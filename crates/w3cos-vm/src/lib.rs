@@ -2086,6 +2086,12 @@ impl Vm {
                     .ok_or(VmError::Unsupported("DynamicImport"))?;
                 registers[dst.0 as usize] = handler(read(*specifier).to_js_string());
             }
+            Instruction::NewTarget { dst } => {
+                // VM closures are host functions: [[Construct]] does not
+                // record a code entry for them, so only AOT code observes a
+                // constructor here.
+                registers[dst.0 as usize] = Value::Undefined;
+            }
             Instruction::ImportMeta { dst } => {
                 let value = Value::object(HashMap::from([(
                     "url".into(),
@@ -2393,6 +2399,7 @@ mod tests {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         }
     }
@@ -2872,6 +2879,7 @@ mod tests {
                 generator_suspension_points: Vec::new(),
                 is_async: true,
                 is_generator: false,
+                own_name_length: None,
                 source_span: None,
             }],
         );
@@ -3292,6 +3300,7 @@ mod tests {
             }],
             is_async: false,
             is_generator: true,
+            own_name_length: None,
             source_span: None,
         };
         let module = Module::new("app:///generator.w3ir", FunctionId(0), vec![entry]);
@@ -3373,6 +3382,7 @@ mod tests {
             }],
             is_async: true,
             is_generator: true,
+            own_name_length: None,
             source_span: None,
         };
         let generator = Vm::new(

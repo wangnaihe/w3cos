@@ -437,7 +437,7 @@ mod tests {
                 ..Style::default()
             };
             if let Some(value) = explicit {
-                style.custom_properties = Some(std::collections::HashMap::from([(
+                style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     w3cos_dom::css_style::TEXT_DECORATION_COLOR_PROPERTY.into(),
                     value.into(),
                 )]));
@@ -587,7 +587,7 @@ mod tests {
                 opacity,
                 color: w3cos_std::Color::rgb(0, 0, 238),
                 text_decoration: w3cos_std::style::TextDecoration::Underline,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     w3cos_std::inline_text::SOURCE_RUN.into(),
                     "text:unit-source".into(),
                 )])),
@@ -595,7 +595,7 @@ mod tests {
             };
             let parent = Style {
                 display: Display::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),

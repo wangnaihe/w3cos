@@ -1,10 +1,11 @@
 //! Single-line metrics with authored inline struts and parent font context.
+#[cfg(test)]
+use crate::layout::HashMap;
 use crate::layout::{
     LayoutRect, count_nodes, inline_font_baseline_from_line_top, inline_font_content_ascent,
     inline_font_height, inline_leaf_alignment_keyword, inline_leaf_baseline_offset,
     inline_used_line_height,
 };
-use std::collections::HashMap;
 use w3cos_std::style::{Dimension, Display, Float, Overflow, Position, TextDirection};
 use w3cos_std::{Component, ComponentKind, Style};
 
@@ -35,7 +36,7 @@ fn place(
     x_shift: f32,
     y: f32,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) {
     let y_shift = y - layouts[item.position].0.y;
     if let Some((start, count)) = item.subtree {
@@ -72,7 +73,7 @@ impl Line {
         relative_y: f32,
         relative_x: f32,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<()> {
         let style = &component.style;
         // Positioned descendants (including outside markers) are not line
@@ -428,7 +429,7 @@ fn resolve(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<Line> {
     // An authored block containing only inline descendants establishes an IFC
     // even when DOM lowering did not need an anonymous flex-row marker. collect
@@ -528,7 +529,7 @@ fn soft_lines(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<Vec<Line>> {
     let style = &component.style;
     if style.direction != TextDirection::Ltr
@@ -657,7 +658,7 @@ fn forced_lines(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<Vec<Line>> {
     fn has_break(component: &Component) -> bool {
         matches!(&component.kind, ComponentKind::Text { content } if content == "\u{2028}")
@@ -697,7 +698,7 @@ fn forced_lines(
         lines: &mut Vec<Line>,
         fresh: &impl Fn() -> Line,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<()> {
         let style = &component.style;
         if matches!(&component.kind, ComponentKind::Text { content } if content == "\u{2028}") {
@@ -799,7 +800,7 @@ fn preserved_text(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<(usize, f32, f32, f32)> {
     if component.children.len() != 1
         || !matches!(
@@ -943,7 +944,7 @@ pub(crate) fn natural_content_height(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<f32> {
     if let Some(lines) = forced_lines(component, index, layouts, positions)
         .or_else(|| soft_lines(component, index, layouts, positions))
@@ -960,7 +961,7 @@ pub(crate) fn project(
     component: &Component,
     index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> bool {
     project_with_constraints(component, index, layouts, positions, None)
 }
@@ -969,7 +970,7 @@ pub(crate) fn project_with_constraints(
     component: &Component,
     index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
     used: Option<UsedHeightConstraints>,
 ) -> bool {
     if let Some(lines) = forced_lines(component, index, layouts, positions)
@@ -1098,7 +1099,7 @@ pub(crate) fn is_projected(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> bool {
     if let Some(lines) = forced_lines(component, index, layouts, positions)
         .or_else(|| soft_lines(component, index, layouts, positions))
@@ -1226,7 +1227,7 @@ mod tests {
             &tree,
             0,
             &mut layouts,
-            &HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)])
+            &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)])
         ));
         assert_eq!(layouts[0].0.height, 104.0);
         assert_eq!(layouts[3].0.y, 84.0);
@@ -1240,7 +1241,7 @@ mod tests {
             font_size: 24.0,
             line_height: 1.375,
             line_height_is_normal: true,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
                 "1".into(),
             )])),
@@ -1279,7 +1280,12 @@ mod tests {
             ),
         ];
         assert!(
-            project(&root, 0, &mut layouts, &HashMap::from([(0, 0), (1, 1)])),
+            project(
+                &root,
+                0,
+                &mut layouts,
+                &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)])
+            ),
             "horizontal decoration must not disable the containing line's vertical strut: font={}, used={}, wrap={}",
             inline_font_height(&root.children[0].style),
             crate::layout::inline_style_line_height(&root.children[0].style),
@@ -1363,7 +1369,7 @@ mod tests {
             &root,
             0,
             &mut layouts,
-            &HashMap::from([(0, 0), (1, 1), (2, 2)])
+            &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2)])
         ));
         assert_eq!(
             layouts[1].0, marker,
@@ -1382,7 +1388,7 @@ mod tests {
             width: Dimension::Px(288.0),
             height: Dimension::Px(288.0),
             border_width: 3.0,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
                 "1".into(),
             )])),
@@ -1505,7 +1511,7 @@ mod tests {
             (rect(161.625, 263.0, 24.0, 18.0), 2),
             (rect(185.625, 224.0, 153.625, 72.0), 3),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
         let projected = project(&root, 0, &mut layouts, &positions);
         registry.clear_owner(OWNER);
         assert!(projected);
@@ -1611,7 +1617,7 @@ mod tests {
                 &root,
                 0,
                 &mut layouts,
-                &HashMap::from([(0, 0), (1, 1)])
+                &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)])
             ));
             assert_eq!(
                 layouts[1].0.x,
@@ -1699,7 +1705,7 @@ mod tests {
                     1,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1)]);
+            let positions = crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)]);
             let used = UsedHeightConstraints {
                 minimum: (root.style.min_height != Dimension::Auto).then_some(used_height),
                 maximum: (root.style.max_height != Dimension::Auto).then_some(used_height),
@@ -1725,7 +1731,7 @@ mod tests {
         for absolute in [false, true] {
             let mut style = Style {
                 display: Display::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -1848,7 +1854,7 @@ mod tests {
                         display: Display::InlineBlock,
                         width: Dimension::Px(30.0),
                         height: Dimension::Px(30.0),
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-vertical-align-keyword".into(),
                             keyword.into(),
                         )])),
@@ -1913,7 +1919,7 @@ mod tests {
                         3,
                     ),
                 ];
-                let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+                let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
                 assert!(
                     project(&root, 0, &mut layouts, &positions),
                     "one line with empty atomic {keyword} box, inline padding={decorated}"
@@ -1946,7 +1952,7 @@ mod tests {
                 font_size: 16.0,
                 line_height: 1.2,
                 line_height_is_normal: false,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -1981,7 +1987,7 @@ mod tests {
                     1,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1)]);
+            let positions = HashMap::from_iter([(0, 0), (1, 1)]);
             assert!(
                 project(&root, 0, &mut layouts, &positions),
                 "fractional single line must not be rejected as wrapped"
@@ -2011,7 +2017,7 @@ mod tests {
             line_height: 20.0 / 12.0,
             line_height_is_normal: false,
             align_self: w3cos_std::style::AlignSelf::FlexStart,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-keyword".into(),
                 "top".into(),
             )])),
@@ -2030,7 +2036,7 @@ mod tests {
             height: 14.0,
         };
         let mut layouts = vec![(rect, 0), (rect, 1)];
-        let positions = HashMap::from([(0, 0), (1, 1)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1)]);
         assert!(project(&root, 0, &mut layouts, &positions));
         assert_eq!(
             layouts[1].0.y, 11.0,
@@ -2083,10 +2089,9 @@ mod tests {
                     vec![Component::row(
                         Style {
                             display: Display::InlineFlex,
-                            custom_properties: Some(HashMap::from([(
-                                "--w3cos-internal-unbroken-inline-word".into(),
-                                "1".into(),
-                            )])),
+                            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter(
+                                [("--w3cos-internal-unbroken-inline-word".into(), "1".into())],
+                            )),
                             ..small
                         },
                         children,
@@ -2132,7 +2137,7 @@ mod tests {
             font_size: 16.0,
             line_height: 1.125,
             line_height_is_normal: true,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-keyword".into(),
                 "top".into(),
             )])),
@@ -2163,7 +2168,7 @@ mod tests {
             (rect(8.0, 8.0, 57.78125, 92.0), 1),
             (rect(65.78125, 82.0, 12.0, 18.0), 2),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2)]);
+        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2)]);
         assert!(
             project(&root, 0, &mut layouts, &positions),
             "outer top alignment does not disable its internal baseline"
@@ -2215,7 +2220,12 @@ mod tests {
         ];
         let before = layouts.clone();
         assert!(
-            !project(&root, 0, &mut layouts, &HashMap::from([(0, 0), (1, 1)])),
+            !project(
+                &root,
+                0,
+                &mut layouts,
+                &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)])
+            ),
             "a font-sized projected rect does not prove the text fits on one line"
         );
         assert_eq!(layouts, before);
@@ -2229,7 +2239,7 @@ mod tests {
             font_size: 60.0,
             line_height: 0.4,
             line_height_is_normal: false,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2245,7 +2255,7 @@ mod tests {
             .into_iter()
             .map(|offset| {
                 let mut style = small.clone();
-                style.custom_properties = Some(HashMap::from([(
+                style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-vertical-align-length".into(),
                     format!("{offset} 0"),
                 )]));
@@ -2266,7 +2276,8 @@ mod tests {
             (rect(24.0, 26.4, 24.0, 28.0), 3),
             (rect(48.0, 40.8, 24.0, 28.0), 4),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+        let positions =
+            crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
         assert!(
             project(&root, 0, &mut layouts, &positions),
             "nested text-only lines need the same shared strut solver as nested image/text lines"
@@ -2306,7 +2317,7 @@ mod tests {
             font_size: 60.0,
             line_height: 0.4,
             line_height_is_normal: false,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2315,7 +2326,7 @@ mod tests {
         let child = Style {
             display: Display::Inline,
             font_size: 24.0,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-length".into(),
                 "24 0".into(),
             )])),
@@ -2327,7 +2338,7 @@ mod tests {
             width: 100.0,
             height,
         };
-        let positions = HashMap::from([(0, 0), (1, 1)]);
+        let positions = crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)]);
         let mut plain = vec![(rect(50.0, 24.0), 0), (rect(14.4, 28.0), 1)];
         assert!(project(
             &Component::row(parent.clone(), vec![Component::text("abc", child.clone())]),
@@ -2376,14 +2387,14 @@ mod tests {
         ] {
             for offset in [-20.0_f32, 0.0, 20.0] {
                 let leaf = Style {
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-vertical-align-keyword".into(),
                         keyword.into(),
                     )])),
                     ..small.clone()
                 };
                 let nested = Style {
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-vertical-align-length".into(),
                         format!("{offset} 0"),
                     )])),
@@ -2392,7 +2403,7 @@ mod tests {
                 let root = Component::row(
                     Style {
                         display: Display::Flex,
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-inline-formatting-context".into(),
                             "1".into(),
                         )])),
@@ -2428,7 +2439,13 @@ mod tests {
                     (rect(30.0, 16.0, 18.0), 3),
                     (rect(46.0, 32.0, 36.0), 4),
                 ];
-                let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+                let positions = crate::layout::LayoutPositions::from_iter([
+                    (0, 0),
+                    (1, 1),
+                    (2, 2),
+                    (3, 3),
+                    (4, 4),
+                ]);
                 assert!(project(&root, 0, &mut layouts, &positions));
                 let baseline = layouts[1].0.y + 30.0;
                 let large_ascent = inline_font_content_ascent(&large);

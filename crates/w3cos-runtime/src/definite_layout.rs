@@ -769,11 +769,14 @@ fn try_apply_authored(viewport_w: f32) -> bool {
             reuse: !w3cos_dom::stylesheet::has_position_dependent_rules(),
             styles: HashMap::new(),
         };
-        if layout_authored(
-            document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects,
-        )
-        .is_none()
-        {
+        let laid_out = {
+            let document: &w3cos_dom::Document = document;
+            let _filter = w3cos_dom::stylesheet::StyleRecalcScope::enter(document);
+            layout_authored(
+                document, root, 0.0, 0.0, viewport_w, None, 0, &mut walk, &mut rects,
+            )
+        };
+        if laid_out.is_none() {
             return false;
         }
         for (id, rect) in &rects {
@@ -825,7 +828,7 @@ fn hash_authored_node(document: &w3cos_dom::Document, id: NodeId, hasher: &mut i
 struct AuthorWalk {
     /// Safe when no rule distinguishes elements by sibling index or descendants.
     reuse: bool,
-    styles: HashMap<u64, Style>,
+    styles: HashMap<u64, w3cos_dom::document::SharedStyle>,
 }
 
 fn cascade_signature(document: &w3cos_dom::Document, id: NodeId) -> u64 {
@@ -871,7 +874,7 @@ fn layout_authored(
     x: f32,
     y: f32,
     cb_width: f32,
-    inherited: Option<&Style>,
+    inherited: Option<&w3cos_dom::document::SharedStyle>,
     chain: u64,
     walk: &mut AuthorWalk,
     out: &mut Vec<(NodeId, DOMRect)>,
@@ -887,12 +890,12 @@ fn layout_authored(
         if let Some(style) = walk.styles.get(&child_chain) {
             style.clone()
         } else {
-            let style = document.computed_style_inherited(id, inherited);
+            let style = document.computed_style_inherited_shared(id, inherited);
             walk.styles.insert(child_chain, style.clone());
             style
         }
     } else {
-        document.computed_style_inherited(id, inherited)
+        document.computed_style_inherited_shared(id, inherited)
     };
     if style.display == Display::None {
         zero_subtree(document, id, out);

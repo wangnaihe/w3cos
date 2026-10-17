@@ -42,6 +42,86 @@ impl<F: Fn() -> AncestorBloom> LazyAncestorBloom<F> {
     }
 }
 
+std::thread_local! {
+    static RECALC_BLOOMS: std::cell::RefCell<Option<RecalcBlooms>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Per-pass memo of "ancestor features seen by this node's children" —
+/// Blink's SelectorFilter, which pushes each parent while RecalcStyle walks
+/// the tree so an element's ancestor bloom is O(1) instead of a walk to the
+/// root per element.
+struct RecalcBlooms {
+    document: *const Document,
+    children: Vec<Option<AncestorBloom>>,
+}
+
+impl RecalcBlooms {
+    fn children_of(&mut self, document: &Document, parent: NodeId) -> AncestorBloom {
+        let mut pending = Vec::new();
+        let mut current = Some(parent);
+        let mut base = AncestorBloom::default();
+        while let Some(id) = current {
+            if let Some(Some(bloom)) = self.children.get(id.0 as usize) {
+                base = *bloom;
+                break;
+            }
+            pending.push(id);
+            current = document.get_node(id).parent;
+        }
+        while let Some(id) = pending.pop() {
+            base.insert_node_features(document, id);
+            let index = id.0 as usize;
+            if self.children.len() <= index {
+                self.children.resize(index + 1, None);
+            }
+            self.children[index] = Some(base);
+        }
+        base
+    }
+}
+
+/// While alive, ancestor blooms are memoized per parent for `document`. It
+/// borrows the document, so the tree cannot change during the pass.
+pub struct StyleRecalcScope<'a> {
+    owner: bool,
+    _document: std::marker::PhantomData<&'a Document>,
+}
+
+impl<'a> StyleRecalcScope<'a> {
+    pub fn enter(document: &'a Document) -> Self {
+        let owner = RECALC_BLOOMS.with(|slot| {
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return false;
+            };
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(RecalcBlooms {
+                document: document as *const Document,
+                children: Vec::new(),
+            });
+            true
+        });
+        Self {
+            owner,
+            _document: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for StyleRecalcScope<'_> {
+    fn drop(&mut self) {
+        if self.owner {
+            RECALC_BLOOMS.with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = None;
+                }
+            });
+        }
+    }
+}
+
 /// Compact, no-false-negative prefilter for ancestor-dependent selectors.
 /// Hash collisions only retain extra rules; the full selector matcher remains
 /// authoritative for every rule that passes.
@@ -76,33 +156,49 @@ impl AncestorBloom {
     }
 
     pub(super) fn for_node(document: &Document, node: NodeId) -> Self {
+        let parent = document.get_node(node).parent;
+        let Some(parent) = parent else {
+            return Self::default();
+        };
+        if let Some(bloom) = RECALC_BLOOMS.with(|slot| {
+            let mut slot = slot.try_borrow_mut().ok()?;
+            let blooms = slot.as_mut()?;
+            std::ptr::eq(blooms.document, document).then(|| blooms.children_of(document, parent))
+        }) {
+            return bloom;
+        }
         let mut bloom = Self::default();
-        let mut ancestor = document.get_node(node).parent;
+        let mut ancestor = Some(parent);
         while let Some(candidate) = ancestor {
-            let node = document.get_node(candidate);
-            if node.node_type == NodeType::Element {
-                let id = node
-                    .attributes
-                    .iter()
-                    .find_map(|(name, value)| (name.as_str() == "id").then(|| value.as_str()));
-                if let Some(id) = id {
-                    bloom.insert(FEATURE_ID, &id, false);
-                }
-                for class in &node.class_list {
-                    bloom.insert(FEATURE_CLASS, &class.as_str(), false);
-                }
-                for (name, _) in &node.attributes {
-                    bloom.insert(
-                        FEATURE_ATTRIBUTE,
-                        attribute_local_name(&name.as_str()),
-                        true,
-                    );
-                }
-                bloom.insert_tag(&node.tag.as_str());
-            }
-            ancestor = node.parent;
+            bloom.insert_node_features(document, candidate);
+            ancestor = document.get_node(candidate).parent;
         }
         bloom
+    }
+
+    fn insert_node_features(&mut self, document: &Document, id: NodeId) {
+        let node = document.get_node(id);
+        if node.node_type != NodeType::Element {
+            return;
+        }
+        let element_id = node
+            .attributes
+            .iter()
+            .find_map(|(name, value)| (name.as_str() == "id").then(|| value.as_str()));
+        if let Some(element_id) = element_id {
+            self.insert(FEATURE_ID, &element_id, false);
+        }
+        for class in &node.class_list {
+            self.insert(FEATURE_CLASS, &class.as_str(), false);
+        }
+        for (name, _) in &node.attributes {
+            self.insert(
+                FEATURE_ATTRIBUTE,
+                attribute_local_name(&name.as_str()),
+                true,
+            );
+        }
+        self.insert_tag(&node.tag.as_str());
     }
 
     pub(super) fn might_contain(self, required: Self) -> bool {

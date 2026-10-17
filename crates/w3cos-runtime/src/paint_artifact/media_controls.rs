@@ -26,7 +26,7 @@ pub(super) fn append(nodes: &mut Vec<PaintNode>, rects: &mut Vec<Option<LayoutRe
             height: w3cos_std::style::Dimension::Px(rect.height),
             visibility: node.style.visibility,
             background: Color::rgb(51, 51, 51),
-            custom_properties: Some(std::collections::HashMap::from([
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
                 (
                     "--w3cos-internal-media-controls-layer".into(),
                     "no-source".into(),
@@ -70,7 +70,7 @@ mod tests {
                     display: Display::InlineBlock,
                     opacity: 0.5,
                     overflow: Overflow::Hidden,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-video-controls".into(),
                         "no-source".into(),
                     )])),

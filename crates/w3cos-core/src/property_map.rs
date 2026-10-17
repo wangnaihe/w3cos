@@ -10,6 +10,10 @@
 
 use std::collections::HashMap;
 
+/// Spilled storage hashes with Fx (V8 hashes property names with a cheap
+/// string hash cached on the name); SipHash dominated every spilled lookup.
+type SpillMap = crate::fxhash::FxHashMap<JsString, Value>;
+
 use crate::js_string::JsString;
 use crate::value::Value;
 
@@ -30,12 +34,12 @@ enum PropertyStore {
         entries: [(JsString, Value); INLINE_CAP],
     },
     Map {
-        map: HashMap<JsString, Value>,
+        map: SpillMap,
         order: Vec<JsString>,
     },
 }
 
-fn map_contains_prefixed(map: &HashMap<JsString, Value>, prefix: &str, key: &str) -> bool {
+fn map_contains_prefixed(map: &SpillMap, prefix: &str, key: &str) -> bool {
     const STACK_KEY_BYTES: usize = 64;
     let total = prefix.len().saturating_add(key.len());
     if total <= STACK_KEY_BYTES {
@@ -82,6 +86,7 @@ impl PropertyMap {
         }
         let mut order: Vec<JsString> = map.keys().cloned().collect();
         order.sort();
+        let map: SpillMap = map.into_iter().collect();
         Self {
             inner: Some(Box::new(PropertyStore::Map { map, order })),
         }
@@ -195,7 +200,8 @@ impl PropertyMap {
                         *len += 1;
                         return None;
                     }
-                    let mut map = HashMap::with_capacity(INLINE_CAP + 1);
+                    let mut map =
+                        SpillMap::with_capacity_and_hasher(INLINE_CAP + 1, Default::default());
                     let mut order = Vec::with_capacity(INLINE_CAP + 1);
                     for i in 0..n {
                         let (k, v) = std::mem::replace(

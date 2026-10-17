@@ -40,7 +40,29 @@ WORKLOADS = (
     "table-repaint",
     "styled-scroll",
     "text-layout",
+    "md-stream-append",
+    "md-stream-rerender",
+    "md-long-history",
+    "dom-ops",
+    "css-ops",
+    "animation",
+    "event-flood",
 )
+# Workloads added 2026-10 (markdown chat stream, DOM ops, CSS, animation,
+# event floods). Their checksum is structural (DOM shape, text, counts and
+# explicit px sizes) so it does not depend on which sans-serif font each
+# engine resolves; the forced layout still runs on every step.
+NEW_WORKLOADS = ('md-stream-append', 'md-stream-rerender', 'md-long-history', 'dom-ops', 'css-ops', 'animation', 'event-flood')
+# Extra scalar fields reported as their own rows (milliseconds).
+EXTRA_METRICS = {
+    "md-stream-append": ("chunk_p50_ms", "chunk_p95_ms", "chunk_max_ms"),
+    "md-stream-rerender": ("chunk_p50_ms", "chunk_p95_ms", "chunk_max_ms"),
+    "md-long-history": ("build_ms", "scroll_ms"),
+    "dom-ops": ("churn_ms", "shuffle_ms", "parse_ms", "clone_ms", "query_ms", "classlist_ms", "attr_ms", "fragment_ms"),
+    "css-ops": ("match_ms", "toggle_ms", "computed_ms", "vars_ms", "media_ms"),
+    "animation": ("frame_p50_ms", "frame_p95_ms"),
+    "event-flood": ("listen_ms", "bubble_ms", "delegate_ms", "dispatch_ms", "churn_ms", "flood_ms"),
+}
 # Per-side limits in milliseconds. Every WORKLOADS entry must appear here;
 # a missing key aborts the run before results are written.
 TIMEOUTS_MS = {
@@ -57,6 +79,13 @@ TIMEOUTS_MS = {
     "table-repaint": 180000,
     "styled-scroll": 180000,
     "text-layout": 180000,
+    "md-stream-append": 240000,
+    "md-stream-rerender": 240000,
+    "md-long-history": 240000,
+    "dom-ops": 240000,
+    "css-ops": 240000,
+    "animation": 240000,
+    "event-flood": 240000,
 }
 # Production `w3cos build --release` embeds the size profile. speed and max
 # are measurement-only. panic stays unwind in every profile: JS exceptions
@@ -123,10 +152,24 @@ PGO_TRAIN_SUBSTITUTIONS = (
     ("var STYLED_NODES = 800;", "var STYLED_NODES = 400;"),
     ("var TEXT_PARAS = 80;", "var TEXT_PARAS = 40;"),
     ("var cards = 40;", "var cards = 20;"),
+    ("var MD_HISTORY = 200;", "var MD_HISTORY = 100;"),
+    ("var MD_LONG_HISTORY = 2000;", "var MD_LONG_HISTORY = 1000;"),
+    ("var MD_TOKENS = 5000;", "var MD_TOKENS = 2500;"),
+    ("var OPS_LIST = 1000;", "var OPS_LIST = 500;"),
+    ("var CSS_NODES = 2000;", "var CSS_NODES = 1000;"),
+    ("var ANIM_NODES = 500;", "var ANIM_NODES = 250;"),
+    ("var EVT_LISTENERS = 10000;", "var EVT_LISTENERS = 5000;"),
+    ("var EVT_DISPATCHES = 100000;", "var EVT_DISPATCHES = 50000;"),
     ("(k * 17)", "(k * 13)"),
     ("(frameIndex * 17)", "(frameIndex * 13)"),
 )
-CHROME = os.environ.get("W3COS_CHROME", "/usr/bin/google-chrome")
+IS_DARWIN = platform.system() == "Darwin"
+DEFAULT_CHROME = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if IS_DARWIN
+    else "/usr/bin/google-chrome"
+)
+CHROME = os.environ.get("W3COS_CHROME", DEFAULT_CHROME)
 CHROME_ARGS = [
     "--disable-gpu",
     "--force-device-scale-factor=1",
@@ -171,7 +214,43 @@ def read_text(path):
         return ""
 
 
+def parse_ps_time(text):
+    """ps `time` is [[dd-]hh:]mm:ss[.cc]. Returns milliseconds."""
+    days = 0
+    if "-" in text:
+        day, text = text.split("-", 1)
+        days = int(day)
+    parts = [float(part) for part in text.split(":")]
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60.0 + part
+    return (days * 86400.0 + seconds) * 1000.0
+
+
+def darwin_process_rows():
+    # macOS has no /proc. rss is KiB; cpu is user+system in milliseconds.
+    out = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,rss=,time="], capture_output=True, text=True
+    ).stdout
+    rows = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        try:
+            rows[int(fields[0])] = {
+                "ppid": int(fields[1]),
+                "cpu": parse_ps_time(fields[3]),
+                "rss": int(fields[2]),
+            }
+        except ValueError:
+            continue
+    return rows
+
+
 def process_rows():
+    if IS_DARWIN:
+        return darwin_process_rows()
     rows = {}
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -223,6 +302,16 @@ def tree_rss_cpu(roots):
 
 
 def chrome_roots():
+    if IS_DARWIN:
+        # Only the Playwright-launched headless browser, never a desktop Chrome
+        # the user has open. Helpers are its children and join via tree_ids.
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        roots = []
+        for line in out.splitlines():
+            pid, _, cmd = line.strip().partition(" ")
+            if CHROME in cmd and "--headless" in cmd and "--type=" not in cmd:
+                roots.append(int(pid))
+        return roots
     roots = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
@@ -238,18 +327,24 @@ def clk_tck():
 
 
 def cpu_ms(ticks):
+    if IS_DARWIN:
+        return float(ticks)
     return ticks * 1000.0 / clk_tck()
 
 
 def host_info(repo):
     model = ""
+    if IS_DARWIN:
+        model = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True
+        ).stdout.strip()
     try:
         for line in Path("/proc/cpuinfo").read_text().splitlines():
             if line.lower().startswith("model name"):
                 model = line.split(":", 1)[1].strip()
                 break
     except OSError:
-        model = platform.processor()
+        model = model or platform.processor()
     chrome = subprocess.check_output([CHROME, "--version"], text=True).strip()
     rustc = subprocess.check_output(["rustc", "-Vv"], text=True).strip()
     revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
@@ -257,8 +352,12 @@ def host_info(repo):
         "os": " ".join(platform.uname()),
         "cpu_model": model,
         "cpus": os.cpu_count(),
-        "gpu": Path("/dev/dri").exists(),
-        "native_raster": "tiny-skia CPU (no /dev/dri, skia/gpu features off)",
+        "gpu": True if IS_DARWIN else Path("/dev/dri").exists(),
+        "native_raster": (
+            "tiny-skia CPU (cpu-render feature, kept for parity with the Linux tables)"
+            if IS_DARWIN
+            else "tiny-skia CPU (no /dev/dri, skia/gpu features off)"
+        ),
         "chrome": chrome,
         "rustc": rustc,
         "git": revision,
@@ -572,7 +671,7 @@ def run_native(binary, workload, timeout, extra_env=None):
         "wall_ms": (time.perf_counter() - started) * 1000.0,
         "peak_rss_kb": max(peak, rss),
         "steady_rss_kb": steady_from_proc(procs),
-        "cpu_ms": cpu_from_proc(procs, "done" if workload in ("startup", "frames") else "script"),
+        "cpu_ms": cpu_from_proc(procs, "done" if workload in ("startup", "frames", "animation") else "script"),
         "result": result,
         "frames": frames,
         "content": content,
@@ -749,6 +848,11 @@ def comparable(workload, native, browser):
         ):
             count_ok = native_result.get("count") == browser_result.get("count")
         return count_ok and numbers_close(checksum_of(native_result), checksum_of(browser_result), rel=0.02, abs_tol=8)
+    if workload in NEW_WORKLOADS:
+        return (
+            native_result.get("count") == browser_result.get("count")
+            and checksum_of(native_result) == checksum_of(browser_result)
+        )
     if workload == "events":
         return (
             native_result.get("count") == browser_result.get("count")
@@ -842,6 +946,9 @@ def summarize_runs(workload, native_runs, browser_runs):
             add("native_pipeline_p50_ms", native_pipeline, [])
             rows[-1]["note"] = "Pipeline time is rAF callback plus tiny-skia raster. Browser gap is reported separately."
             add("browser_raf_gap_p50_ms", [], browser_gaps)
+        for key in EXTRA_METRICS.get(workload, ()):
+            add(key, [v for run in ok_native if (v := run_median(run.get("result"), key)) is not None],
+                [v for run in ok_browser if (v := run_median(run.get("result"), key)) is not None])
         add("cpu_ms", [run["cpu_ms"] for run in ok_native if run.get("cpu_ms") is not None],
             [run["cpu_ms"] for run in ok_browser if run.get("cpu_ms") is not None])
         add("peak_rss_kb", [run["peak_rss_kb"] for run in ok_native if run.get("peak_rss_kb")],
@@ -927,6 +1034,10 @@ def self_check():
     assert numbers_close(1.0, 1.01, rel=0.02, abs_tol=0)
     assert not numbers_close(1.0, 2.0, rel=0.02, abs_tol=0)
     assert set(TIMEOUTS_MS) == set(WORKLOADS)
+    assert set(NEW_WORKLOADS) <= set(WORKLOADS) and set(EXTRA_METRICS) <= set(WORKLOADS)
+    assert parse_ps_time("0:01.50") == 1500.0
+    assert parse_ps_time("1:02:03.00") == 3723000.0
+    assert parse_ps_time("1-00:00:00") == 86400000.0
     assert set(PRIMARY_PROFILES) <= set(PROFILE_SETTINGS)
     assert PROFILE_SETTINGS["size"]["opt_level"] == "z"
     assert PROFILE_SETTINGS["size"]["lto"] == "fat"
@@ -941,6 +1052,14 @@ def self_check():
     for old, _new in (
         ("var DOM_NODES = 1000;", "var DOM_NODES = 500;"),
         ("var cards = 40;", "var cards = 20;"),
+    ("var MD_HISTORY = 200;", "var MD_HISTORY = 100;"),
+    ("var MD_LONG_HISTORY = 2000;", "var MD_LONG_HISTORY = 1000;"),
+    ("var MD_TOKENS = 5000;", "var MD_TOKENS = 2500;"),
+    ("var OPS_LIST = 1000;", "var OPS_LIST = 500;"),
+    ("var CSS_NODES = 2000;", "var CSS_NODES = 1000;"),
+    ("var ANIM_NODES = 500;", "var ANIM_NODES = 250;"),
+    ("var EVT_LISTENERS = 10000;", "var EVT_LISTENERS = 5000;"),
+    ("var EVT_DISPATCHES = 100000;", "var EVT_DISPATCHES = 50000;"),
         ("(k * 17)", "(k * 13)"),
         ("(frameIndex * 17)", "(frameIndex * 13)"),
     ):

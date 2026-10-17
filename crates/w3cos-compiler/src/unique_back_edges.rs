@@ -378,6 +378,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(*dst),

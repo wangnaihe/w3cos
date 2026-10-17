@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn shell_gesture_reads_the_hit_node_only() {
         let mut title = Component::row(w3cos_std::Style::default(), vec![]);
-        title.style.custom_properties = Some(HashMap::from([
+        title.style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
             ("--w3cos-win".to_string(), "2".to_string()),
             ("--w3cos-gesture".to_string(), "move".to_string()),
         ]));
@@ -950,7 +950,7 @@ mod tests {
         let mut stroke = Component::text("一", w3cos_std::Style::default());
         stroke.style.custom_properties = None;
         let mut surface = Component::column(w3cos_std::Style::default(), vec![stroke]);
-        surface.style.custom_properties = Some(HashMap::from([(
+        surface.style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-ink".to_string(),
             "1".to_string(),
         )]));

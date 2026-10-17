@@ -28,6 +28,7 @@ mod selector_filter;
 mod selector_parse_cache;
 
 use rule_set::RuleSet;
+pub use selector_filter::StyleRecalcScope;
 use selector_filter::{AncestorBloom, LazyAncestorBloom};
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
@@ -212,62 +213,13 @@ impl CompoundSelector {
         self.classes
             .iter()
             .all(|c| ctx.classes.iter().any(|have| have == c))
-            && self.attributes.iter().all(|selector| match selector {
-                AttributeSelector::Present(name) => ctx
-                    .attributes
+            && attribute_selectors_match(
+                ctx,
+                &self.attributes,
+                ctx.attributes
                     .iter()
-                    .any(|(have, _)| attribute_name_eq(ctx, have, name)),
-                AttributeSelector::Equals(name, value, insensitive) => {
-                    ctx.attributes.iter().any(|(have, actual)| {
-                        attribute_name_eq(ctx, have, name)
-                            && attribute_value_eq(ctx, name, actual, value, *insensitive)
-                    })
-                }
-                AttributeSelector::Includes(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && actual.split_ascii_whitespace().any(|token| {
-                                    attribute_value_eq(ctx, name, token, value, *insensitive)
-                                })
-                        })
-                }
-                AttributeSelector::DashMatch(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && (attribute_value_eq(ctx, name, actual, value, *insensitive)
-                                    || attribute_value_dash_prefix(
-                                        ctx,
-                                        name,
-                                        actual,
-                                        value,
-                                        *insensitive,
-                                    ))
-                        })
-                }
-                AttributeSelector::Prefix(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && attribute_value_starts_with(actual, value, *insensitive)
-                        })
-                }
-                AttributeSelector::Suffix(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && attribute_value_ends_with(actual, value, *insensitive)
-                        })
-                }
-                AttributeSelector::Substring(name, value, insensitive) => {
-                    !value.is_empty()
-                        && ctx.attributes.iter().any(|(have, actual)| {
-                            attribute_name_eq(ctx, have, name)
-                                && attribute_value_contains(actual, value, *insensitive)
-                        })
-                }
-            })
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            )
             && self.pseudo_classes.iter().all(|pseudo| match pseudo {
                 PseudoClass::FirstChild => ctx.is_first_child,
                 PseudoClass::Root => ctx.is_root,
@@ -285,6 +237,64 @@ impl CompoundSelector {
         let tags = u32::from(self.tag.is_some());
         ids * 1_000_000 + classes * 1_000 + tags
     }
+}
+
+/// Attribute selectors against any `(name, value)` view of an element, so
+/// matching against a live DOM node needs no SelectorContext allocation.
+fn attribute_selectors_match<'a>(
+    ctx: &SelectorContext,
+    selectors: &[AttributeSelector],
+    attributes: impl Iterator<Item = (&'a str, &'a str)> + Clone,
+) -> bool {
+    selectors.iter().all(|selector| match selector {
+        AttributeSelector::Present(name) => attributes
+            .clone()
+            .any(|(have, _)| attribute_name_eq(ctx, have, name)),
+        AttributeSelector::Equals(name, value, insensitive) => {
+            attributes.clone().any(|(have, actual)| {
+                attribute_name_eq(ctx, have, name)
+                    && attribute_value_eq(ctx, name, actual, value, *insensitive)
+            })
+        }
+        AttributeSelector::Includes(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && actual
+                            .split_ascii_whitespace()
+                            .any(|token| attribute_value_eq(ctx, name, token, value, *insensitive))
+                })
+        }
+        AttributeSelector::DashMatch(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && (attribute_value_eq(ctx, name, actual, value, *insensitive)
+                            || attribute_value_dash_prefix(ctx, name, actual, value, *insensitive))
+                })
+        }
+        AttributeSelector::Prefix(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && attribute_value_starts_with(actual, value, *insensitive)
+                })
+        }
+        AttributeSelector::Suffix(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && attribute_value_ends_with(actual, value, *insensitive)
+                })
+        }
+        AttributeSelector::Substring(name, value, insensitive) => {
+            !value.is_empty()
+                && attributes.clone().any(|(have, actual)| {
+                    attribute_name_eq(ctx, have, name)
+                        && attribute_value_contains(actual, value, *insensitive)
+                })
+        }
+    })
 }
 
 fn attribute_name_eq(ctx: &SelectorContext, actual: &str, expected: &str) -> bool {
@@ -446,6 +456,12 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     if rules.has_structural_dependencies() {
         flags |= 8;
     }
+    if rules.has_match_volatile_rules() {
+        flags |= 16;
+    }
+    if rules.has_transition_rules() {
+        flags |= 32;
+    }
     flags
 }
 
@@ -468,6 +484,17 @@ pub(crate) fn has_sibling_dependencies() -> bool {
 
 pub(crate) fn has_relational_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 4 != 0)
+}
+
+/// `:has()`-style selectors: a mutation can restyle any ancestor.
+pub fn has_relational_selectors() -> bool {
+    has_relational_dependencies()
+}
+
+/// `+`/`~` combinators: an attribute edit can restyle following siblings
+/// (Blink's sibling invalidation sets). `:nth-child` alone cannot.
+pub fn has_sibling_selectors() -> bool {
+    has_sibling_dependencies()
 }
 
 /// Sibling, structural, and relational selectors can change when a node moves.
@@ -745,7 +772,20 @@ pub fn rule_count() -> usize {
     RULES.with(|rules| rules.borrow().rules.len())
 }
 
+/// Matched-rule lists stay valid across inline-style-only edits unless a
+/// rule depends on container size or the `style` attribute.
+pub(crate) fn matched_rules_survive_inline_style_edits() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 16 == 0)
+}
+
 /// Whether any rules are registered — fast path for the DOM walk.
+/// Some registered rule declares `transition*`. Without one (and without an
+/// inline transition) a class or style edit cannot start a CSS transition,
+/// so callers skip the before/after style snapshots.
+pub fn has_transition_rules() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 32 != 0)
+}
+
 pub fn has_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 1 != 0)
 }
@@ -999,16 +1039,23 @@ pub(crate) fn matching_cascade_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<CascadeDeclaration> {
+    cascade_declarations_for_rules(&matching_rule_indices_for_node(document, node))
+}
+
+/// Indices of the principal-box rules matching `node`, in (specificity,
+/// order) order. Blink's ElementRuleCollector produces the same list of
+/// matched rules; the MatchedPropertiesCache is keyed by it, so a cache hit
+/// never materializes declaration strings.
+pub(crate) fn matching_rule_indices_for_node(document: &Document, node: NodeId) -> Vec<u32> {
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
     RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
-        let mut matched: Vec<&Rule> = rules
-            .candidate_indices_for_node(document, node)
-            .into_iter()
-            .map(|index| &rules.rules[index])
-            .filter(|rule| {
-                rule.pseudo_element.is_none()
+        let mut matched: Vec<u32> = Vec::new();
+        rules.for_each_candidate_bucket(document, node, |bucket| {
+            for &index in bucket {
+                let rule = &rules.rules[index];
+                if rule.pseudo_element.is_none()
                     && rule_matches_document_scope(rule, document_scope)
                     && ancestor_bloom.might_contain(rule.ancestor_filter)
                     && matches_chain_node(
@@ -1025,11 +1072,30 @@ pub(crate) fn matching_cascade_declarations_for_node(
                         .iter()
                         .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
                         .all(|(_, query)| container_query_matches(&rules, document, node, query))
-            })
-            .collect();
-        matched.sort_by_key(|rule| (rule.specificity, rule.order));
+                {
+                    matched.push(index as u32);
+                }
+            }
+        });
+        matched.sort_unstable_by_key(|&index| {
+            let rule = &rules.rules[index as usize];
+            (rule.specificity, rule.order, index)
+        });
+        matched.dedup();
+        matched
+    })
+}
+
+/// Cascade-ordered declarations of rules from [`matching_rule_indices_for_node`].
+pub(crate) fn cascade_declarations_for_rules(matched: &[u32]) -> Vec<CascadeDeclaration> {
+    if matched.is_empty() {
+        return Vec::new();
+    }
+    RULES.with(|rules| {
+        let rules = rules.borrow();
         let mut buckets: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
-        for rule in matched {
+        for &index in matched {
+            let rule = &rules.rules[index as usize];
             for (prop, value) in &rule.declarations {
                 if prop != CONTAINER_QUERY_MARKER {
                     let (value, is_important) = declaration_value_and_importance(value);
@@ -1177,6 +1243,67 @@ pub fn selector_matches_node_with_target(
             None,
         )
     }))
+}
+
+/// `querySelector[All]` over the descendants of `scope` in tree order.
+/// Like Blink's SelectorQuery the group is parsed once (not per candidate)
+/// and the walk follows sibling links without collecting the subtree.
+/// A selector that does not parse matches nothing, as per-node matching did.
+pub fn query_selector_descendants(
+    selector: &str,
+    document: &Document,
+    scope: NodeId,
+    limit: usize,
+) -> Vec<NodeId> {
+    let mut matches = Vec::new();
+    let selector = trim_css_whitespace(selector);
+    if selector.is_empty() || selector.starts_with(',') || selector.ends_with(',') {
+        return matches;
+    }
+    let Some(parsed) = split_selector_group(selector)
+        .into_iter()
+        .map(|single| parse_selector_chain_cached(&single))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return matches;
+    };
+    let next_in_subtree = |node: NodeId| -> Option<NodeId> {
+        if let Some(child) = document.get_node(node).first_child {
+            return Some(child);
+        }
+        let mut current = node;
+        while current != scope {
+            let current_node = document.get_node(current);
+            if let Some(next) = crate::node::sib(current_node.next_sibling) {
+                return Some(next);
+            }
+            current = current_node.parent?;
+        }
+        None
+    };
+    let mut cursor = document.get_node(scope).first_child;
+    while let Some(node) = cursor {
+        if document.get_node(node).node_type == NodeType::Element
+            && parsed.iter().any(|parsed| {
+                matches_chain_node(
+                    document,
+                    node,
+                    &parsed.chain,
+                    &parsed.combinators,
+                    parsed.chain.len() - 1,
+                    None,
+                    None,
+                )
+            })
+        {
+            matches.push(node);
+            if matches.len() >= limit {
+                break;
+            }
+        }
+        cursor = next_in_subtree(node);
+    }
+    matches
 }
 
 /// Match prefixes of a relative selector under a reference element. This is
@@ -1460,34 +1587,39 @@ fn pseudo_matches_node(
     target_id: Option<&str>,
 ) -> bool {
     let dom_node = document.get_node(node);
-    let element_siblings = || {
-        dom_node.parent.map_or_else(Vec::new, |parent| {
-            document
-                .children_ids(parent)
-                .into_iter()
-                .filter(|sibling| document.get_node(*sibling).node_type == NodeType::Element)
-                .collect::<Vec<_>>()
-        })
+    // Structural pseudo-classes walk the sibling chain in place (Blink
+    // SelectorChecker counts siblings via ElementTraversal / NthIndexCache)
+    // instead of collecting the parent's children into a Vec per check.
+    let same_type = |sibling: &crate::node::DomNode| {
+        sibling
+            .tag
+            .as_str()
+            .eq_ignore_ascii_case(&dom_node.tag.as_str())
     };
-    let type_siblings = || {
-        element_siblings()
-            .into_iter()
-            .filter(|sibling| {
-                document
-                    .get_node(*sibling)
-                    .tag
-                    .as_str()
-                    .eq_ignore_ascii_case(&dom_node.tag.as_str())
-            })
-            .collect::<Vec<_>>()
-    };
+    let has_parent = dom_node.parent.is_some();
     match pseudo {
-        PseudoClass::FirstChild => element_siblings().first().copied() == Some(node),
-        PseudoClass::LastChild => element_siblings().last().copied() == Some(node),
-        PseudoClass::FirstOfType => type_siblings().first().copied() == Some(node),
-        PseudoClass::LastOfType => type_siblings().last().copied() == Some(node),
-        PseudoClass::OnlyChild => element_siblings().as_slice() == [node],
-        PseudoClass::OnlyOfType => type_siblings().as_slice() == [node],
+        PseudoClass::FirstChild => {
+            has_parent && count_element_siblings(document, node, false, |_| true, 1) == 0
+        }
+        PseudoClass::LastChild => {
+            has_parent && count_element_siblings(document, node, true, |_| true, 1) == 0
+        }
+        PseudoClass::FirstOfType => {
+            has_parent && count_element_siblings(document, node, false, same_type, 1) == 0
+        }
+        PseudoClass::LastOfType => {
+            has_parent && count_element_siblings(document, node, true, same_type, 1) == 0
+        }
+        PseudoClass::OnlyChild => {
+            has_parent
+                && count_element_siblings(document, node, false, |_| true, 1) == 0
+                && count_element_siblings(document, node, true, |_| true, 1) == 0
+        }
+        PseudoClass::OnlyOfType => {
+            has_parent
+                && count_element_siblings(document, node, false, same_type, 1) == 0
+                && count_element_siblings(document, node, true, same_type, 1) == 0
+        }
         PseudoClass::Empty => document.children_ids(node).into_iter().all(|child| {
             let child = document.get_node(child);
             match child.node_type {
@@ -1548,16 +1680,32 @@ fn pseudo_matches_node(
                 .is_ok_and(|matched| !matched)
         }
         PseudoClass::NthChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, false)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, false, |_| true, usize::MAX),
+                    expression,
+                )
         }
         PseudoClass::NthLastChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, true)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, true, |_| true, usize::MAX),
+                    expression,
+                )
         }
         PseudoClass::NthOfType(expression) => {
-            matches_nth_position(&type_siblings(), node, expression, false)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, false, same_type, usize::MAX),
+                    expression,
+                )
         }
         PseudoClass::NthLastOfType(expression) => {
-            matches_nth_position(&type_siblings(), node, expression, true)
+            has_parent
+                && matches_nth_position(
+                    count_element_siblings(document, node, true, same_type, usize::MAX),
+                    expression,
+                )
         }
     }
 }
@@ -1693,20 +1841,42 @@ fn node_direction(document: &Document, mut node: NodeId) -> String {
     }
 }
 
-fn matches_nth_position(
-    siblings: &[NodeId],
+/// Element siblings before (`from_end == false`) or after `node` accepted by
+/// `filter`, stopping once `limit` are counted.
+fn count_element_siblings(
+    document: &Document,
     node: NodeId,
-    expression: &str,
     from_end: bool,
-) -> bool {
-    let Some(index) = siblings.iter().position(|sibling| *sibling == node) else {
-        return false;
+    filter: impl Fn(&crate::node::DomNode) -> bool,
+    limit: usize,
+) -> usize {
+    let step = |id: NodeId| {
+        let current = document.get_node(id);
+        crate::node::sib(if from_end {
+            current.next_sibling
+        } else {
+            current.prev_sibling
+        })
     };
-    let position = if from_end {
-        siblings.len() - index
-    } else {
-        index + 1
-    } as i64;
+    let mut count = 0;
+    let mut sibling = step(node);
+    while let Some(candidate) = sibling {
+        let candidate_node = document.get_node(candidate);
+        if candidate_node.node_type == NodeType::Element && filter(candidate_node) {
+            count += 1;
+            if count >= limit {
+                break;
+            }
+        }
+        sibling = step(candidate);
+    }
+    count
+}
+
+/// `preceding` = matching siblings before the node (or after, for the
+/// `-last-` variants); the 1-based position is `preceding + 1`.
+fn matches_nth_position(preceding: usize, expression: &str) -> bool {
+    let position = preceding as i64 + 1;
     let Some((a, b)) = parse_an_plus_b(expression) else {
         return false;
     };
@@ -1718,12 +1888,36 @@ fn matches_nth_position(
 }
 
 fn parse_an_plus_b(expression: &str) -> Option<(i64, i64)> {
-    let expression = expression
-        .chars()
-        .filter(|character| !is_css_whitespace(*character))
-        .collect::<String>()
-        .to_ascii_lowercase();
-    match expression.as_str() {
+    // Compact (whitespace-free, lowercase) form in a stack buffer; the
+    // An+B grammar is ASCII, so longer or non-ASCII input takes the slow path.
+    let mut buffer = [0u8; 32];
+    let mut len = 0;
+    let mut compact_ok = expression.is_ascii();
+    if compact_ok {
+        for byte in expression.bytes() {
+            if is_css_whitespace(byte as char) {
+                continue;
+            }
+            if len == buffer.len() {
+                compact_ok = false;
+                break;
+            }
+            buffer[len] = byte.to_ascii_lowercase();
+            len += 1;
+        }
+    }
+    let owned;
+    let expression: &str = if compact_ok {
+        std::str::from_utf8(&buffer[..len]).ok()?
+    } else {
+        owned = expression
+            .chars()
+            .filter(|character| !is_css_whitespace(*character))
+            .collect::<String>()
+            .to_ascii_lowercase();
+        owned.as_str()
+    };
+    match expression {
         "odd" => return Some((2, 1)),
         "even" => return Some((2, 0)),
         _ => {}

@@ -118,10 +118,25 @@ pub fn negate(value: &Value) -> Value {
 }
 
 pub fn get_property(object: &Value, key: &Value) -> Value {
-    if let Some(index) = canonical_number_index(key)
-        && let Some(value) = crate::fast_collection_get(object, Some(index))
-    {
-        return value;
+    if let Some(index) = canonical_number_index(key) {
+        if let Some(value) = crate::fast_collection_get(object, Some(index)) {
+            return value;
+        }
+        // `array[i]` with a number key: read the element directly instead of
+        // formatting the index to a string and parsing it back (V8 keyed
+        // element load). Same result as the string path: holes and
+        // out-of-range indices read as undefined; typed-array views keep the
+        // byte-backed path.
+        if let Some(array) = object.as_array()
+            && !crate::binary::is_typed_array_view(object)
+        {
+            return array
+                .borrow()
+                .get(index)
+                .cloned()
+                .map(crate::value::array_slot_value)
+                .unwrap_or(Value::Undefined);
+        }
     }
     object.get_property(&key.to_js_string())
 }
@@ -367,7 +382,79 @@ pub fn for_in_keys(value: &Value) -> Value {
     Value::array(keys)
 }
 
+/// Headroom kept below the JS stack limit for the error path and host code
+/// called from the last admitted frame.
+const STACK_RED_ZONE: usize = 256 * 1024;
+
+thread_local! {
+    /// Lowest stack address a JS frame may start at on this thread
+    /// (`usize::MAX` until first measured, 0 when the platform cannot tell).
+    static JS_STACK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// V8 StackGuard / Isolate::StackOverflow: every compiled function entry
+/// compares the stack pointer with a per-thread limit and throws
+/// `RangeError: Maximum call stack size exceeded` instead of overflowing the
+/// native stack. The fast path is a thread-local load and one compare.
+#[inline(always)]
+pub fn check_stack() -> Result<(), Value> {
+    let marker = 0u8;
+    let sp = std::ptr::addr_of!(marker) as usize;
+    if sp > JS_STACK_LIMIT.with(|limit| limit.get()) {
+        return Ok(());
+    }
+    check_stack_slow(sp)
+}
+
+#[cold]
+#[inline(never)]
+fn check_stack_slow(sp: usize) -> Result<(), Value> {
+    let limit = JS_STACK_LIMIT.with(|limit| {
+        if limit.get() == usize::MAX {
+            let measured = stacker::remaining_stack()
+                .map(|remaining| sp.saturating_sub(remaining).saturating_add(STACK_RED_ZONE))
+                .unwrap_or(0);
+            limit.set(measured);
+        }
+        limit.get()
+    });
+    if sp > limit {
+        Ok(())
+    } else {
+        Err(crate::error_instance(
+            "RangeError",
+            vec![Value::string("Maximum call stack size exceeded")],
+        ))
+    }
+}
+
+/// ECMA-262 Call(F, V, args) step 2: a non-callable callee throws a
+/// TypeError (V8 Builtins::Call -> CallNonCallable) instead of producing
+/// undefined.
+#[cold]
+#[inline(never)]
+fn not_callable(callee: &Value) -> Value {
+    let what = if callee.is_null() {
+        "null"
+    } else {
+        callee.type_of()
+    };
+    type_error(&format!("{what} is not a function"))
+}
+
+#[inline]
+fn ensure_callable(callee: &Value) -> Result<(), Value> {
+    if matches!(callee, Value::Function(_)) || callee.is_callable() {
+        Ok(())
+    } else {
+        Err(not_callable(callee))
+    }
+}
+
 pub fn call(callee: &Value, this_value: Value, arguments: Vec<Value>) -> Value {
+    if let Err(exception) = ensure_callable(callee) {
+        crate::throw_value(exception);
+    }
     callee.call(this_value, arguments)
 }
 
@@ -378,6 +465,18 @@ pub fn call_completion(
     arguments: Vec<Value>,
 ) -> crate::Completion {
     crate::catch_js(|| call(callee, this_value, arguments))
+}
+
+/// [`call_completion`] with borrowed arguments: AOT callees and slice-aware
+/// host closures take the slice directly, so a JS call site no longer
+/// allocates an argument `Vec` per call (V8 passes arguments on the stack).
+pub fn call_completion_slice(
+    callee: &Value,
+    this_value: Value,
+    arguments: &[Value],
+) -> crate::Completion {
+    ensure_callable(callee)?;
+    crate::catch_js(|| callee.call_slice(this_value, arguments))
 }
 
 fn try_materialized_arguments(arguments: &Value) -> Result<Vec<Value>, Value> {
@@ -1033,6 +1132,59 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn unbounded_recursion_throws_range_error_instead_of_overflowing() {
+        fn recurse(depth: usize) -> Result<usize, Value> {
+            check_stack()?;
+            let pad = std::hint::black_box([0u8; 512]);
+            recurse(depth + 1).map(|d| d + pad[0] as usize)
+        }
+        let handle = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let error = recurse(0).expect_err("recursion must hit the guard");
+                (
+                    get_property(&error, &Value::string("name")).to_js_string(),
+                    get_property(&error, &Value::string("message")).to_js_string(),
+                )
+            })
+            .unwrap();
+        let (name, message) = handle.join().unwrap();
+        assert_eq!(name, "RangeError");
+        assert_eq!(message, "Maximum call stack size exceeded");
+        // The guard keeps working after a caught overflow.
+        assert!(check_stack().is_ok());
+    }
+
+    #[test]
+    fn calling_a_non_callable_value_throws_type_error() {
+        for callee in [
+            Value::Number(5.0),
+            Value::Undefined,
+            Value::Null,
+            Value::string("f"),
+        ] {
+            let error = call_completion_slice(&callee, Value::Undefined, &[])
+                .expect_err("non-callable [[Call]] must throw");
+            assert_eq!(
+                get_property(&error, &Value::string("name")).to_js_string(),
+                "TypeError"
+            );
+            assert!(
+                get_property(&error, &Value::string("message"))
+                    .to_js_string()
+                    .ends_with("is not a function")
+            );
+        }
+        let ok = Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined));
+        assert_eq!(
+            call_completion_slice(&ok, Value::Undefined, &[Value::Number(2.0)])
+                .unwrap()
+                .to_number(),
+            2.0
+        );
+    }
+
+    #[test]
     fn dom_shape_baseline_is_the_pristine_stamp() {
         note_dom_shape_baseline();
         assert!(dom_shape_is_pristine());
@@ -1374,6 +1526,20 @@ mod tests {
 
 #[cfg(test)]
 mod call_completion_tests {
+    #[test]
+    fn numeric_array_index_matches_the_string_key_path() {
+        let array = super::create_array(vec![
+            crate::Value::Number(1.0),
+            crate::value::array_hole(),
+            crate::Value::from("x"),
+        ]);
+        for index in [0.0, 1.0, 2.0, 3.0, 1.5, -1.0] {
+            let fast = super::get_property(&array, &crate::Value::Number(index));
+            let slow = array.get_property(&crate::Value::Number(index).to_js_string());
+            assert!(fast.strict_eq(&slow), "index {index}: {fast:?} vs {slow:?}");
+        }
+    }
+
     use super::*;
     use crate::Value;
 

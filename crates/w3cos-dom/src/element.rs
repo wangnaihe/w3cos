@@ -484,26 +484,9 @@ impl Element {
         let root = doc.get_layout_rect(self.id);
         let mut width = root.width;
         let mut height = root.height;
-        // Sibling links, not one `Vec` per parent. A flat list of hundreds of
-        // rows stays at stack depth two.
-        let mut stack = Vec::new();
-        if let Some(child) = doc.get_node(self.id).first_child {
-            stack.push(child);
-        }
-        while let Some(id) = stack.pop() {
-            let rect = doc.get_layout_rect(id);
-            width = width.max(rect.x + rect.width - root.x);
-            height = height.max(rect.y + rect.height - root.y);
-            let (child, next) = {
-                let node = doc.get_node(id);
-                (node.first_child, crate::node::sib(node.next_sibling))
-            };
-            if let Some(next) = next {
-                stack.push(next);
-            }
-            if let Some(child) = child {
-                stack.push(child);
-            }
+        if let Some((right, bottom)) = doc.descendant_extent(self.id) {
+            width = width.max(right - root.x);
+            height = height.max(bottom - root.y);
         }
         (width.max(0.0), height.max(0.0))
     }

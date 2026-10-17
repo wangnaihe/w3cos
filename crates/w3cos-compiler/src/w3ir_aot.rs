@@ -60,6 +60,12 @@ struct EscapePlan {
     n_num_bindings: u32,
     /// Binding id → number that is stored exactly once as a literal.
     constants: HashMap<u32, f64>,
+    /// Non-escaping local binding id → slot in `val_bindings` (an
+    /// `Option<Value>`, `None` while in the TDZ). V8 keeps such locals in
+    /// interpreter registers instead of a heap Context; only bindings a
+    /// closure captures need a shared cell. Sync functions only.
+    val_binding_of: HashMap<u32, u32>,
+    n_val_bindings: u32,
 }
 
 thread_local! {
@@ -93,6 +99,71 @@ impl Drop for SharedNumberGuard {
     fn drop(&mut self) {
         SHARED_NUMBERS.with(|numbers| numbers.borrow_mut().clear());
     }
+}
+
+thread_local! {
+    /// Parameter binding ids a number-specialized entry may assume hold a
+    /// Number on entry (static analogue of V8 feedback-driven parameter
+    /// representation selection). Only set while emitting `__num` entries,
+    /// which known-target call sites reach with exactly that many Number
+    /// arguments.
+    static ASSUMED_NUMBER_PARAMS: std::cell::RefCell<HashSet<u32>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+fn assumed_number_params() -> HashSet<u32> {
+    ASSUMED_NUMBER_PARAMS.with(|params| params.borrow().clone())
+}
+
+/// Run `f` with every parameter of `function` assumed to be a Number.
+pub(crate) fn with_number_params<T>(function: &Function, f: impl FnOnce() -> T) -> T {
+    struct Restore(HashSet<u32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            ASSUMED_NUMBER_PARAMS.with(|params| *params.borrow_mut() = previous);
+        }
+    }
+    let assumed = function
+        .parameters
+        .iter()
+        .map(|binding| binding.0)
+        .collect();
+    let previous =
+        ASSUMED_NUMBER_PARAMS.with(|params| std::mem::replace(&mut *params.borrow_mut(), assumed));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Whether a Number-parameter entry of `function` keeps every parameter as a
+/// bare f64: a leaf ordinary function (no nested closures/classes, so the
+/// entry can be emitted twice), with no `arguments` object or rest parameter
+/// aliasing the parameters, and whose parameters are only ever assigned
+/// numbers.
+pub(crate) fn number_specializable(function: &Function) -> bool {
+    if function.is_async
+        || function.is_generator
+        || function.parameters.is_empty()
+        || function.arguments_binding.is_some()
+        || function.rest_parameter.is_some()
+        || function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::CreateClosure { .. } | Instruction::CreateClass { .. }
+                )
+            })
+        })
+    {
+        return false;
+    }
+    with_number_params(function, || {
+        let numeric = numeric_local_bindings(function, &HashMap::new());
+        function
+            .parameters
+            .iter()
+            .all(|binding| numeric.contains(&binding.0))
+    })
 }
 
 fn is_shared_number(id: u32) -> bool {
@@ -401,7 +472,95 @@ fn analyze_function(function: &Function) -> EscapePlan {
         num_binding_of,
         n_num_bindings,
         constants,
+        val_binding_of: HashMap::new(),
+        n_val_bindings: 0,
     }
+}
+
+thread_local! {
+    static VALUE_BINDING_PROMOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Give non-escaping locals of a synchronous function a plain `Value` slot
+/// instead of an `Rc<RefCell<(Value, bool)>>` cell.
+fn promote_value_bindings(function: &Function, plan: &mut EscapePlan, shared: &HashSet<u32>) {
+    if !VALUE_BINDING_PROMOTION.with(|flag| flag.get())
+        || function.is_async
+        || function.is_generator
+    {
+        return;
+    }
+    let captured = captured_binding_ids(function);
+    let mut reserved = HashSet::new();
+    reserved.extend(function.captures.iter().map(|binding| binding.0));
+    // A mapped `arguments` object aliases the parameters.
+    if let Some(binding) = function.arguments_binding {
+        reserved.insert(binding.0);
+        reserved.extend(function.parameters.iter().map(|binding| binding.0));
+    }
+    if let Some(binding) = function.rest_parameter {
+        reserved.insert(binding.0);
+    }
+    if let Some(binding) = function.this_binding {
+        reserved.insert(binding.0);
+    }
+    let mut ids = function
+        .bindings
+        .iter()
+        .filter(|binding| {
+            let id = binding.id.0;
+            matches!(
+                binding.kind,
+                BindingKind::Var | BindingKind::Let | BindingKind::Const | BindingKind::Parameter
+            ) && !captured.contains(&id)
+                && !reserved.contains(&id)
+                && !shared.contains(&id)
+                && !plan.num_binding_of.contains_key(&id)
+                && !plan.constants.contains_key(&id)
+        })
+        .map(|binding| binding.id.0)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        plan.val_binding_of.insert(id, plan.n_val_bindings);
+        plan.n_val_bindings += 1;
+    }
+}
+
+fn val_binding_slot(plan: &EscapePlan, binding: u32) -> Option<u32> {
+    plan.val_binding_of.get(&binding).copied()
+}
+
+/// Generic cell accesses that would bypass a promoted slot. Any hit means
+/// some emitter path does not know about `val_bindings`, so the caller
+/// regenerates the function without promotion.
+fn promoted_binding_leaks(code: &str, plan: &EscapePlan, storage: SlotStorage) -> bool {
+    plan.val_binding_of.keys().any(|&id| {
+        let mut patterns = vec![
+            format!("bindings.get(&{id})"),
+            format!("bindings.get_mut(&{id})"),
+            format!("bindings.insert({id},"),
+            format!("capture_getters.get(&{id})"),
+            format!("capture_setters.get(&{id})"),
+            format!("__w3cos_cb_{id}"),
+            format!("__w3cos_cg_{id}"),
+            format!("__w3cos_cs_{id}"),
+            format!("__captures.get(&{id})"),
+        ];
+        if !matches!(storage, SlotStorage::Map(_)) {
+            let index = slot_index(storage, id);
+            patterns.push(format!("bindings.get({index})"));
+            patterns.push(format!("bindings.get_mut({index})"));
+            // Leading space: `val_bindings[i]` must not match.
+            patterns.push(format!(" bindings[{index}]"));
+            patterns.push(format!("capture_getters.get({index})"));
+            patterns.push(format!("capture_setters.get({index})"));
+        }
+        patterns
+            .iter()
+            .any(|pattern| code.contains(pattern.as_str()))
+    })
 }
 
 /// `let`/`var` bindings stay writable from every nested closure, including
@@ -437,8 +596,19 @@ fn captured_binding_ids(function: &Function) -> HashSet<u32> {
 
 fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) -> HashSet<u32> {
     let captured = captured_binding_ids(function);
+    let assumed = if function.arguments_binding.is_none() && function.rest_parameter.is_none() {
+        assumed_number_params()
+    } else {
+        HashSet::new()
+    };
     let mut reserved = HashSet::new();
-    reserved.extend(function.parameters.iter().map(|binding| binding.0));
+    reserved.extend(
+        function
+            .parameters
+            .iter()
+            .map(|binding| binding.0)
+            .filter(|id| !assumed.contains(id)),
+    );
     reserved.extend(function.captures.iter().map(|binding| binding.0));
     if let Some(binding) = function.rest_parameter {
         reserved.insert(binding.0);
@@ -453,10 +623,11 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
         .bindings
         .iter()
         .filter(|binding| {
-            matches!(
+            (matches!(
                 binding.kind,
                 BindingKind::Var | BindingKind::Let | BindingKind::Const
-            ) && !captured.contains(&binding.id.0)
+            ) || assumed.contains(&binding.id.0))
+                && !captured.contains(&binding.id.0)
                 && !reserved.contains(&binding.id.0)
         })
         .map(|binding| binding.id.0)
@@ -473,7 +644,11 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
         let dominated = loads_after_numeric_store(function, &numeric, &number_regs);
         let mut next = HashSet::new();
         for id in &eligible {
-            if dominated.contains(id) && stores_are_numbers(function, *id, &number_regs) {
+            if dominated.contains(id)
+                && (stores_are_numbers(function, *id, &number_regs)
+                    || (assumed.contains(id)
+                        && stores_are_numbers_or_none(function, *id, &number_regs)))
+            {
                 next.insert(*id);
             }
         }
@@ -531,6 +706,29 @@ fn stores_are_numbers(function: &Function, binding: u32, number_regs: &HashSet<u
     saw_store
 }
 
+/// Parameters start with their (Number) argument, so no explicit store is
+/// required; any explicit store must still be a Number.
+fn stores_are_numbers_or_none(
+    function: &Function,
+    binding: u32,
+    number_regs: &HashSet<u32>,
+) -> bool {
+    function.blocks.iter().all(|block| {
+        block
+            .instructions
+            .iter()
+            .all(|instruction| match instruction {
+                Instruction::InitializeBinding { binding: id, value }
+                | Instruction::StoreBinding { binding: id, value }
+                    if id.0 == binding =>
+                {
+                    number_regs.contains(&value.0)
+                }
+                _ => true,
+            })
+    })
+}
+
 fn loads_after_numeric_store(
     function: &Function,
     candidates: &HashSet<u32>,
@@ -559,13 +757,22 @@ fn loads_after_numeric_store(
             preds.entry(target).or_default().push(block.id);
         }
     }
+    // Assumed-Number parameters are initialized by the entry itself.
+    let entry_state = if function.arguments_binding.is_none() && function.rest_parameter.is_none() {
+        assumed_number_params()
+            .into_iter()
+            .filter(|id| candidates.contains(id))
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let mut out: HashMap<w3cos_ir::BlockId, HashSet<u32>> = HashMap::new();
     let mut changed = true;
     while changed {
         changed = false;
         for block in &function.blocks {
             let mut state = if block.id == function.entry {
-                HashSet::new()
+                entry_state.clone()
             } else {
                 let mut incoming: Option<HashSet<u32>> = None;
                 let mut saw_pred = false;
@@ -618,7 +825,7 @@ fn loads_after_numeric_store(
             continue;
         }
         let mut state = if block.id == function.entry {
-            HashSet::new()
+            entry_state.clone()
         } else {
             let mut incoming: Option<HashSet<u32>> = None;
             for pred in preds.get(&block.id).into_iter().flatten() {
@@ -1166,6 +1373,7 @@ fn apply_register_def(
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => def_class(classes, *dst, RegClass::Unknown),
         _ => {}
@@ -1176,7 +1384,7 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
     let mut fields = String::new();
     let mut inits = String::new();
     if plan.n_num > 0 {
-        if (plan.n_num as usize) <= INLINE_FRAME {
+        if (plan.n_num as usize) <= INLINE_UNBOXED_F64 {
             fields.push_str(&format!("    num_regs: [f64; {}],\n", plan.n_num));
             inits.push_str(&format!("        num_regs: [0.0_f64; {}],\n", plan.n_num));
         } else {
@@ -1188,7 +1396,7 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
         }
     }
     if plan.n_bool > 0 {
-        if (plan.n_bool as usize) <= INLINE_FRAME {
+        if (plan.n_bool as usize) <= INLINE_UNBOXED_BOOL {
             fields.push_str(&format!("    bool_regs: [bool; {}],\n", plan.n_bool));
             inits.push_str(&format!("        bool_regs: [false; {}],\n", plan.n_bool));
         } else {
@@ -1199,8 +1407,15 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
             ));
         }
     }
+    if plan.n_val_bindings > 0 {
+        fields.push_str(&format!(
+            "    val_bindings: [Option<w3cos_core::Value>; {}],\n",
+            plan.n_val_bindings
+        ));
+        inits.push_str("        val_bindings,\n");
+    }
     if plan.n_num_bindings > 0 {
-        if (plan.n_num_bindings as usize) <= INLINE_FRAME {
+        if (plan.n_num_bindings as usize) <= INLINE_UNBOXED_F64 {
             fields.push_str(&format!(
                 "    num_bindings: [f64; {}],\n",
                 plan.n_num_bindings
@@ -1405,6 +1620,7 @@ fn instruction_dst(instruction: &Instruction) -> Option<u32> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(dst.0),
@@ -1435,6 +1651,11 @@ fn reaching_number_constants(instructions: &[Instruction]) -> Vec<HashMap<u32, f
 }
 
 const INLINE_FRAME: usize = 8;
+/// Unboxed f64 / bool banks need no drop glue, so (like V8's interpreter
+/// register file living in the native stack frame) they stay inline in the
+/// frame up to this size instead of costing a heap allocation per call.
+const INLINE_UNBOXED_F64: usize = 64;
+const INLINE_UNBOXED_BOOL: usize = 128;
 
 #[derive(Clone, Copy)]
 enum SlotStorage {
@@ -1443,7 +1664,9 @@ enum SlotStorage {
     /// At most [`INLINE_FRAME`] sparse ids, packed into a stack array.
     /// The array is the original ids; the length is how many are live.
     Packed([u32; INLINE_FRAME], u8),
-    Map,
+    /// More sparse ids than fit inline: a sorted static id table plus a
+    /// compact vector (`w3cos_core::SparseSlots`), never a hashed map.
+    Map(&'static [u32]),
 }
 
 fn slot_index(storage: SlotStorage, id: u32) -> usize {
@@ -1452,7 +1675,7 @@ fn slot_index(storage: SlotStorage, id: u32) -> usize {
             .iter()
             .position(|candidate| *candidate == id)
             .expect("packed binding id"),
-        SlotStorage::Dense(_) | SlotStorage::Map => id as usize,
+        SlotStorage::Dense(_) | SlotStorage::Map(_) => id as usize,
     }
 }
 
@@ -1490,12 +1713,27 @@ fn slot_storage(function: &Function) -> SlotStorage {
             }
             SlotStorage::Packed(packed, ids.len() as u8)
         }
-        _ => SlotStorage::Map,
+        _ => SlotStorage::Map(Box::leak(ids.into_boxed_slice())),
     }
 }
 
+fn slot_ids_literal(ids: &[u32]) -> String {
+    let list = ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{list}]")
+}
+
+/// Register files up to this many Values live inline in the frame (V8
+/// Ignition keeps the register file in the interpreter's stack frame), so
+/// small hot functions don't pay a heap allocation per call. 32 Values is
+/// 512 bytes of stack.
+const INLINE_REGISTERS: usize = 32;
+
 fn emit_registers_field(n: u32) -> String {
-    if (n as usize) <= INLINE_FRAME {
+    if (n as usize) <= INLINE_REGISTERS {
         format!("    registers: [w3cos_core::Value; {n}],\n")
     } else {
         "    registers: Vec<w3cos_core::Value>,\n".to_string()
@@ -1503,7 +1741,7 @@ fn emit_registers_field(n: u32) -> String {
 }
 
 fn emit_registers_init(n: u32) -> String {
-    if (n as usize) <= INLINE_FRAME {
+    if (n as usize) <= INLINE_REGISTERS {
         "        registers: std::array::from_fn(|_| w3cos_core::Value::Undefined),\n".to_string()
     } else {
         format!("        registers: vec![w3cos_core::Value::Undefined; {n}],\n")
@@ -1518,8 +1756,8 @@ fn emit_slot_fields(storage: SlotStorage) -> String {
             "    bindings: Vec<Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>>,\n    capture_getters: Vec<Option<w3cos_core::Value>>,\n    capture_setters: Vec<Option<w3cos_core::Value>>,\n"
         )
             .into(),
-        SlotStorage::Map => (
-            "    bindings: std::collections::HashMap<\n        u32,\n        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,\n    >,\n    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,\n    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,\n"
+        SlotStorage::Map(_) => (
+            "    bindings: w3cos_core::SparseSlots<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>,\n    capture_getters: w3cos_core::SparseSlots<w3cos_core::Value>,\n    capture_setters: w3cos_core::SparseSlots<w3cos_core::Value>,\n"
         )
             .into(),
     }
@@ -1536,7 +1774,10 @@ fn emit_bindings_new(storage: SlotStorage) -> String {
         SlotStorage::Dense(len) if len <= INLINE_FRAME => inline_bindings_new(len),
         SlotStorage::Packed(_, len) => inline_bindings_new(len as usize),
         SlotStorage::Dense(len) => format!("    let mut bindings = vec![None; {len}];\n"),
-        SlotStorage::Map => "    let mut bindings = std::collections::HashMap::new();\n".into(),
+        SlotStorage::Map(ids) => format!(
+            "    let mut bindings = w3cos_core::SparseSlots::new(&{});\n",
+            slot_ids_literal(ids)
+        ),
     }
 }
 
@@ -1584,10 +1825,10 @@ fn emit_capture_init(storage: SlotStorage) -> String {
                 "    let mut capture_getters = vec![None; bindings.len()];\n    let mut capture_setters = vec![None; bindings.len()];\n    for (binding, capture) in __captures.iter() {{\n        let index = *binding as usize;\n        match capture {{\n            w3cos_core::AotCapture::Accessors(getter, setter) => {{\n                if let Some(slot) = capture_getters.get_mut(index) {{ *slot = Some(getter.clone()); }}\n                if let Some(slot) = capture_setters.get_mut(index) {{ *slot = Some(setter.clone()); }}\n            }}\n            w3cos_core::AotCapture::Cell(cell) => {{\n                if let Some(slot) = bindings.get_mut(index) {{ *slot = Some(std::rc::Rc::clone(cell)); }}\n            }}\n            {number}\n        }}\n    }}\n"
             )
         }
-        SlotStorage::Map => (
-            "    let mut capture_getters = std::collections::HashMap::new();\n    let mut capture_setters = std::collections::HashMap::new();\n    for (binding, capture) in __captures.iter() {\n        match capture {\n            w3cos_core::AotCapture::Accessors(getter, setter) => {\n                capture_getters.insert(*binding, getter.clone());\n                capture_setters.insert(*binding, setter.clone());\n            }\n            w3cos_core::AotCapture::Cell(cell) => {\n                bindings.insert(*binding, std::rc::Rc::clone(cell));\n            }\n            w3cos_core::AotCapture::Number(cell) => {\n                let __w3cos_number = std::rc::Rc::clone(cell);\n                let __w3cos_number_set = std::rc::Rc::clone(cell);\n                capture_getters.insert(*binding, w3cos_core::Value::function(move |_, _| match __w3cos_number.get() { Some(n) => w3cos_core::Value::Number(n), None => w3cos_core::Value::Undefined }));\n                capture_setters.insert(*binding, w3cos_core::Value::function(move |_, arguments| { let next = arguments.first().map(|value| value.to_number()).unwrap_or(f64::NAN); __w3cos_number_set.set(Some(next)); w3cos_core::Value::Undefined }));\n            }\n        }\n    }\n"
-        )
-            .into(),
+        SlotStorage::Map(ids) => format!(
+            "    let mut capture_getters = w3cos_core::SparseSlots::new(&{ids});\n    let mut capture_setters = w3cos_core::SparseSlots::new(&{ids});\n    for (binding, capture) in __captures.iter() {{\n        match capture {{\n            w3cos_core::AotCapture::Accessors(getter, setter) => {{\n                capture_getters.insert(*binding, getter.clone());\n                capture_setters.insert(*binding, setter.clone());\n            }}\n            w3cos_core::AotCapture::Cell(cell) => {{\n                bindings.insert(*binding, std::rc::Rc::clone(cell));\n            }}\n            w3cos_core::AotCapture::Number(cell) => {{\n                let __w3cos_number = std::rc::Rc::clone(cell);\n                let __w3cos_number_set = std::rc::Rc::clone(cell);\n                capture_getters.insert(*binding, w3cos_core::Value::function(move |_, _| match __w3cos_number.get() {{ Some(n) => w3cos_core::Value::Number(n), None => w3cos_core::Value::Undefined }}));\n                capture_setters.insert(*binding, w3cos_core::Value::function(move |_, arguments| {{ let next = arguments.first().map(|value| value.to_number()).unwrap_or(f64::NAN); __w3cos_number_set.set(Some(next)); w3cos_core::Value::Undefined }}));\n            }}\n        }}\n    }}\n",
+            ids = slot_ids_literal(ids)
+        ),
     }
 }
 
@@ -1597,7 +1838,7 @@ fn emit_binding_assign(storage: SlotStorage, id: u32, value: &str) -> String {
             let index = slot_index(storage, id);
             format!("        bindings[{index}] = Some({value});\n")
         }
-        SlotStorage::Map => format!("        bindings.insert({id}, {value});\n"),
+        SlotStorage::Map(_) => format!("        bindings.insert({id}, {value});\n"),
     }
 }
 
@@ -1607,7 +1848,7 @@ fn emit_capture_get(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_getters.get({index}).and_then(|slot| slot.as_ref())")
         }
-        SlotStorage::Map => format!("self.capture_getters.get(&{id})"),
+        SlotStorage::Map(_) => format!("self.capture_getters.get(&{id})"),
     }
 }
 
@@ -1617,7 +1858,7 @@ fn emit_capture_get_cloned(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_getters.get({index}).and_then(|slot| slot.clone())")
         }
-        SlotStorage::Map => format!("self.capture_getters.get(&{id}).cloned()"),
+        SlotStorage::Map(_) => format!("self.capture_getters.get(&{id}).cloned()"),
     }
 }
 
@@ -1627,7 +1868,7 @@ fn emit_capture_setter_get(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_setters.get({index}).and_then(|slot| slot.as_ref())")
         }
-        SlotStorage::Map => format!("self.capture_setters.get(&{id})"),
+        SlotStorage::Map(_) => format!("self.capture_setters.get(&{id})"),
     }
 }
 
@@ -1637,7 +1878,7 @@ fn emit_capture_setter_get_cloned(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_setters.get({index}).and_then(|slot| slot.clone())")
         }
-        SlotStorage::Map => format!("self.capture_setters.get(&{id}).cloned()"),
+        SlotStorage::Map(_) => format!("self.capture_setters.get(&{id}).cloned()"),
     }
 }
 
@@ -1647,7 +1888,7 @@ fn emit_binding_get(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.bindings.get({index}).and_then(|slot| slot.as_ref())")
         }
-        SlotStorage::Map => format!("self.bindings.get(&{id})"),
+        SlotStorage::Map(_) => format!("self.bindings.get(&{id})"),
     }
 }
 
@@ -1657,7 +1898,7 @@ fn emit_binding_get_cloned(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.bindings.get({index}).and_then(|slot| slot.clone())")
         }
-        SlotStorage::Map => format!("self.bindings.get(&{id}).cloned()"),
+        SlotStorage::Map(_) => format!("self.bindings.get(&{id}).cloned()"),
     }
 }
 
@@ -1669,7 +1910,7 @@ fn emit_binding_store_value(storage: SlotStorage, id: u32, rust_expr: &str) -> S
                 "if let Some(slot) = self.bindings.get_mut({index}) {{ *slot = Some(std::rc::Rc::new(std::cell::RefCell::new({rust_expr}))); }}"
             )
         }
-        SlotStorage::Map => format!(
+        SlotStorage::Map(_) => format!(
             "self.bindings.insert({id}, std::rc::Rc::new(std::cell::RefCell::new({rust_expr})));"
         ),
     }
@@ -1701,6 +1942,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(*dst),
@@ -1729,6 +1971,7 @@ fn read_registers(instruction: &Instruction) -> Vec<u32> {
         | Instruction::LoadBinding { .. }
         | Instruction::RefreshBinding { .. }
         | Instruction::ImportMeta { .. }
+        | Instruction::NewTarget { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::Jump { .. } => Vec::new(),
         Instruction::Move { src, .. } => vec![src.0],
@@ -2032,6 +2275,7 @@ pub fn generate_generator_from_module(
     function: &Function,
     rust_name: &str,
 ) -> Result<String> {
+    let _closure_meta = note_closure_meta(module);
     let mut factories = HashMap::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -2043,6 +2287,48 @@ pub fn generate_generator_from_module(
         &mut emitted,
         &mut visiting,
     )
+}
+
+thread_local! {
+    /// Own name/length of every closure of the module being emitted (set by
+    /// each public module-level emission entry).
+    static CLOSURE_META: std::cell::RefCell<((), HashMap<FunctionId, (String, u32)>)> =
+        std::cell::RefCell::new(((), HashMap::new()));
+}
+
+struct ClosureMetaScope(HashMap<FunctionId, (String, u32)>);
+
+impl Drop for ClosureMetaScope {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        CLOSURE_META.with(|meta| meta.borrow_mut().1 = previous);
+    }
+}
+
+#[must_use]
+fn note_closure_meta(module: &Module) -> ClosureMetaScope {
+    let table = module
+        .functions
+        .iter()
+        .filter_map(|function| Some((function.id, function.own_name_length.clone()?)))
+        .collect();
+    ClosureMetaScope(CLOSURE_META.with(|meta| std::mem::replace(&mut meta.borrow_mut().1, table)))
+}
+
+/// `; set_name_and_length(..)` for a closure stored in `self.registers[dst]`
+/// (SetFunctionName + SetFunctionLength in InstantiateOrdinaryFunctionExpression).
+fn emit_closure_name_and_length(nested: FunctionId, dst: usize) -> String {
+    CLOSURE_META.with(|meta| {
+        meta.borrow()
+            .1
+            .get(&nested)
+            .map(|(name, length)| {
+                format!(
+                    " if let Some(__w3cos_f) = self.registers[{dst}].as_function() {{ __w3cos_f.set_name_and_length({name:?}, {length}); }}"
+                )
+            })
+            .unwrap_or_default()
+    })
 }
 
 fn generate_function_tree(
@@ -2141,6 +2427,7 @@ pub fn generate_async_function_from_module(
     if function.is_generator || !function.is_async {
         bail!("async W3IR AOT emission requires a non-generator async function");
     }
+    let _closure_meta = note_closure_meta(module);
     let mut factories = HashMap::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -2165,6 +2452,7 @@ pub fn generate_sync_function_from_module(
     if function.is_generator || function.is_async {
         bail!("sync W3IR AOT emission requires a non-async ordinary function");
     }
+    let _closure_meta = note_closure_meta(module);
     let mut factories = HashMap::new();
     let mut emitted = HashSet::new();
     let mut visiting = HashSet::new();
@@ -2178,18 +2466,65 @@ pub fn generate_sync_function_from_module(
     )
 }
 
+thread_local! {
+    /// Rust name of the sync factory being emitted; `new.target` compares it
+    /// with the code entry [[Construct]] recorded.
+    static CURRENT_AOT_FACTORY: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
 fn generate_sync_function_with_factories(
     function: &Function,
     rust_name: &str,
     factories: &HashMap<FunctionId, String>,
     module_specifier: Option<&str>,
 ) -> Result<String> {
+    struct RestoreFactory(String);
+    impl Drop for RestoreFactory {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            CURRENT_AOT_FACTORY.with(|name| *name.borrow_mut() = previous);
+        }
+    }
+    let _restore_factory = RestoreFactory(
+        CURRENT_AOT_FACTORY
+            .with(|name| std::mem::replace(&mut *name.borrow_mut(), rust_name.to_string())),
+    );
+    let promoted = generate_sync_function_with_factories_inner(
+        function,
+        rust_name,
+        factories,
+        module_specifier,
+    );
+    if let Ok((code, false)) = promoted {
+        return Ok(code);
+    }
+    let previous = VALUE_BINDING_PROMOTION.with(|flag| flag.replace(false));
+    let fallback = generate_sync_function_with_factories_inner(
+        function,
+        rust_name,
+        factories,
+        module_specifier,
+    );
+    VALUE_BINDING_PROMOTION.with(|flag| flag.set(previous));
+    fallback.map(|(code, _)| code)
+}
+
+/// Returns the code and whether a promoted binding leaked into a generic
+/// cell access (the caller then regenerates without promotion).
+fn generate_sync_function_with_factories_inner(
+    function: &Function,
+    rust_name: &str,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+) -> Result<(String, bool)> {
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let shared = shared_numeric_ids(function);
     SHARED_NUMBERS.with(|numbers| *numbers.borrow_mut() = shared.clone());
     let _shared_guard = SharedNumberGuard;
-    let plan = analyze_function(function);
+    let mut plan = analyze_function(function);
+    promote_value_bindings(function, &mut plan, &shared);
     let back_edges = analyze_and_warn(function, module_specifier);
     let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
@@ -2276,6 +2611,18 @@ fn generate_sync_function_with_factories(
     let skip_unread_this = function
         .this_binding
         .is_some_and(|binding| !binding_is_used(function, binding.0));
+    let mut val_initializers = String::new();
+    if plan.n_val_bindings > 0 {
+        val_initializers.push_str(&format!(
+            "    let mut val_bindings: [Option<w3cos_core::Value>; {}] = std::array::from_fn(|_| None);\n",
+            plan.n_val_bindings
+        ));
+    }
+    let parameter_ids = function
+        .parameters
+        .iter()
+        .map(|binding| binding.0)
+        .collect::<HashSet<_>>();
     for binding in &function.bindings {
         if num_binding_slot(&plan, binding.id.0).is_some() || shared.contains(&binding.id.0) {
             continue;
@@ -2287,6 +2634,14 @@ fn generate_sync_function_with_factories(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
         );
+        if let Some(slot) = val_binding_slot(&plan, binding.id.0) {
+            if initialized && !parameter_ids.contains(&binding.id.0) {
+                val_initializers.push_str(&format!(
+                    "    val_bindings[{slot}] = Some(w3cos_core::Value::Undefined);\n"
+                ));
+            }
+            continue;
+        }
         binding_initializers.push_str(&emit_binding_assign(
             storage,
             binding.id.0,
@@ -2296,7 +2651,22 @@ fn generate_sync_function_with_factories(
         ));
     }
     let mut parameter_initializers = String::new();
+    let mut number_parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
+        if let Some(slot) = num_binding_slot(&plan, binding.0) {
+            // Only reachable in a Number-parameter entry: the caller passes
+            // exactly `parameters.len()` Number values.
+            number_parameter_initializers.push_str(&format!(
+                "    __w3cos_frame.num_bindings[{slot}] = __args.get({index}).map_or(f64::NAN, |value| value.to_number());\n"
+            ));
+            continue;
+        }
+        if let Some(slot) = val_binding_slot(&plan, binding.0) {
+            val_initializers.push_str(&format!(
+                "    val_bindings[{slot}] = Some(__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined));\n"
+            ));
+            continue;
+        }
         parameter_initializers.push_str(&emit_binding_assign(
             storage,
             binding.0,
@@ -2334,7 +2704,7 @@ fn generate_sync_function_with_factories(
     let (num_cells_field, num_cells_local, num_cells_init) = emit_num_cells(&shared);
     let fast_prefix = emit_number_bump_prefix(function);
 
-    Ok(format!(
+    let code = format!(
         r#"
 struct {type_name} {{
 {registers_field}
@@ -2347,23 +2717,50 @@ impl {type_name} {{
     }}
 }}
 
-pub fn {rust_name}(
+/// Completion-returning entry: a JS `throw` comes back as `Err` instead of
+/// unwinding, so known-target callers propagate it without a landing pad.
+#[allow(dead_code)]
+pub fn {rust_name}__result(
     __this: w3cos_core::Value,
     __args: &[w3cos_core::Value],
     __captures: &w3cos_core::AotCaptureMap,
-) -> w3cos_core::Value {{
-{fast_prefix}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    {type_name} {{
+) -> Result<w3cos_core::Value, w3cos_core::Value> {{
+    w3cos_core::intrinsics::check_stack()?;
+{fast_prefix_result}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{val_initializers}{slot_capture_init}    #[allow(unused_mut)]
+    let mut __w3cos_frame = {type_name} {{
 {registers_init}
 {num_init}        bindings,
         capture_getters,
         capture_setters,
 {num_cells_init}{block_initializer}
-    }}.run().unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
+    }};
+{number_parameter_initializers}    __w3cos_frame.run()
+}}
+
+pub fn {rust_name}(
+    __this: w3cos_core::Value,
+    __args: &[w3cos_core::Value],
+    __captures: &w3cos_core::AotCaptureMap,
+) -> w3cos_core::Value {{
+    {rust_name}__result(__this, __args, __captures).unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
 }}
 "#,
+        fast_prefix_result = fast_prefix.replace(
+            "return w3cos_core::Value::Undefined;",
+            "return Ok(w3cos_core::Value::Undefined);"
+        ),
         registers_field = emit_registers_field(plan.n_val),
         registers_init = emit_registers_init(plan.n_val),
-    ))
+    );
+    let leaked = promoted_binding_leaks(&code, &plan, storage);
+    if std::env::var_os("W3COS_AOT_PROMOTE_DEBUG").is_some() {
+        eprintln!(
+            "[promote] {rust_name}: {} slots, leaked {leaked}, ids {:?}",
+            plan.n_val_bindings,
+            plan.val_binding_of.keys().collect::<Vec<_>>()
+        );
+    }
+    Ok((code, leaked))
 }
 
 fn generate_async_function_with_factories(
@@ -3706,6 +4103,7 @@ fn emit_block_instructions(
     let live_in = analyze_live_in(function);
     let last_uses = last_uses_in_sequence(instructions, function, exception_target, &live_in);
     let dead_strings = dead_string_loads(instructions, function, exception_target, &live_in);
+    resolve_direct_call_sites(instructions);
     let emitted = instructions
         .iter()
         .enumerate()
@@ -6253,6 +6651,91 @@ fn emit_capture_pair_store(capture_id: u32, weaken: bool) -> String {
     )
 }
 
+thread_local! {
+    /// Module-entry binding id -> bundled Rust name of a never-reassigned,
+    /// ordinary synchronous function declaration of the module being
+    /// emitted. Installed by the ESM code generator around one symbol's
+    /// emission; empty means every call stays dynamic.
+    static DIRECT_CALL_TARGETS: std::cell::RefCell<HashMap<u32, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Run `f` with `targets` as the known direct-call targets, restoring the
+/// previous set afterwards (also on error).
+pub(crate) fn with_direct_call_targets<T>(
+    targets: HashMap<u32, String>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<HashMap<u32, String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                DIRECT_CALL_TARGETS.with(|slot| *slot.borrow_mut() = previous);
+                DIRECT_CALL_SITES.with(|slot| *slot.borrow_mut() = (0, HashMap::new()));
+            }
+        }
+    }
+    let previous =
+        DIRECT_CALL_TARGETS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), targets));
+    // Function addresses can be reused across emissions; drop resolved sites.
+    DIRECT_CALL_SITES.with(|slot| *slot.borrow_mut() = (0, HashMap::new()));
+    let _restore = Restore(Some(previous));
+    f()
+}
+
+thread_local! {
+    /// Per emitted function: `Call` instruction address -> direct target.
+    static DIRECT_CALL_SITES: std::cell::RefCell<(usize, HashMap<usize, String>)> =
+        std::cell::RefCell::new((0, HashMap::new()));
+}
+
+/// The direct target for a `Call` whose callee register is defined, in the
+/// same block and before the call with no intervening redefinition, by a
+/// `LoadBinding` of a known constant function binding. Any other shape (a
+/// register flowing in from another block, a callee read from a property, a
+/// binding not proven constant) stays a dynamic call. Sites are resolved
+/// once per function in a single block-local pass.
+fn direct_call_target(_function: &Function, instruction: &Instruction) -> Option<String> {
+    DIRECT_CALL_SITES.with(|sites| {
+        sites
+            .borrow()
+            .1
+            .get(&(instruction as *const Instruction as usize))
+            .cloned()
+    })
+}
+
+/// Resolve the direct-call sites of one emitted instruction sequence (a
+/// straight-line block body). Called before the sequence is emitted so the
+/// lookup in `direct_call_target` is keyed by the exact instructions emitted.
+fn resolve_direct_call_sites(instructions: &[Instruction]) {
+    let sites = DIRECT_CALL_TARGETS.with(|targets| {
+        let targets = targets.borrow();
+        let mut sites = HashMap::new();
+        if targets.is_empty() {
+            return sites;
+        }
+        // Register -> binding loaded into it and not overwritten since.
+        let mut loaded: HashMap<u32, u32> = HashMap::new();
+        for candidate in instructions {
+            if let Instruction::Call { callee, .. } = candidate
+                && let Some(binding) = loaded.get(&callee.0)
+                && let Some(target) = targets.get(binding)
+            {
+                sites.insert(candidate as *const Instruction as usize, target.clone());
+            }
+            if let Some(written) = written_register(candidate) {
+                loaded.remove(&written.0);
+            }
+            if let Instruction::LoadBinding { dst, binding } = candidate {
+                loaded.insert(dst.0, binding.0);
+            }
+        }
+        sites
+    });
+    DIRECT_CALL_SITES.with(|slot| *slot.borrow_mut() = (instructions.as_ptr() as usize, sites));
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -6339,6 +6822,16 @@ fn emit_instruction(
             emit_shared_number_load(plan, dst.0, binding.0)
         }
         Instruction::LoadBinding { dst, binding }
+            if val_binding_slot(plan, binding.0).is_some() =>
+        {
+            let slot = val_binding_slot(plan, binding.0).unwrap();
+            let propagate = emit_exception_propagation(exception_target, mode, plan);
+            format!(
+                "match &self.val_bindings[{slot}] {{ Some(__w3cos_value) => {{ self.registers[{}] = __w3cos_value.clone(); }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}",
+                register(*dst)
+            )
+        }
+        Instruction::LoadBinding { dst, binding }
             if num_binding_slot(plan, binding.0).is_some() =>
         {
             emit_numeric_binding_load(plan, dst.0, num_binding_slot(plan, binding.0).unwrap())
@@ -6369,6 +6862,15 @@ fn emit_instruction(
             emit_shared_number_store(plan, binding.0, value.0)
         }
         Instruction::InitializeBinding { binding, value }
+            if val_binding_slot(plan, binding.0).is_some() =>
+        {
+            format!(
+                "self.val_bindings[{}] = Some({});",
+                val_binding_slot(plan, binding.0).unwrap(),
+                emit_boxed_value(plan, value.0)
+            )
+        }
+        Instruction::InitializeBinding { binding, value }
             if num_binding_slot(plan, binding.0).is_some() =>
         {
             emit_numeric_binding_store(plan, binding.0, value.0)
@@ -6385,6 +6887,16 @@ fn emit_instruction(
         ),
         Instruction::StoreBinding { binding, value } if is_shared_number(binding.0) => {
             emit_shared_number_store(plan, binding.0, value.0)
+        }
+        Instruction::StoreBinding { binding, value }
+            if val_binding_slot(plan, binding.0).is_some() =>
+        {
+            let slot = val_binding_slot(plan, binding.0).unwrap();
+            let propagate = emit_exception_propagation(exception_target, mode, plan);
+            format!(
+                "let __w3cos_stored = {}; match &mut self.val_bindings[{slot}] {{ Some(__w3cos_slot) => {{ *__w3cos_slot = __w3cos_stored; }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}",
+                emit_boxed_value(plan, value.0)
+            )
         }
         Instruction::StoreBinding { binding, value }
             if num_binding_slot(plan, binding.0).is_some() =>
@@ -6409,7 +6921,10 @@ fn emit_instruction(
                 )
             }
         }
-        Instruction::RefreshBinding { binding } if num_binding_slot(plan, binding.0).is_some() => {
+        Instruction::RefreshBinding { binding }
+            if num_binding_slot(plan, binding.0).is_some()
+                || val_binding_slot(plan, binding.0).is_some() =>
+        {
             String::new()
         }
         Instruction::RefreshBinding { binding } => format!(
@@ -6743,8 +7258,9 @@ fn emit_instruction(
                 )
             } else {
                 format!(
-                    "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);",
-                    register(*dst)
+                    "let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} self.registers[{}] = w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures);{}",
+                    register(*dst),
+                    emit_closure_name_and_length(*nested, register(*dst) as usize)
                 )
             }
         }
@@ -6771,12 +7287,66 @@ fn emit_instruction(
             callee,
             this_value,
             arguments,
+        } if direct_call_target(function, instruction).is_some() => {
+            let target = direct_call_target(function, instruction).expect("checked");
+            // `name#arity`: the target also has a Number-parameter entry.
+            let (target, number_arity) = match target.split_once('#') {
+                Some((name, arity)) => (name.to_string(), arity.parse::<usize>().ok()),
+                None => (target, None),
+            };
+            let entry = if number_arity == Some(arguments.len())
+                && arguments
+                    .iter()
+                    .all(|argument| num_slot(plan, argument.0).is_some())
+            {
+                "call_num"
+            } else {
+                "call_result"
+            };
+            // Known-target call (TurboFan JSCallReducer on a constant
+            // function): the callee register was just loaded from a
+            // never-reassigned module function declaration, so call its
+            // native entry directly instead of dispatching through the
+            // function Value. `this`, the argument slice (arity and the
+            // `arguments` object are built by the callee factory exactly as
+            // for a dynamic call) and the exception completion are unchanged.
+            let mut reads = vec![this_value.0];
+            reads.extend(arguments.iter().map(|argument| argument.0));
+            let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+            let call = format!(
+                "{target}_{entry}({}, &[{}])",
+                uses.emit(this_value.0),
+                emit_arguments_from(&mut uses, arguments)
+            );
+            // The callee hands a JS throw back as `Err`. Outside a try region
+            // of a synchronous frame, a host exception unwinding out of the
+            // callee leaves this frame exactly like one raised by this frame's
+            // own statements, so no landing pad is needed; inside one, it must
+            // still be caught here.
+            let expr = if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
+                call
+            } else {
+                format!("w3cos_core::catch_js_result(|| {call})")
+            };
+            emit_completion_match(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                mode,
+                plan,
+            )
+        }
+        Instruction::Call {
+            dst,
+            callee,
+            this_value,
+            arguments,
         } => {
             let mut reads = vec![callee.0, this_value.0];
             reads.extend(arguments.iter().map(|argument| argument.0));
             let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
             let expr = format!(
-                "w3cos_core::intrinsics::call_completion(&{}, {}, vec![{}])",
+                "w3cos_core::intrinsics::call_completion_slice(&{}, {}, &[{}])",
                 uses.emit(callee.0),
                 uses.emit(this_value.0),
                 emit_arguments_from(&mut uses, arguments)
@@ -6935,6 +7505,13 @@ fn emit_instruction(
                 "self.registers[{}] = w3cos_core::host_modules::dynamic_import({}, w3cos_core::Value::string({referrer:?}));",
                 register(*dst),
                 emit_boxed_value(plan, specifier.0)
+            )
+        }
+        Instruction::NewTarget { dst } => {
+            let factory = CURRENT_AOT_FACTORY.with(|name| name.borrow().clone());
+            format!(
+                "self.registers[{}] = w3cos_core::class::take_new_target({factory} as usize);",
+                register(*dst)
             )
         }
         Instruction::ImportMeta { dst } => {
@@ -8119,6 +8696,7 @@ fn main() {{
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         };
 
@@ -8599,10 +9177,10 @@ fn main() {{
                     "dense 0..n BindingIds should index a compact slot array: {add_generated}"
                 );
             }
-            SlotStorage::Map => {
+            SlotStorage::Map(_) => {
                 assert!(
-                    add_generated.contains("std::collections::HashMap::new()"),
-                    "non-dense add should keep HashMap slots: {add_generated}"
+                    add_generated.contains("w3cos_core::SparseSlots::new(&["),
+                    "non-dense add should index a sorted static id table: {add_generated}"
                 );
             }
             SlotStorage::Packed(_, _) => {
@@ -8620,10 +9198,10 @@ fn main() {{
                     "unexpected dense inner captures: {inner_generated}"
                 );
             }
-            SlotStorage::Map => {
+            SlotStorage::Map(_) => {
                 assert!(
-                    inner_generated.contains("std::collections::HashMap<"),
-                    "large sparse captured BindingIds must keep HashMap slots: {inner_generated}"
+                    inner_generated.contains("w3cos_core::SparseSlots<"),
+                    "large sparse captured BindingIds must use compact sparse slots: {inner_generated}"
                 );
                 assert!(
                     !inner_generated.contains("vec![None;"),
@@ -8769,6 +9347,38 @@ fn main() {{
             );
         }
         assert!(!generated.contains("w3cos_vm"));
+    }
+
+    #[test]
+    fn non_escaping_locals_use_value_slots_not_shared_cells() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                function pick(word) {
+                    let label = "w:" + word;
+                    let kept = word;
+                    const read = function () { return kept; };
+                    return label + read();
+                }
+                pick;
+            "#,
+            "app:///value-slots.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("pick"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "pick_aot").unwrap();
+        assert!(
+            generated.contains("val_bindings: [Option<w3cos_core::Value>;"),
+            "non-escaping locals should live in plain Value slots: {generated}"
+        );
+        assert!(
+            generated.contains("AotCapture::Cell") || generated.contains("RefCell"),
+            "the captured local must keep a shared cell: {generated}"
+        );
     }
 
     #[test]
@@ -9574,6 +10184,7 @@ fn main() {{
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         }
     }
@@ -9647,6 +10258,8 @@ fn main() {{
                 "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
             ) || generated.contains(
                 "vec![std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined),"
+            ) || generated.contains(
+                "&[std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined)]"
             ),
             "last-use Call argument must be taken, not cloned: {generated}"
         );
@@ -9769,6 +10382,7 @@ fn main() {{
         let generated = emit_slice(&function);
         assert!(
             generated.contains("call_completion(&self.registers[0].clone()")
+                || generated.contains("call_completion_slice(&self.registers[0]")
                 || generated.contains("call(&self.registers[0].clone()")
                 || generated.contains("call_completion(&self.registers[0]")
                 || generated.contains("call(&self.registers[0]"),
@@ -9784,6 +10398,9 @@ fn main() {{
             )
                 && !generated.contains(
                     "call_completion(&std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
+                )
+                && !generated.contains(
+                    "call_completion_slice(&std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)"
                 ),
             "must not take a callee that is returned later: {generated}"
         );

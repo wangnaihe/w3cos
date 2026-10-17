@@ -3760,6 +3760,135 @@ mod tests {
     }
 
     #[test]
+    fn test_structural_selectors_with_shared_matched_properties() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("height", "4px")]);
+        crate::stylesheet::register_rule(".cell:nth-child(2n)", &[("height", "9px")]);
+
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let mut cells = Vec::new();
+        for _ in 0..4 {
+            let cell = doc.create_element("div");
+            cell.set_class_name(&mut doc, "cell");
+            parent.append_child(&mut doc, cell);
+            cells.push(cell);
+        }
+        let heights = cells
+            .iter()
+            .map(|cell| doc.computed_style_for(cell.id).height)
+            .collect::<Vec<_>>();
+        use w3cos_std::style::Dimension::Px;
+        assert_eq!(heights, vec![Px(4.0), Px(9.0), Px(4.0), Px(9.0)]);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_child_list_log_replays_to_live_children() {
+        use crate::document::{ChildListChange, replay_child_changes_since, structure_tick};
+        let mut doc = Document::new();
+        let list = doc.create_element("ul");
+        doc.body().append_child(&mut doc, list);
+        let mut items = Vec::new();
+        for _ in 0..4 {
+            let item = doc.create_element("li");
+            list.append_child(&mut doc, item);
+            items.push(item);
+        }
+        let live = |doc: &Document| {
+            doc.children_ids(list.id)
+                .iter()
+                .map(|id| id.as_u32())
+                .collect::<Vec<_>>()
+        };
+        let mut cached = live(&doc);
+        let since = structure_tick();
+        let fresh = doc.create_element("li");
+        doc.insert_before(list.id, fresh.id, items[2].id);
+        doc.remove_child(list.id, items[0].id);
+        doc.insert_before(list.id, items[3].id, items[1].id);
+        let (serial, parent) = (doc.serial(), list.id.as_u32());
+        assert!(replay_child_changes_since(
+            since,
+            64,
+            |change| match change {
+                ChildListChange::Insert {
+                    doc: d,
+                    parent: p,
+                    child,
+                    before,
+                } if d == serial && p == parent => {
+                    let at = if before == 0 {
+                        cached.len()
+                    } else {
+                        cached.iter().position(|&id| id == before).unwrap()
+                    };
+                    cached.insert(at, child);
+                }
+                ChildListChange::Remove {
+                    doc: d,
+                    parent: p,
+                    child,
+                } if d == serial && p == parent => {
+                    let at = cached.iter().position(|&id| id == child).unwrap();
+                    cached.remove(at);
+                }
+                _ => {}
+            }
+        ));
+        assert_eq!(cached, live(&doc));
+    }
+
+    #[test]
+    fn test_text_runs_share_matched_properties_by_parent_style() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".a", &[("color", "#123456")]);
+        crate::stylesheet::register_rule(".b", &[("color", "#654321")]);
+
+        let mut doc = Document::new();
+        let mut texts = Vec::new();
+        for class in ["a", "a", "b"] {
+            let p = doc.create_element("p");
+            p.set_class_name(&mut doc, class);
+            doc.body().append_child(&mut doc, p);
+            let text = doc.create_text_node("run");
+            p.append_child(&mut doc, text);
+            texts.push((p, text));
+        }
+        let styles = texts
+            .iter()
+            .map(|(p, text)| {
+                let parent = doc.computed_style_shared(p.id, None);
+                doc.computed_style_shared(text.id, Some(&parent))
+            })
+            .collect::<Vec<_>>();
+        // Equal parent styles share one text style (Blink LayoutText reuses
+        // its parent's ComputedStyle); a different parent does not.
+        assert!(std::rc::Rc::ptr_eq(&styles[0], &styles[1]));
+        assert!(!std::rc::Rc::ptr_eq(&styles[0], &styles[2]));
+        assert_eq!(styles[0].color, w3cos_std::Color::from_hex("#123456"));
+        assert_eq!(styles[2].color, w3cos_std::Color::from_hex("#654321"));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn test_color_from_custom_property_is_declared_not_inherited() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(":root", &[("--c", "rgb(10, 20, 30)")]);
+        crate::stylesheet::register_rule(".cell", &[("color", "var(--c)")]);
+
+        let mut doc = Document::new();
+        let cell = doc.create_element("div");
+        cell.set_class_name(&mut doc, "cell");
+        doc.body().append_child(&mut doc, cell);
+
+        let style = doc.computed_style_for(cell.id);
+        assert_eq!(style.color, w3cos_std::Color::rgb(10, 20, 30));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_current_color_background_uses_inherited_text_color() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".status", &[("color", "#1677ff")]);

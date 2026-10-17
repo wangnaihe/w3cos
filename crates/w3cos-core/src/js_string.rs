@@ -76,6 +76,11 @@ impl JsString {
         Self(Repr::Heap(Rc::new(s.as_ref().to_string())))
     }
 
+    /// [`Self::heap`] without copying an already-owned buffer.
+    pub fn heap_owned(s: String) -> Self {
+        Self(Repr::Heap(Rc::new(s)))
+    }
+
     pub fn as_str(&self) -> &str {
         match &self.0 {
             Repr::Interned(interned) => page_arena::str_at(interned.handle, interned.epoch),

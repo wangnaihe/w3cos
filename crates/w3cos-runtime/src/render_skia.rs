@@ -6863,7 +6863,7 @@ mod tests {
             font_size: 16.0,
             color: w3cos_std::Color::rgb(0, 128, 0),
             color_rgba: Some([0.0, 0.5, 0.0, 1.0]),
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-html-standard-font".into(),
                 "1".into(),
             )])),
@@ -7119,7 +7119,7 @@ mod tests {
                     font_size: 32.0,
                     line_height,
                     line_height_is_normal: false,
-                    custom_properties: Some(std::collections::HashMap::from([
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
                         ("--w3cos-internal-html-standard-font".into(), "1".into()),
                         ("--w3cos-internal-outside-list-marker".into(), kind.into()),
                     ])),
@@ -9334,7 +9334,7 @@ mod tests {
             font_size: 16.0,
             ..Style::default()
         };
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.to_string(),
             "1".to_string(),
         )]));
@@ -10373,7 +10373,7 @@ mod tests {
                 line_height_is_normal: false,
                 background: w3cos_std::Color::rgb(255, 0, 0),
                 color: w3cos_std::Color::rgb(0, 128, 0),
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-background-group".into(),
                     "first-line".into(),
                 )])),
@@ -11610,7 +11610,7 @@ mod tests {
             background: w3cos_std::Color::rgb(0, 0, 255),
             font_family: Some("serif".into()),
             font_size: 16.0,
-            custom_properties: Some(HashMap::from([
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
                 ("--w3cos-internal-split-inline-fragment".into(), "1".into()),
                 ("--w3cos-internal-split-inline-edge".into(), "1".into()),
             ])),
@@ -14063,7 +14063,7 @@ mod tests {
         const FAMILY: &str = "W3COS Strut Space Subset";
         let fallback_style = Style {
             font_size: 100.0,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-html-standard-font".into(),
                 "1".into(),
             )])),

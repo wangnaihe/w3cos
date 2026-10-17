@@ -47,6 +47,8 @@ pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
             builder.predeclare_lexical_binding(statement)?;
         }
     }
+    builder.superseded_function_declarations =
+        superseded_function_declarations(module_function_declarations(&parsed.body));
     for item in &parsed.body {
         if let ModuleItem::Stmt(statement) = item {
             builder.initialize_function_declaration(statement)?;
@@ -69,6 +71,54 @@ pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
 /// entry. Unresolved identifiers become `w3cos:global` imports so native ESM
 /// codegen can adapt them to its existing live module cells. This lets the
 /// incremental ESM pipeline reuse W3IR without printing and reparsing SWC AST.
+/// Spans of function declarations that a later same-named declaration in the
+/// same statement list supersedes (FunctionDeclarationInstantiation step 36:
+/// "the last declaration of that name is initialized").
+fn superseded_function_declarations<'a>(
+    declarations: impl Iterator<Item = &'a swc_ecma_ast::FnDecl>,
+) -> HashSet<swc_common::BytePos> {
+    let mut last = HashMap::<String, swc_common::BytePos>::new();
+    let mut superseded = HashSet::new();
+    for declaration in declarations {
+        if declaration.declare {
+            continue;
+        }
+        if let Some(previous) = last.insert(
+            declaration.ident.sym.to_string(),
+            declaration.function.span.lo,
+        ) {
+            superseded.insert(previous);
+        }
+    }
+    superseded
+}
+
+fn statement_function_declarations(
+    statements: &[Stmt],
+) -> impl Iterator<Item = &swc_ecma_ast::FnDecl> {
+    statements.iter().filter_map(|statement| match statement {
+        Stmt::Decl(Decl::Fn(declaration)) => Some(declaration),
+        _ => None,
+    })
+}
+
+fn module_function_declarations(
+    items: &[ModuleItem],
+) -> impl Iterator<Item = &swc_ecma_ast::FnDecl> {
+    items.iter().filter_map(|item| match item {
+        ModuleItem::Stmt(Stmt::Decl(Decl::Fn(declaration))) => Some(declaration),
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+            Decl::Fn(declaration) => Some(declaration),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Hidden lexical binding through which arrows read the enclosing ordinary
+/// function's new.target.
+const NEW_TARGET_BINDING: &str = "*new.target*";
+
 pub(crate) fn lower_module_statements(
     statements: &[Stmt],
     specifier: &str,
@@ -87,6 +137,8 @@ pub(crate) fn lower_module_statements(
     for statement in statements {
         builder.predeclare_lexical_binding(statement)?;
     }
+    builder.superseded_function_declarations =
+        superseded_function_declarations(statement_function_declarations(statements));
     for statement in statements {
         builder.initialize_function_declaration(statement)?;
     }
@@ -247,6 +299,8 @@ pub fn lower_module(source: &str, specifier: &str) -> Result<Module> {
         }
     }
 
+    builder.superseded_function_declarations =
+        superseded_function_declarations(module_function_declarations(&parsed.body));
     for item in &parsed.body {
         match item {
             ModuleItem::Stmt(statement) => {
@@ -458,6 +512,7 @@ fn finish_module(mut builder: Builder, specifier: &str, name: &str) -> Result<Mo
         generator_suspension_points: builder.generator_suspension_points,
         is_async: builder.is_async,
         is_generator: builder.is_generator,
+        own_name_length: None,
         source_span: None,
     }];
     functions.extend(builder.functions);
@@ -774,6 +829,22 @@ struct Builder {
     suspension_points: Vec<SuspensionPoint>,
     generator_suspension_points: Vec<GeneratorSuspensionPoint>,
     terminated: bool,
+    /// Ordinary (non-arrow, non-class-member) function: `new.target` is its
+    /// [[Construct]] new target.
+    allows_new_target: bool,
+    /// Function declarations whose binding is re-initialized by a later
+    /// declaration of the same name in the same scope (ECMA-262
+    /// FunctionDeclarationInstantiation keeps only the last one).
+    superseded_function_declarations: HashSet<swc_common::BytePos>,
+    /// Register holding `new.target`, read once at function entry.
+    new_target: Option<Register>,
+    /// `new.target` is statically undefined here: class methods/accessors/
+    /// field initializers and async/generator bodies are never
+    /// [[Construct]]ed, and arrows inherit that from their scope.
+    new_target_undefined: bool,
+    /// NamedEvaluation name for the anonymous function/arrow about to be
+    /// lowered (`x = function () {}`, `{ x: () => 0 }`).
+    pending_function_name: Option<String>,
 }
 
 impl Builder {
@@ -824,6 +895,11 @@ impl Builder {
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
+            allows_new_target: false,
+            superseded_function_declarations: HashSet::new(),
+            new_target: None,
+            new_target_undefined: false,
+            pending_function_name: None,
         }
     }
 
@@ -878,6 +954,11 @@ impl Builder {
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
+            allows_new_target: false,
+            superseded_function_declarations: HashSet::new(),
+            new_target: None,
+            new_target_undefined: false,
+            pending_function_name: None,
         }
     }
 
@@ -1054,6 +1135,52 @@ impl Builder {
         let block = BlockId(self.next_block);
         self.next_block += 1;
         block
+    }
+
+    /// The function's `new.target`, read by a `NewTarget` instruction placed
+    /// first in the entry block so it runs before parameter initializers or
+    /// any call can start another [[Construct]].
+    fn new_target_register(&mut self) -> Result<Register> {
+        if let Some(register) = self.new_target {
+            return Ok(register);
+        }
+        let dst = self.register();
+        let instruction = Instruction::NewTarget { dst };
+        if let Some(block) = self.blocks.iter_mut().find(|block| block.id == BlockId(0)) {
+            block.instructions.insert(0, instruction);
+        } else if self.current_block == BlockId(0) {
+            self.instructions.insert(0, instruction);
+        } else {
+            return Err(anyhow!(
+                "runtime W3IR new.target: entry block is unavailable"
+            ));
+        }
+        self.new_target = Some(dst);
+        Ok(dst)
+    }
+
+    /// Declares the hidden `*new.target*` binding with a reserved id and
+    /// initializes it right after the entry `NewTarget` read.
+    fn materialize_new_target_binding(&mut self, binding: BindingId) -> Result<()> {
+        let value = self.new_target_register()?;
+        self.scopes[0].insert(NEW_TARGET_BINDING.to_string(), binding);
+        self.bindings.push(Binding {
+            id: binding,
+            name: NEW_TARGET_BINDING.to_string(),
+            kind: BindingKind::Const,
+            mutable: false,
+        });
+        let instruction = Instruction::InitializeBinding { binding, value };
+        if let Some(block) = self.blocks.iter_mut().find(|block| block.id == BlockId(0)) {
+            block.instructions.insert(1, instruction);
+        } else if self.current_block == BlockId(0) {
+            self.instructions.insert(1, instruction);
+        } else {
+            return Err(anyhow!(
+                "runtime W3IR new.target: entry block is unavailable"
+            ));
+        }
+        Ok(())
     }
 
     fn seal_current_block(&mut self) {
@@ -1438,7 +1565,11 @@ impl Builder {
         let Stmt::Decl(Decl::Fn(declaration)) = statement else {
             return Ok(());
         };
-        if declaration.declare {
+        if declaration.declare
+            || self
+                .superseded_function_declarations
+                .contains(&declaration.function.span.lo)
+        {
             return Ok(());
         }
         let name = declaration.ident.sym.to_string();
@@ -2090,6 +2221,11 @@ impl Builder {
                                         function.function.body.as_ref().ok_or_else(|| {
                                             anyhow!("runtime function expression has no body")
                                         })?;
+                                    // A named function expression keeps its own name.
+                                    self.pending_function_name = function
+                                        .ident
+                                        .as_ref()
+                                        .map(|identifier| identifier.sym.to_string());
                                     self.lower_nested_function(
                                         parameters,
                                         &body.stmts,
@@ -3502,13 +3638,43 @@ impl Builder {
         }
     }
 
+    /// ECMA-262 NamedEvaluation: an anonymous function definition takes the
+    /// name of the binding or property it is assigned to.
+    fn lower_named_evaluation(
+        &mut self,
+        expression: &Expr,
+        name: Option<String>,
+    ) -> Result<Register> {
+        let mut inner = expression;
+        while let Expr::Paren(paren) = inner {
+            inner = &paren.expr;
+        }
+        let anonymous = match inner {
+            Expr::Fn(function) => function.ident.is_none(),
+            Expr::Arrow(_) => true,
+            _ => false,
+        };
+        if anonymous && name.is_some() {
+            self.pending_function_name = name;
+        }
+        let value = self.lower_expression(expression);
+        self.pending_function_name = None;
+        value
+    }
+
     fn lower_simple_assignment(
         &mut self,
         assignment: &swc_ecma_ast::AssignExpr,
     ) -> Result<Register> {
         let target = self.lower_assignment_target(&assignment.left)?;
         self.ensure_assignment_target_mutable(target)?;
-        let value = self.lower_expression(&assignment.right)?;
+        let name = match &assignment.left {
+            AssignTarget::Simple(SimpleAssignTarget::Ident(identifier)) => {
+                Some(identifier.id.sym.to_string())
+            }
+            _ => None,
+        };
+        let value = self.lower_named_evaluation(&assignment.right, name)?;
         self.store_assignment_target(target, value);
         Ok(value)
     }
@@ -3622,7 +3788,10 @@ impl Builder {
                             let (key, value) = match property.as_ref() {
                                 Prop::KeyValue(property) => (
                                     self.lower_property_name(&property.key)?,
-                                    self.lower_expression(&property.value)?,
+                                    self.lower_named_evaluation(
+                                        &property.value,
+                                        object_property_name(&property.key),
+                                    )?,
                                 ),
                                 Prop::Shorthand(identifier) => (
                                     self.constant(Constant::String(identifier.sym.to_string())),
@@ -3933,6 +4102,28 @@ impl Builder {
                 let dst = self.register();
                 self.emit_construct(dst, constructor, arguments);
                 Ok(dst)
+            }
+            Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget => {
+                if self.allows_new_target {
+                    if self.is_async || self.is_generator {
+                        // Not constructors: [[Construct]] never reaches them.
+                        return Ok(self.constant(Constant::Undefined));
+                    }
+                    return self.new_target_register();
+                }
+                // Arrow functions have no own new.target: GetNewTarget walks
+                // to the enclosing ordinary function's environment, captured
+                // here as the hidden lexical `*new.target*` binding.
+                if self.find_binding(NEW_TARGET_BINDING).is_some() {
+                    let binding = self.resolve_binding(NEW_TARGET_BINDING);
+                    return Ok(self.load_binding(binding));
+                }
+                if self.new_target_undefined {
+                    return Ok(self.constant(Constant::Undefined));
+                }
+                Err(anyhow!(
+                    "new.target in arrow functions, class members or module code is not yet supported in runtime W3IR"
+                ))
             }
             Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::ImportMeta => {
                 let dst = self.register();
@@ -4866,6 +5057,7 @@ impl Builder {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         };
         self.functions.extend(child.functions);
@@ -4894,6 +5086,8 @@ impl Builder {
             false,
             true,
         );
+        // Field initializers are evaluated as methods: new.target is undefined.
+        child.new_target_undefined = true;
         child.class_super_is_static = Some(is_static);
         let this_binding = child.declare_this_binding()?;
         let this_value = child.load_binding(this_binding);
@@ -4946,6 +5140,7 @@ impl Builder {
             generator_suspension_points: Vec::new(),
             is_async: false,
             is_generator: false,
+            own_name_length: None,
             source_span: None,
         };
         self.functions.extend(child.functions);
@@ -4970,13 +5165,42 @@ impl Builder {
         bind_this: bool,
         class_super_is_static: Option<bool>,
     ) -> Result<Register> {
+        let named_evaluation = self.pending_function_name.take();
+        // SetFunctionName / SetFunctionLength for the closure object; class
+        // members get theirs from the class definition.
+        let own_name_length = class_super_is_static.is_none().then(|| {
+            (
+                named_evaluation
+                    .or_else(|| name.clone())
+                    .unwrap_or_default(),
+                crate::esm_codegen::expected_argument_count(parameters.iter()),
+            )
+        });
         let function_id = FunctionId(self.next_function);
         self.next_function += 1;
         let strict_mode = self.strict_mode
             || class_super_is_static.is_some()
             || statements_have_use_strict_directive(statements.iter());
+        // An arrow directly inside an ordinary function may read the
+        // function's new.target lexically: offer a reserved binding id and
+        // materialize it only if the arrow (or an arrow nested in it)
+        // captures it, so arrows that never mention new.target cost nothing.
+        let reserved_new_target = (!bind_this
+            && self.allows_new_target
+            && !self.is_async
+            && !self.is_generator
+            && self.find_binding(NEW_TARGET_BINDING).is_none())
+        .then(|| {
+            let binding = BindingId(self.next_binding);
+            self.next_binding += 1;
+            binding
+        });
+        let mut visible = self.visible_bindings();
+        if let Some(binding) = reserved_new_target {
+            visible.insert(NEW_TARGET_BINDING.to_string(), binding);
+        }
         let mut child = Builder::nested(
-            self.visible_bindings(),
+            visible,
             self.globals.clone(),
             self.next_binding,
             self.next_function,
@@ -4987,6 +5211,17 @@ impl Builder {
         );
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
+        child.allows_new_target = bind_this && class_super_is_static.is_none();
+        let is_class_constructor = class_super_is_static.is_some()
+            && name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(".constructor"));
+        child.new_target_undefined = if bind_this {
+            class_super_is_static.is_some() && !is_class_constructor
+        } else {
+            self.new_target_undefined
+                || (self.allows_new_target && (self.is_async || self.is_generator))
+        };
         let this_binding = if bind_this {
             Some(child.declare_this_binding()?)
         } else {
@@ -5019,6 +5254,8 @@ impl Builder {
         for (parameter, source) in parameters.iter().zip(parameter_sources) {
             child.initialize_parameter(parameter, source)?;
         }
+        child.superseded_function_declarations =
+            superseded_function_declarations(statement_function_declarations(statements));
         for statement in statements {
             child.initialize_function_declaration(statement)?;
         }
@@ -5036,6 +5273,11 @@ impl Builder {
         child.seal_current_block();
         child.prune_unused_arguments_binding();
 
+        if let Some(binding) = reserved_new_target
+            && child.captures.values().any(|captured| *captured == binding)
+        {
+            self.materialize_new_target_binding(binding)?;
+        }
         self.merge_child_scope(&child);
         let captures = child.capture_order.clone();
         let function = Function {
@@ -5055,6 +5297,7 @@ impl Builder {
             generator_suspension_points: child.generator_suspension_points,
             is_async: child.is_async,
             is_generator: child.is_generator,
+            own_name_length,
             source_span: None,
         };
         self.functions.extend(child.functions);
@@ -5530,6 +5773,101 @@ mod tests {
                 Value::string("bigint-key"),
             ]
         );
+    }
+
+    #[test]
+    fn new_target_is_read_first_in_the_entry_block_of_ordinary_functions() {
+        let module = lower_module(
+            "export function F(a = new.target) { g(); return new.target; }\nfunction g() {}",
+            "app:///new-target.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("F"))
+            .unwrap();
+        let entry = function
+            .blocks
+            .iter()
+            .find(|block| block.id == function.entry)
+            .unwrap();
+        let Instruction::NewTarget { dst } = entry.instructions[0] else {
+            panic!("new.target must be read before any other instruction");
+        };
+        let reads = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction, Instruction::NewTarget { .. }))
+            .count();
+        assert_eq!(reads, 1, "one entry read serves every new.target use");
+        assert!(format!("{function:?}").contains(&format!("{dst:?}")));
+        // Module code has no new.target (early SyntaxError), arrows there too.
+        assert!(lower_module("export const f = () => new.target;", "app:///arrow.js").is_err());
+    }
+
+    #[test]
+    fn arrows_read_the_enclosing_new_target_and_class_members_see_undefined() {
+        let module = lower_module(
+            r#"
+                export function F() {
+                    const plain = () => 1;
+                    const inner = () => () => new.target;
+                    return [plain, inner];
+                }
+                export function G() { return [1].map((x) => x); }
+                export class C { m() { return new.target; } static s() { return (() => new.target)(); } }
+                export async function A() { return (() => new.target)(); }
+            "#,
+            "app:///new-target-arrows.js",
+        )
+        .unwrap();
+        let named = |name: &str| {
+            module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let f = named("F");
+        let binding = f
+            .bindings
+            .iter()
+            .find(|binding| binding.name == NEW_TARGET_BINDING)
+            .expect("F materializes the lexical new.target binding");
+        let entry = f.blocks.iter().find(|block| block.id == f.entry).unwrap();
+        assert!(matches!(
+            entry.instructions[0],
+            Instruction::NewTarget { .. }
+        ));
+        assert!(matches!(
+            entry.instructions[1],
+            Instruction::InitializeBinding { binding: target, .. } if target == binding.id
+        ));
+        // Both nested arrows carry the capture; the plain arrow does not.
+        let capturing = module
+            .functions
+            .iter()
+            .filter(|function| function.captures.contains(&binding.id))
+            .count();
+        assert_eq!(capturing, 2);
+        // Arrows that never mention new.target add nothing to their function.
+        let g = named("G");
+        assert!(
+            g.bindings
+                .iter()
+                .all(|binding| binding.name != NEW_TARGET_BINDING)
+        );
+        assert!(!format!("{g:?}").contains("NewTarget"));
+        // Class methods and async functions are never constructed: undefined.
+        assert!(!module.functions.iter().any(|function| {
+            function
+                .name
+                .as_deref()
+                .is_some_and(|name| name.contains("C") || name == "A")
+                && format!("{function:?}").contains("NewTarget")
+        }));
     }
 
     #[test]

@@ -80,10 +80,10 @@ thread_local! {
 }
 
 fn type_error(message: &str) -> ! {
-    crate::throw_value(Value::object(HashMap::from([
-        ("name".into(), Value::string("TypeError")),
-        ("message".into(), Value::string(message)),
-    ])))
+    crate::throw_value(crate::error_instance(
+        "TypeError",
+        vec![Value::string(message)],
+    ))
 }
 
 fn weak_value(value: &Value, operation: &str) -> WeakValue {

@@ -368,6 +368,22 @@ impl PartialEq for Immediate {
     }
 }
 
+/// `prefix + key` without a heap allocation for ordinary property names.
+pub(crate) fn accessor_key<'a>(
+    buf: &'a mut [u8; 96],
+    prefix: &str,
+    key: &str,
+) -> std::borrow::Cow<'a, str> {
+    let total = prefix.len() + key.len();
+    if total > buf.len() {
+        return std::borrow::Cow::Owned(format!("{prefix}{key}"));
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    buf[prefix.len()..total].copy_from_slice(key.as_bytes());
+    // Both halves are valid UTF-8 and concatenation preserves that.
+    std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
+}
+
 impl Value {
     /// Unit-like constructor kept so AOT / host code can write `Value::Undefined`.
     #[allow(non_upper_case_globals)]
@@ -553,7 +569,8 @@ impl Value {
         }
     }
 
-    fn function_identity_eq(left: &Value, right: &Value) -> bool {
+    /// Same callable (handle or Rc identity). Used for listener matching.
+    pub fn function_identity_eq(left: &Value, right: &Value) -> bool {
         match (left.function_handle(), right.function_handle()) {
             (Some(a), Some(b)) => a == b,
             _ => match (left.as_function(), right.as_function()) {
@@ -1398,8 +1415,24 @@ fn bump_number(cell: &Cell<Option<f64>>, addend: f64) -> Value {
 /// Page-local interned functions store one of these in the page arena. Host /
 /// DOM callables share [`Rc<FunctionData>`] on [`Value::Function`] and object
 /// call-slots.
+/// SetFunctionName / SetFunctionLength (ECMA-262 10.2.9, 10.2.10): the own
+/// `name` and `length` properties every ordinary function is created with.
+/// They are non-writable, non-enumerable and configurable, so they live
+/// outside the enumerable property map (V8 serves them from the
+/// SharedFunctionInfo through AccessorInfo rather than per-closure storage).
+#[derive(Clone, Copy, Default)]
+struct FunctionMeta {
+    name: &'static str,
+    length: u32,
+    /// AOT code entry of a host wrapper around a compiled function (0: none).
+    code_entry: usize,
+    has_name: bool,
+    has_length: bool,
+}
+
 pub struct FunctionData {
     body: FunctionBody,
+    meta: Cell<FunctionMeta>,
     /// Own string-keyed data properties. Ordinary functions keep ≤4 inline
     /// (prototype, and often length/name) without a HashMap spill.
     props: RefCell<PropertyMap>,
@@ -1483,8 +1516,35 @@ impl FunctionData {
         );
         Self {
             body,
+            meta: Cell::new(FunctionMeta::default()),
             props: RefCell::new(props),
             allocation,
+        }
+    }
+
+    /// Install the own `name` / `length` of an ordinary function.
+    pub fn set_name_and_length(&self, name: &'static str, length: u32) {
+        let mut meta = self.meta.get();
+        meta.name = name;
+        meta.length = length;
+        meta.has_name = true;
+        meta.has_length = true;
+        self.meta.set(meta);
+    }
+
+    /// Record the compiled code entry a host wrapper forwards to.
+    pub fn set_code_entry(&self, entry: usize) {
+        let mut meta = self.meta.get();
+        meta.code_entry = entry;
+        self.meta.set(meta);
+    }
+
+    fn meta_property(&self, key: &str) -> Option<Value> {
+        let meta = self.meta.get();
+        match key {
+            "name" if meta.has_name => Some(Value::string(meta.name)),
+            "length" if meta.has_length => Some(Value::Number(f64::from(meta.length))),
+            _ => None,
         }
     }
 
@@ -1510,6 +1570,9 @@ impl FunctionData {
     }
 
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(value) = self.meta_property(key) {
+            return value;
+        }
         self.props
             .borrow()
             .get(key)
@@ -1518,7 +1581,7 @@ impl FunctionData {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.props.borrow().contains_key(key)
+        self.meta_property(key).is_some() || self.props.borrow().contains_key(key)
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -1536,6 +1599,13 @@ impl FunctionData {
     }
 
     pub fn set_property(&self, key: &str, value: Value) {
+        if self.meta_property(key).is_some() {
+            // [[Writable]]: false. Module code is strict, so OrdinarySet's
+            // false result throws (ECMA-262 PutValue step 6.d).
+            throw_value(crate::intrinsics::type_error(&format!(
+                "Cannot assign to read only property '{key}' of function"
+            )));
+        }
         let mut props = self.props.borrow_mut();
         props.insert(JsString::intern(key), value);
         self.allocation
@@ -1543,6 +1613,14 @@ impl FunctionData {
     }
 
     pub fn delete_property(&self, key: &str) {
+        // [[Configurable]]: true.
+        let mut meta = self.meta.get();
+        match key {
+            "name" => meta.has_name = false,
+            "length" => meta.has_length = false,
+            _ => {}
+        }
+        self.meta.set(meta);
         let mut props = self.props.borrow_mut();
         props.remove(key);
         self.allocation
@@ -1656,6 +1734,24 @@ impl JsFunction {
 
     pub fn delete_property(&self, key: &str) {
         self.data().delete_property(key)
+    }
+
+    /// Address of the AOT code entry, when this function has one.
+    pub fn aot_factory_address(&self) -> Option<usize> {
+        match &self.data().body {
+            FunctionBody::Aot { factory, .. } => Some(*factory as usize),
+            _ => Some(self.data().meta.get().code_entry).filter(|entry| *entry != 0),
+        }
+    }
+
+    /// Install the own `name` / `length` (SetFunctionName / SetFunctionLength).
+    pub fn set_name_and_length(&self, name: &'static str, length: u32) {
+        self.data().set_name_and_length(name, length)
+    }
+
+    /// Record the compiled code entry this host wrapper forwards to.
+    pub fn set_code_entry(&self, entry: usize) {
+        self.data().set_code_entry(entry)
     }
 
     /// A stable identity address for this function value (clones of the same
@@ -1849,6 +1945,13 @@ impl Value {
 
     /// ECMAScript `ToBoolean`.
     pub fn to_bool(&self) -> bool {
+        // V8 ToBoolean fast path for Numbers and Booleans.
+        if let Some(n) = self.as_number() {
+            return n != 0.0 && !n.is_nan();
+        }
+        if let Some(b) = self.as_bool() {
+            return b;
+        }
         if self.live_dom_node().is_some() {
             return true;
         }
@@ -1866,6 +1969,9 @@ impl Value {
 
     /// ECMAScript `ToNumber`.
     pub fn to_number(&self) -> f64 {
+        if let Some(n) = self.as_number() {
+            return n;
+        }
         if self.live_dom_node().is_some() {
             return f64::NAN;
         }
@@ -2044,6 +2150,13 @@ impl Value {
 
     /// Property access: `obj[key]` or `obj.key`.
     pub fn get_property(&self, key: &str) -> Value {
+        // String length without the object/array/DOM probes and the
+        // index parse below.
+        if key == "length"
+            && let Some(string) = self.as_js_string()
+        {
+            return Value::Number(utf16_length(string.as_str()) as f64);
+        }
         if let Some(value) = fast_known_collection_key(self, key) {
             return value;
         }
@@ -2089,10 +2202,9 @@ impl Value {
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
-                let getter = o
-                    .borrow()
-                    .get(&format!("__w3cos_getter_{key}"), receiver)
-                    .clone();
+                let mut buf = [0u8; 96];
+                let getter_key = accessor_key(&mut buf, "__w3cos_getter_", key);
+                let getter = o.borrow().get(&getter_key, receiver).clone();
                 getter.call(receiver.clone(), vec![])
             };
         }
@@ -2124,7 +2236,7 @@ impl Value {
                         .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(s.encode_utf16().count() as f64)
+                    Value::Number(utf16_length(&s) as f64)
                 } else {
                     Value::Undefined
                 }
@@ -2194,21 +2306,36 @@ impl Value {
             crate::intrinsics::bump_dom_shape();
         }
         if let Some(o) = self.as_object() {
-            let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
-            let canonical_index = key
-                .parse::<u32>()
-                .is_ok_and(|index| index.to_string() == key);
-            if rejects_indexed_set && canonical_index {
+            // Only canonical array indices can hit the indexed-set guard; test
+            // the cheap shape before probing the object.
+            let canonical_index = key.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && key
+                    .parse::<u32>()
+                    .is_ok_and(|index| index.to_string() == key);
+            if canonical_index && o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool() {
                 return false;
             }
-            let descriptor = o.borrow().get_own_property_descriptor(key);
-            let writable = descriptor.get_property("writable");
-            if writable.is_bool() && !writable.to_bool() {
-                return false;
+            // Ordinary own data properties are always writable here (there is
+            // no non-writable attribute outside a proxy), so the descriptor is
+            // only consulted when a getOwnPropertyDescriptor trap can say no.
+            // Building it allocated a descriptor object per [[Set]].
+            let trapped_descriptor = o
+                .borrow()
+                .proxy_handler
+                .as_ref()
+                .is_some_and(|handler| handler.get_own_property_descriptor.is_some());
+            if trapped_descriptor {
+                let descriptor = o.borrow().get_own_property_descriptor(key);
+                let writable = descriptor.get_property("writable");
+                if writable.is_bool() && !writable.to_bool() {
+                    return false;
+                }
             }
             let has_own = o.borrow().properties.contains_key(key);
             if !has_own {
-                let setter_key = format!("__w3cos_setter_{key}");
+                let mut setter_buf = [0u8; 96];
+                let setter_key = accessor_key(&mut setter_buf, "__w3cos_setter_", key);
+                let setter_key: &str = &setter_key;
                 let setter = {
                     let object = o.borrow();
                     if object
@@ -2321,6 +2448,38 @@ impl Value {
     }
 }
 
+/// UTF-16 length of a UTF-8 string: one unit per scalar below U+10000, two
+/// above. ASCII (the common case) is the byte length.
+#[inline]
+fn utf16_length(value: &str) -> usize {
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.encode_utf16().count()
+    }
+}
+
+/// `String.prototype.charCodeAt` with an ASCII-prefix fast path.
+#[inline]
+fn string_char_code_at(value: &str, index: Option<&Value>) -> Value {
+    let index = index.map(Value::to_number).unwrap_or(0.0);
+    if !index.is_finite() || index < 0.0 {
+        return Value::Number(f64::NAN);
+    }
+    let index = index as usize;
+    let bytes = value.as_bytes();
+    if index < bytes.len() && bytes[..=index].is_ascii() {
+        return Value::Number(f64::from(bytes[index]));
+    }
+    Value::Number(
+        value
+            .encode_utf16()
+            .nth(index)
+            .map(f64::from)
+            .unwrap_or(f64::NAN),
+    )
+}
+
 // ── Constructors ───────────────────────────────────────────────────────
 
 impl Value {
@@ -2405,6 +2564,20 @@ impl Value {
     /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
     pub fn aot_function(factory: AotFactory, captures: AotCaptureMap) -> Self {
         let handle = crate::page_arena::alloc_function(FunctionData::from_aot(factory, captures));
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
+    /// An AOT function with its own `name` and `length` (SetFunctionName /
+    /// SetFunctionLength at function object creation).
+    pub fn aot_function_named(
+        factory: AotFactory,
+        captures: AotCaptureMap,
+        name: &'static str,
+        length: u32,
+    ) -> Self {
+        let data = FunctionData::from_aot(factory, captures);
+        data.set_name_and_length(name, length);
+        let handle = crate::page_arena::alloc_function(data);
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
@@ -2668,8 +2841,14 @@ impl Value {
             }
             (this, "slice") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                let ascii = value.is_ascii();
+                // ASCII: UTF-16 units are bytes, so skip re-encoding the string.
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let normalize = |argument: Option<&Value>, fallback: i64| {
                     let raw = argument
                         .map(Value::to_number)
@@ -2684,6 +2863,9 @@ impl Value {
                 };
                 let start = normalize(args.first(), 0);
                 let end = normalize(args.get(1), length).max(start);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "substr") if this.is_string() => {
@@ -2732,23 +2914,59 @@ impl Value {
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
+                    .map(|byte| {
+                        let prefix = &value.as_bytes()[..byte];
+                        if prefix.is_ascii() {
+                            byte as f64
+                        } else {
+                            value[..byte].chars().count() as f64
+                        }
+                    })
+                    .unwrap_or(-1.0);
+                return Value::Number(index);
+            }
+            (this, "lastIndexOf") if this.is_string() => {
+                // ECMA-262 String.prototype.lastIndexOf: a NaN position means
+                // +Infinity; the match must start at or before it. Indices
+                // follow indexOf above.
+                let value = this.as_js_string().expect("string");
+                let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                if value.is_ascii() && needle.is_ascii() {
+                    // One-byte strings (V8's SeqOneByteString): indices are
+                    // byte offsets, no char counting over the whole string.
+                    let length = value.len();
+                    let position = match args.get(1).map(Value::to_number) {
+                        Some(number) if !number.is_nan() => {
+                            number.trunc().clamp(0.0, length as f64) as usize
+                        }
+                        _ => length,
+                    };
+                    let end = (position + needle.len()).min(length);
+                    return Value::Number(
+                        value[..end]
+                            .rfind(needle.as_str())
+                            .map(|byte| byte as f64)
+                            .unwrap_or(-1.0),
+                    );
+                }
+                let length = value.chars().count();
+                let position = match args.get(1).map(Value::to_number) {
+                    Some(number) if !number.is_nan() => {
+                        number.trunc().clamp(0.0, length as f64) as usize
+                    }
+                    _ => length,
+                };
+                let end = (position + needle.chars().count()).min(length);
+                let end_byte = string_index_to_byte(&value, end);
+                let index = value[..end_byte]
+                    .rfind(needle.as_str())
                     .map(|byte| value[..byte].chars().count() as f64)
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
             (this, "charCodeAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let index = args.first().map(Value::to_number).unwrap_or(0.0);
-                if !index.is_finite() || index < 0.0 {
-                    return Value::Number(f64::NAN);
-                }
-                return Value::Number(
-                    value
-                        .encode_utf16()
-                        .nth(index as usize)
-                        .map(f64::from)
-                        .unwrap_or(f64::NAN),
-                );
+                return string_char_code_at(value.as_str(), args.first());
             }
             (this, "charAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -2756,10 +2974,14 @@ impl Value {
                 if !index.is_finite() || index < 0.0 {
                     return Value::from(String::new());
                 }
+                let index = index as usize;
+                if index < value.len() && value.as_bytes()[..=index].is_ascii() {
+                    return Value::from(&value[index..=index]);
+                }
                 return Value::from(
                     value
                         .chars()
-                        .nth(index as usize)
+                        .nth(index)
                         .map(|character| character.to_string())
                         .unwrap_or_default(),
                 );
@@ -2972,6 +3194,14 @@ impl Value {
     /// Other methods still collect a `Vec`. `dispatchEvent` on a live DOM node
     /// does not.
     pub fn call_method_slice(&self, key: &str, args: &[Value]) -> Value {
+        // String.prototype.charCodeAt has no override hook in call_method
+        // either; answer it without the method-dispatch chain and the
+        // argument Vec (V8 inlines it as a StringCharCodeAt node).
+        if key == "charCodeAt"
+            && let Some(string) = self.as_js_string()
+        {
+            return string_char_code_at(string.as_str(), args.first());
+        }
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
         }
@@ -3205,11 +3435,10 @@ fn is_iterator_object(value: &Value) -> bool {
         && crate::bigint::get(value).is_none()
 }
 
+/// A realm %TypeError% instance (prototype chain, `instanceof TypeError`,
+/// `constructor`), as V8's NewTypeError builds through the native context.
 pub(crate) fn type_error(message: &str) -> Value {
-    Value::object(HashMap::from([
-        ("name".into(), Value::string("TypeError")),
-        ("message".into(), Value::string(message)),
-    ]))
+    crate::error_instance("TypeError", vec![Value::string(message)])
 }
 
 fn close_iterator_chain(iterators: &Value, mut throw_completion: Option<Value>) -> Option<Value> {
@@ -3267,6 +3496,12 @@ fn array_index(value: Option<&Value>, len: usize, default: usize) -> usize {
 }
 
 fn string_index_to_byte(value: &str, index: usize) -> usize {
+    // An ASCII prefix maps chars to bytes one-to-one; checking it is a
+    // vectorized byte scan instead of decoding every char up to `index`.
+    let prefix = index.min(value.len());
+    if value.as_bytes()[..prefix].is_ascii() {
+        return prefix;
+    }
     value
         .char_indices()
         .nth(index)
@@ -3793,12 +4028,27 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
     let mut owned = String::with_capacity(total);
     owned.push_str(left_text);
     owned.push_str(right_text);
+    // V8 only internalizes strings used as keys; a concatenation result is a
+    // fresh sequential string. Interning every large result hashed and copied
+    // it into the never-freed page arena, so `s = s + token` was quadratic in
+    // time and memory. Large results stay heap strings (freed on last use).
+    if total > CONCAT_INTERN_LIMIT {
+        return Value::String(JsString::heap_owned(owned));
+    }
     Value::from_js_string(JsString::intern(&owned))
 }
+
+/// Concatenations up to this many bytes are interned (cheap equality and
+/// property-key reuse); longer ones are plain heap strings.
+const CONCAT_INTERN_LIMIT: usize = 256;
 
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
     pub fn js_add(&self, other: &Value) -> Value {
+        // Number + Number first (V8's Smi/HeapNumber feedback fast path).
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs + rhs);
+        }
         if self.is_string() || other.is_string() {
             concat_js_values(self, other)
         } else if let Some(value) = crate::bigint::add(self, other) {
@@ -3809,6 +4059,9 @@ impl Value {
     }
 
     pub fn js_sub(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs - rhs);
+        }
         if let Some(value) = crate::bigint::sub(self, other) {
             return value;
         }
@@ -3816,6 +4069,9 @@ impl Value {
     }
 
     pub fn js_mul(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs * rhs);
+        }
         if let Some(value) = crate::bigint::mul(self, other) {
             return value;
         }
@@ -3823,6 +4079,9 @@ impl Value {
     }
 
     pub fn js_div(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs / rhs);
+        }
         if let Some(value) = crate::bigint::div(self, other) {
             return value;
         }
@@ -3830,6 +4089,9 @@ impl Value {
     }
 
     pub fn js_rem(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs % rhs);
+        }
         if let Some(value) = crate::bigint::rem(self, other) {
             return value;
         }
@@ -3898,13 +4160,7 @@ impl Value {
 
     pub fn js_ushr(&self, other: &Value) -> Value {
         if crate::bigint::get(self).is_some() || crate::bigint::get(other).is_some() {
-            crate::throw_value(crate::Value::object(HashMap::from([
-                ("name".into(), Value::string("TypeError")),
-                (
-                    "message".into(),
-                    Value::string("BigInts have no unsigned right shift"),
-                ),
-            ])));
+            crate::throw_value(type_error("BigInts have no unsigned right shift"));
         }
         let shift = (other.to_i32() as u32) & 0x1f;
         Value::Number(((self.to_i32() as u32) >> shift) as f64)
@@ -3912,6 +4168,9 @@ impl Value {
 
     /// ECMAScript `===` (strict equality).
     pub fn strict_eq(&self, other: &Value) -> bool {
+        if let (Some(x), Some(y)) = (self.as_number(), other.as_number()) {
+            return x == y; // NaN !== NaN
+        }
         if let Some(equal) = crate::intrinsics::dom_nodes_equal(self, other) {
             return equal;
         }
@@ -3992,6 +4251,10 @@ impl Value {
     }
 
     pub fn js_lt(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs < rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return ordering.is_lt();
         }
@@ -4004,6 +4267,10 @@ impl Value {
     }
 
     pub fn js_gt(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs > rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return ordering.is_gt();
         }
@@ -4016,6 +4283,10 @@ impl Value {
     }
 
     pub fn js_le(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs <= rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return !ordering.is_gt();
         }
@@ -4028,6 +4299,10 @@ impl Value {
     }
 
     pub fn js_ge(&self, other: &Value) -> bool {
+        // V8 NumberLessThan fast path: two Numbers compare directly.
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return lhs >= rhs;
+        }
         if let Some(ordering) = crate::bigint::compare(self, other) {
             return !ordering.is_lt();
         }
@@ -4164,6 +4439,54 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_type_errors_are_realm_type_error_instances() {
+        let type_error_class = crate::builtins::error_class("TypeError");
+        let errors = [
+            type_error("boom"),
+            crate::catch_js(|| Value::Number(1.0).js_ushr(&crate::bigint::parse("1")))
+                .expect_err("BigInt >>> must throw"),
+        ];
+        for error in errors {
+            assert!(crate::class::instance_of(&error, &type_error_class));
+            assert!(crate::class::instance_of(
+                &error,
+                &crate::builtins::error_class("Error")
+            ));
+            assert_eq!(error.get_property("name"), Value::string("TypeError"));
+            assert_eq!(error.get_property("constructor"), type_error_class);
+        }
+    }
+
+    #[test]
+    fn function_name_and_length_are_own_readonly_configurable_non_enumerable() {
+        fn factory(_: Value, _: &[Value], _: &AotCaptureMap) -> Value {
+            Value::Undefined
+        }
+        let function = Value::aot_function_named(factory, AotCaptureMap::new(), "sum", 2);
+        let handle = function.as_function().unwrap();
+        assert_eq!(function.get_property("name").to_js_string(), "sum");
+        assert_eq!(function.get_property("length"), Value::Number(2.0));
+        assert!(handle.has_own_property("name") && handle.has_own_property("length"));
+        assert!(
+            !handle
+                .keys()
+                .iter()
+                .any(|key| key == "name" || key == "length")
+        );
+        let assigned = catch_js(|| {
+            handle.set_property("name", Value::string("other"));
+            Value::Undefined
+        });
+        assert!(assigned.is_err());
+        assert_eq!(function.get_property("name").to_js_string(), "sum");
+        handle.delete_property("name");
+        assert!(!handle.has_own_property("name"));
+        handle.set_property("name", Value::string("redefined"));
+        assert_eq!(function.get_property("name").to_js_string(), "redefined");
+        assert_eq!(function.get_property("length"), Value::Number(2.0));
+    }
 
     #[test]
     fn explicit_receiver_lookup_preserves_undefined_and_proxy_exception() {
@@ -5784,5 +6107,95 @@ mod tests {
         crate::page_arena::reset();
         assert_eq!(crate::page_arena::live_handles(), 0);
         assert_eq!(JsString::interned_table_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod string_last_index_of_tests {
+    use super::*;
+
+    fn last(value: &str, args: Vec<Value>) -> f64 {
+        Value::from(value)
+            .call_method("lastIndexOf", args)
+            .to_number()
+    }
+
+    #[test]
+    fn last_index_of_follows_ecma262() {
+        assert_eq!(last("ab\ncd\nef", vec![Value::from("\n")]), 5.0);
+        assert_eq!(last("abc", vec![Value::from("\n")]), -1.0);
+        assert_eq!(last("canal", vec![Value::from("a")]), 3.0);
+        assert_eq!(
+            last("canal", vec![Value::from("a"), Value::Number(2.0)]),
+            1.0
+        );
+        assert_eq!(
+            last("canal", vec![Value::from("a"), Value::Number(0.0)]),
+            -1.0
+        );
+        assert_eq!(last("canal", vec![Value::from("x")]), -1.0);
+        assert_eq!(
+            last("canal", vec![Value::from("c"), Value::Number(-5.0)]),
+            0.0
+        );
+        assert_eq!(
+            last("canal", vec![Value::from("c"), Value::Number(0.0)]),
+            0.0
+        );
+        assert_eq!(last("canal", vec![Value::from("")]), 5.0);
+        assert_eq!(
+            last("canal", vec![Value::from(""), Value::Number(2.0)]),
+            2.0
+        );
+        assert_eq!(
+            last("canal", vec![Value::from("l"), Value::Number(f64::NAN)]),
+            4.0
+        );
+        assert_eq!(last("aaa", vec![Value::from("aa")]), 1.0);
+    }
+
+    fn text(value: &str, method: &str, args: Vec<Value>) -> String {
+        Value::from(value)
+            .call_method(method, args)
+            .to_js_string()
+            .to_string()
+    }
+
+    #[test]
+    fn ascii_fast_paths_match_the_general_paths() {
+        assert_eq!(
+            text(
+                "hello",
+                "slice",
+                vec![Value::Number(1.0), Value::Number(3.0)]
+            ),
+            "el"
+        );
+        assert_eq!(text("hello", "slice", vec![Value::Number(-3.0)]), "llo");
+        assert_eq!(text("hello", "slice", vec![Value::Number(9.0)]), "");
+        assert_eq!(
+            text(
+                "héllo",
+                "slice",
+                vec![Value::Number(1.0), Value::Number(3.0)]
+            ),
+            "él"
+        );
+        assert_eq!(text("hello", "charAt", vec![Value::Number(4.0)]), "o");
+        assert_eq!(text("hello", "charAt", vec![Value::Number(5.0)]), "");
+        assert_eq!(text("héllo", "charAt", vec![Value::Number(1.0)]), "é");
+        assert_eq!(text("héllo", "charAt", vec![Value::Number(2.0)]), "l");
+        assert_eq!(
+            Value::from("héllo")
+                .call_method("indexOf", vec![Value::from("l"), Value::Number(3.0)])
+                .to_number(),
+            3.0
+        );
+        assert_eq!(
+            Value::from("hello")
+                .call_method("indexOf", vec![Value::from("l"), Value::Number(3.0)])
+                .to_number(),
+            3.0
+        );
     }
 }
