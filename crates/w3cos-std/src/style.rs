@@ -116,6 +116,35 @@ impl CustomProperties {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Copy-on-write aware: a no-op removal never unshares the map (Blink's
+    /// DataRef::Access() is likewise only taken when a field really changes).
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<String>
+    where
+        String: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        if !self.0.contains_key(key) {
+            return None;
+        }
+        std::sync::Arc::make_mut(&mut self.0).remove(key)
+    }
+
+    /// Like `HashMap::retain`, but only unshares when something is dropped.
+    pub fn retain(&mut self, mut keep: impl FnMut(&String, &String) -> bool) {
+        if self.0.iter().all(|(key, value)| keep(key, value)) {
+            return;
+        }
+        std::sync::Arc::make_mut(&mut self.0).retain(|key, value| keep(key, value));
+    }
+
+    /// Like `HashMap::insert`, but storing an identical value keeps sharing.
+    pub fn insert(&mut self, key: String, value: String) -> Option<String> {
+        if self.0.get(&key) == Some(&value) {
+            return Some(value);
+        }
+        std::sync::Arc::make_mut(&mut self.0).insert(key, value)
+    }
 }
 
 impl std::ops::Deref for CustomProperties {

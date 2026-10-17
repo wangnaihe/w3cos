@@ -13188,8 +13188,14 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
         // Source identity is not a CSS paint difference. Coalescing carries
         // its boundaries separately rather than keeping transparent wrappers.
         if let Some(properties) = style.custom_properties.as_mut() {
-            properties.remove(w3cos_std::inline_text::SOURCE_RUN);
-            properties.remove(w3cos_std::inline_text::FRAGMENT_ENDS);
+            // Probe first: removing through the copy-on-write handle would
+            // deep-copy a shared map even when neither key is present.
+            if properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
+                || properties.contains_key(w3cos_std::inline_text::FRAGMENT_ENDS)
+            {
+                properties.remove(w3cos_std::inline_text::SOURCE_RUN);
+                properties.remove(w3cos_std::inline_text::FRAGMENT_ENDS);
+            }
             if properties.is_empty() {
                 style.custom_properties = None;
             }
