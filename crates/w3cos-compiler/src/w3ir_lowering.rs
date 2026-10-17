@@ -115,6 +115,10 @@ fn module_function_declarations(
     })
 }
 
+/// Hidden lexical binding through which arrows read the enclosing ordinary
+/// function's new.target.
+const NEW_TARGET_BINDING: &str = "*new.target*";
+
 pub(crate) fn lower_module_statements(
     statements: &[Stmt],
     specifier: &str,
@@ -833,6 +837,10 @@ struct Builder {
     superseded_function_declarations: HashSet<swc_common::BytePos>,
     /// Register holding `new.target`, read once at function entry.
     new_target: Option<Register>,
+    /// `new.target` is statically undefined here: class methods/accessors/
+    /// field initializers and async/generator bodies are never
+    /// [[Construct]]ed, and arrows inherit that from their scope.
+    new_target_undefined: bool,
 }
 
 impl Builder {
@@ -886,6 +894,7 @@ impl Builder {
             allows_new_target: false,
             superseded_function_declarations: HashSet::new(),
             new_target: None,
+            new_target_undefined: false,
         }
     }
 
@@ -943,6 +952,7 @@ impl Builder {
             allows_new_target: false,
             superseded_function_declarations: HashSet::new(),
             new_target: None,
+            new_target_undefined: false,
         }
     }
 
@@ -1141,6 +1151,30 @@ impl Builder {
         }
         self.new_target = Some(dst);
         Ok(dst)
+    }
+
+    /// Declares the hidden `*new.target*` binding with a reserved id and
+    /// initializes it right after the entry `NewTarget` read.
+    fn materialize_new_target_binding(&mut self, binding: BindingId) -> Result<()> {
+        let value = self.new_target_register()?;
+        self.scopes[0].insert(NEW_TARGET_BINDING.to_string(), binding);
+        self.bindings.push(Binding {
+            id: binding,
+            name: NEW_TARGET_BINDING.to_string(),
+            kind: BindingKind::Const,
+            mutable: false,
+        });
+        let instruction = Instruction::InitializeBinding { binding, value };
+        if let Some(block) = self.blocks.iter_mut().find(|block| block.id == BlockId(0)) {
+            block.instructions.insert(1, instruction);
+        } else if self.current_block == BlockId(0) {
+            self.instructions.insert(1, instruction);
+        } else {
+            return Err(anyhow!(
+                "runtime W3IR new.target: entry block is unavailable"
+            ));
+        }
+        Ok(())
     }
 
     fn seal_current_block(&mut self) {
@@ -4033,6 +4067,16 @@ impl Builder {
                     }
                     return self.new_target_register();
                 }
+                // Arrow functions have no own new.target: GetNewTarget walks
+                // to the enclosing ordinary function's environment, captured
+                // here as the hidden lexical `*new.target*` binding.
+                if self.find_binding(NEW_TARGET_BINDING).is_some() {
+                    let binding = self.resolve_binding(NEW_TARGET_BINDING);
+                    return Ok(self.load_binding(binding));
+                }
+                if self.new_target_undefined {
+                    return Ok(self.constant(Constant::Undefined));
+                }
                 Err(anyhow!(
                     "new.target in arrow functions, class members or module code is not yet supported in runtime W3IR"
                 ))
@@ -4997,6 +5041,8 @@ impl Builder {
             false,
             true,
         );
+        // Field initializers are evaluated as methods: new.target is undefined.
+        child.new_target_undefined = true;
         child.class_super_is_static = Some(is_static);
         let this_binding = child.declare_this_binding()?;
         let this_value = child.load_binding(this_binding);
@@ -5078,8 +5124,26 @@ impl Builder {
         let strict_mode = self.strict_mode
             || class_super_is_static.is_some()
             || statements_have_use_strict_directive(statements.iter());
+        // An arrow directly inside an ordinary function may read the
+        // function's new.target lexically: offer a reserved binding id and
+        // materialize it only if the arrow (or an arrow nested in it)
+        // captures it, so arrows that never mention new.target cost nothing.
+        let reserved_new_target = (!bind_this
+            && self.allows_new_target
+            && !self.is_async
+            && !self.is_generator
+            && self.find_binding(NEW_TARGET_BINDING).is_none())
+        .then(|| {
+            let binding = BindingId(self.next_binding);
+            self.next_binding += 1;
+            binding
+        });
+        let mut visible = self.visible_bindings();
+        if let Some(binding) = reserved_new_target {
+            visible.insert(NEW_TARGET_BINDING.to_string(), binding);
+        }
         let mut child = Builder::nested(
-            self.visible_bindings(),
+            visible,
             self.globals.clone(),
             self.next_binding,
             self.next_function,
@@ -5091,6 +5155,16 @@ impl Builder {
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
         child.allows_new_target = bind_this && class_super_is_static.is_none();
+        let is_class_constructor = class_super_is_static.is_some()
+            && name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(".constructor"));
+        child.new_target_undefined = if bind_this {
+            class_super_is_static.is_some() && !is_class_constructor
+        } else {
+            self.new_target_undefined
+                || (self.allows_new_target && (self.is_async || self.is_generator))
+        };
         let this_binding = if bind_this {
             Some(child.declare_this_binding()?)
         } else {
@@ -5142,6 +5216,11 @@ impl Builder {
         child.seal_current_block();
         child.prune_unused_arguments_binding();
 
+        if let Some(binding) = reserved_new_target
+            && child.captures.values().any(|captured| *captured == binding)
+        {
+            self.materialize_new_target_binding(binding)?;
+        }
         self.merge_child_scope(&child);
         let captures = child.capture_order.clone();
         let function = Function {
@@ -5666,9 +5745,71 @@ mod tests {
             .count();
         assert_eq!(reads, 1, "one entry read serves every new.target use");
         assert!(format!("{function:?}").contains(&format!("{dst:?}")));
-        // Arrow functions inherit new.target lexically: still rejected
-        // rather than silently undefined.
+        // Module code has no new.target (early SyntaxError), arrows there too.
         assert!(lower_module("export const f = () => new.target;", "app:///arrow.js").is_err());
+    }
+
+    #[test]
+    fn arrows_read_the_enclosing_new_target_and_class_members_see_undefined() {
+        let module = lower_module(
+            r#"
+                export function F() {
+                    const plain = () => 1;
+                    const inner = () => () => new.target;
+                    return [plain, inner];
+                }
+                export function G() { return [1].map((x) => x); }
+                export class C { m() { return new.target; } static s() { return (() => new.target)(); } }
+                export async function A() { return (() => new.target)(); }
+            "#,
+            "app:///new-target-arrows.js",
+        )
+        .unwrap();
+        let named = |name: &str| {
+            module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let f = named("F");
+        let binding = f
+            .bindings
+            .iter()
+            .find(|binding| binding.name == NEW_TARGET_BINDING)
+            .expect("F materializes the lexical new.target binding");
+        let entry = f.blocks.iter().find(|block| block.id == f.entry).unwrap();
+        assert!(matches!(
+            entry.instructions[0],
+            Instruction::NewTarget { .. }
+        ));
+        assert!(matches!(
+            entry.instructions[1],
+            Instruction::InitializeBinding { binding: target, .. } if target == binding.id
+        ));
+        // Both nested arrows carry the capture; the plain arrow does not.
+        let capturing = module
+            .functions
+            .iter()
+            .filter(|function| function.captures.contains(&binding.id))
+            .count();
+        assert_eq!(capturing, 2);
+        // Arrows that never mention new.target add nothing to their function.
+        let g = named("G");
+        assert!(
+            g.bindings
+                .iter()
+                .all(|binding| binding.name != NEW_TARGET_BINDING)
+        );
+        assert!(!format!("{g:?}").contains("NewTarget"));
+        // Class methods and async functions are never constructed: undefined.
+        assert!(!module.functions.iter().any(|function| {
+            function
+                .name
+                .as_deref()
+                .is_some_and(|name| name.contains("C") || name == "A")
+                && format!("{function:?}").contains("NewTarget")
+        }));
     }
 
     #[test]

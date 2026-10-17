@@ -4096,17 +4096,17 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
         let cases = [
             (
                 "sync",
-                "export function copy() { return (() => new.target)(); }",
+                "export function copy() { return String.raw`a`; }",
                 "synchronous function",
             ),
             (
                 "async",
-                "export async function copy() { return (() => new.target)(); }",
+                "export async function copy() { return String.raw`a`; }",
                 "async function",
             ),
             (
                 "generator",
-                "export function* copy() { yield (() => new.target)(); }",
+                "export function* copy() { yield String.raw`a`; }",
                 "generator",
             ),
         ];
@@ -4142,17 +4142,17 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
         let cases = [
             (
                 "method",
-                "export class Broken { copy() { return new.target; } }",
+                "export class Broken { copy() { return String.raw`a`; } }",
                 "Broken.copy",
             ),
             (
                 "async_method",
-                "export class Broken { async copy() { return new.target; } }",
+                "export class Broken { async copy() { return String.raw`a`; } }",
                 "Broken.copy",
             ),
             (
                 "generator_method",
-                "export class Broken { *copy() { yield new.target; } }",
+                "export class Broken { *copy() { yield String.raw`a`; } }",
                 "Broken.copy",
             ),
             (
