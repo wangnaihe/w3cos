@@ -60,6 +60,12 @@ struct EscapePlan {
     n_num_bindings: u32,
     /// Binding id → number that is stored exactly once as a literal.
     constants: HashMap<u32, f64>,
+    /// Non-escaping local binding id → slot in `val_bindings` (an
+    /// `Option<Value>`, `None` while in the TDZ). V8 keeps such locals in
+    /// interpreter registers instead of a heap Context; only bindings a
+    /// closure captures need a shared cell. Sync functions only.
+    val_binding_of: HashMap<u32, u32>,
+    n_val_bindings: u32,
 }
 
 thread_local! {
@@ -401,7 +407,93 @@ fn analyze_function(function: &Function) -> EscapePlan {
         num_binding_of,
         n_num_bindings,
         constants,
+        val_binding_of: HashMap::new(),
+        n_val_bindings: 0,
     }
+}
+
+thread_local! {
+    static VALUE_BINDING_PROMOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Give non-escaping locals of a synchronous function a plain `Value` slot
+/// instead of an `Rc<RefCell<(Value, bool)>>` cell.
+fn promote_value_bindings(function: &Function, plan: &mut EscapePlan, shared: &HashSet<u32>) {
+    if !VALUE_BINDING_PROMOTION.with(|flag| flag.get())
+        || function.is_async
+        || function.is_generator
+    {
+        return;
+    }
+    let captured = captured_binding_ids(function);
+    let mut reserved = HashSet::new();
+    reserved.extend(function.captures.iter().map(|binding| binding.0));
+    // A mapped `arguments` object aliases the parameters.
+    if let Some(binding) = function.arguments_binding {
+        reserved.insert(binding.0);
+        reserved.extend(function.parameters.iter().map(|binding| binding.0));
+    }
+    if let Some(binding) = function.rest_parameter {
+        reserved.insert(binding.0);
+    }
+    if let Some(binding) = function.this_binding {
+        reserved.insert(binding.0);
+    }
+    let mut ids = function
+        .bindings
+        .iter()
+        .filter(|binding| {
+            let id = binding.id.0;
+            matches!(
+                binding.kind,
+                BindingKind::Var | BindingKind::Let | BindingKind::Const | BindingKind::Parameter
+            ) && !captured.contains(&id)
+                && !reserved.contains(&id)
+                && !shared.contains(&id)
+                && !plan.num_binding_of.contains_key(&id)
+                && !plan.constants.contains_key(&id)
+        })
+        .map(|binding| binding.id.0)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        plan.val_binding_of.insert(id, plan.n_val_bindings);
+        plan.n_val_bindings += 1;
+    }
+}
+
+fn val_binding_slot(plan: &EscapePlan, binding: u32) -> Option<u32> {
+    plan.val_binding_of.get(&binding).copied()
+}
+
+/// Generic cell accesses that would bypass a promoted slot. Any hit means
+/// some emitter path does not know about `val_bindings`, so the caller
+/// regenerates the function without promotion.
+fn promoted_binding_leaks(code: &str, plan: &EscapePlan, storage: SlotStorage) -> bool {
+    plan.val_binding_of.keys().any(|&id| {
+        let mut patterns = vec![
+            format!("bindings.get(&{id})"),
+            format!("bindings.get_mut(&{id})"),
+            format!("bindings.insert({id},"),
+            format!("capture_getters.get(&{id})"),
+            format!("capture_setters.get(&{id})"),
+            format!("__w3cos_cb_{id}"),
+            format!("__w3cos_cg_{id}"),
+            format!("__w3cos_cs_{id}"),
+            format!("__captures.get(&{id})"),
+        ];
+        if !matches!(storage, SlotStorage::Map(_)) {
+            let index = slot_index(storage, id);
+            patterns.push(format!("bindings.get({index})"));
+            patterns.push(format!("bindings.get_mut({index})"));
+            // Leading space: `val_bindings[i]` must not match.
+            patterns.push(format!(" bindings[{index}]"));
+            patterns.push(format!("capture_getters.get({index})"));
+            patterns.push(format!("capture_setters.get({index})"));
+        }
+        patterns.iter().any(|pattern| code.contains(pattern.as_str()))
+    })
 }
 
 /// `let`/`var` bindings stay writable from every nested closure, including
@@ -1198,6 +1290,13 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
                 plan.n_bool
             ));
         }
+    }
+    if plan.n_val_bindings > 0 {
+        fields.push_str(&format!(
+            "    val_bindings: [Option<w3cos_core::Value>; {}],\n",
+            plan.n_val_bindings
+        ));
+        inits.push_str("        val_bindings,\n");
     }
     if plan.n_num_bindings > 0 {
         if (plan.n_num_bindings as usize) <= INLINE_FRAME {
@@ -2194,12 +2293,33 @@ fn generate_sync_function_with_factories(
     factories: &HashMap<FunctionId, String>,
     module_specifier: Option<&str>,
 ) -> Result<String> {
+    let promoted =
+        generate_sync_function_with_factories_inner(function, rust_name, factories, module_specifier);
+    if let Ok((code, false)) = promoted {
+        return Ok(code);
+    }
+    let previous = VALUE_BINDING_PROMOTION.with(|flag| flag.replace(false));
+    let fallback =
+        generate_sync_function_with_factories_inner(function, rust_name, factories, module_specifier);
+    VALUE_BINDING_PROMOTION.with(|flag| flag.set(previous));
+    fallback.map(|(code, _)| code)
+}
+
+/// Returns the code and whether a promoted binding leaked into a generic
+/// cell access (the caller then regenerates without promotion).
+fn generate_sync_function_with_factories_inner(
+    function: &Function,
+    rust_name: &str,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+) -> Result<(String, bool)> {
     let rust_name = sanitize_identifier(rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let shared = shared_numeric_ids(function);
     SHARED_NUMBERS.with(|numbers| *numbers.borrow_mut() = shared.clone());
     let _shared_guard = SharedNumberGuard;
-    let plan = analyze_function(function);
+    let mut plan = analyze_function(function);
+    promote_value_bindings(function, &mut plan, &shared);
     let back_edges = analyze_and_warn(function, module_specifier);
     let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
     let storage = slot_storage(function);
@@ -2286,6 +2406,18 @@ fn generate_sync_function_with_factories(
     let skip_unread_this = function
         .this_binding
         .is_some_and(|binding| !binding_is_used(function, binding.0));
+    let mut val_initializers = String::new();
+    if plan.n_val_bindings > 0 {
+        val_initializers.push_str(&format!(
+            "    let mut val_bindings: [Option<w3cos_core::Value>; {}] = std::array::from_fn(|_| None);\n",
+            plan.n_val_bindings
+        ));
+    }
+    let parameter_ids = function
+        .parameters
+        .iter()
+        .map(|binding| binding.0)
+        .collect::<HashSet<_>>();
     for binding in &function.bindings {
         if num_binding_slot(&plan, binding.id.0).is_some() || shared.contains(&binding.id.0) {
             continue;
@@ -2297,6 +2429,14 @@ fn generate_sync_function_with_factories(
             binding.kind,
             BindingKind::Var | BindingKind::Function | BindingKind::Parameter
         );
+        if let Some(slot) = val_binding_slot(&plan, binding.id.0) {
+            if initialized && !parameter_ids.contains(&binding.id.0) {
+                val_initializers.push_str(&format!(
+                    "    val_bindings[{slot}] = Some(w3cos_core::Value::Undefined);\n"
+                ));
+            }
+            continue;
+        }
         binding_initializers.push_str(&emit_binding_assign(
             storage,
             binding.id.0,
@@ -2307,6 +2447,12 @@ fn generate_sync_function_with_factories(
     }
     let mut parameter_initializers = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
+        if let Some(slot) = val_binding_slot(&plan, binding.0) {
+            val_initializers.push_str(&format!(
+                "    val_bindings[{slot}] = Some(__args.get({index}).cloned().unwrap_or(w3cos_core::Value::Undefined));\n"
+            ));
+            continue;
+        }
         parameter_initializers.push_str(&emit_binding_assign(
             storage,
             binding.0,
@@ -2344,7 +2490,7 @@ fn generate_sync_function_with_factories(
     let (num_cells_field, num_cells_local, num_cells_init) = emit_num_cells(&shared);
     let fast_prefix = emit_number_bump_prefix(function);
 
-    Ok(format!(
+    let code = format!(
         r#"
 struct {type_name} {{
 {registers_field}
@@ -2362,7 +2508,7 @@ pub fn {rust_name}(
     __args: &[w3cos_core::Value],
     __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
-{fast_prefix}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    {type_name} {{
+{fast_prefix}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{val_initializers}{slot_capture_init}    {type_name} {{
 {registers_init}
 {num_init}        bindings,
         capture_getters,
@@ -2373,7 +2519,12 @@ pub fn {rust_name}(
 "#,
         registers_field = emit_registers_field(plan.n_val),
         registers_init = emit_registers_init(plan.n_val),
-    ))
+    );
+    let leaked = promoted_binding_leaks(&code, &plan, storage);
+    if std::env::var_os("W3COS_AOT_PROMOTE_DEBUG").is_some() {
+        eprintln!("[promote] {rust_name}: {} slots, leaked {leaked}, ids {:?}", plan.n_val_bindings, plan.val_binding_of.keys().collect::<Vec<_>>());
+    }
+    Ok((code, leaked))
 }
 
 fn generate_async_function_with_factories(
@@ -6348,6 +6499,14 @@ fn emit_instruction(
         Instruction::LoadBinding { dst, binding } if is_shared_number(binding.0) => {
             emit_shared_number_load(plan, dst.0, binding.0)
         }
+        Instruction::LoadBinding { dst, binding } if val_binding_slot(plan, binding.0).is_some() => {
+            let slot = val_binding_slot(plan, binding.0).unwrap();
+            let propagate = emit_exception_propagation(exception_target, mode, plan);
+            format!(
+                "match &self.val_bindings[{slot}] {{ Some(__w3cos_value) => {{ self.registers[{}] = __w3cos_value.clone(); }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}",
+                register(*dst)
+            )
+        }
         Instruction::LoadBinding { dst, binding }
             if num_binding_slot(plan, binding.0).is_some() =>
         {
@@ -6379,6 +6538,15 @@ fn emit_instruction(
             emit_shared_number_store(plan, binding.0, value.0)
         }
         Instruction::InitializeBinding { binding, value }
+            if val_binding_slot(plan, binding.0).is_some() =>
+        {
+            format!(
+                "self.val_bindings[{}] = Some({});",
+                val_binding_slot(plan, binding.0).unwrap(),
+                emit_boxed_value(plan, value.0)
+            )
+        }
+        Instruction::InitializeBinding { binding, value }
             if num_binding_slot(plan, binding.0).is_some() =>
         {
             emit_numeric_binding_store(plan, binding.0, value.0)
@@ -6395,6 +6563,16 @@ fn emit_instruction(
         ),
         Instruction::StoreBinding { binding, value } if is_shared_number(binding.0) => {
             emit_shared_number_store(plan, binding.0, value.0)
+        }
+        Instruction::StoreBinding { binding, value }
+            if val_binding_slot(plan, binding.0).is_some() =>
+        {
+            let slot = val_binding_slot(plan, binding.0).unwrap();
+            let propagate = emit_exception_propagation(exception_target, mode, plan);
+            format!(
+                "let __w3cos_stored = {}; match &mut self.val_bindings[{slot}] {{ Some(__w3cos_slot) => {{ *__w3cos_slot = __w3cos_stored; }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}",
+                emit_boxed_value(plan, value.0)
+            )
         }
         Instruction::StoreBinding { binding, value }
             if num_binding_slot(plan, binding.0).is_some() =>
@@ -6419,7 +6597,10 @@ fn emit_instruction(
                 )
             }
         }
-        Instruction::RefreshBinding { binding } if num_binding_slot(plan, binding.0).is_some() => {
+        Instruction::RefreshBinding { binding }
+            if num_binding_slot(plan, binding.0).is_some()
+                || val_binding_slot(plan, binding.0).is_some() =>
+        {
             String::new()
         }
         Instruction::RefreshBinding { binding } => format!(
@@ -8779,6 +8960,38 @@ fn main() {{
             );
         }
         assert!(!generated.contains("w3cos_vm"));
+    }
+
+    #[test]
+    fn non_escaping_locals_use_value_slots_not_shared_cells() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                "use strict";
+                function pick(word) {
+                    let label = "w:" + word;
+                    let kept = word;
+                    const read = function () { return kept; };
+                    return label + read();
+                }
+                pick;
+            "#,
+            "app:///value-slots.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("pick"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "pick_aot").unwrap();
+        assert!(
+            generated.contains("val_bindings: [Option<w3cos_core::Value>;"),
+            "non-escaping locals should live in plain Value slots: {generated}"
+        );
+        assert!(
+            generated.contains("AotCapture::Cell") || generated.contains("RefCell"),
+            "the captured local must keep a shared cell: {generated}"
+        );
     }
 
     #[test]
