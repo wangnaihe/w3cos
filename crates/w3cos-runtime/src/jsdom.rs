@@ -457,9 +457,10 @@ thread_local! {
     static BRIDGE_REALM_GENERATION: Cell<u32> = const { Cell::new(1) };
     /// node id → memoized element Value (identity: `a === b` via Rc::ptr_eq).
     static ELEMENT_VALUES: RefCell<HashMap<u32, ElementMemo>> = RefCell::new(HashMap::new());
-    /// (node, key) → JS expando properties assigned through the set trap
-    /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
-    static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
+    /// node → (key → JS expando properties assigned through the set trap)
+    /// (plus bridge-cached "style"/"classList"/"__ctx2d" values). Grouping by
+    /// node lets reads use `&str` keys without allocating a temporary `String`.
+    static ELEMENT_PROPS: RefCell<HashMap<u32, HashMap<String, Value>>> = RefCell::new(HashMap::new());
     static KNOWN_EXPANDS: RefCell<HashMap<(u32, u8), Value>> = RefCell::new(HashMap::new());
     // Navigation-owned origin decision, never a writable JS document URL.
     static OBJECT_DOCUMENT_READABLE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
@@ -994,7 +995,7 @@ fn get_expando(node: u32, key: &str) -> Option<Value> {
     if let Some(id) = known_expando(key) {
         return KNOWN_EXPANDS.with(|props| props.borrow().get(&(node, id)).cloned());
     }
-    ELEMENT_PROPS.with(|p| p.borrow().get(&(node, key.to_string())).cloned())
+    ELEMENT_PROPS.with(|p| p.borrow().get(&node)?.get(key).cloned())
 }
 
 fn set_expando(node: u32, key: &str, value: Value) {
@@ -1008,7 +1009,12 @@ fn set_expando(node: u32, key: &str, value: Value) {
         KNOWN_EXPANDS.with(|props| props.borrow_mut().insert((node, id), value));
         return;
     }
-    ELEMENT_PROPS.with(|p| p.borrow_mut().insert((node, key.to_string()), value));
+    ELEMENT_PROPS.with(|p| {
+        p.borrow_mut()
+            .entry(node)
+            .or_default()
+            .insert(key.to_string(), value)
+    });
 }
 
 fn shadow_host_for_root(root: u32) -> Option<u32> {
@@ -3350,7 +3356,7 @@ fn release_element_wrapper(node: u32) {
 }
 
 fn purge_detached_node_js(node: u32) {
-    ELEMENT_PROPS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
+    ELEMENT_PROPS.with(|props| props.borrow_mut().remove(&node));
     KNOWN_EXPANDS.with(|props| props.borrow_mut().retain(|(id, _), _| *id != node));
     STYLE_CACHE.with(|cache| cache.borrow_mut().retain_other_nodes(node));
     LISTENERS.with(|listeners| {
@@ -4517,8 +4523,10 @@ fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
         }
         let direct = ELEMENT_PROPS.with(|props| {
             let props = props.borrow();
-            props.contains_key(&(node, "__w3cos_custom_element_upgraded".to_string()))
-                || props.contains_key(&(node, "disconnectedCallback".to_string()))
+            props.get(&node).is_some_and(|node_props| {
+                node_props.contains_key("__w3cos_custom_element_upgraded")
+                    || node_props.contains_key("disconnectedCallback")
+            })
         });
         if direct {
             found = true;
