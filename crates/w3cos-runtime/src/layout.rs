@@ -50,8 +50,8 @@ struct WrappedTextMeasure {
 
 #[derive(Default)]
 struct TextMeasureCache {
-    intrinsic: HashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
-    wrapped_height: HashMap<String, Vec<WrappedTextMeasure>>,
+    intrinsic: w3cos_std::fxhash::FxHashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
+    wrapped_height: w3cos_std::fxhash::FxHashMap<String, Vec<WrappedTextMeasure>>,
     entries: usize,
 }
 
@@ -4018,7 +4018,7 @@ pub(crate) fn wrapped_text_height(
 
 fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> TextMeasureKey {
     use std::hash::{Hash, Hasher};
-    let mut typography = std::collections::hash_map::DefaultHasher::new();
+    let mut typography = w3cos_std::fxhash::FxHasher::default();
     // Resolved cascade identities alone do not distinguish platform fallback
     // faces. Preserve all typography that can change shaping/measurement,
     // while excluding paint-only properties from cache invalidation.

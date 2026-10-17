@@ -533,11 +533,15 @@ thread_local! {
     /// address a recycled node id after navigation.
     static BRIDGE_REALM_GENERATION: Cell<u32> = const { Cell::new(1) };
     /// node id → memoized element Value (identity: `a === b` via Rc::ptr_eq).
-    static ELEMENT_VALUES: RefCell<HashMap<u32, ElementMemo>> = RefCell::new(HashMap::new());
+    static ELEMENT_VALUES: RefCell<w3cos_std::fxhash::FxHashMap<u32, ElementMemo>> =
+        RefCell::new(Default::default());
     /// (node, key) → JS expando properties assigned through the set trap
     /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
-    static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
-    static KNOWN_EXPANDS: RefCell<HashMap<(u32, u8), Value>> = RefCell::new(HashMap::new());
+    /// Fx-hashed: probed per node by removal lifecycle walks.
+    static ELEMENT_PROPS: RefCell<w3cos_std::fxhash::FxHashMap<(u32, String), Value>> =
+        RefCell::new(Default::default());
+    static KNOWN_EXPANDS: RefCell<w3cos_std::fxhash::FxHashMap<(u32, u8), Value>> =
+        RefCell::new(Default::default());
     // Navigation-owned origin decision, never a writable JS document URL.
     static OBJECT_DOCUMENT_READABLE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     /// Processing-instruction attributes are projected from `data`, but values
@@ -4865,15 +4869,19 @@ fn prototype_chain_has_authored_lifecycle(mut prototype: Value) -> bool {
 
 fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
     let mut found = false;
-    let mut prototype_cache = HashMap::<u64, bool>::new();
+    let mut prototype_cache = w3cos_std::fxhash::FxHashMap::<u64, bool>::default();
+    // Reuse the probe keys instead of allocating two Strings per node.
+    let mut upgraded = (0u32, "__w3cos_custom_element_upgraded".to_string());
+    let mut disconnected = (0u32, "disconnectedCallback".to_string());
     walk_subtree(root, &mut |node| {
         if found {
             return;
         }
+        upgraded.0 = node;
+        disconnected.0 = node;
         let direct = ELEMENT_PROPS.with(|props| {
             let props = props.borrow();
-            props.contains_key(&(node, "__w3cos_custom_element_upgraded".to_string()))
-                || props.contains_key(&(node, "disconnectedCallback".to_string()))
+            props.contains_key(&upgraded) || props.contains_key(&disconnected)
         });
         if direct {
             found = true;

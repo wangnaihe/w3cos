@@ -223,7 +223,7 @@ thread_local! {
 }
 
 fn face_hit_key(family: &str, weight: FontWeight, style: FontFaceStyle) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
     family.hash(&mut hasher);
     weight.hash(&mut hasher);
     style.hash(&mut hasher);
@@ -870,11 +870,11 @@ impl FontRegistry {
     ) -> Option<LoadedFont> {
         type Key = (usize, u64, FontWeight, FontFaceStyle, Option<char>, bool);
         thread_local! {
-            static MEMO: RefCell<(u64, HashMap<Key, Option<LoadedFont>>)> =
-                RefCell::new((u64::MAX, HashMap::new()));
+            static MEMO: RefCell<(u64, w3cos_std::fxhash::FxHashMap<Key, Option<LoadedFont>>)> =
+                RefCell::new((u64::MAX, Default::default()));
         }
         let revision = self.revision();
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = w3cos_std::fxhash::FxHasher::default();
         stack.hash(&mut hasher);
         let key: Key = (
             self as *const Self as usize,
@@ -1031,15 +1031,18 @@ impl FontRegistry {
     /// text node walked the fallback list once per character.
     pub(crate) fn cascade_cache_key(&self, style: &w3cos_std::style::Style, text: &str) -> u64 {
         thread_local! {
-            static MEMO: RefCell<(u64, usize, HashMap<u64, HashMap<String, u64>>)> =
-                RefCell::new((u64::MAX, 0, HashMap::new()));
+            static MEMO: RefCell<(
+                u64,
+                usize,
+                w3cos_std::fxhash::FxHashMap<u64, w3cos_std::fxhash::FxHashMap<String, u64>>,
+            )> = RefCell::new((u64::MAX, 0, Default::default()));
         }
         #[cfg(feature = "dynamic-js")]
         if std::ptr::eq(self, Self::global()) {
             crate::dynamic_script::request_stylesheet_fonts_for_text(style, text);
         }
         let revision = self.revision();
-        let mut meta = DefaultHasher::new();
+        let mut meta = w3cos_std::fxhash::FxHasher::default();
         (self as *const Self as usize).hash(&mut meta);
         style.font_family.hash(&mut meta);
         style.font_weight.hash(&mut meta);
@@ -1072,7 +1075,7 @@ impl FontRegistry {
     }
 
     fn cascade_cache_key_uncached(&self, style: &w3cos_std::style::Style, text: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = w3cos_std::fxhash::FxHasher::default();
         style.font_kerning.hash(&mut hasher);
         style.font_feature_kern.hash(&mut hasher);
         for run in self.resolve_style_runs(style, text) {
