@@ -211,6 +211,7 @@ const OP_CHAIN_DENY: u8 = 122;
 const OP_CHAIN_SAVE: u8 = 123;
 const OP_TX_SEND: u8 = 124;
 const OP_TX_HOLD: u8 = 125;
+const OP_INFER_BACKEND: u8 = 126;
 const OP_SANDBOX_FS: u8 = 127;
 const OP_SANDBOX_NET: u8 = 128;
 
@@ -776,6 +777,7 @@ fn on_shell_intent(code: u8, draft: &str) {
         OP_CHAIN_DENY => deny_chain_read(session),
         OP_CHAIN_SAVE => save_chain_endpoint(session, draft),
         OP_L2_TOGGLE => toggle_l2(session),
+        OP_INFER_BACKEND => toggle_infer_backend(session),
         OP_SHARED_PLUGIN => {
             shared_launch::spawn_detached(
                 "plugin",
@@ -2882,6 +2884,25 @@ fn toggle_l2(session: &mut IntentSession) {
         state::get_signal(PHASE_SIGNAL),
         &locale::t("toast-l2-blocked"),
     );
+}
+
+fn toggle_infer_backend(session: &mut IntentSession) {
+    use w3cos_ai_bridge::infer::{self, InferBackendKind};
+    let next = if infer::active_backend() == InferBackendKind::InProcess {
+        InferBackendKind::Inferd
+    } else {
+        InferBackendKind::InProcess
+    };
+    let notice = if infer::set_runtime_backend(next).is_ok() {
+        if next == InferBackendKind::InProcess {
+            locale::t("toast-infer-in-process")
+        } else {
+            locale::t("toast-infer-inferd")
+        }
+    } else {
+        locale::t("infer-backend-unavailable")
+    };
+    sync_session(session, state::get_signal(PHASE_SIGNAL), &notice);
 }
 
 fn session_l2_on() -> bool {
@@ -7755,6 +7776,38 @@ fn settings_l2_page() -> Vec<Component> {
     rows.push(settings_row(&locale::t("l2-env"), &env_flag));
     rows.push(settings_row(&locale::t("l2-model"), &model));
     rows.push(settings_row(&locale::t("l2-endpoint"), &endpoint));
+    rows.push(settings_row(
+        &locale::t("infer-backend"),
+        &infer_backend_label(),
+    ));
+    let in_process = w3cos_ai_bridge::infer::active_backend()
+        == w3cos_ai_bridge::infer::InferBackendKind::InProcess;
+    rows.push(settings_switch(
+        &locale::t("infer-backend-toggle"),
+        in_process,
+        OP_INFER_BACKEND,
+    ));
+    rows.push(Component::text(
+        locale::t("infer-backend-detail"),
+        Style {
+            font_size: 13.0,
+            color: Color::from_hex("#d5dee8"),
+            ..Style::default()
+        },
+    ));
+    if w3cos_ai_bridge::infer::requested_backend()
+        == w3cos_ai_bridge::infer::InferBackendKind::InProcess
+        && !w3cos_ai_bridge::infer::in_process_compiled()
+    {
+        rows.push(Component::text(
+            locale::t("infer-backend-unavailable"),
+            Style {
+                font_size: 13.0,
+                color: Color::from_hex("#ffe08a"),
+                ..Style::default()
+            },
+        ));
+    }
     rows.push(chrome_button(
         if on {
             locale::t("l2-turn-off")
@@ -7765,6 +7818,16 @@ fn settings_l2_page() -> Vec<Component> {
         if on { "#3d5570" } else { "#1d4e89" },
     ));
     rows
+}
+
+fn infer_backend_label() -> String {
+    if w3cos_ai_bridge::infer::active_backend()
+        == w3cos_ai_bridge::infer::InferBackendKind::InProcess
+    {
+        locale::t("infer-backend-in-process")
+    } else {
+        locale::t("infer-backend-inferd")
+    }
 }
 
 fn settings_row(label: &str, value: &str) -> Component {
@@ -13108,5 +13171,67 @@ mod shell_ux_tests {
         state::set_signal(OPEN_MASK_SIGNAL, 0);
         state::set_signal(APP_SIGNAL, 0);
         state::set_text_signal(TIER_SIGNAL, "");
+    }
+
+    #[test]
+    fn infer_backend_toggle_uses_fluent_and_stays_out_of_process_by_default() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        ensure_shell_signals();
+        w3cos_ai_bridge::infer::clear_runtime_backend();
+        state::note_shell_viewport(1200.0, 800.0);
+        state::set_signal(PHASE_SIGNAL, 0);
+        for tag in ["en", "zh-CN"] {
+            locale::set_locale(tag);
+            let page = Component::column(Style::default(), settings_l2_page());
+            let blob = text_blob(&page);
+            let current = locale::t("infer-backend-inferd");
+            let toggle = locale::t("infer-backend-toggle");
+            let detail = locale::t("infer-backend-detail");
+            assert_ne!(current, "infer-backend-inferd", "{tag}");
+            assert_ne!(toggle, "infer-backend-toggle", "{tag}");
+            assert!(detail.contains("SHA-256"), "{tag} {detail}");
+            assert!(blob.contains(&current), "{tag} {blob}");
+            assert!(blob.contains(&toggle), "{tag} {blob}");
+            assert!(blob.contains(&detail), "{tag} {blob}");
+            assert_eq!(
+                w3cos_ai_bridge::infer::active_backend(),
+                w3cos_ai_bridge::infer::InferBackendKind::Inferd
+            );
+        }
+        locale::set_locale("en");
+        on_shell_intent(OP_INFER_BACKEND, "");
+        #[cfg(not(feature = "in-process-infer"))]
+        {
+            assert_eq!(
+                state::get_signal_text(TOAST_SIGNAL),
+                locale::t("infer-backend-unavailable")
+            );
+            assert_eq!(
+                w3cos_ai_bridge::infer::active_backend(),
+                w3cos_ai_bridge::infer::InferBackendKind::Inferd
+            );
+        }
+        #[cfg(feature = "in-process-infer")]
+        {
+            assert_eq!(
+                state::get_signal_text(TOAST_SIGNAL),
+                locale::t("toast-infer-in-process")
+            );
+            assert_eq!(
+                w3cos_ai_bridge::infer::active_backend(),
+                w3cos_ai_bridge::infer::InferBackendKind::InProcess
+            );
+            on_shell_intent(OP_INFER_BACKEND, "");
+            assert_eq!(
+                state::get_signal_text(TOAST_SIGNAL),
+                locale::t("toast-infer-inferd")
+            );
+            assert_eq!(
+                w3cos_ai_bridge::infer::active_backend(),
+                w3cos_ai_bridge::infer::InferBackendKind::Inferd
+            );
+        }
+        w3cos_ai_bridge::infer::clear_runtime_backend();
+        locale::set_locale("zh-CN");
     }
 }

@@ -202,6 +202,14 @@ l2-endpoint = 端点
 l2-endpoint-default = 未设置，不连接
 l2-turn-off = 关闭 L2
 l2-turn-on = 打开 L2
+infer-backend = 推理
+infer-backend-inferd = 独立进程（w3cos-inferd）
+infer-backend-in-process = 本进程
+infer-backend-toggle = 在本进程里推理
+infer-backend-detail = 默认是独立的 w3cos-inferd 进程。模型崩溃留在那个进程，也可以把该进程沙箱起来，不碰这个窗口的文件和网络。只有这个构建包含进程内引擎，并且打开这个开关，才会在本进程推理。那样少一个进程，一步可以更快开始，权重占用的是本进程的内存。引擎出错会连这个窗口一起退出。这个开关不会下载权重。下载要先同意，并且只有 SHA-256 相符才保留文件。
+infer-backend-unavailable = 这个构建把推理留在 w3cos-inferd。进程内引擎没有编译进来。
+toast-infer-inferd = 推理仍在独立进程 w3cos-inferd。
+toast-infer-in-process = 推理将在本进程运行。权重只在同意后加载，并且 SHA-256 必须相符。
 
 open-count = { $count ->
    *[other] { $count } 个打开

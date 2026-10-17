@@ -1,8 +1,11 @@
 //! L2 planners. Inference is a blocking call meant for a worker thread.
 //!
-//! [`ScriptedPlanner`] is an offline fixture. [`OpenAiPlanner`] talks to any
-//! OpenAI-compatible `/v1/chat/completions` endpoint (llama-server, Ollama,
-//! or a remote API). Both are off unless the shell is started with `W3COS_L2`.
+//! [`ScriptedPlanner`] is an offline fixture. [`OpenAiPlanner`] asks
+//! [`crate::infer::InferenceBackend`] for one step. The default backend is
+//! `w3cos-inferd` (any OpenAI-compatible `/v1/chat/completions` server). The
+//! in-process backend runs only when the `in-process-infer` feature is
+//! compiled and `W3COS_INFER_BACKEND=in-process`. Both are off unless the
+//! shell is started with `W3COS_L2`.
 
 use std::io::Read;
 use std::time::{Duration, Instant};
@@ -159,7 +162,7 @@ pub enum L2Mode {
 }
 
 pub fn mode_from_env() -> Result<L2Mode, String> {
-    mode_from_parts(
+    mode_with_backend(
         &std::env::var("W3COS_L2").unwrap_or_default(),
         std::env::var("W3COS_L2_BASE_URL").ok().as_deref(),
         std::env::var("W3COS_L2_MODEL").ok().as_deref(),
@@ -167,6 +170,7 @@ pub fn mode_from_env() -> Result<L2Mode, String> {
         std::env::var("W3COS_L2_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse().ok()),
+        crate::infer::requested_backend(),
     )
 }
 
@@ -177,16 +181,28 @@ pub fn mode_from_parts(
     api_key: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<L2Mode, String> {
+    mode_with_backend(
+        flag,
+        base_url,
+        model,
+        api_key,
+        timeout_secs,
+        crate::infer::InferBackendKind::Inferd,
+    )
+}
+
+fn mode_with_backend(
+    flag: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    api_key: Option<&str>,
+    timeout_secs: Option<u64>,
+    backend: crate::infer::InferBackendKind,
+) -> Result<L2Mode, String> {
     match flag.trim() {
         "" | "0" | "false" => Ok(L2Mode::Off),
         "script" => Ok(L2Mode::Script),
         "1" | "true" => {
-            let base_url = base_url
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or("W3COS_L2=1 but W3COS_L2_BASE_URL is unset")?
-                .trim_end_matches('/')
-                .to_string();
             let model = model
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -196,11 +212,32 @@ pub fn mode_from_parts(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string);
+            let timeout = Duration::from_secs(timeout_secs.unwrap_or(120).clamp(1, 600));
+            if backend == crate::infer::InferBackendKind::InProcess {
+                if !crate::infer::in_process_compiled() {
+                    return Err(
+                        "W3COS_INFER_BACKEND=in-process but this build has no in-process engine"
+                            .into(),
+                    );
+                }
+                return Ok(L2Mode::Remote(OpenAiConfig {
+                    base_url: String::new(),
+                    model,
+                    api_key,
+                    timeout,
+                }));
+            }
+            let base_url = base_url
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("W3COS_L2=1 but W3COS_L2_BASE_URL is unset")?
+                .trim_end_matches('/')
+                .to_string();
             Ok(L2Mode::Remote(OpenAiConfig {
                 base_url,
                 model,
                 api_key,
-                timeout: Duration::from_secs(timeout_secs.unwrap_or(120).clamp(1, 600)),
+                timeout,
             }))
         }
         other => Err(format!("unknown W3COS_L2 value {other:?}")),
@@ -250,21 +287,12 @@ pub struct OpenAiPlanner {
 
 impl Planner for OpenAiPlanner {
     fn complete(&self, turn: &PlannerTurn) -> Result<PlannerCompletion, String> {
-        let started = Instant::now();
-        let body = self.request_body(turn);
-        let (bytes, first_token_ms) = post_chat(&self.config, &body)?;
-        let text = String::from_utf8_lossy(&bytes);
-        let step = parse_model_body(&text)?;
-        Ok(PlannerCompletion {
-            step,
-            first_token_ms,
-            total_ms: started.elapsed().as_millis(),
-        })
+        crate::infer::dispatch(&self.config, turn)
     }
 }
 
 impl OpenAiPlanner {
-    fn request_body(&self, turn: &PlannerTurn) -> String {
+    pub(crate) fn request_body(&self, turn: &PlannerTurn) -> String {
         let mut messages = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
         messages.extend(turn.messages.iter().map(ChatMessage::to_json));
         json!({
@@ -280,7 +308,10 @@ impl OpenAiPlanner {
     }
 }
 
-fn post_chat(config: &OpenAiConfig, body: &str) -> Result<(Vec<u8>, Option<u128>), String> {
+pub(crate) fn post_chat(
+    config: &OpenAiConfig,
+    body: &str,
+) -> Result<(Vec<u8>, Option<u128>), String> {
     let agent = Agent::config_builder()
         .timeout_global(Some(config.timeout))
         .build()
