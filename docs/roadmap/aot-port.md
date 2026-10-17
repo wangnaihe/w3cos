@@ -202,7 +202,26 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
          | `set_property` | 1530 ns | 1311 ns（噪声范围） |
          | 句柄 clone + drop | 2.2 ns | 6.9 ns（每次 clone/drop 多一次线程局部的槽位计数） |
          | 10 万个对象装进数组再丢弃 | 798 ns/个，丢弃后存活 100,000 | 944 ns/个，存活 0 |
-       - 还没做的：AOT 冗余 inc/dec 消除（item 4）、句柄 clone 的计数开销优化、标量替换和跨过程逃逸分析、环检测器（item 6）。
+       - 还没做的：标量替换和跨过程逃逸分析、环检测器（item 6）；冗余 inc/dec 消除见下一条。
+   - **冗余 inc/dec 消除，第一步（已完成）**：
+     - 计数快路径：槽位元数据改成 `Cell`，每种槽的元数据缓冲区地址和长度发布到一个 `const`、无析构的线程局部里。`retain` 和"释放后仍大于 0"的 `release` 不再借用 `RefCell<PageArena>`，也不再经过惰性初始化的 TLS；归零（generation +1、live 计数、payload drop）仍在借用 arena 的慢路径上。`meta.push`（唯一会搬动缓冲区的操作）之后重新发布，slab drop 之前先撤销发布，所以指针不会悬空；上一页的句柄在 epoch 检查处就被挡掉，不会走到快路径。
+     - AOT 生成代码：`&Value` 参数位置（`add`、二元/一元 intrinsic、属性/私有字段/define 的对象和键、数组追加目标、rest/spread 源）直接借用 `self.registers[i]`，不再 clone 一份临时值再 drop；按值参数位置（属性值、数组追加、绑定写入/初始化、对象/数组字面量元素）在寄存器的最后一次使用时 move 出来（先 hoist 成 `let`，不和借用重叠），同一条指令里读两次的寄存器不 move（`o.self = o`）；`return` 在最后一次使用时 move。最后一次使用沿用已有的活跃性分析（含异常处理块的活跃集），借用由 Rust 借用检查器保证，不可能提前释放。
+     - 实测（box x86_64，release，box 噪声较大，各 3 次）：
+
+       | | 前 | 后 |
+       |---|---|---|
+       | `arena_rc_bench` 句柄 clone + drop | 7.0–7.7 ns | 5.9–6.4 ns |
+       | 同一循环换成数字（下限：枚举分派 + `Value` 的 drop glue） | 3.4–3.5 ns | 3.5–3.7 ns |
+       | 计数本身的开销（减去下限） | ≈ 3.9 ns | ≈ 2.6 ns |
+       | 示例 bundle（`particles` 类实例 + 方法、`filter/map/reduce`、字典查找、递归建树）生成代码里的 `self.registers[i].clone()` | 303 处 | 8 处 |
+       | 同上，运行时 retain / release 次数 | 30.05M / 68.85M | 22.40M / 61.20M |
+       | 同上，总耗时 | 9.0–9.6 s | 8.6–9.0 s |
+       | probe（`workEscapeDrop` + `workClosures` + `workBatch`，5 轮）生成代码里的寄存器 clone | 81 处 | 4 处 |
+       | probe 运行时 retain / release 次数 | 1.50M / 3.82M | 0.90M / 3.22M |
+       | probe 耗时 | 474–557 ms | 447–497 ms |
+
+       两个程序的计算结果、存活对象数和 RSS 前后一致。`retain`/`release` 次数用 `w3cos-core` 的 `rc-stats` feature 统计（默认关闭）。
+     - 还没做的：`LoadBinding`（`binding.0.clone()`）和捕获变量 getter 调用（每次读捕获变量都是一次函数调用）是剩下的大头；调用参数以外的 callee/receiver 借用、跨基本块的 inc/dec 配对消除、语句边界批量释放都还没做。示例 bundle 在 `main` 返回后仍有约 24 万个对象存活（改前改后一样），需要单独排查是不是环。
 5. ~~`WeakRef` / `FinalizationRegistry` / `WeakMap` / `WeakSet` 完整实现~~ **已完成（M1 PR 1）**：
    - 原有基础：`w3cos-core/src/weak.rs` 早已基于 `Rc`/`Weak` 实现四个类，编译器 `unique_back_edges.rs` 会把三类常见闭包回边（自挂载、Promise 回调捕获自身、集合迭代器）自动改写成 `WeakRef`。
    - **确定性 finalization**：每个堆分配的 `HeapAllocation` 带一个 48 位、永不复用的弱身份 id（塞进已有的对齐空洞，对象大小不变）。被弱引用过的对象在 `Drop` 时只把 id 记进死亡队列（不在 `Drop` 里跑 JS、不重入）；下一个 job checkpoint（`drain_microtasks` 清空微任务后）统一处理并按"死亡顺序 → 同一目标按注册顺序"调用 `FinalizationRegistry` 回调，每个回调独立 panic 边界，回调里排的微任务在下一批回调前清空。`cleanupSome()` 保留，可同步交付本 registry 的待处理项；`unregister()` 同时取消已死但未交付的项；registry 自身死亡后不再回调。`FinalizationRegistry.cleanupMode` 现在是 `"automatic"`。
