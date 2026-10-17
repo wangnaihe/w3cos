@@ -14,6 +14,9 @@ pub(super) struct RuleSet {
     has_sibling_dependencies: bool,
     has_relational_dependencies: bool,
     has_structural_dependencies: bool,
+    /// Container queries or `[style]` selectors: matching can change
+    /// without a class/id/attribute/tree mutation.
+    has_match_volatile_rules: bool,
 }
 
 enum RuleBucket<'a> {
@@ -72,6 +75,7 @@ impl RuleSet {
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
+        self.has_match_volatile_rules = false;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -98,6 +102,23 @@ impl RuleSet {
             .iter()
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
+
+        self.has_match_volatile_rules |= self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, _)| property == super::CONTAINER_QUERY_MARKER)
+            || self.rules[index].chain.iter().any(|compound| {
+                compound
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.name().eq_ignore_ascii_case("style"))
+                    || compound.pseudo_classes.iter().any(|pseudo| match pseudo {
+                        super::PseudoClass::Not(selector) | super::PseudoClass::Has(selector) => {
+                            selector.to_ascii_lowercase().contains("style")
+                        }
+                        _ => false,
+                    })
+            });
 
         // A rule lives in one best subject bucket. Matching gathers the
         // element's buckets plus universal rules, so no per-node RuleSet scan
@@ -188,8 +209,68 @@ impl RuleSet {
         candidates
     }
 
+    /// Visit the element's rule buckets (Blink ElementRuleCollector walks
+    /// the id/class/attribute/tag/universal RuleData lists in place). A rule
+    /// lives in one bucket, but a bucket can be reached twice (duplicate
+    /// class tokens), so callers dedup the few matched rules, not the
+    /// candidates.
+    pub(super) fn for_each_candidate_bucket(
+        &self,
+        document: &Document,
+        node: NodeId,
+        mut visit: impl FnMut(&[usize]),
+    ) {
+        let node = document.get_node(node);
+        if !self.universal_rules.is_empty() {
+            visit(&self.universal_rules);
+        }
+        if !self.id_rules.is_empty()
+            && let Some((_, id)) = node
+                .attributes
+                .iter()
+                .find(|(name, _)| name.as_static() == "id")
+            && let Some(indices) = self.id_rules.get(id.as_str())
+        {
+            visit(indices);
+        }
+        if !self.class_rules.is_empty() {
+            for class in &node.class_list {
+                if let Some(indices) = self.class_rules.get(class.as_static()) {
+                    visit(indices);
+                }
+            }
+        }
+        if !self.attribute_rules.is_empty() {
+            for (name, _) in &node.attributes {
+                let name = name.as_static();
+                let simple = !name
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase() || byte == b':' || byte == b'|');
+                let indices = if simple {
+                    self.attribute_rules.get(name)
+                } else {
+                    self.attribute_rules.get(&attribute_index_key(name))
+                };
+                if let Some(indices) = indices {
+                    visit(indices);
+                }
+            }
+        }
+        if !self.tag_rules.is_empty() {
+            let mut tag_candidates = Vec::new();
+            append_tag_candidates(&self.tag_rules, node.tag.as_static(), &mut tag_candidates);
+            if !tag_candidates.is_empty() {
+                visit(&tag_candidates);
+            }
+        }
+    }
+
     pub(super) fn has_sibling_dependencies(&self) -> bool {
         self.has_sibling_dependencies
+    }
+
+    pub(super) fn has_match_volatile_rules(&self) -> bool {
+        self.has_match_volatile_rules
     }
 
     pub(super) fn has_relational_dependencies(&self) -> bool {

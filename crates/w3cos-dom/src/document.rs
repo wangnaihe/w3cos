@@ -662,6 +662,14 @@ pub struct Document {
     text_stable_epoch: u32,
     text_stable_stamp: Vec<u32>,
     style_revision_clock: u64,
+    /// `style_revision_clock` at the last invalidation that can change
+    /// selector matching (everything except inline-style-only edits).
+    last_match_change: u64,
+    /// Per-node matched rule lists, reused while `last_match_change` and the
+    /// stylesheet generation hold. Blink keeps matching results across
+    /// inherited-only recalcs the same way (a custom property on the root
+    /// does not re-run selector matching for descendants' rule sets).
+    matched_rules_cache: RefCell<Vec<Option<(u64, u64, Vec<u32>)>>>,
     style_revisions: Vec<u64>,
     focused_node: Option<NodeId>,
     focus_visible: bool,
@@ -809,6 +817,8 @@ impl Document {
             text_stable_epoch: 1,
             text_stable_stamp: Vec::new(),
             style_revision_clock: 0,
+            last_match_change: 0,
+            matched_rules_cache: RefCell::new(Vec::new()),
             style_revisions: Vec::new(),
             focused_node: None,
             focus_visible: false,
@@ -1595,6 +1605,7 @@ impl Document {
         }
         let initial_style = shared_ua_style(node.tag);
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         let style_revision = self.style_revision_clock;
         let id = if let Some(slot) = self.free_list.pop() {
             node.id = NodeId(slot);
@@ -1740,6 +1751,7 @@ impl Document {
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
     pub fn free_node(&mut self, id: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         self.style_revisions[id.0 as usize] = self.style_revision_clock;
         self.image_render_sources.remove(&id);
         self.embedded_document_hosts.remove(&id);
@@ -1969,6 +1981,7 @@ impl Document {
 
     fn touch_style_revision(&mut self, id: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         let revision = self.style_revision_clock;
         if let Some(slot) = self.style_revisions.get_mut(id.0 as usize) {
             *slot = revision;
@@ -1993,7 +2006,11 @@ impl Document {
     /// Inline declarations cannot change selector matching, but inherited
     /// values and custom properties require the complete descendant subtree.
     pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
+        let last_match_change = self.last_match_change;
         self.invalidate_style_subtree(id);
+        if stylesheet::matched_rules_survive_inline_style_edits() {
+            self.last_match_change = last_match_change;
+        }
         self.record_layout_dirty(id);
         self.note_cascade_change();
     }
@@ -2234,6 +2251,7 @@ impl Document {
 
     fn invalidate_style_subtree(&mut self, root: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         let revision = self.style_revision_clock;
         thread_local! {
             static INVALIDATE_STACK: std::cell::RefCell<Vec<NodeId>> =
@@ -2659,7 +2677,29 @@ impl Document {
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched_rules = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            stylesheet::matching_rule_indices_for_node(self, id)
+            let index = id.0 as usize;
+            let cached = self
+                .matched_rules_cache
+                .borrow()
+                .get(index)
+                .and_then(Option::as_ref)
+                .filter(|(clock, generation, _)| {
+                    *clock == self.last_match_change && *generation == stylesheet_generation
+                })
+                .map(|(_, _, rules)| rules.clone());
+            match cached {
+                Some(rules) => rules,
+                None => {
+                    let rules = stylesheet::matching_rule_indices_for_node(self, id);
+                    let mut cache = self.matched_rules_cache.borrow_mut();
+                    if cache.len() <= index {
+                        cache.resize(index + 1, None);
+                    }
+                    cache[index] =
+                        Some((self.last_match_change, stylesheet_generation, rules.clone()));
+                    rules
+                }
+            }
         } else {
             Vec::new()
         };

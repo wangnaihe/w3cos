@@ -456,6 +456,9 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     if rules.has_structural_dependencies() {
         flags |= 8;
     }
+    if rules.has_match_volatile_rules() {
+        flags |= 16;
+    }
     flags
 }
 
@@ -766,6 +769,12 @@ pub fn rule_count() -> usize {
     RULES.with(|rules| rules.borrow().rules.len())
 }
 
+/// Matched-rule lists stay valid across inline-style-only edits unless a
+/// rule depends on container size or the `style` attribute.
+pub(crate) fn matched_rules_survive_inline_style_edits() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 16 == 0)
+}
+
 /// Whether any rules are registered — fast path for the DOM walk.
 pub fn has_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 1 != 0)
@@ -1032,12 +1041,11 @@ pub(crate) fn matching_rule_indices_for_node(document: &Document, node: NodeId) 
     RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
-        let mut matched: Vec<u32> = rules
-            .candidate_indices_for_node(document, node)
-            .into_iter()
-            .filter(|&index| {
+        let mut matched: Vec<u32> = Vec::new();
+        rules.for_each_candidate_bucket(document, node, |bucket| {
+            for &index in bucket {
                 let rule = &rules.rules[index];
-                rule.pseudo_element.is_none()
+                if rule.pseudo_element.is_none()
                     && rule_matches_document_scope(rule, document_scope)
                     && ancestor_bloom.might_contain(rule.ancestor_filter)
                     && matches_chain_node(
@@ -1054,13 +1062,16 @@ pub(crate) fn matching_rule_indices_for_node(document: &Document, node: NodeId) 
                         .iter()
                         .filter(|(property, _)| property == CONTAINER_QUERY_MARKER)
                         .all(|(_, query)| container_query_matches(&rules, document, node, query))
-            })
-            .map(|index| index as u32)
-            .collect();
-        matched.sort_by_key(|&index| {
-            let rule = &rules.rules[index as usize];
-            (rule.specificity, rule.order)
+                {
+                    matched.push(index as u32);
+                }
+            }
         });
+        matched.sort_unstable_by_key(|&index| {
+            let rule = &rules.rules[index as usize];
+            (rule.specificity, rule.order, index)
+        });
+        matched.dedup();
         matched
     })
 }
