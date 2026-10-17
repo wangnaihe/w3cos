@@ -1917,6 +1917,13 @@ impl Document {
         if stylesheet::has_structural_dependencies() || stylesheet::has_relational_dependencies() {
             return true;
         }
+        // A text node never has a specified width/height (they are not
+        // inherited and no rule matches it), so its box always follows the
+        // text, like LayoutText::SetText marking NeedsLayout. Skip resolving
+        // the whole ancestor style chain per appendData.
+        if self.get_node(id).node_type == NodeType::Text {
+            return true;
+        }
         let style = self.computed_style_for(id);
         // Both axes must be specified lengths. An auto width on a
         // shrink-to-fit box still grows with the text.
@@ -28659,3 +28666,4 @@ mod extent_cache_tests {
         assert_eq!(scroller.scroll_width(&document), 100.0);
     }
 }
+
