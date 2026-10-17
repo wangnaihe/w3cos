@@ -2086,6 +2086,12 @@ impl Vm {
                     .ok_or(VmError::Unsupported("DynamicImport"))?;
                 registers[dst.0 as usize] = handler(read(*specifier).to_js_string());
             }
+            Instruction::NewTarget { dst } => {
+                // VM closures are host functions: [[Construct]] does not
+                // record a code entry for them, so only AOT code observes a
+                // constructor here.
+                registers[dst.0 as usize] = Value::Undefined;
+            }
             Instruction::ImportMeta { dst } => {
                 let value = Value::object(HashMap::from([(
                     "url".into(),

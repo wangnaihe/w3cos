@@ -1424,6 +1424,8 @@ fn bump_number(cell: &Cell<Option<f64>>, addend: f64) -> Value {
 struct FunctionMeta {
     name: &'static str,
     length: u32,
+    /// AOT code entry of a host wrapper around a compiled function (0: none).
+    code_entry: usize,
     has_name: bool,
     has_length: bool,
 }
@@ -1522,12 +1524,19 @@ impl FunctionData {
 
     /// Install the own `name` / `length` of an ordinary function.
     pub fn set_name_and_length(&self, name: &'static str, length: u32) {
-        self.meta.set(FunctionMeta {
-            name,
-            length,
-            has_name: true,
-            has_length: true,
-        });
+        let mut meta = self.meta.get();
+        meta.name = name;
+        meta.length = length;
+        meta.has_name = true;
+        meta.has_length = true;
+        self.meta.set(meta);
+    }
+
+    /// Record the compiled code entry a host wrapper forwards to.
+    pub fn set_code_entry(&self, entry: usize) {
+        let mut meta = self.meta.get();
+        meta.code_entry = entry;
+        self.meta.set(meta);
     }
 
     fn meta_property(&self, key: &str) -> Option<Value> {
@@ -1727,9 +1736,22 @@ impl JsFunction {
         self.data().delete_property(key)
     }
 
+    /// Address of the AOT code entry, when this function has one.
+    pub fn aot_factory_address(&self) -> Option<usize> {
+        match &self.data().body {
+            FunctionBody::Aot { factory, .. } => Some(*factory as usize),
+            _ => Some(self.data().meta.get().code_entry).filter(|entry| *entry != 0),
+        }
+    }
+
     /// Install the own `name` / `length` (SetFunctionName / SetFunctionLength).
     pub fn set_name_and_length(&self, name: &'static str, length: u32) {
         self.data().set_name_and_length(name, length)
+    }
+
+    /// Record the compiled code entry this host wrapper forwards to.
+    pub fn set_code_entry(&self, entry: usize) {
+        self.data().set_code_entry(entry)
     }
 
     /// A stable identity address for this function value (clones of the same

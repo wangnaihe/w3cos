@@ -304,6 +304,12 @@ pub enum Instruction {
     ImportMeta {
         dst: Register,
     },
+    /// `new.target` of the enclosing ordinary function: the constructor
+    /// for a [[Construct]] call, undefined for a [[Call]]. Lowering places
+    /// it first in the entry block.
+    NewTarget {
+        dst: Register,
+    },
     Await {
         dst: Register,
         value: Register,
@@ -791,7 +797,9 @@ fn bindings(instruction: &Instruction) -> Vec<BindingId> {
 
 fn registers(instruction: &Instruction) -> Vec<Register> {
     match instruction {
-        Instruction::LoadConstant { dst, .. } | Instruction::ImportMeta { dst } => vec![*dst],
+        Instruction::LoadConstant { dst, .. }
+        | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst } => vec![*dst],
         Instruction::Move { dst, src } => vec![*dst, *src],
         Instruction::LoadBinding { dst, .. } => vec![*dst],
         Instruction::InitializeBinding { value, .. } | Instruction::StoreBinding { value, .. } => {

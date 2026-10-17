@@ -774,6 +774,11 @@ struct Builder {
     suspension_points: Vec<SuspensionPoint>,
     generator_suspension_points: Vec<GeneratorSuspensionPoint>,
     terminated: bool,
+    /// Ordinary (non-arrow, non-class-member) function: `new.target` is its
+    /// [[Construct]] new target.
+    allows_new_target: bool,
+    /// Register holding `new.target`, read once at function entry.
+    new_target: Option<Register>,
 }
 
 impl Builder {
@@ -824,6 +829,8 @@ impl Builder {
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
+            allows_new_target: false,
+            new_target: None,
         }
     }
 
@@ -878,6 +885,8 @@ impl Builder {
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
+            allows_new_target: false,
+            new_target: None,
         }
     }
 
@@ -1054,6 +1063,28 @@ impl Builder {
         let block = BlockId(self.next_block);
         self.next_block += 1;
         block
+    }
+
+    /// The function's `new.target`, read by a `NewTarget` instruction placed
+    /// first in the entry block so it runs before parameter initializers or
+    /// any call can start another [[Construct]].
+    fn new_target_register(&mut self) -> Result<Register> {
+        if let Some(register) = self.new_target {
+            return Ok(register);
+        }
+        let dst = self.register();
+        let instruction = Instruction::NewTarget { dst };
+        if let Some(block) = self.blocks.iter_mut().find(|block| block.id == BlockId(0)) {
+            block.instructions.insert(0, instruction);
+        } else if self.current_block == BlockId(0) {
+            self.instructions.insert(0, instruction);
+        } else {
+            return Err(anyhow!(
+                "runtime W3IR new.target: entry block is unavailable"
+            ));
+        }
+        self.new_target = Some(dst);
+        Ok(dst)
     }
 
     fn seal_current_block(&mut self) {
@@ -3934,6 +3965,18 @@ impl Builder {
                 self.emit_construct(dst, constructor, arguments);
                 Ok(dst)
             }
+            Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget => {
+                if self.allows_new_target {
+                    if self.is_async || self.is_generator {
+                        // Not constructors: [[Construct]] never reaches them.
+                        return Ok(self.constant(Constant::Undefined));
+                    }
+                    return self.new_target_register();
+                }
+                Err(anyhow!(
+                    "new.target in arrow functions, class members or module code is not yet supported in runtime W3IR"
+                ))
+            }
             Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::ImportMeta => {
                 let dst = self.register();
                 self.emit(Instruction::ImportMeta { dst });
@@ -4987,6 +5030,7 @@ impl Builder {
         );
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
+        child.allows_new_target = bind_this && class_super_is_static.is_none();
         let this_binding = if bind_this {
             Some(child.declare_this_binding()?)
         } else {
@@ -5530,6 +5574,39 @@ mod tests {
                 Value::string("bigint-key"),
             ]
         );
+    }
+
+    #[test]
+    fn new_target_is_read_first_in_the_entry_block_of_ordinary_functions() {
+        let module = lower_module(
+            "export function F(a = new.target) { g(); return new.target; }\nfunction g() {}",
+            "app:///new-target.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("F"))
+            .unwrap();
+        let entry = function
+            .blocks
+            .iter()
+            .find(|block| block.id == function.entry)
+            .unwrap();
+        let Instruction::NewTarget { dst } = entry.instructions[0] else {
+            panic!("new.target must be read before any other instruction");
+        };
+        let reads = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| matches!(instruction, Instruction::NewTarget { .. }))
+            .count();
+        assert_eq!(reads, 1, "one entry read serves every new.target use");
+        assert!(format!("{function:?}").contains(&format!("{dst:?}")));
+        // Arrow functions inherit new.target lexically: still rejected
+        // rather than silently undefined.
+        assert!(lower_module("export const f = () => new.target;", "app:///arrow.js").is_err());
     }
 
     #[test]

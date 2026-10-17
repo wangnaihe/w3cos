@@ -1373,6 +1373,7 @@ fn apply_register_def(
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => def_class(classes, *dst, RegClass::Unknown),
         _ => {}
@@ -1619,6 +1620,7 @@ fn instruction_dst(instruction: &Instruction) -> Option<u32> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(dst.0),
@@ -1940,6 +1942,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::ConstructWithArguments { dst, .. }
         | Instruction::DynamicImport { dst, .. }
         | Instruction::ImportMeta { dst }
+        | Instruction::NewTarget { dst }
         | Instruction::Await { dst, .. }
         | Instruction::Yield { dst, .. }
         | Instruction::YieldDelegate { dst, .. } => Some(*dst),
@@ -1968,6 +1971,7 @@ fn read_registers(instruction: &Instruction) -> Vec<u32> {
         | Instruction::LoadBinding { .. }
         | Instruction::RefreshBinding { .. }
         | Instruction::ImportMeta { .. }
+        | Instruction::NewTarget { .. }
         | Instruction::CreateClosure { .. }
         | Instruction::Jump { .. } => Vec::new(),
         Instruction::Move { src, .. } => vec![src.0],
@@ -2417,12 +2421,30 @@ pub fn generate_sync_function_from_module(
     )
 }
 
+thread_local! {
+    /// Rust name of the sync factory being emitted; `new.target` compares it
+    /// with the code entry [[Construct]] recorded.
+    static CURRENT_AOT_FACTORY: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+}
+
 fn generate_sync_function_with_factories(
     function: &Function,
     rust_name: &str,
     factories: &HashMap<FunctionId, String>,
     module_specifier: Option<&str>,
 ) -> Result<String> {
+    struct RestoreFactory(String);
+    impl Drop for RestoreFactory {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            CURRENT_AOT_FACTORY.with(|name| *name.borrow_mut() = previous);
+        }
+    }
+    let _restore_factory = RestoreFactory(
+        CURRENT_AOT_FACTORY
+            .with(|name| std::mem::replace(&mut *name.borrow_mut(), rust_name.to_string())),
+    );
     let promoted = generate_sync_function_with_factories_inner(
         function,
         rust_name,
@@ -7436,6 +7458,13 @@ fn emit_instruction(
                 "self.registers[{}] = w3cos_core::host_modules::dynamic_import({}, w3cos_core::Value::string({referrer:?}));",
                 register(*dst),
                 emit_boxed_value(plan, specifier.0)
+            )
+        }
+        Instruction::NewTarget { dst } => {
+            let factory = CURRENT_AOT_FACTORY.with(|name| name.borrow().clone());
+            format!(
+                "self.registers[{}] = w3cos_core::class::take_new_target({factory} as usize);",
+                register(*dst)
             )
         }
         Instruction::ImportMeta { dst } => {

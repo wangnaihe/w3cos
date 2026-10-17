@@ -139,6 +139,38 @@ pub fn construct_slice(class_value: &Value, args: &[Value]) -> Value {
     construct_slow(class_value, args.to_vec())
 }
 
+thread_local! {
+    /// [[Construct]] in flight for an AOT function: (code entry address,
+    /// new.target). The callee's `NewTarget` instruction, which lowering
+    /// places before any other code of the function, takes it when its own
+    /// code entry matches; every other function observes undefined.
+    static PENDING_NEW_TARGET: std::cell::RefCell<Option<(usize, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `new.target` for the AOT function whose factory address is `factory`.
+pub fn take_new_target(factory: usize) -> Value {
+    PENDING_NEW_TARGET.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        match pending.as_ref() {
+            Some((entry, _)) if *entry == factory => pending
+                .take()
+                .map_or(Value::Undefined, |(_, target)| target),
+            _ => Value::Undefined,
+        }
+    })
+}
+
+struct RestoreNewTarget(Option<Option<(usize, Value)>>);
+
+impl Drop for RestoreNewTarget {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            PENDING_NEW_TARGET.with(|pending| *pending.borrow_mut() = previous);
+        }
+    }
+}
+
 fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
     if class_value.as_object().is_some() {
         return class_value.call(Value::Undefined, args);
@@ -149,6 +181,12 @@ fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
         if prototype.is_object() {
             set_prototype_of(&instance, &prototype);
         }
+        let _restore = function.aot_factory_address().map(|entry| {
+            RestoreNewTarget(Some(
+                PENDING_NEW_TARGET
+                    .with(|pending| pending.replace(Some((entry, class_value.clone())))),
+            ))
+        });
         let result = function.call(instance.clone(), args);
         if result.is_object() || result.is_array() || result.is_function() {
             return result;

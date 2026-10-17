@@ -2308,7 +2308,7 @@ fn emit_w3ir_generator_symbol(
         )
     } else {
         format!(
-            "w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args))",
+            "{{ let __w3cos_wrapper = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)); if let Some(__w3cos_f) = __w3cos_wrapper.as_function() {{ __w3cos_f.set_code_entry({factory} as usize); }} __w3cos_wrapper }}",
             symbol.bundled_name
         )
     };
@@ -2502,7 +2502,7 @@ fn emit_w3ir_sync_symbol(
         )
     } else {
         format!(
-            "w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args))",
+            "{{ let __w3cos_wrapper = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)); if let Some(__w3cos_f) = __w3cos_wrapper.as_function() {{ __w3cos_f.set_code_entry({factory} as usize); }} __w3cos_wrapper }}",
             symbol.bundled_name
         )
     };
@@ -4041,17 +4041,17 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
         let cases = [
             (
                 "sync",
-                "export function copy() { return new.target; }",
+                "export function copy() { return (() => new.target)(); }",
                 "synchronous function",
             ),
             (
                 "async",
-                "export async function copy() { return new.target; }",
+                "export async function copy() { return (() => new.target)(); }",
                 "async function",
             ),
             (
                 "generator",
-                "export function* copy() { yield new.target; }",
+                "export function* copy() { yield (() => new.target)(); }",
                 "generator",
             ),
         ];
