@@ -4635,6 +4635,19 @@ impl LayoutEngine {
         viewport_h: f32,
     ) -> Result<LayoutResults> {
         let _subtree_sizes = SubtreeSizeScope::new(root);
+        // Table-prepared tree (collapsed borders resolved + grid annotated),
+        // built at most once per compute: the Taffy build and the fixed
+        // table cell projection read the same used table geometry (LayoutNG
+        // computes NGTableBorders once per table and shares it).
+        let table_prepared = std::cell::OnceCell::<Component>::new();
+        let prepare_tables = || {
+            table_prepared.get_or_init(|| {
+                let mut layout_root = root.clone();
+                resolve_collapsed_table_layout_borders(&mut layout_root);
+                crate::table_grid::annotate(&mut layout_root);
+                layout_root
+            })
+        };
         if self.viewport != Some((viewport_w, viewport_h)) {
             self.tree_valid = false;
             self.viewport = Some((viewport_w, viewport_h));
@@ -4642,13 +4655,11 @@ impl LayoutEngine {
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
-            let prepared = component_needs_table_prep(root).then(|| {
-                let mut layout_root = root.clone();
-                resolve_collapsed_table_layout_borders(&mut layout_root);
-                crate::table_grid::annotate(&mut layout_root);
-                layout_root
-            });
-            let layout_root = prepared.as_ref().unwrap_or(root);
+            let layout_root = if component_needs_table_prep(root) {
+                prepare_tables()
+            } else {
+                root
+            };
             self.root_node = Some(build_taffy_tree(
                 &mut self.tree,
                 layout_root,
@@ -4797,15 +4808,10 @@ impl LayoutEngine {
                             edge.width > 0.0 || edge.hidden
                         }))
             })
-            .then(|| {
-                let mut resolved = root.clone();
-                resolve_collapsed_table_layout_borders(&mut resolved);
-                crate::table_grid::annotate(&mut resolved);
-                resolved
-            });
+            .then(prepare_tables);
         project_fixed_table_cell_rects(
             &mut results,
-            projection_root.as_ref().unwrap_or(root),
+            projection_root.unwrap_or(root),
             viewport_w,
             viewport_h,
         );
@@ -4860,10 +4866,24 @@ impl LayoutEngine {
         );
         project_auto_table_child_heights(&mut results, root, flat, viewport_w, viewport_h);
         crate::table_grid::project_rowspan_extents(&mut results, flat);
+        // Without row spans the grid annotation is a no-op, so the prepared
+        // table tree is exactly the border-resolved tree alignment needs.
+        let prepared_flat;
+        let shared_resolved = if has_collapsed_table_root(flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1)
+        {
+            prepared_flat = pre_flatten(prepare_tables());
+            Some(prepared_flat.as_slice())
+        } else {
+            None
+        };
         align_table_cell_baselines_with_resolved_borders(
             &mut results,
             root,
             flat,
+            shared_resolved,
             viewport_w,
             viewport_h,
         );
@@ -5130,10 +5150,22 @@ pub fn compute_with_scroll_details(
     project_table_rows_after_content_settlement(&mut results, root, &flat, viewport_w, viewport_h);
     project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h);
     crate::table_grid::project_rowspan_extents(&mut results, &flat);
+    let prepared_flat;
+    let shared_resolved = if has_collapsed_table_root(&flat)
+        && !flat
+            .iter()
+            .any(|node| crate::table_grid::row_span(node.style) != 1)
+    {
+        prepared_flat = pre_flatten(&layout_root);
+        Some(prepared_flat.as_slice())
+    } else {
+        None
+    };
     align_table_cell_baselines_with_resolved_borders(
         &mut results,
         root,
         &flat,
+        shared_resolved,
         viewport_w,
         viewport_h,
     );
@@ -5960,17 +5992,24 @@ fn project_table_cell_inline_vertical_padding(
     }
 }
 
+fn has_collapsed_table_root(flat: &[FlatNodeInfo<'_>]) -> bool {
+    flat.iter().any(|node| {
+        node.style.border_collapse
+            && matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
+    })
+}
+
 fn align_table_cell_baselines_with_resolved_borders(
     layouts: &mut [(LayoutRect, usize)],
     root: &Component,
     flat: &[FlatNodeInfo<'_>],
+    shared_resolved: Option<&[FlatNodeInfo<'_>]>,
     viewport_w: f32,
     viewport_h: f32,
 ) {
-    if flat.iter().any(|node| {
-        node.style.border_collapse
-            && matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
-    }) {
+    if let Some(resolved) = shared_resolved {
+        align_table_cell_baselines(layouts, resolved, viewport_w, viewport_h);
+    } else if has_collapsed_table_root(flat) {
         // The grid sizes already include the winning shared half-borders.
         // Alignment must use those same edges, not the authored cell border:
         // an outer table/column edge can make the available area asymmetric.
