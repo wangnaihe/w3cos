@@ -1002,7 +1002,93 @@ pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
 }
 
 pub(crate) fn count_nodes(comp: &Component) -> usize {
+    if comp.children.is_empty() {
+        return 1;
+    }
+    if let Some(size) = SUBTREE_SIZES.with(|sizes| {
+        let sizes = sizes.borrow();
+        if sizes.is_empty() {
+            None
+        } else {
+            sizes.get(&(comp as *const Component as usize)).copied()
+        }
+    }) {
+        return size;
+    }
     1 + comp.children.iter().map(count_nodes).sum::<usize>()
+}
+
+/// Pointer-identity hasher for the subtree-size memo (keys are addresses).
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn write_usize(&mut self, value: usize) {
+        let mixed = (value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = mixed ^ (mixed >> 29);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type SubtreeSizeMap =
+    std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHasher>>;
+
+thread_local! {
+    /// Descendant counts of the component tree a layout pass is reading,
+    /// keyed by node address. LayoutNG walks children through box-tree links
+    /// and never re-counts a subtree; the projection passes here address the
+    /// preorder array by `index + count_nodes(child)`, which made every pass
+    /// O(nodes x depth). Populated by `SubtreeSizeScope` only for a tree that
+    /// stays immutably borrowed for the whole scope, so addresses cannot be
+    /// reused while an entry is visible.
+    static SUBTREE_SIZES: std::cell::RefCell<SubtreeSizeMap> =
+        std::cell::RefCell::new(SubtreeSizeMap::default());
+}
+
+/// Memoizes `count_nodes` for `root` until dropped; restores the enclosing
+/// scope's memo (nested layouts of temporary trees never see stale keys).
+struct SubtreeSizeScope<'a> {
+    previous: Option<SubtreeSizeMap>,
+    _root: std::marker::PhantomData<&'a Component>,
+}
+
+impl<'a> SubtreeSizeScope<'a> {
+    fn new(root: &'a Component) -> Self {
+        fn fill(component: &Component, sizes: &mut SubtreeSizeMap) -> usize {
+            if component.children.is_empty() {
+                return 1;
+            }
+            let size = 1 + component
+                .children
+                .iter()
+                .map(|child| fill(child, sizes))
+                .sum::<usize>();
+            sizes.insert(component as *const Component as usize, size);
+            size
+        }
+        let mut sizes = SubtreeSizeMap::default();
+        fill(root, &mut sizes);
+        let previous = SUBTREE_SIZES.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), sizes));
+        Self {
+            previous: Some(previous),
+            _root: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for SubtreeSizeScope<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            SUBTREE_SIZES.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
 }
 
 /// Leaf intrinsic size used by Taffy (must stay in sync with `build_taffy_tree`).
@@ -4484,6 +4570,7 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> Result<LayoutResults> {
+        let _subtree_sizes = SubtreeSizeScope::new(root);
         if self.viewport != Some((viewport_w, viewport_h)) {
             self.tree_valid = false;
             self.viewport = Some((viewport_w, viewport_h));
@@ -25514,6 +25601,29 @@ mod tests {
 
     fn s() -> Style {
         Style::default()
+    }
+
+    #[test]
+    fn subtree_size_scope_matches_recount_and_restores() {
+        let leaf = |text: &str| Component::text(text, Style::default());
+        let inner = Component::column(Style::default(), vec![leaf("a"), leaf("b")]);
+        let root = Component::column(Style::default(), vec![inner, leaf("c")]);
+        let other = Component::column(Style::default(), vec![leaf("x")]);
+        assert_eq!(count_nodes(&root), 5);
+        {
+            let _scope = SubtreeSizeScope::new(&root);
+            assert_eq!(count_nodes(&root), 5);
+            assert_eq!(count_nodes(&root.children[0]), 3);
+            // A tree outside the scope is still counted directly.
+            assert_eq!(count_nodes(&other), 2);
+            {
+                let _nested = SubtreeSizeScope::new(&other);
+                assert_eq!(count_nodes(&other), 2);
+                assert_eq!(count_nodes(&root), 5);
+            }
+            assert_eq!(count_nodes(&root.children[0]), 3);
+        }
+        SUBTREE_SIZES.with(|sizes| assert!(sizes.borrow().is_empty()));
     }
 
     #[test]
