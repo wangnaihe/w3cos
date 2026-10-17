@@ -11527,27 +11527,191 @@ pub(crate) fn sync_style_element(node: u32) {
     let owner = node as u64;
     w3cos_dom::stylesheet::clear_owner(owner);
     if !dom::is_connected(node) {
+        MEDIA_DEPENDENT_STYLE_OWNERS.with(|owners| owners.borrow_mut().remove(&node));
         return;
     }
     let css = dom::get_descendant_text_content(node);
     register_author_sheet(owner, &css);
 }
 
+thread_local! {
+    /// `<style>` owners whose registered rules depend on `@media`; they are
+    /// re-registered when the viewport changes (Blink: MediaQueryEvaluator
+    /// results feed RuleSet invalidation on viewport resize).
+    static MEDIA_DEPENDENT_STYLE_OWNERS: RefCell<std::collections::BTreeMap<u32, Vec<(String, bool)>>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
+}
+
 fn register_author_sheet(owner: u64, css: &str) {
-    for block in css.split('}') {
-        let Some((selector, body)) = block.split_once('{') else {
-            continue;
+    let css = strip_css_comments(css);
+    let mut media_queries = Vec::new();
+    register_author_blocks(owner, &css, &mut media_queries);
+    if let Ok(node) = u32::try_from(owner) {
+        MEDIA_DEPENDENT_STYLE_OWNERS.with(|owners| {
+            let mut owners = owners.borrow_mut();
+            if !media_queries.is_empty() {
+                owners.insert(node, media_queries);
+            } else {
+                owners.remove(&node);
+            }
+        });
+    }
+}
+
+/// Re-register `<style>` sheets with `@media` blocks after a viewport change.
+pub(crate) fn refresh_author_media_rules() {
+    // Only sheets whose media query results flipped are re-registered.
+    let owners = MEDIA_DEPENDENT_STYLE_OWNERS.with(|owners| {
+        owners
+            .borrow()
+            .iter()
+            .filter(|(_, queries)| {
+                queries
+                    .iter()
+                    .any(|(query, matched)| media_query_matches(query) != *matched)
+            })
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>()
+    });
+    for node in owners {
+        sync_style_element(node);
+    }
+}
+
+fn strip_css_comments(css: &str) -> std::borrow::Cow<'_, str> {
+    if !css.contains("/*") {
+        return std::borrow::Cow::Borrowed(css);
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Byte index of the `}` closing the block whose `{` is at `open`, honouring
+/// nested blocks and quoted strings.
+fn css_block_end(css: &str, open: usize) -> Option<usize> {
+    let bytes = css.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(q) => {
+                if byte == b'\\' {
+                    index += 1;
+                } else if byte == q {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Split at `separator` outside parentheses and strings.
+fn split_css_top_level(text: &str, separator: u8) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(q) => {
+                if byte == b'\\' {
+                    index += 1;
+                } else if byte == q {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ if byte == separator && depth <= 0 => {
+                    parts.push(&text[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+fn register_author_blocks(owner: u64, css: &str, media_queries: &mut Vec<(String, bool)>) {
+    let mut cursor = 0;
+    while cursor < css.len() {
+        let Some(open) = css[cursor..].find('{').map(|offset| cursor + offset) else {
+            break;
         };
-        let selector = selector.trim();
-        if selector.is_empty() {
+        // Statement at-rules (`@import ...;`, `@charset ...;`) end at `;`.
+        let mut prelude_start = cursor;
+        if let Some(semicolon) = css[cursor..open].rfind(';') {
+            prelude_start = cursor + semicolon + 1;
+        }
+        let prelude = css[prelude_start..open].trim();
+        let Some(close) = css_block_end(css, open) else {
+            break;
+        };
+        let body = &css[open + 1..close];
+        cursor = close + 1;
+        if let Some(at_rule) = prelude.strip_prefix('@') {
+            let name_end = at_rule
+                .find(|character: char| character.is_whitespace() || character == '(')
+                .unwrap_or(at_rule.len());
+            let name = at_rule[..name_end].to_ascii_lowercase();
+            match name.as_str() {
+                "font-face" => {
+                    let _ = crate::font_face::parse_and_register(body);
+                }
+                "media" => {
+                    let query = at_rule[name_end..].trim();
+                    let matched = media_query_matches(query);
+                    media_queries.push((query.to_string(), matched));
+                    if matched {
+                        register_author_blocks(owner, body, media_queries);
+                    }
+                }
+                "supports" | "layer" => register_author_blocks(owner, body, media_queries),
+                // @keyframes, @page, ... are not style rules.
+                _ => {}
+            }
             continue;
         }
-        if selector.starts_with("@font-face") {
-            let _ = crate::font_face::parse_and_register(body);
+        if prelude.is_empty() {
             continue;
         }
         let mut declarations = Vec::new();
-        for decl in body.split(';') {
+        for decl in split_css_top_level(body, b';') {
             let Some((property, value)) = decl.split_once(':') else {
                 continue;
             };
@@ -11565,7 +11729,7 @@ fn register_author_sheet(owner: u64, css: &str) {
             .iter()
             .map(|(property, value)| (property.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        w3cos_dom::stylesheet::register_rule_for_owner(owner, selector, &pairs);
+        w3cos_dom::stylesheet::register_rule_for_owner(owner, prelude, &pairs);
     }
 }
 
@@ -19172,6 +19336,7 @@ pub fn set_viewport(width: f64, height: f64) {
             .call_method("dispatchEvent", vec![event]);
     }
     refresh_media_query_lists();
+    refresh_author_media_rules();
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::refresh_stylesheet_media_queries();
     #[cfg(feature = "dynamic-js")]
@@ -19194,6 +19359,7 @@ pub fn set_device_pixel_ratio(dpr: f64) {
         v.set((w, h, dpr));
     });
     refresh_media_query_lists();
+    refresh_author_media_rules();
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::refresh_stylesheet_media_queries();
     #[cfg(feature = "dynamic-js")]
@@ -31931,5 +32097,37 @@ try {
             hits.get()
         );
         assert_eq!(hits.get(), 400);
+    }
+}
+
+#[cfg(test)]
+mod author_sheet_block_tests {
+    use super::*;
+
+    #[test]
+    fn block_end_honours_nesting_and_strings() {
+        let css = "@media (x){.a{content:'}'}.b{c:d}} .z{}";
+        let open = css.find('{').unwrap();
+        assert_eq!(&css[css_block_end(css, open).unwrap() + 1..], " .z{}");
+    }
+
+    #[test]
+    fn declarations_split_outside_parens_and_strings() {
+        assert_eq!(
+            split_css_top_level("a:url(data:x;y);b:'p;q';c:d", b';'),
+            vec!["a:url(data:x;y)", "b:'p;q'", "c:d"]
+        );
+    }
+
+    #[test]
+    fn media_blocks_record_their_queries_and_skip_unknown_at_rules() {
+        let css = strip_css_comments(
+            "/* } */@charset \"x\";@keyframes k{from{top:0}to{top:1px}}\
+             @media (min-width: 100000px){.never{height:1px}}.a{height:2px}",
+        );
+        let mut queries = Vec::new();
+        register_author_blocks(u64::MAX - 7, &css, &mut queries);
+        assert_eq!(queries, vec![("(min-width: 100000px)".to_string(), false)]);
+        w3cos_dom::stylesheet::clear_owner(u64::MAX - 7);
     }
 }
