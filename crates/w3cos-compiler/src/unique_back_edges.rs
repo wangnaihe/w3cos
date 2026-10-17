@@ -409,8 +409,7 @@ mod tests {
     }
 
     fn is_rewritten(generated: &str) -> bool {
-        generated.contains("w3cos_core::weak::weak_ref_class")
-            && generated.contains("call_method(\"deref\"")
+        generated.contains("w3cos_core::weak::weak_capture_getter")
     }
 
     #[test]

@@ -80,7 +80,10 @@ pub fn js_string_from_utf16_units(units: &[u16]) -> String {
 ///
 /// Core heap values are thread-confined (`Rc` + thread-local heap
 /// counters), so string intern is thread-local as well.
-#[derive(Clone)]
+///
+/// Page-arena object / array / function immediates are strong references:
+/// `Clone` takes a slot count and `Drop` releases it (see
+/// [`crate::page_arena`]), exactly like the host `Rc` arms.
 pub enum Value {
     /// NaN-boxed undefined / null / bool / number / page-interned string.
     /// Prefer `Value::Undefined` / `Value::Bool` / `Value::Number` /
@@ -96,6 +99,35 @@ impl Default for Value {
     #[inline]
     fn default() -> Self {
         Value::Undefined
+    }
+}
+
+impl Clone for Value {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Value::Imm(imm) => {
+                if let Some((kind, handle)) = imm.arena_slot() {
+                    crate::page_arena::retain(kind, handle);
+                }
+                Value::Imm(*imm)
+            }
+            Value::String(s) => Value::String(s.clone()),
+            Value::Array(a) => Value::Array(Rc::clone(a)),
+            Value::Object(o) => Value::Object(Rc::clone(o)),
+            Value::Function(f) => Value::Function(Rc::clone(f)),
+        }
+    }
+}
+
+impl Drop for Value {
+    #[inline]
+    fn drop(&mut self) {
+        if let Value::Imm(imm) = self
+            && let Some((kind, handle)) = imm.arena_slot()
+        {
+            crate::page_arena::release(kind, handle);
+        }
     }
 }
 
@@ -188,19 +220,19 @@ impl Immediate {
 
     /// Pack a page-arena object handle into the tagged word.
     #[inline]
-    pub fn from_object_handle(handle: u32) -> Self {
+    pub(crate) fn from_object_handle(handle: u32) -> Self {
         Self(Self::pack_handle(Self::TAG_OBJ, handle))
     }
 
     /// Pack a page-arena array handle into the tagged word.
     #[inline]
-    pub fn from_array_handle(handle: u32) -> Self {
+    pub(crate) fn from_array_handle(handle: u32) -> Self {
         Self(Self::pack_handle(Self::TAG_ARR, handle))
     }
 
     /// Pack a page-arena function handle into the tagged word.
     #[inline]
-    pub fn from_function_handle(handle: u32) -> Self {
+    pub(crate) fn from_function_handle(handle: u32) -> Self {
         Self(Self::pack_handle(Self::TAG_FN, handle))
     }
 
@@ -283,6 +315,22 @@ impl Immediate {
     #[inline]
     pub fn as_js_string(self) -> Option<JsString> {
         self.interned_handle().and_then(JsString::from_page_handle)
+    }
+
+    /// Slab and handle of a current-page object / array / function word.
+    /// Stale (previous-epoch) handles and non-heap immediates are `None`.
+    #[inline]
+    pub(crate) fn arena_slot(self) -> Option<(crate::page_arena::SlotKind, u32)> {
+        if !self.is_tagged() {
+            return None;
+        }
+        let kind = match self.tag() {
+            Self::TAG_OBJ => crate::page_arena::SlotKind::Object,
+            Self::TAG_ARR => crate::page_arena::SlotKind::Array,
+            Self::TAG_FN => crate::page_arena::SlotKind::Function,
+            _ => return None,
+        };
+        self.live_slot().map(|handle| (kind, handle))
     }
 
     #[inline]
@@ -455,7 +503,10 @@ impl Value {
             Value::Object(object) => Some(Rc::as_ptr(object) as u64),
             Value::Imm(imm) => imm
                 .object_handle()
-                .map(|handle| (handle as u64) | (1 << 63)),
+                .and_then(|handle| {
+                    crate::page_arena::identity_bits(crate::page_arena::SlotKind::Object, handle)
+                })
+                .map(|bits| bits | (1 << 63)),
             _ => None,
         }
     }
@@ -693,7 +744,8 @@ impl fmt::Debug for ArrayStorage {
 
 /// A JS object: interned page-local handle, or host `Rc`.
 ///
-/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer).
+/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer)
+/// and takes one page-arena slot count; `Drop` releases it.
 /// It does not `Rc::clone` the object. Host clones clone one
 /// `Rc<RefCell<JsObject>>`. Lookups use the cached slot pointer so they
 /// do not hold the page-arena `RefCell` (nested `Value::object` would
@@ -714,13 +766,20 @@ enum JsObjectRepr {
 
 #[derive(Clone)]
 pub enum WeakJsObject {
-    Interned { handle: u32, epoch: u32 },
+    /// Does not hold a slot count. `generation` is the slot's full
+    /// generation, so a freed-and-reused slot never upgrades.
+    Interned {
+        handle: u32,
+        epoch: u32,
+        generation: u32,
+    },
     Host(Weak<RefCell<crate::JsObject>>),
 }
 
 /// A JS array: interned page-local handle, or host `Rc`.
 ///
-/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer).
+/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer)
+/// and takes one page-arena slot count; `Drop` releases it.
 /// It does not `Rc::clone` the storage. Host clones clone one
 /// `Rc<RefCell<ArrayStorage>>`. `array_hole` stays a host object.
 pub struct JsArrayRef {
@@ -738,8 +797,23 @@ enum JsArrayRepr {
 }
 
 pub(crate) enum WeakJsArray {
-    Interned { handle: u32, epoch: u32 },
+    Interned {
+        handle: u32,
+        epoch: u32,
+        generation: u32,
+    },
     Host(Weak<RefCell<ArrayStorage>>),
+}
+
+impl Drop for JsObjectRef {
+    #[inline]
+    fn drop(&mut self) {
+        if let JsObjectRepr::Interned { handle, epoch, .. } = self.repr
+            && epoch == crate::page_arena::current_epoch()
+        {
+            crate::page_arena::release(crate::page_arena::SlotKind::Object, handle);
+        }
+    }
 }
 
 impl Clone for JsObjectRef {
@@ -750,14 +824,19 @@ impl Clone for JsObjectRef {
                 epoch,
                 ptr,
                 _thread,
-            } => Self {
-                repr: JsObjectRepr::Interned {
-                    handle,
-                    epoch,
-                    ptr,
-                    _thread,
-                },
-            },
+            } => {
+                if epoch == crate::page_arena::current_epoch() {
+                    crate::page_arena::retain(crate::page_arena::SlotKind::Object, handle);
+                }
+                Self {
+                    repr: JsObjectRepr::Interned {
+                        handle,
+                        epoch,
+                        ptr,
+                        _thread,
+                    },
+                }
+            }
             JsObjectRepr::Host(ref rc) => Self {
                 repr: JsObjectRepr::Host(Rc::clone(rc)),
             },
@@ -820,6 +899,8 @@ impl JsObjectRef {
                 if epoch != crate::page_arena::current_epoch() {
                     return Value::Undefined;
                 }
+                // The new `Value` owns its own count; `self` keeps its own.
+                crate::page_arena::retain(crate::page_arena::SlotKind::Object, handle);
                 Value::Imm(Immediate::from_object_handle(handle))
             }
             JsObjectRepr::Host(ref rc) => Value::Object(Rc::clone(rc)),
@@ -848,7 +929,16 @@ impl JsObjectRef {
     }
 
     /// Stable identity address for this object value.
+    ///
+    /// Interned objects use the slot's index + generation (not its address),
+    /// so a freed-and-reused slot never repeats an identity seen earlier.
     pub fn identity(&self) -> usize {
+        if let JsObjectRepr::Interned { handle, .. } = self.repr
+            && let Some(word) =
+                crate::page_arena::identity_word(crate::page_arena::SlotKind::Object, handle)
+        {
+            return word;
+        }
         self.cell() as *const RefCell<crate::JsObject> as usize
     }
 
@@ -866,8 +956,8 @@ impl JsObjectRef {
         self.host_rc_counts().map(|(strong, _)| strong)
     }
 
-    /// `(strong, weak)` counts for a host `Rc` object. Interned handles have
-    /// no per-value count. `weak` does not include a temporary `Weak`.
+    /// `(strong, weak)` counts for a host `Rc` object. Interned handles keep
+    /// their count in the page-arena slot instead. `weak` does not include a temporary `Weak`.
     pub fn host_rc_counts(&self) -> Option<(usize, usize)> {
         match &self.repr {
             JsObjectRepr::Host(rc) => Some((Rc::strong_count(rc), Rc::weak_count(rc))),
@@ -877,9 +967,15 @@ impl JsObjectRef {
 
     pub fn downgrade(&self) -> WeakJsObject {
         match self.repr {
-            JsObjectRepr::Interned { handle, epoch, .. } => {
-                WeakJsObject::Interned { handle, epoch }
-            }
+            JsObjectRepr::Interned { handle, epoch, .. } => WeakJsObject::Interned {
+                handle,
+                epoch,
+                generation: crate::page_arena::generation(
+                    crate::page_arena::SlotKind::Object,
+                    handle,
+                )
+                .unwrap_or(u32::MAX),
+            },
             JsObjectRepr::Host(ref rc) => WeakJsObject::Host(Rc::downgrade(rc)),
         }
     }
@@ -888,9 +984,11 @@ impl JsObjectRef {
 impl WeakJsObject {
     pub fn upgrade(&self) -> Option<JsObjectRef> {
         match self {
-            WeakJsObject::Interned { handle, epoch } => {
-                crate::page_arena::upgrade_object(*handle, *epoch)
-            }
+            WeakJsObject::Interned {
+                handle,
+                epoch,
+                generation,
+            } => crate::page_arena::upgrade_object(*handle, *epoch, *generation),
             WeakJsObject::Host(weak) => weak.upgrade().map(JsObjectRef::from_host),
         }
     }
@@ -902,9 +1000,7 @@ impl WeakJsObject {
     /// Host `Weak::strong_count`, or `1`/`0` for a live/dead interned slot.
     pub fn strong_count(&self) -> usize {
         match self {
-            WeakJsObject::Interned { handle, epoch } => {
-                usize::from(crate::page_arena::upgrade_object(*handle, *epoch).is_some())
-            }
+            WeakJsObject::Interned { .. } => usize::from(self.upgrade().is_some()),
             WeakJsObject::Host(weak) => weak.strong_count(),
         }
     }
@@ -918,6 +1014,17 @@ impl Deref for JsObjectRef {
     }
 }
 
+impl Drop for JsArrayRef {
+    #[inline]
+    fn drop(&mut self) {
+        if let JsArrayRepr::Interned { handle, epoch, .. } = self.repr
+            && epoch == crate::page_arena::current_epoch()
+        {
+            crate::page_arena::release(crate::page_arena::SlotKind::Array, handle);
+        }
+    }
+}
+
 impl Clone for JsArrayRef {
     fn clone(&self) -> Self {
         match self.repr {
@@ -926,14 +1033,19 @@ impl Clone for JsArrayRef {
                 epoch,
                 ptr,
                 _thread,
-            } => Self {
-                repr: JsArrayRepr::Interned {
-                    handle,
-                    epoch,
-                    ptr,
-                    _thread,
-                },
-            },
+            } => {
+                if epoch == crate::page_arena::current_epoch() {
+                    crate::page_arena::retain(crate::page_arena::SlotKind::Array, handle);
+                }
+                Self {
+                    repr: JsArrayRepr::Interned {
+                        handle,
+                        epoch,
+                        ptr,
+                        _thread,
+                    },
+                }
+            }
             JsArrayRepr::Host(ref rc) => Self {
                 repr: JsArrayRepr::Host(Rc::clone(rc)),
             },
@@ -987,6 +1099,8 @@ impl JsArrayRef {
                 if epoch != crate::page_arena::current_epoch() {
                     return Value::Undefined;
                 }
+                // The new `Value` owns its own count; `self` keeps its own.
+                crate::page_arena::retain(crate::page_arena::SlotKind::Array, handle);
                 Value::Imm(Immediate::from_array_handle(handle))
             }
             JsArrayRepr::Host(ref rc) => Value::Array(Rc::clone(rc)),
@@ -1015,7 +1129,14 @@ impl JsArrayRef {
     }
 
     /// Stable identity address for this array value.
+    /// Interned arrays use index + generation; see [`JsObjectRef::identity`].
     pub fn identity(&self) -> usize {
+        if let JsArrayRepr::Interned { handle, .. } = self.repr
+            && let Some(word) =
+                crate::page_arena::identity_word(crate::page_arena::SlotKind::Array, handle)
+        {
+            return word;
+        }
         self.cell() as *const RefCell<ArrayStorage> as usize
     }
 
@@ -1038,7 +1159,15 @@ impl JsArrayRef {
 
     pub(crate) fn downgrade(&self) -> WeakJsArray {
         match self.repr {
-            JsArrayRepr::Interned { handle, epoch, .. } => WeakJsArray::Interned { handle, epoch },
+            JsArrayRepr::Interned { handle, epoch, .. } => WeakJsArray::Interned {
+                handle,
+                epoch,
+                generation: crate::page_arena::generation(
+                    crate::page_arena::SlotKind::Array,
+                    handle,
+                )
+                .unwrap_or(u32::MAX),
+            },
             JsArrayRepr::Host(ref rc) => WeakJsArray::Host(Rc::downgrade(rc)),
         }
     }
@@ -1047,9 +1176,11 @@ impl JsArrayRef {
 impl WeakJsArray {
     pub(crate) fn upgrade(&self) -> Option<JsArrayRef> {
         match self {
-            WeakJsArray::Interned { handle, epoch } => {
-                crate::page_arena::upgrade_array(*handle, *epoch)
-            }
+            WeakJsArray::Interned {
+                handle,
+                epoch,
+                generation,
+            } => crate::page_arena::upgrade_array(*handle, *epoch, *generation),
             WeakJsArray::Host(weak) => weak.upgrade().map(JsArrayRef::from_host),
         }
     }
@@ -1409,7 +1540,8 @@ pub struct FunctionData {
 
 /// A callable JS function: interned page-local handle, or host `Rc`.
 ///
-/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer).
+/// Interned `Clone` copies a `u32` handle (plus a cached payload pointer)
+/// and takes one page-arena slot count; `Drop` releases it.
 /// It does not `Rc::clone` the closure / props / allocation. Host clones
 /// clone one `Rc<FunctionData>`.
 pub struct JsFunction {
@@ -1427,7 +1559,11 @@ enum JsFunctionRepr {
 }
 
 pub(crate) enum WeakJsFunction {
-    Interned { handle: u32, epoch: u32 },
+    Interned {
+        handle: u32,
+        epoch: u32,
+        generation: u32,
+    },
     Host(Weak<FunctionData>),
 }
 
@@ -1560,6 +1696,17 @@ impl FunctionData {
     }
 }
 
+impl Drop for JsFunction {
+    #[inline]
+    fn drop(&mut self) {
+        if let JsFunctionRepr::Interned { handle, epoch, .. } = self.repr
+            && epoch == crate::page_arena::current_epoch()
+        {
+            crate::page_arena::release(crate::page_arena::SlotKind::Function, handle);
+        }
+    }
+}
+
 impl Clone for JsFunction {
     fn clone(&self) -> Self {
         match self.repr {
@@ -1568,14 +1715,19 @@ impl Clone for JsFunction {
                 epoch,
                 ptr,
                 _thread,
-            } => Self {
-                repr: JsFunctionRepr::Interned {
-                    handle,
-                    epoch,
-                    ptr,
-                    _thread,
-                },
-            },
+            } => {
+                if epoch == crate::page_arena::current_epoch() {
+                    crate::page_arena::retain(crate::page_arena::SlotKind::Function, handle);
+                }
+                Self {
+                    repr: JsFunctionRepr::Interned {
+                        handle,
+                        epoch,
+                        ptr,
+                        _thread,
+                    },
+                }
+            }
             JsFunctionRepr::Host(ref rc) => Self {
                 repr: JsFunctionRepr::Host(Rc::clone(rc)),
             },
@@ -1603,6 +1755,20 @@ impl JsFunction {
     pub(crate) fn from_host(data: Rc<FunctionData>) -> Self {
         Self {
             repr: JsFunctionRepr::Host(data),
+        }
+    }
+
+    /// Restore an interned `Imm` handle or a host `Value::Function`.
+    pub(crate) fn as_value(&self) -> Value {
+        match self.repr {
+            JsFunctionRepr::Interned { handle, epoch, .. } => {
+                if epoch != crate::page_arena::current_epoch() {
+                    return Value::Undefined;
+                }
+                crate::page_arena::retain(crate::page_arena::SlotKind::Function, handle);
+                Value::Imm(Immediate::from_function_handle(handle))
+            }
+            JsFunctionRepr::Host(ref rc) => Value::Function(Rc::clone(rc)),
         }
     }
 
@@ -1663,7 +1829,14 @@ impl JsFunction {
 
     /// A stable identity address for this function value (clones of the same
     /// `JsFunction` share it) — used for identity-keyed collections (JS Map).
+    /// Interned functions use index + generation; see [`JsObjectRef::identity`].
     pub fn identity(&self) -> usize {
+        if let JsFunctionRepr::Interned { handle, .. } = self.repr
+            && let Some(word) =
+                crate::page_arena::identity_word(crate::page_arena::SlotKind::Function, handle)
+        {
+            return word;
+        }
         self.data().identity()
     }
 
@@ -1712,9 +1885,15 @@ impl JsFunction {
 
     pub(crate) fn downgrade(&self) -> WeakJsFunction {
         match self.repr {
-            JsFunctionRepr::Interned { handle, epoch, .. } => {
-                WeakJsFunction::Interned { handle, epoch }
-            }
+            JsFunctionRepr::Interned { handle, epoch, .. } => WeakJsFunction::Interned {
+                handle,
+                epoch,
+                generation: crate::page_arena::generation(
+                    crate::page_arena::SlotKind::Function,
+                    handle,
+                )
+                .unwrap_or(u32::MAX),
+            },
             JsFunctionRepr::Host(ref rc) => WeakJsFunction::Host(Rc::downgrade(rc)),
         }
     }
@@ -1723,10 +1902,12 @@ impl JsFunction {
 impl WeakJsFunction {
     pub(crate) fn upgrade_value(&self) -> Option<Value> {
         match self {
-            WeakJsFunction::Interned { handle, epoch } => {
-                crate::page_arena::upgrade_function(*handle, *epoch)
-                    .map(|_| Value::Imm(Immediate::from_function_handle(*handle)))
-            }
+            WeakJsFunction::Interned {
+                handle,
+                epoch,
+                generation,
+            } => crate::page_arena::upgrade_function(*handle, *epoch, *generation)
+                .map(|function| function.as_value()),
             WeakJsFunction::Host(weak) => weak.upgrade().map(Value::Function),
         }
     }
@@ -2338,8 +2519,10 @@ impl Value {
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        let handle = crate::page_arena::alloc_array(ArrayStorage::new(items));
-        Value::Imm(Immediate::from_array_handle(handle))
+        match crate::page_arena::alloc_array(ArrayStorage::new(items)) {
+            Ok(handle) => Value::Imm(Immediate::from_array_handle(handle)),
+            Err(storage) => Value::Array(Rc::new(RefCell::new(storage))),
+        }
     }
 
     /// Reference-counted host object for a literal the compiler proved never
@@ -2357,8 +2540,7 @@ impl Value {
     }
 
     pub fn object(props: HashMap<String, Value>) -> Self {
-        let handle = crate::page_arena::alloc_object(crate::JsObject::from_map(props));
-        Value::Imm(Immediate::from_object_handle(handle))
+        Self::arena_object(crate::JsObject::from_map(props))
     }
 
     /// Arena object with a shared proxy. Own properties are written directly
@@ -2369,8 +2551,7 @@ impl Value {
         for (key, value) in entries {
             object.set_direct(key, value.clone());
         }
-        let handle = crate::page_arena::alloc_object(object);
-        Value::Imm(Immediate::from_object_handle(handle))
+        Self::arena_object(object)
     }
 
     /// Host `Rc` object with a shared proxy. Unlike [`Self::proxied_object`],
@@ -2405,23 +2586,37 @@ impl Value {
         Value::object(properties)
     }
 
+    /// Page-arena object with one slot count; a host `Rc` when the slab
+    /// handle space is exhausted.
+    fn arena_object(object: crate::JsObject) -> Self {
+        match crate::page_arena::alloc_object(object) {
+            Ok(handle) => Value::Imm(Immediate::from_object_handle(handle)),
+            Err(object) => Value::Object(Rc::new(RefCell::new(object))),
+        }
+    }
+
+    /// Page-arena function with one slot count; see [`Self::arena_object`].
+    fn arena_function(function: FunctionData) -> Self {
+        match crate::page_arena::alloc_function(function) {
+            Ok(handle) => Value::Imm(Immediate::from_function_handle(handle)),
+            Err(function) => Value::Function(Rc::new(function)),
+        }
+    }
+
     pub fn function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
-        let handle = crate::page_arena::alloc_function(FunctionData::new(f));
-        Value::Imm(Immediate::from_function_handle(handle))
+        Self::arena_function(FunctionData::new(f))
     }
 
     /// Intern an AOT `CreateClosure` body without boxing a `dyn Fn`.
     ///
     /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
     pub fn aot_function(factory: AotFactory, captures: AotCaptureMap) -> Self {
-        let handle = crate::page_arena::alloc_function(FunctionData::from_aot(factory, captures));
-        Value::Imm(Immediate::from_function_handle(handle))
+        Self::arena_function(FunctionData::from_aot(factory, captures))
     }
 
     /// Intern a captured numeric increment. Calling it adds `addend` to `cell`.
     pub fn number_bump(cell: Rc<Cell<Option<f64>>>, addend: f64) -> Self {
-        let handle = crate::page_arena::alloc_function(FunctionData::from_bump(cell, addend));
-        Value::Imm(Immediate::from_function_handle(handle))
+        Self::arena_function(FunctionData::from_bump(cell, addend))
     }
 
     /// A plain object that is also callable (a JS class / constructor object).

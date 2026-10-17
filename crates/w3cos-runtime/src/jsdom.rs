@@ -8275,7 +8275,7 @@ fn math_ml_element_class() -> Value {
         class.set_property("name", Value::string("MathMLElement"));
         let prototype = Value::object(HashMap::new());
         prototype.set_property("constructor", class.clone());
-        if let Value::Object(html_prototype) = crate::dom_constructors::prototype("HTMLElement") {
+        if let Value::Object(html_prototype) = &crate::dom_constructors::prototype("HTMLElement") {
             for key in html_prototype.borrow().keys() {
                 if key != "constructor" {
                     prototype.set_property(&key, Value::Undefined);

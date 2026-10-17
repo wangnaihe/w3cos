@@ -5063,6 +5063,176 @@ fn main() {
     }
 
     #[test]
+    fn generated_bundle_frees_escaping_values_at_their_last_release() {
+        let root = fixture_root("w3cos_esm_codegen_arena_rc");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"function makePoint(i: number): any {
+  return { x: i, y: i + 1 };
+}
+export function workEscapeDrop(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const p = makePoint(i);
+    sum += p.x + p.y;
+  }
+  return sum;
+}
+export function workClosures(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const f = () => i + 1;
+    sum += f();
+  }
+  return sum;
+}
+export function workBatch(n: number): number {
+  const batch: any[] = [];
+  for (let i = 0; i < n; i++) {
+    batch.push({ x: i, inner: { y: i } });
+  }
+  return batch.length;
+}
+let kept: any[] = [];
+export function keep(n: number): number {
+  for (let i = 0; i < n; i++) {
+    kept.push({ x: i });
+  }
+  return kept.length;
+}
+export function forget(): number {
+  kept = [];
+  return kept.length;
+}
+export function nestedKeepsTarget(): any {
+  const holder: any = {};
+  holder.run = () => {
+    const later = () => holder.tag;
+    return later;
+  };
+  holder.tag = "alive";
+  return holder.run();
+}
+let weakTemp: any = undefined;
+let finalized = "";
+const registry = new FinalizationRegistry((held: string) => {
+  finalized += held;
+});
+export function registerTemp(): number {
+  const temp = { x: 1 };
+  registry.register(temp, "T");
+  weakTemp = new WeakRef(temp);
+  return 0;
+}
+export function derefTemp(): string {
+  return weakTemp.deref() === undefined ? "gone" : "alive";
+}
+export function getFinalized(): string {
+  return finalized;
+}
+export function makeCycles(n: number): number {
+  for (let i = 0; i < n; i++) {
+    const a: any = {};
+    const b: any = { a };
+    a.b = b;
+  }
+  return n;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("w3cos_core::weak::weak_capture_getter"),
+            "holder.run is a unique back-edge:\n{code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::{page_arena, Value};
+    let _ = run_entry();
+    let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
+    let base = live();
+    for _ in 0..5 {
+        let r = m0::m0_workEscapeDrop(vec![Value::Number(10000.0)]);
+        assert_eq!(r.to_number(), 100000000.0, "workEscapeDrop: {r:?}");
+        let r = m0::m0_workClosures(vec![Value::Number(10000.0)]);
+        assert_eq!(r.to_number(), 50005000.0, "workClosures: {r:?}");
+        let r = m0::m0_workBatch(vec![Value::Number(10000.0)]);
+        assert_eq!(r.to_number(), 10000.0, "workBatch: {r:?}");
+    }
+    let after = live();
+    println!("PROBE escaping work x5: live_arena {base} -> {after}, slab_bytes {}", page_arena::slab_bytes());
+    assert!(after <= base + 8, "escaping-then-dropped values must be freed before reset: {base} -> {after}");
+
+    let r = m0::m0_keep(vec![Value::Number(1000.0)]);
+    assert_eq!(r.to_number(), 1000.0);
+    assert!(live() >= after + 1000, "kept values stay alive");
+    let r = m0::m0_forget(vec![]);
+    assert_eq!(r.to_number(), 0.0);
+    assert!(live() <= after + 8, "dropping the holder frees what it kept: {after} -> {}", live());
+
+    let later = m0::m0_nestedKeepsTarget(vec![]);
+    let _ = m0::m0_workEscapeDrop(vec![Value::Number(1000.0)]);
+    let tag = later.call(Value::Undefined, vec![]);
+    assert_eq!(tag.to_js_string(), "alive", "a closure nested in a weakened back-edge closure keeps its target");
+    drop(later);
+
+    let r = m0::m0_registerTemp(vec![]);
+    assert_eq!(r.to_number(), 0.0);
+    let r = m0::m0_derefTemp(vec![]);
+    assert_eq!(r.to_js_string(), "gone", "WeakRef to a dropped arena object derefs to undefined");
+    w3cos_core::promise::drain_microtasks();
+    let r = m0::m0_getFinalized(vec![]);
+    assert_eq!(r.to_js_string(), "T", "FinalizationRegistry fires for a dropped arena object");
+
+    let before_cycles = live();
+    let _ = m0::m0_makeCycles(vec![Value::Number(100.0)]);
+    let leaked = live() - before_cycles;
+    println!("PROBE cycles: +{leaked} until reset");
+    assert!(leaked >= 200, "reference cycles are not collected before reset: +{leaked}");
+    page_arena::reset();
+    assert_eq!(page_arena::live_objects(), 0, "reset frees cycles");
+    println!("W3COS_ARENA_RC_E2E_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}");
+        assert!(
+            output.status.success() && stdout.contains("W3COS_ARENA_RC_E2E_OK"),
+            "arena refcount bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn generated_bundle_runs_jsdom_globals() {
         let root = fixture_root("w3cos_esm_codegen_globals_jsdom");
         std::fs::create_dir_all(root.join("src")).unwrap();

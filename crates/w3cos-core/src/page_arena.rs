@@ -2,7 +2,7 @@
 //!
 //! Page-interned JS strings (any length), page-local [`crate::JsObject`]s, constructor
 //! / literal arrays, and ordinary JS closures created via [`crate::Value::function`]
-//! live here so clones copy a `u32` handle instead of `Rc::clone`. The bump
+//! live here as one `u64` handle word whose clone bumps a slot count. The bump
 //! and slabs are dropped on [`reset`] (`reset_bridge` / document navigation).
 //! Host/outliving strings keep [`crate::JsString::heap`] (thin `Rc<String>`).
 //! Host / DOM wrappers keep the `Value::Object(Rc)` path so WeakRef intern
@@ -12,18 +12,23 @@
 //! on the `Value::Function(Rc<FunctionData>)` / object call-slot `Rc` path.
 //! Interned functions store one `FunctionData` in a size-class slab;
 //! interned objects / arrays store one `RefCell<_>` in a size-class slab.
-//! `as_function` / `get_function` / clone return a handle and do not clone
-//! inner Rcs. `as_object` / `as_array` / `get_object` / `get_array` / clone
-//! return a handle and do not clone the slab slot.
+//! `as_function` / `get_function` / clone return a counted handle and do not
+//! clone inner Rcs. `as_object` / `as_array` / `get_object` / `get_array` /
+//! clone return a counted handle and do not clone the slab slot.
 //!
-//! Immediate handles are `Copy` and do not refcount, so dead interned
-//! payloads cannot be reclaimed mid-page. Slabs only speed the alloc path:
-//! many same-size `FunctionData` / `JsObject` / `ArrayStorage` payloads
-//! share a chunk instead of one `Box` malloc each. Strings stay on
-//! the packed bump — intern never aborts after the copy, so size-class
-//! padding would not reclaim holes.
+//! Object / array / function slots are strictly reference counted. A
+//! `Value` immediate or a resolved `JsObjectRef` / `JsArrayRef` /
+//! `JsFunction` handle owns one strong count ([`retain`] on clone,
+//! [`release`] on drop). At zero the slot dies at once (weak references
+//! stop upgrading), its payload is dropped from an iterative work list
+//! outside the arena borrow, and the slot is reused from a free list with a
+//! bumped generation. Cycles keep their counts and wait for [`reset`], the
+//! bulk free. Many same-size payloads still share a chunk instead of one
+//! `Box` malloc each. Strings stay on the packed bump and are not counted:
+//! intern never aborts after the copy, so size-class padding would not
+//! reclaim holes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -59,17 +64,61 @@ impl PageString {
     }
 }
 
-/// Same-size payload slab. One malloc per chunk; bump-allocate slots;
-/// pointers stay stable (chunks never reallocate). Never frees mid-page.
-/// `reset` / `Drop` drop every initialized slot, then the chunks.
+/// Bits of an object / array / function handle that hold the 1-based slot
+/// index. The top 8 bits carry the low byte of the slot generation, so a
+/// handle to a freed-and-reused slot never equals the new occupant's handle
+/// (until the byte wraps; weak references compare the full generation).
+const INDEX_BITS: u32 = 24;
+const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
+/// A saturated strong count pins the slot until [`reset`].
+const PINNED: u32 = u32::MAX;
+
+#[inline]
+fn encode_handle(idx: usize, generation: u32) -> u32 {
+    (idx as u32 + 1) | ((generation & 0xFF) << INDEX_BITS)
+}
+
+#[inline]
+fn decode_handle(handle: u32) -> Option<(usize, u32)> {
+    let index = handle & INDEX_MASK;
+    if index == 0 {
+        return None;
+    }
+    Some(((index - 1) as usize, handle >> INDEX_BITS))
+}
+
+/// Per-slot bookkeeping, kept beside (not inside) the payload so a count
+/// change never touches payload bytes.
+#[derive(Clone, Copy, Default)]
+struct SlotMeta {
+    /// Strong references: `Value` handles plus resolved `JsObjectRef` /
+    /// `JsArrayRef` / `JsFunction` handles. Weak references do not count.
+    strong: u32,
+    /// Bumped when the strong count reaches zero. Weak references store the
+    /// full value; handles store its low byte.
+    generation: u32,
+    /// The payload is initialized (live, or dead but not yet dropped).
+    init: bool,
+}
+
+/// Same-size payload slab. One malloc per chunk; pointers stay stable
+/// (chunks never reallocate).
+///
+/// Each slot is strictly reference counted: `alloc` hands out one strong
+/// count, [`retain`] / [`release`] adjust it, and a slot whose count reaches
+/// zero is dropped (iteratively, see [`schedule_drop`]) and pushed on a free
+/// list for reuse with a bumped generation. Cycles keep their counts above
+/// zero and stay until `reset`, which drops every initialized slot.
 ///
 /// Measured 64-bit classes:
 /// - `RefCell<JsObject>` = 304 → 13 slots / 4K chunk (lazy-boxed rare fields)
 /// - `RefCell<ArrayStorage>` = 56 → 73 slots / 4K chunk
 /// - `FunctionData` = 64 → 64 slots / 4K chunk (compact PropertyMap)
 struct SizeClassSlab<T> {
-    chunks: Vec<Box<[MaybeUninit<T>]>>,
-    len: usize,
+    chunks: Vec<Box<[UnsafeCell<MaybeUninit<T>>]>>,
+    meta: Vec<SlotMeta>,
+    free: Vec<u32>,
+    live: usize,
 }
 
 impl<T> SizeClassSlab<T> {
@@ -85,41 +134,129 @@ impl<T> SizeClassSlab<T> {
     fn new() -> Self {
         Self {
             chunks: Vec::new(),
-            len: 0,
+            meta: Vec::new(),
+            free: Vec::new(),
+            live: 0,
         }
     }
 
-    fn new_chunk() -> Box<[MaybeUninit<T>]> {
-        let slots = Self::slots_per_chunk();
-        let mut chunk = Vec::with_capacity(slots);
-        chunk.resize_with(slots, MaybeUninit::uninit);
-        chunk.into_boxed_slice()
+    fn new_chunk() -> Box<[UnsafeCell<MaybeUninit<T>>]> {
+        (0..Self::slots_per_chunk())
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect()
     }
 
     #[inline]
-    fn alloc(&mut self, value: T) -> *const T {
-        let idx = self.len;
+    fn slot_ptr(&self, idx: usize) -> *mut T {
         let slots = Self::slots_per_chunk();
-        let chunk_idx = idx / slots;
-        let slot = idx % slots;
-        if chunk_idx == self.chunks.len() {
-            self.chunks.push(Self::new_chunk());
-        }
-        let ptr = self.chunks[chunk_idx][slot].write(value) as *const T;
-        self.len += 1;
-        ptr
+        self.chunks[idx / slots][idx % slots].get().cast::<T>()
     }
 
-    fn get(&self, idx: usize) -> Option<*const T> {
-        if idx >= self.len {
+    /// Store `value` with one strong count. `Err` when the handle space is
+    /// exhausted; the caller then falls back to a host `Rc`.
+    #[inline]
+    fn alloc(&mut self, value: T) -> Result<u32, T> {
+        let idx = match self.free.pop() {
+            Some(idx) => idx as usize,
+            None => {
+                let idx = self.meta.len();
+                if idx >= INDEX_MASK as usize {
+                    return Err(value);
+                }
+                if idx / Self::slots_per_chunk() == self.chunks.len() {
+                    self.chunks.push(Self::new_chunk());
+                }
+                self.meta.push(SlotMeta::default());
+                idx
+            }
+        };
+        // Safety: `idx` is a free slot (never written, or dropped by
+        // `begin_drop` and returned by `finish_drop`).
+        unsafe { self.slot_ptr(idx).write(value) };
+        let meta = &mut self.meta[idx];
+        meta.strong = 1;
+        meta.init = true;
+        self.live += 1;
+        Ok(encode_handle(idx, meta.generation))
+    }
+
+    /// Slot index of a live handle whose generation byte matches.
+    #[inline]
+    fn live_index(&self, handle: u32) -> Option<usize> {
+        let (idx, generation) = decode_handle(handle)?;
+        let meta = self.meta.get(idx)?;
+        (meta.strong > 0 && (meta.generation & 0xFF) == generation).then_some(idx)
+    }
+
+    #[inline]
+    fn get(&self, handle: u32) -> Option<*const T> {
+        self.live_index(handle)
+            .map(|idx| self.slot_ptr(idx) as *const T)
+    }
+
+    fn generation(&self, handle: u32) -> Option<u32> {
+        self.live_index(handle).map(|idx| self.meta[idx].generation)
+    }
+
+    fn upgrade(&self, handle: u32, generation: u32) -> Option<*const T> {
+        let idx = self.live_index(handle)?;
+        (self.meta[idx].generation == generation).then(|| self.slot_ptr(idx) as *const T)
+    }
+
+    #[inline]
+    fn retain(&mut self, handle: u32) -> bool {
+        let Some(idx) = self.live_index(handle) else {
+            return false;
+        };
+        let meta = &mut self.meta[idx];
+        if meta.strong != PINNED {
+            meta.strong += 1;
+        }
+        true
+    }
+
+    /// Drop one strong count. Returns the slot index when it reached zero;
+    /// the slot is then dead to handles and weak refs (generation bumped)
+    /// but its payload is still initialized until [`Self::begin_drop`].
+    #[inline]
+    fn release(&mut self, handle: u32) -> Option<usize> {
+        let idx = self.live_index(handle)?;
+        let meta = &mut self.meta[idx];
+        if meta.strong == PINNED {
             return None;
         }
-        let slots = Self::slots_per_chunk();
-        Some(self.chunks[idx / slots][idx % slots].as_ptr())
+        meta.strong -= 1;
+        if meta.strong > 0 {
+            return None;
+        }
+        meta.generation = meta.generation.wrapping_add(1);
+        self.live -= 1;
+        Some(idx)
     }
 
+    /// Hand out a dead slot's payload pointer for an in-place drop. The
+    /// slot is not reusable until [`Self::finish_drop`].
+    fn begin_drop(&mut self, idx: usize) -> Option<*mut T> {
+        let meta = self.meta.get_mut(idx)?;
+        if meta.strong != 0 || !meta.init {
+            return None;
+        }
+        meta.init = false;
+        Some(self.slot_ptr(idx))
+    }
+
+    fn finish_drop(&mut self, idx: usize) {
+        if let Some(meta) = self.meta.get(idx)
+            && meta.strong == 0
+            && !meta.init
+        {
+            self.free.push(idx as u32);
+        }
+    }
+
+    /// Live (strongly referenced) slots.
     fn len(&self) -> usize {
-        self.len
+        self.live
     }
 
     fn reserved_bytes(&self) -> usize {
@@ -129,20 +266,22 @@ impl<T> SizeClassSlab<T> {
             .saturating_mul(std::mem::size_of::<T>())
     }
 
+    /// Drop every initialized slot (live, cycle-held, or dead but pending),
+    /// then the chunks. Only called on a slab already detached from the
+    /// arena, so payload drops may re-enter the (new) arena freely.
     fn clear(&mut self) {
-        let slots = Self::slots_per_chunk();
-        let mut remaining = self.len;
-        self.len = 0;
-        for chunk in self.chunks.iter_mut() {
-            let n = remaining.min(slots);
-            for slot in 0..n {
-                // Safety: the first `len` slots were written by `alloc`.
-                unsafe {
-                    chunk[slot].assume_init_drop();
-                }
+        for idx in 0..self.meta.len() {
+            if !self.meta[idx].init {
+                continue;
             }
-            remaining = remaining.saturating_sub(n);
+            self.meta[idx].init = false;
+            // Safety: `init` slots hold a value written by `alloc` and not
+            // yet dropped.
+            unsafe { std::ptr::drop_in_place(self.slot_ptr(idx)) };
         }
+        self.meta.clear();
+        self.free.clear();
+        self.live = 0;
         self.chunks.clear();
         self.chunks.shrink_to_fit();
     }
@@ -151,6 +290,40 @@ impl<T> SizeClassSlab<T> {
 impl<T> Drop for SizeClassSlab<T> {
     fn drop(&mut self) {
         self.clear();
+    }
+}
+
+/// Which slab a handle names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotKind {
+    Object,
+    Array,
+    Function,
+}
+
+/// Slabs detached by [`reset`]; dropping it drops the old page's payloads.
+struct RetiredSlabs {
+    _objects: SizeClassSlab<RefCell<crate::JsObject>>,
+    _arrays: SizeClassSlab<RefCell<crate::value::ArrayStorage>>,
+    _functions: SizeClassSlab<crate::value::FunctionData>,
+}
+
+enum DropPtr {
+    Object(*mut RefCell<crate::JsObject>),
+    Array(*mut RefCell<crate::value::ArrayStorage>),
+    Function(*mut crate::value::FunctionData),
+}
+
+impl DropPtr {
+    /// Safety: the pointer came from `begin_drop` and its chunk is alive.
+    unsafe fn drop_payload(self) {
+        unsafe {
+            match self {
+                DropPtr::Object(ptr) => std::ptr::drop_in_place(ptr),
+                DropPtr::Array(ptr) => std::ptr::drop_in_place(ptr),
+                DropPtr::Function(ptr) => std::ptr::drop_in_place(ptr),
+            }
+        }
     }
 }
 
@@ -293,7 +466,7 @@ impl PageArena {
         unsafe { self.current.as_ptr().add(start) }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> RetiredSlabs {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.epoch = 1;
@@ -312,71 +485,168 @@ impl PageArena {
         self.hash_slots.fill(0);
         self.hash_len = 0;
         self.allocated = 0;
-        self.objects.clear();
-        self.arrays.clear();
-        self.functions.clear();
+        RetiredSlabs {
+            _objects: std::mem::replace(&mut self.objects, SizeClassSlab::new()),
+            _arrays: std::mem::replace(&mut self.arrays, SizeClassSlab::new()),
+            _functions: std::mem::replace(&mut self.functions, SizeClassSlab::new()),
+        }
     }
 
-    fn alloc_object(&mut self, object: crate::JsObject) -> u32 {
-        self.objects.alloc(RefCell::new(object));
-        self.objects.len() as u32
+    fn alloc_object(&mut self, object: crate::JsObject) -> Result<u32, crate::JsObject> {
+        self.objects
+            .alloc(RefCell::new(object))
+            .map_err(RefCell::into_inner)
     }
 
-    fn get_object(&self, handle: u32) -> Option<crate::value::JsObjectRef> {
-        let idx = handle.checked_sub(1)? as usize;
-        let ptr = self.objects.get(idx)?;
+    /// Resolve a live handle and take one strong count for the returned ref.
+    fn get_object(&mut self, handle: u32) -> Option<crate::value::JsObjectRef> {
+        let ptr = self.objects.get(handle)?;
+        self.objects.retain(handle);
         Some(crate::value::JsObjectRef::from_interned(
             handle, self.epoch, ptr,
         ))
     }
 
-    fn upgrade_object(&self, handle: u32, epoch: u32) -> Option<crate::value::JsObjectRef> {
+    fn upgrade_object(
+        &mut self,
+        handle: u32,
+        epoch: u32,
+        generation: u32,
+    ) -> Option<crate::value::JsObjectRef> {
         if epoch != self.epoch {
             return None;
         }
-        self.get_object(handle)
+        let ptr = self.objects.upgrade(handle, generation)?;
+        self.objects.retain(handle);
+        Some(crate::value::JsObjectRef::from_interned(
+            handle, self.epoch, ptr,
+        ))
     }
 
-    fn alloc_array(&mut self, array: crate::value::ArrayStorage) -> u32 {
-        self.arrays.alloc(RefCell::new(array));
-        self.arrays.len() as u32
+    fn alloc_array(
+        &mut self,
+        array: crate::value::ArrayStorage,
+    ) -> Result<u32, crate::value::ArrayStorage> {
+        self.arrays
+            .alloc(RefCell::new(array))
+            .map_err(RefCell::into_inner)
     }
 
-    fn get_array(&self, handle: u32) -> Option<crate::value::JsArrayRef> {
-        let idx = handle.checked_sub(1)? as usize;
-        let ptr = self.arrays.get(idx)?;
+    fn get_array(&mut self, handle: u32) -> Option<crate::value::JsArrayRef> {
+        let ptr = self.arrays.get(handle)?;
+        self.arrays.retain(handle);
         Some(crate::value::JsArrayRef::from_interned(
             handle, self.epoch, ptr,
         ))
     }
 
-    fn upgrade_array(&self, handle: u32, epoch: u32) -> Option<crate::value::JsArrayRef> {
+    fn upgrade_array(
+        &mut self,
+        handle: u32,
+        epoch: u32,
+        generation: u32,
+    ) -> Option<crate::value::JsArrayRef> {
         if epoch != self.epoch {
             return None;
         }
-        self.get_array(handle)
+        let ptr = self.arrays.upgrade(handle, generation)?;
+        self.arrays.retain(handle);
+        Some(crate::value::JsArrayRef::from_interned(
+            handle, self.epoch, ptr,
+        ))
     }
 
-    fn alloc_function(&mut self, function: crate::value::FunctionData) -> u32 {
-        self.functions.alloc(function);
-        self.functions.len() as u32
+    fn alloc_function(
+        &mut self,
+        function: crate::value::FunctionData,
+    ) -> Result<u32, crate::value::FunctionData> {
+        self.functions.alloc(function)
     }
 
-    fn get_function(&self, handle: u32) -> Option<crate::value::JsFunction> {
-        let idx = handle.checked_sub(1)? as usize;
-        let ptr = self.functions.get(idx)?;
+    fn get_function(&mut self, handle: u32) -> Option<crate::value::JsFunction> {
+        let ptr = self.functions.get(handle)?;
+        self.functions.retain(handle);
         Some(crate::value::JsFunction::from_interned(
             handle, self.epoch, ptr,
         ))
     }
 
-    fn upgrade_function(&self, handle: u32, epoch: u32) -> Option<crate::value::JsFunction> {
+    fn upgrade_function(
+        &mut self,
+        handle: u32,
+        epoch: u32,
+        generation: u32,
+    ) -> Option<crate::value::JsFunction> {
         if epoch != self.epoch {
             return None;
         }
-        self.get_function(handle)
+        let ptr = self.functions.upgrade(handle, generation)?;
+        self.functions.retain(handle);
+        Some(crate::value::JsFunction::from_interned(
+            handle, self.epoch, ptr,
+        ))
     }
 
+    #[inline]
+    fn retain(&mut self, kind: SlotKind, handle: u32) -> bool {
+        match kind {
+            SlotKind::Object => self.objects.retain(handle),
+            SlotKind::Array => self.arrays.retain(handle),
+            SlotKind::Function => self.functions.retain(handle),
+        }
+    }
+
+    #[inline]
+    fn release(&mut self, kind: SlotKind, handle: u32) -> Option<usize> {
+        match kind {
+            SlotKind::Object => self.objects.release(handle),
+            SlotKind::Array => self.arrays.release(handle),
+            SlotKind::Function => self.functions.release(handle),
+        }
+    }
+
+    fn generation(&self, kind: SlotKind, handle: u32) -> Option<u32> {
+        match kind {
+            SlotKind::Object => self.objects.generation(handle),
+            SlotKind::Array => self.arrays.generation(handle),
+            SlotKind::Function => self.functions.generation(handle),
+        }
+    }
+
+    fn begin_drop(&mut self, kind: SlotKind, idx: usize) -> Option<DropPtr> {
+        match kind {
+            SlotKind::Object => self.objects.begin_drop(idx).map(DropPtr::Object),
+            SlotKind::Array => self.arrays.begin_drop(idx).map(DropPtr::Array),
+            SlotKind::Function => self.functions.begin_drop(idx).map(DropPtr::Function),
+        }
+    }
+
+    fn finish_drop(&mut self, kind: SlotKind, idx: usize) {
+        match kind {
+            SlotKind::Object => self.objects.finish_drop(idx),
+            SlotKind::Array => self.arrays.finish_drop(idx),
+            SlotKind::Function => self.functions.finish_drop(idx),
+        }
+    }
+
+    #[cfg(test)]
+    fn strong_count(&self, kind: SlotKind, handle: u32) -> Option<u32> {
+        let meta = |slab_meta: &[SlotMeta], idx: usize| slab_meta[idx].strong;
+        match kind {
+            SlotKind::Object => self
+                .objects
+                .live_index(handle)
+                .map(|idx| meta(&self.objects.meta, idx)),
+            SlotKind::Array => self
+                .arrays
+                .live_index(handle)
+                .map(|idx| meta(&self.arrays.meta, idx)),
+            SlotKind::Function => self
+                .functions
+                .live_index(handle)
+                .map(|idx| meta(&self.functions.meta, idx)),
+        }
+    }
     fn slab_bytes(&self) -> usize {
         self.objects
             .reserved_bytes()
@@ -450,12 +720,26 @@ pub(crate) fn str_at(handle: u32, epoch: u32) -> &'static str {
 
 /// Drop interned page strings and payload slabs. Called from `reset_bridge`
 /// / navigation.
+///
+/// The epoch is bumped before any payload is dropped, so handles released
+/// by those drops are stale no-ops. The old slabs are dropped outside the
+/// arena borrow; inside a running [`schedule_drop`] they are parked until
+/// the in-place drop in progress has finished with its chunk.
 pub fn reset() {
-    ARENA.with(|arena| {
+    let retired = ARENA.with(|arena| {
         let mut arena = arena.borrow_mut();
-        arena.reset();
+        let retired = arena.reset();
         sync_epoch(arena.epoch);
+        retired
     });
+    if DRAINING.get() {
+        let parked = GRAVEYARD.try_with(|graveyard| graveyard.borrow_mut().push(retired));
+        if let Err(_) = parked {
+            // Thread teardown: nothing else can touch the old slabs.
+        }
+        return;
+    }
+    drop(retired);
 }
 
 /// UTF-8 bytes currently interned in the page bump.
@@ -473,92 +757,242 @@ pub fn live_handles() -> usize {
     ARENA.with(|arena| arena.borrow().slots.len().saturating_sub(1))
 }
 
-/// Store a page-local object. The arena owns the payload once;
-/// returned handles are `Clone` (`u32` + cached slot pointer).
-pub(crate) fn alloc_object(object: crate::JsObject) -> u32 {
+thread_local! {
+    /// Dead slots whose payloads still have to be dropped: `(kind, slot
+    /// index, epoch)`. A LIFO work list instead of recursion, so releasing
+    /// a long chain or a huge array of arena values runs in constant stack.
+    static PENDING: RefCell<Vec<(SlotKind, u32, u32)>> = const { RefCell::new(Vec::new()) };
+    static DRAINING: Cell<bool> = const { Cell::new(false) };
+    /// Slabs retired by a `reset` that ran inside a payload drop.
+    static GRAVEYARD: RefCell<Vec<RetiredSlabs>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take one more strong count on a live handle (`Value` / ref clone).
+///
+/// Panics if the arena is mutably borrowed: skipping the increment would
+/// let a later release free a slot that is still referenced.
+#[inline]
+pub(crate) fn retain(kind: SlotKind, handle: u32) {
+    let _ = ARENA.try_with(|arena| arena.borrow_mut().retain(kind, handle));
+}
+
+/// Drop one strong count. At zero the slot dies: weak references stop
+/// upgrading at once, and the payload (with every child it holds) is
+/// dropped through the iterative [`schedule_drop`] queue before this
+/// returns, unless an outer drop is already draining it.
+///
+/// A release that cannot reach the arena (thread teardown, or an arena
+/// borrow that should not exist) leaks the slot until reset rather than
+/// risking a free of a referenced slot.
+#[inline]
+pub(crate) fn release(kind: SlotKind, handle: u32) {
+    let freed = ARENA
+        .try_with(|arena| {
+            arena
+                .try_borrow_mut()
+                .ok()
+                .and_then(|mut arena| arena.release(kind, handle))
+        })
+        .ok()
+        .flatten();
+    if let Some(idx) = freed {
+        schedule_drop(kind, idx as u32);
+    }
+}
+
+struct DrainGuard;
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        DRAINING.set(false);
+    }
+}
+
+fn schedule_drop(kind: SlotKind, idx: u32) {
+    let epoch = current_epoch();
+    if PENDING
+        .try_with(|pending| pending.borrow_mut().push((kind, idx, epoch)))
+        .is_err()
+    {
+        return;
+    }
+    if DRAINING.get() {
+        return;
+    }
+    DRAINING.set(true);
+    let guard = DrainGuard;
+    loop {
+        let Some((kind, idx, epoch)) = PENDING.with(|pending| pending.borrow_mut().pop()) else {
+            break;
+        };
+        if epoch != current_epoch() {
+            // A reset already dropped (or will drop) this payload with its slab.
+            continue;
+        }
+        let ptr = ARENA
+            .try_with(|arena| arena.borrow_mut().begin_drop(kind, idx as usize))
+            .ok()
+            .flatten();
+        let Some(ptr) = ptr else {
+            continue;
+        };
+        // Safety: `begin_drop` marked the slot uninitialized, so neither a
+        // reset `clear` nor another drain drops it again, and the slot is
+        // not on the free list yet. Its chunk stays alive: a reset during
+        // this drop parks the retired slabs in `GRAVEYARD` until the loop
+        // ends. The arena is not borrowed here, so the payload's own
+        // children re-enter `release` and only append to `PENDING`.
+        unsafe { ptr.drop_payload() };
+        if epoch == current_epoch() {
+            let _ = ARENA.try_with(|arena| arena.borrow_mut().finish_drop(kind, idx as usize));
+        }
+    }
+    drop(guard);
+    let graves = GRAVEYARD
+        .try_with(|graveyard| std::mem::take(&mut *graveyard.borrow_mut()))
+        .unwrap_or_default();
+    drop(graves);
+}
+
+/// Full slot generation of a live handle, for weak references.
+pub(crate) fn generation(kind: SlotKind, handle: u32) -> Option<u32> {
+    ARENA.with(|arena| arena.borrow().generation(kind, handle))
+}
+
+/// Identity bits (63 bits; bit 63 is left for callers to tag) for a live
+/// handle. Unlike the slot address they stay unique across slot reuse:
+/// slab kind (bits 61..63), low epoch bits (56..61), full slot generation
+/// (24..56) and slot index (0..24).
+pub(crate) fn identity_bits(kind: SlotKind, handle: u32) -> Option<u64> {
+    let generation = generation(kind, handle)?;
+    let kind = match kind {
+        SlotKind::Object => 0_u64,
+        SlotKind::Array => 1,
+        SlotKind::Function => 2,
+    };
+    let epoch = (current_epoch() as u64) & 0x1F;
+    Some(
+        (kind << 61)
+            | (epoch << 56)
+            | ((generation as u64) << INDEX_BITS)
+            | (handle & INDEX_MASK) as u64,
+    )
+}
+
+/// [`identity_bits`] as a `usize` identity word tagged with the top bit, so
+/// it never equals a host allocation address.
+pub(crate) fn identity_word(kind: SlotKind, handle: u32) -> Option<usize> {
+    let bits = identity_bits(kind, handle)? | (1 << 63);
+    Some(if usize::BITS >= 64 {
+        bits as usize
+    } else {
+        ((bits ^ (bits >> 32)) as usize) | (1 << (usize::BITS - 1))
+    })
+}
+
+/// Strong count of a live slot (tests / diagnostics).
+#[cfg(test)]
+pub(crate) fn strong_count_of(kind: SlotKind, handle: u32) -> Option<u32> {
+    ARENA.with(|arena| arena.borrow().strong_count(kind, handle))
+}
+
+/// Store a page-local object with one strong count (owned by the returned
+/// handle). `Err` returns the payload when the slab handle space is full.
+pub(crate) fn alloc_object(object: crate::JsObject) -> Result<u32, crate::JsObject> {
     ARENA.with(|arena| arena.borrow_mut().alloc_object(object))
 }
 
-/// Resolve a live object handle. Returns `None` if the slot is empty
-/// (previous-page leftover after [`reset`]). Does not clone the payload.
-/// Already-resolved `JsObjectRef` values still epoch-check on deref.
+/// Resolve a live object handle into a counted ref. `None` for a dead,
+/// reused, or previous-page handle. Does not clone the payload.
 pub(crate) fn get_object(handle: u32) -> Option<crate::value::JsObjectRef> {
     if handle == 0 {
         return None;
     }
-    ARENA.with(|arena| arena.borrow().get_object(handle))
+    ARENA.with(|arena| arena.borrow_mut().get_object(handle))
 }
 
-/// Upgrade an interned weak object. Fails after [`reset`] via epoch
-/// or empty slot — not `Weak::upgrade` of an inner Rc.
-pub(crate) fn upgrade_object(handle: u32, epoch: u32) -> Option<crate::value::JsObjectRef> {
+/// Upgrade an interned weak object. Fails after the slot died (count zero,
+/// generation bumped) or after [`reset`] (epoch).
+pub(crate) fn upgrade_object(
+    handle: u32,
+    epoch: u32,
+    generation: u32,
+) -> Option<crate::value::JsObjectRef> {
     if handle == 0 || epoch != current_epoch() {
         return None;
     }
-    ARENA.with(|arena| arena.borrow().upgrade_object(handle, epoch))
+    ARENA.with(|arena| arena.borrow_mut().upgrade_object(handle, epoch, generation))
 }
 
-/// Live page-local objects (empty after [`reset`]).
+/// Live (strongly referenced) page-local objects.
 pub fn live_objects() -> usize {
     ARENA.with(|arena| arena.borrow().objects.len())
 }
 
-/// Store a page-local array. The arena owns the payload once;
-/// returned handles are `Clone` (`u32` + cached slot pointer).
-pub(crate) fn alloc_array(array: crate::value::ArrayStorage) -> u32 {
+/// Store a page-local array; see [`alloc_object`].
+pub(crate) fn alloc_array(
+    array: crate::value::ArrayStorage,
+) -> Result<u32, crate::value::ArrayStorage> {
     ARENA.with(|arena| arena.borrow_mut().alloc_array(array))
 }
 
-/// Resolve a live array handle. Returns `None` if the slot is empty
-/// (previous-page leftover after [`reset`]). Does not clone the payload.
-/// Already-resolved `JsArrayRef` values still epoch-check on deref.
+/// Resolve a live array handle into a counted ref; see [`get_object`].
 pub(crate) fn get_array(handle: u32) -> Option<crate::value::JsArrayRef> {
     if handle == 0 {
         return None;
     }
-    ARENA.with(|arena| arena.borrow().get_array(handle))
+    ARENA.with(|arena| arena.borrow_mut().get_array(handle))
 }
 
-/// Upgrade an interned weak array. Fails after [`reset`] via epoch
-/// or empty slot — not `Weak::upgrade` of an inner Rc.
-pub(crate) fn upgrade_array(handle: u32, epoch: u32) -> Option<crate::value::JsArrayRef> {
+/// Upgrade an interned weak array; see [`upgrade_object`].
+pub(crate) fn upgrade_array(
+    handle: u32,
+    epoch: u32,
+    generation: u32,
+) -> Option<crate::value::JsArrayRef> {
     if handle == 0 || epoch != current_epoch() {
         return None;
     }
-    ARENA.with(|arena| arena.borrow().upgrade_array(handle, epoch))
+    ARENA.with(|arena| arena.borrow_mut().upgrade_array(handle, epoch, generation))
 }
 
-/// Live page-local arrays (empty after [`reset`]).
+/// Live (strongly referenced) page-local arrays.
 pub fn live_arrays() -> usize {
     ARENA.with(|arena| arena.borrow().arrays.len())
 }
 
-/// Store a page-local JS function. The arena owns the payload once;
-/// returned handles are `Copy` (`u32` + cached slot pointer).
-pub(crate) fn alloc_function(function: crate::value::FunctionData) -> u32 {
+/// Store a page-local JS function; see [`alloc_object`].
+pub(crate) fn alloc_function(
+    function: crate::value::FunctionData,
+) -> Result<u32, crate::value::FunctionData> {
     ARENA.with(|arena| arena.borrow_mut().alloc_function(function))
 }
 
-/// Resolve a live function handle. Returns `None` if the slot is empty
-/// (previous-page leftover after [`reset`]). Does not clone the payload.
-/// Already-resolved `JsFunction` values still epoch-check on deref.
+/// Resolve a live function handle into a counted ref; see [`get_object`].
 pub(crate) fn get_function(handle: u32) -> Option<crate::value::JsFunction> {
     if handle == 0 {
         return None;
     }
-    ARENA.with(|arena| arena.borrow().get_function(handle))
+    ARENA.with(|arena| arena.borrow_mut().get_function(handle))
 }
 
-/// Upgrade an interned weak function. Fails after [`reset`] via epoch
-/// or empty slot — not `Weak::upgrade` of inner Rcs.
-pub(crate) fn upgrade_function(handle: u32, epoch: u32) -> Option<crate::value::JsFunction> {
+/// Upgrade an interned weak function; see [`upgrade_object`].
+pub(crate) fn upgrade_function(
+    handle: u32,
+    epoch: u32,
+    generation: u32,
+) -> Option<crate::value::JsFunction> {
     if handle == 0 || epoch != current_epoch() {
         return None;
     }
-    ARENA.with(|arena| arena.borrow().upgrade_function(handle, epoch))
+    ARENA.with(|arena| {
+        arena
+            .borrow_mut()
+            .upgrade_function(handle, epoch, generation)
+    })
 }
 
-/// Live page-local functions (empty after [`reset`]).
+/// Live (strongly referenced) page-local functions.
 pub fn live_functions() -> usize {
     ARENA.with(|arena| arena.borrow().functions.len())
 }
@@ -609,7 +1043,7 @@ mod tests {
         reset();
         assert_eq!(live_objects(), 0);
         assert_eq!(slab_bytes(), 0);
-        let handle = alloc_object(crate::JsObject::new());
+        let handle = alloc_object(crate::JsObject::new()).ok().expect("slot");
         assert_eq!(handle, 1);
         let resolved = get_object(handle).expect("live object");
         let cloned = resolved.clone();
@@ -631,7 +1065,9 @@ mod tests {
         reset();
         assert_eq!(live_arrays(), 0);
         assert_eq!(slab_bytes(), 0);
-        let handle = alloc_array(crate::value::ArrayStorage::new(Vec::new()));
+        let handle = alloc_array(crate::value::ArrayStorage::new(Vec::new()))
+            .ok()
+            .expect("slot");
         assert_eq!(handle, 1);
         let resolved = get_array(handle).expect("live array");
         let cloned = resolved.clone();
@@ -655,7 +1091,9 @@ mod tests {
         assert_eq!(slab_bytes(), 0);
         let handle = alloc_function(crate::value::FunctionData::new(|_, _| {
             crate::Value::Undefined
-        }));
+        }))
+        .ok()
+        .expect("slot");
         assert_eq!(handle, 1);
         let resolved = get_function(handle).expect("live function");
         let cloned = resolved.clone();
@@ -725,7 +1163,7 @@ mod tests {
         assert!(n >= 8);
 
         for _ in 0..n {
-            alloc_function(crate::value::FunctionData::new(|_, _| {
+            let _ = alloc_function(crate::value::FunctionData::new(|_, _| {
                 crate::Value::Undefined
             }));
         }
@@ -741,5 +1179,255 @@ mod tests {
         assert_eq!(slab_bytes(), 0);
         assert_eq!(live_functions(), 0);
         assert_eq!(live_objects(), 0);
+    }
+
+    fn object_value(props: &[(&str, crate::Value)]) -> crate::Value {
+        let mut map = std::collections::HashMap::new();
+        for (key, value) in props {
+            map.insert((*key).to_string(), value.clone());
+        }
+        crate::Value::object(map)
+    }
+
+    fn handle_of(value: &crate::Value) -> u32 {
+        value.object_handle().expect("page-arena object")
+    }
+
+    #[test]
+    fn slot_strong_count_tracks_clone_and_drop() {
+        reset();
+        let value = object_value(&[]);
+        let handle = handle_of(&value);
+        assert_eq!(strong_count_of(SlotKind::Object, handle), Some(1));
+        let copy = value.clone();
+        assert_eq!(strong_count_of(SlotKind::Object, handle), Some(2));
+        let resolved = value.as_object().expect("object");
+        assert_eq!(strong_count_of(SlotKind::Object, handle), Some(3));
+        let resolved_copy = resolved.clone();
+        assert_eq!(strong_count_of(SlotKind::Object, handle), Some(4));
+        drop(resolved_copy);
+        drop(resolved);
+        drop(copy);
+        assert_eq!(strong_count_of(SlotKind::Object, handle), Some(1));
+        assert_eq!(live_objects(), 1);
+        drop(value);
+        assert_eq!(strong_count_of(SlotKind::Object, handle), None);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn freed_slot_is_reused_with_a_new_generation() {
+        reset();
+        let first = object_value(&[("tag", crate::Value::Number(1.0))]);
+        let old_handle = handle_of(&first);
+        let old_bits = first.object_identity_bits().expect("identity");
+        let old_identity = first.as_object().expect("object").identity();
+        let weak = first.as_object().expect("object").downgrade();
+        drop(first);
+        assert!(weak.upgrade().is_none(), "weak ref dies with the slot");
+        assert!(get_object(old_handle).is_none(), "stale handle is rejected");
+
+        let second = object_value(&[("tag", crate::Value::Number(2.0))]);
+        let new_handle = handle_of(&second);
+        assert_eq!(
+            new_handle & INDEX_MASK,
+            old_handle & INDEX_MASK,
+            "free list reuses the slot"
+        );
+        assert_ne!(new_handle, old_handle, "generation byte differs");
+        assert_ne!(second.object_identity_bits(), Some(old_bits));
+        assert_ne!(
+            second.as_object().expect("object").identity(),
+            old_identity,
+            "identity-keyed side tables never alias a reused slot"
+        );
+        assert!(get_object(old_handle).is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "old weak ref never sees the new occupant"
+        );
+        assert_eq!(second.get_property("tag"), crate::Value::Number(2.0));
+        assert_eq!(slab_bytes(), {
+            let size = std::mem::size_of::<RefCell<crate::JsObject>>();
+            SizeClassSlab::<RefCell<crate::JsObject>>::slots_per_chunk() * size
+        });
+        reset();
+    }
+
+    #[test]
+    fn full_generation_guards_weak_refs_across_generation_byte_wrap() {
+        reset();
+        let first = object_value(&[]);
+        let weak = first.as_object().expect("object").downgrade();
+        let handle = handle_of(&first);
+        drop(first);
+        // 256 reuses bring the handle's generation byte back around.
+        let mut reused = None;
+        for _ in 0..256 {
+            reused = Some(object_value(&[]));
+            if reused.as_ref().map(handle_of) == Some(handle) {
+                break;
+            }
+            reused = None;
+        }
+        let reused = reused.expect("same handle after the generation byte wraps");
+        assert_eq!(handle_of(&reused), handle);
+        assert!(weak.upgrade().is_none(), "full generation still differs");
+        reset();
+    }
+
+    #[test]
+    fn escaping_objects_are_freed_before_reset() {
+        reset();
+        let base = live_objects();
+        {
+            let items: Vec<crate::Value> = (0..1000)
+                .map(|index| {
+                    let inner = object_value(&[("i", crate::Value::Number(index as f64))]);
+                    object_value(&[("inner", inner)])
+                })
+                .collect();
+            let array = crate::Value::array(items);
+            assert_eq!(live_objects(), base + 2000);
+            assert_eq!(live_arrays(), 1);
+            let holder = object_value(&[("list", array)]);
+            assert_eq!(live_objects(), base + 2001);
+            drop(holder);
+        }
+        assert_eq!(live_objects(), base);
+        assert_eq!(live_arrays(), 0);
+        reset();
+    }
+
+    #[test]
+    fn overwriting_a_property_releases_the_old_value() {
+        reset();
+        let holder = object_value(&[]);
+        holder.set_property("slot", object_value(&[]));
+        assert_eq!(live_objects(), 2);
+        holder.set_property("slot", crate::Value::Number(0.0));
+        assert_eq!(live_objects(), 1);
+        drop(holder);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn long_chain_is_released_iteratively() {
+        reset();
+        // Deep enough to overflow a 2 MiB test-thread stack with recursive drops.
+        let mut head = object_value(&[]);
+        for _ in 0..200_000 {
+            head = object_value(&[("next", head)]);
+        }
+        assert_eq!(live_objects(), 200_001);
+        drop(head);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn closures_and_their_captures_are_freed() {
+        reset();
+        let captured = object_value(&[("n", crate::Value::Number(41.0))]);
+        let inside = captured.clone();
+        let function = crate::Value::function(move |_, _| {
+            crate::Value::Number(inside.get_property("n").as_number().unwrap_or(0.0) + 1.0)
+        });
+        drop(captured);
+        assert_eq!(live_functions(), 1);
+        // The capture plus the function's own `prototype` object.
+        assert_eq!(live_objects(), 2);
+        assert_eq!(
+            function.call(crate::Value::Undefined, vec![]),
+            crate::Value::Number(42.0)
+        );
+        drop(function);
+        assert_eq!(live_functions(), 0);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn host_values_holding_arena_values_release_them() {
+        reset();
+        let host = crate::Value::Object(std::rc::Rc::new(RefCell::new(crate::JsObject::new())));
+        host.set_property("child", object_value(&[]));
+        assert_eq!(live_objects(), 1);
+        drop(host);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn cycles_stay_alive_until_reset() {
+        reset();
+        let a = object_value(&[]);
+        let b = object_value(&[("peer", a.clone())]);
+        a.set_property("peer", b.clone());
+        let selfish = object_value(&[]);
+        selfish.set_property("me", selfish.clone());
+        drop(a);
+        drop(b);
+        drop(selfish);
+        // Strong refcounting cannot see cycles; they are the documented
+        // leak that `reset` (or `unique_back_edges` weakening) reclaims.
+        assert_eq!(live_objects(), 3);
+        reset();
+        assert_eq!(live_objects(), 0);
+        assert_eq!(slab_bytes(), 0);
+    }
+
+    #[test]
+    fn values_from_a_previous_page_are_inert() {
+        reset();
+        let old = object_value(&[]);
+        let old_handle = handle_of(&old);
+        let old_ref = old.as_object().expect("object");
+        reset();
+        let current = object_value(&[]);
+        assert_eq!(
+            handle_of(&current),
+            old_handle,
+            "same slot index and generation"
+        );
+        drop(old_ref);
+        drop(old.clone());
+        drop(old);
+        assert_eq!(
+            strong_count_of(SlotKind::Object, handle_of(&current)),
+            Some(1)
+        );
+        assert_eq!(live_objects(), 1);
+        drop(current);
+        assert_eq!(live_objects(), 0);
+        reset();
+    }
+
+    #[test]
+    fn reset_during_a_payload_drop_is_deferred() {
+        reset();
+        struct ResetOnDrop;
+        impl Drop for ResetOnDrop {
+            fn drop(&mut self) {
+                super::reset();
+            }
+        }
+        let guard = std::rc::Rc::new(ResetOnDrop);
+        let function = crate::Value::function(move |_, _| {
+            let _keep = &guard;
+            crate::Value::Undefined
+        });
+        let sibling = object_value(&[("f", function)]);
+        let other = object_value(&[]);
+        drop(sibling);
+        // The reset ran inside the closure's drop; its slabs were parked and
+        // dropped once the drain finished.
+        assert_eq!(live_objects(), 0);
+        assert_eq!(live_functions(), 0);
+        drop(other);
+        assert_eq!(live_objects(), 0);
+        reset();
     }
 }
