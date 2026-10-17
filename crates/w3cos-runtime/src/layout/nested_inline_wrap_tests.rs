@@ -976,7 +976,9 @@ fn empty_decorated_inline_exports_its_font_box_baseline() {
             1,
         ),
     ];
-    let positions = HashMap::from([(0, 0), (1, 1)]);
+    let positions = [(0, 0), (1, 1)]
+        .into_iter()
+        .collect::<crate::layout::LayoutPositions>();
     assert_eq!(
         last_text_baseline(&root, 0, &layouts, &positions),
         Some(54.0 + inline_font_content_ascent(&inline)),
@@ -999,7 +1001,14 @@ fn empty_decorated_inline_exports_its_font_box_baseline() {
         0,
     )];
     assert_eq!(
-        last_text_baseline(&empty, 0, &zero, &HashMap::from([(0, 0)])),
+        last_text_baseline(
+            &empty,
+            0,
+            &zero,
+            &[(0, 0)]
+                .into_iter()
+                .collect::<crate::layout::LayoutPositions>()
+        ),
         None
     );
 }
