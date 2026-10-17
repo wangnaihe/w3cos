@@ -47,6 +47,8 @@ pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
             builder.predeclare_lexical_binding(statement)?;
         }
     }
+    builder.superseded_function_declarations =
+        superseded_function_declarations(module_function_declarations(&parsed.body));
     for item in &parsed.body {
         if let ModuleItem::Stmt(statement) = item {
             builder.initialize_function_declaration(statement)?;
@@ -69,6 +71,50 @@ pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
 /// entry. Unresolved identifiers become `w3cos:global` imports so native ESM
 /// codegen can adapt them to its existing live module cells. This lets the
 /// incremental ESM pipeline reuse W3IR without printing and reparsing SWC AST.
+/// Spans of function declarations that a later same-named declaration in the
+/// same statement list supersedes (FunctionDeclarationInstantiation step 36:
+/// "the last declaration of that name is initialized").
+fn superseded_function_declarations<'a>(
+    declarations: impl Iterator<Item = &'a swc_ecma_ast::FnDecl>,
+) -> HashSet<swc_common::BytePos> {
+    let mut last = HashMap::<String, swc_common::BytePos>::new();
+    let mut superseded = HashSet::new();
+    for declaration in declarations {
+        if declaration.declare {
+            continue;
+        }
+        if let Some(previous) = last.insert(
+            declaration.ident.sym.to_string(),
+            declaration.function.span.lo,
+        ) {
+            superseded.insert(previous);
+        }
+    }
+    superseded
+}
+
+fn statement_function_declarations(
+    statements: &[Stmt],
+) -> impl Iterator<Item = &swc_ecma_ast::FnDecl> {
+    statements.iter().filter_map(|statement| match statement {
+        Stmt::Decl(Decl::Fn(declaration)) => Some(declaration),
+        _ => None,
+    })
+}
+
+fn module_function_declarations(
+    items: &[ModuleItem],
+) -> impl Iterator<Item = &swc_ecma_ast::FnDecl> {
+    items.iter().filter_map(|item| match item {
+        ModuleItem::Stmt(Stmt::Decl(Decl::Fn(declaration))) => Some(declaration),
+        ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
+            Decl::Fn(declaration) => Some(declaration),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
 pub(crate) fn lower_module_statements(
     statements: &[Stmt],
     specifier: &str,
@@ -87,6 +133,8 @@ pub(crate) fn lower_module_statements(
     for statement in statements {
         builder.predeclare_lexical_binding(statement)?;
     }
+    builder.superseded_function_declarations =
+        superseded_function_declarations(statement_function_declarations(statements));
     for statement in statements {
         builder.initialize_function_declaration(statement)?;
     }
@@ -247,6 +295,8 @@ pub fn lower_module(source: &str, specifier: &str) -> Result<Module> {
         }
     }
 
+    builder.superseded_function_declarations =
+        superseded_function_declarations(module_function_declarations(&parsed.body));
     for item in &parsed.body {
         match item {
             ModuleItem::Stmt(statement) => {
@@ -777,6 +827,10 @@ struct Builder {
     /// Ordinary (non-arrow, non-class-member) function: `new.target` is its
     /// [[Construct]] new target.
     allows_new_target: bool,
+    /// Function declarations whose binding is re-initialized by a later
+    /// declaration of the same name in the same scope (ECMA-262
+    /// FunctionDeclarationInstantiation keeps only the last one).
+    superseded_function_declarations: HashSet<swc_common::BytePos>,
     /// Register holding `new.target`, read once at function entry.
     new_target: Option<Register>,
 }
@@ -830,6 +884,7 @@ impl Builder {
             generator_suspension_points: Vec::new(),
             terminated: false,
             allows_new_target: false,
+            superseded_function_declarations: HashSet::new(),
             new_target: None,
         }
     }
@@ -886,6 +941,7 @@ impl Builder {
             generator_suspension_points: Vec::new(),
             terminated: false,
             allows_new_target: false,
+            superseded_function_declarations: HashSet::new(),
             new_target: None,
         }
     }
@@ -1469,7 +1525,11 @@ impl Builder {
         let Stmt::Decl(Decl::Fn(declaration)) = statement else {
             return Ok(());
         };
-        if declaration.declare {
+        if declaration.declare
+            || self
+                .superseded_function_declarations
+                .contains(&declaration.function.span.lo)
+        {
             return Ok(());
         }
         let name = declaration.ident.sym.to_string();
@@ -5063,6 +5123,8 @@ impl Builder {
         for (parameter, source) in parameters.iter().zip(parameter_sources) {
             child.initialize_parameter(parameter, source)?;
         }
+        child.superseded_function_declarations =
+            superseded_function_declarations(statement_function_declarations(statements));
         for statement in statements {
             child.initialize_function_declaration(statement)?;
         }

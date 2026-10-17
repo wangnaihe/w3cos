@@ -620,6 +620,33 @@ fn generate_module_with_bodies(
             error.replace(['\r', '\n'], " ")
         ));
     }
+    // Function declarations are mutable `var`-like bindings (ECMA-262
+    // FunctionDeclarationInstantiation / CreateMutableBinding): a module that
+    // writes one makes it a live cell (`{bundled}:value`, written through
+    // `{bundled}_set`) instead of a constant known call target.
+    REASSIGNED_FUNCTIONS.with(|reassigned| {
+        let names = w3ir_module
+            .as_ref()
+            .and_then(|w3ir| {
+                let entry = w3ir.functions.iter().find(|f| f.id == w3ir.entry)?;
+                Some(
+                    entry
+                        .bindings
+                        .iter()
+                        .filter(|binding| {
+                            bundle.symbols.iter().any(|symbol| {
+                                symbol.module == module.path
+                                    && symbol.kind == SymbolKind::Function
+                                    && symbol.original_name == binding.name
+                            }) && binding_is_reassigned(w3ir, entry.id, binding.id)
+                        })
+                        .map(|binding| binding.name.clone())
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        *reassigned.borrow_mut() = (module.path.clone(), names);
+    });
     OWN_CELL_BINDINGS.with(|own| {
         *own.borrow_mut() = (
             module.path.clone(),
@@ -1324,7 +1351,7 @@ fn module_init_external_bindings(
     let mut insert = |name: &str| {
         bindings.insert(
             name.to_string(),
-            value_bindings.contains(&sanitize_ident(name)),
+            value_bindings.contains(&sanitize_ident(name)) || function_is_reassigned(module, name),
         );
     };
     for (name, _) in &module.local_to_bundled {
@@ -1436,8 +1463,9 @@ fn module_init_capture_map(
             } else {
                 context.lower_ident(&import.imported)
             };
-            let setter = value_bindings
-                .contains(&sanitize_ident(&import.imported))
+            let reassigned_function = function_is_reassigned(module, &import.imported);
+            let setter = (value_bindings.contains(&sanitize_ident(&import.imported))
+                || reassigned_function)
                 .then(|| module.lookup(&import.imported))
                 .flatten()
                 .and_then(|bundled| {
@@ -1446,7 +1474,9 @@ fn module_init_capture_map(
                         .iter()
                         .find(|symbol| {
                             symbol.bundled_name == bundled
-                                && symbol.kind == SymbolKind::Variable
+                                && (symbol.kind == SymbolKind::Variable
+                                    || (reassigned_function
+                                        && symbol.kind == SymbolKind::Function))
                         })
                         .map(|_| {
                             cached_stateless_function(&format!(
@@ -2044,6 +2074,9 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
     match decl {
         Decl::Fn(fn_decl) if !fn_decl.declare => {
             let name = fn_decl.ident.sym.to_string();
+            // Same-named declarations bind once; the last one initializes
+            // the binding (FunctionDeclarationInstantiation).
+            items.retain(|item| !matches!(item, TopLevelItem::Function { name: existing, .. } if *existing == name));
             items.push(TopLevelItem::Function {
                 function_name: name.clone(),
                 name,
@@ -2318,9 +2351,11 @@ fn emit_w3ir_generator_symbol(
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
     ));
-    if symbol.kind == SymbolKind::Variable {
+    // Function declarations are mutable bindings (CreateMutableBinding in
+    // FunctionDeclarationInstantiation); `_set` replaces the live value.
+    {
         output.push_str(&format!(
-            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            "    #[allow(dead_code)]\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
             symbol.bundled_name,
             format!("{}:value", symbol.bundled_name),
         ));
@@ -2391,9 +2426,11 @@ fn emit_w3ir_async_symbol(
         format!("{}:value", symbol.bundled_name),
         symbol.bundled_name,
     ));
-    if symbol.kind == SymbolKind::Variable {
+    // Function declarations are mutable bindings (CreateMutableBinding in
+    // FunctionDeclarationInstantiation); `_set` replaces the live value.
+    {
         output.push_str(&format!(
-            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            "    #[allow(dead_code)]\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
             symbol.bundled_name,
             format!("{}:value", symbol.bundled_name),
         ));
@@ -2512,9 +2549,11 @@ fn emit_w3ir_sync_symbol(
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
     ));
-    if symbol.kind == SymbolKind::Variable {
+    // Function declarations are mutable bindings (CreateMutableBinding in
+    // FunctionDeclarationInstantiation); `_set` replaces the live value.
+    {
         output.push_str(&format!(
-            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            "    #[allow(dead_code)]\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
             symbol.bundled_name,
             format!("{}:value", symbol.bundled_name),
         ));
@@ -2702,6 +2741,20 @@ fn entry_bound_w3ir_function<'a>(
 }
 
 std::thread_local! {
+    /// Function declarations of the module being generated that are written
+    /// somewhere besides their hoisted initialization.
+    static REASSIGNED_FUNCTIONS: std::cell::RefCell<(std::path::PathBuf, HashSet<String>)> =
+        std::cell::RefCell::new((std::path::PathBuf::new(), HashSet::new()));
+}
+
+fn function_is_reassigned(module: &BundledModule, name: &str) -> bool {
+    REASSIGNED_FUNCTIONS.with(|reassigned| {
+        let reassigned = reassigned.borrow();
+        reassigned.0 == module.path && reassigned.1.contains(name)
+    })
+}
+
+std::thread_local! {
     /// Top-level `var`/`let`/`const` items of the module being generated:
     /// these own a `{bundled}:cell` BindingCell in that module's registry
     /// (the `find_variable` accessor branch).
@@ -2816,8 +2869,8 @@ fn generator_capture_map_with_synthetic(
                     )
                 })
                 .unwrap_or_else(|| context.lower_ident(&binding.name));
-            let setter = binding
-                .mutable
+            let reassigned_function = function_is_reassigned(module, &binding.name);
+            let setter = (binding.mutable || reassigned_function)
                 .then(|| module.lookup(&binding.name))
                 .flatten()
                 .and_then(|bundled| {
@@ -2826,7 +2879,9 @@ fn generator_capture_map_with_synthetic(
                         .iter()
                         .find(|symbol| {
                             symbol.bundled_name == bundled
-                                && symbol.kind == SymbolKind::Variable
+                                && (symbol.kind == SymbolKind::Variable
+                                    || (reassigned_function
+                                        && symbol.kind == SymbolKind::Function))
                         })
                         .map(|_| {
                             cached_stateless_function(&format!(
@@ -4143,6 +4198,49 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
             );
         }
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reassigned_function_declarations_are_mutable_bindings_without_known_targets() {
+        let root = fixture_root("w3cos_esm_codegen_reassigned_functions");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+function swap() { return 1; }
+const before = swap();
+swap = function () { return 2; };
+function inner(x) { return x + 1; }
+function caller(x) { return inner(x) * 10; }
+function twice() { return "a"; }
+function twice() { return "b"; }
+export function result() {
+  const first = caller(1);
+  inner = function (x) { return x + 2; };
+  return before + swap() + first + caller(1) + twice();
+}
+"#;
+        std::fs::write(root.join("src/app.js"), source).unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = try_generate_with_bodies(&bundle).unwrap();
+        std::fs::write("/tmp/w3cos-reassigned-functions.rs", &code).ok();
+        // Function declarations are mutable bindings: writes go to the live
+        // `{bundled}:value` cell and captures expose a setter.
+        assert!(code.contains("pub fn m0_swap_set(value: w3cos_core::Value)"));
+        assert!(code.contains("m0_inner_set(arguments.first()"));
+        // A reassigned declaration is no longer a known call target.
+        // (The entries are still emitted for the hoisted value; no call
+        // site may bind to them.)
+        assert_eq!(code.matches("m0_inner_call_num(").count(), 1);
+        assert_eq!(code.matches("m0_inner_call_result(").count(), 1);
+        assert_eq!(code.matches("m0_swap_call_num(").count(), 1);
+        assert_eq!(code.matches("m0_swap_call_result(").count(), 1);
+        // Duplicate declarations bind once; the last one wins (spec order).
+        assert_eq!(code.matches("pub fn m0_twice(").count(), 1);
+        assert_eq!(code.matches("pub fn m0_swap(").count(), 1);
         std::fs::remove_dir_all(root).ok();
     }
 
