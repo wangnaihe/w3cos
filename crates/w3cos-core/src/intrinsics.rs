@@ -382,7 +382,33 @@ pub fn for_in_keys(value: &Value) -> Value {
     Value::array(keys)
 }
 
+/// ECMA-262 Call(F, V, args) step 2: a non-callable callee throws a
+/// TypeError (V8 Builtins::Call -> CallNonCallable) instead of producing
+/// undefined.
+#[cold]
+#[inline(never)]
+fn not_callable(callee: &Value) -> Value {
+    let what = if callee.is_null() {
+        "null"
+    } else {
+        callee.type_of()
+    };
+    type_error(&format!("{what} is not a function"))
+}
+
+#[inline]
+fn ensure_callable(callee: &Value) -> Result<(), Value> {
+    if matches!(callee, Value::Function(_)) || callee.is_callable() {
+        Ok(())
+    } else {
+        Err(not_callable(callee))
+    }
+}
+
 pub fn call(callee: &Value, this_value: Value, arguments: Vec<Value>) -> Value {
+    if let Err(exception) = ensure_callable(callee) {
+        crate::throw_value(exception);
+    }
     callee.call(this_value, arguments)
 }
 
@@ -403,6 +429,7 @@ pub fn call_completion_slice(
     this_value: Value,
     arguments: &[Value],
 ) -> crate::Completion {
+    ensure_callable(callee)?;
     crate::catch_js(|| callee.call_slice(this_value, arguments))
 }
 
@@ -1057,6 +1084,35 @@ pub fn await_value(value: &Value) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn calling_a_non_callable_value_throws_type_error() {
+        for callee in [
+            Value::Number(5.0),
+            Value::Undefined,
+            Value::Null,
+            Value::string("f"),
+        ] {
+            let error = call_completion_slice(&callee, Value::Undefined, &[])
+                .expect_err("non-callable [[Call]] must throw");
+            assert_eq!(
+                get_property(&error, &Value::string("name")).to_js_string(),
+                "TypeError"
+            );
+            assert!(
+                get_property(&error, &Value::string("message"))
+                    .to_js_string()
+                    .ends_with("is not a function")
+            );
+        }
+        let ok = Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined));
+        assert_eq!(
+            call_completion_slice(&ok, Value::Undefined, &[Value::Number(2.0)])
+                .unwrap()
+                .to_number(),
+            2.0
+        );
+    }
 
     #[test]
     fn dom_shape_baseline_is_the_pristine_stamp() {
