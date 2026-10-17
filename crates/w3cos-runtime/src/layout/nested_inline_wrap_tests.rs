@@ -503,7 +503,7 @@ fn interior_authored_endpoints_are_not_snapped_again_at_font_boundary() {
     let text = ".Test passes if there is a green stripe on the right and ";
     let mut style = Style {
         display: WDisplay::Inline,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-html-standard-font".into(),
             "1".into(),
         )])),
@@ -534,7 +534,7 @@ fn interior_authored_endpoints_are_not_snapped_again_at_font_boundary() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -558,7 +558,7 @@ fn authored_boundary_inside_generated_word_keeps_layout_unit_endpoint() {
     use w3cos_std::Style;
     let mut style = Style {
         display: WDisplay::Inline,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-html-standard-font".into(),
             "1".into(),
         )])),
@@ -579,7 +579,7 @@ fn authored_boundary_inside_generated_word_keeps_layout_unit_endpoint() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -606,7 +606,7 @@ fn resolved_bidi_words_keep_contextual_advances_in_rtl_container() {
     use w3cos_std::{Style, style::TextDirection};
     let style = Style {
         display: WDisplay::Inline,
-        custom_properties: Some(HashMap::from([
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
             (
                 w3cos_std::inline_text::SOURCE_RUN.into(),
                 "text:bidi".into(),
@@ -622,7 +622,7 @@ fn resolved_bidi_words_keep_contextual_advances_in_rtl_container() {
         Style {
             display: WDisplay::Flex,
             direction: TextDirection::Rtl,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -664,7 +664,7 @@ fn terminal_authored_inline_source_uses_layout_unit_endpoint() {
         display: WDisplay::Inline,
         font_size: 16.0,
         font_weight: 700,
-        custom_properties: Some(HashMap::from([
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
             (
                 w3cos_std::inline_text::SOURCE_RUN.into(),
                 "text:terminal".into(),
@@ -681,7 +681,7 @@ fn terminal_authored_inline_source_uses_layout_unit_endpoint() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -891,7 +891,7 @@ fn decorated_source_uses_one_layout_unit_endpoint() {
         font_family: Some("sans-serif".into()),
         font_size: 16.0,
         text_decoration: w3cos_std::style::TextDecoration::Underline,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             w3cos_std::inline_text::SOURCE_RUN.into(),
             "text:link".into(),
         )])),
@@ -906,7 +906,7 @@ fn decorated_source_uses_one_layout_unit_endpoint() {
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -1709,7 +1709,7 @@ fn character_unit_uses_font_zero_not_shaped_fixed_point_advance() {
     install_font_unit_provider();
     let style = w3cos_std::Style {
         font_size: 16.0,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
             "1".into(),
         )])),
@@ -1732,7 +1732,7 @@ fn pure_image_soft_lines_keep_containing_font_descent() {
         font_size: 20.0,
         line_height: 1.0,
         line_height_is_normal: false,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-inline-formatting-context".into(),
             "1".into(),
         )])),
@@ -1777,7 +1777,7 @@ fn horizontal_decorated_collapsible_separator_stays_on_completed_line() {
         font_size: 20.0,
         line_height: 1.0,
         line_height_is_normal: false,
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-inline-formatting-context".into(),
             "1".into(),
         )])),
@@ -2076,7 +2076,7 @@ fn generated_border_words_use_shared_layout_advances() {
         font_size: 16.0,
         font_family: Some("sans-serif".into()),
         border_top_width: Some(3.0),
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             w3cos_std::inline_text::SOURCE_RUN.into(),
             "text:1".into(),
         )])),
@@ -2086,7 +2086,7 @@ fn generated_border_words_use_shared_layout_advances() {
     let root = Component::row(
         w3cos_std::Style {
             display: WDisplay::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2139,7 +2139,7 @@ fn generated_border_box_words_keep_horizontal_edges_in_used_width() {
         font_family: Some("sans-serif".into()),
         box_sizing: WBoxSizing::BorderBox,
         border_top_width: Some(3.0),
-        custom_properties: Some(HashMap::from([(
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
             w3cos_std::inline_text::SOURCE_RUN.into(),
             "text:1".into(),
         )])),
@@ -2154,7 +2154,7 @@ fn generated_border_box_words_keep_horizontal_edges_in_used_width() {
     let root = Component::row(
         w3cos_std::Style {
             display: WDisplay::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2198,7 +2198,7 @@ fn nested_normal_inline_text_wraps_without_making_nowrap_shrink() {
                 display: WDisplay::Flex,
                 width: WDim::Px(300.0),
                 flex_wrap: WWrap::Wrap,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),

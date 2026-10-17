@@ -3256,7 +3256,7 @@ mod tests {
             font_size: 50.0,
             line_height: 0.2,
             line_height_is_normal: false,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
                 "1".into(),
             )])),
@@ -4689,7 +4689,7 @@ mod tests {
                 display,
                 visibility,
                 custom_properties: span.map(|span| {
-                    std::collections::HashMap::from([(
+                    w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-table-column-span".to_string(),
                         span.to_string(),
                     )])
@@ -5811,7 +5811,7 @@ mod tests {
         for rank in [2, 1, 0] {
             let mut style = Style::default();
             style.display = Display::Inline;
-            style.custom_properties = Some(std::collections::HashMap::from([(
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-bidi-logical-order".to_string(),
                 rank.to_string(),
             )]));
@@ -6312,7 +6312,7 @@ mod tests {
             border.line_height_is_normal = true;
             border.border_width = 3.0;
             if split {
-                border.custom_properties = Some(std::collections::HashMap::from([(
+                border.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-split-inline-edge".to_string(),
                     "1".to_string(),
                 )]));
@@ -6373,7 +6373,7 @@ mod tests {
     fn split_inline_edge_paints_behind_following_block_text() {
         let mut edge_style = Style::default();
         edge_style.display = Display::Inline;
-        edge_style.custom_properties = Some(std::collections::HashMap::from([(
+        edge_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-split-inline-edge".to_string(),
             "1".to_string(),
         )]));

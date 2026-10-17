@@ -6986,7 +6986,7 @@ fn retained_layout_excludes_video_controls_paint_children() {
         PaintNode {
             kind: ComponentKind::Box,
             style: Style {
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-video-controls".into(),
                     "no-source".into(),
                 )])),

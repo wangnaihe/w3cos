@@ -2241,7 +2241,7 @@ mod tests {
     #[test]
     fn visual_order_marker_skips_a_second_bidi_reorder() {
         let mut style = w3cos_std::style::Style::default();
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-bidi-visual-order".to_string(),
             "1".to_string(),
         )]));
@@ -2483,7 +2483,7 @@ mod tests {
 
         let turkish = Style {
             text_transform: TextTransform::Uppercase,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-text-language".to_string(),
                 "tr".to_string(),
             )])),

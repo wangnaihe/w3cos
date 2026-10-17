@@ -583,7 +583,7 @@ mod tests {
         };
         let parent = Style {
             display: Display::Inline,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -653,7 +653,7 @@ mod tests {
             color: w3cos_std::Color::rgb(0, 128, 0),
             border_color: w3cos_std::Color::rgb(0, 128, 0),
             border_styles: [Some(w3cos_std::style::BorderLineStyle::Solid); 4],
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_std::inline_text::SOURCE_RUN.into(),
                 "text:1".into(),
             )])),
@@ -661,7 +661,7 @@ mod tests {
         };
         let parent = Style {
             display: Display::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -780,7 +780,7 @@ mod tests {
             display: Display::Inline,
             font_family: Some("serif".into()),
             font_size: 16.0,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_std::inline_text::SOURCE_RUN.into(),
                 "pseudo:1:before:2".into(),
             )])),
@@ -794,7 +794,7 @@ mod tests {
             .insert("--w3cos-internal-generated-quote".into(), "1".into());
         let parent = Style {
             display: Display::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -802,7 +802,7 @@ mod tests {
         };
         let word = Style {
             display: Display::InlineFlex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-unbroken-inline-word".into(),
                 "1".into(),
             )])),
@@ -919,7 +919,7 @@ mod tests {
             font_family: Some("serif".into()),
             font_size: 16.0,
             color: w3cos_std::Color::BLACK,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-bidi-logical-order".into(),
                 "0".into(),
             )])),
@@ -930,7 +930,7 @@ mod tests {
             .unwrap();
         let parent = Style {
             display: Display::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -1079,7 +1079,7 @@ mod tests {
             .collect::<Vec<_>>();
         let parent = Style {
             display: Display::Flex,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -1263,7 +1263,10 @@ mod tests {
             ] {
                 let mut marked = plain.clone();
                 marked.clear = w3cos_std::style::Clear::Left;
-                marked.custom_properties = Some(HashMap::from([(marker.into(), "1".into())]));
+                marked.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+                    marker.into(),
+                    "1".into(),
+                )]));
                 let actual =
                     render_skia::measure_skia_text_intrinsic_size("Filler Text", &marked).0;
                 assert_eq!(actual, expected, "marker={marker}, word-spacing={spacing}");
@@ -1295,10 +1298,12 @@ mod tests {
                         };
                         let parent = Style {
                             display: parent_display,
-                            custom_properties: Some(HashMap::from([(
-                                "--w3cos-internal-inline-formatting-context".into(),
-                                "1".into(),
-                            )])),
+                            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter(
+                                [(
+                                    "--w3cos-internal-inline-formatting-context".into(),
+                                    "1".into(),
+                                )],
+                            )),
                             ..Style::default()
                         };
                         let lines = [["⇦", " ", "There"], ["There", " ", "should"]];

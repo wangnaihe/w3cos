@@ -105,6 +105,87 @@ pub struct CssClipRect {
     pub left: Option<Dimension>,
 }
 
+/// Custom (and internal `--w3cos-*`) properties, shared copy-on-write
+/// between styles like Blink's DataRef<StyleRareInheritedData>: cloning a
+/// computed style for inheritance no longer deep-copies the map; the first
+/// mutation through `DerefMut` unshares it.
+#[derive(Clone, Default)]
+pub struct CustomProperties(std::sync::Arc<std::collections::HashMap<String, String>>);
+
+impl CustomProperties {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for CustomProperties {
+    type Target = std::collections::HashMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CustomProperties {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl PartialEq for CustomProperties {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for CustomProperties {}
+
+impl std::fmt::Debug for CustomProperties {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<std::collections::HashMap<String, String>> for CustomProperties {
+    fn from(map: std::collections::HashMap<String, String>) -> Self {
+        Self(std::sync::Arc::new(map))
+    }
+}
+
+impl From<CustomProperties> for std::collections::HashMap<String, String> {
+    fn from(props: CustomProperties) -> Self {
+        std::sync::Arc::try_unwrap(props.0).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl FromIterator<(String, String)> for CustomProperties {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        Self::from(
+            iter.into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+    }
+}
+
+impl<'a> IntoIterator for &'a CustomProperties {
+    type Item = (&'a String, &'a String);
+    type IntoIter = std::collections::hash_map::Iter<'a, String, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for CustomProperties {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (*self.0).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomProperties {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        std::collections::HashMap::deserialize(deserializer).map(Self::from)
+    }
+}
+
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Style {
@@ -295,7 +376,7 @@ pub struct Style {
     pub unicode_bidi: UnicodeBidi,
 
     // CSS Custom Properties (#34)
-    pub custom_properties: Option<std::collections::HashMap<String, String>>,
+    pub custom_properties: Option<CustomProperties>,
 
     // CSS Containment — layout isolation boundaries (Chrome-inspired)
     pub contain: Contain,

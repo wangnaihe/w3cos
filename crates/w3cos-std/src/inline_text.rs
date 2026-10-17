@@ -167,7 +167,7 @@ pub fn decoration_owners(style: &Style) -> Vec<Style> {
                     _ => return None,
                 },
                 custom_properties: decoration_color.map(|color| {
-                    std::collections::HashMap::from([(
+                    crate::style::CustomProperties::from_iter([(
                         DECORATION_COLOR.into(),
                         format!(
                             "#{:02x}{:02x}{:02x}{:02x}",
@@ -291,7 +291,7 @@ mod tests {
             color: crate::Color::rgb(0, 128, 0),
             text_decoration: crate::style::TextDecoration::Underline,
             font_variant: crate::style::FontVariant::SmallCaps,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(crate::style::CustomProperties::from_iter([(
                 DECORATION_COLOR.into(),
                 "rgba(37, 99, 211, 0.5)".into(),
             )])),
