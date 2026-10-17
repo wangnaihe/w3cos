@@ -3785,6 +3785,62 @@ mod tests {
     }
 
     #[test]
+    fn test_child_list_log_replays_to_live_children() {
+        use crate::document::{ChildListChange, replay_child_changes_since, structure_tick};
+        let mut doc = Document::new();
+        let list = doc.create_element("ul");
+        doc.body().append_child(&mut doc, list);
+        let mut items = Vec::new();
+        for _ in 0..4 {
+            let item = doc.create_element("li");
+            list.append_child(&mut doc, item);
+            items.push(item);
+        }
+        let live = |doc: &Document| {
+            doc.children_ids(list.id)
+                .iter()
+                .map(|id| id.as_u32())
+                .collect::<Vec<_>>()
+        };
+        let mut cached = live(&doc);
+        let since = structure_tick();
+        let fresh = doc.create_element("li");
+        doc.insert_before(list.id, fresh.id, items[2].id);
+        doc.remove_child(list.id, items[0].id);
+        doc.insert_before(list.id, items[3].id, items[1].id);
+        let (serial, parent) = (doc.serial(), list.id.as_u32());
+        assert!(replay_child_changes_since(
+            since,
+            64,
+            |change| match change {
+                ChildListChange::Insert {
+                    doc: d,
+                    parent: p,
+                    child,
+                    before,
+                } if d == serial && p == parent => {
+                    let at = if before == 0 {
+                        cached.len()
+                    } else {
+                        cached.iter().position(|&id| id == before).unwrap()
+                    };
+                    cached.insert(at, child);
+                }
+                ChildListChange::Remove {
+                    doc: d,
+                    parent: p,
+                    child,
+                } if d == serial && p == parent => {
+                    let at = cached.iter().position(|&id| id == child).unwrap();
+                    cached.remove(at);
+                }
+                _ => {}
+            }
+        ));
+        assert_eq!(cached, live(&doc));
+    }
+
+    #[test]
     fn test_text_runs_share_matched_properties_by_parent_style() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".a", &[("color", "#123456")]);

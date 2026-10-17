@@ -2605,7 +2605,7 @@ fn element_or_null(node: Option<u32>) -> Value {
 // Child ids for one parent, invalidated by `structure_generation`. Indexed
 // `childNodes[n]` on a stable parent is then O(1) instead of a sibling walk.
 thread_local! {
-    static CHILD_INDEX: RefCell<Option<(u32, u64, Vec<u32>)>> = const { RefCell::new(None) };
+    static CHILD_INDEX: RefCell<Option<(u32, u64, Vec<u32>, u64)>> = const { RefCell::new(None) };
     static COLLECTION_ROOTS: RefCell<HashMap<u64, (u32, Value)>> = RefCell::new(HashMap::new());
     static LENGTH_SHADOWS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
@@ -2614,29 +2614,104 @@ fn ensure_child_index(parent: u32) {
     // Direct document mutations bump this counter inside `note_structure_change`,
     // so a cache hit does not borrow the document.
     let generation = w3cos_dom::document::structure_tick();
-    let fresh = CHILD_INDEX.with(|cache| {
+    let cached = CHILD_INDEX.with(|cache| {
         cache
             .borrow()
             .as_ref()
-            .is_some_and(|(node, cached_generation, _)| {
-                *node == parent && *cached_generation == generation
-            })
+            .map(|(node, cached_generation, _, doc)| (*node, *cached_generation, *doc))
     });
-    if fresh {
-        return;
+    if let Some((node, cached_generation, doc)) = cached
+        && node == parent
+    {
+        if cached_generation == generation {
+            return;
+        }
+        // Blink's CollectionIndexCache survives edits it can account for;
+        // patch the cached ids with the logged child-list edits instead of
+        // walking every sibling again after each insertBefore/removeChild.
+        if dom::with_document(|document| document.serial()) == doc
+            && CHILD_INDEX.with(|cache| patch_child_index(&mut cache.borrow_mut(), generation))
+        {
+            return;
+        }
     }
-    let ids = dom::with_document(|document| {
+    let (ids, doc) = dom::with_document(|document| {
         let mut ids = Vec::new();
         let mut child = document.get_node(NodeId::from_u32(parent)).first_child;
         while let Some(id) = child {
             ids.push(id.as_u32());
             child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
         }
-        ids
+        (ids, document.serial())
     });
     CHILD_INDEX.with(|cache| {
-        *cache.borrow_mut() = Some((parent, generation, ids));
+        *cache.borrow_mut() = Some((parent, generation, ids, doc));
     });
+}
+
+fn patch_child_index(cache: &mut Option<(u32, u64, Vec<u32>, u64)>, generation: u64) -> bool {
+    use w3cos_dom::document::ChildListChange;
+    let Some((parent, cached_generation, ids, doc)) = cache.as_mut() else {
+        return false;
+    };
+    let (parent, doc) = (*parent, *doc);
+    let mut valid = true;
+    let replayed =
+        w3cos_dom::document::replay_child_changes_since(*cached_generation, 64, |change| {
+            if !valid {
+                return;
+            }
+            match change {
+                ChildListChange::Insert {
+                    doc: d,
+                    parent: p,
+                    child,
+                    before,
+                } => {
+                    if d != doc {
+                        valid = false;
+                    } else if p == parent {
+                        let at = if before == 0 {
+                            Some(ids.len())
+                        } else {
+                            ids.iter().position(|&id| id == before)
+                        };
+                        match at {
+                            Some(at) => ids.insert(at, child),
+                            None => valid = false,
+                        }
+                    }
+                }
+                ChildListChange::Remove {
+                    doc: d,
+                    parent: p,
+                    child,
+                } => {
+                    if d != doc {
+                        valid = false;
+                    } else if p == parent {
+                        match ids.iter().position(|&id| id == child) {
+                            Some(at) => {
+                                ids.remove(at);
+                            }
+                            None => valid = false,
+                        }
+                    }
+                }
+                ChildListChange::Reset { doc: d, node } => {
+                    if d != doc || node == parent || ids.contains(&node) {
+                        valid = false;
+                    }
+                }
+            }
+        });
+    if replayed && valid {
+        *cached_generation = generation;
+        true
+    } else {
+        *cache = None;
+        false
+    }
 }
 
 fn child_node_at(node: u32, index: usize) -> Option<u32> {
@@ -2645,7 +2720,7 @@ fn child_node_at(node: u32, index: usize) -> Option<u32> {
         cache
             .borrow()
             .as_ref()
-            .and_then(|(_, _, ids)| ids.get(index).copied())
+            .and_then(|(_, _, ids, _)| ids.get(index).copied())
     })
 }
 
@@ -2655,7 +2730,7 @@ fn child_node_count(node: u32) -> usize {
         cache
             .borrow()
             .as_ref()
-            .map(|(_, _, ids)| ids.len())
+            .map(|(_, _, ids, _)| ids.len())
             .unwrap_or(0)
     })
 }

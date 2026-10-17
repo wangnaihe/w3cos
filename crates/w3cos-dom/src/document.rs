@@ -17,6 +17,75 @@ use crate::user_agent;
 
 thread_local! {
     static STRUCTURE_TICK: Cell<u64> = const { Cell::new(1) };
+    static CHILD_LOG: RefCell<ChildListLog> = RefCell::new(ChildListLog::default());
+    static DOCUMENT_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One child-list edit, recorded so a cached child-id vector can be patched
+/// instead of rebuilt (Blink's CollectionIndexCache keeps its cached node and
+/// count across edits it can account for; here the edits are replayed).
+#[derive(Clone, Copy, Debug)]
+pub enum ChildListChange {
+    /// `child` linked under `parent` before `before` (0 = at the end).
+    Insert {
+        doc: u64,
+        parent: u32,
+        child: u32,
+        before: u32,
+    },
+    /// `child` unlinked from `parent`.
+    Remove { doc: u64, parent: u32, child: u32 },
+    /// Slot `node` (re)allocated: any cached children are meaningless.
+    Reset { doc: u64, node: u32 },
+}
+
+#[derive(Default)]
+struct ChildListLog {
+    /// Every edit with tick >= `start` is in `entries`.
+    start: u64,
+    entries: std::collections::VecDeque<(u64, ChildListChange)>,
+}
+
+const CHILD_LOG_CAP: usize = 256;
+
+/// Each edit gets its own tick: an edit stamped `t` is reflected in any cache
+/// built at tick > t and missing from any built at tick <= t.
+fn log_child_change(change: ChildListChange) {
+    let tick = structure_tick();
+    CHILD_LOG.with(|log| {
+        let mut log = log.borrow_mut();
+        if log.entries.len() >= CHILD_LOG_CAP
+            && let Some((dropped, _)) = log.entries.pop_front()
+        {
+            log.start = dropped + 1;
+        }
+        log.entries.push_back((tick, change));
+    });
+    bump_structure_tick();
+}
+
+/// Replays the child-list edits made since `tick` (a cache built at that
+/// tick). Returns `false` when the log no longer covers that range or holds
+/// more than `limit` edits; the caller then rebuilds.
+pub fn replay_child_changes_since(
+    tick: u64,
+    limit: usize,
+    mut apply: impl FnMut(ChildListChange),
+) -> bool {
+    CHILD_LOG.with(|log| {
+        let log = log.borrow();
+        if tick < log.start {
+            return false;
+        }
+        let first = log.entries.partition_point(|(stamp, _)| *stamp < tick);
+        if log.entries.len() - first > limit {
+            return false;
+        }
+        for (_, change) in log.entries.range(first..) {
+            apply(*change);
+        }
+        true
+    })
 }
 
 /// Monotonic tree-shape counter. Readers can invalidate a child-id cache
@@ -655,6 +724,8 @@ impl ExtentCache {
 /// - HashMap indexes: O(1) getElementById, querySelector by class/tag
 /// - Node freelist: bounded memory with slot recycling
 pub struct Document {
+    /// Distinguishes documents in the shared child-list log.
+    serial: u64,
     nodes: Vec<Option<DomNode>>,
     /// Bump arena for unique per-page strings (ids and text tails). Capacity
     /// is reserved up front so the create loop does not malloc.
@@ -786,6 +857,11 @@ mod replaced_table_tests;
 mod form_control_tests;
 
 impl Document {
+    /// Identity in [`ChildListChange`] records.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// Host readability preferences, separate from author-specified sizes.
     /// Zero leaves the corresponding minimum disabled.
     pub fn set_font_size_minimums(&mut self, hard: f32, logical: f32) {
@@ -832,7 +908,12 @@ impl Document {
     }
 
     pub fn new() -> Self {
+        let serial = DOCUMENT_SERIAL.with(|serial| {
+            serial.set(serial.get() + 1);
+            serial.get()
+        });
         let mut doc = Self {
+            serial,
             nodes: Vec::new(),
             page_strings: Vec::new(),
             styles: Vec::new(),
@@ -1087,6 +1168,12 @@ impl Document {
         self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: child.as_u32(),
+            before: 0,
+        });
 
         let parent_changed = old_parent != Some(parent);
         if let Some(old_parent) = old_parent
@@ -1214,6 +1301,12 @@ impl Document {
         } else {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: new_child.as_u32(),
+            before: ref_child.as_u32(),
+        });
 
         if let Some(old_parent) = old_parent
             && old_parent != parent
@@ -1256,6 +1349,13 @@ impl Document {
 
         self.get_node_mut(child).prev_sibling = 0;
         self.get_node_mut(child).next_sibling = 0;
+        if let Some(parent) = parent {
+            log_child_change(ChildListChange::Remove {
+                doc: self.serial,
+                parent: parent.as_u32(),
+                child: child.as_u32(),
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1414,6 +1514,12 @@ impl Document {
         self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: child.as_u32(),
+            before: 0,
+        });
     }
 
     /// Single text child stored as the parent's tail. Bytes are bump-copied
@@ -1484,6 +1590,12 @@ impl Document {
         self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: child.as_u32(),
+            before: 0,
+        });
         true
     }
 
@@ -1648,6 +1760,10 @@ impl Document {
             node.id = NodeId(slot);
             let idx = slot as usize;
             self.nodes[idx] = Some(node);
+            log_child_change(ChildListChange::Reset {
+                doc: self.serial,
+                node: slot,
+            });
             self.styles[idx] = initial_style;
             self.layout_rects[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
