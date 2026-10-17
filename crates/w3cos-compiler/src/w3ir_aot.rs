@@ -1443,7 +1443,9 @@ enum SlotStorage {
     /// At most [`INLINE_FRAME`] sparse ids, packed into a stack array.
     /// The array is the original ids; the length is how many are live.
     Packed([u32; INLINE_FRAME], u8),
-    Map,
+    /// More sparse ids than fit inline: a sorted static id table plus a
+    /// compact vector (`w3cos_core::SparseSlots`), never a hashed map.
+    Map(&'static [u32]),
 }
 
 fn slot_index(storage: SlotStorage, id: u32) -> usize {
@@ -1452,7 +1454,7 @@ fn slot_index(storage: SlotStorage, id: u32) -> usize {
             .iter()
             .position(|candidate| *candidate == id)
             .expect("packed binding id"),
-        SlotStorage::Dense(_) | SlotStorage::Map => id as usize,
+        SlotStorage::Dense(_) | SlotStorage::Map(_) => id as usize,
     }
 }
 
@@ -1490,8 +1492,13 @@ fn slot_storage(function: &Function) -> SlotStorage {
             }
             SlotStorage::Packed(packed, ids.len() as u8)
         }
-        _ => SlotStorage::Map,
+        _ => SlotStorage::Map(Box::leak(ids.into_boxed_slice())),
     }
+}
+
+fn slot_ids_literal(ids: &[u32]) -> String {
+    let list = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ");
+    format!("[{list}]")
 }
 
 fn emit_registers_field(n: u32) -> String {
@@ -1518,8 +1525,8 @@ fn emit_slot_fields(storage: SlotStorage) -> String {
             "    bindings: Vec<Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>>,\n    capture_getters: Vec<Option<w3cos_core::Value>>,\n    capture_setters: Vec<Option<w3cos_core::Value>>,\n"
         )
             .into(),
-        SlotStorage::Map => (
-            "    bindings: std::collections::HashMap<\n        u32,\n        std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>,\n    >,\n    capture_getters: std::collections::HashMap<u32, w3cos_core::Value>,\n    capture_setters: std::collections::HashMap<u32, w3cos_core::Value>,\n"
+        SlotStorage::Map(_) => (
+            "    bindings: w3cos_core::SparseSlots<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>,\n    capture_getters: w3cos_core::SparseSlots<w3cos_core::Value>,\n    capture_setters: w3cos_core::SparseSlots<w3cos_core::Value>,\n"
         )
             .into(),
     }
@@ -1536,7 +1543,10 @@ fn emit_bindings_new(storage: SlotStorage) -> String {
         SlotStorage::Dense(len) if len <= INLINE_FRAME => inline_bindings_new(len),
         SlotStorage::Packed(_, len) => inline_bindings_new(len as usize),
         SlotStorage::Dense(len) => format!("    let mut bindings = vec![None; {len}];\n"),
-        SlotStorage::Map => "    let mut bindings = std::collections::HashMap::new();\n".into(),
+        SlotStorage::Map(ids) => format!(
+            "    let mut bindings = w3cos_core::SparseSlots::new(&{});\n",
+            slot_ids_literal(ids)
+        ),
     }
 }
 
@@ -1584,10 +1594,10 @@ fn emit_capture_init(storage: SlotStorage) -> String {
                 "    let mut capture_getters = vec![None; bindings.len()];\n    let mut capture_setters = vec![None; bindings.len()];\n    for (binding, capture) in __captures.iter() {{\n        let index = *binding as usize;\n        match capture {{\n            w3cos_core::AotCapture::Accessors(getter, setter) => {{\n                if let Some(slot) = capture_getters.get_mut(index) {{ *slot = Some(getter.clone()); }}\n                if let Some(slot) = capture_setters.get_mut(index) {{ *slot = Some(setter.clone()); }}\n            }}\n            w3cos_core::AotCapture::Cell(cell) => {{\n                if let Some(slot) = bindings.get_mut(index) {{ *slot = Some(std::rc::Rc::clone(cell)); }}\n            }}\n            {number}\n        }}\n    }}\n"
             )
         }
-        SlotStorage::Map => (
-            "    let mut capture_getters = std::collections::HashMap::new();\n    let mut capture_setters = std::collections::HashMap::new();\n    for (binding, capture) in __captures.iter() {\n        match capture {\n            w3cos_core::AotCapture::Accessors(getter, setter) => {\n                capture_getters.insert(*binding, getter.clone());\n                capture_setters.insert(*binding, setter.clone());\n            }\n            w3cos_core::AotCapture::Cell(cell) => {\n                bindings.insert(*binding, std::rc::Rc::clone(cell));\n            }\n            w3cos_core::AotCapture::Number(cell) => {\n                let __w3cos_number = std::rc::Rc::clone(cell);\n                let __w3cos_number_set = std::rc::Rc::clone(cell);\n                capture_getters.insert(*binding, w3cos_core::Value::function(move |_, _| match __w3cos_number.get() { Some(n) => w3cos_core::Value::Number(n), None => w3cos_core::Value::Undefined }));\n                capture_setters.insert(*binding, w3cos_core::Value::function(move |_, arguments| { let next = arguments.first().map(|value| value.to_number()).unwrap_or(f64::NAN); __w3cos_number_set.set(Some(next)); w3cos_core::Value::Undefined }));\n            }\n        }\n    }\n"
-        )
-            .into(),
+        SlotStorage::Map(ids) => format!(
+            "    let mut capture_getters = w3cos_core::SparseSlots::new(&{ids});\n    let mut capture_setters = w3cos_core::SparseSlots::new(&{ids});\n    for (binding, capture) in __captures.iter() {{\n        match capture {{\n            w3cos_core::AotCapture::Accessors(getter, setter) => {{\n                capture_getters.insert(*binding, getter.clone());\n                capture_setters.insert(*binding, setter.clone());\n            }}\n            w3cos_core::AotCapture::Cell(cell) => {{\n                bindings.insert(*binding, std::rc::Rc::clone(cell));\n            }}\n            w3cos_core::AotCapture::Number(cell) => {{\n                let __w3cos_number = std::rc::Rc::clone(cell);\n                let __w3cos_number_set = std::rc::Rc::clone(cell);\n                capture_getters.insert(*binding, w3cos_core::Value::function(move |_, _| match __w3cos_number.get() {{ Some(n) => w3cos_core::Value::Number(n), None => w3cos_core::Value::Undefined }}));\n                capture_setters.insert(*binding, w3cos_core::Value::function(move |_, arguments| {{ let next = arguments.first().map(|value| value.to_number()).unwrap_or(f64::NAN); __w3cos_number_set.set(Some(next)); w3cos_core::Value::Undefined }}));\n            }}\n        }}\n    }}\n",
+            ids = slot_ids_literal(ids)
+        ),
     }
 }
 
@@ -1597,7 +1607,7 @@ fn emit_binding_assign(storage: SlotStorage, id: u32, value: &str) -> String {
             let index = slot_index(storage, id);
             format!("        bindings[{index}] = Some({value});\n")
         }
-        SlotStorage::Map => format!("        bindings.insert({id}, {value});\n"),
+        SlotStorage::Map(_) => format!("        bindings.insert({id}, {value});\n"),
     }
 }
 
@@ -1607,7 +1617,7 @@ fn emit_capture_get(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_getters.get({index}).and_then(|slot| slot.as_ref())")
         }
-        SlotStorage::Map => format!("self.capture_getters.get(&{id})"),
+        SlotStorage::Map(_) => format!("self.capture_getters.get(&{id})"),
     }
 }
 
@@ -1617,7 +1627,7 @@ fn emit_capture_get_cloned(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_getters.get({index}).and_then(|slot| slot.clone())")
         }
-        SlotStorage::Map => format!("self.capture_getters.get(&{id}).cloned()"),
+        SlotStorage::Map(_) => format!("self.capture_getters.get(&{id}).cloned()"),
     }
 }
 
@@ -1627,7 +1637,7 @@ fn emit_capture_setter_get(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_setters.get({index}).and_then(|slot| slot.as_ref())")
         }
-        SlotStorage::Map => format!("self.capture_setters.get(&{id})"),
+        SlotStorage::Map(_) => format!("self.capture_setters.get(&{id})"),
     }
 }
 
@@ -1637,7 +1647,7 @@ fn emit_capture_setter_get_cloned(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.capture_setters.get({index}).and_then(|slot| slot.clone())")
         }
-        SlotStorage::Map => format!("self.capture_setters.get(&{id}).cloned()"),
+        SlotStorage::Map(_) => format!("self.capture_setters.get(&{id}).cloned()"),
     }
 }
 
@@ -1647,7 +1657,7 @@ fn emit_binding_get(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.bindings.get({index}).and_then(|slot| slot.as_ref())")
         }
-        SlotStorage::Map => format!("self.bindings.get(&{id})"),
+        SlotStorage::Map(_) => format!("self.bindings.get(&{id})"),
     }
 }
 
@@ -1657,7 +1667,7 @@ fn emit_binding_get_cloned(storage: SlotStorage, id: u32) -> String {
             let index = slot_index(storage, id);
             format!("self.bindings.get({index}).and_then(|slot| slot.clone())")
         }
-        SlotStorage::Map => format!("self.bindings.get(&{id}).cloned()"),
+        SlotStorage::Map(_) => format!("self.bindings.get(&{id}).cloned()"),
     }
 }
 
@@ -1669,7 +1679,7 @@ fn emit_binding_store_value(storage: SlotStorage, id: u32, rust_expr: &str) -> S
                 "if let Some(slot) = self.bindings.get_mut({index}) {{ *slot = Some(std::rc::Rc::new(std::cell::RefCell::new({rust_expr}))); }}"
             )
         }
-        SlotStorage::Map => format!(
+        SlotStorage::Map(_) => format!(
             "self.bindings.insert({id}, std::rc::Rc::new(std::cell::RefCell::new({rust_expr})));"
         ),
     }
@@ -8599,10 +8609,10 @@ fn main() {{
                     "dense 0..n BindingIds should index a compact slot array: {add_generated}"
                 );
             }
-            SlotStorage::Map => {
+            SlotStorage::Map(_) => {
                 assert!(
-                    add_generated.contains("std::collections::HashMap::new()"),
-                    "non-dense add should keep HashMap slots: {add_generated}"
+                    add_generated.contains("w3cos_core::SparseSlots::new(&["),
+                    "non-dense add should index a sorted static id table: {add_generated}"
                 );
             }
             SlotStorage::Packed(_, _) => {
@@ -8620,10 +8630,10 @@ fn main() {{
                     "unexpected dense inner captures: {inner_generated}"
                 );
             }
-            SlotStorage::Map => {
+            SlotStorage::Map(_) => {
                 assert!(
-                    inner_generated.contains("std::collections::HashMap<"),
-                    "large sparse captured BindingIds must keep HashMap slots: {inner_generated}"
+                    inner_generated.contains("w3cos_core::SparseSlots<"),
+                    "large sparse captured BindingIds must use compact sparse slots: {inner_generated}"
                 );
                 assert!(
                     !inner_generated.contains("vec![None;"),

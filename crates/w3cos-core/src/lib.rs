@@ -1,3 +1,4 @@
+pub mod aot_slots;
 pub mod bigint;
 pub mod binary;
 mod builtins;
@@ -26,6 +27,7 @@ pub use builtins::{
     console, dispatch_resize_observers, dispatch_resize_observers_bounded, document, error_class,
     error_instance, json_value, math_value, object_value, parseFloat, parseInt, reset_constructors,
 };
+pub use aot_slots::SparseSlots;
 pub use js_string::JsString;
 pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
