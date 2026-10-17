@@ -23848,6 +23848,47 @@ mod image_component_tests {
     }
 
     #[test]
+    fn matched_rules_reuse_survives_inline_edits_but_not_class_changes() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("width", "var(--w)")]);
+        crate::stylesheet::register_rule(".alt .cell", &[("width", "120px")]);
+        let mut document = Document::new();
+        let root = document.create_element("div");
+        let cell = document.create_element("div");
+        cell.set_class_name(&mut document, "cell");
+        root.append_child(&mut document, cell);
+        document.body().append_child(&mut document, root);
+        let set_w = |document: &mut Document, value: &str| {
+            document.get_style_mut(root.id).set_property("--w", value);
+            document.mark_inline_style_dirty(root.id);
+        };
+        set_w(&mut document, "10px");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(10.0)
+        );
+        // Inline-only edit: matched rules are reused, values still update.
+        set_w(&mut document, "20px");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(20.0)
+        );
+        // An ancestor class change must re-run matching.
+        root.set_class_name(&mut document, "alt");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(120.0)
+        );
+        root.set_class_name(&mut document, "");
+        set_w(&mut document, "30px");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(30.0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn multicol_properties_inherit_only_explicitly_in_cascade_order() {
         crate::stylesheet::clear_rules();
         let mut document = Document::new();
