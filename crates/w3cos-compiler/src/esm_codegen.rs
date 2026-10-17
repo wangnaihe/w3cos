@@ -2360,9 +2360,19 @@ fn emit_w3ir_sync_symbol(
             w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
         let function = select_w3ir_function(w3ir_module, &symbol.original_name, false, false)
             .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
-        let state_machine =
+        let targets = direct_call_targets(
+            bundle,
+            module,
+            w3ir_module,
+            items,
+            value_bindings,
+            class_names,
+            namespace_names,
+        );
+        let state_machine = crate::w3ir_aot::with_direct_call_targets(targets, || {
             crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
-                .map_err(|error| error.to_string())?;
+        })
+        .map_err(|error| error.to_string())?;
         let captures = generator_capture_map(
             bundle,
             module,
@@ -2382,8 +2392,8 @@ fn emit_w3ir_sync_symbol(
     let mut output = String::new();
     output.push_str(&state_machine);
     output.push_str(&format!(
-        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
-        symbol.original_name, symbol.bundled_name, symbol.bundled_name,
+        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n    /// Known-target entry for direct calls from this module (no Value dispatch).\n    #[allow(dead_code)]\n    fn {}_call_slice(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n",
+        symbol.original_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name,
     ));
     // Same code-entry form as generators above (FunctionBody::Aot).
     let value_body = if (captures.starts_with("(*__w3cos_site_captures(")
@@ -2419,6 +2429,91 @@ fn emit_w3ir_sync_symbol(
         ));
     }
     Some(Ok(output))
+}
+
+thread_local! {
+    static DIRECT_CALL_TARGET_CACHE: std::cell::RefCell<Option<(std::path::PathBuf, usize, HashMap<u32, String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Module-entry bindings that a call may target directly: ordinary
+/// synchronous function declarations of this module that are never
+/// reassigned anywhere in it. This is exactly the set the capture map
+/// snapshots as constant slots, further limited to sync non-generator
+/// declarations (whose `_call_slice` entry `emit_w3ir_sync_symbol` emits).
+/// Anything else (host imports, synthetic cells, classes, variables,
+/// async/generator functions, reassigned or duplicate declarations) is
+/// left to the dynamic call path.
+fn direct_call_targets(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    items: &[TopLevelItem],
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> HashMap<u32, String> {
+    // Escape hatch for differential testing: every call stays dynamic.
+    if std::env::var_os("W3COS_NO_DIRECT_CALLS").is_some() {
+        return HashMap::new();
+    }
+    let key = w3ir_module as *const w3cos_ir::Module as usize;
+    if let Some(cached) = DIRECT_CALL_TARGET_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(path, module_key, _)| path == &module.path && *module_key == key)
+            .map(|(_, _, targets)| targets.clone())
+    }) {
+        return cached;
+    }
+    let mut targets = HashMap::new();
+    if let Some(entry) = w3ir_module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == w3ir_module.entry)
+    {
+        let context =
+            LowerCtx::new_dynamic_with_bindings(lowering_names(module), value_bindings.clone())
+                .with_classes(class_names.clone())
+                .with_namespaces(namespace_names.clone());
+        for binding in &entry.bindings {
+            if binding.name.starts_with('*')
+                || module
+                    .host_imports
+                    .iter()
+                    .any(|(local, _)| local == &binding.name)
+                || function_flags(items, &binding.name) != Some((false, false))
+            {
+                continue;
+            }
+            let Some(bundled) = module.lookup(&binding.name) else {
+                continue;
+            };
+            let declared_here = bundle.symbols.iter().any(|symbol| {
+                symbol.bundled_name == bundled
+                    && symbol.module == module.path
+                    && symbol.kind == SymbolKind::Function
+            });
+            if !declared_here
+                || !{
+                    // Lowering may name the module-local alias
+                    // (`pub use self::{bundled}_value as {name}_value`).
+                    let lowered = context.lower_ident(&binding.name);
+                    lowered == format!("{bundled}_value()")
+                        || lowered == format!("{}_value()", binding.name)
+                }
+                || binding_is_reassigned(w3ir_module, entry.id, binding.id)
+            {
+                continue;
+            }
+            targets.insert(binding.id.0, bundled.to_string());
+        }
+    }
+    DIRECT_CALL_TARGET_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((module.path.clone(), key, targets.clone()));
+    });
+    targets
 }
 
 fn generator_capture_map(
@@ -3943,6 +4038,42 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
             );
         }
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn constant_function_declarations_are_called_through_known_target_entries() {
+        let root = fixture_root("w3cos_esm_codegen_known_target_calls");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+function add(a, b) { return a + b; }
+function* gen() { yield 1; }
+const alias = add;
+export function result() {
+  const viaAlias = alias(1, 2);
+  const direct = add(3, 4);
+  const it = gen();
+  return direct + viaAlias + it.next().value;
+}
+"#;
+        std::fs::write(root.join("src/app.js"), source).unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = try_generate_with_bodies(&bundle).unwrap();
+        // `add` is a never-reassigned ordinary declaration: native entry.
+        assert!(
+            code.contains("catch_js(|| m0_add_call_slice("),
+            "known-target call missing"
+        );
+        // `alias` is a binding to a value (not a declaration) and `gen` is a
+        // generator: both keep the generic [[Call]] dispatch.
+        assert!(!code.contains("m0_alias_call_slice"));
+        assert!(!code.contains("catch_js(|| m0_gen_call_slice("));
+        assert!(code.contains("call_completion_slice("));
+        assert!(code.contains("fn m0_add_call_slice(__this: w3cos_core::Value"));
         std::fs::remove_dir_all(root).ok();
     }
 

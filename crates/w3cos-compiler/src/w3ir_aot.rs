@@ -3891,6 +3891,7 @@ fn emit_block_instructions(
     let live_in = analyze_live_in(function);
     let last_uses = last_uses_in_sequence(instructions, function, exception_target, &live_in);
     let dead_strings = dead_string_loads(instructions, function, exception_target, &live_in);
+    resolve_direct_call_sites(instructions);
     let emitted = instructions
         .iter()
         .enumerate()
@@ -6438,6 +6439,91 @@ fn emit_capture_pair_store(capture_id: u32, weaken: bool) -> String {
     )
 }
 
+thread_local! {
+    /// Module-entry binding id -> bundled Rust name of a never-reassigned,
+    /// ordinary synchronous function declaration of the module being
+    /// emitted. Installed by the ESM code generator around one symbol's
+    /// emission; empty means every call stays dynamic.
+    static DIRECT_CALL_TARGETS: std::cell::RefCell<HashMap<u32, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Run `f` with `targets` as the known direct-call targets, restoring the
+/// previous set afterwards (also on error).
+pub(crate) fn with_direct_call_targets<T>(
+    targets: HashMap<u32, String>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<HashMap<u32, String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                DIRECT_CALL_TARGETS.with(|slot| *slot.borrow_mut() = previous);
+                DIRECT_CALL_SITES.with(|slot| *slot.borrow_mut() = (0, HashMap::new()));
+            }
+        }
+    }
+    let previous =
+        DIRECT_CALL_TARGETS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), targets));
+    // Function addresses can be reused across emissions; drop resolved sites.
+    DIRECT_CALL_SITES.with(|slot| *slot.borrow_mut() = (0, HashMap::new()));
+    let _restore = Restore(Some(previous));
+    f()
+}
+
+thread_local! {
+    /// Per emitted function: `Call` instruction address -> direct target.
+    static DIRECT_CALL_SITES: std::cell::RefCell<(usize, HashMap<usize, String>)> =
+        std::cell::RefCell::new((0, HashMap::new()));
+}
+
+/// The direct target for a `Call` whose callee register is defined, in the
+/// same block and before the call with no intervening redefinition, by a
+/// `LoadBinding` of a known constant function binding. Any other shape (a
+/// register flowing in from another block, a callee read from a property, a
+/// binding not proven constant) stays a dynamic call. Sites are resolved
+/// once per function in a single block-local pass.
+fn direct_call_target(_function: &Function, instruction: &Instruction) -> Option<String> {
+    DIRECT_CALL_SITES.with(|sites| {
+        sites
+            .borrow()
+            .1
+            .get(&(instruction as *const Instruction as usize))
+            .cloned()
+    })
+}
+
+/// Resolve the direct-call sites of one emitted instruction sequence (a
+/// straight-line block body). Called before the sequence is emitted so the
+/// lookup in `direct_call_target` is keyed by the exact instructions emitted.
+fn resolve_direct_call_sites(instructions: &[Instruction]) {
+    let sites = DIRECT_CALL_TARGETS.with(|targets| {
+        let targets = targets.borrow();
+        let mut sites = HashMap::new();
+        if targets.is_empty() {
+            return sites;
+        }
+        // Register -> binding loaded into it and not overwritten since.
+        let mut loaded: HashMap<u32, u32> = HashMap::new();
+        for candidate in instructions {
+            if let Instruction::Call { callee, .. } = candidate
+                && let Some(binding) = loaded.get(&callee.0)
+                && let Some(target) = targets.get(binding)
+            {
+                sites.insert(candidate as *const Instruction as usize, target.clone());
+            }
+            if let Some(written) = written_register(candidate) {
+                loaded.remove(&written.0);
+            }
+            if let Instruction::LoadBinding { dst, binding } = candidate {
+                loaded.insert(dst.0, binding.0);
+            }
+        }
+        sites
+    });
+    DIRECT_CALL_SITES.with(|slot| *slot.borrow_mut() = (instructions.as_ptr() as usize, sites));
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -6981,6 +7067,36 @@ fn emit_instruction(
                 "let __w3cos_constructor = {}; let __w3cos_super_class = {super_class}; let __w3cos_initializer = {initializer}; self.registers[{}] = w3cos_core::intrinsics::create_class_with_initializer(&__w3cos_constructor, __w3cos_super_class.as_ref(), &__w3cos_initializer);",
                 emit_boxed_value(plan, constructor.0),
                 register(*dst),
+            )
+        }
+        Instruction::Call {
+            dst,
+            callee,
+            this_value,
+            arguments,
+        } if direct_call_target(function, instruction).is_some() => {
+            let target = direct_call_target(function, instruction).expect("checked");
+            // Known-target call (TurboFan JSCallReducer on a constant
+            // function): the callee register was just loaded from a
+            // never-reassigned module function declaration, so call its
+            // native entry directly instead of dispatching through the
+            // function Value. `this`, the argument slice (arity and the
+            // `arguments` object are built by the callee factory exactly as
+            // for a dynamic call) and the exception completion are unchanged.
+            let mut reads = vec![this_value.0];
+            reads.extend(arguments.iter().map(|argument| argument.0));
+            let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+            let expr = format!(
+                "w3cos_core::catch_js(|| {target}_call_slice({}, &[{}]))",
+                uses.emit(this_value.0),
+                emit_arguments_from(&mut uses, arguments)
+            );
+            emit_completion_match(
+                &expr,
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                mode,
+                plan,
             )
         }
         Instruction::Call {
