@@ -1868,6 +1868,12 @@ enum TopLevelItem {
         name: String,
         is_async: bool,
         is_generator: bool,
+        /// Own `name` (SetFunctionName: the declared identifier, the binding
+        /// name for an anonymous function/arrow initializer, or "default").
+        function_name: String,
+        /// Own `length`: ExpectedArgumentCount, the formals before the first
+        /// default or rest parameter.
+        length: u32,
     },
     Class {
         name: String,
@@ -1989,6 +1995,14 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
                                 .unwrap_or_else(|| synthetic_default_export_name(item_index)),
                             is_async: function.function.is_async,
                             is_generator: function.function.is_generator,
+                            function_name: function
+                                .ident
+                                .as_ref()
+                                .map(|ident| ident.sym.to_string())
+                                .unwrap_or_else(|| "default".to_string()),
+                            length: expected_argument_count(
+                                function.function.params.iter().map(|param| &param.pat),
+                            ),
                         });
                     }
                     _ => {}
@@ -2031,9 +2045,13 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
         Decl::Fn(fn_decl) if !fn_decl.declare => {
             let name = fn_decl.ident.sym.to_string();
             items.push(TopLevelItem::Function {
+                function_name: name.clone(),
                 name,
                 is_async: fn_decl.function.is_async,
                 is_generator: fn_decl.function.is_generator,
+                length: expected_argument_count(
+                    fn_decl.function.params.iter().map(|param| &param.pat),
+                ),
             });
         }
         Decl::Class(class_decl) if !class_decl.declare => {
@@ -2050,11 +2068,24 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                 let Some(init) = &declarator.init else {
                     continue;
                 };
-                let (is_async, is_generator) = match init.as_ref() {
-                    Expr::Arrow(arrow) => (arrow.is_async, false),
-                    Expr::Fn(function) => {
-                        (function.function.is_async, function.function.is_generator)
-                    }
+                let (is_async, is_generator, function_name, length) = match init.as_ref() {
+                    Expr::Arrow(arrow) => (
+                        arrow.is_async,
+                        false,
+                        binding.id.sym.to_string(),
+                        expected_argument_count(arrow.params.iter()),
+                    ),
+                    Expr::Fn(function) => (
+                        function.function.is_async,
+                        function.function.is_generator,
+                        function.ident.as_ref().map_or_else(
+                            || binding.id.sym.to_string(),
+                            |ident| ident.sym.to_string(),
+                        ),
+                        expected_argument_count(
+                            function.function.params.iter().map(|param| &param.pat),
+                        ),
+                    ),
                     Expr::Ident(target) => {
                         items.push(TopLevelItem::Alias {
                             name: binding.id.sym.to_string(),
@@ -2092,6 +2123,8 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                     name: binding.id.sym.to_string(),
                     is_async,
                     is_generator,
+                    function_name,
+                    length,
                 });
             }
         }
@@ -2156,6 +2189,45 @@ fn emit_shared_module_registration(
     format!(
         "\n    /// Register this native module in the shared AOT/W3VM live-binding ABI.\n    pub fn {namespace}__register_shared_module() {{\n        {namespace}__instantiate_bindings();\n        let mut exports = ::std::collections::HashMap::new();\n{entries}        w3cos_core::module_registry::register({specifier:?}, exports, Some(w3cos_core::Value::function(move |_, _| {evaluator})));\n    }}\n"
     )
+}
+
+/// ExpectedArgumentCount (ECMA-262 15.1.5): formals before the first one
+/// with an initializer or a rest element. A TypeScript `this` parameter is
+/// type-only and not a formal.
+fn expected_argument_count<'a>(params: impl Iterator<Item = &'a Pat>) -> u32 {
+    let mut count = 0;
+    for pat in params {
+        match pat {
+            Pat::Ident(ident) if ident.id.sym == *"this" => continue,
+            Pat::Assign(_) | Pat::Rest(_) => break,
+            _ => count += 1,
+        }
+    }
+    count
+}
+
+/// The own `name` / `length` an ordinary function value is created with.
+fn function_name_and_length(items: &[TopLevelItem], name: &str) -> Option<(String, u32)> {
+    items.iter().find_map(|item| match item {
+        TopLevelItem::Function {
+            name: item_name,
+            function_name,
+            length,
+            ..
+        } if item_name == name => Some((function_name.clone(), *length)),
+        _ => None,
+    })
+}
+
+/// Wrap a function-value expression so the created function owns `name`
+/// and `length`.
+fn named_function_value(items: &[TopLevelItem], name: &str, value: String) -> String {
+    match function_name_and_length(items, name) {
+        Some((function_name, length)) => format!(
+            "{{ let __w3cos_function = {value}; if let Some(__w3cos_f) = __w3cos_function.as_function() {{ __w3cos_f.set_name_and_length({function_name:?}, {length}); }} __w3cos_function }}"
+        ),
+        None => value,
+    }
 }
 
 fn function_flags(items: &[TopLevelItem], name: &str) -> Option<(bool, bool)> {
@@ -2240,6 +2312,7 @@ fn emit_w3ir_generator_symbol(
             symbol.bundled_name
         )
     };
+    let value_body = named_function_value(items, &symbol.original_name, value_body);
     output.push_str(&format!(
         "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || {value_body})\n    }}\n",
         symbol.bundled_name,
@@ -2433,6 +2506,7 @@ fn emit_w3ir_sync_symbol(
             symbol.bundled_name
         )
     };
+    let value_body = named_function_value(items, &symbol.original_name, value_body);
     output.push_str(&format!(
         "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || {value_body})\n    }}\n",
         symbol.bundled_name,
@@ -4104,6 +4178,9 @@ export function result() {
         assert!(code.contains("pub fn m0_add__w3ir_sync_factory__num__result("));
         assert!(code.contains("__w3cos_frame.num_bindings["));
         assert!(code.contains("fn m0_add_call_result("));
+        // SetFunctionName / SetFunctionLength on the declaration's value.
+        assert!(code.contains("set_name_and_length(\"add\", 2)"));
+        assert!(code.contains("set_name_and_length(\"gen\", 0)"));
         // `alias` is a binding to a value (not a declaration) and `gen` is a
         // generator: both keep the generic [[Call]] dispatch.
         assert!(!code.contains("m0_alias_call_slice"));

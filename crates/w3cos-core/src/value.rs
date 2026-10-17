@@ -1415,8 +1415,22 @@ fn bump_number(cell: &Cell<Option<f64>>, addend: f64) -> Value {
 /// Page-local interned functions store one of these in the page arena. Host /
 /// DOM callables share [`Rc<FunctionData>`] on [`Value::Function`] and object
 /// call-slots.
+/// SetFunctionName / SetFunctionLength (ECMA-262 10.2.9, 10.2.10): the own
+/// `name` and `length` properties every ordinary function is created with.
+/// They are non-writable, non-enumerable and configurable, so they live
+/// outside the enumerable property map (V8 serves them from the
+/// SharedFunctionInfo through AccessorInfo rather than per-closure storage).
+#[derive(Clone, Copy, Default)]
+struct FunctionMeta {
+    name: &'static str,
+    length: u32,
+    has_name: bool,
+    has_length: bool,
+}
+
 pub struct FunctionData {
     body: FunctionBody,
+    meta: Cell<FunctionMeta>,
     /// Own string-keyed data properties. Ordinary functions keep ≤4 inline
     /// (prototype, and often length/name) without a HashMap spill.
     props: RefCell<PropertyMap>,
@@ -1500,8 +1514,28 @@ impl FunctionData {
         );
         Self {
             body,
+            meta: Cell::new(FunctionMeta::default()),
             props: RefCell::new(props),
             allocation,
+        }
+    }
+
+    /// Install the own `name` / `length` of an ordinary function.
+    pub fn set_name_and_length(&self, name: &'static str, length: u32) {
+        self.meta.set(FunctionMeta {
+            name,
+            length,
+            has_name: true,
+            has_length: true,
+        });
+    }
+
+    fn meta_property(&self, key: &str) -> Option<Value> {
+        let meta = self.meta.get();
+        match key {
+            "name" if meta.has_name => Some(Value::string(meta.name)),
+            "length" if meta.has_length => Some(Value::Number(f64::from(meta.length))),
+            _ => None,
         }
     }
 
@@ -1527,6 +1561,9 @@ impl FunctionData {
     }
 
     pub fn get_property(&self, key: &str) -> Value {
+        if let Some(value) = self.meta_property(key) {
+            return value;
+        }
         self.props
             .borrow()
             .get(key)
@@ -1535,7 +1572,7 @@ impl FunctionData {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.props.borrow().contains_key(key)
+        self.meta_property(key).is_some() || self.props.borrow().contains_key(key)
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -1553,6 +1590,13 @@ impl FunctionData {
     }
 
     pub fn set_property(&self, key: &str, value: Value) {
+        if self.meta_property(key).is_some() {
+            // [[Writable]]: false. Module code is strict, so OrdinarySet's
+            // false result throws (ECMA-262 PutValue step 6.d).
+            throw_value(crate::intrinsics::type_error(&format!(
+                "Cannot assign to read only property '{key}' of function"
+            )));
+        }
         let mut props = self.props.borrow_mut();
         props.insert(JsString::intern(key), value);
         self.allocation
@@ -1560,6 +1604,14 @@ impl FunctionData {
     }
 
     pub fn delete_property(&self, key: &str) {
+        // [[Configurable]]: true.
+        let mut meta = self.meta.get();
+        match key {
+            "name" => meta.has_name = false,
+            "length" => meta.has_length = false,
+            _ => {}
+        }
+        self.meta.set(meta);
         let mut props = self.props.borrow_mut();
         props.remove(key);
         self.allocation
@@ -1673,6 +1725,11 @@ impl JsFunction {
 
     pub fn delete_property(&self, key: &str) {
         self.data().delete_property(key)
+    }
+
+    /// Install the own `name` / `length` (SetFunctionName / SetFunctionLength).
+    pub fn set_name_and_length(&self, name: &'static str, length: u32) {
+        self.data().set_name_and_length(name, length)
     }
 
     /// A stable identity address for this function value (clones of the same
@@ -2485,6 +2542,20 @@ impl Value {
     /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
     pub fn aot_function(factory: AotFactory, captures: AotCaptureMap) -> Self {
         let handle = crate::page_arena::alloc_function(FunctionData::from_aot(factory, captures));
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
+    /// An AOT function with its own `name` and `length` (SetFunctionName /
+    /// SetFunctionLength at function object creation).
+    pub fn aot_function_named(
+        factory: AotFactory,
+        captures: AotCaptureMap,
+        name: &'static str,
+        length: u32,
+    ) -> Self {
+        let data = FunctionData::from_aot(factory, captures);
+        data.set_name_and_length(name, length);
+        let handle = crate::page_arena::alloc_function(data);
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
@@ -4353,6 +4424,35 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn function_name_and_length_are_own_readonly_configurable_non_enumerable() {
+        fn factory(_: Value, _: &[Value], _: &AotCaptureMap) -> Value {
+            Value::Undefined
+        }
+        let function = Value::aot_function_named(factory, AotCaptureMap::new(), "sum", 2);
+        let handle = function.as_function().unwrap();
+        assert_eq!(function.get_property("name").to_js_string(), "sum");
+        assert_eq!(function.get_property("length"), Value::Number(2.0));
+        assert!(handle.has_own_property("name") && handle.has_own_property("length"));
+        assert!(
+            !handle
+                .keys()
+                .iter()
+                .any(|key| key == "name" || key == "length")
+        );
+        let assigned = catch_js(|| {
+            handle.set_property("name", Value::string("other"));
+            Value::Undefined
+        });
+        assert!(assigned.is_err());
+        assert_eq!(function.get_property("name").to_js_string(), "sum");
+        handle.delete_property("name");
+        assert!(!handle.has_own_property("name"));
+        handle.set_property("name", Value::string("redefined"));
+        assert_eq!(function.get_property("name").to_js_string(), "redefined");
+        assert_eq!(function.get_property("length"), Value::Number(2.0));
+    }
 
     #[test]
     fn explicit_receiver_lookup_preserves_undefined_and_proxy_exception() {
