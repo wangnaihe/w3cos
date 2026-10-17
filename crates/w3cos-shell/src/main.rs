@@ -3110,7 +3110,7 @@ fn apply_screen_override() {
         }
         Some("devices") => {
             present_settings(4, 0);
-            handoff::demo_pending();
+            handoff::demo_pending_signed();
         }
         Some("devices-sync") => {
             present_settings(4, 0);
@@ -6748,16 +6748,86 @@ fn device_line(label: String, color: Color) -> Component {
     }
 }
 
+fn pair_id_keep() -> usize {
+    let width = state::shell_viewport().0;
+    if width < 600.0 {
+        18
+    } else if width < 1024.0 {
+        20
+    } else {
+        28
+    }
+}
+
+/// One wrapping row. A card's minimum width is wider than a phone column and
+/// narrower than half a tablet or desktop pane, so the same tree stacks or
+/// sits side by side without a second layout.
+fn pair_identifier_row(fingerprint: &str, did: Option<&str>) -> Component {
+    let mut cards = vec![pair_identifier(
+        &locale::t("pair-fingerprint-label"),
+        fingerprint,
+    )];
+    if let Some(did) = did {
+        cards.push(pair_identifier(&locale::t("pair-did-label"), did));
+    }
+    Component::row(
+        Style {
+            width: Dimension::Percent(100.0),
+            gap: 8.0,
+            flex_wrap: FlexWrap::Wrap,
+            align_items: AlignItems::Stretch,
+            ..Style::default()
+        },
+        cards,
+    )
+}
+
+fn pair_identifier(label: &str, value: &str) -> Component {
+    let coarse = state::pointer_is_coarse();
+    Component::column(
+        Style {
+            flex_grow: 1.0,
+            flex_shrink: 0.0,
+            min_width: Dimension::Px(220.0),
+            gap: 4.0,
+            padding: Edges::xy(12.0, if coarse { 12.0 } else { 10.0 }),
+            background: Color::from_hex("#31475e"),
+            border_radius: 8.0,
+            min_height: Dimension::Px(if coarse { 64.0 } else { 0.0 }),
+            ..Style::default()
+        },
+        vec![
+            Component::text(
+                label.to_string(),
+                Style {
+                    font_size: 12.0,
+                    color: muted_ink(),
+                    ..Style::default()
+                },
+            ),
+            Component::text(
+                truncate_middle(value, pair_id_keep()),
+                Style {
+                    font_size: 14.0,
+                    color: Color::from_hex("#ffe08a"),
+                    font_family: Some("ui-monospace, monospace".to_string()),
+                    white_space: WhiteSpace::NoWrap,
+                    ..Style::default()
+                },
+            ),
+        ],
+    )
+}
+
 fn settings_devices_page() -> Vec<Component> {
     let mut page = settings_heading(
         &locale::t("settings-devices-nav"),
         &locale::t("settings-devices-detail"),
     );
-    let fingerprint = truncate_middle(&handoff::local_fingerprint(), 28);
-    page.push(device_line(
-        format!("{} · {fingerprint}", handoff::local_name()),
-        ink(),
-    ));
+    let fingerprint = handoff::local_fingerprint();
+    let did = handoff::local_did_key();
+    page.push(device_line(handoff::local_name(), ink()));
+    page.push(pair_identifier_row(&fingerprint, Some(&did)));
     let qr = handoff::pairing_qr_svg();
     if qr.contains("<svg") {
         page.push(Component::svg_document(
@@ -6777,10 +6847,12 @@ fn settings_devices_page() -> Vec<Component> {
             &peer.fingerprint,
             &peer.nonce,
         );
+        let peer_did = handoff::peer_display_did(&peer);
         page.push(device_line(
             format!("{} · {}", peer.name, locale::t("pair-pending")),
             Color::from_hex("#f0d7b4"),
         ));
+        page.push(pair_identifier_row(&peer.fingerprint, peer_did.as_deref()));
         page.push(Component::text(
             grouped,
             Style {
@@ -6828,7 +6900,9 @@ fn settings_devices_page() -> Vec<Component> {
             } else {
                 locale::t("pair-pending").to_string()
             };
+            let peer_did = handoff::peer_display_did(&peer);
             page.push(device_line(format!("{} · {state}", peer.name), ink()));
+            page.push(pair_identifier_row(&peer.fingerprint, peer_did.as_deref()));
         }
     }
     let placeholder = locale::t("pair-paste-placeholder");
@@ -11090,6 +11164,145 @@ mod shell_ux_tests {
         );
         assert!(blob.contains(&grouped), "{grouped} missing from {blob}");
         locale::set_locale("en");
+    }
+
+    #[test]
+    fn pairing_screen_shows_the_spec_did_beside_the_fingerprint() {
+        let _guard = POSTURE_LOCK.lock().unwrap();
+        handoff::reset_for_tests();
+        ensure_shell_signals();
+        locale::set_locale("zh-CN");
+        handoff::demo_pending();
+        let legacy = handoff::peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .expect("legacy peer");
+        let legacy_fingerprint = legacy.fingerprint.clone();
+        assert_eq!(legacy.ed25519, [0; 32]);
+        state::note_shell_viewport(1440.0, 900.0);
+        state::note_pointer_coarse(false);
+        let legacy_page = Component::column(Style::default(), settings_devices_page());
+        let legacy_blob = text_blob(&legacy_page);
+        assert_eq!(identifier_rows(&legacy_page), vec![2, 1]);
+        assert_eq!(label_count(&legacy_blob, "配对指纹"), 2, "{legacy_blob}");
+        assert_eq!(
+            label_count(&legacy_blob, "签名 did:key"),
+            1,
+            "{legacy_blob}"
+        );
+        assert!(!legacy_blob.contains(&legacy_fingerprint), "{legacy_blob}");
+        let still = handoff::peers()
+            .into_iter()
+            .find(|peer| peer.name == "手机")
+            .expect("legacy peer");
+        assert_eq!(still.fingerprint, legacy_fingerprint);
+        assert_eq!(still.ed25519, [0; 32]);
+
+        handoff::reset_for_tests();
+        handoff::demo_pending_signed();
+        let local_fp = handoff::local_fingerprint();
+        let local_did = handoff::local_did_key();
+        let peer = handoff::pending_peer().expect("pending");
+        let peer_fp = peer.fingerprint.clone();
+        let peer_did = handoff::peer_display_did(&peer).expect("signing key");
+        assert_ne!(local_fp, local_did);
+        assert_ne!(peer_fp, peer_did);
+        let stored = (peer_fp.clone(), peer.ed25519, peer.public, peer.trusted);
+
+        for (width, height, coarse, keep) in [
+            (1440.0, 900.0, false, 28usize),
+            (800.0, 1024.0, false, 20usize),
+            (390.0, 760.0, true, 18usize),
+        ] {
+            state::note_shell_viewport(width, height);
+            state::note_pointer_coarse(coarse);
+            let page = Component::column(Style::default(), settings_devices_page());
+            assert_eq!(identifier_rows(&page), vec![2, 2], "{width}");
+            let blob = text_blob(&page);
+            assert_eq!(label_count(&blob, "配对指纹"), 2, "{blob}");
+            assert_eq!(label_count(&blob, "签名 did:key"), 2, "{blob}");
+            assert!(blob.contains("待核对"), "{blob}");
+            for value in [&local_fp, &local_did, &peer_fp, &peer_did] {
+                let shown = truncate_middle(value, keep);
+                assert!(
+                    blob.contains(&shown),
+                    "{shown} missing at {width} from {blob}"
+                );
+                assert!(!blob.contains(value), "{value} leaked at {width}");
+            }
+            let peer_now = handoff::pending_peer().expect("pending");
+            assert_eq!(peer_now.fingerprint, stored.0);
+            assert_eq!(peer_now.ed25519, stored.1);
+            assert_eq!(peer_now.public, stored.2);
+            assert_eq!(peer_now.trusted, stored.3);
+            assert_ne!(peer_now.fingerprint, peer_did);
+        }
+
+        state::note_shell_viewport(390.0, 760.0);
+        state::note_pointer_coarse(true);
+        state::set_signal(SETTINGS_TAB_SIGNAL, 4);
+        state::set_signal(SETTINGS_MENU_SIGNAL, 0);
+        state::set_signal(UNLOCKED_SIGNAL, 1);
+        let phone = build_settings_app();
+        let (_, _, _, trust_h) = button_face(&phone, "数字一致，信任这台");
+        assert!(trust_h >= 48.0, "{trust_h}");
+        let (_, _, _, import_h) = button_face(&phone, "导入配对码");
+        assert!(import_h >= 48.0, "{import_h}");
+        let phone_blob = text_blob(&phone);
+        assert!(phone_blob.contains("签名 did:key"), "{phone_blob}");
+        assert!(phone_blob.contains("配对指纹"), "{phone_blob}");
+
+        locale::set_locale("en");
+        state::note_shell_viewport(800.0, 1024.0);
+        state::note_pointer_coarse(false);
+        let english = text_blob(&Component::column(
+            Style::default(),
+            settings_devices_page(),
+        ));
+        assert!(english.contains("Pairing fingerprint"), "{english}");
+        assert!(english.contains("Signing did:key"), "{english}");
+        assert!(
+            english.contains("A stored peer keeps the fingerprint"),
+            "{english}"
+        );
+        assert_eq!(label_count(&english, "Signing did:key"), 2, "{english}");
+        let shown = truncate_middle(&local_did, 20);
+        assert!(english.contains(&shown), "{english}");
+        assert!(!english.contains(&local_did), "{english}");
+
+        locale::set_locale("zh-CN");
+        state::note_pointer_coarse(false);
+        state::note_shell_viewport(1200.0, 800.0);
+    }
+
+    fn label_count(blob: &str, label: &str) -> usize {
+        blob.lines().filter(|line| *line == label).count()
+    }
+
+    fn identifier_rows(root: &Component) -> Vec<usize> {
+        let mut counts = Vec::new();
+        walk(root, &mut |node| {
+            if node.style.flex_wrap != FlexWrap::Wrap {
+                return;
+            }
+            let Dimension::Percent(width) = node.style.width else {
+                return;
+            };
+            if (width - 100.0).abs() > 0.1 {
+                return;
+            }
+            assert_eq!(node.kind, ComponentKind::Row);
+            assert_eq!(node.style.flex_direction, FlexDirection::Row);
+            for child in &node.children {
+                assert!(
+                    matches!(child.style.min_width, Dimension::Px(value) if (value - 220.0).abs() < 0.1)
+                );
+                assert_eq!(child.style.flex_shrink, 0.0);
+                assert_eq!(child.kind, ComponentKind::Column);
+            }
+            counts.push(node.children.len());
+        });
+        counts
     }
 
     #[test]
