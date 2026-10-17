@@ -10738,10 +10738,14 @@ fn project_simple_float_margin_boxes(
 }
 
 fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
-    let anonymous = style.custom_properties.as_ref().is_some_and(|properties| {
-        properties.contains_key("--w3cos-internal-inline-formatting-context")
-            || properties.contains_key("--w3cos-internal-anonymous-float-group")
-    });
+    // Only consulted for flex/grid boxes; probing the custom property map
+    // for every box in every float pass dominated this predicate.
+    let anonymous = || {
+        style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                || properties.contains_key("--w3cos-internal-anonymous-float-group")
+        })
+    };
     root || establishes_column_context(style)
         || style.float != WFloat::None
         || matches!(style.position, WPos::Absolute | WPos::Fixed)
@@ -10754,11 +10758,10 @@ fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
                 | WDisplay::InlineTable
                 | WDisplay::TableCell
         )
-        || (!anonymous
-            && matches!(
-                style.display,
-                WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
-            ))
+        || (matches!(
+            style.display,
+            WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
+        ) && !anonymous())
 }
 
 fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
