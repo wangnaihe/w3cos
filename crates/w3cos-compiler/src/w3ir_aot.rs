@@ -9874,6 +9874,109 @@ fn main() {{
         );
     }
 
+    fn set_property_fixture(value: u32, returned: u32) -> Function {
+        last_use_fixture(
+            vec![
+                Instruction::CreateObject {
+                    dst: Register(0),
+                    properties: Vec::new(),
+                },
+                Instruction::LoadConstant {
+                    dst: Register(1),
+                    value: Constant::String("k".into()),
+                },
+                Instruction::CreateObject {
+                    dst: Register(2),
+                    properties: Vec::new(),
+                },
+                Instruction::SetProperty {
+                    object: Register(0),
+                    key: Register(1),
+                    value: Register(value),
+                    strict: false,
+                },
+                Instruction::Return {
+                    value: Register(returned),
+                },
+            ],
+            3,
+        )
+    }
+
+    #[test]
+    fn add_borrows_both_operands_in_place() {
+        let function = last_use_fixture(
+            vec![
+                Instruction::LoadConstant {
+                    dst: Register(0),
+                    value: Constant::String("a".into()),
+                },
+                Instruction::LoadConstant {
+                    dst: Register(1),
+                    value: Constant::String("b".into()),
+                },
+                Instruction::Add {
+                    dst: Register(2),
+                    lhs: Register(0),
+                    rhs: Register(1),
+                },
+                Instruction::Return { value: Register(2) },
+            ],
+            3,
+        );
+        let generated = emit_slice(&function);
+        assert!(
+            generated
+                .contains("w3cos_core::intrinsics::add(&self.registers[0], &self.registers[1])"),
+            "add takes &Value: no clone + drop per operand: {generated}"
+        );
+        assert!(
+            generated.contains("return Ok(std::mem::replace(&mut self.registers[2]"),
+            "the returned register is moved out: {generated}"
+        );
+    }
+
+    #[test]
+    fn set_property_moves_a_value_on_its_last_use() {
+        let generated = emit_slice(&set_property_fixture(2, 0));
+        assert!(
+            generated.contains("let __w3cos_owned_2 = std::mem::replace(&mut self.registers[2], w3cos_core::Value::Undefined);"),
+            "the stored value dies here, so it is moved: {generated}"
+        );
+        assert!(
+            !generated.contains("self.registers[2].clone()"),
+            "no clone of a dying value: {generated}"
+        );
+    }
+
+    #[test]
+    fn set_property_clones_a_value_that_is_live_afterwards() {
+        let generated = emit_slice(&set_property_fixture(2, 2));
+        assert!(
+            !generated.contains("__w3cos_owned_2"),
+            "the value is returned afterwards, so it must be cloned: {generated}"
+        );
+        assert!(
+            generated.contains("self.registers[2].clone()"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn set_property_clones_when_receiver_and_value_are_one_register() {
+        // `o.self = o` at o's last use: moving the value out first would
+        // leave the receiver undefined.
+        let generated = emit_slice(&set_property_fixture(0, 2));
+        assert!(
+            !generated.contains("__w3cos_owned_0"),
+            "a register read twice by one instruction is never moved: {generated}"
+        );
+        assert!(
+            generated.contains("self.registers[0].clone()"),
+            "{generated}"
+        );
+    }
+
     #[test]
     fn clones_value_register_that_is_live_after_use() {
         let function = last_use_fixture(
@@ -9901,9 +10004,9 @@ fn main() {{
         );
         let generated = emit_slice(&function);
         assert!(
-            generated.contains("self.registers[0].clone().get_property(\"name\")")
-                || generated.contains("get_property(&self.registers[0].clone()"),
-            "GetProperty object that is live after the use must still clone: {generated}"
+            generated.contains("self.registers[0].get_property(\"name\")")
+                || generated.contains("get_property(&self.registers[0]"),
+            "GetProperty object that is live after the use is borrowed in place: {generated}"
         );
         assert!(
             generated.contains("self.registers[3] = std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined)")
