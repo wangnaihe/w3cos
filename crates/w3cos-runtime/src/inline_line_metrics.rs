@@ -1,4 +1,5 @@
 //! Single-line metrics with authored inline struts and parent font context.
+#[cfg(test)]
 use crate::layout::HashMap;
 use crate::layout::{
     LayoutRect, count_nodes, inline_font_baseline_from_line_top, inline_font_content_ascent,
@@ -35,7 +36,7 @@ fn place(
     x_shift: f32,
     y: f32,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) {
     let y_shift = y - layouts[item.position].0.y;
     if let Some((start, count)) = item.subtree {
@@ -72,7 +73,7 @@ impl Line {
         relative_y: f32,
         relative_x: f32,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<()> {
         let style = &component.style;
         // Positioned descendants (including outside markers) are not line
@@ -428,7 +429,7 @@ fn resolve(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<Line> {
     // An authored block containing only inline descendants establishes an IFC
     // even when DOM lowering did not need an anonymous flex-row marker. collect
@@ -528,7 +529,7 @@ fn soft_lines(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<Vec<Line>> {
     let style = &component.style;
     if style.direction != TextDirection::Ltr
@@ -657,7 +658,7 @@ fn forced_lines(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<Vec<Line>> {
     fn has_break(component: &Component) -> bool {
         matches!(&component.kind, ComponentKind::Text { content } if content == "\u{2028}")
@@ -697,7 +698,7 @@ fn forced_lines(
         lines: &mut Vec<Line>,
         fresh: &impl Fn() -> Line,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<()> {
         let style = &component.style;
         if matches!(&component.kind, ComponentKind::Text { content } if content == "\u{2028}") {
@@ -799,7 +800,7 @@ fn preserved_text(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<(usize, f32, f32, f32)> {
     if component.children.len() != 1
         || !matches!(
@@ -943,7 +944,7 @@ pub(crate) fn natural_content_height(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<f32> {
     if let Some(lines) = forced_lines(component, index, layouts, positions)
         .or_else(|| soft_lines(component, index, layouts, positions))
@@ -960,7 +961,7 @@ pub(crate) fn project(
     component: &Component,
     index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> bool {
     project_with_constraints(component, index, layouts, positions, None)
 }
@@ -969,7 +970,7 @@ pub(crate) fn project_with_constraints(
     component: &Component,
     index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
     used: Option<UsedHeightConstraints>,
 ) -> bool {
     if let Some(lines) = forced_lines(component, index, layouts, positions)
@@ -1098,7 +1099,7 @@ pub(crate) fn is_projected(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> bool {
     if let Some(lines) = forced_lines(component, index, layouts, positions)
         .or_else(|| soft_lines(component, index, layouts, positions))
@@ -1226,7 +1227,7 @@ mod tests {
             &tree,
             0,
             &mut layouts,
-            &HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)])
+            &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)])
         ));
         assert_eq!(layouts[0].0.height, 104.0);
         assert_eq!(layouts[3].0.y, 84.0);
@@ -1283,7 +1284,7 @@ mod tests {
                 &root,
                 0,
                 &mut layouts,
-                &HashMap::from_iter([(0, 0), (1, 1)])
+                &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)])
             ),
             "horizontal decoration must not disable the containing line's vertical strut: font={}, used={}, wrap={}",
             inline_font_height(&root.children[0].style),
@@ -1368,7 +1369,7 @@ mod tests {
             &root,
             0,
             &mut layouts,
-            &HashMap::from_iter([(0, 0), (1, 1), (2, 2)])
+            &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2)])
         ));
         assert_eq!(
             layouts[1].0, marker,
@@ -1616,7 +1617,7 @@ mod tests {
                 &root,
                 0,
                 &mut layouts,
-                &HashMap::from_iter([(0, 0), (1, 1)])
+                &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)])
             ));
             assert_eq!(
                 layouts[1].0.x,
@@ -1704,7 +1705,7 @@ mod tests {
                     1,
                 ),
             ];
-            let positions = HashMap::from_iter([(0, 0), (1, 1)]);
+            let positions = crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)]);
             let used = UsedHeightConstraints {
                 minimum: (root.style.min_height != Dimension::Auto).then_some(used_height),
                 maximum: (root.style.max_height != Dimension::Auto).then_some(used_height),
@@ -2223,7 +2224,7 @@ mod tests {
                 &root,
                 0,
                 &mut layouts,
-                &HashMap::from_iter([(0, 0), (1, 1)])
+                &crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)])
             ),
             "a font-sized projected rect does not prove the text fits on one line"
         );
@@ -2275,7 +2276,8 @@ mod tests {
             (rect(24.0, 26.4, 24.0, 28.0), 3),
             (rect(48.0, 40.8, 24.0, 28.0), 4),
         ];
-        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+        let positions =
+            crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
         assert!(
             project(&root, 0, &mut layouts, &positions),
             "nested text-only lines need the same shared strut solver as nested image/text lines"
@@ -2336,7 +2338,7 @@ mod tests {
             width: 100.0,
             height,
         };
-        let positions = HashMap::from_iter([(0, 0), (1, 1)]);
+        let positions = crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1)]);
         let mut plain = vec![(rect(50.0, 24.0), 0), (rect(14.4, 28.0), 1)];
         assert!(project(
             &Component::row(parent.clone(), vec![Component::text("abc", child.clone())]),
@@ -2437,7 +2439,13 @@ mod tests {
                     (rect(30.0, 16.0, 18.0), 3),
                     (rect(46.0, 32.0, 36.0), 4),
                 ];
-                let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+                let positions = crate::layout::LayoutPositions::from_iter([
+                    (0, 0),
+                    (1, 1),
+                    (2, 2),
+                    (3, 3),
+                    (4, 4),
+                ]);
                 assert!(project(&root, 0, &mut layouts, &positions));
                 let baseline = layouts[1].0.y + 30.0;
                 let large_ascent = inline_font_content_ascent(&large);

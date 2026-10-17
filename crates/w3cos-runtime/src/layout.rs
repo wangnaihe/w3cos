@@ -4,6 +4,67 @@ use std::cell::RefCell;
 /// layout thread: hash them with Fx + fmix64 instead of SipHash, as Blink's
 /// LayoutNG uses WTF::HashMap with integer hashing for its per-pass maps.
 pub(crate) type HashMap<K, V> = w3cos_std::fxhash::FxHashMap<K, V>;
+
+/// Dense layout-position table: preorder component index -> position of its
+/// fragment in the `layouts` vector. LayoutNG walks fragments through
+/// box-tree links instead of hashing; the projection passes here index a
+/// flat vector built once per pass instead of a HashMap<usize, usize>.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct LayoutPositions(Vec<usize>);
+
+impl LayoutPositions {
+    const NONE: usize = usize::MAX;
+
+    pub(crate) fn of(layouts: &[(LayoutRect, usize)]) -> Self {
+        layouts
+            .iter()
+            .enumerate()
+            .map(|(position, (_, index))| (*index, position))
+            .collect()
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, index: &usize) -> Option<&usize> {
+        self.0
+            .get(*index)
+            .filter(|position| **position != Self::NONE)
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, index: &usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|position| **position != Self::NONE)
+            .count()
+    }
+}
+
+impl FromIterator<(usize, usize)> for LayoutPositions {
+    fn from_iter<I: IntoIterator<Item = (usize, usize)>>(iter: I) -> Self {
+        let mut positions = Vec::new();
+        for (index, position) in iter {
+            if index >= positions.len() {
+                positions.resize(index + 1, Self::NONE);
+            }
+            // Same as HashMap::insert during collect: the last entry wins.
+            positions[index] = position;
+        }
+        Self(positions)
+    }
+}
+
+impl std::ops::Index<&usize> for LayoutPositions {
+    type Output = usize;
+    #[inline]
+    fn index(&self, index: &usize) -> &usize {
+        self.get(index)
+            .expect("layout position for component index")
+    }
+}
 use taffy::prelude::*;
 use taffy::util::ResolveOrZero;
 use w3cos_std::component::EventAction;
@@ -5130,7 +5191,7 @@ fn project_terminal_preserved_tabs(layouts: &mut [(LayoutRect, usize)], flat: &[
         }) {
             return;
         }
-        let positions: HashMap<_, _> = layouts
+        let positions: LayoutPositions = layouts
             .iter()
             .enumerate()
             .map(|(position, (_, index))| (*index, position))
@@ -5255,7 +5316,7 @@ fn project_empty_painted_inline_boxes(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for index in 0..flat.len() {
         let node = &flat[index];
         if node.style.display != WDisplay::Inline {
@@ -5321,7 +5382,7 @@ fn project_mixed_inline_block_definite_widths(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut parent_has_float = vec![false; flat.len()];
     // Previous sibling of each preorder entry, in one pass (was a backward
     // scan per node that ran to the start of the list for first children).
@@ -5425,13 +5486,13 @@ fn project_inline_background_widths(layouts: &mut [(LayoutRect, usize)], root: &
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn visit(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = index + 1;
         for child in &component.children {
@@ -5473,7 +5534,7 @@ fn project_block_after_floated_inline_line(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut children = vec![Vec::new(); flat.len()];
     let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
     for (index, node) in flat.iter().enumerate() {
@@ -5594,7 +5655,7 @@ fn project_top_table_captions_outside_border(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
     for index in (0..flat.len()).rev() {
         if let Some(parent) = flat[index].parent {
@@ -5649,7 +5710,7 @@ fn project_rtl_fixed_block_alignment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     // Preorder flattening makes each subtree contiguous. Compute its end in
     // one reverse pass rather than walking ancestry for every shifted node.
     let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
@@ -5755,7 +5816,7 @@ fn project_collapsible_line_end_whitespace(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for (index, node) in flat.iter().enumerate() {
         let ComponentKind::Text { content } = node.kind else {
             continue;
@@ -5851,7 +5912,7 @@ fn project_table_cell_inline_vertical_padding(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for (index, node) in flat.iter().enumerate() {
         let Some(parent_index) = node.parent else {
             continue;
@@ -5939,7 +6000,7 @@ pub(crate) fn subtree_ends(flat: &[FlatNodeInfo<'_>]) -> Vec<usize> {
 /// Move the in-flow descendants of `root` (the range `root + 1..end`) by `delta`.
 fn shift_subtree(
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
     flat: &[FlatNodeInfo<'_>],
     root: usize,
     end: usize,
@@ -6004,7 +6065,7 @@ fn align_table_cell_baselines(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     // `flat` is pre-order, so a subtree is the contiguous range
     // `index + 1..ends[index]`. Scanning only that range keeps each cell
     // linear in its own subtree instead of in the whole document.
@@ -6275,7 +6336,7 @@ fn align_empty_inline_table_baselines(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for table in 0..flat.len() {
         if flat[table].style.display != WDisplay::InlineTable
             || flat.iter().enumerate().any(|(index, node)| {
@@ -6338,7 +6399,7 @@ fn align_inline_table_first_row_baselines(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut line_baselines = HashMap::<usize, Vec<(LayoutRect, f32)>>::default();
     for (table, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::InlineTable
@@ -6575,7 +6636,7 @@ fn project_table_rows_after_content_settlement(
     for (position, &(_, index)) in layouts.iter().enumerate() {
         positions[index] = Some(position);
     }
-    let line_positions: HashMap<_, _> = positions
+    let line_positions: LayoutPositions = positions
         .iter()
         .enumerate()
         .filter_map(|(index, position)| position.map(|position| (index, position)))
@@ -6585,7 +6646,7 @@ fn project_table_rows_after_content_settlement(
         component: &Component,
         index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         heights: &mut [Option<f32>],
     ) {
         if component.style.display == WDisplay::TableCell {
@@ -6868,7 +6929,7 @@ fn project_auto_table_child_heights(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut children = vec![Vec::<usize>::new(); flat.len()];
     let mut bfc_owners = vec![None; flat.len()];
     let mut owned_floats = vec![Vec::<usize>::new(); flat.len()];
@@ -7238,11 +7299,11 @@ fn project_fixed_table_cell_rects(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn shift_subtree_x(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta: f32,
@@ -7267,7 +7328,7 @@ fn project_fixed_table_cell_rects(
         viewport_w: f32,
         viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         if component.style.display == WDisplay::TableRow {
             let Some(row_position) = layout_position.get(&component_index).copied() else {
@@ -7436,7 +7497,7 @@ fn project_fixed_table_cell_rects(
         component: &Component,
         component_index: usize,
         layouts: &[(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) -> Option<LayoutRect> {
         let mut result = if component.style.display == WDisplay::TableRow {
             layout_position
@@ -7475,7 +7536,7 @@ fn project_fixed_table_cell_rects(
         grid_rect: Option<LayoutRect>,
         column: &mut usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         let start_column = *column;
         let mut child_index = component_index + 1;
@@ -7535,7 +7596,7 @@ fn project_fixed_table_cell_rects(
         viewport_w: f32,
         viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         if matches!(
             component.style.display,
@@ -7571,7 +7632,7 @@ fn project_fixed_table_cell_rects(
                 component: &Component,
                 component_index: usize,
                 layouts: &[(LayoutRect, usize)],
-                layout_position: &HashMap<usize, usize>,
+                layout_position: &LayoutPositions,
                 row_count: &mut usize,
                 current_row_height: &mut f32,
             ) {
@@ -7716,7 +7777,7 @@ fn project_leading_descendant_margin_groups(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     let collapse = |margins: &[f32]| {
         let positive = margins.iter().copied().fold(0.0_f32, f32::max);
@@ -7731,7 +7792,7 @@ fn project_leading_descendant_margin_groups(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         viewport_w: f32,
         viewport_h: f32,
         collapse: &impl Fn(&[f32]) -> f32,
@@ -7878,13 +7939,13 @@ fn project_inline_after_leading_empty_blocks(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn visit(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         let Some(parent_position) = layout_position.get(&component_index).copied() else {
             return;
@@ -7976,7 +8037,7 @@ fn project_constrained_height_trailing_margin_containment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn collapse(margins: impl IntoIterator<Item = f32>) -> f32 {
         let mut positive = 0.0_f32;
@@ -7990,7 +8051,7 @@ fn project_constrained_height_trailing_margin_containment(
 
     fn shift_range(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         end: usize,
         delta_y: f32,
@@ -8006,7 +8067,7 @@ fn project_constrained_height_trailing_margin_containment(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         viewport_w: f32,
         viewport_h: f32,
     ) {
@@ -8301,11 +8362,11 @@ fn project_simple_float_margin_boxes(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta_y: f32,
@@ -8319,7 +8380,7 @@ fn project_simple_float_margin_boxes(
 
     fn shift_subtree_x(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta_x: f32,
@@ -8335,7 +8396,7 @@ fn project_simple_float_margin_boxes(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         viewport_w: f32,
         viewport_h: f32,
     ) {
@@ -8598,7 +8659,7 @@ fn project_simple_float_margin_boxes(
                     component_index: usize,
                     containing_width: f32,
                     layouts: &[(LayoutRect, usize)],
-                    layout_position: &HashMap<usize, usize>,
+                    layout_position: &LayoutPositions,
                     viewport_w: f32,
                     viewport_h: f32,
                     margins: &mut Vec<f32>,
@@ -13404,7 +13465,7 @@ fn project_right_float_text_containment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for (index, node) in flat.iter().enumerate() {
         let Some(parent) = node.parent else {
             continue;
@@ -14120,7 +14181,7 @@ fn project_auto_height_bfc_float_heights(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn establishes_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
         establishes_float_bfc(style, root)
@@ -14130,7 +14191,7 @@ fn project_auto_height_bfc_float_heights(
         index: usize,
         height: f32,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         flat: &[FlatNodeInfo<'_>],
         vw: f32,
         vh: f32,
@@ -14174,7 +14235,7 @@ fn project_auto_height_bfc_float_heights(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         flat: &[FlatNodeInfo<'_>],
         viewport_w: f32,
         viewport_h: f32,
@@ -14405,7 +14466,7 @@ fn project_cleared_descendant_bfc_heights(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     // Pre-order: the descendants of `ancestor` are `ancestor + 1..ends[ancestor]`.
     let ends = subtree_ends(flat);
     for ancestor in 0..flat.len() {
@@ -14516,12 +14577,12 @@ fn project_single_baseline_replaced_image(layouts: &mut [(LayoutRect, usize)], r
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     fn visit(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = index + 1;
         for child in &component.children {
@@ -14586,7 +14647,7 @@ fn project_table_block_inline_height_changes(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let original = original
         .iter()
         .map(|(rect, index)| (*index, *rect))
@@ -14595,7 +14656,7 @@ fn project_table_block_inline_height_changes(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         original: &HashMap<usize, LayoutRect>,
     ) {
         let mut child_index = index + 1;
@@ -14704,13 +14765,13 @@ fn project_inline_block_atomic_line_descent(layouts: &mut [(LayoutRect, usize)],
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn visit(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -14965,7 +15026,7 @@ fn project_forced_break_inline_block_alignment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn keyword(component: &Component) -> &str {
         component
@@ -14986,7 +15047,7 @@ fn project_forced_break_inline_block_alignment(
         component: &Component,
         component_index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) -> Option<f32> {
         let own = positions.get(&component_index).and_then(|position| {
             let rect = layouts[*position].0;
@@ -15018,7 +15079,7 @@ fn project_forced_break_inline_block_alignment(
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         index: usize,
         component: &Component,
         delta_y: f32,
@@ -15037,7 +15098,7 @@ fn project_forced_break_inline_block_alignment(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -15203,7 +15264,7 @@ fn project_inline_continuation_after_wrapped_row(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn whitespace_only(component: &Component) -> bool {
         match &component.kind {
@@ -15235,7 +15296,7 @@ fn project_inline_continuation_after_wrapped_row(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = index + 1;
         let children = component
@@ -15747,7 +15808,7 @@ fn image_text_line_packets<'a>(
     component: &'a Component,
     component_index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> Option<Vec<Vec<(&'a Component, usize)>>> {
     // Lowered inline contexts can retain their principal Block or Inline
     // display. The marker, not the Flex representation,
@@ -15990,7 +16051,7 @@ fn image_text_packets_have_shared_baselines(
     component: &Component,
     component_index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> bool {
     if crate::inline_line_metrics::is_projected(component, component_index, layouts, positions) {
         return true;
@@ -16125,7 +16186,7 @@ fn project_image_text_lines(
     component: &Component,
     component_index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> bool {
     project_image_text_lines_with_constraints(component, component_index, layouts, positions, None)
 }
@@ -16134,7 +16195,7 @@ fn project_image_text_lines_with_constraints(
     component: &Component,
     component_index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
     used: Option<crate::inline_line_metrics::UsedHeightConstraints>,
 ) -> bool {
     if crate::inline_line_metrics::project_with_constraints(
@@ -16436,7 +16497,7 @@ fn project_forced_break_lines_with_constraints(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let original_rects = layouts
         .iter()
         .map(|(rect, index)| (*index, *rect))
@@ -16444,7 +16505,7 @@ fn project_forced_break_lines_with_constraints(
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta_x: f32,
@@ -16462,7 +16523,7 @@ fn project_forced_break_lines_with_constraints(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         original_rects: &HashMap<usize, LayoutRect>,
         inherited_line_origin: Option<LineOrigin>,
         constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
@@ -17145,7 +17206,7 @@ fn project_inline_block_vertical_align_keywords(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let original_rects = layouts
         .iter()
         .map(|(rect, index)| (*index, *rect))
@@ -17165,7 +17226,7 @@ fn project_inline_block_vertical_align_keywords(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         original_rects: &HashMap<usize, LayoutRect>,
         viewport_w: f32,
         viewport_h: f32,
@@ -17673,7 +17734,7 @@ fn project_inline_block_vertical_align_keywords(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         original_rects: &HashMap<usize, LayoutRect>,
     ) {
         let mut child_index = component_index + 1;
@@ -17725,7 +17786,7 @@ fn last_text_baseline(
     component: &Component,
     component_index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> Option<f32> {
     // Out-of-flow descendants do not export an in-flow line baseline.
     if matches!(component.style.position, WPos::Absolute | WPos::Fixed)
@@ -17877,18 +17938,18 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         component_index: usize,
         component: &Component,
         delta_y: f32,
     ) {
         fn shift(
             layouts: &mut [(LayoutRect, usize)],
-            positions: &HashMap<usize, usize>,
+            positions: &LayoutPositions,
             component: &Component,
             index: usize,
             delta_y: f32,
@@ -17941,7 +18002,7 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -19108,7 +19169,7 @@ fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Co
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn custom_length(component: &Component, property: &str) -> Option<f32> {
         component
@@ -19122,7 +19183,7 @@ fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Co
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         component_index: usize,
         component: &Component,
         delta_y: f32,
@@ -19138,7 +19199,7 @@ fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Co
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -19207,12 +19268,12 @@ fn apply_inline_vertical_align_length(layouts: &mut [(LayoutRect, usize)], root:
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     fn visit(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         inside_unbroken_word: bool,
     ) {
         let inside_unbroken_word = inside_unbroken_word
@@ -33319,7 +33380,7 @@ mod tests {
                 2,
             ),
         ];
-        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2)]);
+        let positions = crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2)]);
         assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
         // Chrome's Arial 15px/15px inline has a 17px font box whose top is
         // 1px above the line top; the 15px baseline image is at the line top.
