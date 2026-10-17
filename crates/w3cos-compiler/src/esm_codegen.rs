@@ -2227,8 +2227,9 @@ fn emit_w3ir_generator_symbol(
     // carry the factory itself (FunctionBody::Aot, V8's code entry on the
     // JSFunction): a call jumps to the factory without a boxed closure, a
     // `_call` shim and a per-call capture-map lookup.
-    let value_body = if captures.starts_with("(*__w3cos_site_captures(")
-        || captures == "w3cos_core::AotCaptureMap::new()"
+    let value_body = if (captures.starts_with("(*__w3cos_site_captures(")
+        || captures == "w3cos_core::AotCaptureMap::new()")
+        && !LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(std::cell::Cell::get)
     {
         format!(
             "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
@@ -2384,11 +2385,24 @@ fn emit_w3ir_sync_symbol(
         "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
+    // Same code-entry form as generators above (FunctionBody::Aot).
+    let value_body = if (captures.starts_with("(*__w3cos_site_captures(")
+        || captures == "w3cos_core::AotCaptureMap::new()")
+        && !LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(std::cell::Cell::get)
+    {
+        format!(
+            "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
+        )
+    } else {
+        format!(
+            "w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args))",
+            symbol.bundled_name
+        )
+    };
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || {value_body})\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
-        symbol.bundled_name,
     ));
     if symbol.kind == SymbolKind::Variable {
         output.push_str(&format!(
@@ -2536,6 +2550,15 @@ fn owns_binding_cell(module: &BundledModule, name: &str) -> bool {
     })
 }
 
+thread_local! {
+    /// Set by `generator_capture_map_with_synthetic` when the map snapshots
+    /// other functions' `_value()` eagerly. Such a function keeps the lazy
+    /// closure `_value` so mutually recursive declarations never evaluate
+    /// each other's values while initializing.
+    static LAST_CAPTURES_SNAPSHOT_FUNCTIONS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn generator_capture_map_with_synthetic(
     bundle: &EsmBundle,
     module: &BundledModule,
@@ -2546,6 +2569,7 @@ fn generator_capture_map_with_synthetic(
     namespace_names: &HashSet<String>,
     synthetic: &HashMap<String, (String, String)>,
 ) -> Option<String> {
+    LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(|flag| flag.set(false));
     if function.captures.is_empty() {
         return Some("w3cos_core::AotCaptureMap::new()".into());
     }
@@ -2625,6 +2649,7 @@ fn generator_capture_map_with_synthetic(
                 })
                 && !binding_is_reassigned(w3ir_module, entry.id, *capture)
             {
+                LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(|flag| flag.set(true));
                 return Some(format!(
                     "({}, w3cos_core::AotCapture::Cell(::std::rc::Rc::new(::std::cell::RefCell::new(({load}, true)))))",
                     capture.0
@@ -9327,7 +9352,17 @@ export function main() { return total; }"#,
             r#"function stable(x) { return x + 1; }
 function swapped(x) { return x * 10; }
 function useBoth(x) { return stable(x) + swapped(x); }
-export function main() { return useBoth(2) * 1000 + useBoth(3); }"#,
+function isEven(n) { return n === 0 ? true : isOdd(n - 1); }
+function isOdd(n) { return n === 0 ? false : isEven(n - 1); }
+function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
+function strFold(sum, text) {
+  for (var i = 0; i < text.length; i++) sum = (sum * 31 + text.charCodeAt(i)) % 1000;
+  return sum;
+}
+export function main() {
+  return useBoth(2) * 1000 + useBoth(3) + (isEven(7) ? 100000 : 0) + fact(5) * 1000000 +
+    (isOdd(7) && strFold(0, "ab") === 105 ? 0 : 7);
+}"#,
         )
         .unwrap();
 
@@ -9362,7 +9397,7 @@ export function main() { return useBoth(2) * 1000 + useBoth(3); }"#,
         std::fs::write(
             crate_dir.join("src/main.rs"),
             format!(
-                "#![allow(warnings)]\n{code}\nfn main() {{ assert_eq!(run_entry().to_u32(), 23034); println!(\"W3COS_FN_SNAPSHOT_OK\"); }}\n"
+                "#![allow(warnings)]\n{code}\nfn main() {{ assert_eq!(run_entry().to_u32(), 120023034); println!(\"W3COS_FN_SNAPSHOT_OK\"); }}\n"
             ),
         )
         .unwrap();
