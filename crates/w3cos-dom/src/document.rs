@@ -113,6 +113,63 @@ enum GeneratedContentItem {
     Image(String),
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MatchedPropertiesKey {
+    tag: u32,
+    attributes: Vec<(u32, &'static str)>,
+    matched: Vec<(u8, bool, u32, String, String)>,
+}
+
+#[derive(Default)]
+struct MatchedPropertiesCache {
+    epoch: Option<(u64, u64)>,
+    entries: usize,
+    styles: HashMap<MatchedPropertiesKey, Vec<(w3cos_std::style::Style, w3cos_std::style::Style)>>,
+}
+
+impl MatchedPropertiesCache {
+    fn validate(&mut self, epoch: (u64, u64)) {
+        if self.epoch != Some(epoch) || self.entries > 8192 {
+            self.epoch = Some(epoch);
+            self.entries = 0;
+            self.styles.clear();
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &MatchedPropertiesKey,
+        epoch: (u64, u64),
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> Option<w3cos_std::style::Style> {
+        self.validate(epoch);
+        let inherited = inherited?;
+        self.styles
+            .get(key)?
+            .iter()
+            .find(|(parent, _)| parent == inherited)
+            .map(|(_, style)| style.clone())
+    }
+
+    fn insert(
+        &mut self,
+        key: MatchedPropertiesKey,
+        epoch: (u64, u64),
+        inherited: Option<&w3cos_std::style::Style>,
+        style: &w3cos_std::style::Style,
+    ) {
+        self.validate(epoch);
+        let Some(inherited) = inherited else {
+            return;
+        };
+        let slot = self.styles.entry(key).or_default();
+        if slot.len() < 8 {
+            slot.push((inherited.clone(), style.clone()));
+            self.entries += 1;
+        }
+    }
+}
+
 #[derive(Default)]
 struct StyleForMemo {
     key: Option<(u64, u64, u64)>,
@@ -561,6 +618,7 @@ pub struct Document {
     /// resolved once instead of per query (Blink keeps ComputedStyle on the
     /// element until StyleRecalc; this is the same lifetime).
     style_for_memo: RefCell<StyleForMemo>,
+    matched_properties_cache: RefCell<MatchedPropertiesCache>,
     style_write_epoch: u64,
     /// Sibling selector contexts are rebuilt for every node during a tree walk.
     /// Caching one pass, and skipping the sibling chain when no rule needs it,
@@ -702,6 +760,7 @@ impl Document {
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
             style_for_memo: RefCell::new(StyleForMemo::default()),
+            matched_properties_cache: RefCell::new(MatchedPropertiesCache::default()),
             style_write_epoch: 0,
             selector_context_cache: RefCell::new(SelectorContextCache {
                 style_clock: 0,
@@ -2550,6 +2609,25 @@ impl Document {
         } else {
             Vec::new()
         };
+        let mpc_key = self.matched_properties_key(id, inline, &matched, inherited);
+        if let Some(key) = &mpc_key
+            && let Some(style) = self.matched_properties_cache.borrow_mut().get(
+                key,
+                (stylesheet_generation, self.style_write_epoch),
+                inherited,
+            )
+        {
+            self.computed_style_cache.borrow_mut().insert(
+                id,
+                CachedComputedStyle {
+                    node_revision,
+                    stylesheet_generation,
+                    inherited_style: inherited.cloned(),
+                    style: style.clone(),
+                },
+            );
+            return style;
+        }
         let mut author_declarations =
             Vec::with_capacity(matched.len() + inline.inline_declarations.len());
         let mut important = Vec::new();
@@ -4462,6 +4540,14 @@ impl Document {
                 style.line_height = ratio;
             }
         }
+        if let Some(key) = mpc_key {
+            self.matched_properties_cache.borrow_mut().insert(
+                key,
+                (stylesheet_generation, self.style_write_epoch),
+                inherited,
+                &style,
+            );
+        }
         self.computed_style_cache.borrow_mut().insert(
             id,
             CachedComputedStyle {
@@ -4472,6 +4558,67 @@ impl Document {
             },
         );
         style
+    }
+
+    /// Key for the matched-properties cache, or `None` when the computed
+    /// style may depend on more than the element's own tag, attributes,
+    /// matched declarations and parent style. Mirrors Blink's
+    /// MatchedPropertiesCache: elements that matched the same declarations
+    /// under an equal parent style share one computed style instead of
+    /// re-running the cascade (a re-rendered markdown block creates dozens
+    /// of identical `span.tok-*` elements per chunk).
+    fn matched_properties_key(
+        &self,
+        id: NodeId,
+        inline: &Arc<CSSStyleDeclaration>,
+        matched: &[stylesheet::CascadeDeclaration],
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> Option<MatchedPropertiesKey> {
+        let node = self.get_node(id);
+        let inherited = inherited?;
+        if node.node_type != NodeType::Element
+            || !node.is_html_element
+            || !node.attribute_namespaces.is_empty()
+            // Display: contents makes blockification walk further ancestors.
+            || inherited.display == w3cos_std::style::Display::Contents
+            // Selectors observing siblings or descendants are not captured
+            // by the element's own declarations alone.
+            || stylesheet::has_relational_dependencies()
+            || stylesheet::has_sibling_dependencies()
+            || stylesheet::has_structural_dependencies()
+            // Inline style edits and per-tag UA rules that look at
+            // ancestors (nested lists, table hints, form controls) opt out.
+            || !Arc::ptr_eq(inline, &shared_ua_style(node.tag))
+            || !matches!(
+                node.tag.as_static(),
+                "span" | "strong" | "em" | "b" | "i" | "u" | "s" | "code" | "a" | "p"
+                    | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre"
+                    | "blockquote" | "li" | "small" | "sub" | "sup" | "mark" | "del"
+                    | "ins" | "kbd" | "samp" | "var" | "q" | "cite" | "br" | "hr"
+            )
+        {
+            return None;
+        }
+        Some(MatchedPropertiesKey {
+            tag: node.tag.as_u32(),
+            attributes: node
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.as_u32(), value.as_str()))
+                .collect(),
+            matched: matched
+                .iter()
+                .map(|declaration| {
+                    (
+                        declaration.origin as u8,
+                        declaration.important,
+                        declaration.specificity,
+                        declaration.property.clone(),
+                        declaration.value.clone(),
+                    )
+                })
+                .collect(),
+        })
     }
 
     #[cfg(test)]

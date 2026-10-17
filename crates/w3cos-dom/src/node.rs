@@ -726,6 +726,10 @@ impl AttributeNamespaceList {
             .push(attribute);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.values.is_none()
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(&AttributeNamespace) -> bool) {
         let Some(values) = self.values.as_mut() else {
             return;
