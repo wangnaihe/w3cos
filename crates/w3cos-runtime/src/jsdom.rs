@@ -4019,6 +4019,8 @@ fn tree_method_slot(key: &str) -> Option<u8> {
         "removeChild" => Some(1),
         "insertBefore" => Some(2),
         "replaceChild" => Some(3),
+        "matches" => Some(4),
+        "webkitMatchesSelector" => Some(5),
         _ => None,
     }
 }
@@ -24621,6 +24623,17 @@ mod tests {
         let child = document.call_method_slice("createElement", &[Value::string("span")]);
         child.set_property("className", Value::string("active"));
 
+        let cached_matches = child.get_property("matches");
+        assert!(
+            cached_matches.strict_eq(&child.get_property("matches")),
+            "the builtin matches function should be reused for the same node"
+        );
+        let cached_webkit = child.get_property("webkitMatchesSelector");
+        assert!(
+            cached_webkit.strict_eq(&child.get_property("webkitMatchesSelector")),
+            "the builtin webkitMatchesSelector function should be reused for the same node"
+        );
+
         assert!(
             parent
                 .call_method_slice("appendChild", std::slice::from_ref(&child))
@@ -24701,6 +24714,16 @@ mod tests {
                 "the borrowed route must retain an authored element method override"
             );
         }
+
+        child.set_property(
+            "matches",
+            Value::function(|_, args| args.first().cloned().unwrap_or(Value::Undefined)),
+        );
+        assert_eq!(
+            child.call_method_slice("matches", &[Value::string("cached-override")]),
+            Value::string("cached-override"),
+            "an own override must still win after the builtin method was cached"
+        );
     }
 
     #[test]
