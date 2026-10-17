@@ -1026,7 +1026,52 @@ impl FontRegistry {
         runs
     }
 
+    /// Memoized per (font stack, weight, style, kerning, text), like Blink's
+    /// ShapeCache keyed by FontDescription + text: re-measuring an unchanged
+    /// text node walked the fallback list once per character.
     pub(crate) fn cascade_cache_key(&self, style: &w3cos_std::style::Style, text: &str) -> u64 {
+        thread_local! {
+            static MEMO: RefCell<(u64, usize, HashMap<u64, HashMap<String, u64>>)> =
+                RefCell::new((u64::MAX, 0, HashMap::new()));
+        }
+        #[cfg(feature = "dynamic-js")]
+        if std::ptr::eq(self, Self::global()) {
+            crate::dynamic_script::request_stylesheet_fonts_for_text(style, text);
+        }
+        let revision = self.revision();
+        let mut meta = DefaultHasher::new();
+        (self as *const Self as usize).hash(&mut meta);
+        style.font_family.hash(&mut meta);
+        style.font_weight.hash(&mut meta);
+        (style.font_style as u8).hash(&mut meta);
+        style.font_kerning.hash(&mut meta);
+        style.font_feature_kern.hash(&mut meta);
+        let meta = meta.finish();
+        if let Some(hit) = MEMO.with(|memo| {
+            let memo = memo.borrow();
+            (memo.0 == revision)
+                .then(|| memo.2.get(&meta).and_then(|texts| texts.get(text)).copied())
+                .flatten()
+        }) {
+            return hit;
+        }
+        let key = self.cascade_cache_key_uncached(style, text);
+        // A font load during resolution bumps the revision; storing under the
+        // old one makes the next lookup recompute.
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.0 != revision || memo.1 > 65_536 {
+                memo.0 = revision;
+                memo.1 = 0;
+                memo.2.clear();
+            }
+            memo.1 += 1;
+            memo.2.entry(meta).or_default().insert(text.to_owned(), key);
+        });
+        key
+    }
+
+    fn cascade_cache_key_uncached(&self, style: &w3cos_std::style::Style, text: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
         style.font_kerning.hash(&mut hasher);
         style.font_feature_kern.hash(&mut hasher);

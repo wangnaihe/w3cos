@@ -3284,6 +3284,45 @@ fn component_min_content_width_with_preferred_width(
         + margin.right
 }
 
+/// `inline_line_filled_by_previous_items` for every prefix of `items` in one
+/// pass; asking it per child was quadratic in a long paragraph's inline
+/// children.
+fn inline_line_prefix_filled(
+    prefix: &std::cell::OnceCell<Vec<f32>>,
+    items: &[Component],
+    count: usize,
+    available_width: f32,
+) -> bool {
+    let widths = prefix.get_or_init(|| {
+        let mut widths = Vec::with_capacity(items.len() + 1);
+        widths.push(0.0_f32);
+        let mut line_width = 0.0_f32;
+        for item in items {
+            line_width = inline_line_fold_step(line_width, item, available_width);
+            widths.push(line_width);
+        }
+        widths
+    });
+    (widths[count] - available_width).abs() < 0.01
+}
+
+fn inline_line_fold_step(line_width: f32, item: &Component, available_width: f32) -> f32 {
+    if (line_width - available_width).abs() < 0.01
+        && matches!(&item.kind, ComponentKind::Text { content }
+            if !content.is_empty() && content.chars().all(|ch|
+                matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}')))
+    {
+        return line_width;
+    }
+    let width = component_max_content_width(item);
+    if line_width + width > available_width + 0.01 {
+        width
+    } else {
+        line_width + width
+    }
+}
+
+#[allow(dead_code)]
 fn inline_line_filled_by_previous_items(items: &[Component], available_width: f32) -> bool {
     let line_width = items.iter().fold(0.0_f32, |line_width, item| {
         if (line_width - available_width).abs() < 0.01
@@ -22046,6 +22085,7 @@ fn build_taffy_tree(
             viewport_h,
         );
         let mut separator_breaks = Vec::new();
+        let line_prefix = std::cell::OnceCell::new();
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
             .children
             .iter()
@@ -22586,8 +22626,10 @@ fn build_taffy_tree(
                     && c.style.margin == w3cos_std::style::Edges::ZERO
                     && c.style.border_width == 0.0
                     && c.style.background.a == 0
-                    && inline_line_filled_by_previous_items(
-                        &comp.children[..source_index],
+                    && inline_line_prefix_filled(
+                        &line_prefix,
+                        &comp.children,
+                        source_index,
                         child_containing_width,
                     )
                     && let ComponentKind::Text { content } = &c.kind
@@ -22667,8 +22709,10 @@ fn build_taffy_tree(
                                 >= child_containing_width
                         || matches!(&comp.children[source_index - 1].kind,
                                 ComponentKind::Text { content } if content.ends_with('\u{a0}'))
-                            && inline_line_filled_by_previous_items(
-                                &comp.children[..source_index],
+                            && inline_line_prefix_filled(
+                                &line_prefix,
+                                &comp.children,
+                                source_index,
                                 child_containing_width,
                             )
                         || flex_backed_inline_formatting_context
@@ -22694,8 +22738,10 @@ fn build_taffy_tree(
                                             },
                                         )
                             })
-                            && inline_line_filled_by_previous_items(
-                                &comp.children[..source_index],
+                            && inline_line_prefix_filled(
+                                &line_prefix,
+                                &comp.children,
+                                source_index,
                                 child_containing_width,
                             ))
                 {
@@ -22743,8 +22789,10 @@ fn build_taffy_tree(
                     && matches!(&c.kind, ComponentKind::Text { content } if content == " ")
                     && c.style.margin.left == WSpacing::Px(0.0)
                     && c.style.margin.right == WSpacing::Px(0.0)
-                    && inline_line_filled_by_previous_items(
-                        &comp.children[..source_index],
+                    && inline_line_prefix_filled(
+                        &line_prefix,
+                        &comp.children,
+                        source_index,
                         child_containing_width,
                     )
                 {
