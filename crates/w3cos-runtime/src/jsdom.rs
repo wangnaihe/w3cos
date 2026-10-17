@@ -1304,6 +1304,9 @@ fn dom_imm_get(node: u32, key: &str) -> Value {
     if let Some(cached) = cached_tree_method(node, key) {
         return cached;
     }
+    if let Some(method) = shared_attribute_method(node, key) {
+        return method;
+    }
     let computed = element_computed_get(node, key);
     remember_tree_method(node, key, &computed);
     if !computed.is_undefined() {
@@ -4197,6 +4200,12 @@ fn element_qualified_name(node: u32) -> String {
 }
 
 fn normalized_attribute_name(node: u32, name: &str) -> String {
+    // ASCII-lowercasing is the identity for names without uppercase bytes,
+    // so both branches agree and the owner-document lookup can be skipped
+    // (Blink: Element::LowercaseIfNecessary).
+    if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return name.to_string();
+    }
     let owner_document = get_expando(node, "ownerDocument").unwrap_or_else(document_value);
     if namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE
         && owner_document.get_property("contentType").to_js_string() == "text/html"
@@ -4539,6 +4548,80 @@ fn remember_tree_method(node: u32, key: &str, value: &Value) {
     TREE_METHOD_CACHE.with(|cache| {
         cache.borrow_mut().insert((node, slot), value.clone());
     });
+}
+
+thread_local! {
+    static ATTRIBUTE_METHODS: RefCell<(u32, [Option<Value>; 3])> =
+        const { RefCell::new((u32::MAX, [None, None, None])) };
+}
+
+/// One attribute-method function object per realm for every HTML element,
+/// like V8's FunctionTemplate methods on `Element.prototype`: the receiver
+/// carries the node, so `el.setAttribute(...)` no longer allocates a closure
+/// per property get. Only reached after own properties, expandos and the
+/// prototype chain missed, so author overrides still win.
+fn shared_attribute_method(node: u32, key: &str) -> Option<Value> {
+    let slot = match key {
+        "getAttribute" => 0,
+        "setAttribute" => 1,
+        "hasAttribute" => 2,
+        _ => return None,
+    };
+    if dom::node_type(node) != 1 || is_svg_node(node) {
+        return None;
+    }
+    let generation = realm_generation();
+    ATTRIBUTE_METHODS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != generation {
+            *cache = (generation, [None, None, None]);
+        }
+        if let Some(method) = cache.1[slot].clone() {
+            return Some(method);
+        }
+        let name: &'static str = ["getAttribute", "setAttribute", "hasAttribute"][slot];
+        let method = func(move |this, args| {
+            let Some(receiver) = node_id_of(&this) else {
+                type_error("Illegal invocation");
+            };
+            if dom::node_type(receiver) != 1 || is_svg_node(receiver) {
+                return element_computed_get(receiver, name).call(this, args);
+            }
+            match slot {
+                0 => {
+                    let name = normalized_attribute_name(receiver, &arg(&args, 0).to_js_string());
+                    match dom::get_attribute(receiver, &name) {
+                        Some(value) => Value::from(value),
+                        None => Value::Null,
+                    }
+                }
+                1 => {
+                    let requested_name = arg(&args, 0).to_js_string();
+                    if !valid_attribute_name(&requested_name) {
+                        dom_exception("Attribute name is not valid", "InvalidCharacterError");
+                    }
+                    let name = normalized_attribute_name(receiver, &requested_name);
+                    let value = arg(&args, 1).to_js_string();
+                    apply_html_attribute(receiver, &name, &value);
+                    #[cfg(feature = "dynamic-js")]
+                    if let Some(event_type) =
+                        name.strip_prefix("on").filter(|event| !event.is_empty())
+                    {
+                        crate::dynamic_script::update_inline_event_handler(
+                            receiver, event_type, &value,
+                        );
+                    }
+                    Value::Undefined
+                }
+                _ => {
+                    let name = normalized_attribute_name(receiver, &arg(&args, 0).to_js_string());
+                    Value::Bool(dom::has_attribute(receiver, &name))
+                }
+            }
+        });
+        cache.1[slot] = Some(method.clone());
+        Some(method)
+    })
 }
 
 fn shared_element_proxy() -> w3cos_core::ProxyHandler {
@@ -22923,6 +23006,35 @@ mod tests {
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn attribute_methods_are_shared_and_use_the_receiver() {
+        setup();
+        let document = document_value();
+        let a = document.call_method("createElement", vec![Value::string("div")]);
+        let b = document.call_method("createElement", vec![Value::string("span")]);
+        let set_a = a.get_property("setAttribute");
+        let set_b = b.get_property("setAttribute");
+        assert!(
+            set_a.strict_eq(&set_b),
+            "one setAttribute per realm, like Element.prototype"
+        );
+        // The receiver, not the node the method was read from, is mutated.
+        let _ = set_a.call(b.clone(), vec![Value::string("Data-V"), Value::string("7")]);
+        assert!(
+            a.call_method("getAttribute", vec![Value::string("data-v")])
+                .is_null()
+        );
+        assert_eq!(
+            b.call_method("getAttribute", vec![Value::string("DATA-V")])
+                .to_js_string(),
+            "7"
+        );
+        assert_eq!(
+            b.call_method("hasAttribute", vec![Value::string("data-v")]),
+            Value::Bool(true)
+        );
     }
 
     #[test]
