@@ -5233,6 +5233,170 @@ fn main() {
     }
 
     #[test]
+    fn generated_bundle_elided_counts_keep_values_alive_exactly_as_long() {
+        // Borrowed operands and last-use moves must never free a value that
+        // is still reachable (across calls, closures, awaits, aliasing in
+        // one instruction), and must still free it at its last reference.
+        let root = fixture_root("w3cos_esm_codegen_rc_elide");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"let stash: any = null;
+let weakA: any = undefined;
+let asyncResult = 0;
+export function borrowThenUse(): number {
+  const o: any = { a: 1, b: 2 };
+  const s = o.a + o.b;
+  o.c = s;
+  return o.a + o.b + o.c;
+}
+export function storeThenDrop(): number {
+  const o: any = { v: 7 };
+  stash = { inner: o };
+  return stash.inner.v;
+}
+export function returnMoved(): any {
+  const o = { r: 5 };
+  return o;
+}
+export function closureKeeps(): any {
+  let o: any = { k: 3 };
+  const f = () => o.k;
+  return f;
+}
+export function sameRegTwice(): number {
+  const o: any = { n: 1 };
+  const arr = [o, o];
+  return arr[0].n + arr[1].n + (arr[0] === arr[1] ? 10 : 0);
+}
+export function selfStore(): number {
+  const o: any = {};
+  o.self = o;
+  const r = o.self === o ? 1 : 0;
+  o.self = null;
+  return r;
+}
+export function moveIntoArgThenUse(): number {
+  const o: any = { m: 4 };
+  const holder: any = {};
+  holder.x = o;
+  holder.y = o;
+  return holder.x.m + holder.y.m + (holder.x === holder.y ? 100 : 0);
+}
+async function asyncHold(): Promise<number> {
+  const o: any = { w: 9 };
+  await null;
+  return o.w;
+}
+export function asyncRun(): number {
+  asyncHold().then((v: number) => {
+    asyncResult = v;
+  });
+  return 0;
+}
+export function getAsync(): number {
+  return asyncResult;
+}
+export function weakAfterMove(): number {
+  const o = { z: 1 };
+  weakA = new WeakRef(o);
+  stash = [o];
+  return 0;
+}
+export function weakState(): string {
+  return weakA.deref() === undefined ? "gone" : "alive";
+}
+export function clearStash(): number {
+  stash = null;
+  return 0;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("let __w3cos_owned_"),
+            "last-use operands are moved, not cloned:\n{code}"
+        );
+        assert!(
+            code.contains("w3cos_core::intrinsics::add(&self.registers["),
+            "add borrows its operands in place:\n{code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::{page_arena, Value};
+    let _ = run_entry();
+    let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
+    let base = live();
+    let n = |v: Value| v.to_number();
+    for _ in 0..200 {
+        assert_eq!(n(m0::m0_borrowThenUse(vec![])), 6.0, "borrowed operands keep the object");
+        assert_eq!(n(m0::m0_sameRegTwice(vec![])), 12.0, "one register used twice in a literal");
+        assert_eq!(n(m0::m0_selfStore(vec![])), 1.0, "receiver and stored value are the same register");
+        assert_eq!(n(m0::m0_moveIntoArgThenUse(vec![])), 108.0, "a value stored twice stays the same object");
+    }
+    assert!(live() <= base + 8, "temporaries are freed: {base} -> {}", live());
+
+    assert_eq!(n(m0::m0_storeThenDrop(vec![])), 7.0);
+    let returned = m0::m0_returnMoved(vec![]);
+    let _ = m0::m0_borrowThenUse(vec![]);
+    assert_eq!(returned.get_property("r").to_number(), 5.0, "a returned value outlives its frame");
+    drop(returned);
+    let f = m0::m0_closureKeeps(vec![]);
+    let _ = m0::m0_borrowThenUse(vec![]);
+    assert_eq!(f.call(Value::Undefined, vec![]).to_number(), 3.0, "a closure keeps its captured object");
+    drop(f);
+
+    let _ = m0::m0_asyncRun(vec![]);
+    let _ = m0::m0_borrowThenUse(vec![]);
+    w3cos_core::promise::drain_microtasks();
+    assert_eq!(n(m0::m0_getAsync(vec![])), 9.0, "an object held across await stays alive");
+
+    let _ = m0::m0_weakAfterMove(vec![]);
+    let _ = m0::m0_borrowThenUse(vec![]);
+    assert_eq!(m0::m0_weakState(vec![]).to_js_string(), "alive", "moved into a global array, still reachable");
+    let _ = m0::m0_clearStash(vec![]);
+    assert_eq!(m0::m0_weakState(vec![]).to_js_string(), "gone", "freed at the last release");
+    assert!(live() <= base + 8, "everything freed after the holders drop: {base} -> {}", live());
+    println!("W3COS_RC_ELIDE_E2E_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("W3COS_RC_ELIDE_E2E_OK"),
+            "rc elision bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn generated_bundle_runs_jsdom_globals() {
         let root = fixture_root("w3cos_esm_codegen_globals_jsdom");
         std::fs::create_dir_all(root.join("src")).unwrap();

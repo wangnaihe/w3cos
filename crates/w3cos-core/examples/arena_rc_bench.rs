@@ -17,6 +17,15 @@ fn ns_per(elapsed: std::time::Duration, n: usize) -> f64 {
     elapsed.as_nanos() as f64 / n as f64
 }
 
+#[inline(never)]
+fn clone_drop_loop(value: &Value, n: usize) -> std::time::Duration {
+    let started = Instant::now();
+    for _ in 0..n {
+        black_box(black_box(value).clone());
+    }
+    started.elapsed()
+}
+
 fn main() {
     let n: usize = std::env::args()
         .nth(1)
@@ -60,12 +69,11 @@ fn main() {
     }
     let write = started.elapsed();
 
-    // 4. Clone + drop the handle N times.
-    let started = Instant::now();
-    for _ in 0..n {
-        black_box(black_box(&object).clone());
-    }
-    let clone = started.elapsed();
+    // 4. Clone + drop the handle N times; 4b. the same loop on a number is
+    // the floor (enum dispatch, no count). Separate non-inlined loops so
+    // the rest of `main` does not change their codegen.
+    let clone = clone_drop_loop(&object, n);
+    let clone_number = clone_drop_loop(&Value::Number(1.0), n);
 
     // 5. Build an array of N/10 objects, drop it, count survivors.
     let m = (n / 10).max(1);
@@ -92,6 +100,10 @@ fn main() {
     println!("get_property          {:8.1} ns/op", ns_per(access, n));
     println!("set_property          {:8.1} ns/op", ns_per(write, n));
     println!("clone+drop handle     {:8.1} ns/op", ns_per(clone, n));
+    println!(
+        "clone+drop number     {:8.1} ns/op",
+        ns_per(clone_number, n)
+    );
     println!(
         "array of {m} objs     {:8.1} ns/obj live_after_drop={array_live}",
         ns_per(array_cycle, m)
