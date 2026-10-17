@@ -35,6 +35,24 @@ enum PropertyStore {
     },
 }
 
+fn map_contains_prefixed(map: &HashMap<JsString, Value>, prefix: &str, key: &str) -> bool {
+    const STACK_KEY_BYTES: usize = 64;
+    let total = prefix.len().saturating_add(key.len());
+    if total <= STACK_KEY_BYTES {
+        let mut bytes = [0_u8; STACK_KEY_BYTES];
+        bytes[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        bytes[prefix.len()..total].copy_from_slice(key.as_bytes());
+        // Concatenating two valid UTF-8 strings is valid UTF-8.
+        let combined = unsafe { std::str::from_utf8_unchecked(&bytes[..total]) };
+        map.contains_key(combined)
+    } else {
+        let mut combined = String::with_capacity(total);
+        combined.push_str(prefix);
+        combined.push_str(key);
+        map.contains_key(combined.as_str())
+    }
+}
+
 impl PropertyMap {
     #[inline]
     pub(crate) fn new() -> Self {
@@ -123,26 +141,31 @@ impl PropertyMap {
         self.get(key).is_some()
     }
 
-    /// Look up `prefix + key` without a temporary heap string for ordinary
-    /// property names. Getter/setter probes are hot during DOM lifecycle
-    /// checks, while their complete internal keys are normally well below
-    /// this fixed stack capacity. Long keys retain the same owned-string
-    /// fallback and exact byte lookup as before.
-    pub(crate) fn contains_prefixed(&self, prefix: &str, key: &str) -> bool {
-        const STACK_KEY_BYTES: usize = 64;
-        let total = prefix.len().saturating_add(key.len());
-        if total <= STACK_KEY_BYTES {
-            let mut bytes = [0_u8; STACK_KEY_BYTES];
-            bytes[..prefix.len()].copy_from_slice(prefix.as_bytes());
-            bytes[prefix.len()..total].copy_from_slice(key.as_bytes());
-            // Concatenating two valid UTF-8 strings is valid UTF-8.
-            let combined = unsafe { std::str::from_utf8_unchecked(&bytes[..total]) };
-            self.contains_key(combined)
-        } else {
-            let mut combined = String::with_capacity(total);
-            combined.push_str(prefix);
-            combined.push_str(key);
-            self.contains_key(&combined)
+    /// Check a direct key and its two prefixed accessor forms. Compact maps
+    /// scan their at-most-four entries once, avoiding three separate scans and
+    /// any temporary combined key. Spilled maps retain exact borrowed HashMap
+    /// lookups and the stack/fallback prefix construction.
+    pub(crate) fn contains_key_or_prefixed(
+        &self,
+        key: &str,
+        first_prefix: &str,
+        second_prefix: &str,
+    ) -> bool {
+        match self.inner.as_deref() {
+            None => false,
+            Some(PropertyStore::Inline { len, entries }) => {
+                entries[..*len as usize].iter().any(|(candidate, _)| {
+                    let candidate = candidate.as_str();
+                    candidate == key
+                        || candidate.strip_prefix(first_prefix) == Some(key)
+                        || candidate.strip_prefix(second_prefix) == Some(key)
+                })
+            }
+            Some(PropertyStore::Map { map, .. }) => {
+                map.contains_key(key)
+                    || map_contains_prefixed(map, first_prefix, key)
+                    || map_contains_prefixed(map, second_prefix, key)
+            }
         }
     }
 
@@ -327,19 +350,25 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_lookup_matches_short_unicode_and_long_fallback_keys() {
+    fn combined_lookup_matches_inline_spilled_unicode_and_fallback_keys() {
         let mut map = PropertyMap::new();
         let getter_prefix = "__w3cos_getter_";
+        let setter_prefix = "__w3cos_setter_";
         map.insert(
             JsString::intern(&format!("{getter_prefix}值")),
             Value::Bool(true),
         );
-        for key in ["fill-a", "fill-b", "fill-c", "fill-d"] {
+        map.insert(JsString::intern("direct"), Value::Bool(true));
+        assert!(map.contains_key_or_prefixed("值", getter_prefix, setter_prefix));
+        assert!(map.contains_key_or_prefixed("direct", getter_prefix, setter_prefix));
+        assert!(!map.contains_key_or_prefixed("missing", getter_prefix, setter_prefix));
+
+        for key in ["fill-a", "fill-b", "fill-c"] {
             map.insert(JsString::intern(key), Value::Undefined);
         }
         assert!(!map.is_compact());
-        assert!(map.contains_prefixed(getter_prefix, "值"));
-        assert!(!map.contains_prefixed("__w3cos_setter_", "值"));
+        assert!(map.contains_key_or_prefixed("值", getter_prefix, setter_prefix));
+        assert!(map.contains_key_or_prefixed("fill-a", getter_prefix, setter_prefix));
 
         let boundary_64 = "a".repeat(64 - getter_prefix.len());
         let boundary_65 = "b".repeat(65 - getter_prefix.len());
@@ -351,16 +380,16 @@ mod tests {
             JsString::intern(&format!("{getter_prefix}{boundary_65}")),
             Value::Bool(true),
         );
-        assert!(map.contains_prefixed(getter_prefix, &boundary_64));
-        assert!(map.contains_prefixed(getter_prefix, &boundary_65));
+        assert!(map.contains_key_or_prefixed(&boundary_64, getter_prefix, setter_prefix));
+        assert!(map.contains_key_or_prefixed(&boundary_65, getter_prefix, setter_prefix));
 
         let long = "x".repeat(128);
         map.insert(
             JsString::intern(&format!("__w3cos_setter_{long}")),
             Value::Bool(true),
         );
-        assert!(map.contains_prefixed("__w3cos_setter_", &long));
-        assert!(!map.contains_prefixed("__w3cos_getter_", &long));
+        assert!(map.contains_key_or_prefixed(&long, getter_prefix, setter_prefix));
+        assert!(!map.contains_key_or_prefixed("other", getter_prefix, setter_prefix));
     }
 
     #[test]

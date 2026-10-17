@@ -282,9 +282,8 @@ impl JsObject {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.properties.contains_key(key)
-            || self.properties.contains_prefixed("__w3cos_getter_", key)
-            || self.properties.contains_prefixed("__w3cos_setter_", key)
+        self.properties
+            .contains_key_or_prefixed(key, "__w3cos_getter_", "__w3cos_setter_")
     }
 
     /// `[[Delete]]` — the `delete` operator.
