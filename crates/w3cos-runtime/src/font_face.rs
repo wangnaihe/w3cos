@@ -855,7 +855,57 @@ impl FontRegistry {
         self.resolve_render_stack_with_eligibility(stack, weight, style, character, true)
     }
 
+    /// Per-character fallback memo, like Blink's FontFallbackList caching the
+    /// font chosen for a character: shaping a streamed paragraph resolved
+    /// the whole family stack (mutex, lowercase, system lookup) once per
+    /// character on every measure. Keyed by registry revision so a newly
+    /// loaded @font-face is seen.
     fn resolve_render_stack_with_eligibility(
+        &self,
+        stack: &str,
+        weight: FontWeight,
+        style: FontFaceStyle,
+        character: Option<char>,
+        require_glyph: bool,
+    ) -> Option<LoadedFont> {
+        type Key = (usize, u64, FontWeight, FontFaceStyle, Option<char>, bool);
+        thread_local! {
+            static MEMO: RefCell<(u64, HashMap<Key, Option<LoadedFont>>)> =
+                RefCell::new((u64::MAX, HashMap::new()));
+        }
+        let revision = self.revision();
+        let mut hasher = DefaultHasher::new();
+        stack.hash(&mut hasher);
+        let key: Key = (
+            self as *const Self as usize,
+            hasher.finish(),
+            weight,
+            style,
+            character,
+            require_glyph,
+        );
+        if let Some(hit) = MEMO.with(|memo| {
+            let memo = memo.borrow();
+            (memo.0 == revision)
+                .then(|| memo.1.get(&key).cloned())
+                .flatten()
+        }) {
+            return hit;
+        }
+        let resolved =
+            self.resolve_render_stack_uncached(stack, weight, style, character, require_glyph);
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.0 != revision || memo.1.len() > 65_536 {
+                memo.0 = revision;
+                memo.1.clear();
+            }
+            memo.1.insert(key, resolved.clone());
+        });
+        resolved
+    }
+
+    fn resolve_render_stack_uncached(
         &self,
         stack: &str,
         weight: FontWeight,

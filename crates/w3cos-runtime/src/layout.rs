@@ -3650,10 +3650,6 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         );
     }
     let registry = crate::font_face::FontRegistry::global();
-    #[cfg(not(feature = "skia"))]
-    let font_runs = registry.resolve_style_runs(style, content);
-    #[cfg(not(feature = "skia"))]
-    let has_registered_runs = font_runs.iter().any(|run| run.font.is_some());
     let key = text_measure_key(
         DEFAULT_TEXT_WRAP_WIDTH,
         style,
@@ -3681,6 +3677,11 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         }
         #[cfg(not(feature = "skia"))]
         {
+            // Only a cache miss needs the font runs again.
+            let has_registered_runs = registry
+                .resolve_style_runs(style, content)
+                .iter()
+                .any(|run| run.font.is_some());
             if has_registered_runs {
                 cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
             } else {

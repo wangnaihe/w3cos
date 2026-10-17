@@ -527,6 +527,22 @@ fn rect_of(
         .map(|(_, rect)| *rect)
 }
 
+/// `can_skip_projections` of the spliced tree without walking all of it.
+/// The predicate is "no box anywhere needs a projection", so only the
+/// replaced and inserted subtrees can change it (the cache already holds
+/// the answer for the rest).
+fn spliced_skip_projections(cache: &Cache, removed: &[Component], inserted: &[Component]) -> bool {
+    let clean = |list: &[Component]| list.iter().all(can_skip_projections);
+    if cache.skip_projections {
+        clean(inserted)
+    } else if clean(removed) {
+        // Whatever needed projections is outside the replaced subtree.
+        false
+    } else {
+        can_skip_projections(&cache.component)
+    }
+}
+
 pub(super) fn try_splice(
     cache: &mut Cache,
     dirty: &[NodeId],
@@ -577,7 +593,11 @@ pub(super) fn try_splice(
             // derive them from the spliced tree, so the subtree uses those.
             let old_subtree =
                 std::mem::replace(at_path_mut(&mut cache.component, &plan.path), fresh);
-            let skip = can_skip_projections(&cache.component);
+            let skip = spliced_skip_projections(
+                cache,
+                std::slice::from_ref(&old_subtree),
+                std::slice::from_ref(at_path(&cache.component, &plan.path)),
+            );
             let measure = needs_text_metric(&cache.component);
             let fresh =
                 std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
@@ -607,7 +627,11 @@ pub(super) fn try_splice(
             let target = at_path_mut(&mut cache.component, &plan.path);
             let removed = target.children.split_off(keep);
             target.children.extend(tail);
-            let skip = can_skip_projections(&cache.component);
+            let skip = spliced_skip_projections(
+                cache,
+                &removed,
+                &at_path(&cache.component, &plan.path).children[keep..],
+            );
             let measure = needs_text_metric(&cache.component);
             let target = at_path_mut(&mut cache.component, &plan.path);
             let tail = target.children.split_off(keep);
