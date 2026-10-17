@@ -3435,11 +3435,10 @@ fn is_iterator_object(value: &Value) -> bool {
         && crate::bigint::get(value).is_none()
 }
 
+/// A realm %TypeError% instance (prototype chain, `instanceof TypeError`,
+/// `constructor`), as V8's NewTypeError builds through the native context.
 pub(crate) fn type_error(message: &str) -> Value {
-    Value::object(HashMap::from([
-        ("name".into(), Value::string("TypeError")),
-        ("message".into(), Value::string(message)),
-    ]))
+    crate::error_instance("TypeError", vec![Value::string(message)])
 }
 
 fn close_iterator_chain(iterators: &Value, mut throw_completion: Option<Value>) -> Option<Value> {
@@ -4161,13 +4160,7 @@ impl Value {
 
     pub fn js_ushr(&self, other: &Value) -> Value {
         if crate::bigint::get(self).is_some() || crate::bigint::get(other).is_some() {
-            crate::throw_value(crate::Value::object(HashMap::from([
-                ("name".into(), Value::string("TypeError")),
-                (
-                    "message".into(),
-                    Value::string("BigInts have no unsigned right shift"),
-                ),
-            ])));
+            crate::throw_value(type_error("BigInts have no unsigned right shift"));
         }
         let shift = (other.to_i32() as u32) & 0x1f;
         Value::Number(((self.to_i32() as u32) >> shift) as f64)
@@ -4446,6 +4439,25 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_type_errors_are_realm_type_error_instances() {
+        let type_error_class = crate::builtins::error_class("TypeError");
+        let errors = [
+            type_error("boom"),
+            crate::catch_js(|| Value::Number(1.0).js_ushr(&crate::bigint::parse("1")))
+                .expect_err("BigInt >>> must throw"),
+        ];
+        for error in errors {
+            assert!(crate::class::instance_of(&error, &type_error_class));
+            assert!(crate::class::instance_of(
+                &error,
+                &crate::builtins::error_class("Error")
+            ));
+            assert_eq!(error.get_property("name"), Value::string("TypeError"));
+            assert_eq!(error.get_property("constructor"), type_error_class);
+        }
+    }
 
     #[test]
     fn function_name_and_length_are_own_readonly_configurable_non_enumerable() {

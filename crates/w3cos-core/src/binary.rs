@@ -203,10 +203,10 @@ impl Kind {
             Self::BigInt64 => {
                 return crate::bigint::to_i64(value)
                     .unwrap_or_else(|| {
-                        crate::throw_value(Value::object(HashMap::from([(
-                            "name".into(),
-                            Value::string("TypeError"),
-                        )])))
+                        crate::throw_value(crate::error_instance(
+                            "TypeError",
+                            vec![Value::string("Cannot convert value to a BigInt")],
+                        ))
                     })
                     .to_le_bytes()
                     .to_vec();
@@ -214,10 +214,10 @@ impl Kind {
             Self::BigUint64 => {
                 return crate::bigint::to_u64(value)
                     .unwrap_or_else(|| {
-                        crate::throw_value(Value::object(HashMap::from([(
-                            "name".into(),
-                            Value::string("TypeError"),
-                        )])))
+                        crate::throw_value(crate::error_instance(
+                            "TypeError",
+                            vec![Value::string("Cannot convert value to a BigInt")],
+                        ))
                     })
                     .to_le_bytes()
                     .to_vec();
