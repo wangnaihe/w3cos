@@ -182,7 +182,7 @@ $ w3cos build app.tsx -o myapp --release
 
 ## Memory model: no GC, reference counting + WeakRef
 
-> **w3cos has no garbage collector.** Heap values are reference-counted and freed deterministically. A reference cycle is never collected, so **cycles must be broken with `WeakRef` / `WeakMap` / `WeakSet` / `FinalizationRegistry`.**
+> **w3cos has no garbage collector.** Memory is reclaimed deterministically, never by a collector. Host values (DOM wrappers, native objects) are reference-counted and freed at their last reference. Ordinary AOT object/array literals and closures currently live in a page arena until page reset, except non-escaping locals, which the compiler now frees when the function returns (see the limitation note below). A reference cycle is never collected, so **cycles must be broken with `WeakRef` / `WeakMap` / `WeakSet` / `FinalizationRegistry`.**
 
 **Why:** with no GC pauses, latency and memory stay predictable (no collector stalls while typing), and the runtime stays close to native Rust (`Rc`/`Weak`) behavior and cost.
 
@@ -222,7 +222,7 @@ For ambiguous cases it **only warns** and never rewrites, because guessing could
 
 **FinalizationRegistry is deterministic.** The cleanup callback runs at the first job checkpoint after the target's last strong reference is dropped, once the microtask queue is empty. It never runs inside `Drop` or during the job that released the target. `WeakMap` and `WeakSet` are O(1), and an entry is removed (and its value released) when its key dies. See [`crates/w3cos-core/src/weak.rs`](crates/w3cos-core/src/weak.rs) for ordering details.
 
-> **Current limitation:** ordinary AOT object literals, arrays, and closures are allocated in a page arena and freed on page reset, not at their last reference. Making arena values reference-counted too is roadmap item M1-4a (planned). Host values (DOM wrappers, native objects) are already freed immediately.
+> **Current limitation:** host values are refcounted and freed at their last reference. Ordinary AOT object literals, arrays, and closures are allocated in a page arena and live until page reset. The exception is object and array literals that the compiler's escape analysis ([`alloc_escape.rs`](crates/w3cos-compiler/src/alloc_escape.rs), M1-4a part 1) proves never leave their function: they are allocated as refcounted locals and freed at their last reference, at the latest on return. Escaping values and closures still wait for page reset until M1-4a part 2 (slot refcounts plus a free list for arena values, planned).
 
 **Tooling (planned):**
 - A cycle detector for debug builds only, which reports the full retaining chain with source locations. It is not compiled into release builds.

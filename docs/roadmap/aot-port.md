@@ -93,7 +93,7 @@ TS/JS（ESM + CommonJS） ─SWC parse─▶ 类型收集（tsc Program / .d.ts 
 - **lint/codemod `w3cos leak-lint`**：基于 SWC 静态分析标记常见隐式环：闭包捕获 `this` 后注册到长生命周期对象、`addEventListener`/`onDidX` 无对应移除或未进入 `DisposableStore`、父↔子双向强引用、`Disposable` 未 dispose/未注册、`Map` 缓存以对象为值无淘汰。可给出 codemod（改为 `WeakRef`/`WeakMap`、补 `dispose`）。
 - **上游泄漏处理**：VS Code、扩展、npm 依赖里发现的环，fork 后用 WeakRef/显式 dispose 修复，进补丁队列，能上游的提 PR 上游（见 M1）。
 - 代价要说清：引用计数在多态热路径上有计数开销；`FinalizationRegistry` 回调时机在引用计数下是确定的（比规范更早），需在兼容报告中注明。已实现：目标的最后一个强引用释放后，在下一个 job checkpoint（微任务清空后）交付，顺序见 `weak.rs` 模块文档。
-- 注意：page arena 里的普通 AOT 值目前到页面 reset 才释放，见 M1 item 4a。
+- 注意：page arena 里的普通 AOT 值目前到页面 reset 才释放；编译器证明不逃逸的对象/数组字面量例外，已改为引用计数的局部值，函数返回即释放（M1 item 4a 第 1 部分）。逃逸值的回收见 4a 第 2 部分。
 
 ### 3.3 WebAssembly
 VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。接入 `wasmtime`（Cranelift，AOT 预编译 `.cwasm` 缓存）作为 `WebAssembly.*` 的实现，与 §3.1 后端 B 共享 Cranelift。
@@ -174,7 +174,9 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 
 ### M1 编译器与内存模型地基（引用计数 + WeakRef）
 4. 确定性引用计数语义：明确释放时机规范、AOT 冗余 inc/dec 消除、大对象图延迟批量释放（避免长停顿）。
-   - **现状更正（M1 第一个 PR 核实）**：普通 AOT 对象字面量、数组和闭包（`Value::object`/`Value::array`/`Value::function`）分配在 page arena 里，句柄是 `Copy` 的 `u32`，**不计数，页面 reset 前不会释放**；只有宿主 `Rc` 值（DOM 包装、`Value::callable`、宿主数组等）是真正的引用计数。所以"最后一个强引用消失立即释放"目前只对宿主值成立。**4a（待做，M1 最大的一块）**：让 arena 值也计数或可回收（例如 slab 槽位 + 计数句柄，或逃逸分析证明不逃逸的才进 arena），否则 VS Code 长跑内存只增不减。
+   - **现状更正（M1 第一个 PR 核实）**：普通 AOT 对象字面量、数组和闭包（`Value::object`/`Value::array`/`Value::function`）分配在 page arena 里，句柄是 `Copy` 的 `u32`，**不计数，页面 reset 前不会释放**；只有宿主 `Rc` 值（DOM 包装、`Value::callable`、宿主数组等）是真正的引用计数。所以"最后一个强引用消失立即释放"目前只对宿主值成立。**4a（M1 最大的一块）**：让 arena 值也能回收，否则 VS Code 长跑内存只增不减。分两部分：
+     - **第 1 部分（已完成）**：`crates/w3cos-compiler/src/alloc_escape.rs` 在 W3IR 上做函数内逃逸分析（基于合一的指向分析，覆盖寄存器和局部绑定，并跟踪"对象里装了什么"）。能证明不逃逸的对象/数组字面量，AOT 生成 `Value::local_object` / `Value::local_array`，即引用计数的宿主值，最后一个引用消失就释放，最晚在函数返回时。逃逸条件全部从严：返回、抛出、作为任何调用/构造的参数或接收者、被闭包捕获、存进参数/外层/全局绑定、`await`/`yield` 跨挂起点、可能触发用户代码的强制转换、计算键、访问字面量形状之外的键（避免原型链上的 getter/setter 拿到 `this`）、自引用环、出现 `eval`。即使误判，宿主 `Rc` 值放在哪里都合法，只影响回收时机，不影响正确性。实测（probe：`work(10000)` 调 5 / 10 轮）：arena 存活对象从 102809 / 202809 降到 2809（与空跑一致），slab 从 31.4 MB / 61.8 MB 降到 0.98 MB，RSS 从 60.1 MB / 103.9 MB 降到 16.1 MB / 16.2 MB。逃逸的 `workEscape` 不变，对象照常存活。
+     - **第 2 部分（待做）**：逃逸值的 arena 槽位引用计数 + free list（以及闭包），让逃逸后不再被引用的值也能在页面 reset 前释放。第 1 部分没做标量替换（把字面量拆成 Rust 局部变量/栈结构），也没做跨过程分析；不逃逸的闭包仍走 arena。
 5. ~~`WeakRef` / `FinalizationRegistry` / `WeakMap` / `WeakSet` 完整实现~~ **已完成（M1 PR 1）**：
    - 原有基础：`w3cos-core/src/weak.rs` 早已基于 `Rc`/`Weak` 实现四个类，编译器 `unique_back_edges.rs` 会把三类常见闭包回边（自挂载、Promise 回调捕获自身、集合迭代器）自动改写成 `WeakRef`。
    - **确定性 finalization**：每个堆分配的 `HeapAllocation` 带一个 48 位、永不复用的弱身份 id（塞进已有的对齐空洞，对象大小不变）。被弱引用过的对象在 `Drop` 时只把 id 记进死亡队列（不在 `Drop` 里跑 JS、不重入）；下一个 job checkpoint（`drain_microtasks` 清空微任务后）统一处理并按"死亡顺序 → 同一目标按注册顺序"调用 `FinalizationRegistry` 回调，每个回调独立 panic 边界，回调里排的微任务在下一批回调前清空。`cleanupSome()` 保留，可同步交付本 registry 的待处理项；`unregister()` 同时取消已死但未交付的项；registry 自身死亡后不再回调。`FinalizationRegistry.cleanupMode` 现在是 `"automatic"`。

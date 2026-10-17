@@ -1,3 +1,4 @@
+pub mod alloc_escape;
 pub mod codegen;
 pub mod css_parser;
 pub mod css_values;

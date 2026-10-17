@@ -2342,6 +2342,20 @@ impl Value {
         Value::Imm(Immediate::from_array_handle(handle))
     }
 
+    /// Reference-counted host object for a literal the compiler proved never
+    /// escapes its frame (`w3cos_compiler::alloc_escape`). Unlike
+    /// [`Self::object`], it is freed at its last reference instead of living
+    /// in the page arena until reset.
+    pub fn local_object(props: HashMap<String, Value>) -> Self {
+        Value::Object(Rc::new(RefCell::new(crate::JsObject::from_map(props))))
+    }
+
+    /// Reference-counted host array for a non-escaping array literal; see
+    /// [`Self::local_object`].
+    pub fn local_array(items: Vec<Value>) -> Self {
+        Value::Array(Rc::new(RefCell::new(ArrayStorage::new(items))))
+    }
+
     pub fn object(props: HashMap<String, Value>) -> Self {
         let handle = crate::page_arena::alloc_object(crate::JsObject::from_map(props));
         Value::Imm(Immediate::from_object_handle(handle))
