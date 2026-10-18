@@ -211,10 +211,14 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
 /// Why this IFC container (and its items) is outside S2a.
 pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
-    // The cascade marks generated IFC roots; an unmarked box holding inline
-    // text (e.g. a shadow <slot>, which is display:contents in Chrome) does
-    // not own the strut, so its style must not drive line metrics.
-    if !has_marker(style, IFC_MARKER) {
+    // The cascade marks multi-item IFC roots.  An unmarked box may still be
+    // the parent of plain text (`<div>text</div>`), whose style then is the
+    // box's own font; a box whose text does not inherit its font (a shadow
+    // <slot>, display:contents in Chrome, carries a default style) does not
+    // own the strut, so its style must not drive line metrics.
+    if !has_marker(style, IFC_MARKER)
+        && rendered_children(flat, index).any(|child| !same_font(flat[child].style, style))
+    {
         return Some("ifc:unmarked");
     }
     if style.text_align == TextAlign::Justify {
@@ -299,6 +303,15 @@ struct InlineItem {
 /// ShapeResult::SnappedWidth.
 fn snap(advance: f32) -> f32 {
     crate::text_layout::inline_layout_advance(advance)
+}
+
+/// Same used font and line-height (text inheriting directly from a box).
+fn same_font(a: &Style, b: &Style) -> bool {
+    a.font_family == b.font_family
+        && a.font_size == b.font_size
+        && a.font_weight == b.font_weight
+        && a.font_style == b.font_style
+        && a.line_height == b.line_height
 }
 
 /// Shaping identity of a word piece: pieces of one authored text node with
