@@ -6,6 +6,7 @@ members = [
     "tools/size-probes",
     "tools/wpt-runner",
     "crates/w3cos-ir",
+    "crates/w3cos-cranelift",
     "crates/w3cos-vm",
     "crates/w3cos-core",
     "crates/w3cos-runtime",

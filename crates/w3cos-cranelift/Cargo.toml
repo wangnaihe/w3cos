@@ -1,0 +1,19 @@
+[package]
+name = "w3cos-cranelift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend B (M1 item 13): W3IR -> machine code via Cranelift, cross-checked against the rustc backend"
+
+[dependencies]
+w3cos-ir = { workspace = true }
+w3cos-core = { workspace = true }
+cranelift-codegen = "0.136"
+cranelift-frontend = "0.136"
+cranelift-jit = "0.136"
+cranelift-module = "0.136"
+cranelift-native = "0.136"
+
+[dev-dependencies]
+w3cos-compiler = { path = "../w3cos-compiler" }

@@ -142,6 +142,17 @@ enum Commands {
         #[arg(long)]
         exclude: Vec<String>,
     },
+    /// Experimental: lower a classic script to W3IR and run it through the
+    /// Cranelift JIT backend (backend B) instead of generating Rust.
+    /// Only built with `--features cranelift`.
+    #[cfg(feature = "cranelift")]
+    Jit {
+        /// Classic script (.js) to run.
+        input: PathBuf,
+        /// Print compile time, instruction counts and W3IR op coverage.
+        #[arg(long)]
+        stats: bool,
+    },
     /// Compare Chromium's live window Web API surface with the w3cos runtime.
     WebApiAudit {
         /// Chrome/Chromium executable. Auto-detected when omitted.
@@ -458,6 +469,31 @@ fn main() -> Result<()> {
             let code = report.exit_code(fail_on);
             if code != 0 {
                 std::process::exit(code);
+            }
+        }
+        #[cfg(feature = "cranelift")]
+        Commands::Jit { input, stats } => {
+            let source = std::fs::read_to_string(&input)?;
+            let specifier = format!("app:///{}", input.display());
+            let module = w3cos_compiler::w3ir_lowering::lower_script(&source, &specifier)
+                .map_err(|error| anyhow::anyhow!("lowering failed: {error:?}"))?;
+            let program = w3cos_cranelift::compile_module(&module).map_err(
+                |w3cos_cranelift::Unsupported(why)| {
+                    anyhow::anyhow!("not supported by the Cranelift backend yet: {why}")
+                },
+            )?;
+            if stats {
+                eprintln!(
+                    "cranelift: compiled {} functions ({} instructions, {} native f64) in {:.2} ms",
+                    program.stats.functions,
+                    program.stats.instructions,
+                    program.stats.native_numeric,
+                    program.compile_time.as_secs_f64() * 1e3
+                );
+                eprintln!("cranelift: ops {:?}", program.stats.ops);
+            }
+            if let Err(error) = program.run_entry() {
+                anyhow::bail!("uncaught exception: {}", error.to_js_string());
             }
         }
         Commands::WebApiAudit {
