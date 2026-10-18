@@ -4634,6 +4634,41 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> Result<LayoutResults> {
+        match crate::layout_ng::mode() {
+            crate::layout_ng::Mode::Off => self.compute_legacy(root, flat, viewport_w, viewport_h),
+            crate::layout_ng::Mode::On => {
+                match crate::layout_ng::layout_tree(root, flat, viewport_w, viewport_h) {
+                    Some(layout_cache) => {
+                        // The legacy Taffy tree no longer matches this output.
+                        self.tree_valid = false;
+                        Ok(LayoutResults {
+                            layout_cache,
+                            scrollable_nodes: Vec::new(),
+                            clip_only_nodes: Vec::new(),
+                            scroll_ancestor: vec![None; flat.len()],
+                        })
+                    }
+                    None => self.compute_legacy(root, flat, viewport_w, viewport_h),
+                }
+            }
+            crate::layout_ng::Mode::Verify => {
+                let legacy = self.compute_legacy(root, flat, viewport_w, viewport_h)?;
+                if let Some(ng) = crate::layout_ng::layout_tree(root, flat, viewport_w, viewport_h)
+                {
+                    crate::layout_ng::verify(flat, &legacy.layout_cache, &ng);
+                }
+                Ok(legacy)
+            }
+        }
+    }
+
+    fn compute_legacy(
+        &mut self,
+        root: &Component,
+        flat: &[FlatNodeInfo],
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Result<LayoutResults> {
         let _subtree_sizes = SubtreeSizeScope::new(root);
         // Table-prepared tree (collapsed borders resolved + grid annotated),
         // built at most once per compute: the Taffy build and the fixed
