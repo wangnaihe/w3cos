@@ -65,7 +65,7 @@ cmd_refresh() {
     echo "# Each patch carries a 'W3cos-Upstream: yes|no' trailer (yes = should be sent to microsoft/vscode)."
     for file in "$tmp"/*.patch; do
       [ -e "$file" ] || continue
-      name="$(basename "$file" | sed 's/^0*[0-9]*-//')"
+      name="$(basename "$file")"
       cp "$file" "$patches/$name"
       echo "$name"
     done
