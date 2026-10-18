@@ -175,11 +175,7 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
     if style.position != Position::Static || style.float != Float::None {
         return Some("text:positioned");
     }
-    // (direction is the container's concern; embeddings and overrides need
-    // bidi reordering.)
-    if style.unicode_bidi != w3cos_std::style::UnicodeBidi::Normal {
-        return Some("unicode-bidi");
-    }
+    // (direction and unicode-bidi are checked by the callers.)
     // Without a newline (the content gate): pre is one preserved unwrapped
     // line, pre-wrap wraps with hanging preserved spaces, pre-line equals
     // normal.  (break-spaces is not a WhiteSpace value here.)
@@ -303,6 +299,10 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     if fallback_grows_line(content, style) {
         return Some("text:fallback-metrics");
     }
+    // A block text leaf is its own paragraph.
+    if !super::block::block_unicode_bidi_ok(style) {
+        return Some("unicode-bidi");
+    }
     text_style_reason(style)
 }
 
@@ -372,7 +372,12 @@ fn inline_text_reason(
     if style.display != Display::Inline {
         return Some("text:display");
     }
-    if style.direction != container.direction {
+    // An embedding or isolate inside the paragraph needs bidi resolution
+    // (around a sole leaf, the whole paragraph, it changes nothing).
+    if style.direction != container.direction
+        || (style.unicode_bidi != w3cos_std::style::UnicodeBidi::Normal
+            && !(sole && super::block::block_unicode_bidi_ok(style)))
+    {
         return Some("direction");
     }
     // An rtl paragraph (UAX #9 paragraph level 1): paint orders a paragraph

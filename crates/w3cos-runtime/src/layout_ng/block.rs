@@ -95,9 +95,8 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if style.column_count.is_some() || style.column_width != Dimension::Auto {
         return Some("columns");
     }
-    // direction: rtl places block children from the right (resolve_inline);
-    // embeddings and overrides need bidi reordering.
-    if style.unicode_bidi != UnicodeBidi::Normal {
+    // direction: rtl places block children from the right (resolve_inline).
+    if !block_unicode_bidi_ok(style) {
         return Some("unicode-bidi");
     }
     if ![
@@ -133,6 +132,17 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
         return Some("spacing-unit");
     }
     None
+}
+
+/// unicode-bidi on a block container (CSS Writing Modes 3 2.2): embed and
+/// isolate do nothing beyond its content being a paragraph (the HTML UA
+/// sheet gives every `[dir]` element `isolate`); bidi-override and
+/// plaintext change the order or base direction of its inline content.
+pub(super) fn block_unicode_bidi_ok(style: &Style) -> bool {
+    matches!(
+        style.unicode_bidi,
+        UnicodeBidi::Normal | UnicodeBidi::Embed | UnicodeBidi::Isolate
+    )
 }
 
 /// Internal markers mean a legacy projection owns this box, except value

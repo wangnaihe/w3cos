@@ -1968,3 +1968,39 @@ fn text_top_and_bottom_align_to_the_parent_content_area() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// unicode-bidi on block containers: embed / isolate (the UA style of
+/// `[dir]`) change nothing; bidi-override reorders the content.
+#[test]
+fn block_isolate_is_supported_override_is_not() {
+    use w3cos_std::style::UnicodeBidi;
+    let tree = |bidi: UnicodeBidi| {
+        let mut block = Style {
+            display: Display::Block,
+            unicode_bidi: bidi,
+            ..Style::default()
+        };
+        font(&mut block, 20.0, LineHeight::Number(1.0));
+        let mut leaf = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut leaf, 20.0, LineHeight::Number(1.0));
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(block, vec![Component::text("AA", leaf)])],
+        )
+    };
+    for (bidi, want) in [
+        (UnicodeBidi::Isolate, Vec::<String>::new()),
+        (UnicodeBidi::Embed, Vec::new()),
+        (UnicodeBidi::BidiOverride, vec!["unicode-bidi".to_string()]),
+    ] {
+        let root = tree(bidi);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), want, "{bidi:?}");
+    }
+}
