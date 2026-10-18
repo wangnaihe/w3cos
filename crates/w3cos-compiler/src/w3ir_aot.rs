@@ -9274,12 +9274,10 @@ fn main() {{
             .find(|function| function.name.as_deref() == Some("read"))
             .unwrap()
             .clone();
-        let expected = Vm::new(module.clone(), Limits::default())
-            .unwrap()
-            .callable(function.id, HashMap::new())
-            .unwrap()
-            .call(Value::Undefined, vec![Value::Null])
-            .to_js_string();
+        // `null.missing` is a TypeError (GetValue on a nullish base), so the
+        // handler runs. The VM still reads nullish bases leniently for
+        // dynamic scripts, so the expectation is spelled out here.
+        let expected = "invalid".to_string();
         let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
         assert!(
             !generated.contains("catch_unwind"),

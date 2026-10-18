@@ -1850,7 +1850,7 @@ impl Vm {
             }
             Instruction::GetProperty { dst, object, key } => {
                 registers[dst.0 as usize] =
-                    w3cos_core::intrinsics::get_property_checked(&read(*object), &read(*key));
+                    w3cos_core::intrinsics::get_property(&read(*object), &read(*key));
             }
             Instruction::DeleteProperty { dst, object, key } => {
                 registers[dst.0 as usize] =
