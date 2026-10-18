@@ -157,6 +157,22 @@ pub fn set_property_strict(object: &Value, key: &Value, value: Value) -> Value {
     value
 }
 
+/// Strict-mode `obj.key = value` for a constant `key` through a static
+/// inline cache (see [`crate::ic`]).
+pub fn set_property_strict_ic(
+    object: &Value,
+    key: &str,
+    value: Value,
+    ic: &crate::ic::PropIc,
+) -> Value {
+    if !object.try_set_property_ic(key, value.clone(), ic) {
+        crate::throw_value(type_error(&format!(
+            "Cannot assign to read only property '{key}'"
+        )));
+    }
+    value
+}
+
 pub fn in_operator(key: &Value, object: &Value) -> Value {
     key.js_in(object)
 }

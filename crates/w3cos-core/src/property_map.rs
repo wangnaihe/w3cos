@@ -76,7 +76,6 @@ enum Transitions {
 
 /// A hidden class: an ordered own-key list shared by many objects.
 pub(crate) struct Shape {
-    #[allow(dead_code)] // read by AOT inline caches
     id: ShapeId,
     /// Insertion-ordered own keys; slot `i` of an object holds `keys[i]`.
     keys: Box<[JsString]>,
@@ -263,14 +262,14 @@ impl PropertyMap {
 
     /// True when the map is empty or shape-backed (no per-object hash table).
     #[inline]
-    #[allow(dead_code)] // IC hooks; used by AOT inline caches
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_compact(&self) -> bool {
         !matches!(self.inner.as_deref(), Some(PropertyStore::Dict { .. }))
     }
 
     /// True once the map has left the shape tree.
     #[inline]
-    #[allow(dead_code)] // IC hooks; used by AOT inline caches
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_dictionary(&self) -> bool {
         !self.is_compact()
     }
@@ -278,7 +277,6 @@ impl PropertyMap {
     /// Shape id for IC checks: [`ROOT_SHAPE_ID`] when empty, `None` in
     /// dictionary mode.
     #[inline]
-    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn shape_id(&self) -> Option<ShapeId> {
         match self.inner.as_deref() {
             None => Some(ROOT_SHAPE_ID),
@@ -289,7 +287,6 @@ impl PropertyMap {
 
     /// `(shape id, slot)` of an own key in a shape-backed map.
     #[inline]
-    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn shaped_slot(&self, key: &str) -> Option<(ShapeId, usize)> {
         match self.inner.as_deref() {
             Some(PropertyStore::Shaped { shape, .. }) => Some((shape.id, shape.lookup(key)?)),
@@ -299,7 +296,6 @@ impl PropertyMap {
 
     /// Slot value when the map currently has shape `id` (IC hit path).
     #[inline]
-    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn slot_if_shape(&self, id: ShapeId, slot: usize) -> Option<&Value> {
         match self.inner.as_deref() {
             Some(PropertyStore::Shaped { shape, slots }) if shape.id == id => slots.get(slot),
@@ -309,7 +305,6 @@ impl PropertyMap {
 
     /// Mutable slot when the map currently has shape `id` (IC hit path).
     #[inline]
-    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn slot_mut_if_shape(&mut self, id: ShapeId, slot: usize) -> Option<&mut Value> {
         match self.inner.as_deref_mut() {
             Some(PropertyStore::Shaped { shape, slots }) if shape.id == id => slots.get_mut(slot),

@@ -1055,6 +1055,20 @@ pub(crate) fn get_object(handle: u32) -> Option<crate::value::JsObjectRef> {
     ARENA.with(|arena| arena.borrow_mut().get_object(handle))
 }
 
+/// Payload pointer of a live object slot **without** taking a count.
+///
+/// For inline-cache hit paths only: the caller must own a strong count for
+/// `handle` (e.g. a borrowed `&Value` holding it) for as long as it uses the
+/// pointer, and must not reset the page meanwhile. Slab chunks never move,
+/// so the pointer stays valid while the slot is live.
+#[inline]
+pub(crate) fn object_ptr(handle: u32) -> Option<*const RefCell<crate::JsObject>> {
+    if handle == 0 {
+        return None;
+    }
+    ARENA.with(|arena| arena.borrow().objects.get(handle))
+}
+
 /// Upgrade an interned weak object. Fails after the slot died (count zero,
 /// generation bumped) or after [`reset`] (epoch).
 pub(crate) fn upgrade_object(

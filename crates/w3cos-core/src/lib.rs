@@ -6,6 +6,7 @@ pub mod collections;
 pub mod heap;
 pub mod host;
 pub mod host_modules;
+pub mod ic;
 pub mod intrinsics;
 pub mod js_string;
 pub mod json;
@@ -34,6 +35,7 @@ pub use builtins::{
     console, dispatch_resize_observers, dispatch_resize_observers_bounded, document, error_class,
     error_instance, json_value, math_value, object_value, parseFloat, parseInt, reset_constructors,
 };
+pub use ic::{IcStats, PropIc};
 pub use js_string::JsString;
 pub use object::JsObject;
 pub use proxy::{ProxyBuilder, ProxyHandler, proxy_class};
