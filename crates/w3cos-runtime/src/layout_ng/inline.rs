@@ -25,6 +25,7 @@
 //! leaf, or the single `text-line-width` leaf of an IFC) is wrapped by paint
 //! inside its rect, so its height comes from the same wrapper paint uses.
 
+use super::block::MinMax;
 use super::{BoxFragment, ConstraintSpace, LastBaseline};
 use crate::layout::{
     FlatNodeInfo, inline_font_baseline_from_line_top, inline_font_content_ascent,
@@ -358,7 +359,7 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
     text_style_reason(style)
 }
 
-fn rendered_children<'a>(
+pub(super) fn rendered_children<'a>(
     flat: &'a [FlatNodeInfo<'a>],
     index: usize,
 ) -> impl Iterator<Item = usize> + 'a {
@@ -407,14 +408,11 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
 }
 
 /// Why an inline-block (its box and content checked by the block gate)
-/// is outside S2: shrink-to-fit widths need min/max-content sizes (NG
-/// ComputeMinMaxSizes), not here yet; auto inline margins are 0 for inline
-/// blocks; vertical-align other than baseline.
+/// is outside S2: auto inline margins are 0 for inline blocks;
+/// vertical-align other than baseline.  (A shrink-to-fit width whose
+/// min-content size is unknown falls back at layout time.)
 pub(super) fn atomic_inline_reason(style: &Style) -> Option<&'static str> {
     use w3cos_std::style::Spacing;
-    if style.width == Dimension::Auto {
-        return Some("inline-block:shrink-to-fit");
-    }
     if matches!(style.margin.left, Spacing::Auto) || matches!(style.margin.right, Spacing::Auto) {
         return Some("inline-block:auto-margin");
     }
@@ -826,6 +824,9 @@ pub(super) struct InlineResult {
     pub children: Vec<(f32, f32, BoxFragment)>,
     /// The last line box's baseline from the content-box top.
     pub last_baseline: LastBaseline,
+    /// The widest line's content width (hanging spaces excluded): the
+    /// min-content / max-content size at available 0 / indefinite.
+    pub max_line_width: f32,
 }
 
 /// Height of a paragraph leaf's text at `width` and whether it is a single
@@ -995,6 +996,7 @@ pub(super) fn layout_inline(
         };
         return Some(InlineResult {
             height,
+            max_line_width: available,
             last_baseline: if single {
                 LastBaseline::At(ascent)
             } else {
@@ -1041,6 +1043,7 @@ pub(super) fn layout_inline(
         let lines = content.split('\n').count() as f32;
         return Some(InlineResult {
             height: single * lines,
+            max_line_width: width,
             last_baseline: LastBaseline::Unknown,
             children: vec![(
                 align_offset(container, available - width),
@@ -1298,6 +1301,7 @@ pub(super) fn layout_inline(
         strut(container)
     };
     let line_count = lines.len();
+    let mut max_line_width = 0.0f32;
     let mut built = Vec::with_capacity(lines.len());
     for (line_index, mut line) in lines.into_iter().enumerate() {
         // Trailing collapsible spaces are removed at the line end, also
@@ -1366,6 +1370,7 @@ pub(super) fn layout_inline(
         {
             return None;
         }
+        max_line_width = max_line_width.max(content_width);
         // CSS Text 3 4.1.3: before a forced break or the end of the block,
         // preserved spaces hang only conditionally: the part that fits
         // still counts for alignment.
@@ -1505,5 +1510,67 @@ pub(super) fn layout_inline(
         height: top,
         children: out,
         last_baseline: last_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
+        max_line_width,
+    })
+}
+
+/// Min/max-content sizes of a paragraph (block-level or sole line-width)
+/// text leaf, which paint wraps itself: max-content is the unwrapped
+/// advance (widest forced-break segment); min-content the widest word where
+/// spaces are the only opportunities (Latin-1 without other soft-wrap
+/// characters), the whole text for nowrap / pre.
+pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
+    let width = |t: &str| snap(text_intrinsic_size(t, style).0);
+    let max = content
+        .split(['\n', '\u{2028}', '\u{2029}'])
+        .map(width)
+        .fold(0.0f32, f32::max);
+    let forced = has_forced_break(content, style)
+        || (content.contains('\n') && !matches!(style.white_space, WhiteSpace::Pre));
+    let min = if matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
+        Some(max)
+    } else if !forced
+        && latin1(content)
+        && !content.chars().any(|c| c != ' ' && is_soft_wrap_char(c))
+        && style.white_space != WhiteSpace::PreWrap
+    {
+        Some(content.split(' ').map(width).fold(0.0f32, f32::max))
+    } else {
+        None
+    };
+    MinMax { min, max }
+}
+
+/// NGInlineNode::ComputeMinMaxSizes: the line breaker's widest line at
+/// available 0 (every opportunity taken) and at an indefinite size (only
+/// forced breaks).  A paragraph leaf is measured as text.
+pub(super) fn inline_min_max(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    let entries = collect_inlines(flat, index);
+    if let [InlineEntry::Leaf(child)] = entries[..]
+        && let ComponentKind::Text { content } = flat[child].kind
+        && (has_marker(flat[child].style, LINE_WIDTH_MARKER) || content.contains('\n'))
+    {
+        return Some(text_min_max(content, flat[child].style));
+    }
+    let at = |available: f32| {
+        layout_inline(
+            flat,
+            index,
+            &ConstraintSpace {
+                available_inline: available,
+                percentage_block: None,
+                ..*space
+            },
+        )
+        .map(|result| result.max_line_width)
+    };
+    let max = at(super::block::INDEFINITE_INLINE)?;
+    Some(MinMax {
+        min: at(0.0).map(|min| min.min(max)),
+        max,
     })
 }

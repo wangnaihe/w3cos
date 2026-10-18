@@ -1306,3 +1306,169 @@ fn inline_blocks_are_atomic_items() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// CSS2 10.3.9 shrink-to-fit inline-blocks (NGBlockNode::ComputeMinMaxSizes):
+/// max-content that fits, min-content vs. available, block children's
+/// margin boxes, nested atomics, max-width below min-content.  Rects from
+/// Chrome (Ahem).
+#[test]
+fn inline_blocks_shrink_to_fit() {
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let container = |width: f32| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str, size: f32| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, size, n1);
+        Component::text(content, style)
+    };
+    let ib = |size: f32| {
+        let mut style = Style {
+            display: Display::InlineBlock,
+            ..Style::default()
+        };
+        font(&mut style, size, n1);
+        style
+    };
+    let block = |w: f32, margin_left: f32| Style {
+        display: Display::Block,
+        width: Dimension::Px(w),
+        height: Dimension::Px(10.0),
+        margin: Edges {
+            left: Spacing::Px(margin_left),
+            ..Edges::default()
+        },
+        ..Style::default()
+    };
+    let px = Spacing::Px;
+    let mut padded = ib(20.0);
+    padded.padding = Edges {
+        top: px(5.0),
+        right: px(5.0),
+        bottom: px(5.0),
+        left: px(5.0),
+    };
+    padded.border_width = 2.0;
+    let mut outer = ib(20.0);
+    outer.border_width = 3.0;
+    outer.margin.left = px(4.0);
+    outer.margin.right = px(4.0);
+    outer
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(inline::IFC_MARKER.into(), "1".into());
+    let mut narrow = ib(20.0);
+    narrow.max_width = Dimension::Px(30.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("AA ", 20.0),
+                    Component::boxed(ib(10.0), vec![text("xy zz", 10.0)]),
+                    text(" BB", 20.0),
+                ],
+            ),
+            Component::boxed(
+                container(100.0),
+                vec![Component::boxed(
+                    ib(20.0),
+                    vec![text("AAAA ", 20.0), text("BBBB ", 20.0), text("CC", 20.0)],
+                )],
+            ),
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("A", 20.0),
+                    Component::boxed(
+                        padded,
+                        vec![
+                            Component::boxed(block(40.0, 7.0), vec![]),
+                            Component::boxed(block(20.0, 0.0), vec![]),
+                        ],
+                    ),
+                    text("B", 20.0),
+                ],
+            ),
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("A", 20.0),
+                    Component::boxed(
+                        outer,
+                        vec![Component::boxed(ib(10.0), vec![text("XX Y", 10.0)])],
+                    ),
+                ],
+            ),
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("A", 20.0),
+                    Component::boxed(narrow, vec![text("BB ", 20.0), text("CC", 20.0)]),
+                    text("D", 20.0),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 27] = [
+        (1, [0.0, 0.0, 300.0, 20.0]),
+        (2, [0.0, 0.0, 60.0, 20.0]),
+        (3, [60.0, 8.0, 50.0, 10.0]),
+        (4, [60.0, 8.0, 50.0, 10.0]),
+        (5, [110.0, 0.0, 60.0, 20.0]),
+        (6, [0.0, 20.0, 100.0, 60.0]),
+        (7, [0.0, 20.0, 100.0, 60.0]),
+        (8, [0.0, 20.0, 80.0, 20.0]),
+        (9, [0.0, 40.0, 80.0, 20.0]),
+        (10, [0.0, 60.0, 40.0, 20.0]),
+        (11, [0.0, 80.0, 300.0, 38.0]),
+        (12, [0.0, 98.0, 20.0, 20.0]),
+        (13, [20.0, 80.0, 61.0, 34.0]),
+        (14, [34.0, 87.0, 40.0, 10.0]),
+        (15, [27.0, 97.0, 20.0, 10.0]),
+        (16, [81.0, 98.0, 20.0, 20.0]),
+        (17, [0.0, 118.0, 300.0, 26.0]),
+        (18, [0.0, 121.0, 20.0, 20.0]),
+        (19, [24.0, 118.0, 46.0, 26.0]),
+        (20, [27.0, 129.0, 40.0, 10.0]),
+        (21, [27.0, 129.0, 40.0, 10.0]),
+        (22, [0.0, 144.0, 300.0, 40.0]),
+        (23, [0.0, 164.0, 20.0, 20.0]),
+        (24, [20.0, 144.0, 30.0, 40.0]),
+        (25, [20.0, 144.0, 40.0, 20.0]),
+        (26, [20.0, 164.0, 40.0, 20.0]),
+        (27, [50.0, 164.0, 20.0, 20.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

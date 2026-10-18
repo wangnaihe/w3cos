@@ -371,6 +371,149 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     }
 }
 
+/// Min-content and max-content inline sizes of a box's content box (Blink
+/// NGBlockNode::ComputeMinMaxSizes, CSS Sizing 3 5.1).  `min` is `None`
+/// where this stage cannot find the min-content size (break opportunities
+/// it does not model); shrink-to-fit then needs the max-content size to fit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct MinMax {
+    pub min: Option<f32>,
+    pub max: f32,
+}
+
+impl MinMax {
+    pub fn exact(size: f32) -> Self {
+        MinMax {
+            min: Some(size),
+            max: size,
+        }
+    }
+
+    /// MinMaxSizes::Encompass.
+    fn encompass(&mut self, other: MinMax) {
+        self.min = self.min.zip(other.min).map(|(a, b)| a.max(b));
+        self.max = self.max.max(other.max);
+    }
+
+    fn map(self, f: impl Fn(f32) -> f32) -> Self {
+        MinMax {
+            min: self.min.map(&f),
+            max: f(self.max),
+        }
+    }
+}
+
+/// Available inline size of a max-content layout (LayoutUnit::Max in
+/// Blink's line breaker).
+pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
+
+/// Percentages in the inline axis resolve against the containing block,
+/// which intrinsic sizing has not sized yet (CSS Sizing 3 5.2.1 cyclic
+/// percentages): such subtrees stay on legacy.
+fn percent_inline(style: &Style) -> bool {
+    let dim = |d: Dimension| matches!(d, Dimension::Percent(_));
+    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+    dim(style.width)
+        || dim(style.min_width)
+        || dim(style.max_width)
+        || spacing(style.margin.left)
+        || spacing(style.margin.right)
+        || spacing(style.padding.left)
+        || spacing(style.padding.right)
+}
+
+/// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
+fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, mut width: f32) -> f32 {
+    let cb = Some(space.available_inline);
+    let to_content = |w: f32| match style.box_sizing {
+        BoxSizing::BorderBox => (w - edges).max(0.0),
+        BoxSizing::ContentBox => w,
+    };
+    if let Some(max) = resolve_dim(style.max_width, cb, style, space).map(to_content) {
+        width = width.min(max);
+    }
+    if let Some(min) = resolve_dim(style.min_width, cb, style, space).map(to_content) {
+        width = width.max(min);
+    }
+    width
+}
+
+/// NGBlockNode::ComputeMinMaxSizes of `index`'s content box.  Block
+/// children contribute their margin box (ComputeMinAndMaxContentContribution:
+/// a definite width, else their own sizes, clamped by min/max-width);
+/// inline content is measured by the line breaker (NGInlineNode::
+/// ComputeMinMaxSizes).
+pub(super) fn intrinsic_sizes(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    let info = &flat[index];
+    if flat[index + 1..info.subtree_end.max(index + 1)]
+        .iter()
+        .any(|node| node.style.display != Display::None && percent_inline(node.style))
+    {
+        return None;
+    }
+    if let ComponentKind::Text { content } = info.kind {
+        return Some(inline::text_min_max(content, info.style));
+    }
+    if inline::is_inline_container(flat, index) {
+        return inline::inline_min_max(flat, index, space);
+    }
+    let mut sizes = MinMax::exact(0.0);
+    for child in inline::rendered_children(flat, index) {
+        let style = flat[child].style;
+        let side = |s: Spacing| match s {
+            Spacing::Auto => 0.0,
+            s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
+        };
+        let b = border(style);
+        let edges = b[1] + b[3] + side(style.padding.left) + side(style.padding.right);
+        let margins = side(style.margin.left) + side(style.margin.right);
+        let content = match resolve_dim(style.width, None, style, space) {
+            Some(w) => MinMax::exact(match style.box_sizing {
+                BoxSizing::BorderBox => (w - edges).max(0.0),
+                BoxSizing::ContentBox => w,
+            }),
+            None => intrinsic_sizes(flat, child, space)?,
+        };
+        sizes.encompass(content.map(|w| clamp_inline(style, space, edges, w) + edges + margins));
+    }
+    Some(sizes)
+}
+
+/// CSS2 10.3.9 shrink-to-fit width of an inline-block's content box:
+/// min(max(min-content, available), max-content), then min/max-width.
+fn shrink_to_fit(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    metrics: &BoxMetrics,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let side = |s: Spacing| match s {
+        Spacing::Auto => 0.0,
+        s => resolve_spacing_for_layout(
+            s,
+            space.available_inline,
+            style,
+            space.viewport_w,
+            space.viewport_h,
+        ),
+    };
+    let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+    let available =
+        space.available_inline - side(style.margin.left) - side(style.margin.right) - edges;
+    let sizes = intrinsic_sizes(flat, index, space)?;
+    let width = match sizes.min {
+        Some(min) => sizes.max.min(available.max(min)),
+        None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
+        None => return None,
+    };
+    Some(clamp_inline(style, space, edges, width.max(0.0)))
+}
+
 fn is_bfc_root(style: &Style) -> bool {
     style.display == Display::FlowRoot
 }
@@ -401,7 +544,10 @@ pub(super) fn layout_block(
 ) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
-    let metrics = resolve_inline(style, space);
+    let mut metrics = resolve_inline(style, space);
+    if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
+        metrics.content_width = shrink_to_fit(flat, index, space, &metrics)?;
+    }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
     let bfc_root = force_bfc_root || is_bfc_root(style);
