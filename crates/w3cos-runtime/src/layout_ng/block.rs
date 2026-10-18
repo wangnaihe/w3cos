@@ -161,6 +161,11 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
         .then_some("internal-marker")
 }
 
+/// `vertical-align` applies to inline-level boxes and table cells only
+/// (CSS 2.1 10.8.1; NGBlockLayoutAlgorithm never reads it), so a
+/// block-level box ignores the keyword marker (and the align-self the
+/// cascade derives from it: block flow does not read align-self).  Length
+/// values stay gated: the cascade also turns them into margins.
 fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     if inline::is_atomic_inline(flat, index) {
@@ -169,21 +174,28 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         // Its display and vertical-align are the IFC's concern.
         let own = match info.kind {
-            ComponentKind::Text { content } => {
-                unsupported_box_style(info.style, &[inline::VALIGN_MARKER], true)
-                    .or_else(|| inline::block_text_reason(content, info.style))
-            }
+            ComponentKind::Text { content } => unsupported_box_style(
+                info.style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::block_text_reason(content, info.style)),
             _ if inline::is_inline_container(flat, index) => unsupported_box_style(
                 info.style,
                 &[
                     inline::IFC_MARKER,
                     inline::ANONYMOUS_BLOCK_MARKER,
                     inline::VALIGN_MARKER,
+                    inline::VALIGN_LENGTH_MARKER,
                 ],
                 true,
             )
             .or_else(|| inline::container_reason(flat, index)),
-            _ => unsupported_box_style(info.style, &[inline::VALIGN_MARKER], true),
+            _ => unsupported_box_style(
+                info.style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            ),
         };
         return own.or_else(|| inline::atomic_inline_reason(info.style));
     }
@@ -195,15 +207,19 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             } else if inline::is_inline_container(flat, index) {
                 unsupported_style(
                     info.style,
-                    &[inline::IFC_MARKER, inline::ANONYMOUS_BLOCK_MARKER],
+                    &[
+                        inline::IFC_MARKER,
+                        inline::ANONYMOUS_BLOCK_MARKER,
+                        inline::VALIGN_MARKER,
+                    ],
                 )
                 .or_else(|| inline::container_reason(flat, index))
             } else {
-                unsupported_style(info.style, &[])
+                unsupported_style(info.style, &[inline::VALIGN_MARKER])
             }
         }
         ComponentKind::Text { content } if info.style.display != Display::Inline => {
-            unsupported_style(info.style, &[])
+            unsupported_style(info.style, &[inline::VALIGN_MARKER])
                 .or_else(|| inline::block_text_reason(content, info.style))
         }
         ComponentKind::Text { .. } => {
@@ -213,7 +229,11 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             } else {
                 unsupported_marker(
                     info.style,
-                    &[inline::LINE_WIDTH_MARKER, inline::VALIGN_MARKER],
+                    &[
+                        inline::LINE_WIDTH_MARKER,
+                        inline::VALIGN_MARKER,
+                        inline::VALIGN_LENGTH_MARKER,
+                    ],
                 )
             }
         }

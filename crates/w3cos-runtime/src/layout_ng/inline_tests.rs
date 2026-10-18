@@ -2089,3 +2089,126 @@ fn rtl_items_are_reordered_by_bidi_level() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// `vertical-align: <length>` on text and atomic items (Blink
+/// ComputeAlignmentBaselineShift kLength: the baseline moves up by the
+/// length; the cascade's line-extension margins do not apply to inline
+/// non-replaced boxes), and a keyword on block-level boxes, which
+/// vertical-align does not apply to (CSS 2.1 10.8.1).  Rects from Chrome
+/// (Ahem).
+#[test]
+fn vertical_align_lengths_shift_the_baseline() {
+    use w3cos_std::style::AlignSelf;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let marked = |mut style: Style, key: &str, value: &str| {
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(key.into(), value.into());
+        style
+    };
+    let container = |valign: Option<&str>| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        if let Some(keyword) = valign {
+            style.align_self = AlignSelf::FlexStart;
+            style = marked(style, inline::VALIGN_MARKER, keyword);
+        }
+        marked(style, inline::IFC_MARKER, "1")
+    };
+    // (offset, line extension) as the cascade computes them.
+    let text = |content: &str, length: Option<(f32, f32)>| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        if let Some((offset, extension)) = length {
+            if offset >= 0.0 {
+                style.margin.bottom = Spacing::Px(extension);
+            } else {
+                style.margin.top = Spacing::Px(extension);
+            }
+            style = marked(
+                style,
+                inline::VALIGN_LENGTH_MARKER,
+                &format!("{offset} {extension}"),
+            );
+        }
+        Component::text(content, style)
+    };
+    let mut ib = Style {
+        display: Display::InlineBlock,
+        width: Dimension::Px(20.0),
+        height: Dimension::Px(30.0),
+        ..Style::default()
+    };
+    font(&mut ib, 20.0, n1);
+    let ib = marked(ib, inline::VALIGN_LENGTH_MARKER, "-10 6");
+    let mut block_text = Style {
+        display: Display::Block,
+        align_self: AlignSelf::FlexEnd,
+        ..Style::default()
+    };
+    font(&mut block_text, 20.0, n1);
+    let block_text = marked(block_text, inline::VALIGN_MARKER, "bottom");
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(None),
+                vec![
+                    text("AA", None),
+                    text("BB", Some((5.0, 1.0))),
+                    Component::boxed(ib, vec![]),
+                ],
+            ),
+            Component::boxed(
+                container(None),
+                vec![
+                    text("A", None),
+                    text("B", Some((-10.0, 6.0))),
+                    text("C", Some((25.0, 21.0))),
+                ],
+            ),
+            Component::boxed(container(Some("top")), vec![text("X", None)]),
+            Component::text("Y", block_text),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 11] = [
+        (1, [0.0, 0.0, 300.0, 31.0]),
+        (2, [0.0, 5.0, 40.0, 20.0]),
+        (3, [40.0, 0.0, 40.0, 20.0]),
+        (4, [80.0, 1.0, 20.0, 30.0]),
+        (5, [0.0, 31.0, 300.0, 55.0]),
+        (6, [0.0, 56.0, 20.0, 20.0]),
+        (7, [20.0, 66.0, 20.0, 20.0]),
+        (8, [40.0, 31.0, 20.0, 20.0]),
+        (9, [0.0, 86.0, 300.0, 20.0]),
+        (10, [0.0, 86.0, 20.0, 20.0]),
+        (11, [0.0, 106.0, 300.0, 20.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

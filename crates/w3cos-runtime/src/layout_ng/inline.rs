@@ -59,6 +59,20 @@ pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
 /// `vertical-align: top | text-top | bottom | text-bottom` (the cascade
 /// maps them to align-self start/end and keeps the keyword here).
 pub(super) const VALIGN_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
+/// `vertical-align: <length-percentage>`: "offset line-extension" in px
+/// (the cascade resolves the length; it also turns the extension into
+/// block-axis margins, which do not apply to inline non-replaced boxes).
+pub(super) const VALIGN_LENGTH_MARKER: &str = "--w3cos-internal-vertical-align-length";
+
+/// The resolved `vertical-align` length (positive raises).
+fn valign_length(style: &Style) -> Option<f32> {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(VALIGN_LENGTH_MARKER))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
 
 /// `vertical-align: top` (Some(true)) or `bottom` (Some(false)): the box's
 /// aligned subtree is placed against the line box edge (CSS 2.1 10.8.1).
@@ -125,6 +139,10 @@ fn x_height(style: &Style) -> Option<f32> {
 /// kTextBottom) put the box's top / bottom at the parent's content area
 /// edge (its primary font's ascent / descent).
 fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style) -> Option<f32> {
+    // kLength: the baseline moves up by the length (LayoutUnit).
+    if let Some(length) = valign_length(style) {
+        return Some(-(length * 64.0).trunc() / 64.0);
+    }
     match style
         .custom_properties
         .as_ref()
@@ -472,6 +490,13 @@ fn inline_text_reason(
 ) -> Option<&'static str> {
     if style.display != Display::Inline {
         return Some("text:display");
+    }
+    // The paragraph and preserved-newline paths place the leaf without a
+    // baseline shift.
+    if valign_length(style).is_some()
+        && (has_marker(style, LINE_WIDTH_MARKER) || content.contains('\n'))
+    {
+        return Some("vertical-align-length");
     }
     // An embedding or isolate inside the paragraph needs bidi resolution
     // (around a sole leaf, the whole paragraph, it changes nothing).
