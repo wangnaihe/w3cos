@@ -9,11 +9,16 @@ description = "W3C OS command-line tool — build and run W3C OS applications"
 name = "w3cos"
 path = "src/main.rs"
 
+[features]
+# Experimental Cranelift JIT backend B: `w3cos jit <script.js>`.
+cranelift = ["dep:w3cos-cranelift"]
+
 [dependencies]
 w3cos-compiler = { workspace = true }
 w3cos-port-analyze = { workspace = true }
 w3cos-core = { workspace = true }
 w3cos-runtime = { workspace = true, default-features = false }
+w3cos-cranelift = { path = "../w3cos-cranelift", optional = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
