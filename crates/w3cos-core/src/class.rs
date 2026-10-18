@@ -571,6 +571,27 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
     obj.clone()
 }
 
+/// `Object.defineProperty` as called from JS: a property the call creates
+/// takes the spec default `enumerable: false` when the descriptor omits it
+/// (e.g. `Object.defineProperty(exports, "__esModule", { value: true })`).
+/// Internal callers keep [`define_property`]'s enumerable default.
+pub fn define_property_from_js(obj: &Value, key: &str, descriptor: &Value) -> Value {
+    let creates = obj.as_object().is_some_and(|object| {
+        let object = object.borrow();
+        object.proxy_handler.is_none() && !object.has_own_property(key)
+    });
+    let omits_enumerable = descriptor
+        .as_object()
+        .is_some_and(|desc| !desc.borrow().properties.contains_key("enumerable"));
+    let result = define_property(obj, key, descriptor);
+    if creates && omits_enumerable {
+        if let Some(object) = obj.as_object() {
+            object.borrow_mut().mark_non_enumerable(key);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
