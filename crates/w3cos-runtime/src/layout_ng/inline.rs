@@ -84,11 +84,50 @@ fn valign_reason(style: &Style) -> Option<&'static str> {
         .as_ref()
         .and_then(|p| p.get(VALIGN_MARKER));
     match (marker.map(String::as_str), style.align_self) {
-        (None, AlignSelf::Auto | AlignSelf::Baseline) => None,
+        // middle: a baseline shift (vertical_align_shift).
+        (None, AlignSelf::Auto | AlignSelf::Baseline | AlignSelf::Center) => None,
         (Some("top"), AlignSelf::FlexStart) | (Some("bottom"), AlignSelf::FlexEnd) => None,
         (Some(_), _) => Some("vertical-align-keyword"),
         _ => Some("vertical-align"),
     }
+}
+
+/// The primary font's x-height (vertical-align: middle uses the parent's).
+fn x_height(style: &Style) -> Option<f32> {
+    #[cfg(feature = "skia")]
+    {
+        crate::render_skia::resolved_font_x_height(style)
+    }
+    // Without Skia only Ahem's metrics are known (x-height 0.8em).
+    #[cfg(not(feature = "skia"))]
+    {
+        style
+            .font_family
+            .as_deref()
+            .is_some_and(|family| {
+                family.split(',').any(|name| {
+                    name.trim()
+                        .trim_matches(['\'', '"'])
+                        .eq_ignore_ascii_case("ahem")
+                })
+            })
+            .then_some(style.font_size * 0.8)
+    }
+}
+
+/// Blink NGInlineBoxState::ComputeAlignmentBaselineShift for
+/// `vertical-align: middle` (CSS 2.1 10.8.1): the box's vertical midpoint
+/// sits half the parent's x-height above the parent's baseline, i.e. its
+/// baseline moves down by (ascent - descent) / 2 - x-height / 2 (LayoutUnit
+/// halving, rounded x-height).  `Some(0.0)` for other values; `None` when
+/// the parent's x-height is unknown.
+fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style) -> Option<f32> {
+    if style.align_self != w3cos_std::style::AlignSelf::Center {
+        return Some(0.0);
+    }
+    let x_height = x_height(parent)?;
+    let half = w3cos_std::style::used_box_spacing((ascent - descent) / 2.0);
+    Some(half - (x_height / 2.0 * 64.0).round() / 64.0)
 }
 
 fn zero_edges(style: &Style) -> bool {
@@ -525,6 +564,10 @@ fn inline_box_reason(
     if let Some(reason) = valign_reason(style) {
         return Some(reason);
     }
+    // (A middle-aligned box would shift its whole subtree.)
+    if style.align_self == w3cos_std::style::AlignSelf::Center {
+        return Some("vertical-align-middle-box");
+    }
     let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
     let m = style.margin_lengths();
     if ![
@@ -641,6 +684,12 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if line_relative_align(info.style).is_some() && !open.is_empty() {
             return Some("vertical-align-nested");
         }
+        let parent = open.last().map_or(style, |&b| flat[b].style);
+        if info.style.align_self == w3cos_std::style::AlignSelf::Center
+            && x_height(parent).is_none()
+        {
+            return Some("vertical-align-middle-font");
+        }
         if is_atomic_inline(flat, child) {
             // An atomic is a neutral (U+FFFC): next to the rtl paragraph's
             // sos/eos it resolves to level 1 and moves (UAX #9 N1/N2).
@@ -736,6 +785,8 @@ struct InlineItem {
     /// dictionary breaks) are not modelled, so a line needing a break
     /// next to one falls back.
     non_latin: bool,
+    /// Baseline shift (down) from vertical-align: middle.
+    shift: f32,
     ascent: f32,
     descent: f32,
     content_ascent: f32,
@@ -979,6 +1030,8 @@ pub(super) fn layout_inline(
     let mut opens: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
     let mut closes: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
     let mut aligned: Vec<Option<(usize, bool)>> = vec![None; children.len()];
+    // Each leaf's innermost inline box (its vertical-align parent).
+    let mut parents: Vec<Option<usize>> = vec![None; children.len()];
     {
         let mut leaf = 0;
         let mut pending = Vec::new();
@@ -991,6 +1044,7 @@ pub(super) fn layout_inline(
                 }
                 InlineEntry::Leaf(c) => {
                     opens[leaf] = std::mem::take(&mut pending);
+                    parents[leaf] = stack.last().copied();
                     aligned[leaf] = stack
                         .iter()
                         .chain(std::iter::once(&c))
@@ -1167,6 +1221,8 @@ pub(super) fn layout_inline(
             let box_start = start_edges(&opens[k]);
             let box_end = end_edges(&closes[k]);
             let raw = margin[3] + result.fragment.width + margin[1] + box_start + box_end;
+            let parent = parents[k].map_or(container, |b| flat[b].style);
+            let shift = vertical_align_shift(style, ascent, height - ascent, parent)?;
             items.push(InlineItem {
                 index: child,
                 raw,
@@ -1183,6 +1239,7 @@ pub(super) fn layout_inline(
                 internal_break: false,
                 atomic: Some((result.fragment, margin[3], margin[0])),
                 non_latin: false,
+                shift,
                 ascent,
                 descent: height - ascent,
                 content_ascent: 0.0,
@@ -1244,6 +1301,8 @@ pub(super) fn layout_inline(
             let box_end = end_edges(&closes[k]);
             let raw = text_raw + inline_edges + box_start + box_end;
             let (height, baseline) = text_line_metrics(content, style);
+            let parent = parents[k].map_or(container, |b| flat[b].style);
+            let shift = vertical_align_shift(style, baseline, height - baseline, parent)?;
             items.push(InlineItem {
                 index: child,
                 raw,
@@ -1269,6 +1328,7 @@ pub(super) fn layout_inline(
                         && content.starts_with(' ')
                         && !content.trim_start_matches(' ').is_empty()),
                 non_latin: !latin1(content),
+                shift,
                 atomic: None,
                 ascent: baseline,
                 descent: height - baseline,
@@ -1414,14 +1474,19 @@ pub(super) fn layout_inline(
                     .find(|s: &&mut (usize, bool, f32, f32)| s.0 == root)
                 {
                     Some(s) => {
-                        s.2 = s.2.max(item.ascent);
-                        s.3 = s.3.max(item.descent);
+                        s.2 = s.2.max(item.ascent - item.shift);
+                        s.3 = s.3.max(item.descent + item.shift);
                     }
-                    None => subtrees.push((root, top, item.ascent, item.descent)),
+                    None => subtrees.push((
+                        root,
+                        top,
+                        item.ascent - item.shift,
+                        item.descent + item.shift,
+                    )),
                 }
             } else {
-                ascent = ascent.max(item.ascent);
-                descent = descent.max(item.descent);
+                ascent = ascent.max(item.ascent - item.shift);
+                descent = descent.max(item.descent + item.shift);
             }
         }
         let content_width = if hang_preserved {
@@ -1509,6 +1574,9 @@ pub(super) fn layout_inline(
                 continue;
             }
             placed[k] = Some((line_index, offset + x, width, baseline));
+            // The item's own baseline after its vertical-align shift (the
+            // enclosing boxes stay on the unshifted one).
+            let baseline = baseline + item.shift;
             if let Some((fragment, margin_start, margin_top)) = &item.atomic {
                 out.push((
                     offset + x + item.box_start + margin_start,

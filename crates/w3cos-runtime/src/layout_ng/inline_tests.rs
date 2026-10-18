@@ -1766,3 +1766,98 @@ fn rtl_blocks_and_lines_start_on_the_right() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// vertical-align: middle on text leaves and atomics (Blink
+/// ComputeAlignmentBaselineShift kMiddle: the midpoint half the parent's
+/// x-height above its baseline).  Rects from Chrome (Ahem, x-height 0.8em).
+#[test]
+fn middle_aligned_items_shift_their_baseline() {
+    use w3cos_std::style::AlignSelf;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let container = || {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str, size: f32, display: Display, middle: bool| {
+        let mut style = Style {
+            display,
+            align_self: if middle {
+                AlignSelf::Center
+            } else {
+                AlignSelf::Auto
+            },
+            ..Style::default()
+        };
+        font(&mut style, size, n1);
+        Component::text(content, style)
+    };
+    let mut ib = Style {
+        display: Display::InlineBlock,
+        width: Dimension::Px(20.0),
+        height: Dimension::Px(50.0),
+        align_self: AlignSelf::Center,
+        ..Style::default()
+    };
+    font(&mut ib, 20.0, n1);
+    let inline = Display::Inline;
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA", 20.0, inline, false),
+                    text("B", 40.0, inline, true),
+                    Component::boxed(ib, vec![]),
+                    text("CC", 20.0, inline, false),
+                ],
+            ),
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA", 20.0, inline, false),
+                    text("xy", 10.0, inline, true),
+                    text("Q", 30.0, Display::InlineBlock, true),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 9] = [
+        (1, [0.0, 0.0, 300.0, 50.0]),
+        (2, [0.0, 17.0, 40.0, 20.0]),
+        (3, [40.0, 5.0, 40.0, 40.0]),
+        (4, [80.0, 0.0, 20.0, 50.0]),
+        (5, [100.0, 17.0, 40.0, 20.0]),
+        (6, [0.0, 50.0, 300.0, 30.0]),
+        (7, [0.0, 57.0, 40.0, 20.0]),
+        (8, [40.0, 60.0, 20.0, 10.0]),
+        (9, [60.0, 50.0, 30.0, 30.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
