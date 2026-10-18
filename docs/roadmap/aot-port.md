@@ -239,7 +239,9 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 7. 泄漏 CI：每个场景堆差分 + 每晚 8 小时 soak，结果入 `docs/perf/`。
    - **第 1 步（已完成）**：`.github/workflows/leak-ci.yml` + `crates/w3cos-compiler/examples/leak_ci.rs`。aot-port 的 PR/push 跑 11 个 AOT 场景（`leak-scenarios/scenarios.ts`）：每个场景先预热，再迭代 N 次，存活对象/数组/函数数必须精确回到基线（残留 = 0，否则打印检测器报告；已知缓存登记在 `known-leaks.txt`）。同时检查 release 构建里没有检测器代码。每晚 02:00（Asia/Shanghai）跑 soak，默认 8 小时，时长可配置，判据是 RSS 增长 ≤ 5% 且零残留，报告作为 artifact 上传。结果见 `docs/perf/leak-ci.md`。第一次跑就发现 Map/Set 注册表永不回收（已修）。
 8. `w3cos leak-lint` + codemod：闭包捕获 `this`、未移除监听器、父↔子强引用、Disposable 模式。
+   - **第 1 步（已完成）**：`w3cos leak-lint <path>`（`w3cos_compiler::leak_lint`）。用 SWC AST 规则检测五类模式：`listener-without-dispose`、`this-capture-stored-on-this`、`back-pointer`、`object-keyed-map`、`disposable-not-registered`。另外对能降到 W3IR 的文件跑 `unique_back_edges`，报告 `closure-back-edge`、`mutual-properties`、`cross-file-cycle`。每条结果给出 file:line、严重级别和修复建议，支持文本/JSON 输出，`--fail-on` 控制 CI 退出码。`--fix` 默认只打印 diff，加 `--write` 才写回。三种 codemod：back pointer 改成 WeakRef 加 deref 访问器；只做 get/set/has/delete 的私有对象键 Map 改成 WeakMap；在 Disposable 子类里包一层 `this._register(...)`。
 9. VS Code fork / 补丁队列流程：`vscode-w3cos` 仓库按上游 tag 重放补丁（quilt 式 `patches/` 目录 + CI 自动 rebase），每个补丁标注"可上游/仅 w3cos"，可上游的向 microsoft/vscode 提 PR；扩展与 npm 依赖同一流程（`patches/npm/<pkg>@<ver>`，安装时应用）。
+   - **第 1 步（已完成）**：补丁队列先放在仓库内的 `ports/vscode/`，暂不建 GitHub fork。`patches/series` 加 `NNNN-*.patch`，每个补丁带 `W3cos-Upstream: yes|no` 标注。`scripts/vscode-patches.sh` 提供 fetch/apply/refresh/lint/check，基线沿用 `tools/vscode-baseline/CODE_OSS.lock.json`。CI（`vscode-patches.yml`）检查队列能干净应用，并对打完补丁的源码跑 leak-lint。排序后的结果见 `docs/perf/code-oss-leak-lint.md`。第一批补丁：extHostTerminalService 的 12 个 Emitter 改为注册释放。
 10. Shape/隐藏类 + 静态 IC 槽。
 11. W3IR typed 节点 + "推测类型 + 双版本"降级。
 12. CommonJS 静态链接 + Node 解析算法（`exports` 条件含 `w3cos`/`node`）。

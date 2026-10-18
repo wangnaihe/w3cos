@@ -1,0 +1,48 @@
+name: Code-OSS patch queue
+
+# M1 item 9: the ports/vscode patch queue must apply cleanly on the pinned Code-OSS
+# commit, and leak-lint runs over the patched tree (report uploaded as an artifact).
+on:
+  pull_request:
+    branches: [aot-port]
+    paths:
+      - "ports/vscode/**"
+      - "tools/vscode-baseline/CODE_OSS.lock.json"
+      - "crates/w3cos-compiler/src/leak_lint/**"
+      - ".github/workflows/vscode-patches.yml"
+  push:
+    branches: [aot-port]
+    paths:
+      - "ports/vscode/**"
+      - "tools/vscode-baseline/CODE_OSS.lock.json"
+      - "crates/w3cos-compiler/src/leak_lint/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Patches carry trailers and apply on the pin
+        run: ports/vscode/scripts/vscode-patches.sh check
+      - name: leak-lint over patched Code-OSS
+        env:
+          LEAK_LINT_REPORT_DIR: ${{ github.workspace }}/code-oss-leak-lint
+        run: |
+          ports/vscode/scripts/vscode-patches.sh lint
+          tail -n 1 code-oss-leak-lint/code-oss-leak-lint.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload leak-lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-oss-leak-lint
+          path: code-oss-leak-lint
+          if-no-files-found: ignore
