@@ -384,6 +384,8 @@ struct CachedComputedStyle {
 
 /// Set on the document element's component in quirks mode (BackCompat).
 pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
+/// Set on a block whose first line is styled by `::first-line`.
+pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
 
 struct SelectorContextCache {
     style_clock: u64,
@@ -8967,6 +8969,13 @@ impl Document {
                         style.font_size * style.line_height,
                         available_width,
                     );
+                    // The first line box's root inline box takes the
+                    // ::first-line style (its strut); layout engines that do
+                    // not model that must know the block has one.
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(FIRST_LINE_STYLE_MARKER.into(), "1".into());
                     // Styling a first line inside a block descendant does
                     // not turn that descendant into an inline-level child.
                     let inline_flow = children
