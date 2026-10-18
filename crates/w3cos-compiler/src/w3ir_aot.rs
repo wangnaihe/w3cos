@@ -472,6 +472,18 @@ fn binding_is_mutable(function: &Function, id: u32) -> bool {
     })
 }
 
+fn refresh_is_unobservable(function: &Function, binding: u32) -> bool {
+    !captured_binding_ids(function).contains(&binding)
+        && !function
+            .bindings
+            .iter()
+            .any(|candidate| candidate.name == "eval")
+        && !function
+            .captures
+            .iter()
+            .any(|capture| is_eval_binding(capture.0))
+}
+
 fn captured_binding_ids(function: &Function) -> HashSet<u32> {
     let mut captured = HashSet::new();
     for block in &function.blocks {
@@ -1635,14 +1647,18 @@ fn reaching_number_constants(instructions: &[Instruction]) -> Vec<HashMap<u32, f
 }
 
 const INLINE_FRAME: usize = 8;
+/// Sparse binding ids up to this count are packed into stack arrays indexed
+/// by a compile-time position (a `HashMap<u32, _>` lookup per binding access
+/// dominated loops with a dozen non-numeric locals).
+const PACKED_SLOTS: usize = 32;
 
 #[derive(Clone, Copy)]
 enum SlotStorage {
     /// Binding ids are exactly `0..len`.
     Dense(usize),
-    /// At most [`INLINE_FRAME`] sparse ids, packed into a stack array.
+    /// At most [`PACKED_SLOTS`] sparse ids, packed into a stack array.
     /// The array is the original ids; the length is how many are live.
-    Packed([u32; INLINE_FRAME], u8),
+    Packed([u32; PACKED_SLOTS], u8),
     Map,
 }
 
@@ -1683,8 +1699,8 @@ fn slot_storage(function: &Function) -> SlotStorage {
         [first, ..] if *first == 0 && ids.len() == (*ids.last().unwrap() as usize) + 1 => {
             SlotStorage::Dense(ids.len())
         }
-        _ if ids.len() <= INLINE_FRAME => {
-            let mut packed = [0u32; INLINE_FRAME];
+        _ if ids.len() <= PACKED_SLOTS => {
+            let mut packed = [0u32; PACKED_SLOTS];
             for (index, id) in ids.iter().enumerate() {
                 packed[index] = *id;
             }
@@ -1713,8 +1729,13 @@ fn emit_registers_init(n: u32) -> String {
 fn emit_slot_fields(storage: SlotStorage) -> String {
     match storage {
         SlotStorage::Dense(len) if len <= INLINE_FRAME => inline_slot_fields(len),
-        SlotStorage::Packed(_, len) => inline_slot_fields(len as usize),
-        SlotStorage::Dense(_) => (
+        SlotStorage::Packed(_, len) if len as usize <= INLINE_FRAME => {
+            inline_slot_fields(len as usize)
+        }
+        // Larger packed frames keep their slots on the heap: big inline
+        // arrays in the frame struct measurably slowed unrelated numeric
+        // loops in the same frame.
+        SlotStorage::Dense(_) | SlotStorage::Packed(_, _) => (
             "    bindings: Vec<Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>>,\n    capture_getters: Vec<Option<w3cos_core::Value>>,\n    capture_setters: Vec<Option<w3cos_core::Value>>,\n"
         )
             .into(),
@@ -1734,7 +1755,10 @@ fn inline_slot_fields(len: usize) -> String {
 fn emit_bindings_new(storage: SlotStorage) -> String {
     match storage {
         SlotStorage::Dense(len) if len <= INLINE_FRAME => inline_bindings_new(len),
-        SlotStorage::Packed(_, len) => inline_bindings_new(len as usize),
+        SlotStorage::Packed(_, len) if len as usize <= INLINE_FRAME => {
+            inline_bindings_new(len as usize)
+        }
+        SlotStorage::Packed(_, len) => format!("    let mut bindings = vec![None; {len}];\n"),
         SlotStorage::Dense(len) => format!("    let mut bindings = vec![None; {len}];\n"),
         SlotStorage::Map => "    let mut bindings = std::collections::HashMap::new();\n".into(),
     }
@@ -1774,8 +1798,17 @@ fn emit_capture_init(storage: SlotStorage) -> String {
                 arms.push_str(&format!("{id} => {index}usize,\n"));
             }
             let body = emit_capture_match_body("index");
+            let slots = if len <= INLINE_FRAME {
+                format!(
+                    "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n"
+                )
+            } else {
+                format!(
+                    "    let mut capture_getters: Vec<Option<w3cos_core::Value>> = vec![None; {len}];\n    let mut capture_setters: Vec<Option<w3cos_core::Value>> = vec![None; {len}];\n"
+                )
+            };
             format!(
-                "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    for (binding, capture) in __captures.iter() {{\n        let index = match *binding {{\n            {arms}            _ => continue,\n        }};\n        {body}\n    }}\n"
+                "{slots}    for (binding, capture) in __captures.iter() {{\n        let index = match *binding {{\n            {arms}            _ => continue,\n        }};\n        {body}\n    }}\n"
             )
         }
         SlotStorage::Dense(_) => {
@@ -6967,6 +7000,11 @@ fn emit_instruction(
         Instruction::RefreshBinding { binding } if num_binding_slot(plan, binding.0).is_some() => {
             String::new()
         }
+        // A fresh per-iteration cell is only observable through a closure
+        // that captured the previous one.
+        Instruction::RefreshBinding { binding } if refresh_is_unobservable(function, binding.0) => {
+            String::new()
+        }
         Instruction::RefreshBinding { binding } => format!(
             "if let Some(binding) = {} {{ let refreshed = binding.borrow().clone(); {} }}",
             emit_binding_get(storage, binding.0),
@@ -9245,8 +9283,9 @@ fn main() {{
             }
             SlotStorage::Packed(_, _) => {
                 assert!(
-                    add_generated.contains("std::array::from_fn"),
-                    "small sparse add should pack slots: {add_generated}"
+                    add_generated.contains("std::array::from_fn")
+                        || add_generated.contains("vec![None;"),
+                    "sparse add should pack slots: {add_generated}"
                 );
             }
         }
@@ -9270,7 +9309,8 @@ fn main() {{
             }
             SlotStorage::Packed(_, _) => {
                 assert!(
-                    inner_generated.contains("std::array::from_fn")
+                    (inner_generated.contains("std::array::from_fn")
+                        || inner_generated.contains("vec![None;"))
                         && inner_generated.contains("AotCapture::Cell"),
                     "a small captured binding should share the parent cell: {inner_generated}"
                 );
