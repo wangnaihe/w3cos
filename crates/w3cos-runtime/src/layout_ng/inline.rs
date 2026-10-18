@@ -86,7 +86,8 @@ fn valign_reason(style: &Style) -> Option<&'static str> {
     match (marker.map(String::as_str), style.align_self) {
         // middle: a baseline shift (vertical_align_shift).
         (None, AlignSelf::Auto | AlignSelf::Baseline | AlignSelf::Center) => None,
-        (Some("top"), AlignSelf::FlexStart) | (Some("bottom"), AlignSelf::FlexEnd) => None,
+        (Some("top" | "text-top"), AlignSelf::FlexStart)
+        | (Some("bottom" | "text-bottom"), AlignSelf::FlexEnd) => None,
         (Some(_), _) => Some("vertical-align-keyword"),
         _ => Some("vertical-align"),
     }
@@ -120,8 +121,23 @@ fn x_height(style: &Style) -> Option<f32> {
 /// sits half the parent's x-height above the parent's baseline, i.e. its
 /// baseline moves down by (ascent - descent) / 2 - x-height / 2 (LayoutUnit
 /// halving, rounded x-height).  `Some(0.0)` for other values; `None` when
-/// the parent's x-height is unknown.
+/// the parent's x-height is unknown.  `text-top` / `text-bottom` (kTextTop,
+/// kTextBottom) put the box's top / bottom at the parent's content area
+/// edge (its primary font's ascent / descent).
 fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style) -> Option<f32> {
+    match style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(VALIGN_MARKER))
+        .map(String::as_str)
+    {
+        Some("text-top") => return Some(ascent - inline_font_content_ascent(parent)),
+        Some("text-bottom") => {
+            let parent_descent = inline_font_height(parent) - inline_font_content_ascent(parent);
+            return Some(parent_descent - descent);
+        }
+        _ => {}
+    }
     if style.align_self != w3cos_std::style::AlignSelf::Center {
         return Some(0.0);
     }
@@ -564,9 +580,19 @@ fn inline_box_reason(
     if let Some(reason) = valign_reason(style) {
         return Some(reason);
     }
-    // (A middle-aligned box would shift its whole subtree.)
+    // (A middle / text-top / text-bottom box would shift its whole subtree.)
     if style.align_self == w3cos_std::style::AlignSelf::Center {
         return Some("vertical-align-middle-box");
+    }
+    if matches!(
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|p| p.get(VALIGN_MARKER))
+            .map(String::as_str),
+        Some("text-top" | "text-bottom")
+    ) {
+        return Some("vertical-align-keyword");
     }
     let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
     let m = style.margin_lengths();
