@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-pub const FORMAT_VERSION: u32 = 19;
+pub mod types;
+
+pub use types::{FunctionTypes, IrType, TypeHint, TypedFunction};
+
+pub const FORMAT_VERSION: u32 = 20;
 
 macro_rules! id {
     ($name:ident) => {
@@ -405,6 +409,10 @@ pub struct Function {
     #[serde(default)]
     pub is_generator: bool,
     pub source_span: Option<SourceSpan>,
+    /// Declared (speculative) parameter / return types from TypeScript
+    /// annotations. Empty for untyped JavaScript. See [`types`].
+    #[serde(default, skip_serializing_if = "FunctionTypes::is_empty")]
+    pub types: FunctionTypes,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -527,6 +535,9 @@ impl Function {
             if !module_bindings.contains(capture) || local_bindings.contains(capture) {
                 return Err(ValidationError::InvalidCapture(self.id, *capture));
             }
+        }
+        if self.types.parameters.len() > self.parameters.len() {
+            return Err(ValidationError::TooManyParameterTypes(self.id));
         }
         let mut parameter_bindings = HashSet::new();
         for parameter in &self.parameters {
@@ -789,6 +800,55 @@ fn bindings(instruction: &Instruction) -> Vec<BindingId> {
     }
 }
 
+/// The register an instruction defines, if any.
+pub fn written_register(instruction: &Instruction) -> Option<Register> {
+    match instruction {
+        Instruction::LoadConstant { dst, .. }
+        | Instruction::Move { dst, .. }
+        | Instruction::LoadBinding { dst, .. }
+        | Instruction::Add { dst, .. }
+        | Instruction::Binary { dst, .. }
+        | Instruction::Unary { dst, .. }
+        | Instruction::GetProperty { dst, .. }
+        | Instruction::DeleteProperty { dst, .. }
+        | Instruction::GetPrivate { dst, .. }
+        | Instruction::HasPrivate { dst, .. }
+        | Instruction::CreateArray { dst, .. }
+        | Instruction::ArrayRest { dst, .. }
+        | Instruction::ObjectRest { dst, .. }
+        | Instruction::CreateObject { dst, .. }
+        | Instruction::CreateClosure { dst, .. }
+        | Instruction::CreateClass { dst, .. }
+        | Instruction::Call { dst, .. }
+        | Instruction::CallWithArguments { dst, .. }
+        | Instruction::CallMethod { dst, .. }
+        | Instruction::CallMethodWithArguments { dst, .. }
+        | Instruction::Construct { dst, .. }
+        | Instruction::ConstructWithArguments { dst, .. }
+        | Instruction::DynamicImport { dst, .. }
+        | Instruction::ImportMeta { dst }
+        | Instruction::Await { dst, .. }
+        | Instruction::Yield { dst, .. }
+        | Instruction::YieldDelegate { dst, .. } => Some(*dst),
+        Instruction::InitializeBinding { .. }
+        | Instruction::StoreBinding { .. }
+        | Instruction::RefreshBinding { .. }
+        | Instruction::SetProperty { .. }
+        | Instruction::DefineField { .. }
+        | Instruction::DefinePrivate { .. }
+        | Instruction::SetPrivate { .. }
+        | Instruction::DefinePrivateMethod { .. }
+        | Instruction::DefinePrivateAccessor { .. }
+        | Instruction::AppendArrayElement { .. }
+        | Instruction::AppendIterable { .. }
+        | Instruction::CopyDataProperties { .. }
+        | Instruction::Jump { .. }
+        | Instruction::Branch { .. }
+        | Instruction::Return { .. }
+        | Instruction::Throw { .. } => None,
+    }
+}
+
 fn registers(instruction: &Instruction) -> Vec<Register> {
     match instruction {
         Instruction::LoadConstant { dst, .. } | Instruction::ImportMeta { dst } => vec![*dst],
@@ -971,6 +1031,7 @@ pub enum ValidationError {
     GeneratorSuspensionInOrdinaryFunction(FunctionId),
     InvalidYield(FunctionId, SuspensionId),
     InvalidSourceSpan,
+    TooManyParameterTypes(FunctionId),
 }
 
 impl fmt::Display for ValidationError {
@@ -1040,6 +1101,7 @@ mod tests {
                 is_async: false,
                 is_generator: false,
                 source_span: None,
+                types: Default::default(),
             }],
         )
     }
@@ -1205,6 +1267,7 @@ mod tests {
                         start: 0,
                         end: 50,
                     }),
+                    types: Default::default(),
                 },
                 Function {
                     id: FunctionId(1),
@@ -1233,6 +1296,7 @@ mod tests {
                     is_async: false,
                     is_generator: false,
                     source_span: None,
+                    types: Default::default(),
                 },
             ],
         );
@@ -1332,6 +1396,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             source_span: None,
+            types: Default::default(),
         });
         assert_eq!(
             module.validate(),
