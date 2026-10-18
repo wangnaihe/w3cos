@@ -373,6 +373,147 @@ fn is_eval_binding(id: u32) -> bool {
     })
 }
 
+thread_local! {
+    /// Same-module function bindings (capture ids) whose function has a
+    /// native typed entry: binding -> (Rust fn taking one `f64` per
+    /// parameter and returning a `Completion`, arity). Installed by the ESM
+    /// backend for one module at a time.
+    static DIRECT_TYPED_CALLEES: std::cell::RefCell<HashMap<u32, (String, usize)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+pub(crate) struct DirectTypedCalleeGuard;
+
+impl Drop for DirectTypedCalleeGuard {
+    fn drop(&mut self) {
+        DIRECT_TYPED_CALLEES.with(|callees| callees.borrow_mut().clear());
+    }
+}
+
+/// Installs the direct typed callees of the module being emitted.
+pub(crate) fn install_direct_typed_callees(
+    callees: HashMap<u32, (String, usize)>,
+) -> DirectTypedCalleeGuard {
+    DIRECT_TYPED_CALLEES.with(|installed| *installed.borrow_mut() = callees);
+    DirectTypedCalleeGuard
+}
+
+/// Arity of an installed direct entry, by its Rust name.
+pub(crate) fn direct_typed_arity_for(target: &str) -> Option<usize> {
+    DIRECT_TYPED_CALLEES.with(|callees| {
+        callees
+            .borrow()
+            .values()
+            .find(|(name, _)| name == target)
+            .map(|(_, arity)| *arity)
+    })
+}
+
+fn direct_typed_callee(binding: u32) -> Option<(String, usize)> {
+    DIRECT_TYPED_CALLEES.with(|callees| callees.borrow().get(&binding).cloned())
+}
+
+/// Arity of a function's native typed entry (`{factory}__typed_direct`):
+/// a plain sync function whose every parameter is a speculable `number`.
+/// Purely structural, so the ESM backend and the function's own emission
+/// always agree; when the typed variant itself is not worth emitting, the
+/// direct entry boxes its arguments and runs the generic version.
+pub(crate) fn direct_typed_arity(function: &Function) -> Option<usize> {
+    if !typed_versions_enabled()
+        || function.is_async
+        || function.is_generator
+        || function.rest_parameter.is_some()
+        || function.arguments_binding.is_some()
+        || function.parameters.is_empty()
+    {
+        return None;
+    }
+    let speculable = w3cos_ir::types::speculable_parameters(function, &function.types);
+    let all_numbers = (0..function.parameters.len()).all(|index| {
+        speculable.contains(&index)
+            && *function.types.parameter(index) == w3cos_ir::TypeHint::Number
+    });
+    all_numbers.then_some(function.parameters.len())
+}
+
+/// The only instruction writing `register`, if there is exactly one.
+fn single_definition(function: &Function, register: u32) -> Option<&Instruction> {
+    let mut found = None;
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        if written_register(instruction).is_some_and(|written| written.0 == register) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(instruction);
+        }
+    }
+    found
+}
+
+/// `callee(args)` where `callee` is a same-module function with a direct
+/// typed entry, `this` is `undefined`, and every argument is an unboxed
+/// number: returns the entry to call.
+fn direct_call_target(
+    function: &Function,
+    plan: &EscapePlan,
+    callee: Register,
+    this_value: Register,
+    arguments: &[Register],
+) -> Option<String> {
+    if DIRECT_TYPED_CALLEES.with(|callees| callees.borrow().is_empty()) {
+        return None;
+    }
+    let Some(Instruction::LoadBinding { binding, .. }) = single_definition(function, callee.0)
+    else {
+        return None;
+    };
+    let (target, arity) = direct_typed_callee(binding.0)?;
+    if arity != arguments.len()
+        || !arguments
+            .iter()
+            .all(|argument| num_slot(plan, argument.0).is_some())
+        || !matches!(
+            single_definition(function, this_value.0),
+            Some(Instruction::LoadConstant {
+                value: Constant::Undefined,
+                ..
+            })
+        )
+    {
+        return None;
+    }
+    Some(target)
+}
+
+/// A `LoadBinding` of a direct callee whose register only feeds direct
+/// calls is dead (module function bindings are hoisted and never
+/// reassigned, so the load can neither throw nor observe anything).
+fn load_only_feeds_direct_calls(function: &Function, plan: &EscapePlan, dst: Register) -> bool {
+    let mut any = false;
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        if !read_registers(instruction).contains(&dst.0) {
+            continue;
+        }
+        match instruction {
+            Instruction::Call {
+                callee,
+                this_value,
+                arguments,
+                ..
+            } if *callee == dst
+                && *this_value != dst
+                && !arguments.contains(&dst)
+                && direct_call_target(function, plan, *callee, *this_value, arguments)
+                    .is_some() =>
+            {
+                any = true;
+            }
+            _ => return false,
+        }
+    }
+    any
+}
+
 fn analyze_function(function: &Function) -> EscapePlan {
     analyze_function_seeded(function, &HashSet::new())
 }
@@ -2715,6 +2856,7 @@ fn generate_sync_function_with_factories(
     };
     let generic_items = &generic.items;
     let generic_entry = &generic.entry;
+    let direct = emit_direct_typed_entry(function, &rust_name);
     let Some((speculated, typed)) = typed else {
         return Ok(format!(
             r#"{generic_items}
@@ -2724,7 +2866,7 @@ pub fn {rust_name}(
     __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
 {fast_prefix}{generic_entry}}}
-"#
+{direct}"#
         ));
     };
     // Entry guard: every speculated argument must already be a Number
@@ -2755,8 +2897,43 @@ pub fn {rust_name}(
     }}
     w3cos_core::typed::record_guard_failure();
 {generic_entry}}}
-"#
+{direct}"#
     ))
+}
+
+/// `{rust_name}__typed_direct(__captures, f64...) -> Completion`: the entry a
+/// same-module caller uses when it already holds every argument as an
+/// unboxed number (see [`direct_call_target`]). It bypasses the callee
+/// lookup, the argument `Vec`, `call_completion` dispatch and the capture
+/// map rebuild of the generic call path; the entry guard then always passes
+/// and runs the typed version.
+fn emit_direct_typed_entry(function: &Function, rust_name: &str) -> String {
+    let Some(arity) = direct_typed_arity(function) else {
+        return String::new();
+    };
+    let parameters = (0..arity)
+        .map(|index| format!("__w3cos_typed_{index}: f64"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let boxed = (0..arity)
+        .map(|index| format!("w3cos_core::Value::Number(__w3cos_typed_{index})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Boxing a number is a register write; the guard re-check is one tag
+    // test per argument. Building a second inline copy of the typed frame
+    // here instead made LLVM stop inlining `run` into the factory and
+    // slowed hot numeric loops several-fold.
+    format!(
+        r#"
+#[allow(dead_code)]
+pub fn {rust_name}__typed_direct(
+    __captures: &w3cos_core::AotCaptureMap,
+    {parameters}
+) -> w3cos_core::Completion {{
+    w3cos_core::catch_js(|| {rust_name}(w3cos_core::Value::Undefined, &[{boxed}], __captures))
+}}
+"#
+    )
 }
 
 fn generate_async_function_with_factories(
@@ -7012,6 +7189,12 @@ fn emit_instruction(
     last_uses: &HashSet<u32>,
 ) -> Result<String> {
     let register = |register: w3cos_ir::Register| val_index(plan, register.0);
+    if let Instruction::LoadBinding { dst, binding } = instruction
+        && direct_typed_callee(binding.0).is_some()
+        && load_only_feeds_direct_calls(function, plan, *dst)
+    {
+        return Ok(String::new());
+    }
     Ok(match instruction {
         Instruction::LoadConstant { dst, value } => match value {
             Constant::Number(value) if num_slot(plan, dst.0).is_some() => {
@@ -7584,6 +7767,29 @@ fn emit_instruction(
                 "let __w3cos_constructor = {}; let __w3cos_super_class = {super_class}; let __w3cos_initializer = {initializer}; self.registers[{}] = w3cos_core::intrinsics::create_class_with_initializer(&__w3cos_constructor, __w3cos_super_class.as_ref(), &__w3cos_initializer);",
                 emit_boxed_value(plan, constructor.0),
                 register(*dst),
+            )
+        }
+        Instruction::Call {
+            dst,
+            callee,
+            this_value,
+            arguments,
+        } if direct_call_target(function, plan, *callee, *this_value, arguments).is_some() => {
+            // Direct native call into a same-module typed entry: no argument
+            // `Vec`, no boxing of the numbers, no `call_completion` dispatch.
+            let target = direct_call_target(function, plan, *callee, *this_value, arguments)
+                .expect("checked by the guard");
+            let args = arguments
+                .iter()
+                .map(|argument| format!("self.num_regs[{}]", num_index(plan, argument.0)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            emit_completion_match(
+                &format!("{target}({args})"),
+                &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
+                exception_target,
+                mode,
+                plan,
             )
         }
         Instruction::Call {
