@@ -105,9 +105,12 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
 /// S2a measures with the primary font only; other scripts (font fallback,
 /// bidi, CJK/Thai breaking) stay on the legacy path for now.
 fn latin1(content: &str) -> bool {
-    content
-        .chars()
-        .all(|c| (c as u32) < 0x100 || matches!(c, '\u{2028}' | '\u{2029}'))
+    content.chars().all(|c| {
+        // Control characters (form feed, C1) have their own rendering
+        // and breaking rules; legacy handles them.
+        let control = c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c);
+        ((c as u32) < 0x100 && !control) || matches!(c, '\u{2028}' | '\u{2029}')
+    })
 }
 
 /// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
