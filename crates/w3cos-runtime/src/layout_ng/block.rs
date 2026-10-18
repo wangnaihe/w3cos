@@ -12,6 +12,7 @@ use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::ComponentKind;
 use w3cos_std::style::{
     BoxSizing, Clear, Dimension, Display, Float, Overflow, Position, Spacing, Style, TextDirection,
+    UnicodeBidi,
 };
 
 fn supported_dimension(_d: Dimension) -> bool {
@@ -94,8 +95,10 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if style.column_count.is_some() || style.column_width != Dimension::Auto {
         return Some("columns");
     }
-    if style.direction != TextDirection::Ltr {
-        return Some("direction");
+    // direction: rtl places block children from the right (resolve_inline);
+    // embeddings and overrides need bidi reordering.
+    if style.unicode_bidi != UnicodeBidi::Normal {
+        return Some("unicode-bidi");
     }
     if ![
         style.width,
@@ -352,13 +355,27 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     if let Some(min) = resolve_dim(style.min_width, Some(cb), style, space).map(to_content) {
         content_width = content_width.max(min);
     }
-    let auto_left = style.margin.left == Spacing::Auto;
-    let auto_right = style.margin.right == Spacing::Auto;
+    // Inline-start / inline-end sides in the containing block's direction.
+    let (start, end) = if space.rtl { (1, 3) } else { (3, 1) };
+    let auto_start = [
+        style.margin.top,
+        style.margin.right,
+        style.margin.bottom,
+        style.margin.left,
+    ][start]
+        == Spacing::Auto;
+    let auto_end = [
+        style.margin.top,
+        style.margin.right,
+        style.margin.bottom,
+        style.margin.left,
+    ][end]
+        == Spacing::Auto;
     let width_was_auto =
         specified.is_none() && content_width == (cb - margin[1] - margin[3] - edges).max(0.0);
+    let remaining = cb - content_width - edges;
     if !width_was_auto {
-        let remaining = cb - content_width - edges;
-        match (auto_left, auto_right) {
+        match (auto_start, auto_end) {
             (true, true) => {
                 let half = layout_unit((remaining / 2.0).max(0.0));
                 margin[3] = half;
@@ -366,11 +383,15 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
             }
             // Blink ResolveInlineAutoMargins: an auto start margin never
             // goes negative (CSS2 margin-auto-on-block-box, as in Chrome).
-            (true, false) => margin[3] = (remaining - margin[1]).max(0.0),
-            (false, true) => margin[1] = remaining - margin[3],
-            // Over-constrained, direction ltr: margin-right is ignored.
-            (false, false) => margin[1] = remaining - margin[3],
+            (true, false) => margin[start] = (remaining - margin[end]).max(0.0),
+            // Over-constrained: the end margin is ignored (CSS2 10.3.3).
+            (false, _) => margin[end] = remaining - margin[start],
         }
+    }
+    if space.rtl {
+        // The box is placed from the right edge; the left margin is the
+        // remainder (also when an auto width was floored at 0).
+        margin[3] = remaining - margin[1];
     }
     BoxMetrics {
         margin,
@@ -539,6 +560,8 @@ pub(super) fn layout_root(
         percentage_block: Some(viewport_h),
         viewport_w,
         viewport_h,
+        // The initial containing block takes the root element's direction.
+        rtl: flat[0].style.direction == TextDirection::Rtl,
     };
     let result = layout_block(flat, 0, &space, true)?;
     let metrics = resolve_inline(flat[0].style, &space);
@@ -610,6 +633,7 @@ pub(super) fn layout_block(
         },
         viewport_w: space.viewport_w,
         viewport_h: space.viewport_h,
+        rtl: style.direction == TextDirection::Rtl,
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;

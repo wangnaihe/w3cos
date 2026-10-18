@@ -1605,3 +1605,164 @@ fn atomic_inlines_align_to_the_line_box() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// direction: rtl without reordering: block children placed from the right
+/// edge (CSS2 10.3.3, Blink ResolveInlineAutoMargins against the container
+/// direction), and rtl IFCs of strong-L text (one UAX #9 level-2 run, so
+/// logical order) aligned start = right, overflowing lines start-aligned.
+/// Rects from Chrome (Ahem).
+#[test]
+fn rtl_blocks_and_lines_start_on_the_right() {
+    use w3cos_std::style::TextDirection;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let rtl = |mut style: Style| {
+        style.direction = TextDirection::Rtl;
+        style
+    };
+    let child = |width: Dimension, left: Spacing, right: Spacing, border: f32| {
+        Component::boxed(
+            rtl(Style {
+                display: Display::Block,
+                width,
+                height: Dimension::Px(10.0),
+                margin: Edges {
+                    left,
+                    right,
+                    ..Edges::default()
+                },
+                border_width: border,
+                ..Style::default()
+            }),
+            vec![],
+        )
+    };
+    let paragraph = |width: f32, align: TextAlign, ws: WhiteSpace, children: Vec<Component>| {
+        let mut style = rtl(Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            text_align: align,
+            white_space: ws,
+            ..Style::default()
+        });
+        font(&mut style, 20.0, n1);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        Component::boxed(style, children)
+    };
+    let text = |content: &str, ws: WhiteSpace| {
+        let mut style = rtl(Style {
+            display: Display::Inline,
+            white_space: ws,
+            ..Style::default()
+        });
+        font(&mut style, 20.0, n1);
+        Component::text(content, style)
+    };
+    let normal = WhiteSpace::Normal;
+    let mut span = rtl(Style {
+        display: Display::Inline,
+        ..Style::default()
+    });
+    font(&mut span, 20.0, n1);
+    span.padding.left = Spacing::Px(5.0);
+    let px = Spacing::Px;
+    let zero = px(0.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                rtl(Style {
+                    display: Display::Block,
+                    width: Dimension::Px(300.0),
+                    height: Dimension::Px(10.0),
+                    ..Style::default()
+                }),
+                vec![
+                    child(Dimension::Px(100.0), zero, px(20.0), 0.0),
+                    child(Dimension::Px(100.0), px(30.0), zero, 0.0),
+                    child(Dimension::Px(100.0), px(10.0), Spacing::Auto, 0.0),
+                    child(Dimension::Px(400.0), zero, zero, 0.0),
+                    child(Dimension::Auto, px(5.0), px(20.0), 2.0),
+                ],
+            ),
+            paragraph(
+                300.0,
+                TextAlign::Start,
+                normal,
+                vec![
+                    text("AA ", normal),
+                    Component::boxed(span, vec![text("BB", normal)]),
+                    text(" CC", normal),
+                ],
+            ),
+            paragraph(
+                300.0,
+                TextAlign::End,
+                normal,
+                vec![text("AA ", normal), text("BB", normal)],
+            ),
+            paragraph(
+                50.0,
+                TextAlign::Start,
+                WhiteSpace::NoWrap,
+                vec![
+                    text("AAAA ", WhiteSpace::NoWrap),
+                    text("BB", WhiteSpace::NoWrap),
+                ],
+            ),
+            paragraph(
+                100.0,
+                TextAlign::Start,
+                normal,
+                vec![
+                    text("AAA ", normal),
+                    text("BBB ", normal),
+                    text("CC", normal),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 21] = [
+        (1, [0.0, 0.0, 300.0, 10.0]),
+        (2, [180.0, 0.0, 100.0, 10.0]),
+        (3, [200.0, 10.0, 100.0, 10.0]),
+        (4, [10.0, 20.0, 100.0, 10.0]),
+        (5, [-100.0, 30.0, 400.0, 10.0]),
+        (6, [5.0, 40.0, 275.0, 14.0]),
+        (7, [0.0, 10.0, 300.0, 20.0]),
+        (8, [135.0, 10.0, 60.0, 20.0]),
+        (9, [195.0, 10.0, 45.0, 20.0]),
+        (10, [200.0, 10.0, 40.0, 20.0]),
+        (11, [240.0, 10.0, 60.0, 20.0]),
+        (12, [0.0, 30.0, 300.0, 20.0]),
+        (13, [0.0, 30.0, 60.0, 20.0]),
+        (14, [60.0, 30.0, 40.0, 20.0]),
+        (15, [0.0, 50.0, 50.0, 20.0]),
+        (16, [-90.0, 50.0, 100.0, 20.0]),
+        (17, [10.0, 50.0, 40.0, 20.0]),
+        (18, [0.0, 70.0, 100.0, 60.0]),
+        (19, [40.0, 70.0, 60.0, 20.0]),
+        (20, [40.0, 90.0, 60.0, 20.0]),
+        (21, [60.0, 110.0, 40.0, 20.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

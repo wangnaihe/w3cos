@@ -64,6 +64,10 @@ pub(crate) struct ConstraintSpace {
     pub percentage_block: Option<f32>,
     pub viewport_w: f32,
     pub viewport_h: f32,
+    /// The containing block's direction is rtl: CSS2 10.3.3 resolves auto
+    /// and over-constrained inline margins from its inline-start (right)
+    /// edge (Blink ResolveInlineAutoMargins with the container style).
+    pub rtl: bool,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.

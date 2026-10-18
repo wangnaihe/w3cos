@@ -120,8 +120,10 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
     if style.position != Position::Static || style.float != Float::None {
         return Some("text:positioned");
     }
-    if style.direction != TextDirection::Ltr {
-        return Some("direction");
+    // (direction is the container's concern; embeddings and overrides need
+    // bidi reordering.)
+    if style.unicode_bidi != w3cos_std::style::UnicodeBidi::Normal {
+        return Some("unicode-bidi");
     }
     // Without a newline (the content gate): pre is one preserved unwrapped
     // line, pre-wrap wraps with hanging preserved spaces, pre-line equals
@@ -157,6 +159,16 @@ fn latin1(content: &str) -> bool {
         let control = c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c);
         // (Newlines are gated by the content checks.)
         ((c as u32) < 0x100 && !control) || matches!(c, '\n' | '\u{2028}' | '\u{2029}')
+    })
+}
+
+/// Strong left-to-right (bidi class L) Latin-1 letters and spaces only.
+fn strong_ltr(content: &str) -> bool {
+    content.chars().all(|c| {
+        c == ' '
+            || c.is_ascii_alphabetic()
+            || matches!(c, '\u{aa}' | '\u{b5}' | '\u{ba}')
+            || (('\u{c0}'..='\u{ff}').contains(&c) && c != '\u{d7}' && c != '\u{f7}')
     })
 }
 
@@ -296,9 +308,30 @@ impl InlineEdges {
 }
 
 /// An inline text leaf inside an IFC container.
-fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'static str> {
+fn inline_text_reason(
+    content: &str,
+    style: &Style,
+    sole: bool,
+    container: &Style,
+) -> Option<&'static str> {
     if style.display != Display::Inline {
         return Some("text:display");
+    }
+    if style.direction != container.direction {
+        return Some("direction");
+    }
+    // An rtl paragraph (UAX #9 paragraph level 1): paint orders a paragraph
+    // leaf itself; word items keep their logical order only when every
+    // character is strong L or a space between them (one level-2 run,
+    // rules W/N/I; line-end spaces are removed).
+    let paragraph = sole && has_marker(style, LINE_WIDTH_MARKER);
+    if container.direction == TextDirection::Rtl && !paragraph {
+        if !strong_ltr(content) {
+            return Some("bidi:neutral");
+        }
+        if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
+            return Some("bidi:white-space");
+        }
     }
     if !zero_edges(style)
         && (has_marker(style, LINE_WIDTH_MARKER) || !inline_edges_supported(content, style))
@@ -481,7 +514,9 @@ fn inline_box_reason(
     if style.position != Position::Static || style.float != Float::None {
         return Some("text:positioned");
     }
-    if style.direction != TextDirection::Ltr {
+    if style.direction != container.direction
+        || style.unicode_bidi != w3cos_std::style::UnicodeBidi::Normal
+    {
         return Some("direction");
     }
     if style.white_space != container.white_space {
@@ -607,6 +642,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             return Some("vertical-align-nested");
         }
         if is_atomic_inline(flat, child) {
+            // An atomic is a neutral (U+FFFC): next to the rtl paragraph's
+            // sos/eos it resolves to level 1 and moves (UAX #9 N1/N2).
+            if style.direction == TextDirection::Rtl {
+                return Some("bidi:atomic");
+            }
             // Validated by the block gate (node_reason).
             continue;
         }
@@ -619,7 +659,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if info.style.white_space != style.white_space {
             return Some("text:white-space");
         }
-        if let Some(reason) = inline_text_reason(content, info.style, sole) {
+        if let Some(reason) = inline_text_reason(content, info.style, sole, style) {
             return Some(reason);
         }
         if content == FORCED_BREAK {
@@ -811,12 +851,32 @@ struct Line {
     subtrees: Vec<(usize, bool, f32, f32)>,
 }
 
+/// NGLineBoxFragmentBuilder alignment offset; `start` / `end` follow the
+/// container's direction, and an overflowing line is start-aligned (CSS
+/// Text 3 6.1), which in rtl puts it left of the content box.
 fn align_offset(style: &Style, free: f32) -> f32 {
-    let free = free.max(0.0);
+    let rtl = style.direction == TextDirection::Rtl;
+    if free < 0.0 {
+        return if rtl { free } else { 0.0 };
+    }
     match style.text_align {
         TextAlign::Center => w3cos_std::style::used_box_spacing(free / 2.0),
-        TextAlign::Right | TextAlign::End => free,
-        _ => 0.0,
+        TextAlign::Right => free,
+        TextAlign::Left => 0.0,
+        TextAlign::Start | TextAlign::Justify => {
+            if rtl {
+                free
+            } else {
+                0.0
+            }
+        }
+        TextAlign::End => {
+            if rtl {
+                0.0
+            } else {
+                free
+            }
+        }
     }
 }
 
