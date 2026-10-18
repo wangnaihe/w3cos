@@ -5087,6 +5087,20 @@ export function poly(a: number, b: number, c: number): number {
   for (let i = 0; i < 10; i++) acc = acc * a + b - c / (i + 1);
   return acc;
 }
+export function compound(n: number): number {
+  const o: any = { x: 1, get y() { return this.x * 2; }, set y(v: number) { this.x = v; } };
+  for (let i = 0; i < n; i++) { o.x += i; o.y += 1; }
+  return o.x;
+}
+export function perIter(n: number): number {
+  const fs: any[] = [];
+  for (let i = 0; i < n; i++) fs.push(() => i);
+  return fs[0]() * 100 + fs[1]() * 10 + fs[2]();
+}
+export function mathIdentity(): boolean {
+  (Math as any).__w3cosProbe = 5;
+  return Math === Math && (Math as any).__w3cosProbe === 5 && Math.sqrt(16) === 4;
+}
 "#,
         )
         .unwrap();
@@ -5180,6 +5194,12 @@ fn main() {
     let typed = num(m0::m0_poly(vec![n(1.5), n(2.0), n(3.0)]));
     let generic = num(m0::m0_poly(vec![s("1.5"), n(2.0), n(3.0)]));
     assert_eq!(typed.to_bits(), generic.to_bits(), "typed {typed} vs generic {generic}");
+
+    // Multi-use receiver borrow keeps accessor order; per-iteration `let`
+    // cells still refresh when a closure captures them; Math is a singleton.
+    assert_eq!(num(m0::m0_compound(vec![n(3.0)])), 23.0);
+    assert_eq!(num(m0::m0_perIter(vec![n(3.0)])), 12.0);
+    assert!(m0::m0_mathIdentity(vec![]).to_bool());
 
     let stats = w3cos_core::typed::stats();
     println!("TYPED_STATS typed={} guard_failures={}", stats.typed, stats.guard_failures);

@@ -4324,7 +4324,168 @@ fn fuse_private_binding_loads(
         fused.insert(current);
         index = next + 1;
     }
+    fuse_multi_use_binding_loads(
+        instructions,
+        emitted,
+        exception_target,
+        mode,
+        storage,
+        plan,
+        &private,
+        &reads,
+        &mut fused,
+        &mut prewrapped,
+    );
     (fused, prewrapped)
+}
+
+/// Rewrites one use of `register` in `text` to read `&{local}.0`. Returns
+/// `None` when the register is used in any other way (moved, cloned,
+/// captured), which keeps the ordinary load.
+fn borrow_register_use(text: &str, register: u32, local: &str) -> Option<String> {
+    if text.contains("move |") || text.contains("move||") {
+        return None;
+    }
+    let mut replaced = text.to_string();
+    for method in [
+        "get_property(",
+        "get_property_ic(",
+        "get_property_checked_ic(",
+        "call_method_slice(",
+    ] {
+        replaced = replaced.replace(
+            &format!(
+                "std::mem::replace(&mut self.registers[{register}], w3cos_core::Value::Undefined).{method}"
+            ),
+            &format!("(&{local}.0).{method}"),
+        );
+        replaced = replaced.replace(
+            &format!("self.registers[{register}].{method}"),
+            &format!("(&{local}.0).{method}"),
+        );
+    }
+    replaced = replaced.replace(
+        &format!("&self.registers[{register}]"),
+        &format!("&{local}.0"),
+    );
+    if !replaced.contains(local) || replaced.contains(&format!("self.registers[{register}]")) {
+        return None;
+    }
+    Some(replaced)
+}
+
+/// Multi-use variable-read borrow (typed W3IR follow-up, nbody): a
+/// `LoadBinding` of a private local whose register is only read later in the
+/// same instruction sequence (e.g. `bi.vx -= ...` reads `bi` as the receiver
+/// of both the get and the set) is replaced by its TDZ check, and every use
+/// borrows the binding cell in place. That saves a retain + release of the
+/// receiver object per load.
+///
+/// Sound for the same reason as [`fuse_private_binding_loads`]: only this
+/// function's own binding instructions can write a private cell, so as long
+/// as none of them targets the binding and nothing rewrites the register
+/// between the load and its last use, every use sees the loaded value.
+#[allow(clippy::too_many_arguments)]
+fn fuse_multi_use_binding_loads(
+    instructions: &[Instruction],
+    emitted: &mut [String],
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    mode: EmissionMode,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+    private: &HashSet<u32>,
+    reads: &HashMap<u32, usize>,
+    fused: &mut HashSet<usize>,
+    prewrapped: &mut HashSet<usize>,
+) {
+    for current in 0..instructions.len() {
+        let Instruction::LoadBinding { dst, binding } = &instructions[current] else {
+            continue;
+        };
+        let total = reads.get(&dst.0).copied().unwrap_or(0);
+        if total < 2
+            || fused.contains(&current)
+            || prewrapped.contains(&current)
+            || !private.contains(&binding.0)
+            || is_shared_number(binding.0)
+            || num_binding_slot(plan, binding.0).is_some()
+            || plan.constants.contains_key(&binding.0)
+            || val_slot(plan, dst.0).is_none()
+        {
+            continue;
+        }
+        let mut uses = Vec::new();
+        let mut found = 0;
+        let mut ok = true;
+        for next in current + 1..instructions.len() {
+            let instruction = &instructions[next];
+            let count = read_registers(instruction)
+                .iter()
+                .filter(|register| **register == dst.0)
+                .count();
+            let writes_binding = matches!(
+                instruction,
+                Instruction::StoreBinding { binding: written, .. }
+                    | Instruction::InitializeBinding { binding: written, .. }
+                    | Instruction::RefreshBinding { binding: written }
+                    if written.0 == binding.0
+            );
+            if count > 0 {
+                if writes_binding
+                    || matches!(instruction, Instruction::CreateClosure { .. })
+                    || fused.contains(&next)
+                    || prewrapped.contains(&next)
+                {
+                    ok = false;
+                    break;
+                }
+                uses.push(next);
+                found += count;
+            }
+            if found >= total {
+                break;
+            }
+            if writes_binding || written_register(instruction).is_some_and(|r| r.0 == dst.0) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok || found != total || uses.is_empty() {
+            continue;
+        }
+        let register = val_index(plan, dst.0);
+        let local = format!("__w3cos_bound_{register}");
+        let Some(rewritten) = uses
+            .iter()
+            .map(|index| borrow_register_use(&emitted[*index], register, &local))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let cell = emit_binding_get(storage, binding.0);
+        let propagate = emit_exception_propagation(exception_target, mode, plan);
+        let tdz = format!(
+            "let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate}"
+        );
+        for (index, mut text) in uses.iter().copied().zip(rewritten) {
+            if exception_target.is_some()
+                && !is_direct_control_flow(&instructions[index], mode)
+                && !handles_own_exceptions(&instructions[index])
+            {
+                text = emit_caught_stmt(&text, exception_target, plan);
+            }
+            // The TDZ check already ran at the load; the cell is present and
+            // initialized from here on.
+            emitted[index] = format!(
+                "match {cell} {{ Some(__w3cos_cell) => {{ let {local} = __w3cos_cell.borrow(); {text} }} None => {{ {tdz} }} }}"
+            );
+            prewrapped.insert(index);
+        }
+        emitted[current] = format!(
+            "match {cell} {{ Some(__w3cos_cell) => {{ if !__w3cos_cell.borrow().1 {{ {tdz} }} }} None => {{ {tdz} }} }}"
+        );
+        prewrapped.insert(current);
+    }
 }
 
 fn fnv1a(text: &str) -> u64 {
