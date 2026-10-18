@@ -296,6 +296,58 @@ fn to_uint16(value: &Value) -> u16 {
     (number.trunc().rem_euclid(65536.0)) as u16
 }
 
+/// Hidden slot holding a `String` wrapper's primitive ([[StringData]]).
+const STRING_DATA: &str = "__w3cos_string_data";
+
+pub(crate) fn string_wrapper_data(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if !object.borrow().has_own_property(STRING_DATA) {
+        return None;
+    }
+    let data = value.get_property(STRING_DATA);
+    data.is_string().then_some(data)
+}
+
+/// Whether `value` is the realm's `String` constructor (without creating it).
+pub(crate) fn is_string_constructor(value: &Value) -> bool {
+    STRING_CONSTRUCTOR.with(|slot| slot.borrow().as_ref().is_some_and(|ctor| ctor == value))
+}
+
+/// `new String(value)`: an object inheriting `String.prototype` with
+/// enumerable index properties and a non-enumerable `length`.
+pub(crate) fn string_wrapper(arguments: &[Value]) -> Value {
+    let data = arguments
+        .first()
+        .map(Value::to_js_string)
+        .unwrap_or_default();
+    let units: Vec<u16> = data.encode_utf16().collect();
+    let mut properties = HashMap::new();
+    for (index, unit) in units.iter().enumerate() {
+        properties.insert(
+            index.to_string(),
+            Value::from(String::from_utf16_lossy(&[*unit])),
+        );
+    }
+    let wrapper = Value::object(properties);
+    for (key, value) in [
+        ("length", Value::Number(units.len() as f64)),
+        (STRING_DATA, Value::from(data)),
+    ] {
+        crate::class::define_property(
+            &wrapper,
+            key,
+            &Value::object(HashMap::from([
+                ("value".into(), value),
+                ("writable".into(), Value::Bool(false)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(false)),
+            ])),
+        );
+    }
+    crate::class::set_prototype_of(&wrapper, &string_value().get_property("prototype"));
+    wrapper
+}
+
 /// The `String` constructor (one per realm, shared by AOT code and the
 /// jsdom window so `String.prototype` has a single identity).
 pub fn string_value() -> Value {
@@ -320,6 +372,8 @@ fn build_string_value() -> Value {
             }
             let receiver = if this.is_string() {
                 this
+            } else if let Some(data) = string_wrapper_data(&this) {
+                data
             } else {
                 Value::from(this.to_js_string())
             };
@@ -331,6 +385,8 @@ fn build_string_value() -> Value {
         let method = native_function(name, 0, move |this, _| {
             if this.is_string() {
                 this
+            } else if let Some(data) = string_wrapper_data(&this) {
+                data
             } else {
                 crate::throw_value(crate::value::type_error(&format!(
                     "String.prototype.{name} requires that 'this' be a String"
@@ -420,6 +476,27 @@ fn build_string_value() -> Value {
     constructor
 }
 
+/// `Array.prototype` methods implemented natively for arrays (see
+/// `array_call_method`); only names it handles, so dispatch cannot loop.
+const ARRAY_METHODS: &[(&str, u32)] = &[
+    ("at", 1),
+    ("concat", 1),
+    ("every", 1),
+    ("find", 1),
+    ("findIndex", 1),
+    ("flat", 0),
+    ("flatMap", 1),
+    ("includes", 1),
+    ("indexOf", 1),
+    ("join", 1),
+    ("lastIndexOf", 1),
+    ("map", 1),
+    ("reduce", 1),
+    ("reduceRight", 1),
+    ("slice", 2),
+    ("some", 1),
+];
+
 pub fn array_value() -> Value {
     ARRAY_CONSTRUCTOR.with(|slot| {
         if let Some(value) = slot.borrow().clone() {
@@ -446,6 +523,22 @@ fn build_array_value() -> Value {
         Value::function(|_, arguments| Value::array(arguments)),
     );
     let prototype = Value::object(HashMap::new());
+    // Non-mutating methods dispatch to the native array implementation;
+    // array-likes run against a snapshot.
+    for &(name, length) in ARRAY_METHODS {
+        let method = native_function(name, length, move |this, arguments| {
+            if this.is_array() {
+                return this.call_method(name, arguments);
+            }
+            if this.is_nullish() {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "Array.prototype.{name} called on null or undefined"
+                )));
+            }
+            Value::array(array_like_snapshot(&this)).call_method(name, arguments)
+        });
+        define_builtin(&prototype, name, method);
+    }
     let values = Value::function(|this, _| live_array_like_values_iterator(this));
     prototype.set_property("values", values.clone());
     prototype.set_property("__w3cos_symbol_iterator", values);

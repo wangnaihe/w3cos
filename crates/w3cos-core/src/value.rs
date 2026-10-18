@@ -2121,6 +2121,9 @@ impl Value {
             }
             ValueUnpack::Number(n) => n,
             ValueUnpack::String(s) => s.parse::<f64>().unwrap_or(f64::NAN),
+            ValueUnpack::Object(_) => {
+                crate::builtins::string_wrapper_data(self).map_or(f64::NAN, |data| data.to_number())
+            }
             _ => f64::NAN,
         }
     }
@@ -2171,7 +2174,7 @@ impl Value {
             }
             ValueUnpack::Object(_) => {
                 let to_string = self.get_property("toString");
-                if to_string.is_function() {
+                if to_string.is_callable() {
                     if let Some(value) = to_string.call(self.clone(), vec![]).as_js_string() {
                         return value.as_str().to_string();
                     }
@@ -4515,6 +4518,15 @@ impl Value {
             }
             (ValueUnpack::Bool(_), _) => Value::Number(self.to_number()).abstract_eq(other),
             (_, ValueUnpack::Bool(_)) => self.abstract_eq(&Value::Number(other.to_number())),
+            // ToPrimitive on a `String` wrapper yields its [[StringData]].
+            (ValueUnpack::Object(_), ValueUnpack::String(_) | ValueUnpack::Number(_)) => {
+                crate::builtins::string_wrapper_data(self)
+                    .is_some_and(|data| data.abstract_eq(other))
+            }
+            (ValueUnpack::String(_) | ValueUnpack::Number(_), ValueUnpack::Object(_)) => {
+                crate::builtins::string_wrapper_data(other)
+                    .is_some_and(|data| self.abstract_eq(&data))
+            }
             _ => false,
         }
     }

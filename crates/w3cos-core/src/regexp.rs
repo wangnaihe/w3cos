@@ -146,6 +146,28 @@ pub fn regexp_class() -> Value {
             create_with_prototype(&source, &flags, &constructor_prototype)
         });
         prototype.set_property("constructor", class.clone());
+        // `RegExp.prototype.exec` / `test` for borrowed receivers
+        // (`RegExp.prototype.exec.call(re, s)`); instances own their methods.
+        let exec = crate::builtins::native_function("exec", 1, |this, args| {
+            let Some((source, flags)) = parts(&this) else {
+                crate::throw_value(crate::value::type_error(
+                    "RegExp.prototype.exec called on incompatible receiver",
+                ));
+            };
+            let input = args.first().cloned().unwrap_or_default().to_js_string();
+            exec_pattern_with_receiver(&this, &input, &source, &flags)
+        });
+        let test = crate::builtins::native_function("test", 1, |this, args| {
+            let Some((source, flags)) = parts(&this) else {
+                crate::throw_value(crate::value::type_error(
+                    "RegExp.prototype.test called on incompatible receiver",
+                ));
+            };
+            let input = args.first().cloned().unwrap_or_default().to_js_string();
+            Value::Bool(!exec_pattern_with_receiver(&this, &input, &source, &flags).is_null())
+        });
+        crate::builtins::define_builtin(&prototype, "exec", exec);
+        crate::builtins::define_builtin(&prototype, "test", test);
         class.set_property("prototype", prototype);
         *cell.borrow_mut() = Some(class.clone());
         class

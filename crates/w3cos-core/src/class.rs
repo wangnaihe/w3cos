@@ -140,6 +140,9 @@ pub fn construct_slice(class_value: &Value, args: &[Value]) -> Value {
 }
 
 fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
+    if crate::builtins::is_string_constructor(class_value) {
+        return crate::builtins::string_wrapper(&args);
+    }
     if class_value.as_object().is_some() {
         return class_value.call(Value::Undefined, args);
     }
