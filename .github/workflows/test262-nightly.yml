@@ -1,0 +1,44 @@
+# Nightly / manual full test262 run for the aot-port branch (M1 item 14).
+#
+# GitHub only runs `schedule` and `workflow_dispatch` from the default branch
+# (main). The test262 runner and the PR subset gate live on aot-port
+# (`.github/workflows/test262.yml`, `scripts/test262.sh`); this file is the
+# main-branch trigger so the nightly full run actually fires. It always checks
+# out `aot-port` and does not change any code on main.
+name: test262 (nightly, aot-port)
+
+on:
+  schedule:
+    # 19:00 UTC = 03:00 Asia/Shanghai, after the leak soak starts.
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: test262-aot-port
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: aot-port
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test262 full run (built-ins + language + annexB)
+        run: scripts/test262.sh full --jobs 4 --build-jobs 2 --timeout 30
+      - name: Summary
+        if: always()
+        run: cat target/test262-report/full.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-full-${{ github.run_id }}
+          path: target/test262-report
+          if-no-files-found: ignore
