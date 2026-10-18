@@ -9,6 +9,8 @@ pub mod host_modules;
 pub mod intrinsics;
 pub mod js_string;
 pub mod json;
+#[cfg(feature = "leak-detector")]
+pub mod leak_detector;
 pub mod module_registry;
 mod object;
 pub mod page_arena;

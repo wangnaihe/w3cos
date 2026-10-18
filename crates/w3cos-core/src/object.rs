@@ -826,3 +826,66 @@ mod tests {
         assert!(child.get_direct("missing").is_undefined());
     }
 }
+
+#[cfg(feature = "leak-detector")]
+impl JsObject {
+    /// Visible strong edges for [`crate::leak_detector`]; returns `true` when
+    /// part of the object (a proxy handler) cannot be enumerated.
+    pub(crate) fn leak_edges(
+        &self,
+        out: &mut Vec<(String, crate::leak_detector::LeakTarget)>,
+    ) -> bool {
+        use crate::value::leak_edges::push_value;
+        for key in self.properties.keys() {
+            if let Some(value) = self.properties.get(key.as_str()) {
+                push_value(out, format!(".{}", key.as_str()), value);
+            }
+        }
+        if let Some(prototype) = &self.prototype {
+            out.push(("[[Prototype]]".to_string(), prototype.leak_target()));
+        }
+        if let Some(call) = &self.call_slot {
+            out.push((
+                "[[Call]]".to_string(),
+                crate::leak_detector::LeakTarget::HostFunction(
+                    std::rc::Rc::as_ptr(call),
+                    std::rc::Rc::strong_count(call) as u32,
+                ),
+            ));
+        }
+        if let Some(rare) = &self.rare {
+            for (_, a, b) in &rare.pending_class_initializers {
+                push_value(out, "[[PendingInitializer]]".to_string(), a);
+                push_value(out, "[[PendingInitializer]]".to_string(), b);
+            }
+            let mut private = rare.private_elements.iter().collect::<Vec<_>>();
+            private.sort_by(|a, b| a.0.1.cmp(&b.0.1));
+            for ((_, name), element) in private {
+                match element {
+                    PrivateElement::Field(value) | PrivateElement::Method(value) => {
+                        push_value(out, format!(".#{name}"), value)
+                    }
+                    PrivateElement::Accessor { getter, setter } => {
+                        if let Some(getter) = getter {
+                            push_value(out, format!(".#{name} get"), getter);
+                        }
+                        if let Some(setter) = setter {
+                            push_value(out, format!(".#{name} set"), setter);
+                        }
+                    }
+                }
+            }
+        }
+        self.proxy_handler.is_some()
+    }
+
+    pub(crate) fn leak_keys(&self, limit: usize) -> (Vec<String>, usize) {
+        let keys = self
+            .properties
+            .keys()
+            .take(limit)
+            .map(|key| key.as_str().to_string())
+            .collect();
+        (keys, self.properties.len())
+    }
+}
