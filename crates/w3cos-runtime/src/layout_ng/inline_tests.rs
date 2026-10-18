@@ -1472,3 +1472,136 @@ fn inline_blocks_shrink_to_fit() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// Atomic inlines with `vertical-align: top | bottom` (their margin box is
+/// the aligned subtree) and text leaves the cascade gives `display:
+/// inline-block` (atomic block text leaves).  Rects from Chrome (Ahem).
+#[test]
+fn atomic_inlines_align_to_the_line_box() {
+    use w3cos_std::style::AlignSelf;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let container = || {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        Component::text(content, style)
+    };
+    let align = |style: &mut Style, top: bool| {
+        style.align_self = if top {
+            AlignSelf::FlexStart
+        } else {
+            AlignSelf::FlexEnd
+        };
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                inline::VALIGN_MARKER.into(),
+                if top { "top" } else { "bottom" }.into(),
+            );
+    };
+    let ib = |w: f32, h: f32, valign: Option<bool>| {
+        let mut style = Style {
+            display: Display::InlineBlock,
+            width: Dimension::Px(w),
+            height: Dimension::Px(h),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, n1);
+        if let Some(top) = valign {
+            align(&mut style, top);
+        }
+        Component::boxed(style, vec![])
+    };
+    let text_ib = |content: &str, size: f32, valign: Option<bool>| {
+        let mut style = Style {
+            display: Display::InlineBlock,
+            ..Style::default()
+        };
+        font(&mut style, size, n1);
+        if let Some(top) = valign {
+            align(&mut style, top);
+        }
+        Component::text(content, style)
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA"),
+                    ib(20.0, 50.0, Some(true)),
+                    text("BB"),
+                    ib(20.0, 30.0, Some(false)),
+                ],
+            ),
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA"),
+                    text_ib("xy", 10.0, None),
+                    text("B"),
+                    text_ib("C", 40.0, Some(true)),
+                ],
+            ),
+            Component::boxed(
+                container(),
+                vec![
+                    text("A"),
+                    text_ib("p q", 10.0, Some(false)),
+                    ib(10.0, 60.0, None),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 14] = [
+        (1, [0.0, 0.0, 300.0, 50.0]),
+        (2, [0.0, 0.0, 40.0, 20.0]),
+        (3, [40.0, 0.0, 20.0, 50.0]),
+        (4, [60.0, 0.0, 40.0, 20.0]),
+        (5, [100.0, 20.0, 20.0, 30.0]),
+        (6, [0.0, 50.0, 300.0, 40.0]),
+        (7, [0.0, 50.0, 40.0, 20.0]),
+        (8, [40.0, 58.0, 20.0, 10.0]),
+        (9, [60.0, 50.0, 20.0, 20.0]),
+        (10, [80.0, 50.0, 40.0, 40.0]),
+        (11, [0.0, 90.0, 300.0, 64.0]),
+        (12, [0.0, 134.0, 20.0, 20.0]),
+        (13, [20.0, 144.0, 30.0, 10.0]),
+        (14, [50.0, 90.0, 10.0, 60.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

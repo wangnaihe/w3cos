@@ -389,10 +389,15 @@ pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
 
 /// An inline-block box: an atomic inline (NGInlineItem kAtomicInline),
 /// laid out as its own block formatting context.
+/// A text leaf the cascade gives `display: inline-block` (an inline-block
+/// holding only text) is one too: a block text leaf as its own BFC.
 pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     matches!(
         flat[index].kind,
-        ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+        ComponentKind::Box
+            | ComponentKind::Column
+            | ComponentKind::Row
+            | ComponentKind::Text { .. }
     ) && flat[index].style.display == Display::InlineBlock
 }
 
@@ -409,17 +414,15 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
 
 /// Why an inline-block (its box and content checked by the block gate)
 /// is outside S2: auto inline margins are 0 for inline blocks;
-/// vertical-align other than baseline.  (A shrink-to-fit width whose
+/// vertical-align other than baseline, top or bottom.  (A shrink-to-fit width whose
 /// min-content size is unknown falls back at layout time.)
 pub(super) fn atomic_inline_reason(style: &Style) -> Option<&'static str> {
     use w3cos_std::style::Spacing;
     if matches!(style.margin.left, Spacing::Auto) || matches!(style.margin.right, Spacing::Auto) {
         return Some("inline-block:auto-margin");
     }
-    if valign_reason(style).is_some() || line_relative_align(style).is_some() {
-        return Some("vertical-align");
-    }
-    None
+    // top / bottom: its margin box is the aligned subtree (CSS 2.1 10.8.1).
+    valign_reason(style)
 }
 
 /// True when `index` sits (through inline boxes) in an IFC container.
@@ -600,12 +603,12 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             InlineEntry::Leaf(child) => child,
         };
         let info = &flat[child];
+        if line_relative_align(info.style).is_some() && !open.is_empty() {
+            return Some("vertical-align-nested");
+        }
         if is_atomic_inline(flat, child) {
             // Validated by the block gate (node_reason).
             continue;
-        }
-        if line_relative_align(info.style).is_some() && !open.is_empty() {
-            return Some("vertical-align-nested");
         }
         let ComponentKind::Text { content } = info.kind else {
             return Some("ifc:atomic-or-span");
@@ -963,6 +966,7 @@ pub(super) fn layout_inline(
     // Paragraph leaf: paint wraps the text inside the line-width rect.
     if !has_boxes
         && let [child] = children[..]
+        && !is_atomic_inline(flat, child)
         && has_marker(flat[child].style, LINE_WIDTH_MARKER)
     {
         let style = flat[child].style;
@@ -1020,6 +1024,7 @@ pub(super) fn layout_inline(
     // line's content box, as wide as the widest line and aligned by it.
     if !has_boxes
         && let [child] = children[..]
+        && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
         && content.contains('\n')
     {
@@ -1551,6 +1556,7 @@ pub(super) fn inline_min_max(
 ) -> Option<MinMax> {
     let entries = collect_inlines(flat, index);
     if let [InlineEntry::Leaf(child)] = entries[..]
+        && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
         && (has_marker(flat[child].style, LINE_WIDTH_MARKER) || content.contains('\n'))
     {
