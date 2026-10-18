@@ -9,8 +9,10 @@ export class Widget extends Disposable {
 		el.addEventListener('click', () => this.render());
 		el.addEventListener('keydown', this.onKey);
 		el.addEventListener('focus', () => this.render(), { once: true });
+		model.onDidChangeLanguage(() => this.render(), this, this.disposables);
 	}
 
+	private readonly disposables: IDisposable[] = [];
 	private onKey = (e: KeyboardEvent) => { };
 
 	render(): void { }

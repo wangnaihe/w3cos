@@ -1155,6 +1155,8 @@ impl Visit for Linter<'_> {
             if (is_event_registration(&name) || via_event)
                 && handler_like
                 && handler.spread.is_none()
+                // `event(listener, thisArgs, disposables)` registers through its third argument.
+                && call.args.len() < 3
             {
                 let captures = handler_captures_this(&handler.expr);
                 let fixable = captures && self.class().is_some_and(|c| c.register_available);
