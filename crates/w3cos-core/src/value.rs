@@ -5621,6 +5621,95 @@ mod tests {
     }
 
     #[test]
+    fn iterating_an_array_frees_the_iterator_and_its_source_afterwards() {
+        // Regression: `[Symbol.iterator]` used to capture a clone of the
+        // iterator object, so every for...of leaked the iterator, its `next`
+        // closure, the source array and all of its elements.
+        crate::page_arena::reset();
+        let live = || {
+            crate::page_arena::live_objects()
+                + crate::page_arena::live_arrays()
+                + crate::page_arena::live_functions()
+        };
+        // The first iteration lazily builds shared, realm-lifetime state
+        // (Array.prototype and friends); that is legitimately retained until
+        // reset, so the baseline is taken after one warm-up round.
+        let mut base = None;
+        for _ in 0..4 {
+            let items = Value::array(
+                (0..16)
+                    .map(|i| crate::js_object! { "i" => Value::Number(i as f64) })
+                    .collect(),
+            );
+            let iterator = items.call_method("__w3cos_symbol_iterator", Vec::new());
+            let again = iterator.call_method("__w3cos_symbol_iterator", Vec::new());
+            assert!(
+                matches!((iterator.as_object(), again.as_object()), (Some(a), Some(b)) if a.ptr_eq(&b)),
+                "an iterator's [Symbol.iterator]() returns the iterator itself"
+            );
+            drop(again);
+            let mut sum = 0.0;
+            loop {
+                let step = iterator.call_method("next", Vec::new());
+                if step.get_property("done").to_bool() {
+                    break;
+                }
+                sum += step.get_property("value").get_property("i").to_number();
+            }
+            assert_eq!(sum, 120.0);
+            drop(iterator);
+            drop(items);
+            let base = *base.get_or_insert_with(live);
+            assert_eq!(live(), base, "iterator, array and elements are all freed");
+        }
+        crate::page_arena::reset();
+    }
+
+    #[test]
+    fn generic_iterator_object_does_not_retain_itself_or_its_source() {
+        // `iterator_object` backs for...of over values without their own
+        // `[Symbol.iterator]`; it must not capture itself either.
+        crate::page_arena::reset();
+        let live = || {
+            crate::page_arena::live_objects()
+                + crate::page_arena::live_arrays()
+                + crate::page_arena::live_functions()
+        };
+        let mut base = None;
+        for _ in 0..3 {
+            let items = Value::array(
+                (0..8)
+                    .map(|i| crate::js_object! { "i" => Value::Number(i as f64) })
+                    .collect(),
+            );
+            let iterator = iterator_object(items.iter());
+            drop(items);
+            let again = iterator.call_method("__w3cos_symbol_iterator", Vec::new());
+            assert!(
+                matches!((iterator.as_object(), again.as_object()), (Some(a), Some(b)) if a.ptr_eq(&b))
+            );
+            drop(again);
+            let mut count = 0;
+            while !iterator
+                .call_method("next", Vec::new())
+                .get_property("done")
+                .to_bool()
+            {
+                count += 1;
+            }
+            assert_eq!(count, 8);
+            drop(iterator);
+            let base = *base.get_or_insert_with(live);
+            assert_eq!(
+                live(),
+                base,
+                "the generic iterator and its source are freed"
+            );
+        }
+        crate::page_arena::reset();
+    }
+
+    #[test]
     fn array_handle_clone_does_not_increase_rc_and_reset_empties_table() {
         crate::page_arena::reset();
         let arr = Value::array(vec![Value::Number(1.0), Value::Number(2.0)]);

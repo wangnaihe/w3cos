@@ -5397,6 +5397,118 @@ fn main() {
     }
 
     #[test]
+    fn generated_bundle_returns_live_objects_to_baseline_after_each_call() {
+        // Regression for the realistic-sample leak: every for...of left its
+        // iterator (and the iterated array with all elements) alive through an
+        // iterator -> [Symbol.iterator] closure -> iterator cycle. Generators
+        // had the same self-capture. After a warm-up call (which may build
+        // module-level / prototype state that legitimately lives until reset)
+        // repeated calls must not grow the live set.
+        let root = fixture_root("w3cos_esm_codegen_leak_baseline");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"class Point {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) { this.x = x; this.y = y; }
+  len(): number { return this.x * this.x + this.y * this.y; }
+}
+export function forOf(n: number): number {
+  const items: any[] = [];
+  for (let i = 0; i < n; i++) items.push({ v: i });
+  let sum = 0;
+  for (const item of items) sum += item.v;
+  return sum;
+}
+export function nestedForOf(n: number): number {
+  const rows: any[] = [];
+  for (let i = 0; i < n; i++) rows.push([i, i + 1]);
+  let sum = 0;
+  for (const row of rows) for (const cell of row) sum += cell;
+  return sum;
+}
+function* count(n: number) {
+  for (let i = 0; i < n; i++) yield { i };
+}
+export function generator(n: number): number {
+  let sum = 0;
+  for (const item of count(n)) sum += item.i;
+  return sum;
+}
+export function classes(n: number): number {
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += new Point(i, 1).len();
+  return sum;
+}
+export function pipeline(n: number): number {
+  const xs: number[] = [];
+  for (let i = 0; i < n; i++) xs.push(i);
+  return xs.map((x) => ({ x })).filter((o) => o.x % 2 === 0).reduce((a, o) => a + o.x, 0);
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::{page_arena, Value};
+    let _ = run_entry();
+    let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
+    macro_rules! steady {
+        ($name:expr, $f:expr, $arg:expr, $expect:expr) => {{
+            assert_eq!($f(vec![Value::Number($arg)]).to_number(), $expect, "{} result", $name);
+            let base = live();
+            for _ in 0..5 {
+                assert_eq!($f(vec![Value::Number($arg)]).to_number(), $expect, "{} result", $name);
+            }
+            assert_eq!(live(), base, "{} must not grow the live set: {} -> {}", $name, base, live());
+        }};
+    }
+    steady!("forOf", m0::m0_forOf, 100.0, 4950.0);
+    steady!("nestedForOf", m0::m0_nestedForOf, 50.0, 2500.0);
+    steady!("generator", m0::m0_generator, 100.0, 4950.0);
+    steady!("classes", m0::m0_classes, 10.0, 295.0);
+    steady!("pipeline", m0::m0_pipeline, 100.0, 2450.0);
+    println!("W3COS_LEAK_BASELINE_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("W3COS_LEAK_BASELINE_OK"),
+            "leak baseline bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn generated_bundle_runs_jsdom_globals() {
         let root = fixture_root("w3cos_esm_codegen_globals_jsdom");
         std::fs::create_dir_all(root.join("src")).unwrap();
