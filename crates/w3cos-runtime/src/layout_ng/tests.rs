@@ -833,3 +833,164 @@ fn positioned_boxes_match_chrome() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// S3b floats and clearance (Chrome rects of the equivalent page):
+/// pending margins stay below a float, a float that does not fit moves to
+/// the next float bottom, clearance only when the hypothetical position is
+/// above the clear offset, a nested float at its BFC offset, and the BFC
+/// root's height includes floats.
+#[test]
+fn floats_and_clearance_match_chrome() {
+    use w3cos_std::style::{Clear, Dimension as D, Display, Edges, Float, Spacing as S, Style};
+    let px = D::Px;
+    let z = S::Px(0.0);
+    let block = |w: D, h: f32, float: Float, clear: Clear, mt: f32, mb: f32| Style {
+        display: Display::Block,
+        width: w,
+        height: px(h),
+        float,
+        clear,
+        margin: Edges {
+            top: S::Px(mt),
+            right: z,
+            bottom: S::Px(mb),
+            left: z,
+        },
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let (n, l, r) = (Float::None, Float::Left, Float::Right);
+    let auto = D::Auto;
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            width: px(300.0),
+            ..Style::default()
+        },
+        vec![
+            leaf(block(auto, 10.0, n, Clear::None, 0.0, 20.0)),
+            leaf(block(px(50.0), 30.0, l, Clear::None, 0.0, 0.0)),
+            leaf(block(auto, 10.0, n, Clear::None, 50.0, 0.0)),
+            leaf(block(px(50.0), 30.0, l, Clear::None, 0.0, 0.0)),
+            leaf(block(px(100.0), 10.0, r, Clear::None, 0.0, 0.0)),
+            leaf(block(px(220.0), 10.0, l, Clear::None, 0.0, 0.0)),
+            leaf(block(auto, 10.0, n, Clear::Left, 5.0, 0.0)),
+            Component::boxed(
+                block(auto, 10.0, n, Clear::None, 5.0, 0.0),
+                vec![leaf(block(px(10.0), 10.0, r, Clear::None, 3.0, 0.0))],
+            ),
+            leaf(block(auto, 5.0, n, Clear::Both, 40.0, 0.0)),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 11] = [
+        (0, [0.0, 0.0, 300.0, 170.0]),
+        (1, [0.0, 0.0, 300.0, 10.0]),
+        (2, [0.0, 30.0, 50.0, 30.0]),
+        (3, [0.0, 60.0, 300.0, 10.0]),
+        (4, [0.0, 70.0, 50.0, 30.0]),
+        (5, [200.0, 70.0, 100.0, 10.0]),
+        (6, [50.0, 80.0, 220.0, 10.0]),
+        (7, [0.0, 100.0, 300.0, 10.0]),
+        (8, [0.0, 115.0, 300.0, 10.0]),
+        (9, [290.0, 118.0, 10.0, 10.0]),
+        (10, [0.0, 165.0, 300.0, 5.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// CSS2 9.5.1 rule 3 bounds a float by opposite floats even outside its
+/// containing block (floats-rule3-outside-left-001), and the hypothetical
+/// position of a cleared box includes margins collapsing through its
+/// parent (no-clearance-due-to-large-margin).
+#[test]
+fn float_rule3_and_collapsed_clearance_match_chrome() {
+    use w3cos_std::style::{Clear, Dimension as D, Display, Edges, Float, Spacing as S, Style};
+    let px = D::Px;
+    let z = S::Px(0.0);
+    let block = |w: D, h: D, float: Float| Style {
+        display: Display::Block,
+        width: w,
+        height: h,
+        float,
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let check = |root: &Component, expected: &[(usize, [f32; 4])]| {
+        let flat = pre_flatten(root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(root, &flat, 800.0, 600.0).expect("ng");
+        let mut bad = Vec::new();
+        for &(index, want) in expected {
+            let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+            if [r.x, r.y, r.width, r.height] != want {
+                bad.push(format!(
+                    "#{index}: {:?} want {want:?}",
+                    [r.x, r.y, r.width, r.height]
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    };
+    let mut narrow = block(D::Auto, D::Auto, Float::None);
+    narrow.margin = Edges {
+        top: z,
+        right: S::Px(100.0),
+        bottom: z,
+        left: z,
+    };
+    let rule3 = Component::boxed(
+        block(px(500.0), px(500.0), Float::None),
+        vec![
+            leaf(block(px(50.0), px(300.0), Float::Right)),
+            Component::boxed(narrow, vec![leaf(block(px(425.0), px(10.0), Float::Left))]),
+        ],
+    );
+    check(
+        &rule3,
+        &[
+            (1, [450.0, 0.0, 50.0, 300.0]),
+            (2, [0.0, 0.0, 400.0, 0.0]),
+            (3, [0.0, 0.0, 425.0, 10.0]),
+        ],
+    );
+    let mut padded = block(D::Auto, D::Auto, Float::None);
+    padded.padding.top = S::Px(1.0);
+    let mut cleared = block(D::Auto, px(10.0), Float::None);
+    cleared.clear = Clear::Left;
+    cleared.margin.top = S::Px(150.0);
+    let collapsed = Component::boxed(
+        block(px(300.0), D::Auto, Float::None),
+        vec![
+            leaf(block(px(100.0), px(100.0), Float::Left)),
+            Component::boxed(
+                padded,
+                vec![Component::boxed(
+                    block(D::Auto, D::Auto, Float::None),
+                    vec![leaf(cleared)],
+                )],
+            ),
+        ],
+    );
+    check(
+        &collapsed,
+        &[
+            (1, [0.0, 0.0, 100.0, 100.0]),
+            (2, [0.0, 0.0, 300.0, 161.0]),
+            (3, [0.0, 151.0, 300.0, 10.0]),
+            (4, [0.0, 151.0, 300.0, 10.0]),
+        ],
+    );
+}

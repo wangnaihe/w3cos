@@ -14,7 +14,7 @@
 //! the box's fragment.
 
 use super::block::{border_widths, clamp_inline_size, intrinsic_sizes, layout_block_sized};
-use super::{BoxFragment, ConstraintSpace};
+use super::{BoxFragment, ConstraintSpace, MarginStrut};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::style::{BoxSizing, Dimension, Position, Spacing, Style, TextDirection};
 
@@ -110,6 +110,10 @@ pub(super) fn layout_out_of_flow(
         viewport_w,
         viewport_h,
         rtl: cb.rtl,
+        bfc_x: 0.0,
+        bfc_y: 0.0,
+        margin_base: 0.0,
+        margin_strut: MarginStrut::default(),
     };
     let (w, h) = (cb.width, cb.height);
     let spacing = |s: Spacing| match s {

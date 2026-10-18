@@ -18,10 +18,13 @@
 //! Stage S1: block flow without floats -- block-level boxes in normal flow,
 //! margin collapsing (siblings, parent/first-child, parent/last-child,
 //! empty boxes), auto/px/percent widths and heights, min/max sizes,
-//! box-sizing, auto horizontal margins.  Anything else makes
+//! box-sizing, auto horizontal margins.  Stage S3b adds block-level floats
+//! and clearance (exclusion.rs); text beside a float is not supported yet.
+//! Anything else makes
 //! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod exclusion;
 mod inline;
 mod oof;
 
@@ -69,6 +72,17 @@ pub(crate) struct ConstraintSpace {
     /// and over-constrained inline margins from its inline-start (right)
     /// edge (Blink ResolveInlineAutoMargins with the container style).
     pub rtl: bool,
+    /// NGBfcOffset: the estimated offset of the box's border box from its
+    /// block formatting context root's border box (S3b).  Floats and
+    /// clearance are resolved in these coordinates.
+    pub bfc_x: f32,
+    pub bfc_y: f32,
+    /// NGConstraintSpace::MarginStrut: the margins adjoining our top edge
+    /// from before us (excluding our own), and the BFC block offset they
+    /// start at -- the hypothetical position of a first child whose
+    /// margins collapse through us (CSS2 9.5.2 clearance).
+    pub margin_base: f32,
+    pub margin_strut: MarginStrut,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.
@@ -144,6 +158,13 @@ pub(crate) struct LayoutResult {
     /// Out-of-flow descendants whose containing block is further up
     /// (static positions relative to this border box).
     pub oof: Vec<oof::OofCandidate>,
+    /// The layout read or wrote the parent's exclusion space, so a
+    /// different BFC offset may change it (Blink relayouts when the
+    /// estimated BFC block offset was wrong).
+    pub bfc_dependent: bool,
+    /// Line boxes or a BFC root would have to avoid a float
+    /// (NGLayoutOpportunity per line; not implemented yet).
+    pub float_overlap: bool,
 }
 
 /// Entry point used by `LayoutEngine::compute`.  Returns `None` when the tree

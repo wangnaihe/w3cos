@@ -1,4 +1,5 @@
-//! Block formatting context, stage S1 (no floats, no inline content).
+//! Block formatting context: stage S1 block flow, S3a positioning, S3b
+//! floats and clearance in BFC coordinates (NGBfcOffset).
 //!
 //! Ported in structure from Blink's NGBlockLayoutAlgorithm
 //! (third_party/blink/renderer/core/layout/block_layout_algorithm.cc,
@@ -7,6 +8,7 @@
 //! (border, padding, in-flow content, BFC root) is reached.  Width follows
 //! CSS2 10.3.3, height 10.6.3, min/max 10.4/10.7, collapsing 8.3.1.
 
+use super::exclusion::ExclusionSpace;
 use super::oof::{self, ContainingBlock, OofCandidate};
 use super::{BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStrut, inline};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
@@ -83,10 +85,12 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if style.position != Position::Static && (atomic || style.position == Position::Sticky) {
         return Some("position");
     }
-    if style.float != Float::None {
+    // Floats and clearance of block-level boxes are checked by node_reason
+    // (float_reason); atomics stay on legacy.
+    if atomic && style.float != Float::None {
         return Some("float");
     }
-    if style.clear != Clear::None {
+    if atomic && style.clear != Clear::None {
         return Some("clear");
     }
     if style.overflow != Overflow::Visible
@@ -170,7 +174,109 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
 /// cascade derives from it: block flow does not read align-self).  Length
 /// values stay gated: the cascade also turns them into margins.
 fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
-    position_reason(flat, index).or_else(|| node_box_reason(flat, index))
+    position_reason(flat, index)
+        .or_else(|| float_reason(flat, index))
+        .or_else(|| node_box_reason(flat, index))
+}
+
+/// Floats of block-level boxes in a block container (S3b).  Floats among
+/// inline content (NGInlineLayoutAlgorithm's float handling) and text
+/// that would have to wrap around a float stay on legacy.
+fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if style.float == Float::None || oof::is_out_of_flow(style) {
+        return None;
+    }
+    if inline::is_atomic_inline(flat, index) || style.display == Display::Inline {
+        return Some("float:inline");
+    }
+    if !matches!(style.display, Display::Block | Display::FlowRoot) {
+        return Some("float:display");
+    }
+    let Some(parent) = info.parent else {
+        return Some("float:root");
+    };
+    if inline::is_inline_container(flat, parent)
+        || matches!(flat[parent].kind, ComponentKind::Text { .. })
+    {
+        return Some("float:inline");
+    }
+    None
+}
+
+/// CSS2 9.5.2: the BFC block offset a `clear` box's border box must not
+/// be above (NGExclusionSpace::ClearanceOffset).
+fn clearance_offset(style: &Style, exclusions: &ExclusionSpace) -> Option<f32> {
+    match style.clear {
+        Clear::None => None,
+        Clear::Left => exclusions.clearance_offset(true, false),
+        Clear::Right => exclusions.clearance_offset(false, true),
+        Clear::Both => exclusions.clearance_offset(true, true),
+    }
+}
+
+/// CSS2 10.3.5 / 10.6.7 / 9.5.1 (Blink PositionFloat): lay out a float
+/// as a BFC root -- its specified or shrink-to-fit width, auto margins 0
+/// -- and place its margin box in the exclusion space.  `start`/`width`:
+/// the containing block's content box in BFC coordinates.  Returns the
+/// float's border-box BFC offset.
+fn layout_float(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    exclusions: &mut ExclusionSpace,
+    start: f32,
+    block_start: f32,
+) -> Option<(f32, f32, LayoutResult)> {
+    let style = flat[index].style;
+    let side = |s: Spacing| match s {
+        Spacing::Auto => 0.0,
+        s => resolve_spacing_for_layout(
+            s,
+            space.available_inline,
+            style,
+            space.viewport_w,
+            space.viewport_h,
+        ),
+    };
+    let b = border(style);
+    let edges = b[1] + b[3] + side(style.padding.left) + side(style.padding.right);
+    let (ml, mr) = (side(style.margin.left), side(style.margin.right));
+    let (mt, mb) = (side(style.margin.top), side(style.margin.bottom));
+    let width = match resolve_dim(style.width, Some(space.available_inline), style, space) {
+        Some(w) => clamp_inline(
+            style,
+            space,
+            edges,
+            match style.box_sizing {
+                BoxSizing::BorderBox => (w - edges).max(0.0),
+                BoxSizing::ContentBox => w,
+            },
+        ),
+        None => {
+            let available = space.available_inline - ml - mr - edges;
+            let sizes = intrinsic_sizes(flat, index, space)?;
+            let w = match sizes.min {
+                Some(min) => sizes.max.min(available.max(min)),
+                None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
+                None => return None,
+            };
+            clamp_inline(style, space, edges, w.max(0.0))
+        }
+    };
+    let result = layout_block_sized(flat, index, space, true, Some((width, None)))?;
+    let margin_w = ml + result.fragment.width + mr;
+    let margin_h = mt + result.fragment.height + mb;
+    let (x, y) = exclusions.place_float(
+        margin_w,
+        margin_h,
+        style.float == Float::Left,
+        start,
+        start + space.available_inline,
+        block_start,
+    );
+    Some((x + ml, y + mt, result))
 }
 
 /// Relative and out-of-flow positioning of block-level boxes (S3a).  An
@@ -587,7 +693,11 @@ pub(super) fn intrinsic_sizes(
     let info = &flat[index];
     if flat[index + 1..info.subtree_end.max(index + 1)]
         .iter()
-        .any(|node| node.style.display != Display::None && percent_inline(node.style))
+        .any(|node| {
+            node.style.display != Display::None
+                && (percent_inline(node.style)
+                    || (node.style.float != Float::None && !oof::is_out_of_flow(node.style)))
+        })
     {
         return None;
     }
@@ -672,8 +782,15 @@ pub(super) fn layout_root(
         viewport_h,
         // The initial containing block takes the root element's direction.
         rtl: flat[0].style.direction == TextDirection::Rtl,
+        bfc_x: 0.0,
+        bfc_y: 0.0,
+        margin_base: 0.0,
+        margin_strut: MarginStrut::default(),
     };
     let result = layout_block(flat, 0, &space, true)?;
+    if result.float_overlap {
+        return None;
+    }
     let metrics = resolve_inline(flat[0].style, &space);
     let (x, y) = (metrics.margin[3], metrics.margin[0]);
     let mut fragment = result.fragment;
@@ -702,13 +819,39 @@ pub(super) fn layout_block(
 }
 
 /// `sized`: the content-box width and (optionally) height an out-of-flow
-/// box's containing block resolved (CSS2 10.3.7 / 10.6.4).
+/// box's containing block or a float's shrink-to-fit resolved (CSS2
+/// 10.3.7 / 10.6.4 / 10.3.5).  Lays out a BFC root: fresh exclusions.
 pub(super) fn layout_block_sized(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
     force_bfc_root: bool,
     sized: Option<(f32, Option<f32>)>,
+) -> Option<LayoutResult> {
+    let space = ConstraintSpace {
+        bfc_x: 0.0,
+        bfc_y: 0.0,
+        ..*space
+    };
+    layout_block_in(
+        flat,
+        index,
+        &space,
+        force_bfc_root,
+        sized,
+        &mut ExclusionSpace::default(),
+    )
+}
+
+/// NGBlockLayoutAlgorithm in a block formatting context whose exclusion
+/// space is `exclusions` (a BFC root starts its own).
+fn layout_block_in(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    force_bfc_root: bool,
+    sized: Option<(f32, Option<f32>)>,
+    exclusions: &mut ExclusionSpace,
 ) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
@@ -721,6 +864,17 @@ pub(super) fn layout_block_sized(
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
     let bfc_root = force_bfc_root || is_bfc_root(style);
+    // NGBfcOffset of our border box; a BFC root starts new coordinates and
+    // a new exclusion space (NGConstraintSpace::IsNewFormattingContext).
+    let mut own_exclusions = ExclusionSpace::default();
+    let (exclusions, bfc_x, bfc_y) = if bfc_root {
+        (&mut own_exclusions, 0.0, 0.0)
+    } else {
+        (exclusions, space.bfc_x, space.bfc_y)
+    };
+    let (margin_base, margin_strut) = (space.margin_base, space.margin_strut);
+    let entry_exclusions = !exclusions.is_empty();
+    let mut float_overlap = false;
 
     let to_content_h = |h: f32| match style.box_sizing {
         BoxSizing::BorderBox => (h - bt - bb - pt - pb).max(0.0),
@@ -774,6 +928,10 @@ pub(super) fn layout_block_sized(
         viewport_w: space.viewport_w,
         viewport_h: space.viewport_h,
         rtl: style.direction == TextDirection::Rtl,
+        bfc_x: 0.0,
+        bfc_y: 0.0,
+        margin_base: 0.0,
+        margin_strut: MarginStrut::default(),
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;
@@ -842,11 +1000,129 @@ pub(super) fn layout_block_sized(
             child = next;
             continue;
         }
-        let result = layout_block(flat, child, &child_space, false)?;
+        let content_bfc_y = bfc_y + bt + pt;
+        if child_info.style.float != Float::None {
+            // PositionFloat: at the current block offset past the pending
+            // margins (which do not collapse with the float's), unless
+            // they may still collapse through our top.
+            let block = if at_top && can_escape_top {
+                0.0
+            } else {
+                cursor + pending.sum()
+            };
+            let mut block_start = content_bfc_y + block;
+            if let Some(clear) = clearance_offset(child_info.style, exclusions) {
+                block_start = block_start.max(clear);
+            }
+            let (fx, fy, result) = layout_float(
+                flat,
+                child,
+                &child_space,
+                exclusions,
+                bfc_x + bl + pl,
+                block_start,
+            )?;
+            let (dx, dy) = oof::relative_offset(child_info.style, &child_space);
+            let (fx, fy) = (fx - bfc_x + dx, fy - bfc_y + dy);
+            oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
+            children.push((fx, fy, result.fragment));
+            child = next;
+            continue;
+        }
         let child_metrics = resolve_inline(child_info.style, &child_space);
         let x = bl + pl + child_metrics.margin[3];
+        // CSS2 9.5.2: clearance places the border box at the clear offset
+        // when the hypothetical position is above it; the cleared box's
+        // top margin then no longer collapses with what precedes it.
+        let clear = clearance_offset(child_info.style, exclusions);
+        let place = |start: MarginStrut| {
+            if at_top && can_escape_top {
+                // The margins still collapse through us: the hypothetical
+                // position is past all of them.
+                let mut combined = margin_strut;
+                combined.merge(start_strut);
+                combined.merge(pending);
+                combined.merge(start);
+                return match clear {
+                    Some(c) if margin_base + combined.sum() < c - 1.0 / 128.0 => None,
+                    _ => Some((0.0, false)),
+                };
+            }
+            let mut combined = pending;
+            combined.merge(start);
+            let hypothetical = cursor + combined.sum();
+            Some(match clear {
+                Some(c) if content_bfc_y + hypothetical < c - 1.0 / 128.0 => {
+                    (c - content_bfc_y, true)
+                }
+                _ => (hypothetical, false),
+            })
+        };
+        // NGBlockLayoutAlgorithm estimates the child's BFC block offset
+        // from its own margin-top, lays it out, and relayouts it when the
+        // resolved offset differs and the layout depended on it.
+        let mut own_top = MarginStrut::default();
+        own_top.append(child_metrics.margin[0]);
+        // (Clearance separating a first child from margins that would
+        // collapse through us is not implemented.)
+        let (estimate, _) = place(own_top)?;
+        let snapshot = exclusions.snapshot();
+        let mut nested = child_space;
+        nested.bfc_x = bfc_x + x;
+        nested.bfc_y = content_bfc_y + estimate;
+        if at_top && can_escape_top {
+            nested.margin_base = margin_base;
+            nested.margin_strut = margin_strut;
+            nested.margin_strut.merge(start_strut);
+            nested.margin_strut.merge(pending);
+        } else {
+            nested.margin_base = content_bfc_y + cursor;
+            nested.margin_strut = pending;
+        }
+        let mut result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
+        let (mut resolved, mut cleared) = place(result.start_strut)?;
+        if result.bfc_dependent && (resolved - estimate).abs() > 1.0 / 128.0 {
+            exclusions.restore(snapshot);
+            nested.bfc_y = content_bfc_y + resolved;
+            result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
+            let (again, c) = place(result.start_strut)?;
+            if (again - resolved).abs() > 1.0 / 128.0 {
+                return None;
+            }
+            (resolved, cleared) = (again, c);
+        }
+        float_overlap |= result.float_overlap;
+        // Line boxes and BFC roots must avoid floats (one layout
+        // opportunity per line is S3c); report and fall back.
+        let child_style = child_info.style;
+        if !exclusions.is_empty()
+            && result.fragment.height > 0.0
+            && (inline::is_inline_container(flat, child)
+                || matches!(child_info.kind, ComponentKind::Text { .. })
+                || is_bfc_root(child_style))
+            && exclusions.overlaps(
+                bfc_x + x,
+                content_bfc_y + resolved,
+                bfc_x + x + result.fragment.width,
+                content_bfc_y + resolved + result.fragment.height,
+            )
+        {
+            float_overlap = true;
+        }
         let y;
-        if result.self_collapsing {
+        if cleared {
+            if result.self_collapsing {
+                // (Clearance on a box that collapses through.)
+                return None;
+            }
+            if at_top && can_escape_top {
+                start_strut.merge(pending);
+            }
+            y = resolved;
+            cursor = y + result.fragment.height;
+            pending = result.end_strut;
+            at_top = false;
+        } else if result.self_collapsing {
             let mut combined = pending;
             combined.merge(result.start_strut);
             if at_top && can_escape_top {
@@ -895,6 +1171,15 @@ pub(super) fn layout_block_sized(
     } else {
         // A negative end strut can pull the block end up (never below 0).
         (cursor + pending.sum()).max(0.0)
+    };
+    if bfc_root && float_overlap {
+        // (Line boxes or a BFC root beside a float.)
+        return None;
+    }
+    // CSS2 10.6.7: a BFC root's auto height includes its floats.
+    let auto_content = match exclusions.max_bottom() {
+        Some(bottom) if bfc_root => auto_content.max(bottom - bt - pt),
+        _ => auto_content,
     };
     let content_height = clamp_h(specified_height.unwrap_or(auto_content));
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
@@ -966,5 +1251,7 @@ pub(super) fn layout_block_sized(
         end_strut,
         self_collapsing,
         oof: oof_candidates,
+        bfc_dependent: !bfc_root && (entry_exclusions || !exclusions.is_empty()),
+        float_overlap,
     })
 }
