@@ -154,12 +154,70 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     text_style_reason(style)
 }
 
+/// Inline box edges the cascade put on a word item of a decorated inline
+/// box (its first item carries the inline-start edges, its last the end
+/// edges, every item the block-axis padding/border).  Absolute lengths
+/// only; an edge next to a collapsible space would need the space handling
+/// at inline box boundaries; forced breaks inside are left to legacy.
+fn inline_edges_supported(content: &str, style: &Style) -> bool {
+    use w3cos_std::style::Spacing;
+    let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
+    let m = style.margin_lengths();
+    let edges = InlineEdges::of(style);
+    [
+        style.padding.top,
+        style.padding.right,
+        style.padding.bottom,
+        style.padding.left,
+        style.margin.left,
+        style.margin.right,
+    ]
+    .into_iter()
+    .all(absolute)
+        && m.left >= 0.0
+        && m.right >= 0.0
+        && !content.contains(['\n', '\u{2028}', '\u{2029}'])
+        && (edges.start == 0.0 || !content.starts_with(' '))
+        && (edges.end == 0.0 || !content.ends_with(' '))
+}
+
+/// An item's inline box edges (NGInlineBoxState): inline-axis margin,
+/// border and padding occupy advance; block-axis border and padding only
+/// grow its painted box, not the line box (CSS 2.1 10.8.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct InlineEdges {
+    start: f32,
+    end: f32,
+    margin_start: f32,
+    margin_end: f32,
+    top: f32,
+    bottom: f32,
+}
+
+impl InlineEdges {
+    fn of(style: &Style) -> Self {
+        let p = style.padding_lengths();
+        let m = style.margin_lengths();
+        let border = |side: Option<f32>| side.unwrap_or(style.border_width);
+        InlineEdges {
+            start: m.left + border(style.border_left_width) + p.left,
+            end: p.right + border(style.border_right_width) + m.right,
+            margin_start: m.left,
+            margin_end: m.right,
+            top: border(style.border_top_width) + p.top,
+            bottom: border(style.border_bottom_width) + p.bottom,
+        }
+    }
+}
+
 /// An inline text leaf inside an IFC container.
 fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'static str> {
     if style.display != Display::Inline {
         return Some("text:display");
     }
-    if !zero_edges(style) {
+    if !zero_edges(style)
+        && (has_marker(style, LINE_WIDTH_MARKER) || !inline_edges_supported(content, style))
+    {
         return Some("text:edges");
     }
     // Preserved newlines (CSS Text 3 4.1.1) in a sole leaf: paint breaks
@@ -341,6 +399,8 @@ struct InlineItem {
     whitespace_only: bool,
     /// A forced line break (`<br>`): ends the line, zero advance.
     forced: bool,
+    /// Edges of the inline box this item starts/ends/sits in.
+    edges: InlineEdges,
     /// A soft-wrap opportunity inside the item's non-space core: NG keeps
     /// one fragment per item, so a line that needs it falls back.
     internal_break: bool,
@@ -373,8 +433,12 @@ fn same_run(a: &Style, b: &Style) -> bool {
             .and_then(|p| p.get(w3cos_std::inline_text::SOURCE_RUN))
             .cloned()
     };
+    // An inline box edge ends the shaping run (its item starts or ends a
+    // box fragment).
     source(a).is_some()
         && source(a) == source(b)
+        && zero_edges(a)
+        && zero_edges(b)
         && a.font_family == b.font_family
         && a.font_size == b.font_size
         && a.font_weight == b.font_weight
@@ -648,11 +712,32 @@ pub(super) fn layout_inline(
             let style = flat[child].style;
             let content = texts[offset];
             // A forced break has no advance (kControl item).
-            let raw = if content == FORCED_BREAK {
+            let edges = InlineEdges::of(style);
+            let inline_edges = edges.start + edges.end;
+            // The text measurement adds a leaf's own padding; an edge item
+            // (its own run) is shaped without its box edges.
+            let bare = (!zero_edges(style)).then(|| {
+                let defaults = Style::default();
+                Style {
+                    padding: defaults.padding,
+                    margin: defaults.margin,
+                    border_width: 0.0,
+                    border_top_width: None,
+                    border_right_width: None,
+                    border_bottom_width: None,
+                    border_left_width: None,
+                    ..style.clone()
+                }
+            });
+            let measure = bare.as_ref().unwrap_or(style);
+            let text_raw = if content == FORCED_BREAK {
                 0.0
+            } else if bare.is_some() {
+                text_intrinsic_size(content, measure).0
             } else {
                 advances[offset]
             };
+            let raw = text_raw + inline_edges;
             let (height, baseline) = text_line_metrics(content, style);
             items.push(InlineItem {
                 index: child,
@@ -661,13 +746,14 @@ pub(super) fn layout_inline(
                 raw_hang: if container.white_space == WhiteSpace::Pre {
                     raw
                 } else {
-                    hang_advance(content, raw, style)
+                    hang_advance(content, text_raw, measure) + inline_edges
                 },
                 run,
                 starts_space: content.starts_with(' '),
                 ends_space: content.ends_with(' '),
                 whitespace_only: content.trim_end_matches(' ').is_empty(),
                 forced: content == FORCED_BREAK,
+                edges,
                 // Preserved leading spaces (pre-wrap) end in an opportunity
                 // inside the item too; collapsible ones vanish at a line start.
                 internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char)
@@ -854,13 +940,16 @@ pub(super) fn layout_inline(
                 ));
                 continue;
             }
+            // The engine's rect is the item's border box: margins excluded,
+            // block-axis padding/border around the font content box.
+            let e = item.edges;
             out.push((
-                offset + x,
-                baseline - item.content_ascent,
+                offset + x + e.margin_start,
+                baseline - item.content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
-                    width,
-                    height: item.font_height,
+                    width: width - e.margin_start - e.margin_end,
+                    height: item.font_height + e.top + e.bottom,
                     children: Vec::new(),
                 },
             ));

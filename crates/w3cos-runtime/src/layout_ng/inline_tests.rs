@@ -740,3 +740,112 @@ fn preserved_newlines_make_lines() {
         assert_eq!((r.y, r.height), (y, height), "#{index}");
     }
 }
+
+/// NGInlineBoxState edges: a decorated inline box's word items carry its
+/// inline-start (first) and inline-end (last) margin/border/padding as
+/// advance and the block-axis padding/border around the painted box; they
+/// never grow the line box (CSS 2.1 10.8.1).  Rects from Chrome (span
+/// border boxes split per word item).
+#[test]
+fn inline_box_edges_take_advance_not_line_height() {
+    let _ahem = AhemGuard::new();
+    let container = || {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str, edges: Option<(Edges, Edges, [f32; 4])>| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        if let Some((padding, margin, [t, r, b, l])) = edges {
+            style.padding = padding;
+            style.margin = margin;
+            style.border_top_width = Some(t);
+            style.border_right_width = Some(r);
+            style.border_bottom_width = Some(b);
+            style.border_left_width = Some(l);
+        }
+        Component::text(content, style)
+    };
+    let px = Spacing::Px;
+    let e = |t: f32, r: f32, b: f32, l: f32| Edges {
+        top: px(t),
+        right: px(r),
+        bottom: px(b),
+        left: px(l),
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            // AA <span style="border:5px;padding:3px 7px">BB</span> CC
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA ", None),
+                    text(
+                        "BB",
+                        Some((e(3.0, 7.0, 3.0, 7.0), e(0.0, 0.0, 0.0, 0.0), [5.0; 4])),
+                    ),
+                    text(" ", None),
+                    text("CC", None),
+                ],
+            ),
+            // AA <span style="padding:10px 4px;margin:0 6px">BB CC</span> DD
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA ", None),
+                    text(
+                        "BB",
+                        Some((e(10.0, 0.0, 10.0, 4.0), e(0.0, 0.0, 0.0, 6.0), [0.0; 4])),
+                    ),
+                    text(
+                        " ",
+                        Some((e(10.0, 0.0, 10.0, 0.0), e(0.0, 0.0, 0.0, 0.0), [0.0; 4])),
+                    ),
+                    text(
+                        "CC",
+                        Some((e(10.0, 4.0, 10.0, 0.0), e(0.0, 6.0, 0.0, 0.0), [0.0; 4])),
+                    ),
+                    text(" ", None),
+                    text("DD", None),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 12] = [
+        (1, [0.0, 0.0, 300.0, 20.0]),
+        (2, [0.0, 0.0, 60.0, 20.0]),
+        (3, [60.0, -8.0, 64.0, 36.0]),
+        (4, [124.0, 0.0, 20.0, 20.0]),
+        (5, [144.0, 0.0, 40.0, 20.0]),
+        (6, [0.0, 20.0, 300.0, 20.0]),
+        (7, [0.0, 20.0, 60.0, 20.0]),
+        (8, [66.0, 10.0, 44.0, 40.0]),
+        (9, [110.0, 10.0, 20.0, 40.0]),
+        (10, [130.0, 10.0, 44.0, 40.0]),
+        (11, [180.0, 20.0, 20.0, 20.0]),
+        (12, [200.0, 20.0, 40.0, 20.0]),
+    ];
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
+    }
+}

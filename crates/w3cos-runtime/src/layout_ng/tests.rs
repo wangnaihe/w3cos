@@ -519,6 +519,26 @@ fn probe_html() {
             w3cos_std::ComponentKind::Text { content } => format!("Text {content:?}"),
             other => format!("{other:?}").chars().take(30).collect(),
         };
+        if std::env::var_os("W3COS_NG_PROBE_EDGES").is_some() {
+            let pad = n.style.padding_lengths();
+            let mar = n.style.margin_lengths();
+            println!(
+                "    edges #{i}: p=[{} {} {} {}] m=[{} {} {} {}] b={}/{:?},{:?},{:?},{:?}",
+                pad.top,
+                pad.right,
+                pad.bottom,
+                pad.left,
+                mar.top,
+                mar.right,
+                mar.bottom,
+                mar.left,
+                n.style.border_width,
+                n.style.border_top_width,
+                n.style.border_right_width,
+                n.style.border_bottom_width,
+                n.style.border_left_width
+            );
+        }
         println!(
             "{:3} {}{} disp={:?} ws={:?} lh={:?}/{}/{:?} fs={} ta={:?} h={:?} minh={:?} -> {:?} ng {:?} {}",
             i,
