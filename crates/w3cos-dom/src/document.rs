@@ -382,6 +382,9 @@ struct CachedComputedStyle {
     style: SharedStyle,
 }
 
+/// Set on the document element's component in quirks mode (BackCompat).
+pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
+
 struct SelectorContextCache {
     style_clock: u64,
     stylesheet_generation: u64,
@@ -2636,6 +2639,14 @@ impl Document {
             // changes pixels, so always retain the document element.
             let mut tree = self.to_component_subtree(document_element);
             self.collapse_document_body_first_child_margin(&mut tree);
+            if self.quirks_mode {
+                // Quirks "line height calculation quirk": layout needs the
+                // document mode to drop a root inline box's strut.
+                tree.style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(QUIRKS_MODE_MARKER.to_string(), "1".to_string());
+            }
             return tree;
         }
         // Keep the browser UA body margin on both the body fast path and the

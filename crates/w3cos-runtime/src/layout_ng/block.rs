@@ -52,6 +52,7 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "background-inherit"
             | "text-source-run"
             | "text-fragment-ends"
+            | "quirks-mode"
     ) || name.starts_with("decoration-owner")
 }
 

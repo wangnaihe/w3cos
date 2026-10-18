@@ -46,6 +46,8 @@ fn has_marker(style: &Style, key: &str) -> bool {
 }
 
 pub(super) const IFC_MARKER: &str = "--w3cos-internal-inline-formatting-context";
+/// On the root component in quirks mode (w3cos_dom QUIRKS_MODE_MARKER).
+const QUIRKS_MARKER: &str = "--w3cos-internal-quirks-mode";
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
 
 fn zero_edges(style: &Style) -> bool {
@@ -209,6 +211,12 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
 /// Why this IFC container (and its items) is outside S2a.
 pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
+    // The cascade marks generated IFC roots; an unmarked box holding inline
+    // text (e.g. a shadow <slot>, which is display:contents in Chrome) does
+    // not own the strut, so its style must not drive line metrics.
+    if !has_marker(style, IFC_MARKER) {
+        return Some("ifc:unmarked");
+    }
     if style.text_align == TextAlign::Justify {
         return Some("text:justify");
     }
@@ -399,8 +407,16 @@ fn paragraph_height(
     width: f32,
     style: &Style,
     container: &Style,
+    quirks: bool,
 ) -> (f32, bool, f32) {
-    let (strut_ascent, strut_descent) = strut(container);
+    // Quirks line height calculation quirk: the root inline box (strut)
+    // contributes only through text it holds directly, whose metrics are the
+    // strut's own when the fonts match — so dropping it is exact either way.
+    let (strut_ascent, strut_descent) = if quirks {
+        (f32::NEG_INFINITY, f32::NEG_INFINITY)
+    } else {
+        strut(container)
+    };
     let (line, baseline) = text_line_metrics(content, style);
     let ascent = strut_ascent.max(baseline);
     let single_height = ascent + strut_descent.max(line - baseline);
@@ -421,7 +437,7 @@ fn paragraph_height(
 
 /// Content height of a block-level text leaf of content width `width`.
 pub(super) fn block_text_height(content: &str, width: f32, style: &Style) -> f32 {
-    paragraph_height(content, width, style, style).0
+    paragraph_height(content, width, style, style, false).0
 }
 
 /// NGInlineLayoutAlgorithm for an S2a container of content width
@@ -433,6 +449,7 @@ pub(super) fn layout_inline(
     available: f32,
 ) -> Option<InlineResult> {
     let container = flat[index].style;
+    let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
     let children: Vec<usize> = rendered_children(flat, index).collect();
 
     // Paragraph leaf: paint wraps the text inside the line-width rect.
@@ -443,7 +460,8 @@ pub(super) fn layout_inline(
         let ComponentKind::Text { content } = flat[child].kind else {
             return None;
         };
-        let (height, single, ascent) = paragraph_height(content, available, style, container);
+        let (height, single, ascent) =
+            paragraph_height(content, available, style, container, quirks);
         let font_height = inline_font_height(style);
         let (y, rect_height) = if single {
             (ascent - inline_font_content_ascent(style), font_height)
@@ -577,7 +595,11 @@ pub(super) fn layout_inline(
     // Line boxes (NGLineBoxFragmentBuilder): run slices start on LayoutUnit
     // offsets; pieces inside a slice keep their raw shaping offsets and the
     // slice's last piece absorbs the snap remainder.
-    let (strut_ascent, strut_descent) = strut(container);
+    let (strut_ascent, strut_descent) = if quirks {
+        (f32::NEG_INFINITY, f32::NEG_INFINITY)
+    } else {
+        strut(container)
+    };
     let mut built = Vec::with_capacity(lines.len());
     for mut line in lines {
         // Trailing collapsible spaces are removed at the line end.

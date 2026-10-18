@@ -397,3 +397,89 @@ fn generated_inline_ext_trees_match_chrome() {
         &failures[..failures.len().min(5)]
     );
 }
+
+/// Quirks "line height calculation quirk": a line holding only span text
+/// ignores the root inline box's strut; root-level text (the space between
+/// two spans) brings it back.  Expected rects are Chrome's for
+/// `<div style="font:20px/1 Ahem;width:300px"><span style="font-size:10px">XX</span></div>`
+/// plus a second div `<span ..>XX</span> <span ..>X</span>`, with and without
+/// `<!doctype html>`.
+#[test]
+fn quirks_mode_drops_the_root_strut() {
+    let _ahem = AhemGuard::new();
+    let tree = |quirks: bool| {
+        let container = || {
+            let mut style = Style {
+                display: Display::Block,
+                width: Dimension::Px(300.0),
+                ..Style::default()
+            };
+            font(&mut style, 20.0, LineHeight::Number(1.0));
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(inline::IFC_MARKER.into(), "1".into());
+            style
+        };
+        let item = |size: f32| {
+            let mut style = Style {
+                display: Display::Inline,
+                ..Style::default()
+            };
+            font(&mut style, size, LineHeight::Number(1.0));
+            style
+        };
+        let mut root = Style {
+            display: Display::Block,
+            ..Style::default()
+        };
+        if quirks {
+            root.custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(w3cos_dom::document::QUIRKS_MODE_MARKER.into(), "1".into());
+        }
+        Component::boxed(
+            root,
+            vec![
+                Component::boxed(container(), vec![Component::text("XX", item(10.0))]),
+                Component::boxed(
+                    container(),
+                    vec![
+                        Component::text("XX", item(10.0)),
+                        Component::text(" ", item(20.0)),
+                        Component::text("X", item(10.0)),
+                    ],
+                ),
+            ],
+        )
+    };
+    // (index, [x, y, w, h]) from Chrome, relative to the root.
+    let quirks: [(usize, [f32; 4]); 5] = [
+        (1, [0.0, 0.0, 300.0, 10.0]),
+        (2, [0.0, 0.0, 20.0, 10.0]),
+        (3, [0.0, 10.0, 300.0, 20.0]),
+        (4, [0.0, 18.0, 20.0, 10.0]),
+        (6, [40.0, 18.0, 10.0, 10.0]),
+    ];
+    let standards: [(usize, [f32; 4]); 5] = [
+        (1, [0.0, 0.0, 300.0, 20.0]),
+        (2, [0.0, 8.0, 20.0, 10.0]),
+        (3, [0.0, 20.0, 300.0, 20.0]),
+        (4, [0.0, 28.0, 20.0, 10.0]),
+        (6, [40.0, 28.0, 10.0, 10.0]),
+    ];
+    for (mode, expected) in [(true, quirks), (false, standards)] {
+        let root = tree(mode);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        for (index, want) in expected {
+            let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+            assert_eq!(
+                [r.x, r.y, r.width, r.height],
+                want,
+                "quirks={mode} #{index}"
+            );
+        }
+    }
+}

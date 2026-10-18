@@ -141,6 +141,35 @@ pub(crate) fn layout_tree(
             ),
         }
     }
+    if std::env::var_os("W3COS_LAYOUT_NG_TRACE").is_some_and(|v| v == "2") {
+        // Tree dump for diagnosing pages whose scripts the unit probe cannot run.
+        for (i, node) in flat.iter().enumerate() {
+            let s = node.style;
+            let kind = match node.kind {
+                w3cos_std::ComponentKind::Text { content } => format!("Text {content:?}"),
+                other => format!("{:?}", std::mem::discriminant(other)),
+            };
+            eprintln!(
+                "[layout-ng tree] #{i} end={} {kind} disp={:?} ws={:?} fs={} lh={:?} ff={:?} h={:?} minh={:?} m=({:?},{:?}) p=({:?},{:?}) markers={:?}",
+                node.subtree_end,
+                s.display,
+                s.white_space,
+                s.font_size,
+                s.line_height,
+                s.font_family,
+                s.height,
+                s.min_height,
+                s.margin.top,
+                s.margin.bottom,
+                s.padding.top,
+                s.padding.bottom,
+                s.custom_properties.as_ref().map(|p| p
+                    .keys()
+                    .filter(|k| k.starts_with("--w3cos-internal"))
+                    .collect::<Vec<_>>())
+            );
+        }
+    }
     if reason.is_some() {
         return None;
     }
