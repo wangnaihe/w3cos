@@ -651,8 +651,9 @@ pub(super) fn layout_inline(
     } else {
         strut(container)
     };
+    let line_count = lines.len();
     let mut built = Vec::with_capacity(lines.len());
-    for mut line in lines {
+    for (line_index, mut line) in lines.into_iter().enumerate() {
         // Trailing collapsible spaces are removed at the line end.
         while !preserve && line.last().is_some_and(|&k| items[k].whitespace_only) {
             line.pop();
@@ -700,9 +701,17 @@ pub(super) fn layout_inline(
         {
             return None;
         }
+        // CSS Text 3 4.1.3: before a forced break or the end of the block,
+        // preserved spaces hang only conditionally: the part that fits
+        // still counts for alignment.
+        let align_width = if hang_preserved && line_index + 1 == line_count {
+            content_width.max(slice_start.min(available))
+        } else {
+            content_width
+        };
         built.push(Line {
             items: placed,
-            width: content_width,
+            width: align_width,
             ascent,
             descent,
         });

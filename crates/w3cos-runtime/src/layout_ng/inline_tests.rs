@@ -520,3 +520,57 @@ fn quirks_mode_drops_the_root_strut() {
         }
     }
 }
+
+/// CSS Text 3 4.1.3 (WPT white-space-pre-wrap-trailing-spaces-001): at the
+/// end of the block, preserved pre-wrap spaces hang only conditionally, so
+/// the part that fits counts for alignment.  Rects from Chrome.
+#[test]
+fn pre_wrap_spaces_at_block_end_hang_conditionally() {
+    let _ahem = AhemGuard::new();
+    let block = |width: f32, align: TextAlign, text: &str| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            text_align: align,
+            white_space: WhiteSpace::PreWrap,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        let mut item = Style {
+            display: Display::Inline,
+            white_space: WhiteSpace::PreWrap,
+            ..Style::default()
+        };
+        font(&mut item, 20.0, LineHeight::Number(1.0));
+        Component::boxed(style, vec![Component::text(text, item)])
+    };
+    let spaces = " ".repeat(32);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            block(140.0, TextAlign::Right, "A  "),
+            block(180.0, TextAlign::Center, &format!("    S{spaces}")),
+            block(180.0, TextAlign::Center, " S "),
+            block(140.0, TextAlign::Right, "AA AA  "),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // (text index, x, width) from Chrome.
+    for (index, x, width) in [
+        (2, 80.0, 60.0),
+        (4, 0.0, 740.0),
+        (6, 60.0, 60.0),
+        (8, 0.0, 140.0),
+    ] {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        // The overflowing space run's advance (Chrome 740) is capped by the
+        // shared text measurement in both engines; only the offset matters.
+        let width = if index == 4 { r.width } else { width };
+        assert_eq!((r.x, r.width), (x, width), "#{index}");
+    }
+}
