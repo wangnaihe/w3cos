@@ -328,7 +328,10 @@ impl Workspace {
                 .into_iter()
                 .filter(|n| !declares(&test.source, n))
                 .collect();
-            text.push_str(&format!("import {{ {} }} from {spec:?};\n", names.join(", ")));
+            text.push_str(&format!(
+                "import {{ {} }} from {spec:?};\n",
+                names.join(", ")
+            ));
         }
         text.push_str(&test.source);
         // Completion marker: a sync test passes only if its body ran to the
@@ -342,7 +345,12 @@ impl Workspace {
 fn declares(source: &str, name: &str) -> bool {
     ["function ", "var ", "let ", "const ", "class "]
         .iter()
-        .any(|kw| source.contains(&format!("{kw}{name} ")) || source.contains(&format!("{kw}{name}(")) || source.contains(&format!("{kw}{name};")) || source.contains(&format!("{kw}{name}=")))
+        .any(|kw| {
+            source.contains(&format!("{kw}{name} "))
+                || source.contains(&format!("{kw}{name}("))
+                || source.contains(&format!("{kw}{name};"))
+                || source.contains(&format!("{kw}{name}="))
+        })
 }
 
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
@@ -362,13 +370,20 @@ fn front_end(root: &Path, entry: &Path) -> Result<String, String> {
             .map_err(|e| format!("parse: {}", first_line(&format!("{e:#}"))))?;
         let bundle = EsmBundle::build(&parsed, &resolver, entry);
         if !bundle.unresolved.is_empty() {
-            return Err(format!("link: {} unresolved binding(s)", bundle.unresolved.len()));
+            return Err(format!(
+                "link: {} unresolved binding(s)",
+                bundle.unresolved.len()
+            ));
         }
-        try_generate_with_bodies(&bundle).map_err(|e| format!("codegen: {}", first_line(&e.to_string())))
+        try_generate_with_bodies(&bundle)
+            .map_err(|e| format!("codegen: {}", first_line(&e.to_string())))
     }));
     match result {
         Ok(r) => r,
-        Err(payload) => Err(format!("frontend panic: {}", first_line(&panic_text(&*payload)))),
+        Err(payload) => Err(format!(
+            "frontend panic: {}",
+            first_line(&panic_text(&*payload))
+        )),
     }
 }
 
@@ -432,7 +447,8 @@ fn module_map(code: &str, tree: &Path) -> ModuleMap {
                 let token = token.trim();
                 if let Some(call) = token.strip_suffix("__init()") {
                     if let Some((module, _)) = call.rsplit_once("::") {
-                        let module = module.trim_start_matches(|c: char| c == '{' || c.is_whitespace());
+                        let module =
+                            module.trim_start_matches(|c: char| c == '{' || c.is_whitespace());
                         let module = module.rsplit(' ').next().unwrap_or(module);
                         order.push(module.to_string());
                     }
@@ -445,7 +461,12 @@ fn module_map(code: &str, tree: &Path) -> ModuleMap {
                 .replace("__w3cos_run_entry_body()", "");
         }
     }
-    ModuleMap { by_path, order, lines, register }
+    ModuleMap {
+        by_path,
+        order,
+        lines,
+        register,
+    }
 }
 
 const MAIN_TAIL: &str = r#"
@@ -567,7 +588,10 @@ fn judge(test: &TestCase, output: &str) -> Outcome {
     if let Some(expected) = negative_runtime {
         return match line.strip_prefix("T262 THROW ") {
             Some(rest) if rest.split(' ').next() == Some(expected) => Outcome::Pass,
-            Some(rest) => Outcome::Fail(format!("runtime: expected {expected}, got {}", first_line(rest))),
+            Some(rest) => Outcome::Fail(format!(
+                "runtime: expected {expected}, got {}",
+                first_line(rest)
+            )),
             None => Outcome::Fail(format!("runtime: expected {expected} to be thrown")),
         };
     }
@@ -575,14 +599,22 @@ fn judge(test: &TestCase, output: &str) -> Outcome {
         return match line.strip_prefix("T262 PRINT ") {
             Some("Test262:AsyncTestComplete") => Outcome::Pass,
             Some(other) => Outcome::Fail(format!("async: {}", first_line(other))),
-            None if line.starts_with("T262 OK") => Outcome::Fail("async: $DONE was not called".into()),
-            None => Outcome::Fail(format!("runtime: {}", first_line(line.trim_start_matches("T262 ")))),
+            None if line.starts_with("T262 OK") => {
+                Outcome::Fail("async: $DONE was not called".into())
+            }
+            None => Outcome::Fail(format!(
+                "runtime: {}",
+                first_line(line.trim_start_matches("T262 "))
+            )),
         };
     }
     if line == "T262 OK" {
         Outcome::Pass
     } else {
-        Outcome::Fail(format!("runtime: {}", first_line(line.trim_start_matches("T262 "))))
+        Outcome::Fail(format!(
+            "runtime: {}",
+            first_line(line.trim_start_matches("T262 "))
+        ))
     }
 }
 
@@ -609,7 +641,11 @@ fn build_batch(
         let mut rel_paths = Vec::new();
         for &index in &members {
             let path = ws.mirror(&tests[index]);
-            let rel = path.strip_prefix(&tree).unwrap().to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(&tree)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             entry.push_str(&format!("import {:?};\n", format!("./{rel}")));
             rel_paths.push(rel);
         }
@@ -617,9 +653,15 @@ fn build_batch(
         std::fs::write(&entry_path, entry).unwrap();
         let code_path = dir.join("bundle.rs");
         let mut command = Command::new(std::env::current_exe().unwrap());
-        command.arg("--frontend-one").arg(&tree).arg(&entry_path).arg(&code_path);
+        command
+            .arg("--frontend-one")
+            .arg(&tree)
+            .arg(&entry_path)
+            .arg(&code_path);
         let fe = match run_with_timeout(command, Duration::from_secs(600)) {
-            Ok(out) if out.lines().last() == Some("FE OK") => Ok(std::fs::read_to_string(&code_path).unwrap()),
+            Ok(out) if out.lines().last() == Some("FE OK") => {
+                Ok(std::fs::read_to_string(&code_path).unwrap())
+            }
             Ok(out) => Err(out.lines().last().unwrap_or("frontend crash").to_string()),
             Err(error) => Err(error),
         };
@@ -638,7 +680,11 @@ fn build_batch(
         let map = module_map(&code, &tree);
         let mut slots = Vec::new();
         for (slot_index, rel) in rel_paths.iter().enumerate() {
-            let own_dir = Path::new(rel).parent().unwrap().to_string_lossy().into_owned();
+            let own_dir = Path::new(rel)
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             let mut modules: Vec<String> = map
                 .by_path
                 .iter()
@@ -646,7 +692,9 @@ fn build_batch(
                     *path == rel
                         || path.starts_with("__harness/")
                         || (path.contains("_FIXTURE")
-                            && Path::new(path).parent().map(|p| p.to_string_lossy().into_owned())
+                            && Path::new(path)
+                                .parent()
+                                .map(|p| p.to_string_lossy().into_owned())
                                 == Some(own_dir.clone()))
                 })
                 .map(|(_, m)| m.clone())
@@ -655,10 +703,10 @@ fn build_batch(
             let harness = harness_module_name(ws, &tests[members[slot_index]], &map);
             modules.retain(|m| !is_harness(&map, m) || Some(m) == harness.as_ref());
             if !map.by_path.contains_key(rel) {
-                results
-                    .lock()
-                    .unwrap()
-                    .insert(members[slot_index], Outcome::Fail("runner: test module missing from batch".into()));
+                results.lock().unwrap().insert(
+                    members[slot_index],
+                    Outcome::Fail("runner: test module missing from batch".into()),
+                );
                 modules.clear();
             }
             slots.push((slot_index, modules));
@@ -690,13 +738,26 @@ fn build_batch(
                 if first_error.is_empty() {
                     first_error = first_line(line);
                 }
-                let number: usize = rest.split(':').next().and_then(|n| n.parse().ok()).unwrap_or(0);
-                let owner = map.lines.iter().rev().find(|(start, _)| *start <= number).map(|(_, p)| p.clone());
+                let number: usize = rest
+                    .split(':')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                let owner = map
+                    .lines
+                    .iter()
+                    .rev()
+                    .find(|(start, _)| *start <= number)
+                    .map(|(_, p)| p.clone());
                 if let Some(owner) = owner {
                     if let Some(pos) = rel_paths.iter().position(|p| *p == owner) {
                         bad.insert(members[pos]);
                     } else if owner.contains("_FIXTURE") {
-                        let dir = Path::new(&owner).parent().unwrap().to_string_lossy().into_owned();
+                        let dir = Path::new(&owner)
+                            .parent()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
                         for (pos, p) in rel_paths.iter().enumerate() {
                             if p.starts_with(&dir) {
                                 bad.insert(members[pos]);
@@ -709,7 +770,10 @@ fn build_batch(
         let mut r = results.lock().unwrap();
         if bad.is_empty() {
             for &index in &members {
-                r.insert(index, Outcome::Fail(format!("rustc (batch): {first_error}")));
+                r.insert(
+                    index,
+                    Outcome::Fail(format!("rustc (batch): {first_error}")),
+                );
             }
             return None;
         }
@@ -744,12 +808,18 @@ fn harness_module_name(ws: &Workspace, test: &TestCase, map: &ModuleMap) -> Opti
 
 fn area(rel: &str) -> String {
     let parts: Vec<&str> = rel.split('/').collect();
-    let depth = if parts.get(1) == Some(&"annexB") { 3 } else { 3 };
+    let depth = if parts.get(1) == Some(&"annexB") {
+        3
+    } else {
+        3
+    };
     parts[..depth.min(parts.len() - 1)].join("/")
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn main() {
@@ -776,17 +846,40 @@ fn main() {
     );
     let jobs: usize = arg(&args, "--jobs")
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
-    let build_jobs: usize = arg(&args, "--build-jobs").and_then(|v| v.parse().ok()).unwrap_or((jobs / 2).max(1));
-    let batch_size: usize = arg(&args, "--batch").and_then(|v| v.parse().ok()).unwrap_or(150);
-    let timeout = Duration::from_secs(arg(&args, "--timeout").and_then(|v| v.parse().ok()).unwrap_or(10));
-    let work = PathBuf::from(arg(&args, "--work").unwrap_or_else(|| workspace.join("target/test262-work").to_string_lossy().into_owned()));
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
+    let build_jobs: usize = arg(&args, "--build-jobs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or((jobs / 2).max(1));
+    let batch_size: usize = arg(&args, "--batch")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    let timeout = Duration::from_secs(
+        arg(&args, "--timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+    );
+    let work = PathBuf::from(arg(&args, "--work").unwrap_or_else(|| {
+        workspace
+            .join("target/test262-work")
+            .to_string_lossy()
+            .into_owned()
+    }));
     let limit: Option<usize> = arg(&args, "--limit").and_then(|v| v.parse().ok());
-    let fe_timeout = Duration::from_secs(arg(&args, "--frontend-timeout").and_then(|v| v.parse().ok()).unwrap_or(30));
+    let fe_timeout = Duration::from_secs(
+        arg(&args, "--frontend-timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    );
 
     // Selection: --subset file of prefixes, positional prefixes, or the
     // default conformance roots.
-    let mut prefixes: Vec<String> = arg(&args, "--subset").map(|f| read_list_file(Path::new(&f))).unwrap_or_default();
+    let mut prefixes: Vec<String> = arg(&args, "--subset")
+        .map(|f| read_list_file(Path::new(&f)))
+        .unwrap_or_default();
     let mut skip_next = false;
     for a in args.iter().skip(1) {
         if skip_next {
@@ -820,11 +913,23 @@ fn main() {
         .into_iter()
         .map(|path| {
             let source = std::fs::read_to_string(&path).unwrap_or_default();
-            let rel = path.strip_prefix(&test262).unwrap().to_string_lossy().into_owned();
-            TestCase { meta: parse_meta(&source), rel, path, source }
+            let rel = path
+                .strip_prefix(&test262)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            TestCase {
+                meta: parse_meta(&source),
+                rel,
+                path,
+                source,
+            }
         })
         .collect();
-    eprintln!("test262: {} tests, jobs {jobs}, batch {batch_size}", tests.len());
+    eprintln!(
+        "test262: {} tests, jobs {jobs}, batch {batch_size}",
+        tests.len()
+    );
     let _ = std::fs::remove_dir_all(work.join("tree"));
     let _ = std::fs::remove_dir_all(work.join("batches"));
     std::fs::create_dir_all(&work).unwrap();
@@ -843,30 +948,37 @@ fn main() {
     std::thread::scope(|scope| {
         for _ in 0..jobs {
             let (ws, results, runnable, next, tests) = (&ws, &results, &runnable, &next, &tests);
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(test) = tests.get(index) else { break };
-                let outcome = if test.has_flag("noStrict") {
-                    Some(Outcome::Fail("unsupported: sloppy mode".into()))
-                } else {
-                    let path = ws.write_test_module(test);
-                    let early = test
-                        .meta
-                        .negative
-                        .as_ref()
-                        .filter(|(phase, _)| phase == "parse" || phase == "resolution");
-                    match (front_end_isolated(&ws.work.join("tree"), &path, fe_timeout), early) {
-                        (Err(_), Some(_)) => Some(Outcome::Pass),
-                        (Ok(_), Some((phase, ty))) => Some(Outcome::Fail(format!("{phase}: expected {ty}, compiled"))),
-                        (Err(error), None) => Some(Outcome::Fail(error)),
-                        (Ok(_), None) => None,
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(test) = tests.get(index) else { break };
+                    let outcome = if test.has_flag("noStrict") {
+                        Some(Outcome::Fail("unsupported: sloppy mode".into()))
+                    } else {
+                        let path = ws.write_test_module(test);
+                        let early = test
+                            .meta
+                            .negative
+                            .as_ref()
+                            .filter(|(phase, _)| phase == "parse" || phase == "resolution");
+                        match (
+                            front_end_isolated(&ws.work.join("tree"), &path, fe_timeout),
+                            early,
+                        ) {
+                            (Err(_), Some(_)) => Some(Outcome::Pass),
+                            (Ok(_), Some((phase, ty))) => {
+                                Some(Outcome::Fail(format!("{phase}: expected {ty}, compiled")))
+                            }
+                            (Err(error), None) => Some(Outcome::Fail(error)),
+                            (Ok(_), None) => None,
+                        }
+                    };
+                    match outcome {
+                        Some(outcome) => {
+                            results.lock().unwrap().insert(index, outcome);
+                        }
+                        None => runnable.lock().unwrap().push(index),
                     }
-                };
-                match outcome {
-                    Some(outcome) => {
-                        results.lock().unwrap().insert(index, outcome);
-                    }
-                    None => runnable.lock().unwrap().push(index),
                 }
             });
         }
@@ -883,49 +995,76 @@ fn main() {
     // Phase 2: batches grouped by harness key, built and run in parallel.
     let mut by_key: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for index in runnable {
-        by_key.entry(tests[index].harness_key()).or_default().push(index);
+        by_key
+            .entry(tests[index].harness_key())
+            .or_default()
+            .push(index);
     }
     let mut batches = Vec::new();
     for (_, members) in by_key {
         for chunk in members.chunks(batch_size) {
-            batches.push(Batch { tests: chunk.to_vec() });
+            batches.push(Batch {
+                tests: chunk.to_vec(),
+            });
         }
     }
     let total_batches = batches.len();
     eprintln!("test262: {total_batches} batches");
-    let batches = Arc::new(Mutex::new(batches.into_iter().enumerate().collect::<Vec<_>>()));
+    let batches = Arc::new(Mutex::new(
+        batches.into_iter().enumerate().collect::<Vec<_>>(),
+    ));
     let done_batches = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for slot in 0..build_jobs {
-            let (ws, results, batches, tests, workspace, done_batches) = (&ws, &results, &batches, &tests, &workspace, &done_batches);
-            scope.spawn(move || loop {
-                let Some((batch_index, batch)) = batches.lock().unwrap().pop() else { break };
-                let built = build_batch(ws, workspace, slot, batch_index, tests, batch.tests, results);
-                if let Some((bin, members)) = built {
-                    // Run this batch's tests with a small per-batch pool.
-                    let per = (jobs / build_jobs).max(1);
-                    let cursor = AtomicUsize::new(0);
-                    std::thread::scope(|inner| {
-                        for _ in 0..per {
-                            inner.spawn(|| loop {
-                                let pos = cursor.fetch_add(1, Ordering::Relaxed);
-                                let Some(&index) = members.get(pos) else { break };
-                                if results.lock().unwrap().contains_key(&index) {
-                                    continue;
-                                }
-                                let mut command = Command::new(&bin);
-                                command.arg(pos.to_string());
-                                let outcome = match run_with_timeout(command, timeout) {
-                                    Ok(output) => judge(&tests[index], &output),
-                                    Err(error) => Outcome::Fail(error),
-                                };
-                                results.lock().unwrap().insert(index, outcome);
-                            });
-                        }
-                    });
+            let (ws, results, batches, tests, workspace, done_batches) =
+                (&ws, &results, &batches, &tests, &workspace, &done_batches);
+            scope.spawn(move || {
+                loop {
+                    let Some((batch_index, batch)) = batches.lock().unwrap().pop() else {
+                        break;
+                    };
+                    let built = build_batch(
+                        ws,
+                        workspace,
+                        slot,
+                        batch_index,
+                        tests,
+                        batch.tests,
+                        results,
+                    );
+                    if let Some((bin, members)) = built {
+                        // Run this batch's tests with a small per-batch pool.
+                        let per = (jobs / build_jobs).max(1);
+                        let cursor = AtomicUsize::new(0);
+                        std::thread::scope(|inner| {
+                            for _ in 0..per {
+                                inner.spawn(|| {
+                                    loop {
+                                        let pos = cursor.fetch_add(1, Ordering::Relaxed);
+                                        let Some(&index) = members.get(pos) else {
+                                            break;
+                                        };
+                                        if results.lock().unwrap().contains_key(&index) {
+                                            continue;
+                                        }
+                                        let mut command = Command::new(&bin);
+                                        command.arg(pos.to_string());
+                                        let outcome = match run_with_timeout(command, timeout) {
+                                            Ok(output) => judge(&tests[index], &output),
+                                            Err(error) => Outcome::Fail(error),
+                                        };
+                                        results.lock().unwrap().insert(index, outcome);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    let done = done_batches.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "test262: batch {done}/{total_batches} ({:.0?})",
+                        started.elapsed()
+                    );
                 }
-                let done = done_batches.fetch_add(1, Ordering::Relaxed) + 1;
-                eprintln!("test262: batch {done}/{total_batches} ({:.0?})", started.elapsed());
             });
         }
     });
@@ -938,7 +1077,10 @@ fn main() {
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut json_tests = serde_json::Map::new();
     for (index, test) in tests.iter().enumerate() {
-        let outcome = results.get(&index).cloned().unwrap_or(Outcome::Fail("not run".into()));
+        let outcome = results
+            .get(&index)
+            .cloned()
+            .unwrap_or(Outcome::Fail("not run".into()));
         let ok = outcome == Outcome::Pass;
         if ok {
             passed.insert(test.rel.clone());
@@ -946,7 +1088,11 @@ fn main() {
         let entry = by_area.entry(area(&test.rel)).or_default();
         entry.1 += 1;
         entry.0 += ok as usize;
-        let features = if test.meta.features.is_empty() { vec!["(none)".to_string()] } else { test.meta.features.clone() };
+        let features = if test.meta.features.is_empty() {
+            vec!["(none)".to_string()]
+        } else {
+            test.meta.features.clone()
+        };
         for feature in features {
             let entry = by_feature.entry(feature).or_default();
             entry.1 += 1;
@@ -963,7 +1109,13 @@ fn main() {
         json_tests.insert(test.rel.clone(), serde_json::Value::String(status));
     }
     let total = tests.len();
-    let pct = |p: usize, t: usize| if t == 0 { 0.0 } else { 100.0 * p as f64 / t as f64 };
+    let pct = |p: usize, t: usize| {
+        if t == 0 {
+            0.0
+        } else {
+            100.0 * p as f64 / t as f64
+        }
+    };
     let commit = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&test262)
@@ -1014,8 +1166,14 @@ fn main() {
 
     // Gate: expected-failures list for the selection.
     if let Some(expected_path) = arg(&args, "--expected") {
-        let expected: BTreeSet<String> = read_list_file(Path::new(&expected_path)).into_iter().collect();
-        let failing: BTreeSet<String> = tests.iter().map(|t| t.rel.clone()).filter(|r| !passed.contains(r)).collect();
+        let expected: BTreeSet<String> = read_list_file(Path::new(&expected_path))
+            .into_iter()
+            .collect();
+        let failing: BTreeSet<String> = tests
+            .iter()
+            .map(|t| t.rel.clone())
+            .filter(|r| !passed.contains(r))
+            .collect();
         if args.iter().any(|a| a == "--update-expected") {
             let body: String = failing.iter().map(|r| format!("{r}\n")).collect();
             std::fs::write(
@@ -1036,7 +1194,10 @@ fn main() {
             println!("REGRESSION: {rel}: {:?}", results.get(&index));
         }
         if !regressions.is_empty() {
-            println!("test262: {} regression(s) against {expected_path}", regressions.len());
+            println!(
+                "test262: {} regression(s) against {expected_path}",
+                regressions.len()
+            );
             std::process::exit(1);
         }
         println!("test262: no regressions ({} newly passing)", fixed.len());
