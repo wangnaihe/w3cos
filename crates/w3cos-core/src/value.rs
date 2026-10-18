@@ -4192,6 +4192,9 @@ fn concat_js_values(left: &Value, right: &Value) -> Value {
 impl Value {
     /// ECMAScript `+` (addition or string concatenation).
     pub fn js_add(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs + rhs);
+        }
         if self.is_string() || other.is_string() {
             concat_js_values(self, other)
         } else if let Some(value) = crate::bigint::add(self, other) {
@@ -4202,6 +4205,9 @@ impl Value {
     }
 
     pub fn js_sub(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs - rhs);
+        }
         if let Some(value) = crate::bigint::sub(self, other) {
             return value;
         }
@@ -4209,6 +4215,9 @@ impl Value {
     }
 
     pub fn js_mul(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs * rhs);
+        }
         if let Some(value) = crate::bigint::mul(self, other) {
             return value;
         }
@@ -4216,6 +4225,9 @@ impl Value {
     }
 
     pub fn js_div(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs / rhs);
+        }
         if let Some(value) = crate::bigint::div(self, other) {
             return value;
         }
@@ -4223,6 +4235,9 @@ impl Value {
     }
 
     pub fn js_rem(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs % rhs);
+        }
         if let Some(value) = crate::bigint::rem(self, other) {
             return value;
         }
@@ -4230,6 +4245,9 @@ impl Value {
     }
 
     pub fn js_neg(&self) -> Value {
+        if let Some(value) = self.as_number() {
+            return Value::Number(-value);
+        }
         if let Some(value) = crate::bigint::neg(self) {
             return value;
         }
@@ -4237,6 +4255,9 @@ impl Value {
     }
 
     pub fn js_pow(&self, other: &Value) -> Value {
+        if let (Some(lhs), Some(rhs)) = (self.as_number(), other.as_number()) {
+            return Value::Number(lhs.powf(rhs));
+        }
         if let Some(value) = crate::bigint::pow(self, other) {
             return value;
         }
