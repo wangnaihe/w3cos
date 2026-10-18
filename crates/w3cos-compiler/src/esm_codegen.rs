@@ -5087,6 +5087,14 @@ export function poly(a: number, b: number, c: number): number {
   for (let i = 0; i < 10; i++) acc = acc * a + b - c / (i + 1);
   return acc;
 }
+export function numPreds(x: any): number {
+  let c = 0;
+  if (Number.isNaN(x)) c += 1;
+  if (Number.isFinite(x)) c += 10;
+  if (Number.isInteger(x)) c += 100;
+  if (Number.isSafeInteger(x)) c += 1000;
+  return c;
+}
 "#,
         )
         .unwrap();
@@ -5180,6 +5188,17 @@ fn main() {
     let typed = num(m0::m0_poly(vec![n(1.5), n(2.0), n(3.0)]));
     let generic = num(m0::m0_poly(vec![s("1.5"), n(2.0), n(3.0)]));
     assert_eq!(typed.to_bits(), generic.to_bits(), "typed {typed} vs generic {generic}");
+
+    // Number.isNaN / isFinite / isInteger / isSafeInteger never coerce.
+    assert_eq!(num(m0::m0_numPreds(vec![n(f64::NAN)])), 1.0);
+    assert_eq!(num(m0::m0_numPreds(vec![s("NaN")])), 0.0);
+    assert_eq!(num(m0::m0_numPreds(vec![s("5")])), 0.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(5.0)])), 1110.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(2.5)])), 10.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(-0.0)])), 1110.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(9007199254740992.0)])), 110.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(f64::INFINITY)])), 0.0);
+    assert_eq!(num(m0::m0_numPreds(vec![])), 0.0);
 
     let stats = w3cos_core::typed::stats();
     println!("TYPED_STATS typed={} guard_failures={}", stats.typed, stats.guard_failures);
