@@ -760,6 +760,12 @@ fn build_batch(
         }
         std::fs::write(dir.join("src/main.rs"), crate_source(&code, &map, &slots)).unwrap();
         std::fs::write(dir.join("Cargo.toml"), manifest(workspace)).unwrap();
+        // Pin the batch crate to the workspace's locked versions so `--offline`
+        // resolves against what `cargo fetch` already downloaded.
+        let lock = dir.join("Cargo.lock");
+        if !lock.exists() {
+            let _ = std::fs::copy(workspace.join("Cargo.lock"), &lock);
+        }
         let target = ws.work.join(format!("target/slot{slot}"));
         let mut build = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
         build
@@ -823,6 +829,17 @@ fn build_batch(
         }
         let mut r = results.lock().unwrap();
         if bad.is_empty() {
+            if first_error.is_empty() {
+                // Not a per-test rustc error (dependency resolution, linker,
+                // ...): surface cargo's own first error line.
+                first_error = stderr
+                    .lines()
+                    .find(|line| line.contains("error"))
+                    .or_else(|| stderr.lines().next())
+                    .map(first_line)
+                    .unwrap_or_default();
+                eprintln!("test262: batch {batch_index} build failed:\n{stderr}");
+            }
             for &index in &members {
                 r.insert(
                     index,

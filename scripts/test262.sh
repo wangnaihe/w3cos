@@ -26,6 +26,8 @@ fetch() {
 }
 
 runner() {
+  # Batch crates build with --offline against the workspace lockfile.
+  cargo fetch -q
   cargo run --release -q -p w3cos-compiler --example test262 -- --test262 "$DIR" "$@"
 }
 
