@@ -5101,6 +5101,14 @@ export function mathIdentity(): boolean {
   (Math as any).__w3cosProbe = 5;
   return Math === Math && (Math as any).__w3cosProbe === 5 && Math.sqrt(16) === 4;
 }
+export function numPreds(x: any): number {
+  let c = 0;
+  if (Number.isNaN(x)) c += 1;
+  if (Number.isFinite(x)) c += 10;
+  if (Number.isInteger(x)) c += 100;
+  if (Number.isSafeInteger(x)) c += 1000;
+  return c;
+}
 "#,
         )
         .unwrap();
@@ -5200,6 +5208,17 @@ fn main() {
     assert_eq!(num(m0::m0_compound(vec![n(3.0)])), 23.0);
     assert_eq!(num(m0::m0_perIter(vec![n(3.0)])), 12.0);
     assert!(m0::m0_mathIdentity(vec![]).to_bool());
+
+    // Number.isNaN / isFinite / isInteger / isSafeInteger never coerce.
+    assert_eq!(num(m0::m0_numPreds(vec![n(f64::NAN)])), 1.0);
+    assert_eq!(num(m0::m0_numPreds(vec![s("NaN")])), 0.0);
+    assert_eq!(num(m0::m0_numPreds(vec![s("5")])), 0.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(5.0)])), 1110.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(2.5)])), 10.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(-0.0)])), 1110.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(9007199254740992.0)])), 110.0);
+    assert_eq!(num(m0::m0_numPreds(vec![n(f64::INFINITY)])), 0.0);
+    assert_eq!(num(m0::m0_numPreds(vec![])), 0.0);
 
     let stats = w3cos_core::typed::stats();
     println!("TYPED_STATS typed={} guard_failures={}", stats.typed, stats.guard_failures);
