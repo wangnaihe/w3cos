@@ -214,6 +214,8 @@ pub(crate) fn verify(
     indices.dedup();
     let close = |a: f32, b: f32| (a - b).abs() <= 1.0 / 64.0;
     let mut diffs = 0;
+    // W3COS_LAYOUT_NG_VERIFY=all also logs matching boxes.
+    let all = std::env::var_os("W3COS_LAYOUT_NG_VERIFY").is_some_and(|v| v == "all");
     for index in indices {
         let (l, n) = (legacy_map.get(&index), ng_map.get(&index));
         let same = match (l, n) {
@@ -225,9 +227,12 @@ pub(crate) fn verify(
             }
             _ => false,
         };
+        if same && all {
+            eprintln!("[layout-ng verify] = #{index} {l:?}");
+        }
         if !same {
             diffs += 1;
-            if diffs <= 8 {
+            if diffs <= 8 || all {
                 let tag = flat
                     .get(index)
                     .map(|info| format!("{:?} {:?}", info.kind, info.style.display))
