@@ -200,9 +200,12 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
             };
             let inner = push_indent(context);
             let mut parts = Vec::new();
-            for key in object.borrow().keys() {
-                // Hidden runtime plumbing never reaches JSON output.
-                if key.starts_with("__w3cos_") {
+            let keys = object.borrow().visible_own_keys();
+            for key in keys {
+                // Hidden runtime plumbing never reaches JSON output, nor do
+                // non-enumerable properties (SerializeJSONObject uses
+                // EnumerableOwnProperties).
+                if key.starts_with("__w3cos_") || object.borrow().rare_non_enumerable(&key) {
                     continue;
                 }
                 if let Some(allowed) = &whitelist {
@@ -210,7 +213,13 @@ fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option
                         continue;
                     }
                 }
-                let child = object.borrow().get_direct(&key);
+                let has_data = object.borrow().properties.contains_key(key.as_str());
+                let child = if has_data {
+                    object.borrow().get_direct(&key)
+                } else {
+                    // Accessor property: [[Get]] runs the getter.
+                    value.get_property(&key)
+                };
                 if let Some(text) = serialize(context, &key, &child) {
                     parts.push(format!(
                         "{}{}{}",

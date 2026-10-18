@@ -3104,6 +3104,44 @@ impl Value {
                 let end = start.saturating_add(count).min(units.len());
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
+            (this, "repeat") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                let count = args.first().map(Value::to_number).unwrap_or(0.0);
+                let count = if count.is_nan() { 0.0 } else { count.trunc() };
+                if count < 0.0 || count.is_infinite() {
+                    crate::throw_value(range_error("Invalid count value"));
+                }
+                let count = count as usize;
+                if value.len().saturating_mul(count) > (1 << 29) {
+                    crate::throw_value(range_error("Invalid string length"));
+                }
+                return Value::from(value.repeat(count));
+            }
+            (this, method @ ("padStart" | "padEnd")) if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                let units: Vec<u16> = value.encode_utf16().collect();
+                let target = args.first().map(Value::to_number).unwrap_or(0.0);
+                let target = if target.is_nan() { 0.0 } else { target.trunc() };
+                let filler = match args.get(1) {
+                    Some(fill) if !fill.is_undefined() => fill.to_js_string(),
+                    _ => " ".to_string(),
+                };
+                let fill_units: Vec<u16> = filler.encode_utf16().collect();
+                if target <= units.len() as f64 || fill_units.is_empty() {
+                    return this.clone();
+                }
+                let pad_len = (target as usize).saturating_sub(units.len());
+                let pad: Vec<u16> = fill_units.iter().copied().cycle().take(pad_len).collect();
+                let mut out = Vec::with_capacity(pad.len() + units.len());
+                if method == "padStart" {
+                    out.extend_from_slice(&pad);
+                    out.extend_from_slice(&units);
+                } else {
+                    out.extend_from_slice(&units);
+                    out.extend_from_slice(&pad);
+                }
+                return Value::from(String::from_utf16_lossy(&out));
+            }
             (this, "startsWith") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
@@ -3596,6 +3634,13 @@ fn close_async_iterator_chain(
 fn is_iterator_object(value: &Value) -> bool {
     (value.is_object() || value.is_array() || value.is_function())
         && crate::bigint::get(value).is_none()
+}
+
+pub(crate) fn range_error(message: &str) -> Value {
+    Value::object(HashMap::from([
+        ("name".into(), Value::string("RangeError")),
+        ("message".into(), Value::string(message)),
+    ]))
 }
 
 pub(crate) fn type_error(message: &str) -> Value {
@@ -4975,6 +5020,46 @@ mod tests {
         let a = Value::String("hello".into());
         let b = Value::Number(42.0);
         assert_eq!(a.js_add(&b).to_js_string(), "hello42");
+    }
+
+    #[test]
+    fn string_repeat_and_padding_follow_ecmascript() {
+        let s = Value::from("ab");
+        assert_eq!(s.call_method("repeat", vec![Value::from(3.0)]).to_js_string(), "ababab");
+        assert_eq!(s.call_method("repeat", vec![Value::from(0.0)]).to_js_string(), "");
+        assert_eq!(
+            s.call_method("padStart", vec![Value::from(5.0), Value::from("xy")]).to_js_string(),
+            "xyxab"
+        );
+        assert_eq!(s.call_method("padEnd", vec![Value::from(4.0)]).to_js_string(), "ab  ");
+        assert_eq!(s.call_method("padStart", vec![Value::from(1.0)]).to_js_string(), "ab");
+    }
+
+    #[test]
+    fn object_define_property_from_js_defaults_to_non_enumerable() {
+        let exports = Value::object(HashMap::new());
+        exports.set_property("plain", Value::from(2.0));
+        let flag = Value::object(HashMap::from([("value".into(), Value::Bool(true))]));
+        crate::class::define_property_from_js(&exports, "__esModule", &flag);
+        let getter = Value::object(HashMap::from([
+            ("enumerable".into(), Value::Bool(true)),
+            ("get".into(), Value::function(|_, _| Value::from(1.0))),
+        ]));
+        crate::class::define_property_from_js(&exports, "g", &getter);
+        let keys = crate::builtins::object_keys(&exports);
+        assert_eq!(keys.to_js_string(), "plain,g");
+        assert!(exports.get_property("__esModule").to_bool());
+        assert_eq!(
+            crate::json::stringify(vec![exports.clone()]).to_js_string(),
+            r#"{"plain":2,"g":1}"#
+        );
+        // Redefining an existing property keeps its enumerability.
+        crate::class::define_property_from_js(
+            &exports,
+            "plain",
+            &Value::object(HashMap::from([("value".into(), Value::from(3.0))])),
+        );
+        assert_eq!(crate::builtins::object_keys(&exports).to_js_string(), "plain,g");
     }
 
     #[test]

@@ -630,8 +630,16 @@ fn build_regex(source: &str, flags: &str) -> Option<Regex> {
     } else {
         format!("(?{modifiers}:{source})")
     };
-    Regex::new(&pattern).ok()
+    // Real-world patterns (e.g. semver's composed grammar regexes) exceed
+    // the regex crate's 10 MiB default NFA budget; V8 has no such limit.
+    fancy_regex::RegexBuilder::new(&pattern)
+        .delegate_size_limit(REGEX_DELEGATE_SIZE_LIMIT)
+        .build()
+        .ok()
 }
+
+/// Compiled-program budget handed to the delegate regex engine.
+const REGEX_DELEGATE_SIZE_LIMIT: usize = 256 << 20;
 
 fn exec_pattern(input: &str, source: &str, flags: &str) -> Value {
     exec_pattern_with_receiver(&Value::Undefined, input, source, flags)
@@ -729,6 +737,14 @@ fn utf16_offset_to_byte(input: &str, offset: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_patterns_compile_past_the_default_delegate_budget() {
+        // Composed grammars like semver's exceed the 10 MiB default.
+        let source = r"^\w{4000}$";
+        assert!(Regex::new(source).is_err(), "pattern no longer exercises the limit");
+        assert!(build_regex(source, "").is_some());
+    }
 
     #[test]
     fn match_returns_full_match_and_capture_groups() {

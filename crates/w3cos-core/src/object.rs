@@ -172,6 +172,19 @@ impl JsObject {
             .map_or(true, |rare| !rare.non_enumerable.contains(key))
     }
 
+    /// Mark an own property non-enumerable.
+    pub(crate) fn mark_non_enumerable(&mut self, key: &str) {
+        self.ensure_rare().non_enumerable.insert(key.to_string());
+    }
+
+    /// Whether `key` was marked non-enumerable (covers accessor properties,
+    /// whose storage lives under internal slot names).
+    pub(crate) fn rare_non_enumerable(&self, key: &str) -> bool {
+        self.rare
+            .as_ref()
+            .is_some_and(|rare| rare.non_enumerable.contains(key))
+    }
+
     /// Return the enumerability of an ordinary own property without
     /// materializing a JavaScript property-descriptor object.
     pub(crate) fn own_property_enumerability(&self, key: &str) -> Option<bool> {
@@ -362,12 +375,31 @@ impl JsObject {
                 return trap(&target);
             }
         }
-        let keys: Vec<Value> = self
-            .properties
-            .keys()
-            .map(|k| Value::from(k.clone()))
-            .collect();
-        Value::array(keys)
+        Value::array(
+            self.visible_own_keys()
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        )
+    }
+
+    /// Own property names in insertion order, with the internal
+    /// `__w3cos_getter_{key}` / `__w3cos_setter_{key}` slots reported as the
+    /// accessor property `key` they implement (once).
+    pub fn visible_own_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for key in self.properties.keys() {
+            let key = key.as_str();
+            let name = key
+                .strip_prefix("__w3cos_getter_")
+                .or_else(|| key.strip_prefix("__w3cos_setter_"))
+                .unwrap_or(key);
+            if seen.insert(name.to_string()) {
+                keys.push(name.to_string());
+            }
+        }
+        keys
     }
 
     /// `[[GetOwnPropertyDescriptor]]`.

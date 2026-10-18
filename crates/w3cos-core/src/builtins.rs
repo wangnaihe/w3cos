@@ -146,7 +146,7 @@ fn build_object_value() -> Value {
                 .unwrap_or(Value::Undefined)
                 .to_js_string();
             let descriptor = arguments.get(2).cloned().unwrap_or(Value::Undefined);
-            crate::class::define_property(&object, &key, &descriptor)
+            crate::class::define_property_from_js(&object, &key, &descriptor)
         }),
     );
     properties.insert(
