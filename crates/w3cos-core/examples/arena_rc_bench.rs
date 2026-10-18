@@ -69,6 +69,44 @@ fn main() {
     }
     let write = started.elapsed();
 
+    // 3b. The same read / write through a static inline cache (AOT sites
+    // with a constant key), plus a prototype read through an IC.
+    static GET_IC: w3cos_core::PropIc = w3cos_core::PropIc::new();
+    static SET_IC: w3cos_core::PropIc = w3cos_core::PropIc::new();
+    static PROTO_IC: w3cos_core::PropIc = w3cos_core::PropIc::new();
+    w3cos_core::ic::reset_stats();
+    let started = Instant::now();
+    let mut sum = 0.0;
+    for _ in 0..n {
+        sum += black_box(&object)
+            .get_property_ic("x", &GET_IC)
+            .as_number()
+            .unwrap_or(0.0);
+    }
+    let access_ic = started.elapsed();
+    black_box(sum);
+    let started = Instant::now();
+    for index in 0..n {
+        black_box(&object).set_property_ic("y", Value::Number(index as f64), &SET_IC);
+    }
+    let write_ic = started.elapsed();
+    let mut proto_props = HashMap::new();
+    proto_props.insert("method".to_string(), Value::Number(1.0));
+    let proto = Value::object(proto_props);
+    let instance = Value::object(HashMap::from([("own".to_string(), Value::Number(0.0))]));
+    w3cos_core::class::set_prototype_of(&instance, &proto);
+    let started = Instant::now();
+    for _ in 0..n {
+        black_box(black_box(&instance).get_property("method"));
+    }
+    let proto_get = started.elapsed();
+    let started = Instant::now();
+    for _ in 0..n {
+        black_box(black_box(&instance).get_property_ic("method", &PROTO_IC));
+    }
+    let proto_ic = started.elapsed();
+    let ic_stats = w3cos_core::ic::stats();
+
     // 4. Clone + drop the handle N times; 4b. the same loop on a number is
     // the floor (enum dispatch, no count). Separate non-inlined loops so
     // the rest of `main` does not change their codegen.
@@ -99,6 +137,16 @@ fn main() {
     );
     println!("get_property          {:8.1} ns/op", ns_per(access, n));
     println!("set_property          {:8.1} ns/op", ns_per(write, n));
+    println!("get_property_ic       {:8.1} ns/op", ns_per(access_ic, n));
+    println!("set_property_ic       {:8.1} ns/op", ns_per(write_ic, n));
+    println!("proto get             {:8.1} ns/op", ns_per(proto_get, n));
+    println!("proto get_ic          {:8.1} ns/op", ns_per(proto_ic, n));
+    println!(
+        "ic hit rate           {:8.4}  ({} hits / {} misses)",
+        ic_stats.hit_rate(),
+        ic_stats.hits(),
+        ic_stats.misses()
+    );
     println!("clone+drop handle     {:8.1} ns/op", ns_per(clone, n));
     println!(
         "clone+drop number     {:8.1} ns/op",

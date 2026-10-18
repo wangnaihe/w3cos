@@ -2507,6 +2507,193 @@ impl Value {
     }
 }
 
+// ── Inline caches (see `crate::ic`) ───────────────────────────────────
+
+impl Value {
+    /// Borrow a plain object's cell without taking a count. `None` for
+    /// every other value (DOM immediates, arrays, functions, primitives).
+    #[inline(always)]
+    fn ic_object_cell<R>(
+        &self,
+        f: impl FnOnce(&RefCell<crate::JsObject>) -> Option<R>,
+    ) -> Option<R> {
+        match self {
+            Value::Object(object) => f(object),
+            Value::Imm(imm) => {
+                let ptr = crate::page_arena::object_ptr(imm.object_handle()?)?;
+                // Safety: `self` owns a strong count for this handle, so the
+                // slot stays live (and its chunk in place) while `f` runs; `f`
+                // never resets the page.
+                f(unsafe { &*ptr })
+            }
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    fn ic_get_hit(&self, ic: &crate::ic::PropIc) -> Option<Value> {
+        let (shape, proto_shape, slot) = ic.load()?;
+        self.ic_object_cell(|cell| {
+            let object = cell.try_borrow().ok()?;
+            if object.proxy_handler.is_some() {
+                return None;
+            }
+            let value = if proto_shape == 0 {
+                object.properties.slot_if_shape(shape, slot)?.clone()
+            } else {
+                if object.properties.shape_id()? != shape {
+                    return None;
+                }
+                let proto = object.prototype.as_ref()?;
+                if !proto.is_live() {
+                    return None;
+                }
+                let proto = proto.try_borrow().ok()?;
+                proto.properties.slot_if_shape(proto_shape, slot)?.clone()
+            };
+            // `undefined` may need the accessor fallback of the generic path.
+            (!value.is_undefined()).then_some(value)
+        })
+    }
+
+    fn ic_fill_get(&self, key: &str, ic: &crate::ic::PropIc) {
+        let _ = self.ic_object_cell(|cell| {
+            let object = cell.try_borrow().ok()?;
+            if object.proxy_handler.is_some() {
+                return None;
+            }
+            if let Some((shape, slot)) = object.properties.shaped_slot(key) {
+                ic.store(shape, 0, slot);
+                return Some(());
+            }
+            let shape = object.properties.shape_id()?;
+            if object.own_getter(key).is_some() {
+                return None;
+            }
+            let proto = object.prototype.as_ref()?;
+            if !proto.is_live() {
+                return None;
+            }
+            let proto = proto.try_borrow().ok()?;
+            let (proto_shape, slot) = proto.properties.shaped_slot(key)?;
+            ic.store(shape, proto_shape, slot);
+            Some(())
+        });
+    }
+
+    /// `obj.key` for a compile-time constant `key`, through a per-site
+    /// inline cache. Same result as [`Self::get_property`].
+    #[inline]
+    pub fn get_property_ic(&self, key: &str, ic: &crate::ic::PropIc) -> Value {
+        if let Some(value) = self.ic_get_hit(ic) {
+            crate::ic::count(crate::ic::GET_HIT);
+            return value;
+        }
+        self.get_property_ic_miss(key, ic)
+    }
+
+    #[inline(never)]
+    fn get_property_ic_miss(&self, key: &str, ic: &crate::ic::PropIc) -> Value {
+        crate::ic::count(crate::ic::GET_MISS);
+        let value = self.get_property(key);
+        if !crate::ic::generic_only_key(key) {
+            self.ic_fill_get(key, ic);
+        }
+        value
+    }
+
+    /// [`Self::get_property_checked`] through an inline cache.
+    #[inline]
+    pub fn get_property_checked_ic(&self, key: &str, ic: &crate::ic::PropIc) -> Value {
+        if let Some(value) = self.ic_get_hit(ic) {
+            crate::ic::count(crate::ic::GET_HIT);
+            return value;
+        }
+        if self.is_nullish() {
+            return self.get_property_checked(key);
+        }
+        self.get_property_ic_miss(key, ic)
+    }
+
+    /// Overwrite an own data slot on an IC hit; gives `value` back on a miss.
+    #[inline(always)]
+    fn ic_set_hit(&self, value: Value, ic: &crate::ic::PropIc) -> Result<(), Value> {
+        let Some((shape, 0, slot)) = ic.load() else {
+            return Err(value);
+        };
+        let mut value = Some(value);
+        let old = self.ic_object_cell(|cell| {
+            let mut object = cell.try_borrow_mut().ok()?;
+            if object.proxy_handler.is_some() {
+                return None;
+            }
+            let target = object.properties.slot_mut_if_shape(shape, slot)?;
+            Some(std::mem::replace(target, value.take().expect("value")))
+        });
+        match old {
+            // Drop the previous value after the object borrow is released.
+            Some(old) => {
+                drop(old);
+                Ok(())
+            }
+            None => Err(value.expect("value not consumed on miss")),
+        }
+    }
+
+    fn ic_fill_set(&self, key: &str, ic: &crate::ic::PropIc) {
+        let _ = self.ic_object_cell(|cell| {
+            let object = cell.try_borrow().ok()?;
+            if object.proxy_handler.is_some() {
+                return None;
+            }
+            let (shape, slot) = object.properties.shaped_slot(key)?;
+            ic.store(shape, 0, slot);
+            Some(())
+        });
+    }
+
+    /// [`Self::try_set_property`] for a compile-time constant `key`, through
+    /// a per-site inline cache (own writable data properties only).
+    #[inline]
+    pub fn try_set_property_ic(&self, key: &str, value: Value, ic: &crate::ic::PropIc) -> bool {
+        if crate::ic::generic_only_key(key) {
+            return self.try_set_property(key, value);
+        }
+        match self.ic_set_hit(value, ic) {
+            Ok(()) => {
+                crate::ic::count(crate::ic::SET_HIT);
+                true
+            }
+            Err(value) => self.try_set_property_ic_miss(key, value, ic),
+        }
+    }
+
+    #[inline(never)]
+    fn try_set_property_ic_miss(&self, key: &str, value: Value, ic: &crate::ic::PropIc) -> bool {
+        crate::ic::count(crate::ic::SET_MISS);
+        let stored = self.try_set_property(key, value);
+        if stored {
+            self.ic_fill_set(key, ic);
+        }
+        stored
+    }
+
+    #[cfg(test)]
+    pub(crate) fn properties_has_own_for_test(&self, key: &str) -> bool {
+        self.as_object()
+            .is_some_and(|object| object.borrow().properties.contains_key(key))
+    }
+
+    /// [`Self::set_property`] through an inline cache.
+    #[inline]
+    pub fn set_property_ic(&self, key: &str, value: Value, ic: &crate::ic::PropIc) {
+        if crate::ic::generic_only_key(key) {
+            return self.set_property(key, value);
+        }
+        let _ = self.try_set_property_ic(key, value, ic);
+    }
+}
+
 // ── Constructors ───────────────────────────────────────────────────────
 
 impl Value {

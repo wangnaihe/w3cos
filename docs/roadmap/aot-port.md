@@ -243,6 +243,15 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 9. VS Code fork / 补丁队列流程：`vscode-w3cos` 仓库按上游 tag 重放补丁（quilt 式 `patches/` 目录 + CI 自动 rebase），每个补丁标注"可上游/仅 w3cos"，可上游的向 microsoft/vscode 提 PR；扩展与 npm 依赖同一流程（`patches/npm/<pkg>@<ver>`，安装时应用）。
    - **第 1 步（已完成）**：补丁队列先放在仓库内的 `ports/vscode/`，暂不建 GitHub fork。`patches/series` 加 `NNNN-*.patch`，每个补丁带 `W3cos-Upstream: yes|no` 标注。`scripts/vscode-patches.sh` 提供 fetch/apply/refresh/lint/check，基线沿用 `tools/vscode-baseline/CODE_OSS.lock.json`。CI（`vscode-patches.yml`）检查队列能干净应用，并对打完补丁的源码跑 leak-lint。排序后的结果见 `docs/perf/code-oss-leak-lint.md`。第一批补丁：extHostTerminalService 的 12 个 Emitter 改为注册释放。
 10. Shape/隐藏类 + 静态 IC 槽。
+   - **第 1 步（已完成）**：
+     - **Shape 树**：`PropertyMap` 改为 `Rc<Shape>` 加扁平 `Vec<Value>` 槽位。每个线程一棵 shape 转移树，按属性名转移，shape id 全进程唯一；同样的键序共享同一个 shape。
+     - **字典模式**：delete、超过 64 键、或 shape 预算（每线程 32768 个）用完时，退回原先的 HashMap 加顺序表。
+     - **Shape 键**：用堆字符串，跨 page reset 存活。shape 不持有任何 Value，引用计数、弱引用语义和泄漏 CI 都不受影响。
+     - **键序**：自有键枚举改为整数键升序在前、其余按插入顺序（`OrdinaryOwnPropertyKeys`）。
+     - **[[Set]] 快路径**：不再为了读 `writable` 每次构造描述符对象（只有带 `getOwnPropertyDescriptor` trap 的 proxy 才构造）；原型链上没有 `__w3cos_` 标记键、也没有 proxy 时，跳过 setter 查找。
+     - **静态 IC**：W3IR AOT 对常量键的 get/set 生成每站点 `static PropIc`（一个 `AtomicU64`，打包 `S:29|PS:29|slot:6`）。get 覆盖自有属性和一层原型；set 只覆盖已有的自有数据槽。每次命中都重新校验 shape，因此不需要失效表。proxy、DOM、数组、函数、字典对象、特殊键（`length`、数组索引、DOM shape 键、`__proto__`、`__w3cos_` 标记），以及读到 `undefined`（需要 getter 回退）时，一律走通用路径。
+     - **性能**：set 1403 → 15 ns；realistic_sample 3474 → 1571 ms；稳态 IC 命中率约 100%。详见 `docs/perf/shapes-ic.md`。
+     - **未做**：freeze/seal/writable/configurable（之前就没有建模）、加属性转移 IC、方法调用 IC、两层及以上的原型链、动态键。
 11. W3IR typed 节点 + "推测类型 + 双版本"降级。
 12. CommonJS 静态链接 + Node 解析算法（`exports` 条件含 `w3cos`/`node`）。
 13. Cranelift 后端 B（W3IR → 机器码），与 rustc 后端结果对拍（test262 子集）。
