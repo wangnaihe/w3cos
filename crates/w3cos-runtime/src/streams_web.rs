@@ -568,7 +568,6 @@ fn readable_stream_async_iterator(
 ) -> Value {
     let reader = acquire_reader(state);
     let finished = Rc::new(Cell::new(false));
-    let iterator_slot = tracked_value_cell(Value::Undefined);
     let iterator = Value::object(HashMap::new());
 
     let reader_for_next = reader.clone();
@@ -659,12 +658,11 @@ fn readable_stream_async_iterator(
             })])
         }),
     );
-    let iterator_slot_for_method = Rc::clone(&iterator_slot);
-    let async_iterator =
-        realm_stream_function(move |_, _| iterator_slot_for_method.borrow().clone());
+    // Return the receiver rather than holding the iterator in a slot the
+    // method captures, which would form an iterator -> function -> iterator cycle.
+    let async_iterator = realm_stream_function(|this, _| this);
     iterator.set_property("__w3cos_symbol_async_iterator", async_iterator.clone());
     iterator.set_property("__w3cos_symbol_asyncIterator", async_iterator);
-    *iterator_slot.borrow_mut() = iterator.clone();
     iterator
 }
 

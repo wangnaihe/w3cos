@@ -448,10 +448,9 @@ fn live_array_like_values_iterator(value: Value) -> Value {
             ]))
         }),
     )]));
-    let self_iterator = iterator.clone();
     iterator.set_property(
         "__w3cos_symbol_iterator",
-        Value::function(move |_, _| self_iterator.clone()),
+        crate::value::self_returning_iterator_method(),
     );
     iterator
 }

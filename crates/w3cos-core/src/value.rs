@@ -3290,6 +3290,12 @@ impl Value {
     }
 }
 
+/// `[Symbol.iterator]` method that returns `this`, without capturing the
+/// iterator object (which would create an uncollectable reference cycle).
+pub(crate) fn self_returning_iterator_method() -> Value {
+    Value::function(|this, _| this)
+}
+
 pub(crate) fn iterator_object(iterator: ValueIterator) -> Value {
     let iterator = Rc::new(RefCell::new(iterator));
     let next_iterator = Rc::clone(&iterator);
@@ -3307,11 +3313,10 @@ pub(crate) fn iterator_object(iterator: ValueIterator) -> Value {
         ]))
     });
     let object = crate::js_object! { "next" => next };
-    let iterator = object.clone();
-    object.set_property(
-        "__w3cos_symbol_iterator",
-        Value::function(move |_, _| iterator.clone()),
-    );
+    // `[Symbol.iterator]()` returns its receiver (as %IteratorPrototype% does).
+    // Capturing a clone of `object` here would form an object -> function ->
+    // object cycle that keeps the iterator and its source alive forever.
+    object.set_property("__w3cos_symbol_iterator", self_returning_iterator_method());
     object
 }
 

@@ -384,8 +384,9 @@ fn async_iterator(values: Vec<Value>) -> Value {
             ]))])
         }),
     );
-    let iterator_self = iterator.clone();
-    let async_iterator = realm_file_system_function(move |_, _| iterator_self.clone());
+    // Return the receiver rather than capturing `iterator`, which would form
+    // an uncollectable iterator -> function -> iterator cycle.
+    let async_iterator = realm_file_system_function(|this, _| this);
     iterator.set_property("__w3cos_symbol_async_iterator", async_iterator.clone());
     iterator.set_property("__w3cos_symbol_asyncIterator", async_iterator);
     register_file_system_value(&iterator);

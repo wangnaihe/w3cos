@@ -560,11 +560,9 @@ impl Vm {
             }),
         );
 
-        let iterable = generator.clone();
-        generator.set_property(
-            "__w3cos_symbol_iterator",
-            Value::function(move |_, _| iterable.clone()),
-        );
+        // Return the receiver; capturing `generator` would form an
+        // uncollectable generator -> function -> generator cycle.
+        generator.set_property("__w3cos_symbol_iterator", Value::function(|this, _| this));
         Ok(generator)
     }
 
@@ -613,10 +611,11 @@ impl Vm {
             );
         }
 
-        let iterable = generator.clone();
+        // Return the receiver; capturing `generator` would form an
+        // uncollectable generator -> function -> generator cycle.
         generator.set_property(
             "__w3cos_symbol_async_iterator",
-            Value::function(move |_, _| iterable.clone()),
+            Value::function(|this, _| this),
         );
         Ok(generator)
     }
