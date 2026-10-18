@@ -9,6 +9,10 @@ description = "W3C OS core — JS value types, Proxy, and reactive primitives"
 # Count arena slot retain/release calls (`page_arena::rc_op_counts`), for
 # measuring refcount traffic. Off by default; costs one TLS add per op.
 rc-stats = []
+# Debug-only cycle detector / retainer dump (`w3cos_core::leak_detector`).
+# Never compiled into release builds unless explicitly enabled; reports only,
+# never frees.
+leak-detector = []
 
 [dependencies]
 serde_json = { workspace = true }
@@ -19,3 +23,7 @@ regex = "1"
 fancy-regex = "0.18"
 num-bigint = "0.4"
 num-traits = "0.2"
+
+[[example]]
+name = "leak_report_demo"
+required-features = ["leak-detector"]

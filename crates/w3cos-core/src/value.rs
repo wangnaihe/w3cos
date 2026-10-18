@@ -6026,3 +6026,119 @@ mod tests {
         assert_eq!(JsString::interned_table_bytes(), 0);
     }
 }
+
+#[cfg(feature = "leak-detector")]
+pub(crate) mod leak_edges {
+    //! Read-only edge extraction for [`crate::leak_detector`]. Never clones
+    //! or drops a `Value`, so no count changes while the graph is scanned.
+    use super::*;
+    use crate::leak_detector::LeakTarget;
+    use crate::page_arena::SlotKind;
+
+    pub(crate) fn value_target(value: &Value) -> Option<LeakTarget> {
+        match value {
+            Value::Imm(imm) => imm
+                .arena_slot()
+                .map(|(kind, handle)| LeakTarget::Arena(kind, handle)),
+            Value::Object(rc) => Some(LeakTarget::HostObject(
+                Rc::as_ptr(rc),
+                Rc::strong_count(rc) as u32,
+            )),
+            Value::Array(rc) => Some(LeakTarget::HostArray(
+                Rc::as_ptr(rc),
+                Rc::strong_count(rc) as u32,
+            )),
+            Value::Function(rc) => Some(LeakTarget::HostFunction(
+                Rc::as_ptr(rc),
+                Rc::strong_count(rc) as u32,
+            )),
+            Value::String(_) => None,
+        }
+    }
+
+    pub(crate) fn push_value(out: &mut Vec<(String, LeakTarget)>, label: String, value: &Value) {
+        if let Some(target) = value_target(value) {
+            out.push((label, target));
+        }
+    }
+
+    impl JsObjectRef {
+        pub(crate) fn leak_target(&self) -> LeakTarget {
+            match &self.repr {
+                JsObjectRepr::Interned { handle, .. } => {
+                    LeakTarget::Arena(SlotKind::Object, *handle)
+                }
+                JsObjectRepr::Host(rc) => {
+                    LeakTarget::HostObject(Rc::as_ptr(rc), Rc::strong_count(rc) as u32)
+                }
+            }
+        }
+    }
+
+    impl ArrayStorage {
+        pub(crate) fn leak_edges(&self, out: &mut Vec<(String, LeakTarget)>) {
+            for (index, value) in self.values.iter().enumerate() {
+                push_value(out, format!("[{index}]"), value);
+            }
+        }
+    }
+
+    impl FunctionData {
+        /// Pushes the visible strong edges; returns `true` when the function
+        /// is a native closure whose captures cannot be enumerated.
+        pub(crate) fn leak_edges(&self, out: &mut Vec<(String, LeakTarget)>) -> bool {
+            if let Ok(props) = self.props.try_borrow() {
+                for key in props.keys() {
+                    if let Some(value) = props.get(key.as_str()) {
+                        push_value(out, format!(".{}", key.as_str()), value);
+                    }
+                }
+            }
+            match &self.body {
+                FunctionBody::Dyn(_) => true,
+                FunctionBody::Bump { .. } => false,
+                FunctionBody::Aot { captures, .. } => {
+                    let mut ids = captures.keys().copied().collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    for id in ids {
+                        match &captures[&id] {
+                            AotCapture::Cell(cell) => out.push((
+                                format!("capture#{id}"),
+                                LeakTarget::HostCell(
+                                    Rc::as_ptr(cell),
+                                    Rc::strong_count(cell) as u32,
+                                ),
+                            )),
+                            AotCapture::Accessors(getter, setter) => {
+                                push_value(out, format!("capture#{id}.get"), getter);
+                                push_value(out, format!("capture#{id}.set"), setter);
+                            }
+                            AotCapture::Number(_) => {}
+                        }
+                    }
+                    false
+                }
+            }
+        }
+
+        pub(crate) fn leak_label(&self) -> String {
+            let name = self
+                .props
+                .try_borrow()
+                .ok()
+                .and_then(|props| props.get("name").and_then(|name| name.as_js_string()))
+                .map(|name| name.as_str().to_string())
+                .unwrap_or_default();
+            let kind = match &self.body {
+                FunctionBody::Dyn(_) => "native closure",
+                FunctionBody::Aot { .. } => "AOT function",
+                FunctionBody::Bump { .. } => "AOT counter function",
+            };
+            if name.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind} {name}")
+            }
+        }
+    }
+}

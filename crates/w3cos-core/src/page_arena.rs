@@ -384,7 +384,7 @@ impl<T> Drop for SizeClassSlab<T> {
 }
 
 /// Which slab a handle names.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub(crate) enum SlotKind {
     Object = 0,
@@ -820,6 +820,11 @@ pub(crate) fn str_at(handle: u32, epoch: u32) -> &'static str {
 /// arena borrow; inside a running [`schedule_drop`] they are parked until
 /// the in-place drop in progress has finished with its chunk.
 pub fn reset() {
+    #[cfg(feature = "leak-detector")]
+    {
+        let _ = crate::leak_detector::report_from_env("page reset");
+        crate::leak_detector::clear_baseline();
+    }
     let retired = ARENA.with(|arena| {
         let mut arena = arena.borrow_mut();
         let retired = arena.reset();
@@ -1134,6 +1139,55 @@ pub(crate) fn upgrade_function(
 /// Live (strongly referenced) page-local functions.
 pub fn live_functions() -> usize {
     ARENA.with(|arena| arena.borrow().functions.len())
+}
+
+/// One live slot as seen by [`crate::leak_detector`].
+#[cfg(feature = "leak-detector")]
+pub(crate) struct LiveSlot {
+    pub(crate) kind: SlotKind,
+    pub(crate) index: usize,
+    pub(crate) generation: u32,
+    pub(crate) strong: u32,
+    pub(crate) payload: crate::leak_detector::Payload,
+}
+
+/// Snapshot every live slot's strong count and payload pointer. Read-only:
+/// no count changes, nothing freed.
+#[cfg(feature = "leak-detector")]
+pub(crate) fn scan_live_slots() -> Vec<LiveSlot> {
+    use crate::leak_detector::Payload;
+    fn scan<T>(
+        slab: &SizeClassSlab<T>,
+        out: &mut Vec<LiveSlot>,
+        wrap: impl Fn(*const T) -> Payload,
+    ) {
+        for (index, meta) in slab.meta.iter().enumerate() {
+            if meta.strong.get() == 0 || !meta.init.get() {
+                continue;
+            }
+            out.push(LiveSlot {
+                kind: slab.kind,
+                index,
+                generation: meta.generation.get(),
+                strong: meta.strong.get(),
+                payload: wrap(slab.slot_ptr(index) as *const T),
+            });
+        }
+    }
+    ARENA.with(|arena| {
+        let arena = arena.borrow();
+        let mut out = Vec::new();
+        scan(&arena.objects, &mut out, Payload::Object);
+        scan(&arena.arrays, &mut out, Payload::Array);
+        scan(&arena.functions, &mut out, Payload::Function);
+        out
+    })
+}
+
+/// Slot index of a handle (no liveness check).
+#[cfg(feature = "leak-detector")]
+pub(crate) fn handle_index(handle: u32) -> Option<usize> {
+    decode_handle(handle).map(|(index, _)| index)
 }
 
 #[cfg(test)]
