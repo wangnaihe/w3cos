@@ -760,6 +760,12 @@ thread_local! {
     static GEN: Cell<u32> = const { Cell::new(1) };
 }
 
+/// Current page epoch; bumped by every [`reset`]. Generated code keys
+/// per-thread caches of page-local values (e.g. AOT capture maps) on it.
+pub fn page_epoch() -> u32 {
+    current_epoch()
+}
+
 pub(crate) fn current_epoch() -> u32 {
     GEN.get()
 }

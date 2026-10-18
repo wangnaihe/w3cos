@@ -665,6 +665,11 @@ fn generate_module_with_bodies(
         }
     }
     let class_names = module_class_names(bundle, module);
+    let _direct_typed_guard = w3ir_module.as_ref().map(|w3ir| {
+        crate::w3ir_aot::install_direct_typed_callees(direct_typed_callees(
+            bundle, module, w3ir, &functions,
+        ))
+    });
 
     // Emit definitions with bodies.
     for sym in bundle.symbols.iter().filter(|s| s.module == module.path) {
@@ -2295,6 +2300,24 @@ fn emit_w3ir_sync_symbol(
         format!("{}:value", symbol.bundled_name),
         symbol.bundled_name,
     ));
+    if let Some(arity) =
+        crate::w3ir_aot::direct_typed_arity_for(&format!("{}_typed_direct", symbol.bundled_name))
+    {
+        let parameters = (0..arity)
+            .map(|index| format!("a{index}: f64"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let arguments = (0..arity)
+            .map(|index| format!("a{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let bundled = &symbol.bundled_name;
+        // The capture map is rebuilt per page (its accessors are page-local
+        // function values) and shared by every direct call on that page.
+        output.push_str(&format!(
+            "    std::thread_local! {{ static __W3COS_DIRECT_CAPTURES_{bundled}: std::cell::RefCell<Option<(u32, std::rc::Rc<w3cos_core::AotCaptureMap>)>> = const {{ std::cell::RefCell::new(None) }}; }}\n    #[allow(dead_code, non_snake_case)]\n    fn {bundled}_typed_direct({parameters}) -> w3cos_core::Completion {{\n        let __w3cos_epoch = w3cos_core::page_arena::page_epoch();\n        let __w3cos_cached = __W3COS_DIRECT_CAPTURES_{bundled}.with(|cell| cell.borrow().as_ref().filter(|(epoch, _)| *epoch == __w3cos_epoch).map(|(_, captures)| std::rc::Rc::clone(captures)));\n        let __w3cos_captures = match __w3cos_cached {{ Some(captures) => captures, None => {{ let captures = std::rc::Rc::new({captures}); let retired = __W3COS_DIRECT_CAPTURES_{bundled}.with(|cell| cell.replace(Some((__w3cos_epoch, std::rc::Rc::clone(&captures))))); drop(retired); captures }} }};\n        {factory}__typed_direct(&__w3cos_captures, {arguments})\n    }}\n"
+        ));
+    }
     if symbol.kind == SymbolKind::Variable {
         output.push_str(&format!(
             "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
@@ -2331,6 +2354,103 @@ fn generator_capture_map(
         namespace_names,
         &HashMap::new(),
     )
+}
+
+/// Same-module function declarations callable through a native typed entry
+/// (`{bundled}_typed_direct`), keyed by their module binding id: sync
+/// functions whose every parameter is a speculable `number`
+/// ([`crate::w3ir_aot::direct_typed_arity`]) and whose binding is never
+/// reassigned anywhere in the module.
+fn direct_typed_callees(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    items: &[TopLevelItem],
+) -> HashMap<u32, (String, usize)> {
+    let mut callees = HashMap::new();
+    let Some(entry) = w3ir_module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == w3ir_module.entry)
+    else {
+        return callees;
+    };
+    for symbol in bundle
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.module == module.path && symbol.kind == SymbolKind::Function)
+    {
+        if function_flags(items, &symbol.original_name)
+            .is_none_or(|(is_async, is_generator)| is_async || is_generator)
+        {
+            continue;
+        }
+        let Some(binding) = entry.bindings.iter().find(|binding| {
+            // Module-scope declarations lower to hoisted `var`-like cells.
+            binding.name == symbol.original_name
+                && matches!(
+                    binding.kind,
+                    w3cos_ir::BindingKind::Function | w3cos_ir::BindingKind::Var
+                )
+        }) else {
+            continue;
+        };
+        let Some(function) = entry_bound_w3ir_function(w3ir_module, &symbol.original_name) else {
+            continue;
+        };
+        let Some(arity) = crate::w3ir_aot::direct_typed_arity(function) else {
+            continue;
+        };
+        // The binding must only ever hold this function: every write is the
+        // module body's hoisted `CreateClosure` of it.
+        let closures: HashMap<w3cos_ir::Register, w3cos_ir::FunctionId> = entry
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction {
+                w3cos_ir::Instruction::CreateClosure { dst, function, .. } => {
+                    Some((*dst, *function))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut writes = 0;
+        let mut foreign = false;
+        for candidate in &w3ir_module.functions {
+            for instruction in candidate
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+            {
+                let (w3cos_ir::Instruction::InitializeBinding {
+                    binding: target,
+                    value,
+                }
+                | w3cos_ir::Instruction::StoreBinding {
+                    binding: target,
+                    value,
+                }) = instruction
+                else {
+                    continue;
+                };
+                if *target != binding.id {
+                    continue;
+                }
+                writes += 1;
+                if candidate.id != entry.id || closures.get(value) != Some(&function.id) {
+                    foreign = true;
+                }
+            }
+        }
+        if foreign || writes != 1 {
+            continue;
+        }
+        callees.insert(
+            binding.id.0,
+            (format!("{}_typed_direct", symbol.bundled_name), arity),
+        );
+    }
+    callees
 }
 
 fn select_w3ir_function<'a>(
@@ -5097,6 +5217,15 @@ export function perIter(n: number): number {
   for (let i = 0; i < n; i++) fs.push(() => i);
   return fs[0]() * 100 + fs[1]() * 10 + fs[2]();
 }
+function sq(x: number): number {
+  if (x > 1e300) throw new Error("big");
+  return x * x;
+}
+export function sumSq(n: number): number { let s = 0; for (let i = 0; i < n; i++) s += sq(i); return s; }
+export function sqThrows(): string { try { sq(1e301); return "no"; } catch (e) { return "caught"; } }
+function fibT(n: number): number { return n < 2 ? n : fibT(n - 1) + fibT(n - 2); }
+export function fibCall(n: number): number { return fibT(n); }
+export function sqMixed(): any { const v: any = "3"; return sq(v); }
 export function mathIdentity(): boolean {
   (Math as any).__w3cosProbe = 5;
   return Math === Math && (Math as any).__w3cosProbe === 5 && Math.sqrt(16) === 4;
@@ -5118,6 +5247,10 @@ export function numPreds(x: any): number {
             .unwrap();
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("m0_fibT_typed_direct(") && code.contains("m0_sq_typed_direct("),
+            "same-module typed callees should be called directly:\n{code}"
+        );
         assert!(
             code.contains("record_typed_entry") && code.contains("FrameTyped"),
             "typed functions should get a typed version:\n{code}"
@@ -5202,6 +5335,14 @@ fn main() {
     let typed = num(m0::m0_poly(vec![n(1.5), n(2.0), n(3.0)]));
     let generic = num(m0::m0_poly(vec![s("1.5"), n(2.0), n(3.0)]));
     assert_eq!(typed.to_bits(), generic.to_bits(), "typed {typed} vs generic {generic}");
+
+    // Direct native calls between typed functions (numbers in, Completion
+    // out), including exceptions crossing a direct call and a non-number
+    // argument that must take the boxed path.
+    assert_eq!(num(m0::m0_sumSq(vec![n(10.0)])), 285.0);
+    assert_eq!(m0::m0_sqThrows(vec![]).to_js_string(), "caught");
+    assert_eq!(num(m0::m0_fibCall(vec![n(15.0)])), 610.0);
+    assert_eq!(num(m0::m0_sqMixed(vec![])), 9.0);
 
     // Multi-use receiver borrow keeps accessor order; per-iteration `let`
     // cells still refresh when a closure captures them; Math is a singleton.
