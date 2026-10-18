@@ -86,12 +86,14 @@ fn line_height_css(style: &Style) -> String {
 
 /// One generated case: a block root with IFC containers of Ahem words.
 fn random_case(rng: &mut Rng) -> Component {
-    random_case_with(rng, false)
+    random_case_with(rng, 0)
 }
 
 /// `ext`: white-space pre (preserved, repeated and line-edge spaces) and
 /// multi-word items whose internal opportunities NG must not need.
-fn random_case_with(rng: &mut Rng, ext: bool) -> Component {
+/// `level` 2 adds pre-wrap and pre-line containers.
+fn random_case_with(rng: &mut Rng, level: u8) -> Component {
+    let ext = level >= 1;
     let mut containers = Vec::new();
     for _ in 0..1 + rng.pick(3) {
         // Sizes with an integral 0.8em Ahem ascent: Blink rounds font
@@ -107,9 +109,12 @@ fn random_case_with(rng: &mut Rng, ext: bool) -> Component {
             display: Display::Block,
             width: Dimension::Px(rng.of(&[40.0, 75.0, 120.0, 200.0, 333.0])),
             text_align: rng.of(&[TextAlign::Start, TextAlign::Center, TextAlign::Right]),
-            white_space: match (ext, rng.pick(10)) {
+            white_space: match (level, rng.pick(10)) {
                 (_, 0) => WhiteSpace::NoWrap,
-                (true, 1..=3) => WhiteSpace::Pre,
+                (1, 1..=3) => WhiteSpace::Pre,
+                (2, 1) => WhiteSpace::Pre,
+                (2, 2..=5) => WhiteSpace::PreWrap,
+                (2, 6..=7) => WhiteSpace::PreLine,
                 _ => WhiteSpace::Normal,
             },
             ..Style::default()
@@ -129,7 +134,7 @@ fn random_case_with(rng: &mut Rng, ext: bool) -> Component {
         let mut items = Vec::new();
         let count = 1 + rng.pick(10);
         for i in 0..count {
-            let pre = style.white_space == WhiteSpace::Pre;
+            let pre = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
             let mut text = String::new();
             if ext && pre && rng.pick(4) == 0 {
                 text.push_str(&" ".repeat(1 + rng.pick(2) as usize));
@@ -201,6 +206,8 @@ fn case_html(flat: &[crate::layout::FlatNodeInfo]) -> String {
             match s.white_space {
                 WhiteSpace::NoWrap => "nowrap",
                 WhiteSpace::Pre => "pre",
+                WhiteSpace::PreWrap => "pre-wrap",
+                WhiteSpace::PreLine => "pre-line",
                 _ => "normal",
             },
         ));
@@ -313,19 +320,21 @@ fn generated_inline_trees_match_chrome() {
 
 const EXT_CASES: usize = 300;
 const EXT_SEED: u64 = 0x5eed_1a70_0115_0003;
+const WRAP_SEED: u64 = 0x5eed_1a70_0115_0004;
 
-/// Extended corpus (pre, multi-word items).  NG may fall back at runtime when
-/// a line would need a break inside an item; the rest must be supported and
-/// are dumped with W3COS_NG_INLINE_EXT_DUMP=path for the Chrome oracle.
-#[test]
-fn generated_inline_ext_trees_are_supported() {
+type Golden = std::collections::HashMap<String, std::collections::HashMap<String, [i64; 4]>>;
+
+/// Extended corpora: NG may fall back at runtime when a line would need a
+/// break inside an item; the rest must be supported and are dumped with
+/// `dump_env`=path for the Chrome oracle.
+fn ext_trees_are_supported(level: u8, seed: u64, dump_env: &str, min_handled: usize) {
     let _ahem = AhemGuard::new();
-    let mut rng = Rng(EXT_SEED);
-    let dump = std::env::var_os("W3COS_NG_INLINE_EXT_DUMP");
+    let mut rng = Rng(seed);
+    let dump = std::env::var_os(dump_env);
     let mut lines = String::new();
     let mut handled = 0;
     for case in 0..EXT_CASES {
-        let root = random_case_with(&mut rng, true);
+        let root = random_case_with(&mut rng, level);
         let flat = pre_flatten(&root);
         assert_eq!(
             block::unsupported_reasons(&flat),
@@ -347,7 +356,7 @@ fn generated_inline_ext_trees_are_supported() {
         }
     }
     assert!(
-        handled * 3 >= EXT_CASES,
+        handled >= min_handled,
         "NG handled only {handled}/{EXT_CASES}"
     );
     if let Some(path) = dump {
@@ -355,19 +364,15 @@ fn generated_inline_ext_trees_are_supported() {
     }
 }
 
-/// Chrome expectations for the extended corpus
-/// (testdata/generated-inline-ext-chrome.json): every case NG lays out
-/// matches, and every golden case is still laid out by NG.
-#[test]
-fn generated_inline_ext_trees_match_chrome() {
-    let golden: std::collections::HashMap<String, std::collections::HashMap<String, [i64; 4]>> =
-        serde_json::from_str(include_str!("testdata/generated-inline-ext-chrome.json"))
-            .expect("golden json");
+/// Every case NG lays out matches Chrome, and every golden case is still
+/// laid out by NG.
+fn ext_trees_match_chrome(level: u8, seed: u64, golden: &str) {
+    let golden: Golden = serde_json::from_str(golden).expect("golden json");
     let _ahem = AhemGuard::new();
-    let mut rng = Rng(EXT_SEED);
+    let mut rng = Rng(seed);
     let mut failures = Vec::new();
     for case in 0..EXT_CASES {
-        let root = random_case_with(&mut rng, true);
+        let root = random_case_with(&mut rng, level);
         let flat = pre_flatten(&root);
         let ng = layout_tree(&root, &flat, 800.0, 600.0);
         let Some(expected) = golden.get(&case.to_string()) else {
@@ -395,6 +400,38 @@ fn generated_inline_ext_trees_match_chrome() {
         "{} boxes differ from Chrome, first: {:?}",
         failures.len(),
         &failures[..failures.len().min(5)]
+    );
+}
+
+/// pre, repeated/edge spaces, multi-word items (seed ...0003).
+#[test]
+fn generated_inline_ext_trees_are_supported() {
+    ext_trees_are_supported(1, EXT_SEED, "W3COS_NG_INLINE_EXT_DUMP", EXT_CASES / 3);
+}
+
+#[test]
+fn generated_inline_ext_trees_match_chrome() {
+    ext_trees_match_chrome(
+        1,
+        EXT_SEED,
+        include_str!("testdata/generated-inline-ext-chrome.json"),
+    );
+}
+
+/// pre-wrap (hanging preserved spaces, breaks only after a space run) and
+/// pre-line (seed ...0004).
+#[test]
+fn generated_inline_wrap_trees_are_supported() {
+    // Items with leading preserved spaces often need a break inside them.
+    ext_trees_are_supported(2, WRAP_SEED, "W3COS_NG_INLINE_WRAP_DUMP", EXT_CASES / 5);
+}
+
+#[test]
+fn generated_inline_wrap_trees_match_chrome() {
+    ext_trees_match_chrome(
+        2,
+        WRAP_SEED,
+        include_str!("testdata/generated-inline-wrap-chrome.json"),
     );
 }
 

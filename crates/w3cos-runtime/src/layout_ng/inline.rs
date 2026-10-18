@@ -82,11 +82,16 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
     if style.direction != TextDirection::Ltr {
         return Some("direction");
     }
-    // pre without a newline (the content gate) is one preserved, unwrapped
-    // line; pre-wrap / pre-line / break-spaces stay on legacy.
+    // Without a newline (the content gate): pre is one preserved unwrapped
+    // line, pre-wrap wraps with hanging preserved spaces, pre-line equals
+    // normal.  (break-spaces is not a WhiteSpace value here.)
     if !matches!(
         style.white_space,
-        WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::Pre
+        WhiteSpace::Normal
+            | WhiteSpace::NoWrap
+            | WhiteSpace::Pre
+            | WhiteSpace::PreWrap
+            | WhiteSpace::PreLine
     ) {
         return Some("text:white-space");
     }
@@ -230,11 +235,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if style.text_indent != Dimension::Px(0.0) {
         return Some("text:indent");
     }
-    // pre without a newline (the content gate) is one preserved, unwrapped
-    // line; pre-wrap / pre-line / break-spaces stay on legacy.
+    // Without a newline (the content gate): pre is one preserved unwrapped
+    // line, pre-wrap wraps with hanging preserved spaces, pre-line equals
+    // normal.  (break-spaces is not a WhiteSpace value here.)
     if !matches!(
         style.white_space,
-        WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::Pre
+        WhiteSpace::Normal
+            | WhiteSpace::NoWrap
+            | WhiteSpace::Pre
+            | WhiteSpace::PreWrap
+            | WhiteSpace::PreLine
     ) {
         return Some("text:white-space");
     }
@@ -368,20 +378,27 @@ fn hang_advance(content: &str, raw: f32, style: &Style) -> f32 {
     (raw - parts[1]).max(0.0)
 }
 
-/// LayoutUnit width of a line holding `line` (item indices in order); the
-/// last item's trailing spaces hang.
+/// LayoutUnit width of a line holding `line` (item indices in order) for
+/// fitting and alignment: trailing spaces hang (removed when collapsible,
+/// CSS Text 3 4.1.2; hanging when preserved by pre-wrap, 4.1.3), so the
+/// trailing whitespace-only items and the last other item's trailing spaces
+/// do not count.
 fn line_width(items: &[InlineItem], line: &[usize]) -> f32 {
+    let end = line
+        .iter()
+        .rposition(|&k| !items[k].whitespace_only)
+        .map_or(0, |p| p + 1);
     let mut width = 0.0f32;
     let mut slice = 0.0f32;
     let mut run = usize::MAX;
-    for (position, &k) in line.iter().enumerate() {
+    for (position, &k) in line[..end].iter().enumerate() {
         let item = &items[k];
         if item.run != run {
             width += snap(slice);
             slice = 0.0;
             run = item.run;
         }
-        slice += if position + 1 == line.len() {
+        slice += if position + 1 == end {
             item.raw_hang
         } else {
             item.raw
@@ -503,7 +520,10 @@ pub(super) fn layout_inline(
         });
     }
 
-    let preserve = container.white_space == WhiteSpace::Pre;
+    // Preserved spaces: pre (neither collapse nor hang) and pre-wrap (hang at
+    // the line end, CSS Text 3 4.1.3).
+    let preserve = matches!(container.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
+    let hang_preserved = container.white_space == WhiteSpace::PreWrap;
     // CollectInlines: group word pieces into authored runs and shape each
     // run once.
     let mut items: Vec<InlineItem> = Vec::with_capacity(children.len());
@@ -532,7 +552,7 @@ pub(super) fn layout_inline(
                 index: child,
                 raw,
                 // Preserved spaces (pre) do not hang (CSS Text 3 4.1.3).
-                raw_hang: if preserve {
+                raw_hang: if container.white_space == WhiteSpace::Pre {
                     raw
                 } else {
                     hang_advance(content, raw, style)
@@ -541,7 +561,12 @@ pub(super) fn layout_inline(
                 starts_space: content.starts_with(' '),
                 ends_space: content.ends_with(' '),
                 whitespace_only: content.trim_end_matches(' ').is_empty(),
-                internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char),
+                // Preserved leading spaces (pre-wrap) end in an opportunity
+                // inside the item too; collapsible ones vanish at a line start.
+                internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char)
+                    || (hang_preserved
+                        && content.starts_with(' ')
+                        && !content.trim_start_matches(' ').is_empty()),
                 ascent: baseline,
                 descent: height - baseline,
                 content_ascent: inline_font_content_ascent(style),
@@ -553,7 +578,10 @@ pub(super) fn layout_inline(
     }
 
     // NGLineBreaker.
-    let can_wrap = container.white_space == WhiteSpace::Normal;
+    let can_wrap = matches!(
+        container.white_space,
+        WhiteSpace::Normal | WhiteSpace::PreWrap | WhiteSpace::PreLine
+    );
     let mut lines: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
     let mut i = 0;
@@ -580,10 +608,13 @@ pub(super) fn layout_inline(
             // The opportunity lies after this item's leading space.
             return None;
         }
-        // Last soft-wrap opportunity: after an item ending in a space.
-        let break_at = (1..=current.len())
-            .rev()
-            .find(|&j| items[current[j - 1]].ends_space);
+        // Last soft-wrap opportunity: after an item ending in a space, at the
+        // end of a space run (preserved spaces in pre-wrap do not break
+        // between each other).
+        let break_at = (1..=current.len()).rev().find(|&j| {
+            let next = current.get(j).copied().unwrap_or(i);
+            items[current[j - 1]].ends_space && !items[next].starts_space
+        });
         match break_at {
             Some(j) if j == current.len() => lines.push(std::mem::take(&mut current)),
             Some(j) => {
@@ -633,7 +664,8 @@ pub(super) fn layout_inline(
         for (position, &k) in line.iter().enumerate() {
             let item = &items[k];
             let last_on_line = position + 1 == line.len();
-            let advance = if last_on_line {
+            // Hanging preserved spaces keep their advance in the fragment.
+            let advance = if last_on_line && !hang_preserved {
                 item.raw_hang
             } else {
                 item.raw
@@ -653,15 +685,20 @@ pub(super) fn layout_inline(
             ascent = ascent.max(item.ascent);
             descent = descent.max(item.descent);
         }
+        let content_width = if hang_preserved {
+            line_width(&items, &line)
+        } else {
+            slice_start
+        };
         if can_wrap
-            && slice_start > available + EPSILON
+            && content_width > available + EPSILON
             && line.iter().any(|&k| items[k].internal_break)
         {
             return None;
         }
         built.push(Line {
             items: placed,
-            width: slice_start,
+            width: content_width,
             ascent,
             descent,
         });
