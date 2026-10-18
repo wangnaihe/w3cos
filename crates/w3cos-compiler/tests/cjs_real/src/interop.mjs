@@ -1,0 +1,10 @@
+import minimist from "minimist";
+import semver, { satisfies } from "semver";
+import { parse as parseCookie } from "cookie";
+import { URI } from "vscode-uri";
+import * as jsonc from "jsonc-parser";
+console.log(JSON.stringify(minimist(["--x", "1"])));
+console.log(semver.valid("2.0.0"), satisfies("1.2.3", "^1.0.0"));
+console.log(JSON.stringify(parseCookie("a=1; b=2")));
+console.log(URI.parse("file:///a/b").fsPath);
+console.log(JSON.stringify(jsonc.parse("[1, /*c*/ 2]")));

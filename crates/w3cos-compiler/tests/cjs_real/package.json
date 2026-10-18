@@ -1,0 +1,17 @@
+{
+  "name": "w3cos-cjs-real-packages",
+  "private": true,
+  "dependencies": {
+    "@vscode/iconv-lite-umd": "0.7.0",
+    "cookie": "0.7.2",
+    "jschardet": "3.1.4",
+    "jsonc-parser": "3.3.1",
+    "minimist": "1.2.8",
+    "semver": "7.6.3",
+    "tas-client-umd": "0.2.0",
+    "vscode-regexpp": "3.1.0",
+    "vscode-textmate": "9.2.0",
+    "vscode-uri": "3.0.8"
+  },
+  "description": "Pinned VS Code CommonJS dependencies for the w3cos CJS linking comparison (see scripts/cjs-real-packages.sh)"
+}

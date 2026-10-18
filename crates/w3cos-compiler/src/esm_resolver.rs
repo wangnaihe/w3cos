@@ -4,13 +4,15 @@
 //! compile time so the compiler can load real package sources, build a module
 //! graph, and then lower the combined SWC AST into w3cos/Rust.
 
+use crate::cjs::{CjsAnalysis, RequireTarget};
+use crate::module_source;
 use crate::node_resolution::{
     PackageJson, ResolveKind, TargetResolution, is_node_builtin, resolve_package_exports,
     resolve_package_imports,
 };
 use anyhow::{Context, Result, anyhow};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use swc_common::{FileName, SourceMap, sync::Lrc};
@@ -694,6 +696,12 @@ pub struct EsmResolver {
     resolve_cache: RefCell<HashMap<(String, PathBuf, ResolveKind), ResolvedModule>>,
     /// Parsed `package.json` per directory (`None`: absent or invalid).
     package_cache: RefCell<HashMap<PathBuf, Option<Rc<PackageJson>>>>,
+    /// CommonJS classification per file (`None`: ESM). See [`crate::cjs`].
+    commonjs: RefCell<HashMap<PathBuf, Option<Rc<CjsAnalysis>>>>,
+    /// Named imports ESM importers request from CommonJS facades.
+    commonjs_requested: RefCell<HashMap<PathBuf, BTreeSet<String>>>,
+    /// Literal `require()`s that did not resolve (they throw when called).
+    commonjs_diagnostics: RefCell<Vec<String>>,
 }
 
 impl EsmResolver {
@@ -703,6 +711,9 @@ impl EsmResolver {
             runtime_modules: HashSet::new(),
             resolve_cache: RefCell::new(HashMap::new()),
             package_cache: RefCell::new(HashMap::new()),
+            commonjs: RefCell::new(HashMap::new()),
+            commonjs_requested: RefCell::new(HashMap::new()),
+            commonjs_diagnostics: RefCell::new(Vec::new()),
         }
     }
 
@@ -811,7 +822,7 @@ impl EsmResolver {
         let graph = self.build_graph_from_entry(entry)?;
         let mut parsed = ParsedModuleGraph::default();
         for node in graph.nodes {
-            let source = std::fs::read_to_string(&node.module.path).with_context(|| {
+            let source = module_source::read(&node.module.path).with_context(|| {
                 format!("Could not read ESM module {}", node.module.path.display())
             })?;
             let module = parse_esm_module(&source, &node.module.path)?;
@@ -832,9 +843,11 @@ impl EsmResolver {
             return Ok(());
         }
 
-        let source = std::fs::read_to_string(&module.path)
+        self.prepare_commonjs(&module.path)?;
+        let source = module_source::read(&module.path)
             .with_context(|| format!("Could not read ESM module {}", module.path.display()))?;
-        let imports = collect_static_imports(&source);
+        let imports = module_source::synthesized_imports(&module.path)
+            .unwrap_or_else(|| collect_static_imports(&source));
         let from_dir = module.path.parent().unwrap_or_else(|| Path::new("."));
 
         graph.nodes.push(ModuleGraphNode {
@@ -842,6 +855,7 @@ impl EsmResolver {
             imports: imports.clone(),
         });
 
+        let mut importer_info: Option<ParsedModuleInfo> = None;
         for import in imports {
             // CSS and other non-code assets are part of the asset pipeline, not this JS graph.
             if is_asset_import(&import)
@@ -851,10 +865,157 @@ impl EsmResolver {
                 continue;
             }
             let resolved = self.resolve(&import, from_dir)?;
+            if !module_source::is_synthesized(&module.path)
+                && self.prepare_commonjs(&resolved.path)?
+            {
+                // ESM → CommonJS: the facade also exports the names this
+                // importer asks for, beyond the lexer's names.
+                if importer_info.is_none() {
+                    importer_info = parse_esm_module(&source, &module.path)
+                        .ok()
+                        .map(|parsed| collect_module_info(&module.path, &parsed));
+                }
+                if let Some(info) = &importer_info {
+                    let imported = info
+                        .imports
+                        .iter()
+                        .filter(|binding| binding.source == import)
+                        .map(|binding| binding.imported.clone());
+                    let reexported = info
+                        .exports
+                        .iter()
+                        .filter(|export| export.source.as_deref() == Some(import.as_str()))
+                        .map(|export| {
+                            export
+                                .local
+                                .clone()
+                                .unwrap_or_else(|| export.exported.clone())
+                        });
+                    let names: Vec<String> = imported
+                        .chain(reexported)
+                        .filter(|name| name != "default" && name != "*")
+                        .collect();
+                    if !names.is_empty() {
+                        self.commonjs_requested
+                            .borrow_mut()
+                            .entry(resolved.path.clone())
+                            .or_default()
+                            .extend(names);
+                        self.write_commonjs_facade(&resolved.path);
+                    }
+                }
+            }
             self.visit_module(resolved, visited, graph)?;
         }
 
         Ok(())
+    }
+
+    /// Classify `path` and, for a CommonJS file, synthesize its module record
+    /// and ESM facade (see [`crate::cjs`]). Returns whether it is CommonJS.
+    /// Dependencies are classified recursively; the memo entry is written
+    /// before recursing, so `require` cycles terminate.
+    pub fn prepare_commonjs(&self, path: &Path) -> Result<bool> {
+        if crate::cjs::is_virtual(path) {
+            return Ok(false);
+        }
+        if let Some(hit) = self.commonjs.borrow().get(path) {
+            return Ok(hit.is_some());
+        }
+        // Always classify the file on disk: a previous build in this process
+        // may have left synthesized text under the same path.
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return Ok(false);
+        };
+        let analysis = crate::cjs::classify(path, &source, self.is_in_type_module_scope(path))?;
+        let Some(analysis) = analysis.map(Rc::new) else {
+            self.commonjs.borrow_mut().insert(path.to_path_buf(), None);
+            module_source::clear(path);
+            return Ok(false);
+        };
+        self.commonjs
+            .borrow_mut()
+            .insert(path.to_path_buf(), Some(analysis.clone()));
+
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut targets = Vec::new();
+        for specifier in &analysis.requires {
+            match self.resolve_with(specifier, dir, ResolveKind::Require) {
+                Ok(resolved) => {
+                    let target = if resolved.path.extension().is_some_and(|ext| ext == "json") {
+                        RequireTarget::Json(resolved.path)
+                    } else if self.prepare_commonjs(&resolved.path)? {
+                        RequireTarget::CommonJs(resolved.path)
+                    } else {
+                        RequireTarget::Esm(resolved.path)
+                    };
+                    targets.push((specifier.clone(), target));
+                }
+                Err(_) if is_node_builtin(specifier) => {
+                    targets.push((specifier.clone(), RequireTarget::Builtin(specifier.clone())));
+                }
+                Err(error) => self.commonjs_diagnostics.borrow_mut().push(format!(
+                    "{}: require(`{specifier}`) is unresolved and throws when called: {error:#}",
+                    path.display()
+                )),
+            }
+        }
+        let runtime = crate::cjs::runtime_path(&self.project_root);
+        module_source::set_synthesized(
+            runtime.clone(),
+            crate::cjs::RUNTIME_SOURCE.to_string(),
+            Vec::new(),
+        );
+        let (record, imports) = crate::cjs::record_source(path, &source, &targets, &runtime);
+        module_source::set_synthesized(crate::cjs::record_path(path), record, imports);
+        self.write_commonjs_facade(path);
+        Ok(true)
+    }
+
+    fn write_commonjs_facade(&self, path: &Path) {
+        let mut names = BTreeSet::new();
+        self.collect_commonjs_export_names(path, &mut names, &mut HashSet::new());
+        if let Some(requested) = self.commonjs_requested.borrow().get(path) {
+            names.extend(requested.iter().cloned());
+        }
+        let (facade, imports) = crate::cjs::facade_source(path, &names);
+        module_source::set_synthesized(path.to_path_buf(), facade, imports);
+    }
+
+    /// Lexer export names of a CommonJS file, following wholesale re-exports
+    /// (`module.exports = require(x)`, `__exportStar(require(x), exports)`).
+    fn collect_commonjs_export_names(
+        &self,
+        path: &Path,
+        names: &mut BTreeSet<String>,
+        visited: &mut HashSet<PathBuf>,
+    ) {
+        if !visited.insert(path.to_path_buf()) {
+            return;
+        }
+        let Some(Some(analysis)) = self.commonjs.borrow().get(path).cloned() else {
+            return;
+        };
+        names.extend(analysis.export_names.iter().cloned());
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for specifier in &analysis.reexports {
+            if let Ok(resolved) = self.resolve_with(specifier, dir, ResolveKind::Require) {
+                self.collect_commonjs_export_names(&resolved.path, names, visited);
+            }
+        }
+    }
+
+    /// Whether `path` was classified as CommonJS by this resolver.
+    pub fn is_commonjs(&self, path: &Path) -> bool {
+        self.commonjs
+            .borrow()
+            .get(path)
+            .is_some_and(|analysis| analysis.is_some())
+    }
+
+    /// Unresolved literal `require()` specifiers (they throw at runtime).
+    pub fn commonjs_diagnostics(&self) -> Vec<String> {
+        self.commonjs_diagnostics.borrow().clone()
     }
 
     fn resolve_package(
@@ -1110,6 +1271,9 @@ impl EsmResolver {
     }
 
     fn resolve_file(&self, candidate: &Path) -> Option<PathBuf> {
+        if crate::cjs::is_virtual(candidate) && module_source::is_synthesized(candidate) {
+            return Some(normalize_path(candidate));
+        }
         if candidate.is_file() {
             return Some(normalize_path(candidate));
         }
