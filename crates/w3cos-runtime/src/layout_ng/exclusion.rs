@@ -128,9 +128,11 @@ impl ExclusionSpace {
                 let cb = if is_left { end } else { start };
                 far = Some(far.map_or(cb, |f| if is_left { f.min(cb) } else { f.max(cb) }));
             }
-            let room = far.map_or(f32::INFINITY, |f| (f - near).abs());
-            let fits = far.is_none_or(|f| if is_left { f >= near } else { f <= near })
-                && room >= width - 1.0 / 128.0;
+            // Signed: a negative margin-box width (negative margins) fits
+            // even where the floats already overrun the band
+            // (negative-margin-float-positioning).
+            let room = far.map_or(f32::INFINITY, |f| if is_left { f - near } else { near - f });
+            let fits = room >= width - 1.0 / 128.0;
             if fits {
                 placed = (if is_left { near } else { near - width }, y);
                 break;

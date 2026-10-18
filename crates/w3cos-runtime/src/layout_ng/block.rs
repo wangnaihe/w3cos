@@ -173,7 +173,66 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
 /// block-level box ignores the keyword marker (and the align-self the
 /// cascade derives from it: block flow does not read align-self).  Length
 /// values stay gated: the cascade also turns them into margins.
+/// The DOM wraps runs of left floats in a synthetic flex row (consecutive
+/// floats, or every float from a cleared one on).  NG reads the row as
+/// transparent: its children are floats of the parent's BFC.
+pub(super) const FLOAT_GROUP_MARKERS: [&str; 2] = [
+    "--w3cos-internal-anonymous-float-group",
+    "--w3cos-internal-cleared-float-wrapper",
+];
+
+pub(super) fn is_float_group(style: &Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| FLOAT_GROUP_MARKERS.iter().any(|m| props.contains_key(*m)))
+}
+
+fn float_group_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if unsupported_marker(style, &FLOAT_GROUP_MARKERS).is_some() {
+        return Some("float-group:marker");
+    }
+    let parent = info.parent?;
+    if inline::is_inline_container(flat, parent)
+        || matches!(flat[parent].kind, ComponentKind::Text { .. })
+        || is_float_group(flat[parent].style)
+        || !matches!(info.kind, ComponentKind::Row | ComponentKind::Box)
+    {
+        return Some("float-group:context");
+    }
+    let zero = |s: Spacing| matches!(s, Spacing::Px(v) if v == 0.0);
+    if border(style) != [0.0; 4]
+        || ![
+            style.margin.top,
+            style.margin.right,
+            style.margin.bottom,
+            style.margin.left,
+            style.padding.top,
+            style.padding.right,
+            style.padding.bottom,
+            style.padding.left,
+        ]
+        .into_iter()
+        .all(zero)
+        || style.position != Position::Static
+    {
+        return Some("float-group:box");
+    }
+    if inline::rendered_children(flat, index).any(|child| {
+        let s = flat[child].style;
+        s.float != Float::Left || oof::is_out_of_flow(s)
+    }) {
+        return Some("float-group:content");
+    }
+    None
+}
+
 fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    if is_float_group(flat[index].style) {
+        return float_group_reason(flat, index);
+    }
     position_reason(flat, index)
         .or_else(|| float_reason(flat, index))
         .or_else(|| node_box_reason(flat, index))
@@ -1001,7 +1060,8 @@ fn layout_block_in(
             continue;
         }
         let content_bfc_y = bfc_y + bt + pt;
-        if child_info.style.float != Float::None {
+        let group = is_float_group(child_info.style);
+        if group || child_info.style.float != Float::None {
             // PositionFloat: at the current block offset past the pending
             // margins (which do not collapse with the float's), unless
             // they may still collapse through our top.
@@ -1010,22 +1070,72 @@ fn layout_block_in(
             } else {
                 cursor + pending.sum()
             };
-            let mut block_start = content_bfc_y + block;
-            if let Some(clear) = clearance_offset(child_info.style, exclusions) {
-                block_start = block_start.max(clear);
+            let floats: Vec<usize> = if group {
+                inline::rendered_children(flat, child).collect()
+            } else {
+                vec![child]
+            };
+            let mut placed = Vec::with_capacity(floats.len());
+            for float in floats {
+                let float_style = flat[float].style;
+                let mut block_start = content_bfc_y + block;
+                if let Some(clear) = clearance_offset(float_style, exclusions) {
+                    block_start = block_start.max(clear);
+                }
+                let (fx, fy, result) = layout_float(
+                    flat,
+                    float,
+                    &child_space,
+                    exclusions,
+                    bfc_x + bl + pl,
+                    block_start,
+                )?;
+                let (dx, dy) = oof::relative_offset(float_style, &child_space);
+                let (fx, fy) = (fx - bfc_x + dx, fy - bfc_y + dy);
+                oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
+                placed.push((fx, fy, result.fragment));
             }
-            let (fx, fy, result) = layout_float(
-                flat,
-                child,
-                &child_space,
-                exclusions,
-                bfc_x + bl + pl,
-                block_start,
-            )?;
-            let (dx, dy) = oof::relative_offset(child_info.style, &child_space);
-            let (fx, fy) = (fx - bfc_x + dx, fy - bfc_y + dy);
-            oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
-            children.push((fx, fy, result.fragment));
+            if group {
+                // The synthetic row's own box: the anonymous group spans
+                // the content box (width: 100%), a cleared wrapper
+                // shrink-wraps its floats; both start at the first float.
+                let x0 = bl + pl;
+                let y0 = placed
+                    .iter()
+                    .map(|p| p.1)
+                    .reduce(f32::min)
+                    .unwrap_or(bt + pt + block);
+                let right = placed
+                    .iter()
+                    .map(|p| p.0 + p.2.width)
+                    .reduce(f32::max)
+                    .unwrap_or(x0);
+                let bottom = placed
+                    .iter()
+                    .map(|p| p.1 + p.2.height)
+                    .reduce(f32::max)
+                    .unwrap_or(y0);
+                let width = if child_info.style.float == Float::None {
+                    metrics.content_width
+                } else {
+                    (right - x0).max(0.0)
+                };
+                children.push((
+                    x0,
+                    y0,
+                    BoxFragment {
+                        index: child,
+                        width,
+                        height: (bottom - y0).max(0.0),
+                        children: placed
+                            .into_iter()
+                            .map(|(x, y, f)| (x - x0, y - y0, f))
+                            .collect(),
+                    },
+                ));
+            } else {
+                children.extend(placed);
+            }
             child = next;
             continue;
         }

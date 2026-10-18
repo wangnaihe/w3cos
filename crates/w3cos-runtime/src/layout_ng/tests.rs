@@ -994,3 +994,129 @@ fn float_rule3_and_collapsed_clearance_match_chrome() {
         ],
     );
 }
+
+/// The DOM's synthetic float rows (anonymous-float-group,
+/// cleared-float-wrapper) are transparent: their floats are placed in the
+/// parent's BFC, the row gets their bounding box.
+#[test]
+fn float_group_rows_are_transparent() {
+    use w3cos_std::style::{Clear, Dimension as D, Display, Float, Style};
+    let px = D::Px;
+    let block = |w: D, h: f32, float: Float, clear: Clear| Style {
+        display: Display::Block,
+        width: w,
+        height: px(h),
+        float,
+        clear,
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let row = |marker: &str, float: Float, clear: Clear| {
+        let mut style = Style {
+            display: Display::Flex,
+            width: if float == Float::None {
+                D::Percent(100.0)
+            } else {
+                D::Auto
+            },
+            float,
+            clear,
+            ..Style::default()
+        };
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(marker.into(), "1".into());
+        style
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            width: px(300.0),
+            ..Style::default()
+        },
+        vec![
+            leaf(block(D::Auto, 10.0, Float::None, Clear::None)),
+            Component::row(
+                row(block::FLOAT_GROUP_MARKERS[0], Float::None, Clear::None),
+                vec![
+                    leaf(block(px(50.0), 30.0, Float::Left, Clear::None)),
+                    leaf(block(px(50.0), 30.0, Float::Left, Clear::None)),
+                ],
+            ),
+            Component::row(
+                row(block::FLOAT_GROUP_MARKERS[1], Float::Left, Clear::Left),
+                vec![
+                    leaf(block(px(20.0), 10.0, Float::Left, Clear::Left)),
+                    leaf(block(px(20.0), 10.0, Float::Left, Clear::None)),
+                ],
+            ),
+            leaf(block(D::Auto, 10.0, Float::None, Clear::None)),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 8] = [
+        (2, [0.0, 10.0, 300.0, 30.0]),
+        (3, [0.0, 10.0, 50.0, 30.0]),
+        (4, [50.0, 10.0, 50.0, 30.0]),
+        (5, [0.0, 40.0, 40.0, 10.0]),
+        (6, [0.0, 40.0, 20.0, 10.0]),
+        (7, [20.0, 40.0, 20.0, 10.0]),
+        (8, [0.0, 10.0, 300.0, 10.0]),
+        (0, [0.0, 0.0, 300.0, 50.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A float whose margin box is negative fits beside earlier floats even
+/// when they already fill the band (negative-margin-float-positioning).
+#[test]
+fn negative_margin_float_fits_beside_floats() {
+    use w3cos_std::style::{Dimension as D, Display, Edges, Float, Spacing as S, Style};
+    let px = D::Px;
+    let float = |ml: f32, mr: f32| Style {
+        display: Display::Block,
+        width: px(50.0),
+        height: px(100.0),
+        float: Float::Left,
+        margin: Edges {
+            top: S::Px(0.0),
+            right: S::Px(mr),
+            bottom: S::Px(0.0),
+            left: S::Px(ml),
+        },
+        ..Style::default()
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            width: px(100.0),
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(float(50.0, 50.0), vec![]),
+            Component::boxed(float(-150.0, 0.0), vec![]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |index: usize| {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    assert_eq!(rect(1), [50.0, 0.0, 50.0, 100.0]);
+    assert_eq!(rect(2), [0.0, 0.0, 50.0, 100.0]);
+    assert_eq!(rect(0), [0.0, 0.0, 100.0, 100.0]);
+}
