@@ -31,9 +31,9 @@ use crate::js_string::JsString;
 use crate::value::Value;
 
 /// Own keys before an object leaves the shape tree for dictionary mode.
-pub(crate) const MAX_SHAPE_KEYS: usize = 64;
+pub const MAX_SHAPE_KEYS: usize = 64;
 /// Shapes one thread may create before new transitions go to dictionary mode.
-pub(crate) const MAX_SHAPES: usize = 1 << 15;
+pub const MAX_SHAPES: usize = 1 << 15;
 /// Prefix of internal property names (`__w3cos_getter_k`, `__w3cos_setter_k`).
 pub(crate) const MARKER_PREFIX: &str = "__w3cos_";
 /// Shapes with at most this many keys are searched linearly.
@@ -76,6 +76,7 @@ enum Transitions {
 
 /// A hidden class: an ordered own-key list shared by many objects.
 pub(crate) struct Shape {
+    #[allow(dead_code)] // read by AOT inline caches
     id: ShapeId,
     /// Insertion-ordered own keys; slot `i` of an object holds `keys[i]`.
     keys: Box<[JsString]>,
@@ -219,10 +220,30 @@ impl PropertyMap {
         // (deterministic, and shared by every literal with the same keys).
         let mut order: Vec<JsString> = map.keys().cloned().collect();
         order.sort();
-        for key in order {
-            let value = map.remove(&key).expect("key from order");
-            out.insert(key, value);
+        let mut slots = Vec::with_capacity(order.len());
+        let mut shape = Some(root_shape());
+        for key in &order {
+            shape = shape.and_then(|shape| shape.transition(key.as_str()));
+            if shape.is_none() {
+                break;
+            }
+            slots.push(map.remove(key).expect("key from order"));
         }
+        if let Some(shape) = shape {
+            out.inner = Some(Box::new(PropertyStore::Shaped { shape, slots }));
+            return out;
+        }
+        // Too wide or out of shape budget: dictionary from the start.
+        for (key, value) in order.iter().zip(slots) {
+            map.insert(key.clone(), value);
+        }
+        let map_order: Vec<JsString> = order;
+        let has_index_key = map_order.iter().any(|key| is_index_key(key.as_str()));
+        out.inner = Some(Box::new(PropertyStore::Dict {
+            map,
+            order: map_order,
+            has_index_key,
+        }));
         out
     }
 
@@ -242,12 +263,14 @@ impl PropertyMap {
 
     /// True when the map is empty or shape-backed (no per-object hash table).
     #[inline]
+    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn is_compact(&self) -> bool {
         !matches!(self.inner.as_deref(), Some(PropertyStore::Dict { .. }))
     }
 
     /// True once the map has left the shape tree.
     #[inline]
+    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn is_dictionary(&self) -> bool {
         !self.is_compact()
     }
@@ -255,6 +278,7 @@ impl PropertyMap {
     /// Shape id for IC checks: [`ROOT_SHAPE_ID`] when empty, `None` in
     /// dictionary mode.
     #[inline]
+    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn shape_id(&self) -> Option<ShapeId> {
         match self.inner.as_deref() {
             None => Some(ROOT_SHAPE_ID),
@@ -265,6 +289,7 @@ impl PropertyMap {
 
     /// `(shape id, slot)` of an own key in a shape-backed map.
     #[inline]
+    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn shaped_slot(&self, key: &str) -> Option<(ShapeId, usize)> {
         match self.inner.as_deref() {
             Some(PropertyStore::Shaped { shape, .. }) => Some((shape.id, shape.lookup(key)?)),
@@ -274,6 +299,7 @@ impl PropertyMap {
 
     /// Slot value when the map currently has shape `id` (IC hit path).
     #[inline]
+    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn slot_if_shape(&self, id: ShapeId, slot: usize) -> Option<&Value> {
         match self.inner.as_deref() {
             Some(PropertyStore::Shaped { shape, slots }) if shape.id == id => slots.get(slot),
@@ -283,6 +309,7 @@ impl PropertyMap {
 
     /// Mutable slot when the map currently has shape `id` (IC hit path).
     #[inline]
+    #[allow(dead_code)] // IC hooks; used by AOT inline caches
     pub(crate) fn slot_mut_if_shape(&mut self, id: ShapeId, slot: usize) -> Option<&mut Value> {
         match self.inner.as_deref_mut() {
             Some(PropertyStore::Shaped { shape, slots }) if shape.id == id => slots.get_mut(slot),
@@ -364,10 +391,9 @@ impl PropertyMap {
                 let root = root_shape();
                 match root.transition(key) {
                     Some(shape) => {
-                        self.inner = Some(Box::new(PropertyStore::Shaped {
-                            shape,
-                            slots: vec![value],
-                        }));
+                        let mut slots = Vec::with_capacity(4);
+                        slots.push(value);
+                        self.inner = Some(Box::new(PropertyStore::Shaped { shape, slots }));
                         return;
                     }
                     None => {
@@ -673,6 +699,38 @@ mod tests {
     fn marker_keys_are_tracked() {
         assert!(!build(&["a", "b"]).may_have_marker_key());
         assert!(build(&["a", "__w3cos_setter_b"]).may_have_marker_key());
+    }
+
+    #[test]
+    fn from_hashmap_builds_sorted_shape_or_dictionary() {
+        let small: HashMap<JsString, Value> = ["b", "a", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (JsString::intern(k), Value::Number(i as f64)))
+            .collect();
+        let map = PropertyMap::from_interned_hashmap(small);
+        assert!(map.is_compact());
+        assert_eq!(keys(&map), vec!["a", "b", "c"]);
+        assert_eq!(map.shape_id(), build(&["a", "b", "c"]).shape_id());
+        assert_eq!(map.get("b").map(Value::to_number), Some(0.0));
+        let wide: HashMap<JsString, Value> = (0..MAX_SHAPE_KEYS + 3)
+            .map(|i| {
+                (
+                    JsString::intern(&format!("w{i:03}")),
+                    Value::Number(i as f64),
+                )
+            })
+            .collect();
+        let map = PropertyMap::from_interned_hashmap(wide);
+        assert!(map.is_dictionary());
+        assert_eq!(map.len(), MAX_SHAPE_KEYS + 3);
+        for i in 0..MAX_SHAPE_KEYS + 3 {
+            assert_eq!(
+                map.get(&format!("w{i:03}")).map(Value::to_number),
+                Some(i as f64)
+            );
+        }
+        assert_eq!(keys(&map).first().map(String::as_str), Some("w000"));
     }
 
     #[test]

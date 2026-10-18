@@ -16,6 +16,12 @@ mod object;
 pub mod page_arena;
 pub mod promise;
 mod property_map;
+/// Hidden-class (shape) diagnostics.
+pub mod shapes {
+    pub use crate::property_map::{
+        MAX_SHAPE_KEYS, MAX_SHAPES, ROOT_SHAPE_ID, ShapeId, shape_count,
+    };
+}
 mod proxy;
 mod reactive;
 pub mod regexp;
