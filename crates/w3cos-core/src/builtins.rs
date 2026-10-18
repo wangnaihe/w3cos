@@ -9,6 +9,7 @@ use std::rc::Rc;
 thread_local! {
     static OBJECT_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
     static ARRAY_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
+    static STRING_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Drop cached constructors before the page arena reset.
@@ -18,6 +19,7 @@ thread_local! {
 pub fn reset_constructors() {
     OBJECT_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     ARRAY_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    STRING_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     ERROR_CLASSES.with(|slot| slot.borrow_mut().take());
 }
 
@@ -207,6 +209,294 @@ fn build_object_value() -> Value {
     })
 }
 
+/// Define a non-enumerable data property (`writable`/`configurable` true),
+/// the shape ECMAScript gives built-in methods.
+pub(crate) fn define_builtin(target: &Value, key: &str, value: Value) {
+    crate::class::define_property(
+        target,
+        key,
+        &Value::object(HashMap::from([
+            ("value".into(), value),
+            ("writable".into(), Value::Bool(true)),
+            ("enumerable".into(), Value::Bool(false)),
+            ("configurable".into(), Value::Bool(true)),
+        ])),
+    );
+}
+
+/// A native function carrying ECMAScript `name` / `length` (both
+/// non-writable, non-enumerable, configurable).
+pub(crate) fn native_function(
+    name: &str,
+    length: u32,
+    f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+) -> Value {
+    // A callable object (not a bare function value) so the descriptors stick.
+    let function = Value::callable(HashMap::new(), f);
+    for (key, value) in [
+        ("length", Value::Number(length as f64)),
+        ("name", Value::string(name)),
+    ] {
+        crate::class::define_property(
+            &function,
+            key,
+            &Value::object(HashMap::from([
+                ("value".into(), value),
+                ("writable".into(), Value::Bool(false)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(true)),
+            ])),
+        );
+    }
+    function
+}
+
+/// `String.prototype` methods dispatched to the primitive string methods.
+const STRING_METHODS: &[(&str, u32)] = &[
+    ("at", 1),
+    ("charAt", 1),
+    ("charCodeAt", 1),
+    ("codePointAt", 1),
+    ("concat", 1),
+    ("endsWith", 1),
+    ("includes", 1),
+    ("indexOf", 1),
+    ("isWellFormed", 0),
+    ("lastIndexOf", 1),
+    ("localeCompare", 1),
+    ("match", 1),
+    ("matchAll", 1),
+    ("normalize", 0),
+    ("padEnd", 1),
+    ("padStart", 1),
+    ("repeat", 1),
+    ("replace", 2),
+    ("replaceAll", 2),
+    ("search", 1),
+    ("slice", 2),
+    ("split", 2),
+    ("startsWith", 1),
+    ("substr", 2),
+    ("substring", 2),
+    ("toLocaleLowerCase", 0),
+    ("toLocaleUpperCase", 0),
+    ("toLowerCase", 0),
+    ("toUpperCase", 0),
+    ("toWellFormed", 0),
+    ("trim", 0),
+    ("trimEnd", 0),
+    ("trimStart", 0),
+];
+
+fn to_uint16(value: &Value) -> u16 {
+    let number = value.to_number();
+    if !number.is_finite() {
+        return 0;
+    }
+    (number.trunc().rem_euclid(65536.0)) as u16
+}
+
+/// Hidden slot holding a `String` wrapper's primitive ([[StringData]]).
+const STRING_DATA: &str = "__w3cos_string_data";
+
+pub(crate) fn string_wrapper_data(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    if !object.borrow().has_own_property(STRING_DATA) {
+        return None;
+    }
+    let data = value.get_property(STRING_DATA);
+    data.is_string().then_some(data)
+}
+
+/// Whether `value` is the realm's `String` constructor (without creating it).
+pub(crate) fn is_string_constructor(value: &Value) -> bool {
+    STRING_CONSTRUCTOR.with(|slot| slot.borrow().as_ref().is_some_and(|ctor| ctor == value))
+}
+
+/// `new String(value)`: an object inheriting `String.prototype` with
+/// enumerable index properties and a non-enumerable `length`.
+pub(crate) fn string_wrapper(arguments: &[Value]) -> Value {
+    let data = arguments
+        .first()
+        .map(Value::to_js_string)
+        .unwrap_or_default();
+    let units: Vec<u16> = data.encode_utf16().collect();
+    let mut properties = HashMap::new();
+    for (index, unit) in units.iter().enumerate() {
+        properties.insert(
+            index.to_string(),
+            Value::from(String::from_utf16_lossy(&[*unit])),
+        );
+    }
+    let wrapper = Value::object(properties);
+    for (key, value) in [
+        ("length", Value::Number(units.len() as f64)),
+        (STRING_DATA, Value::from(data)),
+    ] {
+        crate::class::define_property(
+            &wrapper,
+            key,
+            &Value::object(HashMap::from([
+                ("value".into(), value),
+                ("writable".into(), Value::Bool(false)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(false)),
+            ])),
+        );
+    }
+    crate::class::set_prototype_of(&wrapper, &string_value().get_property("prototype"));
+    wrapper
+}
+
+/// The `String` constructor (one per realm, shared by AOT code and the
+/// jsdom window so `String.prototype` has a single identity).
+pub fn string_value() -> Value {
+    STRING_CONSTRUCTOR.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let value = build_string_value();
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+fn build_string_value() -> Value {
+    let prototype = Value::object(HashMap::new());
+    for &(name, length) in STRING_METHODS {
+        let method = native_function(name, length, move |this, arguments| {
+            if this.is_nullish() {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "String.prototype.{name} called on null or undefined"
+                )));
+            }
+            let receiver = if this.is_string() {
+                this
+            } else if let Some(data) = string_wrapper_data(&this) {
+                data
+            } else {
+                Value::from(this.to_js_string())
+            };
+            receiver.call_method(name, arguments)
+        });
+        define_builtin(&prototype, name, method);
+    }
+    for name in ["toString", "valueOf"] {
+        let method = native_function(name, 0, move |this, _| {
+            if this.is_string() {
+                this
+            } else if let Some(data) = string_wrapper_data(&this) {
+                data
+            } else {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "String.prototype.{name} requires that 'this' be a String"
+                )))
+            }
+        });
+        define_builtin(&prototype, name, method);
+    }
+    let constructor = Value::callable(HashMap::new(), |_, arguments| match arguments.first() {
+        None => Value::string(""),
+        Some(value) => Value::from(value.to_js_string()),
+    });
+    for (key, value) in [
+        ("length", Value::Number(1.0)),
+        ("name", Value::string("String")),
+    ] {
+        crate::class::define_property(
+            &constructor,
+            key,
+            &Value::object(HashMap::from([
+                ("value".into(), value),
+                ("writable".into(), Value::Bool(false)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(true)),
+            ])),
+        );
+    }
+    define_builtin(
+        &constructor,
+        "fromCharCode",
+        native_function("fromCharCode", 1, |_, arguments| {
+            let units: Vec<u16> = arguments.iter().map(to_uint16).collect();
+            Value::from(String::from_utf16_lossy(&units))
+        }),
+    );
+    define_builtin(
+        &constructor,
+        "fromCodePoint",
+        native_function("fromCodePoint", 1, |_, arguments| {
+            let mut units = Vec::new();
+            for argument in &arguments {
+                let number = argument.to_number();
+                if number.fract() != 0.0 || !(0.0..=1_114_111.0).contains(&number) {
+                    crate::throw_value(crate::value::range_error(&format!(
+                        "Invalid code point {}",
+                        argument.to_js_string()
+                    )));
+                }
+                let point = number as u32;
+                if point < 0x10000 {
+                    units.push(point as u16);
+                } else {
+                    let point = point - 0x10000;
+                    units.push(0xD800 + (point >> 10) as u16);
+                    units.push(0xDC00 + (point & 0x3FF) as u16);
+                }
+            }
+            Value::from(String::from_utf16_lossy(&units))
+        }),
+    );
+    define_builtin(
+        &constructor,
+        "raw",
+        native_function("raw", 1, |_, arguments| {
+            let strings = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let raw = strings.get_property_checked("raw");
+            let length = raw.get_property("length").to_number();
+            let length = if length.is_finite() && length > 0.0 {
+                length as usize
+            } else {
+                0
+            };
+            let mut out = String::new();
+            for index in 0..length {
+                out.push_str(&raw.get_property(&index.to_string()).to_js_string());
+                if index + 1 < length {
+                    if let Some(substitution) = arguments.get(index + 1) {
+                        out.push_str(&substitution.to_js_string());
+                    }
+                }
+            }
+            Value::from(out)
+        }),
+    );
+    define_builtin(&constructor, "prototype", prototype.clone());
+    define_builtin(&prototype, "constructor", constructor.clone());
+    constructor
+}
+
+/// `Array.prototype` methods implemented natively for arrays (see
+/// `array_call_method`); only names it handles, so dispatch cannot loop.
+const ARRAY_METHODS: &[(&str, u32)] = &[
+    ("at", 1),
+    ("concat", 1),
+    ("every", 1),
+    ("find", 1),
+    ("findIndex", 1),
+    ("flat", 0),
+    ("flatMap", 1),
+    ("includes", 1),
+    ("indexOf", 1),
+    ("join", 1),
+    ("lastIndexOf", 1),
+    ("map", 1),
+    ("reduce", 1),
+    ("reduceRight", 1),
+    ("slice", 2),
+    ("some", 1),
+];
+
 pub fn array_value() -> Value {
     ARRAY_CONSTRUCTOR.with(|slot| {
         if let Some(value) = slot.borrow().clone() {
@@ -233,6 +523,22 @@ fn build_array_value() -> Value {
         Value::function(|_, arguments| Value::array(arguments)),
     );
     let prototype = Value::object(HashMap::new());
+    // Non-mutating methods dispatch to the native array implementation;
+    // array-likes run against a snapshot.
+    for &(name, length) in ARRAY_METHODS {
+        let method = native_function(name, length, move |this, arguments| {
+            if this.is_array() {
+                return this.call_method(name, arguments);
+            }
+            if this.is_nullish() {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "Array.prototype.{name} called on null or undefined"
+                )));
+            }
+            Value::array(array_like_snapshot(&this)).call_method(name, arguments)
+        });
+        define_builtin(&prototype, name, method);
+    }
     let values = Value::function(|this, _| live_array_like_values_iterator(this));
     prototype.set_property("values", values.clone());
     prototype.set_property("__w3cos_symbol_iterator", values);
@@ -1953,4 +2259,31 @@ mod tests {
         ));
         assert!(crate::class::instance_of(&aggregate, &error_class("Error")));
     }
+}
+
+/// A host function value carrying ECMAScript `name` / `length` (both kept
+/// out of enumeration by `FunctionData::keys`).
+pub fn named_function(
+    name: &str,
+    length: u32,
+    f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+) -> Value {
+    let function = Value::function(f);
+    function.set_property("name", Value::string(name));
+    function.set_property("length", Value::Number(length as f64));
+    function
+}
+
+/// [`named_function`] for an ordinary function declaration: also owns a
+/// `prototype` whose non-enumerable `constructor` points back at it.
+pub fn named_constructor_function(
+    name: &str,
+    length: u32,
+    f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+) -> Value {
+    let function = named_function(name, length, f);
+    let prototype = Value::object(HashMap::new());
+    define_builtin(&prototype, "constructor", function.clone());
+    function.set_property("prototype", prototype);
+    function
 }

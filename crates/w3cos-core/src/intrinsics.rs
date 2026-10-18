@@ -151,6 +151,11 @@ fn canonical_number_index(key: &Value) -> Option<usize> {
 }
 
 pub fn get_property_checked(object: &Value, key: &Value) -> Value {
+    if let Some(index) = canonical_number_index(key)
+        && let Some(value) = crate::fast_collection_get(object, Some(index))
+    {
+        return value;
+    }
     object.get_property_checked(&key.to_js_string())
 }
 

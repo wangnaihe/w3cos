@@ -4465,7 +4465,13 @@ fn fuse_private_binding_loads(
         // A last-use receiver of a `&self` method is moved out of its
         // register; borrowing it instead is equivalent.
         let mut replaced = text.clone();
-        for method in ["get_property(", "get_property_ic(", "call_method_slice("] {
+        for method in [
+            "get_property(",
+            "get_property_ic(",
+            "get_property_checked(",
+            "get_property_checked_ic(",
+            "call_method_slice(",
+        ] {
             replaced = replaced.replace(
                 &format!(
                     "std::mem::replace(&mut self.registers[{register}], w3cos_core::Value::Undefined).{method}"
@@ -4527,6 +4533,7 @@ fn borrow_register_use(text: &str, register: u32, local: &str) -> Option<String>
     for method in [
         "get_property(",
         "get_property_ic(",
+        "get_property_checked(",
         "get_property_checked_ic(",
         "call_method_slice(",
     ] {
@@ -6501,7 +6508,10 @@ fn direct_length_test(lines: &[&str], rest: &[&str]) -> Option<String> {
     let compare = lines[1].trim();
     let branch = lines[2].trim();
     let (len_reg, _) = load.split_once(" = ")?;
-    if !len_reg.starts_with("self.registers[") || !load.contains(".get_property(\"length\")") {
+    if !len_reg.starts_with("self.registers[")
+        || !(load.contains(".get_property(\"length\")")
+            || load.contains(".get_property_checked(\"length\")"))
+    {
         return None;
     }
     let prefix = "w3cos_core::intrinsics::less_than(&w3cos_core::Value::Number(";
@@ -7425,6 +7435,9 @@ fn emit_instruction(
             unary_intrinsic(*operator),
             emit_boxed_ref(plan, value.0)
         ),
+        // `GetValue` throws a TypeError on a nullish base. Optional chaining
+        // branches on nullish before its GetProperty, so every member read
+        // here uses the checked lookup.
         Instruction::GetProperty { dst, object, key } => {
             if let Some(literal) = proven_strings.get(&key.0) {
                 let object_expr = if last_uses.contains(&object.0) {
@@ -7434,19 +7447,19 @@ fn emit_instruction(
                 };
                 if ic_cacheable_key(literal) {
                     format!(
-                        "self.registers[{}] = {{ {IC_DECL} {object_expr}.get_property_ic({literal:?}, &__W3COS_IC) }};",
+                        "self.registers[{}] = {{ {IC_DECL} {object_expr}.get_property_checked_ic({literal:?}, &__W3COS_IC) }};",
                         register(*dst),
                     )
                 } else {
                     format!(
-                        "self.registers[{}] = {object_expr}.get_property({literal:?});",
+                        "self.registers[{}] = {object_expr}.get_property_checked({literal:?});",
                         register(*dst),
                     )
                 }
             } else {
                 let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0]);
                 format!(
-                    "self.registers[{}] = w3cos_core::intrinsics::get_property(&{}, &{});",
+                    "self.registers[{}] = w3cos_core::intrinsics::get_property_checked(&{}, &{});",
                     register(*dst),
                     uses.emit_ref(object.0),
                     uses.emit_ref(key.0)
@@ -7736,6 +7749,31 @@ fn emit_instruction(
                     adapters.push_str(&adapter);
                 }
             }
+            // ECMAScript `name` / `length`, registered once per factory.
+            let (meta_name, meta_length, meta_constructor) = MODULE_FUNCTIONS.with(|functions| {
+                functions
+                    .borrow()
+                    .iter()
+                    .find(|candidate| candidate.id == *nested)
+                    .map(|candidate| {
+                        let name = candidate
+                            .name
+                            .clone()
+                            .filter(|name| !name.contains(['<', '*', '#', '.', ' ']))
+                            .unwrap_or_default();
+                        (
+                            name,
+                            candidate.parameters.len(),
+                            // Arrows are not distinguished in W3IR yet.
+                            !candidate.is_async && !candidate.is_generator,
+                        )
+                    })
+                    .unwrap_or_default()
+            });
+            let meta = format!(
+                "{{ static __W3COS_FN_META: ::std::sync::Once = ::std::sync::Once::new(); __W3COS_FN_META.call_once(|| w3cos_core::register_aot_function_meta({factory}, {meta_name:?}, {meta_length}, {meta_constructor})); }} "
+            );
+            let adapters = format!("{meta}{adapters}");
             let slow = format!(
                 "{{ let mut __w3cos_nested_captures = w3cos_core::AotCaptureMap::new(); {adapters} w3cos_core::Value::aot_function({factory}, __w3cos_nested_captures) }}"
             );
@@ -9236,12 +9274,10 @@ fn main() {{
             .find(|function| function.name.as_deref() == Some("read"))
             .unwrap()
             .clone();
-        let expected = Vm::new(module.clone(), Limits::default())
-            .unwrap()
-            .callable(function.id, HashMap::new())
-            .unwrap()
-            .call(Value::Undefined, vec![Value::Null])
-            .to_js_string();
+        // `null.missing` is a TypeError (GetValue on a nullish base), so the
+        // handler runs. The VM still reads nullish bases leniently for
+        // dynamic scripts, so the expectation is spelled out here.
+        let expected = "invalid".to_string();
         let generated = generate_sync_function_from_module(&module, &function, "read_aot").unwrap();
         assert!(
             !generated.contains("catch_unwind"),
@@ -9550,7 +9586,7 @@ fn main() {{
             .unwrap();
         let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
         assert!(
-            generated.contains(".get_property_ic(\"name\", &__W3COS_IC)"),
+            generated.contains(".get_property_checked_ic(\"name\", &__W3COS_IC)"),
             "constant GetProperty key should use a static IC: {generated}"
         );
         assert!(
@@ -9563,7 +9599,7 @@ fn main() {{
             "constant CallMethod key should skip Value + to_js_string: {generated}"
         );
         assert!(
-            !generated.contains("w3cos_core::intrinsics::get_property(&self.registers"),
+            !generated.contains("w3cos_core::intrinsics::get_property_checked(&self.registers"),
             "proven string keys must not go through the Value-key intrinsic: {generated}"
         );
     }
@@ -10805,17 +10841,17 @@ fn main() {{
         );
         let generated = emit_slice(&function);
         assert!(
-            generated.contains(".get_property_ic(\"name\", &__W3COS_IC)"),
+            generated.contains(".get_property_checked_ic(\"name\", &__W3COS_IC)"),
             "constant GetProperty key should still peephole: {generated}"
         );
         assert!(
             generated.contains(
-                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined).get_property_ic(\"name\""
+                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined).get_property_checked_ic(\"name\""
             ),
             "last-use GetProperty object must take instead of clone: {generated}"
         );
         assert!(
-            !generated.contains(".clone().get_property("),
+            !generated.contains(".clone().get_property"),
             "last-use GetProperty object must not clone: {generated}"
         );
     }
@@ -10950,8 +10986,8 @@ fn main() {{
         );
         let generated = emit_slice(&function);
         assert!(
-            generated.contains("self.registers[0].get_property_ic(\"name\"")
-                || generated.contains("get_property(&self.registers[0]"),
+            generated.contains("self.registers[0].get_property_checked_ic(\"name\"")
+                || generated.contains("get_property_checked(&self.registers[0]"),
             "GetProperty object that is live after the use is borrowed in place: {generated}"
         );
         assert!(

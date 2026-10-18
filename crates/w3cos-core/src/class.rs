@@ -140,12 +140,22 @@ pub fn construct_slice(class_value: &Value, args: &[Value]) -> Value {
 }
 
 fn construct_slow(class_value: &Value, args: Vec<Value>) -> Value {
+    if crate::builtins::is_string_constructor(class_value) {
+        return crate::builtins::string_wrapper(&args);
+    }
     if class_value.as_object().is_some() {
         return class_value.call(Value::Undefined, args);
     }
     if let Some(function) = class_value.as_function() {
         let instance = Value::object(HashMap::new());
-        let prototype = class_value.get_property("prototype");
+        let mut prototype = class_value.get_property("prototype");
+        if prototype.is_undefined() {
+            // Ordinary functions own a `prototype` whose `constructor` points
+            // back at them; materialize it on first `new` instead of per closure.
+            prototype = Value::object(HashMap::new());
+            crate::builtins::define_builtin(&prototype, "constructor", class_value.clone());
+            class_value.set_property("prototype", prototype.clone());
+        }
         if prototype.is_object() {
             set_prototype_of(&instance, &prototype);
         }

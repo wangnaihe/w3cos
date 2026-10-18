@@ -2112,15 +2112,33 @@ impl Builder {
                                         function.function.return_type.as_deref(),
                                         &self.type_names,
                                     ));
-                                    self.lower_nested_function(
-                                        parameters,
-                                        &body.stmts,
-                                        None,
-                                        Some(binding.id.sym.to_string()),
-                                        function.function.is_async,
-                                        function.function.is_generator,
-                                        true,
-                                        None,
+                                    let name = function
+                                        .ident
+                                        .as_ref()
+                                        .unwrap_or(&binding.id)
+                                        .sym
+                                        .to_string();
+                                    let self_binding =
+                                        function.ident.as_ref().filter(|identifier| {
+                                            function_references_name(
+                                                &function.function,
+                                                &identifier.sym,
+                                            )
+                                        });
+                                    self.with_function_self_binding(
+                                        self_binding.map(|identifier| identifier.sym.as_ref()),
+                                        |this| {
+                                            this.lower_nested_function(
+                                                parameters,
+                                                &body.stmts,
+                                                None,
+                                                Some(name),
+                                                function.function.is_async,
+                                                function.function.is_generator,
+                                                true,
+                                                None,
+                                            )
+                                        },
                                     )?
                                 }
                                 (Pat::Ident(binding), Expr::Arrow(arrow)) => {
@@ -3833,18 +3851,27 @@ impl Builder {
                     function.function.return_type.as_deref(),
                     &self.type_names,
                 ));
-                self.lower_nested_function(
-                    parameters,
-                    &body.stmts,
-                    None,
-                    function
-                        .ident
-                        .as_ref()
-                        .map(|identifier| identifier.sym.to_string()),
-                    function.function.is_async,
-                    function.function.is_generator,
-                    true,
-                    None,
+                let name = function
+                    .ident
+                    .as_ref()
+                    .map(|identifier| identifier.sym.to_string());
+                let self_binding = function.ident.as_ref().filter(|identifier| {
+                    function_references_name(&function.function, &identifier.sym)
+                });
+                self.with_function_self_binding(
+                    self_binding.map(|identifier| identifier.sym.as_ref()),
+                    |this| {
+                        this.lower_nested_function(
+                            parameters,
+                            &body.stmts,
+                            None,
+                            name,
+                            function.function.is_async,
+                            function.function.is_generator,
+                            true,
+                            None,
+                        )
+                    },
                 )
             }
             Expr::This(_) => {
@@ -4997,6 +5024,29 @@ impl Builder {
         Ok(Some(dst))
     }
 
+    /// A named function expression sees its own name through an immutable
+    /// binding in a scope between the enclosing one and the function body.
+    /// The binding is refreshed per evaluation so each closure refers to itself.
+    fn with_function_self_binding(
+        &mut self,
+        name: Option<&str>,
+        lower: impl FnOnce(&mut Self) -> Result<Register>,
+    ) -> Result<Register> {
+        let Some(name) = name else {
+            return lower(self);
+        };
+        self.scopes.push(HashMap::new());
+        let result = (|| {
+            let binding = self.declare_current_binding(name, BindingKind::Const, false)?;
+            self.emit(Instruction::RefreshBinding { binding });
+            let value = lower(self)?;
+            self.emit(Instruction::InitializeBinding { binding, value });
+            Ok(value)
+        })();
+        self.scopes.pop();
+        result
+    }
+
     fn lower_nested_function(
         &mut self,
         parameters: Vec<Pat>,
@@ -5397,8 +5447,10 @@ impl Builder {
             Lit::Regex(value) => {
                 let constructor = self.resolve_binding("RegExp");
                 let constructor = self.load_binding(constructor);
-                let source = self.constant(Constant::String(atom_to_string(&value.exp)));
-                let flags = self.constant(Constant::String(atom_to_string(&value.flags)));
+                // Regex `exp` is raw pattern text, not a WTF-8 string value:
+                // `atom_to_string`'s surrogate decoding would collapse `\\`.
+                let source = self.constant(Constant::String(value.exp.to_string()));
+                let flags = self.constant(Constant::String(value.flags.to_string()));
                 let dst = self.register();
                 self.emit(Instruction::Construct {
                     dst,
@@ -11094,4 +11146,27 @@ mod type_hint_tests {
         let plain = lower("export function f(a) { return a; }");
         assert!(!serde_json::to_string(&plain).unwrap().contains("\"types\""));
     }
+}
+
+/// Whether a function's parameters or body mention `name` as an identifier
+/// (conservative: any `Ident` with that symbol counts).
+pub(crate) fn function_references_name(function: &swc_ecma_ast::Function, name: &str) -> bool {
+    use swc_ecma_visit::{Visit, VisitWith};
+    struct Finder<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl Visit for Finder<'_> {
+        fn visit_ident(&mut self, ident: &swc_ecma_ast::Ident) {
+            if &*ident.sym == self.name {
+                self.found = true;
+            }
+        }
+    }
+    let mut finder = Finder { name, found: false };
+    function.params.visit_with(&mut finder);
+    if let Some(body) = &function.body {
+        body.visit_with(&mut finder);
+    }
+    finder.found
 }
