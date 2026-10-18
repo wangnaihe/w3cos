@@ -1,0 +1,66 @@
+# Nightly / manual leak soak for the aot-port branch.
+#
+# GitHub only runs `schedule` and `workflow_dispatch` from the default branch
+# (main). The full Leak CI workflow (scenarios + soak) lives on aot-port as
+# `.github/workflows/leak-ci.yml`; this file is the main-branch trigger so the
+# soak actually fires. It always checks out `aot-port` and runs the same soak
+# job — it does not change any code on main.
+name: Leak soak (nightly, aot-port)
+
+on:
+  schedule:
+    # 18:00 UTC = 02:00 Asia/Shanghai, nightly.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: "Soak duration in hours (8h target; GitHub-hosted runners are clamped to 5.5h)"
+        default: "8"
+        required: true
+      iterations:
+        description: "Iterations per scenario in the residual check"
+        default: "200"
+        required: true
+
+concurrency:
+  group: leak-soak-aot-port
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    # An 8h soak needs a self-hosted runner (set repo variable LEAK_SOAK_RUNNER);
+    # GitHub-hosted jobs are capped at 6h, so the duration is clamped there.
+    runs-on: ${{ vars.LEAK_SOAK_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: aot-port
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve soak duration
+        id: duration
+        env:
+          HOURS: ${{ inputs.duration_hours || '8' }}
+          SELF_HOSTED: ${{ vars.LEAK_SOAK_RUNNER != '' }}
+        run: |
+          secs=$(python3 -c "print(int(float('$HOURS') * 3600))")
+          if [ "$SELF_HOSTED" != "true" ] && [ "$secs" -gt 19800 ]; then
+            echo "::warning::GitHub-hosted runners stop jobs at 6h; clamping the ${HOURS}h soak to 5.5h. Set LEAK_SOAK_RUNNER for the full 8h."
+            secs=19800
+          fi
+          echo "secs=$secs" >> "$GITHUB_OUTPUT"
+      - name: Residual check
+        run: cargo run --release -p w3cos-compiler --example leak_ci -- --iterations ${{ inputs.iterations || '200' }} --report-dir leak-reports/residual
+      - name: Soak (RSS growth <= 5%, zero residual)
+        run: cargo run --release -p w3cos-compiler --example leak_ci -- --soak-secs ${{ steps.duration.outputs.secs }} --report-dir leak-reports/soak
+      - name: Upload soak reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-soak-${{ github.run_id }}
+          path: leak-reports
+          if-no-files-found: ignore
