@@ -100,8 +100,8 @@ export W3COS_L2=1 W3COS_L2_BASE_URL=http://127.0.0.1:8081/v1 W3COS_L2_MODEL=qwen
 
 ### Xvfb demo (Codespaces or any Linux VM)
 
-The shell is a native window, not a browser page. Rust 1.85+ is required
-(`edition = "2024"`). In a Codespace:
+The shell is a native window, not a browser page. The Rust version is pinned
+in `rust-toolchain.toml`; rustup installs it on first use. In a Codespace:
 
 ```bash
 sudo apt-get update

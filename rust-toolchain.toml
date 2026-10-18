@@ -1,0 +1,9 @@
+# The one Rust toolchain this repository is built and tested with.
+# rustup installs it automatically on first use inside the checkout, and CI
+# installs exactly this file (`rustup toolchain install`). Bump the channel
+# and `workspace.package.rust-version` in Cargo.toml together, in their own PR,
+# after `cargo check/clippy/fmt/test` pass with the new version.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

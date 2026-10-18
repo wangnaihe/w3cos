@@ -2,6 +2,7 @@
 name = "w3cos-ffi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "W3C OS native FFI bridge — dlopen, symbol lookup, C ABI calls"
 

@@ -2,6 +2,7 @@
 name = "w3cos-ai-bridge"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "W3C OS AI bridge — structured DOM access, accessibility tree, and annotated screenshots for AI agents"
 
