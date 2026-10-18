@@ -6,6 +6,7 @@ pub mod esm_codegen;
 pub mod esm_css;
 pub mod esm_lowering;
 pub mod esm_resolver;
+pub mod leak_lint;
 pub mod media_query;
 pub mod mobile_codegen;
 pub mod npm_bridge;
