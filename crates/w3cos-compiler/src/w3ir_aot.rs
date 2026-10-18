@@ -1361,6 +1361,45 @@ fn emit_boxed_value(plan: &EscapePlan, register: u32) -> String {
 /// one release per use. Rust's borrow checker rejects any emission where
 /// the register could change while borrowed, so this cannot free early.
 /// Unboxed numbers / booleans still build a temporary `Value`.
+/// Per-site static inline cache declared inside an emitted block
+/// (`w3cos_core::ic`). `PropIc` is `Sync`, so a `static` is fine in any
+/// generated function, generic or not.
+const IC_DECL: &str = "static __W3COS_IC: w3cos_core::PropIc = w3cos_core::PropIc::new();";
+
+/// Constant keys that get a static inline cache. Mirrors
+/// `w3cos_core::ic::generic_only_key`: keys the generic path special-cases
+/// (`length`, indices, DOM shape-bump keys, `__proto__`, internal
+/// `__w3cos_` markers) keep the plain call so no dead cache is emitted.
+fn ic_cacheable_key(key: &str) -> bool {
+    // Measurement knob: `W3COS_AOT_NO_IC=1` emits the plain generic calls
+    // (A/B benchmarking only).
+    thread_local! {
+        static DISABLED: bool = std::env::var_os("W3COS_AOT_NO_IC").is_some();
+    }
+    if DISABLED.with(|disabled| *disabled) {
+        return false;
+    }
+    !(key.is_empty()
+        || matches!(
+            key,
+            "length"
+                | "__proto__"
+                | "id"
+                | "className"
+                | "textContent"
+                | "appendChild"
+                | "insertBefore"
+                | "removeChild"
+                | "replaceChild"
+                | "createElement"
+                | "createElementNS"
+                | "createTextNode"
+                | "push"
+        )
+        || key.as_bytes()[0].is_ascii_digit()
+        || key.starts_with("__w3cos_"))
+}
+
 fn emit_boxed_ref(plan: &EscapePlan, register: u32) -> String {
     if let Some(slot) = val_slot(plan, register) {
         format!("self.registers[{slot}]")
@@ -4003,7 +4042,7 @@ fn fuse_private_binding_loads(
         // A last-use receiver of a `&self` method is moved out of its
         // register; borrowing it instead is equivalent.
         let mut replaced = text.clone();
-        for method in ["get_property(", "call_method_slice("] {
+        for method in ["get_property(", "get_property_ic(", "call_method_slice("] {
             replaced = replaced.replace(
                 &format!(
                     "std::mem::replace(&mut self.registers[{register}], w3cos_core::Value::Undefined).{method}"
@@ -6793,15 +6832,22 @@ fn emit_instruction(
         ),
         Instruction::GetProperty { dst, object, key } => {
             if let Some(literal) = proven_strings.get(&key.0) {
-                format!(
-                    "self.registers[{}] = {}.get_property({literal:?});",
-                    register(*dst),
-                    if last_uses.contains(&object.0) {
-                        emit_boxed_use(plan, object.0, true)
-                    } else {
-                        emit_boxed_ref(plan, object.0)
-                    },
-                )
+                let object_expr = if last_uses.contains(&object.0) {
+                    emit_boxed_use(plan, object.0, true)
+                } else {
+                    emit_boxed_ref(plan, object.0)
+                };
+                if ic_cacheable_key(literal) {
+                    format!(
+                        "self.registers[{}] = {{ {IC_DECL} {object_expr}.get_property_ic({literal:?}, &__W3COS_IC) }};",
+                        register(*dst),
+                    )
+                } else {
+                    format!(
+                        "self.registers[{}] = {object_expr}.get_property({literal:?});",
+                        register(*dst),
+                    )
+                }
             } else {
                 let mut uses = ValueUseEmitter::new(plan, last_uses, [object.0, key.0]);
                 format!(
@@ -6833,7 +6879,19 @@ fn emit_instruction(
             let reads = [object.0, key.0, value.0];
             let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &reads, value.0);
             let object_expr = emit_boxed_ref(plan, object.0);
-            let statement = if let Some(literal) = proven_strings.get(&key.0) {
+            let statement = if let Some(literal) = proven_strings.get(&key.0)
+                && ic_cacheable_key(literal)
+            {
+                if *strict {
+                    format!(
+                        "{{ {IC_DECL} w3cos_core::intrinsics::set_property_strict_ic(&{object_expr}, {literal:?}, {value_expr}, &__W3COS_IC); }}"
+                    )
+                } else {
+                    format!(
+                        "{{ {IC_DECL} {object_expr}.set_property_ic({literal:?}, {value_expr}, &__W3COS_IC); }}"
+                    )
+                }
+            } else if let Some(literal) = proven_strings.get(&key.0) {
                 if *strict {
                     format!(
                         "w3cos_core::intrinsics::set_property_strict(&{object_expr}, &w3cos_core::Value::from({literal:?}), {value_expr});"
@@ -8861,12 +8919,13 @@ fn main() {{
             .unwrap();
         let generated = generate_sync_function_from_module(&module, function, "read_aot").unwrap();
         assert!(
-            generated.contains(".get_property(\"name\")"),
-            "constant GetProperty key should skip Value + to_js_string: {generated}"
+            generated.contains(".get_property_ic(\"name\", &__W3COS_IC)"),
+            "constant GetProperty key should use a static IC: {generated}"
         );
         assert!(
-            generated.contains(".set_property(\"flag\""),
-            "constant SetProperty key should skip Value + to_js_string: {generated}"
+            generated.contains("set_property_strict_ic(") && generated.contains("\"flag\"")
+                || generated.contains(".set_property_ic(\"flag\""),
+            "constant SetProperty key should use a static IC: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"toUpperCase\""),
@@ -10038,12 +10097,12 @@ fn main() {{
         );
         let generated = emit_slice(&function);
         assert!(
-            generated.contains(".get_property(\"name\")"),
+            generated.contains(".get_property_ic(\"name\", &__W3COS_IC)"),
             "constant GetProperty key should still peephole: {generated}"
         );
         assert!(
             generated.contains(
-                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined).get_property(\"name\")"
+                "std::mem::replace(&mut self.registers[0], w3cos_core::Value::Undefined).get_property_ic(\"name\""
             ),
             "last-use GetProperty object must take instead of clone: {generated}"
         );
@@ -10183,7 +10242,7 @@ fn main() {{
         );
         let generated = emit_slice(&function);
         assert!(
-            generated.contains("self.registers[0].get_property(\"name\")")
+            generated.contains("self.registers[0].get_property_ic(\"name\"")
                 || generated.contains("get_property(&self.registers[0]"),
             "GetProperty object that is live after the use is borrowed in place: {generated}"
         );

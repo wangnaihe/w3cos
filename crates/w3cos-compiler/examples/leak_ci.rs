@@ -65,11 +65,13 @@ mod leak_ci_harness {
             call(*f);
             let base = live();
             leak_detector::mark_baseline();
+            w3cos_core::ic::reset_stats();
             let started = std::time::Instant::now();
             for _ in 0..iterations {
                 call(*f);
             }
             let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let ic = w3cos_core::ic::stats();
             let after = live();
             let residual = (
                 after.0 as i64 - base.0 as i64,
@@ -80,13 +82,16 @@ mod leak_ci_harness {
             let known_reason = known.iter().find(|(known, _)| known == name).map(|(_, reason)| *reason);
             let status = if clean { "ok" } else if known_reason.is_some() { "known" } else { "LEAK" };
             let line = format!(
-                "{status:5} {name:40} baseline objs/arrs/fns {}/{}/{} -> {}/{}/{} (residual {:+}/{:+}/{:+}) over {iterations} iterations, {ms:.1} ms",
-                base.0, base.1, base.2, after.0, after.1, after.2, residual.0, residual.1, residual.2
+                "{status:5} {name:40} baseline objs/arrs/fns {}/{}/{} -> {}/{}/{} (residual {:+}/{:+}/{:+}) over {iterations} iterations, {ms:.1} ms, ic hit {:.1}% ({}/{})",
+                base.0, base.1, base.2, after.0, after.1, after.2, residual.0, residual.1, residual.2,
+                ic.hit_rate() * 100.0, ic.hits(), ic.hits() + ic.misses()
             );
             println!("{line}");
             text.push_str(&line);
             text.push('\n');
             let mut entry = serde_json::json!({
+                "ic_hits": ic.hits(),
+                "ic_misses": ic.misses(),
                 "scenario": name,
                 "status": status,
                 "iterations": iterations,

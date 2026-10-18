@@ -3889,9 +3889,12 @@ export function boot() {
             code.contains("fn m0_Animal__ctor(__this: w3cos_core::Value")
                 && code.contains("class constructor Animal.constructor compiled from W3IR")
                 && (code.contains("w3cos_core::Value::string(\"name\")")
-                    || code.contains("w3cos_core::Value::from(\"name\")"))
+                    || code.contains("w3cos_core::Value::from(\"name\")")
+                    || code.contains("set_property_strict_ic(&__this, \"name\"")
+                    || code.contains(", \"name\", "))
                 && (code.contains("w3cos_core::intrinsics::set_property(")
-                    || code.contains("set_property_strict(")),
+                    || code.contains("set_property_strict(")
+                    || code.contains("set_property_strict_ic(")),
             "constructor should lower through W3IR: {code}"
         );
         assert!(
@@ -5504,6 +5507,146 @@ fn main() {
         assert!(
             output.status.success() && stdout.contains("W3COS_LEAK_BASELINE_OK"),
             "leak baseline bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn generated_bundle_inline_caches_stay_correct() {
+        // Static property ICs (M1 item 10): polymorphic sites, shape
+        // transitions, delete -> dictionary, accessors defined after a site
+        // was cached, class accessors / prototype methods, prototype swaps and
+        // prototype writes must all read exactly what the generic path reads.
+        let root = fixture_root("w3cos_esm_codegen_inline_caches");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"class Base {
+  kind: string;
+  constructor() { this.kind = "base"; }
+  get label(): string { return "L" + this.kind; }
+}
+class Rect extends Base {
+  w: number;
+  constructor(w: number) { super(); this.w = w; }
+  area(): number { return this.w * 2; }
+}
+function readX(o: any): number { return o.x; }
+export function polymorphic(): number {
+  const a = { x: 1 };
+  const b = { y: 0, x: 2 };
+  const c: any = { x: 3, z: 1 };
+  let s = 0;
+  for (let i = 0; i < 30; i++) s += readX(a) + readX(b) + readX(c);
+  return s;
+}
+export function transitions(): number {
+  const o: any = { x: 1 };
+  let s = 0;
+  for (let i = 0; i < 10; i++) { s += o.x; o["k" + i] = i; }
+  delete o.k3;
+  s += o.x;
+  o.x = 5;
+  s += o.x;
+  return s;
+}
+export function accessors(): number {
+  const o: any = { v: 1 };
+  let s = 0;
+  for (let i = 0; i < 3; i++) s += o.v;
+  Object.defineProperty(o, "v", { get() { return 10; } });
+  for (let i = 0; i < 3; i++) s += o.v;
+  const r = new Rect(4);
+  s += r.area() + r.label.length + r.w;
+  return s;
+}
+export function protoSwap(): number {
+  const p1: any = { m: 1 };
+  const p2: any = { m: 2 };
+  const o: any = Object.create(p1);
+  let s = 0;
+  for (let i = 0; i < 3; i++) s += o.m;
+  Object.setPrototypeOf(o, p2);
+  for (let i = 0; i < 3; i++) s += o.m;
+  p2.m = 7;
+  s += o.m;
+  o.m = 100;
+  s += o.m;
+  return s;
+}
+export function setSites(): number {
+  const objs: any[] = [];
+  for (let i = 0; i < 20; i++) objs.push({ a: 0, b: 0 });
+  for (let i = 0; i < 20; i++) objs[i].b = i;
+  let s = 0;
+  for (const o of objs) s += o.b + o.a;
+  return s;
+}
+export function keyOrder(): number {
+  const o: any = {};
+  o.b = 1; o["2"] = 1; o.a = 1; o["1"] = 1;
+  return Object.keys(o).join(",") === "1,2,b,a" ? 1 : 0;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("get_property_ic("),
+            "constant-key reads should use static ICs"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::Value;
+    let _ = run_entry();
+    w3cos_core::ic::reset_stats();
+    for round in 0..3 {
+        let check = |name: &str, f: fn(Vec<Value>) -> Value, expect: f64| {
+            assert_eq!(f(Vec::new()).to_number(), expect, "{name} (round {round})");
+        };
+        check("polymorphic", m0::m0_polymorphic, 180.0);
+        check("transitions", m0::m0_transitions, 16.0);
+        check("accessors", m0::m0_accessors, 50.0);
+        check("protoSwap", m0::m0_protoSwap, 116.0);
+        check("setSites", m0::m0_setSites, 190.0);
+        check("keyOrder", m0::m0_keyOrder, 1.0);
+    }
+    let stats = w3cos_core::ic::stats();
+    assert!(stats.get_hits > 0 && stats.set_hits > 0, "ICs should hit: {stats:?}");
+    println!("W3COS_IC_OK {stats:?}");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("W3COS_IC_OK"),
+            "inline-cache bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
