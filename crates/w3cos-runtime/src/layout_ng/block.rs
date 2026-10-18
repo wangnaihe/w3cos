@@ -328,7 +328,9 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
                 margin[3] = half;
                 margin[1] = half;
             }
-            (true, false) => margin[3] = remaining - margin[1],
+            // Blink ResolveInlineAutoMargins: an auto start margin never
+            // goes negative (CSS2 margin-auto-on-block-box, as in Chrome).
+            (true, false) => margin[3] = (remaining - margin[1]).max(0.0),
             (false, true) => margin[1] = remaining - margin[3],
             // Over-constrained, direction ltr: margin-right is ignored.
             (false, false) => margin[1] = remaining - margin[3],
@@ -507,15 +509,13 @@ pub(super) fn layout_block(
     // margin edge, so its margins no longer adjoin ours (Blink FinishLayout
     // only propagates the end strut when the block size is the intrinsic one).
     // CSS2.1 8.3.1 collapse-through: no top/bottom border or padding, not a
-    // BFC root, zero or auto height, zero min-height, no in-flow content.
-    let self_collapsing = at_top
-        && can_escape_top
-        && !bfc_root
-        && bb == 0.0
-        && pb == 0.0
-        && specified_height.is_none_or(|h| h == 0.0)
-        && min_h.is_none_or(|m| m == 0.0)
-        && content_height == 0.0;
+    // BFC root, no in-flow content, and a zero *used* block size.  Blink
+    // (NGBlockLayoutAlgorithm::FinishLayout) leaves the BFC block offset
+    // unresolved exactly when the final block size is zero, so
+    // `height: 100px; max-height: 0` collapses through like `height: 0`
+    // (CSS2 max-height-100), while min-height > 0 keeps it from doing so.
+    let self_collapsing =
+        at_top && can_escape_top && !bfc_root && bb == 0.0 && pb == 0.0 && content_height == 0.0;
     if self_collapsing {
         // CSS2 8.3.1: top and bottom margins adjoin; everything collapses
         // into one strut reported as the start strut.

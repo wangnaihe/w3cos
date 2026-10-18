@@ -548,3 +548,88 @@ fn probe_html() {
         );
     }
 }
+
+/// CSS2 max-height-100: `height: 100px; max-height: 0` has a zero used
+/// block size, so (Blink FinishLayout) it collapses through and the
+/// preceding sibling's bottom margin escapes the parent, as in Chrome.
+#[test]
+fn zero_used_height_collapses_through() {
+    use w3cos_std::style::{Dimension, Display, Edges, Spacing, Style};
+    let block = |height: f32, max: Option<f32>, bottom: f32| {
+        let mut style = Style {
+            display: Display::Block,
+            height: Dimension::Px(height),
+            ..Style::default()
+        };
+        if let Some(max) = max {
+            style.max_height = Dimension::Px(max);
+        }
+        style.margin = Edges {
+            top: Spacing::Px(0.0),
+            right: Spacing::Px(0.0),
+            bottom: Spacing::Px(bottom),
+            left: Spacing::Px(0.0),
+        };
+        Component::boxed(style, Vec::new())
+    };
+    let body = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![block(18.0, None, 16.0), block(100.0, Some(0.0), 0.0)],
+    );
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![body],
+    );
+    let flat = crate::layout::pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |i: usize| ng.iter().find(|(_, n)| *n == i).unwrap().0;
+    assert_eq!(
+        rect(1).height,
+        18.0,
+        "body ends at the first child's border edge"
+    );
+    assert_eq!(rect(3).height, 0.0);
+}
+
+/// Blink ResolveInlineAutoMargins: `margin-left: auto` on an overflowing
+/// block (width 50 + margin-right 75 > 100) resolves to 0, not -25.
+#[test]
+fn auto_start_margin_does_not_go_negative() {
+    let mut test = Style {
+        display: Display::Block,
+        width: Dimension::Px(50.0),
+        height: Dimension::Px(5.0),
+        ..Style::default()
+    };
+    test.margin = Edges {
+        top: Spacing::Px(0.0),
+        right: Spacing::Px(75.0),
+        bottom: Spacing::Px(0.0),
+        left: Spacing::Auto,
+    };
+    let wrapper = Style {
+        display: Display::Block,
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            wrapper,
+            vec![Component::boxed(test, Vec::new())],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = ng.iter().find(|(_, n)| *n == 2).unwrap().0;
+    assert_eq!(rect.x, 0.0);
+}
