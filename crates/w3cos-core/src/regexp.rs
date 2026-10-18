@@ -742,7 +742,10 @@ mod tests {
     fn large_patterns_compile_past_the_default_delegate_budget() {
         // Composed grammars like semver's exceed the 10 MiB default.
         let source = r"^\w{4000}$";
-        assert!(Regex::new(source).is_err(), "pattern no longer exercises the limit");
+        assert!(
+            Regex::new(source).is_err(),
+            "pattern no longer exercises the limit"
+        );
         assert!(build_regex(source, "").is_some());
     }
 

@@ -5025,14 +5025,31 @@ mod tests {
     #[test]
     fn string_repeat_and_padding_follow_ecmascript() {
         let s = Value::from("ab");
-        assert_eq!(s.call_method("repeat", vec![Value::from(3.0)]).to_js_string(), "ababab");
-        assert_eq!(s.call_method("repeat", vec![Value::from(0.0)]).to_js_string(), "");
         assert_eq!(
-            s.call_method("padStart", vec![Value::from(5.0), Value::from("xy")]).to_js_string(),
+            s.call_method("repeat", vec![Value::from(3.0)])
+                .to_js_string(),
+            "ababab"
+        );
+        assert_eq!(
+            s.call_method("repeat", vec![Value::from(0.0)])
+                .to_js_string(),
+            ""
+        );
+        assert_eq!(
+            s.call_method("padStart", vec![Value::from(5.0), Value::from("xy")])
+                .to_js_string(),
             "xyxab"
         );
-        assert_eq!(s.call_method("padEnd", vec![Value::from(4.0)]).to_js_string(), "ab  ");
-        assert_eq!(s.call_method("padStart", vec![Value::from(1.0)]).to_js_string(), "ab");
+        assert_eq!(
+            s.call_method("padEnd", vec![Value::from(4.0)])
+                .to_js_string(),
+            "ab  "
+        );
+        assert_eq!(
+            s.call_method("padStart", vec![Value::from(1.0)])
+                .to_js_string(),
+            "ab"
+        );
     }
 
     #[test]
@@ -5059,7 +5076,10 @@ mod tests {
             "plain",
             &Value::object(HashMap::from([("value".into(), Value::from(3.0))])),
         );
-        assert_eq!(crate::builtins::object_keys(&exports).to_js_string(), "plain,g");
+        assert_eq!(
+            crate::builtins::object_keys(&exports).to_js_string(),
+            "plain,g"
+        );
     }
 
     #[test]
