@@ -1,4 +1,7 @@
 pub mod alloc_escape;
+pub mod cjs;
+#[cfg(test)]
+mod cjs_e2e_tests;
 pub mod codegen;
 pub mod css_parser;
 pub mod css_values;
@@ -9,6 +12,7 @@ pub mod esm_resolver;
 pub mod leak_lint;
 pub mod media_query;
 pub mod mobile_codegen;
+pub mod module_source;
 pub mod node_resolution;
 pub mod npm_bridge;
 pub mod parser;
@@ -349,7 +353,7 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
         .with_runtime_modules(runtime_modules.iter().cloned());
     let graph = resolver.build_graph_from_entry(entry_path)?;
     let has_dynamic_global_access = graph.nodes.iter().any(|node| {
-        std::fs::read_to_string(&node.module.path)
+        module_source::read(&node.module.path)
             .is_ok_and(|source| uses_computed_web_global_access(&source))
     });
     let parsed = resolver.parse_graph_from_entry(entry_path)?;

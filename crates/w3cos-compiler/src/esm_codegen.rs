@@ -537,6 +537,10 @@ fn generate_module_with_bodies(
     // Emit cross-module use aliases (same as skeleton), except variable
     // symbols: those are exposed through `{bundled}_get`/`{bundled}_set`
     // accessor fns, so the aliases must target the accessors.
+    // Two local names may import the same symbol (`import a from "./x";
+    // import b from "./x";`): the alias lines differ, the bundled-name
+    // re-exports must be emitted once.
+    let mut emitted_uses: HashSet<String> = HashSet::new();
     for (local, bundled) in &module.local_to_bundled {
         let sym = bundle.symbols.iter().find(|s| s.bundled_name == *bundled);
         let owned = sym.is_some_and(|s| s.module == module.path);
@@ -550,30 +554,40 @@ fn generate_module_with_bodies(
             {
                 // Both the bundled accessor name (used by the lowering) and
                 // the local alias (used by re-exports) must be in scope.
-                out.push_str(&format!(
-                    "    pub use super::{}::{}_get;\n    pub use super::{}::{}_get as {};\n    pub use super::{}::{}_set;\n",
-                    owner.namespace,
-                    bundled,
-                    owner.namespace,
-                    bundled,
-                    sanitize_ident(local),
-                    owner.namespace,
-                    bundled
-                ));
+                let local = sanitize_ident(local);
+                if emitted_uses.insert(format!("{bundled}_get")) {
+                    out.push_str(&format!(
+                        "    pub use super::{}::{}_get;\n    pub use super::{}::{}_set;\n",
+                        owner.namespace, bundled, owner.namespace, bundled
+                    ));
+                }
+                if local != format!("{bundled}_get") && emitted_uses.insert(local.clone()) {
+                    out.push_str(&format!(
+                        "    pub use super::{}::{}_get as {};\n",
+                        owner.namespace, bundled, local
+                    ));
+                }
             } else if sym.kind == SymbolKind::Function {
                 let local = sanitize_ident(local);
-                out.push_str(&format!(
-                    "    pub use super::{}::{} as {};\n    pub use super::{}::{}_value;\n    pub use super::{}::{}_value as {}_value;\n",
-                    owner.namespace,
-                    bundled,
-                    local,
-                    owner.namespace,
-                    bundled,
-                    owner.namespace,
-                    bundled,
-                    local,
-                ));
-            } else {
+                if emitted_uses.insert(local.clone()) {
+                    out.push_str(&format!(
+                        "    pub use super::{}::{} as {};\n",
+                        owner.namespace, bundled, local
+                    ));
+                }
+                if emitted_uses.insert(format!("{bundled}_value")) {
+                    out.push_str(&format!(
+                        "    pub use super::{}::{}_value;\n",
+                        owner.namespace, bundled
+                    ));
+                }
+                if local != *bundled && emitted_uses.insert(format!("{local}_value")) {
+                    out.push_str(&format!(
+                        "    pub use super::{}::{}_value as {}_value;\n",
+                        owner.namespace, bundled, local
+                    ));
+                }
+            } else if emitted_uses.insert(sanitize_ident(local)) {
                 out.push_str(&format!(
                     "    pub use super::{}::{} as {};\n",
                     owner.namespace,
@@ -603,7 +617,7 @@ fn generate_module_with_bodies(
     // Attempt one backend-neutral lowering for every module. Preserve the
     // diagnostic in generated source: ordinary functions and class members
     // fail explicitly instead of silently switching semantic backends.
-    let (w3ir_module, w3ir_error) = match std::fs::read_to_string(&module.path) {
+    let (w3ir_module, w3ir_error) = match crate::module_source::read(&module.path) {
         Ok(source) => match crate::w3ir_lowering::lower_module(
             &source,
             module.path.to_string_lossy().as_ref(),
@@ -1838,7 +1852,7 @@ fn parse_module_functions(path: &Path) -> Vec<TopLevelItem> {
 }
 
 fn parse_module_items(path: &Path) -> ParsedModuleItems {
-    let source = match std::fs::read_to_string(path) {
+    let source = match crate::module_source::read(path) {
         Ok(s) => s,
         Err(_) => {
             return ParsedModuleItems {
