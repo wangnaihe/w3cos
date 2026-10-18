@@ -897,12 +897,15 @@ pub(super) fn layout_block_sized(
         (cursor + pending.sum()).max(0.0)
     };
     let content_height = clamp_h(specified_height.unwrap_or(auto_content));
-    if can_escape_bottom && content_height == auto_content {
+    // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
+    // computed height is auto, whatever max-height does to the used height
+    // (margin-collapse-038; Blink's FinishLayout drops the strut whenever
+    // the used size differs from the intrinsic one).  A min-height that
+    // grows the box does move its end away from the child's margin edge
+    // (CSS2 min-height-separates-margin).
+    if can_escape_bottom && content_height <= auto_content {
         end_strut = pending;
     }
-    // Otherwise min/max moved the block end away from the last child's
-    // margin edge, so its margins no longer adjoin ours (Blink FinishLayout
-    // only propagates the end strut when the block size is the intrinsic one).
     // CSS2.1 8.3.1 collapse-through: no top/bottom border or padding, not a
     // BFC root, no in-flow content, and a zero *used* block size.  Blink
     // (NGBlockLayoutAlgorithm::FinishLayout) leaves the BFC block offset
