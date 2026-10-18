@@ -11928,7 +11928,19 @@ fn register_author_blocks(owner: u64, css: &str, media_queries: &mut Vec<(String
                     }
                 }
                 "supports" | "layer" => register_author_blocks(owner, body, media_queries),
-                // @keyframes, @page, ... are not style rules.
+                "keyframes" | "-webkit-keyframes" => {
+                    let keyframes_name = at_rule[name_end..]
+                        .trim()
+                        .trim_matches(|character| character == '"' || character == '\'');
+                    if !keyframes_name.is_empty() && keyframes_name != "none" {
+                        w3cos_dom::animation::register_keyframes(
+                            owner,
+                            keyframes_name,
+                            w3cos_dom::animation::parse_keyframes_body(body),
+                        );
+                    }
+                }
+                // @page, ... are not style rules.
                 _ => {}
             }
             continue;
@@ -13371,11 +13383,7 @@ fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
     // `transition` is not inherited: only a rule or this element's inline
     // style can give it (or its pseudos) one. Blink starts transitions from
     // the style diff in recalc; here the three-style snapshot is skipped.
-    if !w3cos_dom::stylesheet::has_transition_rules()
-        && !dom::with_document(|document| {
-            document.inline_declares_transition(NodeId::from_u32(node))
-        })
-    {
+    if !dom::with_document(|document| document.may_start_transition(NodeId::from_u32(node))) {
         return snapshots;
     }
     for pseudo in [None, Some("::before"), Some("::after")] {
@@ -13506,7 +13514,7 @@ fn scan_css_animations() {
                 from,
                 to,
                 started_at: Instant::now(),
-                delay: Duration::from_millis(u64::from(animation.delay_ms)),
+                delay: Duration::from_millis(animation.delay_ms.max(0) as u64),
                 duration: Duration::from_millis(u64::from(animation.duration_ms)),
                 easing: animation.easing,
                 direction: animation.direction,
@@ -22151,6 +22159,12 @@ pub fn tick_timers() -> usize {
 /// batch the same timestamp and defers callbacks registered by a callback to
 /// the next frame, matching browser rAF batching semantics.
 pub fn run_animation_frame() -> usize {
+    // DocumentAnimations::UpdateAnimationTimingForAnimationFrame: elements
+    // whose animated style depends on the timeline restyle each frame.
+    crate::animations_web::resolve_pending_plays();
+    for node in w3cos_dom::animation::take_time_dependent_nodes() {
+        crate::dom::invalidate_animated_style(node);
+    }
     tick_css_motions();
     let callbacks: Vec<Value> = RAF_QUEUE
         .with(|q| std::mem::take(&mut *q.borrow_mut()))
@@ -32157,6 +32171,77 @@ try {
         let right = computed(right);
         assert_eq!(right.get_property("marginLeft"), Value::string("0px"));
         assert_eq!(right.get_property("marginRight"), Value::string("50px"));
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn css_animations_and_waapi_effects_reach_computed_style_and_layout() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let style = document.call_method("createElement", vec![Value::string("style")]);
+        style.set_property(
+            "textContent",
+            Value::string(
+                "@keyframes fade{from{opacity:1}to{opacity:0}}\
+                 @keyframes grow{0%{width:10px}100%{width:110px}}\
+                 .a{position:absolute;width:10px;height:4px}\
+                 .fade{animation:fade 1000ms linear 0s 1 normal both paused}\
+                 .grow{animation:grow 1000ms linear both paused}\
+                 .imp{animation:fade 1000ms linear both paused;opacity:0.25 !important}",
+            ),
+        );
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![style]);
+        let computed = |element: &Value, property: &str| {
+            window_value()
+                .call_method("getComputedStyle", vec![element.clone()])
+                .get_property(property)
+                .to_js_string()
+        };
+        let fade = create_in_body("div");
+        fade.set_property("className", Value::string("a fade"));
+        assert_eq!(computed(&fade, "opacity"), "1");
+        // A paused CSS animation holds current time 0; a negative delay
+        // seeks into the active interval.
+        fade.get_property("style")
+            .set_property("animationDelay", Value::string("-300ms"));
+        assert_eq!(computed(&fade, "opacity"), "0.7");
+        let grow = create_in_body("div");
+        grow.set_property("className", Value::string("a grow"));
+        grow.get_property("style")
+            .set_property("animationDelay", Value::string("-0.5s"));
+        assert_eq!(grow.get_property("offsetWidth").to_number(), 60.0);
+        let important = create_in_body("div");
+        important.set_property("className", Value::string("a imp"));
+        assert_eq!(computed(&important, "opacity"), "0.25");
+
+        let target = create_in_body("div");
+        let animation = target.call_method(
+            "animate",
+            vec![
+                Value::array(vec![
+                    Value::object(HashMap::from([("opacity".into(), Value::Number(1.0))])),
+                    Value::object(HashMap::from([("opacity".into(), Value::Number(0.0))])),
+                ]),
+                Value::object(HashMap::from([
+                    ("duration".into(), Value::Number(1000.0)),
+                    ("fill".into(), Value::string("both")),
+                ])),
+            ],
+        );
+        animation.call_method("pause", Vec::new());
+        assert_eq!(animation.get_property("currentTime"), Value::Number(0.0));
+        animation.set_property("currentTime", Value::Number(500.0));
+        assert_eq!(animation.get_property("currentTime"), Value::Number(500.0));
+        assert_eq!(computed(&target, "opacity"), "0.5");
+        assert_eq!(animation.get_property("playState").to_js_string(), "paused");
+        let listed = target.call_method("getAnimations", Vec::new());
+        assert!(listed.iter().any(|item| item.strict_eq(&animation)));
+        animation.call_method("cancel", Vec::new());
+        assert_eq!(computed(&target, "opacity"), "1");
+        assert_eq!(animation.get_property("currentTime"), Value::Null);
         w3cos_dom::stylesheet::clear_rules();
     }
 

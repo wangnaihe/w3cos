@@ -1407,7 +1407,7 @@ fn gen_animation_rust(value: &str) -> Option<String> {
         _ => "Easing::Ease",
     };
     Some(format!(
-        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None }})",
+        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None, paused: false }})",
         a.name, a.duration_ms, a.delay_ms
     ))
 }

@@ -1755,10 +1755,14 @@ pub struct Animation {
     pub name: String,
     pub duration_ms: u32,
     pub easing: Easing,
-    pub delay_ms: u32,
+    /// Signed: a negative animation-delay starts part-way through.
+    pub delay_ms: i32,
     pub iteration_count: AnimationIterationCount,
     pub direction: AnimationDirection,
     pub fill_mode: AnimationFillMode,
+    /// `animation-play-state: paused`.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

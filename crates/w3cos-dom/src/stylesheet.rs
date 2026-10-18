@@ -474,6 +474,11 @@ fn bump_generation() {
     STYLE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
 }
 
+/// `@keyframes` changed: computed styles depending on them are stale.
+pub(crate) fn note_animation_rules_changed() {
+    bump_generation();
+}
+
 pub fn generation() -> u64 {
     STYLE_GENERATION.with(Cell::get)
 }
@@ -747,7 +752,8 @@ pub fn clear_owner(owner: u64) {
         rules.rebuild_index();
         rules.rules.len() != initial_len || rules.document_roots.len() != initial_roots
     });
-    if matches!(removed, Ok(true)) {
+    let removed_keyframes = crate::animation::clear_keyframes_owner(Some(owner));
+    if matches!(removed, Ok(true)) || removed_keyframes {
         refresh_rule_flags();
         bump_generation();
     }
@@ -761,6 +767,7 @@ pub fn clear_rules() {
         *rules = RuleSet::default();
         removed
     });
+    let removed = crate::animation::clear_keyframes_owner(None) || removed;
     if removed {
         refresh_rule_flags();
         bump_generation();
@@ -784,6 +791,67 @@ pub(crate) fn matched_rules_survive_inline_style_edits() -> bool {
 /// so callers skip the before/after style snapshots.
 pub fn has_transition_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 32 != 0)
+}
+
+/// `!important` declarations of the matched rules in cascade order.
+pub(crate) fn important_declarations_for_rules(matched: &[u32]) -> Vec<(String, String)> {
+    if matched.is_empty() {
+        return Vec::new();
+    }
+    RULES.with(|rules| {
+        let rules = rules.borrow();
+        let mut out = Vec::new();
+        for &index in matched {
+            let Some(rule) = rules.rules.get(index as usize) else {
+                continue;
+            };
+            for (property, value) in &rule.declarations {
+                let (value, important) = declaration_value_and_importance(value);
+                if important && property != CONTAINER_QUERY_MARKER {
+                    out.push((property.clone(), value.to_string()));
+                }
+            }
+        }
+        out
+    })
+}
+
+/// Whether any of the matched principal rules declares a transition.
+pub(crate) fn rules_declare_transition(matched: &[u32]) -> bool {
+    RULES.with(|rules| {
+        let rules = rules.borrow();
+        matched.iter().any(|&index| {
+            rules.rules.get(index as usize).is_some_and(|rule| {
+                rule.declarations
+                    .iter()
+                    .any(|(property, _)| property.starts_with("transition"))
+            })
+        })
+    })
+}
+
+/// Whether any pseudo-element rule declares a transition (memoized per
+/// stylesheet generation).
+pub(crate) fn pseudo_rules_declare_transition() -> bool {
+    thread_local! {
+        static MEMO: Cell<(u64, bool)> = const { Cell::new((0, false)) };
+    }
+    let generation = generation();
+    let (memo_generation, memo) = MEMO.with(Cell::get);
+    if memo_generation == generation {
+        return memo;
+    }
+    let value = RULES.with(|rules| {
+        rules.borrow().rules.iter().any(|rule| {
+            rule.pseudo_element.is_some()
+                && rule
+                    .declarations
+                    .iter()
+                    .any(|(property, _)| property.starts_with("transition"))
+        })
+    });
+    MEMO.with(|cell| cell.set((generation, value)));
+    value
 }
 
 pub fn has_rules() -> bool {

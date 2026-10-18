@@ -190,6 +190,10 @@ struct MatchedPropertiesKey {
     /// rule list). Valid within one stylesheet generation, which the cache
     /// epoch enforces.
     matched: Vec<u32>,
+    /// The element's own inline declarations (Blink's MatchResult includes
+    /// the style attribute's property set), so inline-styled elements share
+    /// entries by content instead of opting out.
+    inline: Vec<(String, String)>,
 }
 
 /// FxHasher (rustc-hash): MPC keys are small integer lists hashed per
@@ -311,6 +315,58 @@ struct StyleForMemo {
 /// ComputedStyle>): the per-node cache, the matched-properties cache and the
 /// layout walk share one allocation instead of deep-cloning `Style`.
 pub type SharedStyle = std::rc::Rc<w3cos_std::style::Style>;
+
+/// Properties that are not inherited (CSS property index "Inherited: no").
+/// Conservative: anything unlisted is treated as possibly inherited.
+fn is_known_non_inherited_property(property: &str) -> bool {
+    let property = property.trim();
+    if property.starts_with("--") {
+        return false;
+    }
+    matches!(
+        property,
+        "opacity"
+            | "transform"
+            | "left"
+            | "top"
+            | "right"
+            | "bottom"
+            | "width"
+            | "height"
+            | "min-width"
+            | "min-height"
+            | "max-width"
+            | "max-height"
+            | "display"
+            | "position"
+            | "z-index"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
+            | "box-shadow"
+            | "filter"
+            | "will-change"
+            | "translate"
+            | "scale"
+            | "rotate"
+    ) || [
+        "margin",
+        "padding",
+        "animation",
+        "transition",
+        "background",
+        "border",
+        "flex",
+        "grid",
+        "outline",
+        "align-",
+        "justify-",
+    ]
+    .iter()
+    .any(|prefix| property.starts_with(prefix))
+        && !property.starts_with("border-collapse")
+        && !property.starts_with("border-spacing")
+}
 
 /// Parent-style equality with Blink's pointer fast path: styles produced by
 /// the same cache entry are the same allocation.
@@ -790,6 +846,11 @@ pub struct Document {
     style_for_memo: RefCell<StyleForMemo>,
     matched_properties_cache: RefCell<MatchedPropertiesCache>,
     style_write_epoch: u64,
+    /// MatchedPropertiesCache epoch. Inline declarations are part of the MPC
+    /// key, so an inline edit never makes an entry wrong; edits that change
+    /// what descendants inherit still flush it so stale parent slots do not
+    /// pile up deep-compare misses.
+    mpc_epoch: u64,
     /// Sibling selector contexts are rebuilt for every node during a tree walk.
     /// Caching one pass, and skipping the sibling chain when no rule needs it,
     /// keeps that walk linear.
@@ -889,6 +950,7 @@ impl Document {
             self.minimum_logical_font_size = logical;
             self.computed_style_cache.borrow_mut().clear();
             self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+            self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
         }
     }
 
@@ -910,6 +972,7 @@ impl Document {
         self.normal_line_height_provider = Some((provider, revision));
         self.computed_style_cache.borrow_mut().clear();
         self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+        self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
     }
 
     /// Query host-decoded CSS images when lowering generated marker content.
@@ -955,6 +1018,7 @@ impl Document {
             style_for_memo: RefCell::new(StyleForMemo::default()),
             matched_properties_cache: RefCell::new(MatchedPropertiesCache::default()),
             style_write_epoch: 0,
+            mpc_epoch: 0,
             selector_context_cache: RefCell::new(SelectorContextCache {
                 style_clock: 0,
                 stylesheet_generation: 0,
@@ -2043,6 +2107,22 @@ impl Document {
 
     pub fn get_style_mut(&mut self, id: NodeId) -> &mut CSSStyleDeclaration {
         self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+        self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
+        Arc::make_mut(&mut self.styles[id.0 as usize])
+    }
+
+    /// `get_style_mut` for a write of one property. A known non-inherited
+    /// property cannot change any descendant's inherited input, so the
+    /// MatchedPropertiesCache (keyed by inline content) survives it.
+    pub fn get_style_mut_for_property(
+        &mut self,
+        id: NodeId,
+        property: &str,
+    ) -> &mut CSSStyleDeclaration {
+        self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+        if !is_known_non_inherited_property(property) {
+            self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
+        }
         Arc::make_mut(&mut self.styles[id.0 as usize])
     }
 
@@ -2860,6 +2940,108 @@ impl Document {
         self.computed_style_impl(id, inherited.map(|style| &**style), inherited)
     }
 
+    /// Animation cascade origin (Blink StyleResolver::ApplyAnimatedStyle with
+    /// the base-computed-style split): the pre-animation base style is
+    /// cascaded and shared through the MatchedPropertiesCache as usual; sampled
+    /// keyframe values from CSS animations and script effects are layered on
+    /// top per element, below `!important` declarations.
+    fn apply_animated_style(
+        &self,
+        id: NodeId,
+        base: SharedStyle,
+        matched_rules: &[u32],
+    ) -> SharedStyle {
+        if base.animation.is_none() && !crate::animation::node_has_script_effects(id.0) {
+            return base;
+        }
+        if self.get_node(id).node_type != NodeType::Element {
+            return base;
+        }
+        let mut declaration = CSSStyleDeclaration {
+            inner: (*base).clone(),
+            inline_declarations: Vec::new(),
+        };
+        let animated =
+            crate::animation::animated_declarations(id.0, base.animation.as_ref(), &|property| {
+                declaration.get_property(property)
+            });
+        if animated.is_empty() {
+            return base;
+        }
+        for (property, value) in &animated {
+            if declaration_value_is_valid(property, value) {
+                declaration.set_property(property, value);
+            }
+        }
+        let inline = &self.styles[id.0 as usize];
+        let inline_important = inline
+            .inline_declarations
+            .iter()
+            .filter_map(|(property, raw)| {
+                let (value, important) = stylesheet::declaration_value_and_importance(raw);
+                important.then(|| (property.clone(), value.to_string()))
+            });
+        let important: Vec<(String, String)> =
+            stylesheet::important_declarations_for_rules(matched_rules)
+                .into_iter()
+                .chain(inline_important)
+                .collect();
+        for (property, value) in important {
+            if animated
+                .iter()
+                .any(|(name, _)| css_property_eq(name, &property))
+            {
+                declaration.set_property(&property, &value);
+            }
+        }
+        SharedStyle::new(declaration.inner)
+    }
+
+    /// Matched rule indices for an element, memoized until selector matching
+    /// can change (Blink's cached MatchResult).
+    fn cached_matched_rules(&self, id: NodeId, stylesheet_generation: u64) -> Vec<u32> {
+        let index = id.0 as usize;
+        let cached = self
+            .matched_rules_cache
+            .borrow()
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|(clock, generation, _)| {
+                *clock == self.last_match_change && *generation == stylesheet_generation
+            })
+            .map(|(_, _, rules)| rules.clone());
+        if let Some(rules) = cached {
+            return rules;
+        }
+        let rules = stylesheet::matching_rule_indices_for_node(self, id);
+        let mut cache = self.matched_rules_cache.borrow_mut();
+        if cache.len() <= index {
+            cache.resize(index + 1, None);
+        }
+        cache[index] = Some((self.last_match_change, stylesheet_generation, rules.clone()));
+        rules
+    }
+
+    /// Whether a style edit on `id` can start a CSS transition: only a
+    /// matched rule, a pseudo-element rule or the inline style can give the
+    /// element (or its pseudos) a `transition` (it is not inherited).
+    pub fn may_start_transition(&self, id: NodeId) -> bool {
+        if self.inline_declares_transition(id) {
+            return true;
+        }
+        if !stylesheet::has_transition_rules() {
+            return false;
+        }
+        if stylesheet::pseudo_rules_declare_transition() {
+            return true;
+        }
+        if self.get_node(id).node_type != NodeType::Element {
+            return false;
+        }
+        let rules = self.cached_matched_rules(id, stylesheet::generation());
+        stylesheet::rules_declare_transition(&rules)
+    }
+
     fn computed_style_impl(
         &self,
         id: NodeId,
@@ -2889,29 +3071,7 @@ impl Document {
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched_rules = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            let index = id.0 as usize;
-            let cached = self
-                .matched_rules_cache
-                .borrow()
-                .get(index)
-                .and_then(Option::as_ref)
-                .filter(|(clock, generation, _)| {
-                    *clock == self.last_match_change && *generation == stylesheet_generation
-                })
-                .map(|(_, _, rules)| rules.clone());
-            match cached {
-                Some(rules) => rules,
-                None => {
-                    let rules = stylesheet::matching_rule_indices_for_node(self, id);
-                    let mut cache = self.matched_rules_cache.borrow_mut();
-                    if cache.len() <= index {
-                        cache.resize(index + 1, None);
-                    }
-                    cache[index] =
-                        Some((self.last_match_change, stylesheet_generation, rules.clone()));
-                    rules
-                }
-            }
+            self.cached_matched_rules(id, stylesheet_generation)
         } else {
             Vec::new()
         };
@@ -2919,10 +3079,11 @@ impl Document {
         if let Some(key) = &mpc_key
             && let Some((parent, style)) = self.matched_properties_cache.borrow_mut().get(
                 key,
-                (stylesheet_generation, self.style_write_epoch),
+                (stylesheet_generation, self.mpc_epoch),
                 inherited,
             )
         {
+            let style = self.apply_animated_style(id, style, &matched_rules);
             self.computed_style_cache.borrow_mut().insert(
                 id,
                 CachedComputedStyle {
@@ -4875,11 +5036,12 @@ impl Document {
         if let Some(key) = mpc_key {
             self.matched_properties_cache.borrow_mut().insert(
                 key,
-                (stylesheet_generation, self.style_write_epoch),
+                (stylesheet_generation, self.mpc_epoch),
                 inherited_style.as_ref(),
                 &style,
             );
         }
+        let style = self.apply_animated_style(id, style, &matched_rules);
         self.computed_style_cache.borrow_mut().insert(
             id,
             CachedComputedStyle {
@@ -4925,6 +5087,7 @@ impl Document {
                 tag: node.tag.as_u32(),
                 attributes: Vec::new(),
                 matched: Vec::new(),
+                inline: Vec::new(),
             });
         }
         if node.node_type != NodeType::Element
@@ -4936,9 +5099,8 @@ impl Document {
             // which declarations matched, and the key is those declarations
             // (Blink's MPC is keyed the same way). :has() stays conservative.
             || stylesheet::has_relational_dependencies()
-            // Inline style edits and per-tag UA rules that look at
-            // ancestors (nested lists, table hints, form controls) opt out.
-            || !Arc::ptr_eq(inline, &shared_ua_style(node.tag))
+            // Per-tag UA rules that look at ancestors (nested lists, table
+            // hints, form controls) opt out.
             || !matches!(
                 node.tag.as_static(),
                 "span" | "strong" | "em" | "b" | "i" | "u" | "s" | "code" | "a" | "p"
@@ -4957,6 +5119,11 @@ impl Document {
                 .map(|(name, value)| (name.as_u32(), value.as_str()))
                 .collect(),
             matched: matched.to_vec(),
+            inline: if Arc::ptr_eq(inline, &shared_ua_style(node.tag)) {
+                Vec::new()
+            } else {
+                inline.inline_declarations.clone()
+            },
         })
     }
 

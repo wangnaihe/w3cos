@@ -1,3 +1,4 @@
+pub mod animation;
 pub mod atom;
 pub mod canvas;
 pub mod css_style;
