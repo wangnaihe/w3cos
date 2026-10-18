@@ -784,6 +784,12 @@ fn build_batch(
         if output.status.success() {
             let bin = dir.join("t262-batch");
             let _ = std::fs::copy(target.join("debug/t262-batch"), &bin);
+            // Generated sources run to ~100 MB per batch; a full run would
+            // otherwise fill a CI runner's disk. W3COS_T262_KEEP=1 keeps them.
+            if std::env::var_os("W3COS_T262_KEEP").is_none() {
+                let _ = std::fs::remove_file(&code_path);
+                let _ = std::fs::remove_file(dir.join("src/main.rs"));
+            }
             return Some((bin, members));
         }
         // Map rustc errors back to modules (tests) by line.
@@ -1134,6 +1140,9 @@ fn main() {
                                 });
                             }
                         });
+                        if std::env::var_os("W3COS_T262_KEEP").is_none() {
+                            let _ = std::fs::remove_file(&bin);
+                        }
                     }
                     let done = done_batches.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
