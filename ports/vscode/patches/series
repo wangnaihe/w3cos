@@ -1,0 +1,2 @@
+# Applied in order on top of tools/vscode-baseline/CODE_OSS.lock.json (`vscode-patches.sh apply`).
+# Each patch carries a 'W3cos-Upstream: yes|no' trailer (yes = should be sent to microsoft/vscode).
