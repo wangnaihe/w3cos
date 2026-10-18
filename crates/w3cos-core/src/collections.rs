@@ -27,7 +27,10 @@
 //! - `entries()` / `keys()` / `values()` return plain **arrays**, not
 //!   iterator objects — `next()`-style iterator protocol is not supported.
 //!   `for … of` and spread still work because they lower to `Value::iter`.
-//! - The id registry never reclaims ids of dropped instances.
+//! - Registry ids are the instance's weak identity (`watch_id`): when the
+//!   instance dies, [`crate::weak`] drops its backing store at the next job
+//!   checkpoint (before this, every Map/Set store and its values leaked).
+//!   `clear()` / `delete()` keep tombstones (and their values) until then.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -64,31 +67,59 @@ thread_local! {
         RefCell::new(HashMap::new());
     static SET_STATES: RefCell<HashMap<u64, Rc<RefCell<SetValues>>>> =
         RefCell::new(HashMap::new());
-    static NEXT_COLLECTION_ID: Cell<u64> = const { Cell::new(1) };
     /// Class-value singletons (built once per thread so prototype identity —
     /// and therefore `instanceof` — is stable across references).
     static MAP_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static SET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
-fn next_id() -> u64 {
-    NEXT_COLLECTION_ID.with(|counter| {
-        let id = counter.get();
-        counter.set(id + 1);
-        id
-    })
+/// Registry id of a new instance: its weak identity, so the instance's
+/// death notice releases the backing store (see [`take_dead_stores`]).
+fn instance_id(instance: &Value) -> u64 {
+    instance
+        .as_object()
+        .map(|object| object.borrow().heap_allocation().watch_id())
+        .unwrap_or_else(crate::weak::next_watch_id)
 }
 
-fn register_map(entries: Rc<RefCell<MapEntries>>) -> u64 {
-    let id = next_id();
+fn register_map(instance: &Value, entries: Rc<RefCell<MapEntries>>) -> u64 {
+    let id = instance_id(instance);
     MAP_STATES.with(|registry| registry.borrow_mut().insert(id, entries));
     id
 }
 
-fn register_set(values: Rc<RefCell<SetValues>>) -> u64 {
-    let id = next_id();
+fn register_set(instance: &Value, values: Rc<RefCell<SetValues>>) -> u64 {
+    let id = instance_id(instance);
     SET_STATES.with(|registry| registry.borrow_mut().insert(id, values));
     id
+}
+
+/// Remove the backing stores of dead instances. The caller drops `garbage`
+/// after every registry borrow is released (values may run destructors that
+/// post further deaths).
+pub(crate) fn take_dead_stores(deaths: &[u64], garbage: &mut Vec<Box<dyn std::any::Any>>) {
+    MAP_STATES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if registry.is_empty() {
+            return;
+        }
+        for id in deaths {
+            if let Some(store) = registry.remove(id) {
+                garbage.push(Box::new(store));
+            }
+        }
+    });
+    SET_STATES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if registry.is_empty() {
+            return;
+        }
+        for id in deaths {
+            if let Some(store) = registry.remove(id) {
+                garbage.push(Box::new(store));
+            }
+        }
+    });
 }
 
 /// The shared entries behind `value`, when `value` is one of our Maps.
@@ -148,7 +179,7 @@ fn map_instance(args: &[Value], proto: &Value) -> Value {
     crate::class::set_prototype_of(&map, proto);
     map.set_property(
         MAP_STATE_KEY,
-        Value::Number(register_map(entries.clone()) as f64),
+        Value::Number(register_map(&map, entries.clone()) as f64),
     );
     match args.first() {
         None => {}
@@ -332,7 +363,7 @@ fn set_instance(args: &[Value], proto: &Value) -> Value {
     crate::class::set_prototype_of(&set, proto);
     set.set_property(
         SET_STATE_KEY,
-        Value::Number(register_set(values.clone()) as f64),
+        Value::Number(register_set(&set, values.clone()) as f64),
     );
     match args.first() {
         None => {}
@@ -692,6 +723,31 @@ mod tests {
 
     fn pair(key: Value, value: Value) -> Value {
         Value::array(vec![key, value])
+    }
+
+    #[test]
+    fn dead_map_and_set_release_their_backing_stores() {
+        // Regression: the id registry used to hold every store (and all of
+        // its keys and values) forever.
+        crate::promise::drain_microtasks();
+        let live = || crate::page_arena::live_objects();
+        let mut base = None;
+        for _ in 0..3 {
+            {
+                let map = new_map(vec![]);
+                let set = new_set(vec![]);
+                for i in 0..10 {
+                    let value =
+                        Value::object(HashMap::from([("i".to_string(), Value::Number(i as f64))]));
+                    map.call_method("set", vec![Value::Number(i as f64), value.clone()]);
+                    set.call_method("add", vec![value]);
+                }
+                map.call_method("clear", vec![]);
+            }
+            crate::promise::drain_microtasks();
+            let base = *base.get_or_insert_with(live);
+            assert_eq!(live(), base, "map, set and their values are freed");
+        }
     }
 
     // ── same_value_zero ──────────────────────────────────────────────────

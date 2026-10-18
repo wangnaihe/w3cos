@@ -254,12 +254,15 @@ fn process_deaths() {
         }
         let mut garbage = Vec::new();
         let mut pending = VecDeque::new();
+        let mut stores = Vec::new();
+        crate::collections::take_dead_stores(&deaths, &mut stores);
         TABLES.with(|tables| {
             let mut tables = tables.borrow_mut();
             for id in deaths {
                 tables.on_death(id, &mut garbage, &mut pending);
             }
         });
+        drop(stores);
         if !pending.is_empty() {
             PENDING.with(|queue| queue.borrow_mut().extend(pending));
         }
