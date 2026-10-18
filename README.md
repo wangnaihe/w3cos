@@ -48,6 +48,10 @@ the formal downstream application gates remain open. See the
 
 ## Quick Start
 
+W3COS is not on npm yet; build it from source. The planned `npx w3cos` /
+`npm create w3cos` distribution is described in
+[docs/NPM_TOOLCHAIN.md](docs/NPM_TOOLCHAIN.md).
+
 ```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
