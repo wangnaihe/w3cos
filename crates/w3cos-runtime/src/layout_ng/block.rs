@@ -169,7 +169,10 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             if !inline::in_inline_container(flat, index) {
                 Some("ifc:mixed")
             } else {
-                unsupported_marker(info.style, &[inline::LINE_WIDTH_MARKER])
+                unsupported_marker(
+                    info.style,
+                    &[inline::LINE_WIDTH_MARKER, inline::VALIGN_MARKER],
+                )
             }
         }
         ComponentKind::Image { .. } => Some("image"),

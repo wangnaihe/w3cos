@@ -55,6 +55,40 @@ const QUIRKS_MARKER: &str = "--w3cos-internal-quirks-mode";
 /// A `<br>` the cascade keeps as its own leaf (Blink NGInlineItem kControl).
 const FORCED_BREAK: &str = "\u{2028}";
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
+/// `vertical-align: top | text-top | bottom | text-bottom` (the cascade
+/// maps them to align-self start/end and keeps the keyword here).
+pub(super) const VALIGN_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
+
+/// `vertical-align: top` (Some(true)) or `bottom` (Some(false)): the box's
+/// aligned subtree is placed against the line box edge (CSS 2.1 10.8.1).
+fn line_relative_align(style: &Style) -> Option<bool> {
+    match style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(VALIGN_MARKER))
+        .map(String::as_str)
+    {
+        Some("top") => Some(true),
+        Some("bottom") => Some(false),
+        _ => None,
+    }
+}
+
+/// Why the item's/box's vertical-align is outside S2: baseline, or top /
+/// bottom of the line box.
+fn valign_reason(style: &Style) -> Option<&'static str> {
+    use w3cos_std::style::AlignSelf;
+    let marker = style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(VALIGN_MARKER));
+    match (marker.map(String::as_str), style.align_self) {
+        (None, AlignSelf::Auto | AlignSelf::Baseline) => None,
+        (Some("top"), AlignSelf::FlexStart) | (Some("bottom"), AlignSelf::FlexEnd) => None,
+        (Some(_), _) => Some("vertical-align-keyword"),
+        _ => Some("vertical-align"),
+    }
+}
 
 fn zero_edges(style: &Style) -> bool {
     let padding = style.padding_lengths();
@@ -249,11 +283,11 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
     } else {
         // vertical-align (middle maps to align-self; the other keywords and
         // lengths carry markers the marker gate rejects).
-        if !matches!(
-            style.align_self,
-            w3cos_std::style::AlignSelf::Auto | w3cos_std::style::AlignSelf::Baseline
-        ) {
-            return Some("vertical-align");
+        if let Some(reason) = valign_reason(style) {
+            return Some(reason);
+        }
+        if sole && line_relative_align(style).is_some() {
+            return Some("vertical-align-keyword");
         }
         // break-all / overflow-wrap add emergency breaks inside an item.
         if !matches!(
@@ -359,7 +393,7 @@ fn inline_box_reason(
         return None;
     };
     let style = flat[index].style;
-    if super::block::unsupported_marker(style, &[]).is_some() {
+    if super::block::unsupported_marker(style, &[VALIGN_MARKER]).is_some() {
         return Some("internal-marker");
     }
     if style.position != Position::Static || style.float != Float::None {
@@ -371,11 +405,8 @@ fn inline_box_reason(
     if style.white_space != container.white_space {
         return Some("text:white-space");
     }
-    if !matches!(
-        style.align_self,
-        w3cos_std::style::AlignSelf::Auto | w3cos_std::style::AlignSelf::Baseline
-    ) {
-        return Some("vertical-align");
+    if let Some(reason) = valign_reason(style) {
+        return Some(reason);
     }
     let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
     let m = style.margin_lengths();
@@ -464,18 +495,35 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     let entries = collect_inlines(flat, index);
     let sole = matches!(entries[..], [InlineEntry::Leaf(_)]);
+    // Open inline boxes; a top/bottom-aligned subtree must not contain
+    // another one (one level of line-relative alignment).
+    let mut open: Vec<usize> = Vec::new();
     for (position, &entry) in entries.iter().enumerate() {
         let child = match entry {
-            InlineEntry::Open(_) => {
+            InlineEntry::Open(b) => {
                 if let Some(reason) = inline_box_reason(flat, &entries[position..], style) {
                     return Some(reason);
                 }
+                if line_relative_align(flat[b].style).is_some()
+                    && open
+                        .iter()
+                        .any(|&o| line_relative_align(flat[o].style).is_some())
+                {
+                    return Some("vertical-align-nested");
+                }
+                open.push(b);
                 continue;
             }
-            InlineEntry::Close(_) => continue,
+            InlineEntry::Close(_) => {
+                open.pop();
+                continue;
+            }
             InlineEntry::Leaf(child) => child,
         };
         let info = &flat[child];
+        if line_relative_align(info.style).is_some() && !open.is_empty() {
+            return Some("vertical-align-nested");
+        }
         let ComponentKind::Text { content } = info.kind else {
             return Some("ifc:atomic-or-span");
         };
@@ -549,6 +597,9 @@ struct InlineItem {
     /// kOpenTag/kCloseTag advances).
     box_start: f32,
     box_end: f32,
+    /// Root of the top/bottom-aligned subtree holding this item (flat index
+    /// of the aligned box or item, and whether it is `top`).
+    aligned: Option<(usize, bool)>,
     /// A soft-wrap opportunity inside the item's non-space core: NG keeps
     /// one fragment per item, so a line that needs it falls back.
     internal_break: bool,
@@ -662,6 +713,9 @@ struct Line {
     width: f32,
     ascent: f32,
     descent: f32,
+    /// Top/bottom-aligned subtrees on the line: (root, top, ascent,
+    /// descent) relative to the subtree's own baseline.
+    subtrees: Vec<(usize, bool, f32, f32)>,
 }
 
 fn align_offset(style: &Style, free: f32) -> f32 {
@@ -756,14 +810,23 @@ pub(super) fn layout_inline(
     // (inner first).
     let mut opens: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
     let mut closes: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
+    let mut aligned: Vec<Option<(usize, bool)>> = vec![None; children.len()];
     {
         let mut leaf = 0;
         let mut pending = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
         for entry in &entries {
             match *entry {
-                InlineEntry::Open(b) => pending.push(b),
-                InlineEntry::Leaf(_) => {
+                InlineEntry::Open(b) => {
+                    pending.push(b);
+                    stack.push(b);
+                }
+                InlineEntry::Leaf(c) => {
                     opens[leaf] = std::mem::take(&mut pending);
+                    aligned[leaf] = stack
+                        .iter()
+                        .chain(std::iter::once(&c))
+                        .find_map(|&n| line_relative_align(flat[n].style).map(|top| (n, top)));
                     leaf += 1;
                 }
                 InlineEntry::Close(b) => {
@@ -771,6 +834,7 @@ pub(super) fn layout_inline(
                         return None;
                     }
                     closes[leaf - 1].push(b);
+                    stack.pop();
                 }
             }
         }
@@ -960,6 +1024,7 @@ pub(super) fn layout_inline(
                 edges,
                 box_start,
                 box_end,
+                aligned: aligned[k],
                 // Preserved leading spaces (pre-wrap) end in an opportunity
                 // inside the item too; collapsible ones vanish at a line start.
                 internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char)
@@ -1070,6 +1135,7 @@ pub(super) fn layout_inline(
         }
         let mut ascent = strut_ascent;
         let mut descent = strut_descent;
+        let mut subtrees: Vec<(usize, bool, f32, f32)> = Vec::new();
         let mut placed = Vec::with_capacity(line.len());
         let mut slice_start = 0.0f32;
         let mut slice = 0.0f32;
@@ -1094,8 +1160,21 @@ pub(super) fn layout_inline(
                 advance
             };
             placed.push((k, x, width));
-            ascent = ascent.max(item.ascent);
-            descent = descent.max(item.descent);
+            if let Some((root, top)) = item.aligned {
+                match subtrees
+                    .iter_mut()
+                    .find(|s: &&mut (usize, bool, f32, f32)| s.0 == root)
+                {
+                    Some(s) => {
+                        s.2 = s.2.max(item.ascent);
+                        s.3 = s.3.max(item.descent);
+                    }
+                    None => subtrees.push((root, top, item.ascent, item.descent)),
+                }
+            } else {
+                ascent = ascent.max(item.ascent);
+                descent = descent.max(item.descent);
+            }
         }
         let content_width = if hang_preserved {
             line_width(&items, &line)
@@ -1116,11 +1195,30 @@ pub(super) fn layout_inline(
         } else {
             content_width
         };
+        // NGInlineLayoutStateStack: top/bottom subtrees are aligned after
+        // the baseline-aligned part; a taller one grows the line box away
+        // from the edge it is aligned to.
+        if ascent == f32::NEG_INFINITY {
+            // (Quirks, nothing baseline-aligned.)
+            ascent = 0.0;
+            descent = 0.0;
+        }
+        for &(_, top, a, d) in &subtrees {
+            let extra = (a + d) - (ascent + descent);
+            if extra > 0.0 {
+                if top {
+                    descent += extra;
+                } else {
+                    ascent += extra;
+                }
+            }
+        }
         built.push(Line {
             items: placed,
             width: align_width,
             ascent,
             descent,
+            subtrees,
         });
     }
 
@@ -1133,6 +1231,17 @@ pub(super) fn layout_inline(
         let baseline = top + line.ascent;
         for (k, x, width) in line.items {
             let item = &items[k];
+            let baseline = match item.aligned {
+                None => baseline,
+                Some((root, _)) => {
+                    let &(_, top_aligned, a, d) = line.subtrees.iter().find(|s| s.0 == root)?;
+                    if top_aligned {
+                        top + a
+                    } else {
+                        top + line.ascent + line.descent - d
+                    }
+                }
+            };
             if item.forced {
                 // The engine's <br> marker: a zero-height full-width rect at
                 // the line end, painting nothing.

@@ -1016,3 +1016,143 @@ fn nested_inline_boxes_share_the_baseline() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// `vertical-align: top | bottom` (CSS 2.1 10.8.1, Blink
+/// NGInlineLayoutStateStack): the aligned subtree (box or item plus its
+/// baseline-aligned descendants) is placed against the line box edge and
+/// grows the line away from it when taller.  Rects from Chrome (Ahem):
+///   <div>AA <span top fs40 lh1>BB</span> CC</div>
+///   <div>AA <span bottom fs10 lh50px>BB <span fs30 lh1>CC</span></span> DD</div>
+///   <div>AA <span top fs10 lh1>bb</span> CC <span fs40 lh1>DD</span></div>
+///   <div>X <span top><span fs80>A</span> x</span></div>
+#[test]
+fn line_relative_vertical_align_places_subtrees() {
+    let _ahem = AhemGuard::new();
+    let container = || {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let styled = |size: f32, lh: LineHeight, valign: Option<&str>| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, size, lh);
+        if let Some(keyword) = valign {
+            style.align_self = if keyword == "top" {
+                w3cos_std::style::AlignSelf::FlexStart
+            } else {
+                w3cos_std::style::AlignSelf::FlexEnd
+            };
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(inline::VALIGN_MARKER.into(), keyword.into());
+        }
+        style
+    };
+    let n1 = LineHeight::Number(1.0);
+    let text =
+        |content: &str, size: f32, lh: LineHeight| Component::text(content, styled(size, lh, None));
+    let lh50 = LineHeight::Px(50.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA ", 20.0, n1),
+                    Component::boxed(styled(40.0, n1, Some("top")), vec![text("BB", 40.0, n1)]),
+                    text(" CC", 20.0, n1),
+                ],
+            ),
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA ", 20.0, n1),
+                    Component::boxed(
+                        styled(10.0, lh50, Some("bottom")),
+                        vec![
+                            text("BB ", 10.0, lh50),
+                            Component::boxed(styled(30.0, n1, None), vec![text("CC", 30.0, n1)]),
+                        ],
+                    ),
+                    text(" DD", 20.0, n1),
+                ],
+            ),
+            Component::boxed(
+                container(),
+                vec![
+                    text("AA ", 20.0, n1),
+                    Component::text("bb", styled(10.0, n1, Some("top"))),
+                    text(" CC ", 20.0, n1),
+                    text("DD", 40.0, n1),
+                ],
+            ),
+            Component::boxed(
+                container(),
+                vec![
+                    text("X ", 20.0, n1),
+                    Component::boxed(
+                        styled(20.0, n1, Some("top")),
+                        vec![
+                            Component::boxed(styled(80.0, n1, None), vec![text("A", 80.0, n1)]),
+                            text(" x", 20.0, n1),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 23] = [
+        (1, [0.0, 0.0, 300.0, 40.0]),
+        (2, [0.0, 0.0, 60.0, 20.0]),
+        (3, [60.0, 0.0, 80.0, 40.0]),
+        (4, [60.0, 0.0, 80.0, 40.0]),
+        (5, [140.0, 0.0, 60.0, 20.0]),
+        (6, [0.0, 40.0, 300.0, 50.0]),
+        (7, [0.0, 70.0, 60.0, 20.0]),
+        (8, [60.0, 60.0, 90.0, 10.0]),
+        (9, [60.0, 60.0, 30.0, 10.0]),
+        (10, [90.0, 44.0, 60.0, 30.0]),
+        (11, [90.0, 44.0, 60.0, 30.0]),
+        (12, [150.0, 70.0, 60.0, 20.0]),
+        (13, [0.0, 90.0, 300.0, 40.0]),
+        (14, [0.0, 106.0, 60.0, 20.0]),
+        (15, [60.0, 90.0, 20.0, 10.0]),
+        (16, [80.0, 106.0, 80.0, 20.0]),
+        (17, [160.0, 90.0, 80.0, 40.0]),
+        (18, [0.0, 130.0, 300.0, 80.0]),
+        (19, [0.0, 130.0, 40.0, 20.0]),
+        (20, [40.0, 178.0, 120.0, 20.0]),
+        (21, [40.0, 130.0, 80.0, 80.0]),
+        (22, [40.0, 130.0, 80.0, 80.0]),
+        (23, [120.0, 178.0, 40.0, 20.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
