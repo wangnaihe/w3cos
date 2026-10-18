@@ -5509,6 +5509,144 @@ fn main() {
     }
 
     #[test]
+    fn generated_bundle_borrowed_binding_reads_stay_correct() {
+        // Variable-read borrow: a private local's read is folded into its
+        // consumer (no counted clone). Writes to the same binding in the same
+        // expression, closure writes, awaits, TDZ errors under try/catch and
+        // getters must all behave as with an ordinary load.
+        let root = fixture_root("w3cos_esm_codegen_binding_borrow");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"class Vec2 {
+  x: number;
+  y: number;
+  constructor(x: number, y: number) { this.x = x; this.y = y; }
+  add(o: Vec2): Vec2 { return new Vec2(this.x + o.x, this.y + o.y); }
+}
+let asyncResult = 0;
+export function reassignInExpr(): number {
+  let o: any = { v: 1 };
+  const r = o.v + (o = { v: 10 }).v + o.v;
+  return r;
+}
+export function closureWrites(): number {
+  let o: any = { v: 1 };
+  const f = () => { o = { v: 5 }; return 0; };
+  return o.v + f() + o.v;
+}
+export function getterReads(): number {
+  let calls = 0;
+  const o: any = { get x() { calls++; return 7; } };
+  const a = o.x;
+  return a + o.x + calls;
+}
+export function tdzUnderTry(): number {
+  try {
+    return (x as any).v;
+  } catch (e) {
+    return -1;
+  }
+  let x: any = { v: 1 };
+}
+export function forOfSum(n: number): number {
+  const items: any[] = [];
+  for (let i = 0; i < n; i++) items.push({ pos: new Vec2(i, 1) });
+  let acc = new Vec2(0, 0);
+  for (const it of items) acc = acc.add(it.pos);
+  return acc.x + acc.y;
+}
+export function methodOnLocal(): number {
+  const xs: number[] = [3, 1, 2];
+  const s = xs.slice();
+  s.sort();
+  return xs[0] * 100 + s[0] * 10 + s.length;
+}
+async function holdAcrossAwait(): Promise<number> {
+  let o: any = { w: 9 };
+  await null;
+  const v = o.w;
+  o = { w: 1 };
+  await null;
+  return v + o.w;
+}
+export function asyncRun(): number {
+  holdAcrossAwait().then((v: number) => { asyncResult = v; });
+  return 0;
+}
+export function getAsync(): number {
+  return asyncResult;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("(&__w3cos_bound_"),
+            "private binding reads are borrowed in place:\n{code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::{page_arena, Value};
+    let _ = run_entry();
+    let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
+    let n = |v: Value| v.to_number();
+    let check = || {
+        assert_eq!(n(m0::m0_reassignInExpr(vec![])), 21.0, "read, then reassign in the same expression");
+        assert_eq!(n(m0::m0_closureWrites(vec![])), 6.0, "closure write between two reads");
+        assert_eq!(n(m0::m0_getterReads(vec![])), 16.0, "getter on a borrowed receiver");
+        assert_eq!(n(m0::m0_tdzUnderTry(vec![])), -1.0, "TDZ read inside try is caught");
+        assert_eq!(n(m0::m0_forOfSum(vec![Value::Number(10.0)])), 55.0, "for...of body with exception target");
+        assert_eq!(n(m0::m0_methodOnLocal(vec![])), 313.0, "method calls on borrowed locals");
+    };
+    check();
+    let base = live();
+    for _ in 0..50 {
+        check();
+    }
+    assert_eq!(live(), base, "borrowed reads neither leak nor free early: {base} -> {}", live());
+    let _ = m0::m0_asyncRun(vec![]);
+    w3cos_core::promise::drain_microtasks();
+    assert_eq!(n(m0::m0_getAsync(vec![])), 10.0, "values read across await");
+    println!("W3COS_BINDING_BORROW_E2E_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("W3COS_BINDING_BORROW_E2E_OK"),
+            "binding borrow bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn generated_bundle_runs_jsdom_globals() {
         let root = fixture_root("w3cos_esm_codegen_globals_jsdom");
         std::fs::create_dir_all(root.join("src")).unwrap();
