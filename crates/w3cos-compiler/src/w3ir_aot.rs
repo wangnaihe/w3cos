@@ -2994,10 +2994,11 @@ pub fn {rust_name}(
             frame.borrow_mut().resume(kind, input)
         }}));
     }}
-    let iterable = generator.clone();
+    // `[Symbol.iterator]()` returns its receiver; capturing `generator`
+    // here would form an uncollectable generator -> function -> generator cycle.
     generator.set_property(
         "__w3cos_symbol_iterator",
-        w3cos_core::Value::function(move |_, _| iterable.clone()),
+        w3cos_core::Value::function(|this, _| this),
     );
     generator
 }}
@@ -3619,10 +3620,10 @@ pub fn {rust_name}(
             {type_name}::enqueue(std::rc::Rc::clone(&frame), kind, input)
         }}));
     }}
-    let iterable = generator.clone();
+    // Return the receiver; capturing `generator` would form a cycle.
     generator.set_property(
         "__w3cos_symbol_async_iterator",
-        w3cos_core::Value::function(move |_, _| iterable.clone()),
+        w3cos_core::Value::function(|this, _| this),
     );
     generator
 }}
