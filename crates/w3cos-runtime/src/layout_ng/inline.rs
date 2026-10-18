@@ -120,7 +120,8 @@ fn latin1(content: &str) -> bool {
         // Control characters (form feed, C1) have their own rendering
         // and breaking rules; legacy handles them.
         let control = c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c);
-        ((c as u32) < 0x100 && !control) || matches!(c, '\u{2028}' | '\u{2029}')
+        // (Newlines are gated by the content checks.)
+        ((c as u32) < 0x100 && !control) || matches!(c, '\n' | '\u{2028}' | '\u{2029}')
     })
 }
 
@@ -161,7 +162,20 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
     if !zero_edges(style) {
         return Some("text:edges");
     }
-    if content.is_empty() || content.contains(['\n', '\r', '\t']) {
+    // Preserved newlines (CSS Text 3 4.1.1) in a sole leaf: paint breaks
+    // the lines; a trailing one only through the paragraph wrapper.
+    let newline_ok = sole
+        && match style.white_space {
+            WhiteSpace::PreLine => has_marker(style, LINE_WIDTH_MARKER),
+            WhiteSpace::Pre | WhiteSpace::PreWrap => {
+                has_marker(style, LINE_WIDTH_MARKER) || !content.ends_with('\n')
+            }
+            _ => false,
+        };
+    if content.is_empty()
+        || content.contains(['\r', '\t'])
+        || (content.contains('\n') && !newline_ok)
+    {
         return Some("text:content");
     }
     if !latin1(content) {
@@ -473,7 +487,7 @@ fn paragraph_height(
     let (line, baseline) = text_line_metrics(content, style);
     let ascent = strut_ascent.max(baseline);
     let single_height = ascent + strut_descent.max(line - baseline);
-    let forced = content.contains(['\u{2028}', '\u{2029}']);
+    let forced = has_forced_break(content, style);
     let fits = matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre)
         || text_intrinsic_size(content, style).0 <= width + EPSILON;
     if !forced && fits {
@@ -486,6 +500,17 @@ fn paragraph_height(
     } else {
         (wrapped, false, 0.0)
     }
+}
+
+/// A forced line break inside a leaf: a coalesced `<br>` or a preserved
+/// newline.
+fn has_forced_break(content: &str, style: &Style) -> bool {
+    content.contains(['\u{2028}', '\u{2029}'])
+        || (content.contains('\n')
+            && matches!(
+                style.white_space,
+                WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+            ))
 }
 
 /// Content height of a block-level text leaf of content width `width`.
@@ -523,7 +548,7 @@ pub(super) fn layout_inline(
             // Paint steps forced (U+2028, a coalesced <br>) lines itself
             // from the first line's content box; soft-wrapped paragraphs
             // cover all their lines.
-            let forced = content.contains('\u{2028}');
+            let forced = has_forced_break(content, style);
             (
                 crate::layout::inline_upper_leading(line, font_height),
                 if forced { font_height } else { height },
@@ -538,6 +563,46 @@ pub(super) fn layout_inline(
                     index: child,
                     width: available,
                     height: rect_height,
+                    children: Vec::new(),
+                },
+            )],
+        });
+    }
+
+    // Preserved newlines in a sole pre / pre-wrap leaf: one line per segment
+    // (pre-wrap only when none wraps).  The engine's rect is the first
+    // line's content box, as wide as the widest line and aligned by it.
+    if let [child] = children[..]
+        && let ComponentKind::Text { content } = flat[child].kind
+        && content.contains('\n')
+    {
+        let style = flat[child].style;
+        let width = text_intrinsic_size(content, style).0;
+        if style.white_space == WhiteSpace::PreWrap
+            && content
+                .split('\n')
+                .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
+        {
+            return None;
+        }
+        let (strut_ascent, strut_descent) = if quirks {
+            (f32::NEG_INFINITY, f32::NEG_INFINITY)
+        } else {
+            strut(container)
+        };
+        let (line, baseline) = text_line_metrics(content, style);
+        let ascent = strut_ascent.max(baseline);
+        let single = ascent + strut_descent.max(line - baseline);
+        let lines = content.split('\n').count() as f32;
+        return Some(InlineResult {
+            height: single * lines,
+            children: vec![(
+                align_offset(container, available - width),
+                ascent - inline_font_content_ascent(style),
+                BoxFragment {
+                    index: child,
+                    width,
+                    height: inline_font_height(style),
                     children: Vec::new(),
                 },
             )],

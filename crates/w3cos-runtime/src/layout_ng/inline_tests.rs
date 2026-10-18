@@ -9,10 +9,16 @@ use w3cos_std::style::{Dimension, Display, Edges, Spacing, Style, TextAlign, Whi
 const AHEM_OWNER: u64 = 0x1a70_75ce_a4e1;
 
 /// Registers the pinned WPT Ahem face for the guard's lifetime.
-pub(super) struct AhemGuard;
+/// Registers the Ahem fixture for one test.  Tests holding it run one at a
+/// time: the registry owner is shared, so a guard dropped by a concurrent
+/// test would unregister the font under another.
+pub(super) struct AhemGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+static AHEM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl AhemGuard {
     pub(super) fn new() -> Self {
+        let lock = AHEM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/layout_ng/testdata/Ahem.ttf"
@@ -28,7 +34,7 @@ impl AhemGuard {
                 },
             )
             .expect("register Ahem");
-        AhemGuard
+        AhemGuard(lock)
     }
 }
 
@@ -675,5 +681,62 @@ fn forced_breaks_end_lines() {
     for (index, want) in expected {
         let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
         assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
+    }
+}
+
+/// Preserved newlines (CSS Text 3 4.1.1) in a sole leaf: one line per
+/// segment, an empty segment is an empty line, a trailing newline of a
+/// paragraph leaf adds none.  Container heights from Chrome.
+#[test]
+fn preserved_newlines_make_lines() {
+    let _ahem = AhemGuard::new();
+    let case = |white_space: WhiteSpace, line_height: f32, text: &str, paragraph: bool| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            white_space,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(line_height));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let mut item = Style {
+            display: Display::Inline,
+            white_space,
+            ..Style::default()
+        };
+        font(&mut item, 20.0, LineHeight::Number(line_height));
+        if paragraph {
+            item.custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(inline::LINE_WIDTH_MARKER.into(), "1".into());
+        }
+        Component::boxed(style, vec![Component::text(text, item)])
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            case(WhiteSpace::Pre, 1.0, "X\nYYY", false),
+            case(WhiteSpace::PreWrap, 2.0, "AA BB\nCC", false),
+            case(WhiteSpace::PreLine, 2.0, "AA   BB\nCC\n", true),
+            case(WhiteSpace::Pre, 2.0, "A\n\nB", false),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    for (index, y, height) in [
+        (1, 0.0, 40.0),
+        (3, 40.0, 80.0),
+        (5, 120.0, 80.0),
+        (7, 200.0, 120.0),
+    ] {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        assert_eq!((r.y, r.height), (y, height), "#{index}");
     }
 }
