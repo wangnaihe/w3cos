@@ -86,6 +86,12 @@ fn line_height_css(style: &Style) -> String {
 
 /// One generated case: a block root with IFC containers of Ahem words.
 fn random_case(rng: &mut Rng) -> Component {
+    random_case_with(rng, false)
+}
+
+/// `ext`: white-space pre (preserved, repeated and line-edge spaces) and
+/// multi-word items whose internal opportunities NG must not need.
+fn random_case_with(rng: &mut Rng, ext: bool) -> Component {
     let mut containers = Vec::new();
     for _ in 0..1 + rng.pick(3) {
         // Sizes with an integral 0.8em Ahem ascent: Blink rounds font
@@ -101,10 +107,10 @@ fn random_case(rng: &mut Rng) -> Component {
             display: Display::Block,
             width: Dimension::Px(rng.of(&[40.0, 75.0, 120.0, 200.0, 333.0])),
             text_align: rng.of(&[TextAlign::Start, TextAlign::Center, TextAlign::Right]),
-            white_space: if rng.pick(10) == 0 {
-                WhiteSpace::NoWrap
-            } else {
-                WhiteSpace::Normal
+            white_space: match (ext, rng.pick(10)) {
+                (_, 0) => WhiteSpace::NoWrap,
+                (true, 1..=3) => WhiteSpace::Pre,
+                _ => WhiteSpace::Normal,
             },
             ..Style::default()
         };
@@ -123,7 +129,19 @@ fn random_case(rng: &mut Rng) -> Component {
         let mut items = Vec::new();
         let count = 1 + rng.pick(10);
         for i in 0..count {
-            let mut text = "X".repeat(1 + rng.pick(6) as usize);
+            let pre = style.white_space == WhiteSpace::Pre;
+            let mut text = String::new();
+            if ext && pre && rng.pick(4) == 0 {
+                text.push_str(&" ".repeat(1 + rng.pick(2) as usize));
+            }
+            text.push_str(&"X".repeat(1 + rng.pick(6) as usize));
+            if ext && rng.pick(4) == 0 {
+                for _ in 0..1 + rng.pick(2) {
+                    let gap = if pre { 1 + rng.pick(2) as usize } else { 1 };
+                    text.push_str(&" ".repeat(gap));
+                    text.push_str(&"X".repeat(1 + rng.pick(4) as usize));
+                }
+            }
             let separator = rng.pick(10);
             let last = i + 1 == count;
             if separator < 6 && !last {
@@ -180,7 +198,11 @@ fn case_html(flat: &[crate::layout::FlatNodeInfo]) -> String {
                 TextAlign::Right => "right",
                 _ => "start",
             },
-            if s.white_space == WhiteSpace::NoWrap { "nowrap" } else { "normal" },
+            match s.white_space {
+                WhiteSpace::NoWrap => "nowrap",
+                WhiteSpace::Pre => "pre",
+                _ => "normal",
+            },
         ));
         let end = flat[i].subtree_end;
         for t in i + 1..end {
@@ -266,6 +288,93 @@ fn generated_inline_trees_match_chrome() {
         let flat = pre_flatten(&root);
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         let expected = &golden[&case.to_string()];
+        for (key, want) in expected {
+            let index: usize = key.parse().expect("index");
+            let got = ng
+                .iter()
+                .find(|(_, i)| *i == index)
+                .map(|(r, _)| [r.x, r.y, r.width, r.height].map(|v| (v * 64.0).round() as i64));
+            let ok = match got {
+                Some(got) => got == *want,
+                None => want[2] == 0,
+            };
+            if !ok {
+                failures.push((case, index, got, *want));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} boxes differ from Chrome, first: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+}
+
+const EXT_CASES: usize = 300;
+const EXT_SEED: u64 = 0x5eed_1a70_0115_0003;
+
+/// Extended corpus (pre, multi-word items).  NG may fall back at runtime when
+/// a line would need a break inside an item; the rest must be supported and
+/// are dumped with W3COS_NG_INLINE_EXT_DUMP=path for the Chrome oracle.
+#[test]
+fn generated_inline_ext_trees_are_supported() {
+    let _ahem = AhemGuard::new();
+    let mut rng = Rng(EXT_SEED);
+    let dump = std::env::var_os("W3COS_NG_INLINE_EXT_DUMP");
+    let mut lines = String::new();
+    let mut handled = 0;
+    for case in 0..EXT_CASES {
+        let root = random_case_with(&mut rng, true);
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "case {case}"
+        );
+        let Some(ng) = layout_tree(&root, &flat, 800.0, 600.0) else {
+            continue;
+        };
+        handled += 1;
+        if dump.is_some() {
+            let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+            lines.push_str(&format!(
+                "{{\"case\":{case},\"fonts\":[\"Ahem\"],\"html\":{:?},\"legacy\":{{{}}},\"ng\":{{{}}}}}\n",
+                case_html(&flat),
+                rects_json(&legacy),
+                rects_json(&ng)
+            ));
+        }
+    }
+    assert!(
+        handled * 3 >= EXT_CASES,
+        "NG handled only {handled}/{EXT_CASES}"
+    );
+    if let Some(path) = dump {
+        std::fs::write(path, lines).expect("dump");
+    }
+}
+
+/// Chrome expectations for the extended corpus
+/// (testdata/generated-inline-ext-chrome.json): every case NG lays out
+/// matches, and every golden case is still laid out by NG.
+#[test]
+fn generated_inline_ext_trees_match_chrome() {
+    let golden: std::collections::HashMap<String, std::collections::HashMap<String, [i64; 4]>> =
+        serde_json::from_str(include_str!("testdata/generated-inline-ext-chrome.json"))
+            .expect("golden json");
+    let _ahem = AhemGuard::new();
+    let mut rng = Rng(EXT_SEED);
+    let mut failures = Vec::new();
+    for case in 0..EXT_CASES {
+        let root = random_case_with(&mut rng, true);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0);
+        let Some(expected) = golden.get(&case.to_string()) else {
+            assert!(ng.is_none(), "case {case} has no Chrome golden");
+            continue;
+        };
+        let ng = ng.unwrap_or_else(|| panic!("case {case} fell back"));
         for (key, want) in expected {
             let index: usize = key.parse().expect("index");
             let got = ng

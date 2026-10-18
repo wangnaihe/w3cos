@@ -80,7 +80,12 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
     if style.direction != TextDirection::Ltr {
         return Some("direction");
     }
-    if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
+    // pre without a newline (the content gate) is one preserved, unwrapped
+    // line; pre-wrap / pre-line / break-spaces stay on legacy.
+    if !matches!(
+        style.white_space,
+        WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::Pre
+    ) {
         return Some("text:white-space");
     }
     if style.text_indent != Dimension::Px(0.0) {
@@ -151,12 +156,24 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
             return Some("text:line-width-shared");
         }
     } else {
-        // Word-split items must not need an internal break.
-        let core = content.trim_matches(' ');
-        if core
-            .chars()
-            .any(|c| is_soft_wrap_char(c) || matches!(c, '\u{2028}' | '\u{2029}'))
-        {
+        // vertical-align (middle maps to align-self; the other keywords and
+        // lengths carry markers the marker gate rejects).
+        if !matches!(
+            style.align_self,
+            w3cos_std::style::AlignSelf::Auto | w3cos_std::style::AlignSelf::Baseline
+        ) {
+            return Some("vertical-align");
+        }
+        // break-all / overflow-wrap add emergency breaks inside an item.
+        if !matches!(
+            style.word_break,
+            w3cos_std::style::WordBreak::Normal | w3cos_std::style::WordBreak::KeepAll
+        ) {
+            return Some("text:word-break");
+        }
+        // Items may hold internal soft-wrap opportunities (the breaker falls
+        // back when it would need one), but no forced break.
+        if content.contains(['\u{2028}', '\u{2029}']) {
             return Some("text:internal-break");
         }
     }
@@ -198,7 +215,12 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if style.text_indent != Dimension::Px(0.0) {
         return Some("text:indent");
     }
-    if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
+    // pre without a newline (the content gate) is one preserved, unwrapped
+    // line; pre-wrap / pre-line / break-spaces stay on legacy.
+    if !matches!(
+        style.white_space,
+        WhiteSpace::Normal | WhiteSpace::NoWrap | WhiteSpace::Pre
+    ) {
         return Some("text:white-space");
     }
     let children: Vec<usize> = rendered_children(flat, index).collect();
@@ -257,6 +279,9 @@ struct InlineItem {
     starts_space: bool,
     ends_space: bool,
     whitespace_only: bool,
+    /// A soft-wrap opportunity inside the item's non-space core: NG keeps
+    /// one fragment per item, so a line that needs it falls back.
+    internal_break: bool,
     ascent: f32,
     descent: f32,
     content_ascent: f32,
@@ -380,7 +405,7 @@ fn paragraph_height(
     let ascent = strut_ascent.max(baseline);
     let single_height = ascent + strut_descent.max(line - baseline);
     let forced = content.contains(['\u{2028}', '\u{2029}']);
-    let fits = style.white_space == WhiteSpace::NoWrap
+    let fits = matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre)
         || text_intrinsic_size(content, style).0 <= width + EPSILON;
     if !forced && fits {
         return (single_height, true, ascent);
@@ -444,6 +469,7 @@ pub(super) fn layout_inline(
         });
     }
 
+    let preserve = container.white_space == WhiteSpace::Pre;
     // CollectInlines: group word pieces into authored runs and shape each
     // run once.
     let mut items: Vec<InlineItem> = Vec::with_capacity(children.len());
@@ -471,11 +497,17 @@ pub(super) fn layout_inline(
             items.push(InlineItem {
                 index: child,
                 raw,
-                raw_hang: hang_advance(content, raw, style),
+                // Preserved spaces (pre) do not hang (CSS Text 3 4.1.3).
+                raw_hang: if preserve {
+                    raw
+                } else {
+                    hang_advance(content, raw, style)
+                },
                 run,
                 starts_space: content.starts_with(' '),
                 ends_space: content.ends_with(' '),
                 whitespace_only: content.trim_end_matches(' ').is_empty(),
+                internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char),
                 ascent: baseline,
                 descent: height - baseline,
                 content_ascent: inline_font_content_ascent(style),
@@ -493,7 +525,7 @@ pub(super) fn layout_inline(
     let mut i = 0;
     while i < items.len() {
         let item = &items[i];
-        if current.is_empty() && item.whitespace_only {
+        if !preserve && current.is_empty() && item.whitespace_only {
             // A collapsible space at the start of a line is removed.
             i += 1;
             continue;
@@ -501,6 +533,10 @@ pub(super) fn layout_inline(
         current.push(i);
         let fits = line_width(&items, &current) <= available + EPSILON;
         current.pop();
+        if !fits && can_wrap && item.internal_break {
+            // NGLineBreaker would break inside this item.
+            return None;
+        }
         if fits || current.is_empty() || !can_wrap {
             current.push(i);
             i += 1;
@@ -545,7 +581,7 @@ pub(super) fn layout_inline(
     let mut built = Vec::with_capacity(lines.len());
     for mut line in lines {
         // Trailing collapsible spaces are removed at the line end.
-        while line.last().is_some_and(|&k| items[k].whitespace_only) {
+        while !preserve && line.last().is_some_and(|&k| items[k].whitespace_only) {
             line.pop();
         }
         if line.is_empty() {
@@ -578,6 +614,12 @@ pub(super) fn layout_inline(
             placed.push((k, x, width));
             ascent = ascent.max(item.ascent);
             descent = descent.max(item.descent);
+        }
+        if can_wrap
+            && slice_start > available + EPSILON
+            && line.iter().any(|&k| items[k].internal_break)
+        {
+            return None;
         }
         built.push(Line {
             items: placed,
