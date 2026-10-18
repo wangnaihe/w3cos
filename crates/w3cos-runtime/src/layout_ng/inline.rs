@@ -167,8 +167,11 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
     let newline_ok = sole
         && match style.white_space {
             WhiteSpace::PreLine => has_marker(style, LINE_WIDTH_MARKER),
+            // (line-height: normal mixes the strut's computed line height
+            // with the font's line spacing differently in legacy.)
             WhiteSpace::Pre | WhiteSpace::PreWrap => {
-                has_marker(style, LINE_WIDTH_MARKER) || !content.ends_with('\n')
+                has_marker(style, LINE_WIDTH_MARKER)
+                    || (!content.ends_with('\n') && !style.line_height_is_normal)
             }
             _ => false,
         };
@@ -548,7 +551,16 @@ pub(super) fn layout_inline(
             // Paint steps forced (U+2028, a coalesced <br>) lines itself
             // from the first line's content box; soft-wrapped paragraphs
             // cover all their lines.
-            let forced = has_forced_break(content, style);
+            let soft_wrapped = || {
+                content
+                    .split(['\u{2028}', '\u{2029}', '\n'])
+                    .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
+            };
+            // (Legacy covers all lines when the content box overflows the
+            // line box, or when line-height: normal lines also soft-wrap.)
+            let forced = has_forced_break(content, style)
+                && font_height <= line + EPSILON
+                && !(style.line_height_is_normal && soft_wrapped());
             (
                 crate::layout::inline_upper_leading(line, font_height),
                 if forced { font_height } else { height },
