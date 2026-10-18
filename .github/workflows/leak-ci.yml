@@ -1,0 +1,100 @@
+name: Leak CI
+
+# M1 item 6/7 leak gates (docs/roadmap/aot-port.md):
+# - `scenarios`: fast per-scenario heap diff on every aot-port PR/push.
+#   Each AOT scenario warms up, runs N iterations and must return exactly to
+#   its baseline live-object counts (residual = 0, or allowlisted in
+#   crates/w3cos-compiler/leak-scenarios/known-leaks.txt). Also checks that a
+#   release build carries no leak-detector symbols.
+# - `soak`: nightly long soak (8h target, configurable). Never runs on PRs.
+on:
+  pull_request:
+    branches: [aot-port]
+  push:
+    branches: [aot-port]
+  schedule:
+    # 18:00 UTC = 02:00 Asia/Shanghai, nightly.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: "Soak duration in hours (8h target; GitHub-hosted runners are clamped to 5.5h)"
+        default: "8"
+        required: true
+      iterations:
+        description: "Iterations per scenario in the residual check"
+        default: "200"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scenarios:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Leak detector unit tests
+        run: cargo test -p w3cos-core --features leak-detector --lib leak_detector
+      - name: Per-scenario heap diff (residual must be 0)
+        run: cargo run --release -p w3cos-compiler --example leak_ci -- --iterations 20 --report-dir leak-reports
+      - name: Release builds carry no leak-detector code
+        # Release binaries are stripped, so look for a string only the detector
+        # emits. arena_rc_bench calls page_arena::reset(), which reaches the
+        # detector when the feature is on: same binary, positive control first.
+        run: |
+          marker="leaked cycles="
+          bin=target/release/examples/arena_rc_bench
+          cargo build --release -p w3cos-core --features leak-detector --example arena_rc_bench
+          grep -q "$marker" "$bin" || { echo "::error::positive control: marker missing with the feature on"; exit 1; }
+          cargo build --release -p w3cos-core --example arena_rc_bench
+          if grep -q "$marker" "$bin"; then
+            echo "::error::leak detector code found in a release build without the feature"
+            exit 1
+          fi
+          echo "release build without the feature carries no leak-detector code"
+      - name: Upload leak reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-reports
+          path: leak-reports
+          if-no-files-found: ignore
+
+  soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # An 8h soak needs a self-hosted runner (set repo variable LEAK_SOAK_RUNNER);
+    # GitHub-hosted jobs are capped at 6h, so the duration is clamped there.
+    runs-on: ${{ vars.LEAK_SOAK_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve soak duration
+        id: duration
+        env:
+          HOURS: ${{ inputs.duration_hours || '8' }}
+          SELF_HOSTED: ${{ vars.LEAK_SOAK_RUNNER != '' }}
+        run: |
+          secs=$(python3 -c "print(int(float('$HOURS') * 3600))")
+          if [ "$SELF_HOSTED" != "true" ] && [ "$secs" -gt 19800 ]; then
+            echo "::warning::GitHub-hosted runners stop jobs at 6h; clamping the ${HOURS}h soak to 5.5h. Set LEAK_SOAK_RUNNER for the full 8h."
+            secs=19800
+          fi
+          echo "secs=$secs" >> "$GITHUB_OUTPUT"
+      - name: Residual check
+        run: cargo run --release -p w3cos-compiler --example leak_ci -- --iterations ${{ inputs.iterations || '200' }} --report-dir leak-reports/residual
+      - name: Soak (RSS growth <= 5%, zero residual)
+        run: cargo run --release -p w3cos-compiler --example leak_ci -- --soak-secs ${{ steps.duration.outputs.secs }} --report-dir leak-reports/soak
+      - name: Upload soak reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leak-soak-${{ github.run_id }}
+          path: leak-reports
+          if-no-files-found: ignore

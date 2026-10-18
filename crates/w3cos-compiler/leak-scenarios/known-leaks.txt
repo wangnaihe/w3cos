@@ -1,0 +1,3 @@
+# Registered leaks / caches allowed by leak CI: `scenario_name: reason`.
+# Keep this empty unless a residual is a deliberate cache; every entry needs
+# an issue or roadmap reference.
