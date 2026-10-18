@@ -219,8 +219,16 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             }
         }
         ComponentKind::Text { content } if info.style.display != Display::Inline => {
-            unsupported_style(info.style, &[inline::VALIGN_MARKER])
-                .or_else(|| inline::block_text_reason(content, info.style))
+            unsupported_style(
+                info.style,
+                &[
+                    inline::VALIGN_MARKER,
+                    inline::BIDI_FRAGMENT_MARKERS[0],
+                    inline::BIDI_FRAGMENT_MARKERS[1],
+                    inline::BIDI_FRAGMENT_MARKERS[2],
+                ],
+            )
+            .or_else(|| inline::block_text_reason(content, info.style))
         }
         ComponentKind::Text { .. } => {
             // Validated with its container (container_reason).
@@ -233,6 +241,9 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
                         inline::LINE_WIDTH_MARKER,
                         inline::VALIGN_MARKER,
                         inline::VALIGN_LENGTH_MARKER,
+                        inline::BIDI_FRAGMENT_MARKERS[0],
+                        inline::BIDI_FRAGMENT_MARKERS[1],
+                        inline::BIDI_FRAGMENT_MARKERS[2],
                     ],
                 )
             }

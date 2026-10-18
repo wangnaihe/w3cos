@@ -55,6 +55,19 @@ pub(super) const ANONYMOUS_BLOCK_MARKER: &str = "--w3cos-internal-anonymous-bloc
 const QUIRKS_MARKER: &str = "--w3cos-internal-quirks-mode";
 /// A `<br>` the cascade keeps as its own leaf (Blink NGInlineItem kControl).
 const FORCED_BREAK: &str = "\u{2028}";
+/// The cascade's UAX #9 pass (reorder_explicit_bidi_*) replaces a bidi
+/// paragraph's text by visual-order fragments: ltr, already reversed and
+/// mirrored, ordered for the lines it estimated.
+pub(super) const BIDI_VISUAL_ORDER_MARKER: &str = "--w3cos-internal-bidi-visual-order";
+pub(super) const BIDI_FRAGMENT_MARKERS: [&str; 3] = [
+    BIDI_VISUAL_ORDER_MARKER,
+    "--w3cos-internal-bidi-resolved-level",
+    "--w3cos-internal-bidi-logical-order",
+];
+
+fn bidi_fragment(style: &Style) -> bool {
+    has_marker(style, BIDI_VISUAL_ORDER_MARKER)
+}
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
 /// `vertical-align: top | text-top | bottom | text-bottom` (the cascade
 /// maps them to align-self start/end and keeps the keyword here).
@@ -348,7 +361,10 @@ fn visual_order(levels: &[u8]) -> Vec<usize> {
 /// characters and bidi controls need bidi reordering (UAX #9), other space
 /// separators have their own collapsing and hanging rules (CSS Text 3 4.1),
 /// and control characters their own rendering: those stay on legacy.
-fn supported_script(content: &str) -> bool {
+///
+/// `reordered`: a visual-order fragment, whose right-to-left characters
+/// the cascade already reversed (paint draws and measures them as given).
+fn supported_script_in(content: &str, reordered: bool) -> bool {
     content.chars().all(|c| {
         let u = c as u32;
         if matches!(c, '\n' | '\u{2028}' | '\u{2029}') {
@@ -373,7 +389,7 @@ fn supported_script(content: &str) -> bool {
             || u == 0x202F
             || (0x2060..=0x2064).contains(&u);
         let special = (0xD800..=0xDFFF).contains(&u) || (0xFFF0..=0xFFFF).contains(&u);
-        !(rtl || bidi_control || other_space || special)
+        !((rtl && !reordered) || bidi_control || other_space || special)
     })
 }
 
@@ -412,7 +428,9 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     if content.is_empty() || content.contains(['\n', '\r', '\t']) {
         return Some("text:content");
     }
-    if !supported_script(content) {
+    // (A visual-order fragment from the cascade's bidi pass: paint draws
+    // the paragraph leaf as given.)
+    if !supported_script_in(content, bidi_fragment(style)) {
         return Some("text:script");
     }
     if fallback_grows_line(content, style) {
@@ -500,7 +518,10 @@ fn inline_text_reason(
     }
     // An embedding or isolate inside the paragraph needs bidi resolution
     // (around a sole leaf, the whole paragraph, it changes nothing).
-    if style.direction != container.direction
+    // (A visual-order fragment is laid out ltr whatever the paragraph's
+    // direction.)
+    let fragment = bidi_fragment(style);
+    if (style.direction != container.direction && !fragment)
         || (style.unicode_bidi != w3cos_std::style::UnicodeBidi::Normal
             && !(sole && super::block::block_unicode_bidi_ok(style)))
     {
@@ -541,7 +562,12 @@ fn inline_text_reason(
     {
         return Some("text:content");
     }
-    if !supported_script(content) {
+    // A fragment with a line break the cascade froze inside it (one
+    // item per fragment here).
+    if fragment && content.contains('\u{2028}') && content != FORCED_BREAK && !paragraph {
+        return Some("bidi:frozen-break");
+    }
+    if !supported_script_in(content, fragment) {
         return Some("text:script");
     }
     if fallback_grows_line(content, style) {
@@ -888,6 +914,22 @@ fn rtl_paragraph_reason(
     entries: &[InlineEntry],
     container: &Style,
 ) -> Option<&'static str> {
+    // Visual-order fragments: the paragraph is already reordered, and all
+    // of its text must be (the cascade's order covers the whole paragraph).
+    let texts = || {
+        entries.iter().filter_map(|e| match *e {
+            InlineEntry::Leaf(c)
+                if !is_atomic_inline(flat, c)
+                    && !matches!(flat[c].kind, ComponentKind::Text { content } if content == FORCED_BREAK) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        })
+    };
+    if texts().any(|c| bidi_fragment(flat[c].style)) {
+        return (!texts().all(|c| bidi_fragment(flat[c].style))).then_some("bidi:fragment-mixed");
+    }
     if container.direction != TextDirection::Rtl {
         return None;
     }
@@ -1381,7 +1423,10 @@ pub(super) fn layout_inline(
     let hang_preserved = container.white_space == WhiteSpace::PreWrap;
     // NGBidiParagraph levels (an ltr paragraph without strong R, which the
     // script gate rejects, resolves to level 0 throughout).
-    let levels = if container.direction == TextDirection::Rtl {
+    // Visual-order fragments are placed in the given order (one line per
+    // estimated line: a soft wrap here falls back below).
+    let fragments = children.iter().any(|&c| bidi_fragment(flat[c].style));
+    let levels = if container.direction == TextDirection::Rtl && !fragments {
         leaf_bidi_levels(flat, &children, container).ok()?
     } else {
         vec![LeafLevel::default(); children.len()]
@@ -1469,6 +1514,7 @@ pub(super) fn layout_inline(
             && same_run(first, flat[children[end]].style)
             && levels[end].level == levels[start].level
             && levels[start].level % 2 == 0
+            && !fragments
         {
             end += 1;
         }
@@ -1629,6 +1675,14 @@ pub(super) fn layout_inline(
     }
     if !current.is_empty() {
         lines.push(current);
+    }
+    if fragments
+        && lines[..lines.len().saturating_sub(1)]
+            .iter()
+            .any(|line| !line.last().is_some_and(|&k| items[k].forced))
+    {
+        // A soft wrap the cascade's line estimate may not have made.
+        return None;
     }
 
     // Line boxes (NGLineBoxFragmentBuilder): run slices start on LayoutUnit

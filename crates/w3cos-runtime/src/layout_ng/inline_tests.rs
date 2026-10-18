@@ -2212,3 +2212,99 @@ fn vertical_align_lengths_shift_the_baseline() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// The cascade's UAX #9 pass hands bidi-override / embedded paragraphs over
+/// as visual-order fragments (ltr, already reversed): they are placed in
+/// the given order, aligned by the container's direction; a paragraph
+/// mixing them with unreordered text stays on legacy.  Rects from Chrome
+/// (Ahem): `<div dir=rtl><span style="unicode-bidi:bidi-override">AB CD`
+/// and `AA <span style="direction:rtl;unicode-bidi:bidi-override">BC</span>
+/// DD`.
+#[test]
+fn bidi_visual_order_fragments_keep_their_order() {
+    use w3cos_std::style::TextDirection;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let paragraph = |direction: TextDirection, children: Vec<Component>| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(100.0),
+            direction,
+            ..Style::default()
+        };
+        font(&mut style, 10.0, n1);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        Component::boxed(style, children)
+    };
+    let text = |content: &str, fragment: Option<(u8, usize)>| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 10.0, n1);
+        if let Some((level, logical)) = fragment {
+            let props = style.custom_properties.get_or_insert_with(Default::default);
+            props.insert(inline::BIDI_FRAGMENT_MARKERS[0].into(), "1".into());
+            props.insert(inline::BIDI_FRAGMENT_MARKERS[1].into(), level.to_string());
+            props.insert(inline::BIDI_FRAGMENT_MARKERS[2].into(), logical.to_string());
+        }
+        Component::text(content, style)
+    };
+    let block = |children| {
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            children,
+        )
+    };
+    let root = block(vec![
+        paragraph(
+            TextDirection::Rtl,
+            vec![text("DC ", Some((1, 1))), text("BA", Some((1, 0)))],
+        ),
+        paragraph(
+            TextDirection::Ltr,
+            vec![
+                text("AA ", Some((0, 0))),
+                text("CB", Some((1, 1))),
+                text(" DD", Some((0, 2))),
+            ],
+        ),
+    ]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 7] = [
+        (1, [0.0, 0.0, 100.0, 10.0]),
+        (2, [50.0, 0.0, 30.0, 10.0]),
+        (3, [80.0, 0.0, 20.0, 10.0]),
+        (4, [0.0, 10.0, 100.0, 10.0]),
+        (5, [0.0, 10.0, 30.0, 10.0]),
+        (6, [30.0, 10.0, 20.0, 10.0]),
+        (7, [50.0, 10.0, 30.0, 10.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let mixed = block(vec![paragraph(
+        TextDirection::Ltr,
+        vec![text("AA ", None), text("CB", Some((1, 0)))],
+    )]);
+    assert_eq!(
+        block::unsupported_reasons(&pre_flatten(&mixed)),
+        vec!["bidi:fragment-mixed".to_string()]
+    );
+}
