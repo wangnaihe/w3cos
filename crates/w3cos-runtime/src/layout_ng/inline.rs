@@ -213,14 +213,115 @@ fn latin1(content: &str) -> bool {
     })
 }
 
-/// Strong left-to-right (bidi class L) Latin-1 letters and spaces only.
-fn strong_ltr(content: &str) -> bool {
-    content.chars().all(|c| {
-        c == ' '
-            || c.is_ascii_alphabetic()
-            || matches!(c, '\u{aa}' | '\u{b5}' | '\u{ba}')
-            || (('\u{c0}'..='\u{ff}').contains(&c) && c != '\u{d7}' && c != '\u{f7}')
-    })
+/// An item's resolved bidi embedding level (NGInlineItem::BidiLevel).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LeafLevel {
+    level: u8,
+    /// Its trailing spaces resolved to another level: only harmless where
+    /// they are removed at the line end (UAX #9 L1 resets them anyway).
+    tail: bool,
+}
+
+/// NGBidiParagraph::SetParagraph over the IFC's text content (atomic
+/// inlines as U+FFFC, `<br>` as a paragraph separator, as in
+/// NGInlineItemsBuilder), base level from the container's direction.  Each
+/// item must resolve to one level (NGInlineItem splits at level changes;
+/// S2 keeps one fragment per item).  Paint draws an item's glyphs in
+/// logical order, so an odd-level (reversed) item must read the same
+/// reversed and contain no mirrored characters (L4).  `Err` names why.
+fn leaf_bidi_levels(
+    flat: &[FlatNodeInfo],
+    leaves: &[usize],
+    container: &Style,
+) -> Result<Vec<LeafLevel>, &'static str> {
+    use unicode_bidi::{BidiInfo, Level};
+    let mut text = String::new();
+    let mut ranges = Vec::with_capacity(leaves.len());
+    for &leaf in leaves {
+        let start = text.len();
+        match flat[leaf].kind {
+            ComponentKind::Text { content } if !is_atomic_inline(flat, leaf) => {
+                if content == FORCED_BREAK {
+                    text.push('\n');
+                } else {
+                    text.push_str(content);
+                }
+            }
+            _ => text.push('\u{FFFC}'),
+        }
+        ranges.push(start..text.len());
+    }
+    let base = if container.direction == TextDirection::Rtl {
+        Level::rtl()
+    } else {
+        Level::ltr()
+    };
+    let info = BidiInfo::new(&text, Some(base));
+    let mut out = Vec::with_capacity(leaves.len());
+    for (&leaf, range) in leaves.iter().zip(ranges) {
+        let content = &text[range.clone()];
+        let levels = &info.levels[range.clone()];
+        if content == "\n" {
+            out.push(LeafLevel {
+                level: base.number(),
+                tail: false,
+            });
+            continue;
+        }
+        let core_len = match content.trim_end_matches(' ').len() {
+            0 => content.len(),
+            n => n,
+        };
+        let level = levels[0];
+        if levels[..core_len].iter().any(|&l| l != level) {
+            return Err("bidi:mixed-item");
+        }
+        let tail = levels[core_len..].iter().any(|&l| l != level);
+        if level.is_rtl() && !is_atomic_inline(flat, leaf) {
+            let drawn = if tail { &content[..core_len] } else { content };
+            if drawn.chars().rev().ne(drawn.chars())
+                || drawn
+                    .chars()
+                    .any(|c| unicode_bidi_mirroring::get_mirrored(c).is_some())
+            {
+                return Err("bidi:rtl-glyphs");
+            }
+        }
+        out.push(LeafLevel {
+            level: level.number(),
+            tail,
+        });
+    }
+    Ok(out)
+}
+
+/// UAX #9 L2 over one line's items (NGBidiParagraph::IndicesInVisualOrder):
+/// from the highest level down to the lowest odd one, reverse every
+/// maximal run at or above it.
+fn visual_order(levels: &[u8]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..levels.len()).collect();
+    let (Some(&max), Some(&min)) = (levels.iter().max(), levels.iter().min()) else {
+        return order;
+    };
+    let lowest_odd = min | 1;
+    let mut level = max;
+    while level >= lowest_odd {
+        let mut i = 0;
+        while i < order.len() {
+            if levels[order[i]] >= level {
+                let mut j = i;
+                while j < order.len() && levels[order[j]] >= level {
+                    j += 1;
+                }
+                order[i..j].reverse();
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        level -= 1;
+    }
+    order
 }
 
 /// Characters S2 lays out.  Shaping and font fallback are the engine's
@@ -381,17 +482,15 @@ fn inline_text_reason(
         return Some("direction");
     }
     // An rtl paragraph (UAX #9 paragraph level 1): paint orders a paragraph
-    // leaf itself; word items keep their logical order only when every
-    // character is strong L or a space between them (one level-2 run,
-    // rules W/N/I; line-end spaces are removed).
+    // leaf itself; word items get their levels from leaf_bidi_levels and
+    // are reordered per line, with line-end spaces removed (collapsible
+    // white space only).
     let paragraph = sole && has_marker(style, LINE_WIDTH_MARKER);
-    if container.direction == TextDirection::Rtl && !paragraph {
-        if !strong_ltr(content) {
-            return Some("bidi:neutral");
-        }
-        if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
-            return Some("bidi:white-space");
-        }
+    if container.direction == TextDirection::Rtl
+        && !paragraph
+        && !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+    {
+        return Some("bidi:white-space");
     }
     if !zero_edges(style)
         && (has_marker(style, LINE_WIDTH_MARKER) || !inline_edges_supported(content, style))
@@ -722,12 +821,8 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             return Some("vertical-align-middle-font");
         }
         if is_atomic_inline(flat, child) {
-            // An atomic is a neutral (U+FFFC): next to the rtl paragraph's
-            // sos/eos it resolves to level 1 and moves (UAX #9 N1/N2).
-            if style.direction == TextDirection::Rtl {
-                return Some("bidi:atomic");
-            }
-            // Validated by the block gate (node_reason).
+            // Validated by the block gate (node_reason); its bidi level (a
+            // U+FFFC neutral) comes from leaf_bidi_levels.
             continue;
         }
         let ComponentKind::Text { content } = info.kind else {
@@ -755,7 +850,52 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             }
         }
     }
+    if let Some(reason) = rtl_paragraph_reason(flat, &entries, style) {
+        return Some(reason);
+    }
     None
+}
+
+/// The bidi part of the container gate: an rtl paragraph laid out by items
+/// (a sole line-width leaf is ordered by paint).
+fn rtl_paragraph_reason(
+    flat: &[FlatNodeInfo],
+    entries: &[InlineEntry],
+    container: &Style,
+) -> Option<&'static str> {
+    if container.direction != TextDirection::Rtl {
+        return None;
+    }
+    if let [InlineEntry::Leaf(c)] = entries[..]
+        && !is_atomic_inline(flat, c)
+        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
+    {
+        return None;
+    }
+    let leaves: Vec<usize> = entries
+        .iter()
+        .filter_map(|e| match *e {
+            InlineEntry::Leaf(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let levels = match leaf_bidi_levels(flat, &leaves, container) {
+        Ok(levels) => levels,
+        Err(reason) => return Some(reason),
+    };
+    if leaves.len() != entries.len() && needs_reorder(&levels) {
+        // Inline box fragments around reordered items (NGInlineBoxState
+        // with bidi-split boxes) are not modelled.
+        return Some("bidi:inline-box");
+    }
+    None
+}
+
+/// Some item is not at the even level shared by all (L2 changes order).
+fn needs_reorder(levels: &[LeafLevel]) -> bool {
+    levels
+        .first()
+        .is_some_and(|first| first.level % 2 == 1 || levels.iter().any(|l| l.level != first.level))
 }
 
 /// Item metrics as the legacy line-metrics pass reads them, so both engines
@@ -816,6 +956,8 @@ struct InlineItem {
     /// dictionary breaks) are not modelled, so a line needing a break
     /// next to one falls back.
     non_latin: bool,
+    /// Resolved bidi level and trailing-space level change (LeafLevel).
+    bidi: LeafLevel,
     /// Baseline shift (down) from vertical-align: middle.
     shift: f32,
     ascent: f32,
@@ -1212,6 +1354,17 @@ pub(super) fn layout_inline(
     // the line end, CSS Text 3 4.1.3).
     let preserve = matches!(container.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
     let hang_preserved = container.white_space == WhiteSpace::PreWrap;
+    // NGBidiParagraph levels (an ltr paragraph without strong R, which the
+    // script gate rejects, resolves to level 0 throughout).
+    let levels = if container.direction == TextDirection::Rtl {
+        leaf_bidi_levels(flat, &children, container).ok()?
+    } else {
+        vec![LeafLevel::default(); children.len()]
+    };
+    let reorder = needs_reorder(&levels);
+    if reorder && has_boxes {
+        return None;
+    }
     // CollectInlines: group word pieces into authored runs and shape each
     // run once.
     let mut items: Vec<InlineItem> = Vec::with_capacity(children.len());
@@ -1270,6 +1423,7 @@ pub(super) fn layout_inline(
                 internal_break: false,
                 atomic: Some((result.fragment, margin[3], margin[0])),
                 non_latin: false,
+                bidi: levels[k],
                 shift,
                 ascent,
                 descent: height - ascent,
@@ -1282,11 +1436,14 @@ pub(super) fn layout_inline(
         }
         let first = flat[children[start]].style;
         let mut end = start + 1;
-        // A box boundary ends the shaping run.
+        // A box boundary ends the shaping run; so does a bidi level change
+        // (NGInlineItem segments), and reversed items are shaped alone.
         while end < children.len()
             && opens[end].is_empty()
             && closes[end - 1].is_empty()
             && same_run(first, flat[children[end]].style)
+            && levels[end].level == levels[start].level
+            && levels[start].level % 2 == 0
         {
             end += 1;
         }
@@ -1359,6 +1516,7 @@ pub(super) fn layout_inline(
                         && content.starts_with(' ')
                         && !content.trim_start_matches(' ').is_empty()),
                 non_latin: !latin1(content),
+                bidi: levels[k],
                 shift,
                 atomic: None,
                 ascent: baseline,
@@ -1472,6 +1630,32 @@ pub(super) fn layout_inline(
         if line.is_empty() {
             continue;
         }
+        // The item whose trailing spaces hang (the logical line end).
+        let hang_item = content_len.checked_sub(1).map(|p| line[p]);
+        if line[..content_len]
+            .iter()
+            .any(|&k| items[k].bidi.tail && Some(k) != hang_item)
+        {
+            // Spaces at another level inside the line would sit apart from
+            // their item after reordering.
+            return None;
+        }
+        // UAX #9 L1/L2: the line's items in visual order (the <br> stays
+        // at the end; it paints nothing).
+        let logical = line;
+        let line: Vec<usize> = if reorder {
+            let item_levels: Vec<u8> = logical[..content_len]
+                .iter()
+                .map(|&k| items[k].bidi.level)
+                .collect();
+            visual_order(&item_levels)
+                .into_iter()
+                .map(|p| logical[p])
+                .chain(logical[content_len..].iter().copied())
+                .collect()
+        } else {
+            logical
+        };
         let mut ascent = strut_ascent;
         let mut descent = strut_descent;
         let mut subtrees: Vec<(usize, bool, f32, f32)> = Vec::new();
@@ -1480,7 +1664,7 @@ pub(super) fn layout_inline(
         let mut slice = 0.0f32;
         for (position, &k) in line.iter().enumerate() {
             let item = &items[k];
-            let last_on_line = position + 1 >= content_len;
+            let last_on_line = Some(k) == hang_item || item.forced;
             // Hanging preserved spaces keep their advance in the fragment.
             let advance = if last_on_line && !hang_preserved {
                 item.raw_hang
@@ -1489,7 +1673,9 @@ pub(super) fn layout_inline(
             };
             let x = slice_start + slice;
             slice += advance;
-            let slice_ends = last_on_line || items[line[position + 1]].run != item.run;
+            let slice_ends = last_on_line
+                || position + 1 >= content_len
+                || items[line[position + 1]].run != item.run;
             let width = if slice_ends {
                 let end = slice_start + snap(slice);
                 slice_start = end;

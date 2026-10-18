@@ -2004,3 +2004,88 @@ fn block_isolate_is_supported_override_is_not() {
         assert_eq!(block::unsupported_reasons(&flat), want, "{bidi:?}");
     }
 }
+
+/// UAX #9 in an rtl IFC (NGBidiParagraph levels, NGLineInfo items in
+/// IndicesInVisualOrder): atomic inlines (U+FFFC neutrals) next to the
+/// paragraph's sos/eos resolve to level 1 and are reordered with the
+/// level-2 Latin runs per line (L2).  Rects from Chrome (Ahem).
+#[test]
+fn rtl_items_are_reordered_by_bidi_level() {
+    use w3cos_std::style::TextDirection;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let rtl = |mut style: Style| {
+        style.direction = TextDirection::Rtl;
+        font(&mut style, 10.0, n1);
+        style
+    };
+    let paragraph = |children: Vec<Component>| {
+        let mut style = rtl(Style {
+            display: Display::Block,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        });
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        Component::boxed(style, children)
+    };
+    let text = |content: &str| {
+        Component::text(
+            content,
+            rtl(Style {
+                display: Display::Inline,
+                ..Style::default()
+            }),
+        )
+    };
+    let ib = |w: f32| {
+        Component::boxed(
+            rtl(Style {
+                display: Display::InlineBlock,
+                width: Dimension::Px(w),
+                height: Dimension::Px(10.0),
+                ..Style::default()
+            }),
+            vec![],
+        )
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            paragraph(vec![ib(20.0), text("AA")]),
+            paragraph(vec![text("AA"), ib(20.0), text(".")]),
+            paragraph(vec![ib(20.0), ib(30.0)]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 10] = [
+        (1, [0.0, 0.0, 100.0, 12.0]),
+        (2, [80.0, 0.0, 20.0, 10.0]),
+        (3, [60.0, 2.0, 20.0, 10.0]),
+        (4, [0.0, 12.0, 100.0, 12.0]),
+        (5, [80.0, 14.0, 20.0, 10.0]),
+        (6, [60.0, 12.0, 20.0, 10.0]),
+        (7, [50.0, 14.0, 10.0, 10.0]),
+        (8, [0.0, 24.0, 100.0, 12.0]),
+        (9, [80.0, 24.0, 20.0, 10.0]),
+        (10, [50.0, 24.0, 30.0, 10.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
