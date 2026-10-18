@@ -252,8 +252,41 @@ impl JsObject {
         if key.starts_with("__w3cos_getter_") {
             self.has_getter_properties = true;
         }
-        self.properties.insert(JsString::intern(key), value);
-        self.refresh_heap_accounting();
+        if self.properties.insert_str(key, value).is_none() {
+            self.refresh_heap_accounting();
+        }
+    }
+
+    /// Whether `[[Set]]` of a missing own key could find a
+    /// `__w3cos_setter_` accessor (or must consult a proxy) on this object
+    /// or its prototype chain. `false` is exact, so the caller may skip the
+    /// setter lookup.
+    pub(crate) fn chain_may_have_setter(&self) -> bool {
+        if self.proxy_handler.is_some() || self.properties.may_have_marker_key() {
+            return true;
+        }
+        match &self.prototype {
+            Some(proto) if proto.is_live() => proto.borrow().chain_may_have_setter(),
+            _ => false,
+        }
+    }
+
+    /// Whether `key` is an own non-writable data property. Ordinary objects
+    /// do not model `writable: false` (every own data property is
+    /// writable), so only a proxy `getOwnPropertyDescriptor` trap can
+    /// report one; only then is a descriptor materialized.
+    pub(crate) fn own_property_non_writable(&self, key: &str) -> bool {
+        let trapped = self
+            .proxy_handler
+            .as_ref()
+            .is_some_and(|handler| handler.get_own_property_descriptor.is_some());
+        if !trapped {
+            return false;
+        }
+        let writable = self
+            .get_own_property_descriptor(key)
+            .get_property("writable");
+        writable.is_bool() && !writable.to_bool()
     }
 
     pub fn may_have_getter_properties(&self) -> bool {
@@ -739,11 +772,16 @@ mod tests {
 
         small.set_direct("e", Value::Number(5.0));
         assert!(
+            small.properties.is_compact(),
+            "shape-backed objects stay compact past 4 keys"
+        );
+        small.delete("e");
+        assert!(
             !small.properties.is_compact(),
-            "5th property spills to HashMap"
+            "a delete switches to dictionary mode"
         );
         assert_eq!(small.get_direct("a").to_number(), 1.0);
-        assert_eq!(small.get_direct("e").to_number(), 5.0);
+        assert!(small.get_direct("e").is_undefined());
 
         // Rare class/private/enumerability state is lazy-boxed so ordinary empty
         // objects shrink vs the prior inline HashSet/HashMap/Vec layout (472 /
