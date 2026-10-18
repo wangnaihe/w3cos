@@ -235,6 +235,7 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
      旧实现是 O(n²)：10k 键时 set 2.6 s、30k 键时 25.5 s。
    - test262 相关用例并入 item 14 的门禁。
 6. 调试构建环检测器（trial deletion），报告保留引用链与源码位置；release 构建不编入（CI 检查二进制符号）。
+   - **第 1 步（已完成）**：`w3cos-core` 的 `leak-detector` feature（默认关闭，release 不编入）提供 `w3cos_core::leak_detector`。按需调用 `report()`，或设置环境变量 `W3COS_LEAK_REPORT`（`1`/`text`、`json` 或文件路径），在每次 page reset 时输出报告。做法是在 arena 强引用计数上做试探性删除：扫描所有存活槽位，以及从它们可达的宿主 `Rc` 值和 AOT 捕获 cell，收集可见强边（属性、原型、call slot、私有元素、数组元素、AOT 捕获、函数属性）。强引用数大于图内入边数的节点算"外部持有"（Rust 栈/寄存器、realm/模块状态、宿主旁路表，或捕获不可枚举的原生闭包）。从这些根不可达的存活节点就是泄漏的环：用 Tarjan 求强连通分量，输出完整引用链、对象种类和键，并建议把哪条边改成 `WeakRef`（优先 parent/owner/back/prev/capture 一类回边）。`mark_baseline()` 记录 realm 基线，之后新增的存活值作为残留报告，附带从根开始的保留链。只读，不 clone、不释放任何值。原生闭包里的边看不见，所以这类环会显示为"外部持有的残留"，不会误报为环。分配位置（AOT 源码行）还没接上，CI 检查二进制符号放在泄漏 CI 那一步。示例：`cargo run -p w3cos-core --features leak-detector --example leak_report_demo`。
 7. 泄漏 CI：每个场景堆差分 + 每晚 8 小时 soak，结果入 `docs/perf/`。
 8. `w3cos leak-lint` + codemod：闭包捕获 `this`、未移除监听器、父↔子强引用、Disposable 模式。
 9. VS Code fork / 补丁队列流程：`vscode-w3cos` 仓库按上游 tag 重放补丁（quilt 式 `patches/` 目录 + CI 自动 rebase），每个补丁标注"可上游/仅 w3cos"，可上游的向 microsoft/vscode 提 PR；扩展与 npm 依赖同一流程（`patches/npm/<pkg>@<ver>`，安装时应用）。
