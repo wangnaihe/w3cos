@@ -1141,6 +1141,25 @@ framework-specific runtime paths to make individual packages pass.
 - [ ] Electron application analysis and standards-oriented migration report.
 - [ ] Keep runtime compatibility work separate from source migration tooling.
 
+### R4.4 Distribution and toolchain
+
+Direction and decisions: [docs/NPM_TOOLCHAIN.md](docs/NPM_TOOLCHAIN.md).
+Nothing is published to npm yet.
+
+- [ ] Pin the Rust toolchain in the repository and use the same pin in CI.
+- [ ] `w3cos build` works from outside a source checkout (runtime source
+  selected by the CLI version, shared build cache).
+- [ ] Portable CLI binaries for macOS arm64/x64, Linux x64/arm64 (glibc 2.28
+  and static musl), and Windows x64/arm64, built and smoke-tested in CI.
+- [ ] `w3cos doctor` checks the toolchain; `--fix` installs Rust and system
+  dependencies only with per-item consent, never elevates without
+  `--allow-sudo` / `--allow-admin`, and records what it installed.
+- [ ] Types for `@w3cos/std` and `w3cos/native`; `w3cos init` creates an npm
+  project.
+- [ ] `w3cos`, `create-w3cos`, `@w3cos/std`, and 8 `@w3cos/cli-*` platform
+  packages published through npm Trusted Publishing with provenance, on the
+  `next` dist-tag first.
+
 **R4 exit:** package support is reproducible, versioned, and explained by
 generic JavaScript/Web-platform coverage.
 

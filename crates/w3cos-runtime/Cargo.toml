@@ -2,6 +2,7 @@
 name = "w3cos-runtime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
