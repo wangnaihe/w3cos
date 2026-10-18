@@ -194,6 +194,18 @@ fn supported_script(content: &str) -> bool {
     })
 }
 
+/// `line-height: normal` text whose fallback faces grow the line box past
+/// the primary font's: the engines resolve those used-font metrics on
+/// different paths (paint wrapper, line metrics), so legacy keeps them.
+fn fallback_grows_line(content: &str, style: &Style) -> bool {
+    #[cfg(feature = "skia")]
+    if style.line_height_is_normal && !latin1(content) {
+        return crate::render_skia::text_fallback_grows_normal_line(content, style);
+    }
+    let _ = (content, style);
+    false
+}
+
 /// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
 /// block-axis margins are handled by block layout.
 pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
@@ -219,6 +231,9 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     }
     if !supported_script(content) {
         return Some("text:script");
+    }
+    if fallback_grows_line(content, style) {
+        return Some("text:fallback-metrics");
     }
     text_style_reason(style)
 }
@@ -310,6 +325,9 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
     }
     if !supported_script(content) {
         return Some("text:script");
+    }
+    if fallback_grows_line(content, style) {
+        return Some("text:fallback-metrics");
     }
     if has_marker(style, LINE_WIDTH_MARKER) {
         if !sole {

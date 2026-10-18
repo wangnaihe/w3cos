@@ -533,6 +533,19 @@ pub(crate) fn resolved_text_font_geometry(
     }))
 }
 
+/// True when shaping `text` uses a fallback face whose normal line box is
+/// taller than the primary face's (or the geometry is unknown).
+pub(crate) fn text_fallback_grows_normal_line(text: &str, style: &Style) -> bool {
+    let (Some(primary), Some(resolved)) = (
+        resolved_font_geometry(style),
+        resolved_text_font_geometry(text, style),
+    ) else {
+        return true;
+    };
+    let primary = primary.normal_line_box();
+    resolved.ascent > primary.ascent + 1e-3 || resolved.descent > primary.descent + 1e-3
+}
+
 /// CSS middle alignment uses the parent's concrete x-height, not half an em.
 /// Resolve the same primary face and weight as its strut/glyph painter.
 pub(crate) fn resolved_font_x_height(style: &Style) -> Option<f32> {
