@@ -3844,12 +3844,23 @@ fn emit_block_instructions(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let mut emitted = emitted;
+    let (fused, prewrapped) = fuse_private_binding_loads(
+        instructions,
+        &mut emitted,
+        exception_target,
+        function,
+        mode,
+        storage,
+        plan,
+    );
     let mut output = String::new();
     for (index, (instruction, emitted)) in instructions.iter().zip(&emitted).enumerate() {
-        if dead_strings.contains(&index) {
+        if dead_strings.contains(&index) || fused.contains(&index) {
             continue;
         }
         let line = if exception_target.is_some()
+            && !prewrapped.contains(&index)
             && !is_direct_control_flow(instruction, mode)
             && !handles_own_exceptions(instruction)
         {
@@ -3862,6 +3873,173 @@ fn emit_block_instructions(
         output.push('\n');
     }
     Ok(output)
+}
+
+/// Bindings only this function's own instructions can write: `var`/`let`/
+/// `const` locals, parameters and `this` that no nested closure captures and
+/// that are not captures from an outer function. Parameters only qualify
+/// without an `arguments` object (which could alias them).
+fn private_value_bindings(function: &Function) -> HashSet<u32> {
+    let captured = captured_binding_ids(function);
+    let outer = function
+        .captures
+        .iter()
+        .map(|binding| binding.0)
+        .collect::<HashSet<_>>();
+    let mut private = function
+        .bindings
+        .iter()
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                BindingKind::Var | BindingKind::Let | BindingKind::Const
+            )
+        })
+        .map(|binding| binding.id.0)
+        .collect::<HashSet<_>>();
+    if function.arguments_binding.is_none() {
+        private.extend(function.parameters.iter().map(|binding| binding.0));
+        private.extend(function.rest_parameter.map(|binding| binding.0));
+    } else {
+        for binding in function.parameters.iter().chain(&function.rest_parameter) {
+            private.remove(&binding.0);
+        }
+    }
+    private.extend(function.this_binding.map(|binding| binding.0));
+    if let Some(binding) = function.arguments_binding {
+        private.remove(&binding.0);
+    }
+    private.retain(|id| !captured.contains(id) && !outer.contains(id));
+    private
+}
+
+fn register_read_counts(function: &Function) -> HashMap<u32, usize> {
+    let mut counts = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            for register in read_registers(instruction) {
+                *counts.entry(register).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// Variable-read borrow: a `LoadBinding` of a private local whose register is
+/// read exactly once, by the very next instruction, is folded into that
+/// instruction. The consumer reads `&cell.borrow().0` in place instead of a
+/// register holding a counted clone (one retain + one release saved per read).
+///
+/// Sound because nothing but this function's own binding writes can touch a
+/// private binding's cell, the consumer is not one of them, and one
+/// instruction never suspends. The consumer's text must use the register only
+/// through the borrowed form (`&self.registers[r]`) or as its destination; any
+/// other use (clone, move, closure) keeps the ordinary load.
+fn fuse_private_binding_loads(
+    instructions: &[Instruction],
+    emitted: &mut [String],
+    exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
+    function: &Function,
+    mode: EmissionMode,
+    storage: SlotStorage,
+    plan: &EscapePlan,
+) -> (HashSet<usize>, HashSet<usize>) {
+    let mut fused = HashSet::new();
+    let mut prewrapped = HashSet::new();
+    if !matches!(mode, EmissionMode::Sync) {
+        return (fused, prewrapped);
+    }
+    let private = private_value_bindings(function);
+    if private.is_empty() {
+        return (fused, prewrapped);
+    }
+    let reads = register_read_counts(function);
+    let mut index = 0;
+    while index + 1 < instructions.len() {
+        let current = index;
+        index += 1;
+        let Instruction::LoadBinding { dst, binding } = &instructions[current] else {
+            continue;
+        };
+        if fused.contains(&current)
+            || !private.contains(&binding.0)
+            || is_shared_number(binding.0)
+            || num_binding_slot(plan, binding.0).is_some()
+            || plan.constants.contains_key(&binding.0)
+            || val_slot(plan, dst.0).is_none()
+            || reads.get(&dst.0).copied() != Some(1)
+        {
+            continue;
+        }
+        // Constant loads in between (e.g. a property key the consumer
+        // inlines) cannot observe or write a binding.
+        let mut next = current + 1;
+        while next < instructions.len()
+            && matches!(&instructions[next], Instruction::LoadConstant { dst: written, .. } if written.0 != dst.0)
+        {
+            next += 1;
+        }
+        if next >= instructions.len() {
+            continue;
+        }
+        let consumer = &instructions[next];
+        if matches!(
+            consumer,
+            Instruction::LoadBinding { .. }
+                | Instruction::StoreBinding { .. }
+                | Instruction::InitializeBinding { .. }
+                | Instruction::RefreshBinding { .. }
+                | Instruction::CreateClosure { .. }
+        ) || !read_registers(consumer).contains(&dst.0)
+        {
+            continue;
+        }
+        let register = val_index(plan, dst.0);
+        let local = format!("__w3cos_bound_{register}");
+        let text = &emitted[next];
+        if text.contains("move |") || text.contains("move||") {
+            continue;
+        }
+        // A last-use receiver of a `&self` method is moved out of its
+        // register; borrowing it instead is equivalent.
+        let mut replaced = text.clone();
+        for method in ["get_property(", "call_method_slice("] {
+            replaced = replaced.replace(
+                &format!(
+                    "std::mem::replace(&mut self.registers[{register}], w3cos_core::Value::Undefined).{method}"
+                ),
+                &format!("(&{local}.0).{method}"),
+            );
+        }
+        replaced = replaced.replace(
+            &format!("&self.registers[{register}]"),
+            &format!("&{local}.0"),
+        );
+        if !replaced.contains(&local) {
+            continue;
+        }
+        let remaining = replaced.replace(&format!("self.registers[{register}] = "), "");
+        if remaining.contains(&format!("self.registers[{register}]")) {
+            continue;
+        }
+        let cell = emit_binding_get(storage, binding.0);
+        let propagate = emit_exception_propagation(exception_target, mode, plan);
+        // The cell borrow and TDZ check stay outside any catch wrapper, so the
+        // TDZ error takes the same path the standalone load's would.
+        if exception_target.is_some()
+            && !is_direct_control_flow(consumer, mode)
+            && !handles_own_exceptions(consumer)
+        {
+            replaced = emit_caught_stmt(&replaced, exception_target, plan);
+            prewrapped.insert(next);
+        }
+        emitted[next] = format!(
+            "match {cell} {{ Some(__w3cos_cell) => {{ let {local} = __w3cos_cell.borrow(); if !{local}.1 {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} {replaced} }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}"
+        );
+        fused.insert(current);
+        index = next + 1;
+    }
+    (fused, prewrapped)
 }
 
 fn fnv1a(text: &str) -> u64 {
