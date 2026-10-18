@@ -529,12 +529,12 @@ fn inline_text_reason(
     }
     // An rtl paragraph (UAX #9 paragraph level 1): paint orders a paragraph
     // leaf itself; word items get their levels from leaf_bidi_levels and
-    // are reordered per line, with line-end spaces removed (collapsible
-    // white space only).
+    // are reordered per line.  Preserved spaces that hang (pre-wrap) would
+    // hang at the line's left end (L1): legacy.
     let paragraph = sole && has_marker(style, LINE_WIDTH_MARKER);
     if container.direction == TextDirection::Rtl
         && !paragraph
-        && !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+        && style.white_space == WhiteSpace::PreWrap
     {
         return Some("bidi:white-space");
     }
@@ -1713,7 +1713,7 @@ pub(super) fn layout_inline(
         let hang_item = content_len.checked_sub(1).map(|p| line[p]);
         if line[..content_len]
             .iter()
-            .any(|&k| items[k].bidi.tail && Some(k) != hang_item)
+            .any(|&k| items[k].bidi.tail && (Some(k) != hang_item || preserve))
         {
             // Spaces at another level inside the line would sit apart from
             // their item after reordering.

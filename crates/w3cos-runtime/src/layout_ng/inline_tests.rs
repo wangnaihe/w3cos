@@ -2308,3 +2308,77 @@ fn bidi_visual_order_fragments_keep_their_order() {
         vec!["bidi:fragment-mixed".to_string()]
     );
 }
+
+/// rtl IFCs with `white-space: pre` (preserved spaces do not hang, so a
+/// level-1 atomic and the level-2 run reorder with the spaces kept) and
+/// `pre-line` (collapsing like normal).  Rects from Chrome (Ahem).
+#[test]
+fn rtl_pre_and_pre_line_are_reordered() {
+    use w3cos_std::style::TextDirection;
+    let _ahem = AhemGuard::new();
+    let n1 = LineHeight::Number(1.0);
+    let style = |display: Display, ws: WhiteSpace| {
+        let mut style = Style {
+            display,
+            direction: TextDirection::Rtl,
+            white_space: ws,
+            ..Style::default()
+        };
+        font(&mut style, 10.0, n1);
+        style
+    };
+    let paragraph = |ws: WhiteSpace, children: Vec<Component>| {
+        let mut s = style(Display::Block, ws);
+        s.width = Dimension::Px(100.0);
+        s.custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        Component::boxed(s, children)
+    };
+    let text = |content: &str, ws: WhiteSpace| Component::text(content, style(Display::Inline, ws));
+    let mut ib = style(Display::InlineBlock, WhiteSpace::Pre);
+    ib.width = Dimension::Px(20.0);
+    ib.height = Dimension::Px(10.0);
+    let pre = WhiteSpace::Pre;
+    let pre_line = WhiteSpace::PreLine;
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            paragraph(
+                pre,
+                vec![
+                    Component::boxed(ib, vec![]),
+                    text("AA  ", pre),
+                    text("BB", pre),
+                ],
+            ),
+            paragraph(pre_line, vec![text("AA ", pre_line), text("BB", pre_line)]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 7] = [
+        (1, [0.0, 0.0, 100.0, 12.0]),
+        (2, [80.0, 0.0, 20.0, 10.0]),
+        (3, [20.0, 2.0, 40.0, 10.0]),
+        (4, [60.0, 2.0, 20.0, 10.0]),
+        (5, [0.0, 12.0, 100.0, 10.0]),
+        (6, [50.0, 12.0, 30.0, 10.0]),
+        (7, [80.0, 12.0, 20.0, 10.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
