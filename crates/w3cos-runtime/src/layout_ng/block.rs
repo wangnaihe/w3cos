@@ -7,6 +7,7 @@
 //! (border, padding, in-flow content, BFC root) is reached.  Width follows
 //! CSS2 10.3.3, height 10.6.3, min/max 10.4/10.7, collapsing 8.3.1.
 
+use super::oof::{self, ContainingBlock, OofCandidate};
 use super::{BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStrut, inline};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::ComponentKind;
@@ -77,7 +78,9 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
             _ => "display:other",
         });
     }
-    if style.position != Position::Static {
+    // Positioned block-level boxes are checked by node_reason
+    // (position_reason); atomics and sticky stay on legacy.
+    if style.position != Position::Static && (atomic || style.position == Position::Sticky) {
         return Some("position");
     }
     if style.float != Float::None {
@@ -167,6 +170,42 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
 /// cascade derives from it: block flow does not read align-self).  Length
 /// values stay gated: the cascade also turns them into margins.
 fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    position_reason(flat, index).or_else(|| node_box_reason(flat, index))
+}
+
+/// Relative and out-of-flow positioning of block-level boxes (S3a).  An
+/// out-of-flow box whose static position lies in an inline formatting
+/// context (NGInlineLayoutAlgorithm's OOF handling) stays on legacy.
+fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    match style.position {
+        Position::Static | Position::Sticky => None,
+        _ if inline::is_atomic_inline(flat, index) || style.display == Display::Inline => {
+            Some("position:inline")
+        }
+        Position::Relative => None,
+        Position::Absolute | Position::Fixed => {
+            if !matches!(style.display, Display::Block | Display::FlowRoot) {
+                return Some("position:display");
+            }
+            let Some(parent) = info.parent else {
+                return Some("position:root");
+            };
+            if inline::is_inline_container(flat, parent)
+                || matches!(flat[parent].kind, ComponentKind::Text { .. })
+            {
+                return Some("position:inline-static");
+            }
+            if style.position == Position::Fixed {
+                return oof::fixed_reason(flat, index);
+            }
+            None
+        }
+    }
+}
+
+fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     if inline::is_atomic_inline(flat, index) {
         if !inline::in_inline_container(flat, index) {
@@ -335,6 +374,32 @@ fn border(style: &Style) -> [f32; 4] {
 /// Blink LayoutUnit: used lengths are stored in 1/64 px, truncating.
 fn layout_unit(v: f32) -> f32 {
     w3cos_std::style::used_box_spacing(v)
+}
+
+pub(super) fn layout_unit_value(v: f32) -> f32 {
+    layout_unit(v)
+}
+
+pub(super) fn border_widths(style: &Style) -> [f32; 4] {
+    border(style)
+}
+
+pub(super) fn resolve_length(
+    d: Dimension,
+    basis: Option<f32>,
+    style: &Style,
+    space: &ConstraintSpace,
+) -> Option<f32> {
+    resolve_dim(d, basis, style, space)
+}
+
+pub(super) fn clamp_inline_size(
+    style: &Style,
+    space: &ConstraintSpace,
+    edges: f32,
+    width: f32,
+) -> f32 {
+    clamp_inline(style, space, edges, width)
 }
 
 /// Used length of a size property (legacy `to_taffy_dim` units).
@@ -535,6 +600,10 @@ pub(super) fn intrinsic_sizes(
     let mut sizes = MinMax::exact(0.0);
     for child in inline::rendered_children(flat, index) {
         let style = flat[child].style;
+        // Out-of-flow children contribute nothing (CSS Sizing 3 5.1).
+        if oof::is_out_of_flow(style) {
+            continue;
+        }
         let side = |s: Spacing| match s {
             Spacing::Auto => 0.0,
             s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
@@ -606,7 +675,21 @@ pub(super) fn layout_root(
     };
     let result = layout_block(flat, 0, &space, true)?;
     let metrics = resolve_inline(flat[0].style, &space);
-    Some((metrics.margin[3], metrics.margin[0], result.fragment))
+    let (x, y) = (metrics.margin[3], metrics.margin[0]);
+    let mut fragment = result.fragment;
+    // The initial containing block (CSS2 10.1): the viewport-sized
+    // rectangle at the canvas origin; it also contains fixed boxes.
+    let icb = ContainingBlock {
+        x: -x,
+        y: -y,
+        width: viewport_w,
+        height: viewport_h,
+        rtl: space.rtl,
+    };
+    let (placed, rest) = oof::resolve(flat, result.oof, &icb, true, viewport_w, viewport_h)?;
+    debug_assert!(rest.is_empty());
+    fragment.children.extend(placed);
+    Some((x, y, fragment))
 }
 
 pub(super) fn layout_block(
@@ -615,10 +698,24 @@ pub(super) fn layout_block(
     space: &ConstraintSpace,
     force_bfc_root: bool,
 ) -> Option<LayoutResult> {
+    layout_block_sized(flat, index, space, force_bfc_root, None)
+}
+
+/// `sized`: the content-box width and (optionally) height an out-of-flow
+/// box's containing block resolved (CSS2 10.3.7 / 10.6.4).
+pub(super) fn layout_block_sized(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    force_bfc_root: bool,
+    sized: Option<(f32, Option<f32>)>,
+) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
     let mut metrics = resolve_inline(style, space);
-    if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
+    if let Some((width, _)) = sized {
+        metrics.content_width = width;
+    } else if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
         metrics.content_width = shrink_to_fit(flat, index, space, &metrics)?;
     }
     let [bt, br, bb, bl] = metrics.border;
@@ -629,8 +726,10 @@ pub(super) fn layout_block(
         BoxSizing::BorderBox => (h - bt - bb - pt - pb).max(0.0),
         BoxSizing::ContentBox => h,
     };
-    let specified_height =
-        resolve_dim(style.height, space.percentage_block, style, space).map(to_content_h);
+    let specified_height = match sized {
+        Some((_, Some(height))) => Some(height),
+        _ => resolve_dim(style.height, space.percentage_block, style, space).map(to_content_h),
+    };
     // DOM lowering gives an authored IFC block `min-height: font-size *
     // line-height` so its flex-row form keeps the initial strut.  The NG
     // line box already contains that strut (in LayoutUnits), so the
@@ -687,6 +786,7 @@ pub(super) fn layout_block(
     // Offset of the content box from the border box.
     let content_top = bt + pt;
     let mut last_baseline = LastBaseline::NoLines;
+    let mut oof_candidates: Vec<OofCandidate> = Vec::new();
 
     if let ComponentKind::Text { content } = info.kind {
         // Block-level text leaf: in-flow content of its own.
@@ -715,6 +815,30 @@ pub(super) fn layout_block(
         let child_info = &flat[child];
         let next = child_info.subtree_end.max(child + 1);
         if child_info.style.display == Display::None {
+            child = next;
+            continue;
+        }
+        if oof::is_out_of_flow(child_info.style) {
+            // NGBlockLayoutAlgorithm::HandleOutOfFlowPositioned: the static
+            // position is the content edge at the current block offset,
+            // past the pending margins unless they may still collapse
+            // through our top (then it is our top edge).
+            let block = if at_top && can_escape_top {
+                0.0
+            } else {
+                cursor + pending.sum()
+            };
+            let content_width = metrics.content_width;
+            oof_candidates.push(OofCandidate {
+                index: child,
+                static_inline: if child_space.rtl {
+                    bl + pl + content_width
+                } else {
+                    bl + pl
+                },
+                static_block: bt + pt + block,
+                static_rtl: child_space.rtl,
+            });
             child = next;
             continue;
         }
@@ -752,7 +876,12 @@ pub(super) fn layout_block(
         if result.last_baseline != LastBaseline::NoLines {
             last_baseline = result.last_baseline.offset(bt + pt + y);
         }
-        children.push((x, bt + pt + y, result.fragment));
+        // CSS2 9.4.3: a relative offset moves the fragment (and what it
+        // carries), not the flow.
+        let (dx, dy) = oof::relative_offset(child_info.style, &child_space);
+        let (fx, fy) = (x + dx, bt + pt + y + dy);
+        oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
+        children.push((fx, fy, result.fragment));
         child = next;
     }
 
@@ -799,16 +928,40 @@ pub(super) fn layout_block(
         start_strut = own;
     }
 
+    let width = metrics.content_width + bl + br + pl + pr;
+    let height = content_height + bt + bb + pt + pb;
+    if style.position != Position::Static && !oof_candidates.is_empty() {
+        // A positioned box is the containing block of its absolute
+        // descendants: its padding box (CSS2 10.1 item 4).
+        let cb = ContainingBlock {
+            x: bl,
+            y: bt,
+            width: width - bl - br,
+            height: height - bt - bb,
+            rtl: oof::direction_rtl(style),
+        };
+        let (placed, rest) = oof::resolve(
+            flat,
+            std::mem::take(&mut oof_candidates),
+            &cb,
+            false,
+            space.viewport_w,
+            space.viewport_h,
+        )?;
+        children.extend(placed);
+        oof_candidates = rest;
+    }
     Some(LayoutResult {
         last_baseline,
         fragment: BoxFragment {
             index,
-            width: metrics.content_width + bl + br + pl + pr,
-            height: content_height + bt + bb + pt + pb,
+            width,
+            height,
             children,
         },
         start_strut,
         end_strut,
         self_collapsing,
+        oof: oof_candidates,
     })
 }

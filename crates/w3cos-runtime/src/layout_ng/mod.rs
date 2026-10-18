@@ -23,6 +23,7 @@
 
 mod block;
 mod inline;
+mod oof;
 
 use crate::layout::{FlatNodeInfo, LayoutRect};
 use std::sync::OnceLock;
@@ -140,6 +141,9 @@ pub(crate) struct LayoutResult {
     /// Top and bottom margins adjoin each other (CSS2 8.3.1 "collapse
     /// through"): start and end strut belong to one collapsed margin.
     pub self_collapsing: bool,
+    /// Out-of-flow descendants whose containing block is further up
+    /// (static positions relative to this border box).
+    pub oof: Vec<oof::OofCandidate>,
 }
 
 /// Entry point used by `LayoutEngine::compute`.  Returns `None` when the tree

@@ -1449,6 +1449,10 @@ pub(super) fn layout_inline(
             let child = children[k];
             let style = flat[child].style;
             let result = super::block::layout_block(flat, child, space, true)?;
+            if !result.oof.is_empty() {
+                // (Out-of-flow descendants carried through a line box.)
+                return None;
+            }
             // Authored margins (no CSS2 10.3.3 over-constraint rule; auto is
             // gated).
             let side = |m| {

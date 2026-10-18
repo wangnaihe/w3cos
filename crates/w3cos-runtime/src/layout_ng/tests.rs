@@ -653,3 +653,183 @@ fn auto_start_margin_does_not_go_negative() {
     let rect = ng.iter().find(|(_, n)| *n == 2).unwrap().0;
     assert_eq!(rect.x, 0.0);
 }
+
+/// S3a positioning: relative offsets (CSS2 9.4.3), absolute boxes at their
+/// static position (past pending margins, or the parent's top while its
+/// margins collapse through), insets / auto margins / percentages against
+/// the positioned ancestor's padding box (10.3.7, 10.6.4), shrink-to-fit,
+/// the initial containing block and fixed boxes.  Rects from Chrome.
+#[test]
+fn positioned_boxes_match_chrome() {
+    use w3cos_std::style::{Dimension as D, Display, Edges, Position, Spacing as S, Style};
+    let px = D::Px;
+    let block = |position: Position, w: D, h: D| Style {
+        display: Display::Block,
+        position,
+        width: w,
+        height: h,
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let inset = |mut s: Style, l: D, t: D, r: D, b: D| {
+        s.left = l;
+        s.top = t;
+        s.right = r;
+        s.bottom = b;
+        s
+    };
+    let margin = |mut s: Style, top: S, right: S, bottom: S, left: S| {
+        s.margin = Edges {
+            top,
+            right,
+            bottom,
+            left,
+        };
+        s
+    };
+    let (rel, abs, st) = (Position::Relative, Position::Absolute, Position::Static);
+    let auto = D::Auto;
+    let z = S::Px(0.0);
+    let mut cb = margin(block(rel, px(200.0), px(100.0)), S::Px(10.0), z, z, z);
+    cb.border_width = 1.0;
+    cb.padding = Edges {
+        top: S::Px(5.0),
+        right: S::Px(5.0),
+        bottom: S::Px(5.0),
+        left: S::Px(5.0),
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            leaf(inset(
+                block(rel, px(50.0), px(10.0)),
+                px(10.0),
+                px(5.0),
+                auto,
+                auto,
+            )),
+            leaf(inset(
+                block(rel, px(50.0), px(10.0)),
+                auto,
+                auto,
+                px(10.0),
+                px(5.0),
+            )),
+            leaf(inset(
+                block(rel, px(50.0), px(10.0)),
+                D::Percent(10.0),
+                D::Percent(50.0),
+                auto,
+                auto,
+            )),
+            Component::boxed(
+                cb,
+                vec![
+                    leaf(margin(block(st, auto, px(10.0)), z, z, S::Px(20.0), z)),
+                    leaf(block(abs, px(10.0), px(10.0))),
+                    leaf(margin(block(st, auto, px(10.0)), S::Px(5.0), z, z, z)),
+                    leaf(margin(
+                        inset(block(abs, auto, auto), px(3.0), px(4.0), px(7.0), px(9.0)),
+                        S::Px(1.0),
+                        S::Px(1.0),
+                        S::Px(1.0),
+                        S::Px(1.0),
+                    )),
+                    leaf(margin(
+                        inset(
+                            block(abs, px(50.0), px(10.0)),
+                            px(0.0),
+                            px(0.0),
+                            px(0.0),
+                            px(0.0),
+                        ),
+                        S::Auto,
+                        S::Auto,
+                        S::Auto,
+                        S::Auto,
+                    )),
+                    leaf(inset(
+                        block(abs, px(30.0), px(10.0)),
+                        auto,
+                        auto,
+                        px(10.0),
+                        auto,
+                    )),
+                    leaf(inset(
+                        block(abs, D::Percent(10.0), D::Percent(10.0)),
+                        D::Percent(10.0),
+                        D::Percent(10.0),
+                        auto,
+                        auto,
+                    )),
+                    Component::boxed(
+                        inset(block(abs, auto, auto), auto, px(50.0), auto, auto),
+                        vec![leaf(block(st, px(40.0), px(5.0)))],
+                    ),
+                    leaf(margin(
+                        block(abs, px(5.0), px(5.0)),
+                        S::Px(3.0),
+                        z,
+                        z,
+                        S::Px(7.0),
+                    )),
+                    Component::boxed(
+                        margin(block(st, auto, auto), S::Px(30.0), z, z, z),
+                        vec![
+                            leaf(block(abs, px(5.0), px(5.0))),
+                            leaf(margin(block(st, auto, px(5.0)), S::Px(8.0), z, z, z)),
+                        ],
+                    ),
+                ],
+            ),
+            leaf(inset(
+                block(Position::Fixed, px(20.0), px(20.0)),
+                auto,
+                auto,
+                px(0.0),
+                px(0.0),
+            )),
+            leaf(block(st, auto, px(10.0))),
+            leaf(block(abs, px(5.0), px(5.0))),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 20] = [
+        (1, [10.0, 5.0, 50.0, 10.0]),
+        (2, [-10.0, 5.0, 50.0, 10.0]),
+        (3, [80.0, 20.0, 50.0, 10.0]),
+        (4, [0.0, 40.0, 212.0, 112.0]),
+        (5, [6.0, 46.0, 200.0, 10.0]),
+        (6, [6.0, 76.0, 10.0, 10.0]),
+        (7, [6.0, 76.0, 200.0, 10.0]),
+        (8, [5.0, 46.0, 198.0, 95.0]),
+        (9, [81.0, 91.0, 50.0, 10.0]),
+        (10, [171.0, 86.0, 30.0, 10.0]),
+        (11, [22.0, 52.0, 21.0, 11.0]),
+        (12, [6.0, 91.0, 40.0, 5.0]),
+        (13, [6.0, 91.0, 40.0, 5.0]),
+        (14, [13.0, 89.0, 5.0, 5.0]),
+        (15, [6.0, 116.0, 200.0, 5.0]),
+        (16, [6.0, 116.0, 5.0, 5.0]),
+        (17, [6.0, 116.0, 200.0, 5.0]),
+        (18, [780.0, 580.0, 20.0, 20.0]),
+        (19, [0.0, 152.0, 800.0, 10.0]),
+        (20, [0.0, 162.0, 5.0, 5.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
