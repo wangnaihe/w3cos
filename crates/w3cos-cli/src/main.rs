@@ -113,6 +113,35 @@ enum Commands {
         #[command(subcommand)]
         command: PortCommands,
     },
+    /// Flag reference-cycle-prone TS/JS patterns (listeners without dispose,
+    /// `this`-capturing closures stored on `this`, parent<->child back pointers,
+    /// object-keyed Map caches, unregistered disposables, W3IR back-edges).
+    LeakLint {
+        /// File or directory to lint.
+        path: PathBuf,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Write the report here instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Exit 1 when a finding is at or above this severity: info, warning, error, never.
+        #[arg(long, default_value = "warning")]
+        fail_on: String,
+        /// Compute mechanical rewrites (WeakRef back pointers, WeakMap caches,
+        /// this._register(...)) and print them as a unified diff.
+        #[arg(long)]
+        fix: bool,
+        /// With --fix: apply the rewrites in place instead of printing the diff.
+        #[arg(long, requires = "fix")]
+        write: bool,
+        /// Skip the W3IR unique_back_edges pass (faster on large trees).
+        #[arg(long)]
+        no_ir: bool,
+        /// Skip paths containing this substring (repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
     /// Compare Chromium's live window Web API surface with the w3cos runtime.
     WebApiAudit {
         /// Chrome/Chromium executable. Auto-detected when omitted.
@@ -376,6 +405,61 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Commands::LeakLint {
+            path,
+            json,
+            output,
+            fail_on,
+            fix,
+            write,
+            no_ir,
+            exclude,
+        } => {
+            use w3cos_compiler::leak_lint;
+            let fail_on = leak_lint::Severity::parse(&fail_on).with_context(|| {
+                format!("--fail-on must be info, warning, error or never (got {fail_on})")
+            })?;
+            if !path.exists() {
+                anyhow::bail!("{} does not exist", path.display());
+            }
+            let options = leak_lint::Options {
+                ir: !no_ir,
+                exclude,
+            };
+            let report = leak_lint::lint_path(&path, &options);
+            let rendered = if json {
+                report.to_json() + "\n"
+            } else {
+                report.to_text()
+            };
+            match output {
+                Some(output) => {
+                    fs::write(&output, &rendered)
+                        .with_context(|| format!("Could not write {}", output.display()))?;
+                    eprintln!("{}", report.summary_line());
+                }
+                None => print!("{rendered}"),
+            }
+            if fix {
+                if write {
+                    let files = report.write_fixes()?;
+                    eprintln!("leak-lint --fix: rewrote {files} file(s)");
+                } else {
+                    let diff = report.fix_diff();
+                    if diff.is_empty() {
+                        eprintln!("leak-lint --fix: nothing to rewrite");
+                    } else if json {
+                        eprint!("{diff}");
+                    } else {
+                        print!("{diff}");
+                    }
+                }
+            }
+            let code = report.exit_code(fail_on);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Commands::WebApiAudit {
             chrome,
             json,
