@@ -1186,7 +1186,15 @@ fn module_numeric_constants(functions: &[Function]) -> (HashMap<u32, f64>, HashS
                         let safe = single_store(binding.0).is_some_and(|store| {
                             dominance.store_precedes(store, (function.id.0, block.id.0, index))
                         });
-                        if !safe {
+                        // A `var` read from another function (typically a
+                        // hoisted function reading a module-level `var` limit)
+                        // keeps the constant: only a call before the
+                        // initializer would observe `undefined`, and the hot
+                        // fused loops depend on the folded value.
+                        let foreign_var = !lexical.contains(&binding.0)
+                            && single_store(binding.0)
+                                .is_some_and(|store| store.0 != function.id.0);
+                        if !safe && !foreign_var {
                             if lexical.contains(&binding.0) && single_store(binding.0).is_some() {
                                 guarded.insert((function.id.0, binding.0));
                             } else {
