@@ -2378,20 +2378,22 @@ impl Value {
             crate::intrinsics::bump_dom_shape();
         }
         if let Some(o) = self.as_object() {
-            let rejects_indexed_set = o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool();
-            let canonical_index = key
-                .parse::<u32>()
-                .is_ok_and(|index| index.to_string() == key);
-            if rejects_indexed_set && canonical_index {
+            // Only canonical array-index keys can be rejected; test the key
+            // before the marker lookup.
+            if canonical_index_str(key).is_some()
+                && o.borrow().get_direct("__w3cosRejectIndexedSet").to_bool()
+            {
                 return false;
             }
-            let descriptor = o.borrow().get_own_property_descriptor(key);
-            let writable = descriptor.get_property("writable");
-            if writable.is_bool() && !writable.to_bool() {
+            if o.borrow().own_property_non_writable(key) {
                 return false;
             }
-            let has_own = o.borrow().properties.contains_key(key);
-            if !has_own {
+            let (has_own, may_have_setter) = {
+                let object = o.borrow();
+                let has_own = object.properties.contains_key(key);
+                (has_own, !has_own && object.chain_may_have_setter())
+            };
+            if !has_own && may_have_setter {
                 let setter_key = format!("__w3cos_setter_{key}");
                 let setter = {
                     let object = o.borrow();
@@ -5788,16 +5790,18 @@ mod tests {
             "prototype-only FunctionData props must stay Inline (no HashMap spill)"
         );
         assert_eq!(js.keys(), vec!["prototype".to_string()]);
-        // length/name still fit in INLINE_CAP (4) with prototype.
+        // Shape-backed: one shared shape per key sequence, slots in a Vec.
         js.set_property("length", Value::Number(0.0));
         js.set_property("name", Value::string("f"));
         assert!(js.props_is_compact(), "prototype+length+name still inline");
         js.set_property("extra", Value::Number(1.0));
         assert!(js.props_is_compact(), "4th own prop still inline");
         js.set_property("spill", Value::Number(2.0));
+        assert!(js.props_is_compact(), "shape-backed props stay compact");
+        js.delete_property("spill");
         assert!(
             !js.props_is_compact(),
-            "5th own prop spills FunctionData props to HashMap"
+            "a delete moves FunctionData props to dictionary mode"
         );
         crate::page_arena::reset();
     }

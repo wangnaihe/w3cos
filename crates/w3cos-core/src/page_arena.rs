@@ -1323,9 +1323,9 @@ mod tests {
             crate::Value::Undefined
         }));
 
-        // FunctionData::new interns "prototype"; PropertyMap Inline placeholders
-        // also intern "" (shared across empty slots).
-        assert_eq!(live_handles(), 3);
+        // FunctionData::new interns "prototype"; the shape tree keeps its
+        // own heap copy, and empty slots no longer intern "" placeholders.
+        assert_eq!(live_handles(), 2);
         assert_eq!(live_objects(), 2); // explicit + function prototype
         assert_eq!(live_arrays(), 1);
         assert_eq!(live_functions(), 1);
