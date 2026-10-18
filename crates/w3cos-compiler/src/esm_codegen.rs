@@ -1991,6 +1991,20 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                 };
                 let (is_async, is_generator) = match init.as_ref() {
                     Expr::Arrow(arrow) => (arrow.is_async, false),
+                    // `var x = function name() { ...name... }` needs the
+                    // expression's own name binding, which only the generic
+                    // module-body lowering provides.
+                    Expr::Fn(function)
+                        if function.ident.as_ref().is_some_and(|ident| {
+                            ident.sym != binding.id.sym
+                                && crate::w3ir_lowering::function_references_name(
+                                    &function.function,
+                                    &ident.sym,
+                                )
+                        }) =>
+                    {
+                        continue;
+                    }
                     Expr::Fn(function) => {
                         (function.function.is_async, function.function.is_generator)
                     }
@@ -2150,9 +2164,9 @@ fn emit_w3ir_generator_symbol(
             namespace_names,
         )
         .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
-        Ok::<_, String>((state_machine, captures))
+        Ok::<_, String>((state_machine, captures, function.parameters.len()))
     })();
-    let (state_machine, captures) = match emitted {
+    let (state_machine, captures, arity) = match emitted {
         Ok(emitted) => emitted,
         Err(error) => return Some(Err(error)),
     };
@@ -2163,9 +2177,10 @@ fn emit_w3ir_generator_symbol(
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::named_function({:?}, {arity}, move |__this, __args| {}_call(__this, __args)))\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
+        symbol.original_name,
         symbol.bundled_name,
     ));
     if symbol.kind == SymbolKind::Variable {
@@ -2223,9 +2238,9 @@ fn emit_w3ir_async_symbol(
             namespace_names,
         )
         .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
-        Ok::<_, String>((state_machine, captures))
+        Ok::<_, String>((state_machine, captures, function.parameters.len()))
     })();
-    let (state_machine, captures) = match emitted {
+    let (state_machine, captures, arity) = match emitted {
         Ok(emitted) => emitted,
         Err(error) => return Some(Err(error)),
     };
@@ -2236,9 +2251,10 @@ fn emit_w3ir_async_symbol(
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::named_function({:?}, {arity}, move |__this, __args| {}_call(__this, __args)))\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
+        symbol.original_name,
         symbol.bundled_name,
     ));
     if symbol.kind == SymbolKind::Variable {
@@ -2296,9 +2312,9 @@ fn emit_w3ir_sync_symbol(
             namespace_names,
         )
         .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
-        Ok::<_, String>((state_machine, captures))
+        Ok::<_, String>((state_machine, captures, function.parameters.len()))
     })();
-    let (state_machine, captures) = match emitted {
+    let (state_machine, captures, arity) = match emitted {
         Ok(emitted) => emitted,
         Err(error) => return Some(Err(error)),
     };
@@ -2309,9 +2325,10 @@ fn emit_w3ir_sync_symbol(
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::named_constructor_function({:?}, {arity}, move |__this, __args| {}_call(__this, __args)))\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
+        symbol.original_name,
         symbol.bundled_name,
     ));
     if let Some(arity) =
@@ -5931,7 +5948,7 @@ export function keyOrder(): number {
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("get_property_ic("),
+            code.contains("get_property_checked_ic("),
             "constant-key reads should use static ICs"
         );
 

@@ -1497,6 +1497,33 @@ fn fast_dom_dispatch(receiver: &Value, key: &str, event: Option<&Value>) -> Opti
 /// clone the env map; the factory clones Values into its frame as needed.
 pub type AotFactory = fn(Value, &[Value], &AotCaptureMap) -> Value;
 
+/// `name` / `length` of AOT functions, keyed by factory. Generated code
+/// registers each factory once (behind a `Once`), so creating a closure stays
+/// allocation-free and the metadata is only consulted when read.
+static AOT_FUNCTION_META: std::sync::Mutex<Option<HashMap<usize, (&'static str, u32, bool)>>> =
+    std::sync::Mutex::new(None);
+
+pub fn register_aot_function_meta(
+    factory: AotFactory,
+    name: &'static str,
+    length: u32,
+    constructor: bool,
+) {
+    AOT_FUNCTION_META
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(factory as usize, (name, length, constructor));
+}
+
+fn aot_function_meta(factory: AotFactory) -> Option<(&'static str, u32, bool)> {
+    AOT_FUNCTION_META
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|map| map.get(&(factory as usize)).copied())
+}
+
 /// Callable body stored inside [`FunctionData`].
 ///
 /// Host / DOM / capture-adapter closures keep [`FunctionBody::Dyn`]. AOT
@@ -1639,21 +1666,41 @@ impl FunctionData {
     }
 
     pub fn get_property(&self, key: &str) -> Value {
-        self.props
-            .borrow()
-            .get(key)
-            .cloned()
-            .unwrap_or(Value::Undefined)
+        if let Some(value) = self.props.borrow().get(key).cloned() {
+            return value;
+        }
+        if matches!(key, "name" | "length")
+            && let FunctionBody::Aot { factory, .. } = &self.body
+            && let Some((name, length, _)) = aot_function_meta(*factory)
+        {
+            return if key == "name" {
+                Value::string(name)
+            } else {
+                Value::Number(length as f64)
+            };
+        }
+        Value::Undefined
+    }
+
+    /// Ordinary (constructor-capable) AOT function without a `prototype` yet.
+    fn wants_lazy_prototype(&self) -> bool {
+        !self.props.borrow().contains_key("prototype")
+            && matches!(&self.body, FunctionBody::Aot { factory, .. }
+                if aot_function_meta(*factory).is_some_and(|(_, _, constructor)| constructor))
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
         self.props.borrow().contains_key(key)
+            || (matches!(key, "name" | "length")
+                && matches!(&self.body, FunctionBody::Aot { factory, .. } if aot_function_meta(*factory).is_some()))
     }
 
     pub fn keys(&self) -> Vec<String> {
+        // `name` / `length` are non-enumerable on functions.
         self.props
             .borrow()
             .keys()
+            .filter(|key| !matches!(key.as_str(), "name" | "length"))
             .map(|key| key.as_str().to_string())
             .collect()
     }
@@ -2176,6 +2223,12 @@ impl Value {
     pub fn is_function(&self) -> bool {
         self.as_function().is_some()
     }
+    /// `Function.prototype.{call,apply,bind}` receivers: bare functions, and
+    /// callable objects (native builtins, classes) that don't shadow `key`.
+    fn is_function_like_for(&self, key: &str) -> bool {
+        self.is_function() || (self.is_callable() && self.get_property(key).is_undefined())
+    }
+
     pub fn is_callable(&self) -> bool {
         if self.live_dom_node().is_some() {
             return false;
@@ -2315,7 +2368,14 @@ impl Value {
             }
             // JS functions are objects: read attached properties.
             _ if self.as_function().is_some() => {
-                self.as_function().expect("function").get_property(key)
+                let function = self.as_function().expect("function");
+                if key == "prototype" && function.data().wants_lazy_prototype() {
+                    let prototype = Value::object(HashMap::new());
+                    crate::builtins::define_builtin(&prototype, "constructor", self.clone());
+                    function.set_property("prototype", prototype.clone());
+                    return prototype;
+                }
+                function.get_property(key)
             }
             _ => Value::Undefined,
         }
@@ -2330,10 +2390,9 @@ impl Value {
     pub fn get_property_checked(&self, key: &str) -> Value {
         if self.is_nullish() {
             let receiver = if self.is_null() { "null" } else { "undefined" };
-            crate::throw_value(crate::js_object! {
-                "name" => "TypeError",
-                "message" => format!("Cannot read properties of {receiver} (reading '{key}')"),
-            });
+            crate::throw_value(type_error(&format!(
+                "Cannot read properties of {receiver} (reading '{key}')"
+            )));
         }
         self.get_property(key)
     }
@@ -3026,11 +3085,11 @@ impl Value {
             return result;
         }
         match (self, key) {
-            (this, "call") if this.is_function() => {
+            (this, "call") if this.is_function_like_for("call") => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 return self.call(this_arg, args.into_iter().skip(1).collect());
             }
-            (this, "apply") if this.is_function() => {
+            (this, "apply") if this.is_function_like_for("apply") => {
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let applied_args = match args.get(1).and_then(Value::as_array) {
                     Some(values) => values
@@ -3043,7 +3102,7 @@ impl Value {
                 };
                 return self.call(this_arg, applied_args);
             }
-            (this, "bind") if this.is_function() => {
+            (this, "bind") if this.is_function_like_for("bind") => {
                 let target = self.clone();
                 let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
@@ -3168,9 +3227,31 @@ impl Value {
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
+            (this, "codePointAt") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                let index = args.first().map(Value::to_number).unwrap_or(0.0);
+                let index = if index.is_nan() { 0.0 } else { index.trunc() };
+                let units = value.encode_utf16().collect::<Vec<_>>();
+                if index < 0.0 || index >= units.len() as f64 {
+                    return Value::Undefined;
+                }
+                let index = index as usize;
+                let first = units[index];
+                if (0xD800..0xDC00).contains(&first)
+                    && let Some(&second) = units.get(index + 1)
+                    && (0xDC00..0xE000).contains(&second)
+                {
+                    let code = 0x10000
+                        + ((u32::from(first) - 0xD800) << 10)
+                        + (u32::from(second) - 0xDC00);
+                    return Value::Number(f64::from(code));
+                }
+                return Value::Number(f64::from(first));
+            }
             (this, "charCodeAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
+                let index = if index.is_nan() { 0.0 } else { index.trunc() };
                 if !index.is_finite() || index < 0.0 {
                     return Value::Number(f64::NAN);
                 }
@@ -3637,17 +3718,11 @@ fn is_iterator_object(value: &Value) -> bool {
 }
 
 pub(crate) fn range_error(message: &str) -> Value {
-    Value::object(HashMap::from([
-        ("name".into(), Value::string("RangeError")),
-        ("message".into(), Value::string(message)),
-    ]))
+    crate::error_instance("RangeError", vec![Value::string(message)])
 }
 
 pub(crate) fn type_error(message: &str) -> Value {
-    Value::object(HashMap::from([
-        ("name".into(), Value::string("TypeError")),
-        ("message".into(), Value::string(message)),
-    ]))
+    crate::error_instance("TypeError", vec![Value::string(message)])
 }
 
 fn close_iterator_chain(iterators: &Value, mut throw_completion: Option<Value>) -> Option<Value> {
@@ -4357,13 +4432,7 @@ impl Value {
 
     pub fn js_ushr(&self, other: &Value) -> Value {
         if crate::bigint::get(self).is_some() || crate::bigint::get(other).is_some() {
-            crate::throw_value(crate::Value::object(HashMap::from([
-                ("name".into(), Value::string("TypeError")),
-                (
-                    "message".into(),
-                    Value::string("BigInts have no unsigned right shift"),
-                ),
-            ])));
+            crate::throw_value(type_error("BigInts have no unsigned right shift"));
         }
         let shift = (other.to_i32() as u32) & 0x1f;
         Value::Number(((self.to_i32() as u32) >> shift) as f64)

@@ -305,10 +305,10 @@ pub fn pending_finalizer_count() -> usize {
 }
 
 fn type_error(message: &str) -> ! {
-    crate::throw_value(Value::object(HashMap::from([
-        ("name".into(), Value::string("TypeError")),
-        ("message".into(), Value::string(message)),
-    ])))
+    crate::throw_value(crate::error_instance(
+        "TypeError",
+        vec![Value::string(message)],
+    ))
 }
 
 /// Weak identity of an object/array/function. `assign` allocates an id for

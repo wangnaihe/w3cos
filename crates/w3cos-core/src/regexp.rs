@@ -10,17 +10,11 @@ const SOURCE: &str = "__w3cos_regexp_source";
 const FLAGS: &str = "__w3cos_regexp_flags";
 
 fn syntax_error(message: &str) -> Value {
-    Value::object(HashMap::from([
-        ("name".into(), Value::string("SyntaxError")),
-        ("message".into(), Value::string(message)),
-    ]))
+    crate::error_instance("SyntaxError", vec![Value::string(message)])
 }
 
 fn type_error(message: &str) -> Value {
-    Value::object(HashMap::from([
-        ("name".into(), Value::string("TypeError")),
-        ("message".into(), Value::string(message)),
-    ]))
+    crate::error_instance("TypeError", vec![Value::string(message)])
 }
 
 fn validate(source: &str, flags: &str) {

@@ -452,12 +452,18 @@ impl EsmBundle {
             let mut local_to_bundled = Vec::new();
 
             if let Some(info) = parsed.find_module(path) {
+                // `var x; var x;` and `var f; function f() {}` declare one
+                // binding: keep the first (functions before variables).
+                let mut declared = HashSet::new();
                 for name in info
                     .top_level_classes
                     .iter()
                     .chain(info.top_level_functions.iter())
                     .chain(info.top_level_variables.iter())
                 {
+                    if !declared.insert(name.as_str()) {
+                        continue;
+                    }
                     let bundled_name =
                         format!("{namespace}_{}", crate::esm_lowering::sanitize_ident(name));
                     let kind = if info.top_level_classes.contains(name) {

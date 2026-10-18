@@ -34,7 +34,8 @@ pub mod web;
 pub use builtins::{
     Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, Set, array_value,
     console, dispatch_resize_observers, dispatch_resize_observers_bounded, document, error_class,
-    error_instance, json_value, math_value, object_value, parseFloat, parseInt, reset_constructors,
+    error_instance, json_value, math_value, named_constructor_function, named_function,
+    object_value, parseFloat, parseInt, reset_constructors, string_value,
 };
 pub use ic::{IcStats, PropIc};
 pub use js_string::JsString;
@@ -45,6 +46,6 @@ pub use value::{
     AotCapture, AotCaptureMap, AotFactory, ArrayStorage, Completion, FunctionData, Immediate,
     JsArrayRef, JsFunction, JsObjectRef, PanicValue, Value, WeakJsObject, catch_js,
     catch_js_result, fast_collection_get, install_fast_collection_get, install_fast_dom_dispatch,
-    install_length_write_hook, js_string_from_utf16_units, js_string_utf16_units, throw_value,
-    type_of, unwrap_or_throw,
+    install_length_write_hook, js_string_from_utf16_units, js_string_utf16_units,
+    register_aot_function_meta, throw_value, type_of, unwrap_or_throw,
 };

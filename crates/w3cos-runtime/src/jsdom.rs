@@ -7442,6 +7442,15 @@ fn function_compat_class() -> Value {
                 },
             );
         }
+        // `Function("return this")()` is the ubiquitous global-object probe
+        // (webpack, core-js, lodash); answer it without source compilation.
+        #[cfg(not(feature = "dynamic-js"))]
+        if args.len() == 1
+            && args[0].is_string()
+            && args[0].to_js_string().trim().trim_end_matches(';').trim() == "return this"
+        {
+            return Value::function(|_, _| window_value());
+        }
         #[cfg(not(feature = "dynamic-js"))]
         FUNCTION_WARNING_EMITTED.with(|warned| {
             if !warned.replace(true) {
@@ -7481,36 +7490,6 @@ fn frame_function_compat_class(global: Value, document: Value) -> Value {
     });
     class.set_property("name", Value::string("Function"));
     class.set_property("prototype", parent_function.get_property("prototype"));
-    class
-}
-
-fn string_compat_class() -> Value {
-    let class = Value::function(|_, args| {
-        Value::string(&args.first().map(Value::to_js_string).unwrap_or_default())
-    });
-    class.set_property("name", Value::string("String"));
-    class.set_property(
-        "fromCharCode",
-        Value::function(|_, args| {
-            let units = args
-                .iter()
-                .map(|value| value.to_u32() as u16)
-                .collect::<Vec<_>>();
-            Value::string(&String::from_utf16_lossy(&units))
-        }),
-    );
-    class.set_property(
-        "fromCodePoint",
-        Value::function(|_, args| {
-            let text = args
-                .iter()
-                .filter_map(|value| char::from_u32(value.to_u32()))
-                .collect::<String>();
-            Value::string(&text)
-        }),
-    );
-    let prototype = class.get_property("prototype");
-    prototype.set_property("constructor", class.clone());
     class
 }
 
@@ -19507,7 +19486,7 @@ fn build_window_value() -> Value {
                 .collect(),
         ),
     );
-    props.insert("String".to_string(), string_compat_class());
+    props.insert("String".to_string(), w3cos_core::string_value());
     props.insert("Number".to_string(), number_compat_class());
     props.insert("Boolean".to_string(), boolean_compat_class());
     // The global numeric predicates coerce their argument. They are not the
