@@ -2382,3 +2382,120 @@ fn rtl_pre_and_pre_line_are_reordered() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// S3c NGLineLayoutOpportunity: each line box is shortened by the floats
+/// beside it, and a line whose first piece does not fit moves down past
+/// the float (Chrome rects of the equivalent page).
+#[test]
+fn lines_avoid_floats() {
+    let _ahem = AhemGuard::new();
+    use w3cos_std::style::Float;
+    let ifc = || {
+        let mut style = Style {
+            display: Display::Block,
+            ..Style::default()
+        };
+        font(&mut style, 10.0, LineHeight::Px(10.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 10.0, LineHeight::Px(10.0));
+        Component::text(content, style)
+    };
+    let float = |float: Float, w: f32, h: f32| {
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                width: Dimension::Px(w),
+                height: Dimension::Px(h),
+                float,
+                ..Style::default()
+            },
+            vec![],
+        )
+    };
+    let mut root_style = Style {
+        display: Display::Block,
+        width: Dimension::Px(200.0),
+        ..Style::default()
+    };
+    font(&mut root_style, 10.0, LineHeight::Px(10.0));
+    let root = Component::boxed(
+        root_style,
+        vec![
+            float(Float::Left, 50.0, 25.0),
+            float(Float::Right, 30.0, 12.0),
+            Component::boxed(ifc(), (0..16).map(|_| text("XX ")).collect()),
+            float(Float::Left, 180.0, 10.0),
+            Component::boxed(ifc(), vec![text("XXXX "), text("XX")]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let words: [[f32; 4]; 16] = [
+        [50.0, 0.0, 30.0, 10.0],
+        [80.0, 0.0, 30.0, 10.0],
+        [110.0, 0.0, 30.0, 10.0],
+        [140.0, 0.0, 20.0, 10.0],
+        [50.0, 10.0, 30.0, 10.0],
+        [80.0, 10.0, 30.0, 10.0],
+        [110.0, 10.0, 30.0, 10.0],
+        [140.0, 10.0, 20.0, 10.0],
+        [50.0, 20.0, 30.0, 10.0],
+        [80.0, 20.0, 30.0, 10.0],
+        [110.0, 20.0, 30.0, 10.0],
+        [140.0, 20.0, 30.0, 10.0],
+        [170.0, 20.0, 20.0, 10.0],
+        [0.0, 30.0, 30.0, 10.0],
+        [30.0, 30.0, 30.0, 10.0],
+        [60.0, 30.0, 20.0, 10.0],
+    ];
+    let mut expected: Vec<(usize, [f32; 4])> = vec![
+        (0, [0.0, 0.0, 200.0, 60.0]),
+        (1, [0.0, 0.0, 50.0, 25.0]),
+        (2, [170.0, 0.0, 30.0, 12.0]),
+        (3, [0.0, 0.0, 200.0, 40.0]),
+        (20, [0.0, 40.0, 180.0, 10.0]),
+        (21, [0.0, 40.0, 200.0, 20.0]),
+        (22, [0.0, 50.0, 50.0, 10.0]),
+        (23, [50.0, 50.0, 20.0, 10.0]),
+    ];
+    expected.extend(words.iter().enumerate().map(|(k, &r)| (4 + k, r)));
+    // A sole text leaf beside a float is re-wrapped by paint
+    // (resolve_float_text_layouts): it stays on legacy.
+    let mut sole_style = Style {
+        display: Display::Block,
+        width: Dimension::Px(200.0),
+        ..Style::default()
+    };
+    font(&mut sole_style, 10.0, LineHeight::Px(10.0));
+    let sole = Component::boxed(
+        sole_style,
+        vec![
+            float(Float::Left, 50.0, 25.0),
+            Component::boxed(ifc(), vec![text("XX XX")]),
+        ],
+    );
+    let sole_flat = pre_flatten(&sole);
+    assert!(layout_tree(&sole, &sole_flat, 800.0, 600.0).is_none());
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

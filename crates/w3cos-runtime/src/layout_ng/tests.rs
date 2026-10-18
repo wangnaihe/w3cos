@@ -1120,3 +1120,74 @@ fn negative_margin_float_fits_beside_floats() {
     assert_eq!(rect(2), [0.0, 0.0, 50.0, 100.0]);
     assert_eq!(rect(0), [0.0, 0.0, 100.0, 100.0]);
 }
+
+/// S3c HandleNewFormattingContext: a BFC root's border box avoids floats
+/// (its margins may overlap them), shrinks to the layout opportunity when
+/// its width is auto, and moves down when a fixed width does not fit.
+#[test]
+fn bfc_roots_avoid_floats() {
+    use w3cos_std::style::{Dimension as D, Display, Edges, Float, Spacing as S, Style};
+    let px = D::Px;
+    let z = S::Px(0.0);
+    let boxed = |display: Display, float: Float, w: D, h: f32, margin: [f32; 4]| Style {
+        display,
+        float,
+        width: w,
+        height: px(h),
+        margin: Edges {
+            top: S::Px(margin[0]),
+            right: S::Px(margin[1]),
+            bottom: z,
+            left: S::Px(margin[3]),
+        },
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let (fr, b) = (Display::FlowRoot, Display::Block);
+    let mut a = boxed(fr, Float::None, D::Auto, 10.0, [0.0, 10.0, 0.0, 20.0]);
+    a.border_width = 1.0;
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            width: px(200.0),
+            ..Style::default()
+        },
+        vec![
+            leaf(boxed(b, Float::Left, px(50.0), 30.0, [0.0; 4])),
+            leaf(a),
+            leaf(boxed(fr, Float::None, px(160.0), 10.0, [0.0; 4])),
+            leaf(boxed(fr, Float::None, D::Auto, 10.0, [0.0, 0.0, 0.0, 60.0])),
+            leaf(boxed(b, Float::Right, px(40.0), 20.0, [0.0; 4])),
+            leaf(boxed(
+                fr,
+                Float::None,
+                px(100.0),
+                30.0,
+                [5.0, 0.0, 0.0, 0.0],
+            )),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 7] = [
+        (0, [0.0, 0.0, 200.0, 85.0]),
+        (1, [0.0, 0.0, 50.0, 30.0]),
+        (2, [50.0, 0.0, 140.0, 12.0]),
+        (3, [0.0, 30.0, 160.0, 10.0]),
+        (4, [60.0, 40.0, 140.0, 10.0]),
+        (5, [160.0, 50.0, 40.0, 20.0]),
+        (6, [0.0, 55.0, 100.0, 30.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

@@ -1012,7 +1012,13 @@ fn layout_block_in(
         last_baseline = baseline.offset(content_top);
         at_top = false;
     } else if inline::is_inline_container(flat, index) {
-        let result = inline::layout_inline(flat, index, &child_space)?;
+        // NGLineLayoutOpportunity: line boxes avoid the BFC's floats.
+        let floats = (!exclusions.is_empty()).then_some(inline::LineFloats {
+            exclusions: &*exclusions,
+            x: bfc_x + bl + pl,
+            y: bfc_y + bt + pt,
+        });
+        let result = inline::layout_inline_beside(flat, index, &child_space, floats)?;
         cursor = result.height;
         last_baseline = result.last_baseline.offset(content_top);
         at_top = result.children.is_empty();
@@ -1201,15 +1207,80 @@ fn layout_block_in(
             }
             (resolved, cleared) = (again, c);
         }
+        let mut x = x;
+        if is_bfc_root(child_info.style) && !exclusions.is_empty() {
+            // NGBlockLayoutAlgorithm::HandleNewFormattingContext: the BFC
+            // root's border box goes into the first layout opportunity at
+            // or below its position where it fits for its whole height.
+            let style = child_info.style;
+            if child_space.rtl
+                || matches!(style.margin.left, Spacing::Auto)
+                || matches!(style.margin.right, Spacing::Auto)
+            {
+                return None;
+            }
+            let m = &child_metrics;
+            let edges = m.border[1] + m.border[3] + m.padding[1] + m.padding[3];
+            let (ml, mr) = (m.margin[3], m.margin[1]);
+            let cb_x = bfc_x + bl + pl;
+            // Margins may overlap floats; the border box may not.
+            let line_start = cb_x + ml;
+            let line_end = cb_x + metrics.content_width - mr;
+            let mut top = content_bfc_y + resolved;
+            let mut height = result.fragment.height;
+            let mut found = None;
+            'opportunities: for _ in 0..64 {
+                for _ in 0..4 {
+                    let (l, r) = exclusions.band(top, height);
+                    let narrowed = l.is_some() || r.is_some();
+                    let start = l.map_or(line_start, |l| l.max(line_start));
+                    let end = r.map_or(line_end, |r| r.min(line_end));
+                    let content = if style.width == Dimension::Auto {
+                        clamp_inline(style, &child_space, edges, (end - start - edges).max(0.0))
+                    } else {
+                        m.content_width
+                    };
+                    if narrowed && start + content + edges > end + 1.0 / 128.0 {
+                        break;
+                    }
+                    let fitted = layout_block_in(
+                        flat,
+                        child,
+                        &nested,
+                        false,
+                        Some((content, None)),
+                        exclusions,
+                    )?;
+                    if (fitted.fragment.height - height).abs() <= 1.0 / 128.0 {
+                        found = Some((start, fitted));
+                        break 'opportunities;
+                    }
+                    // A different height covers different floats: retry.
+                    height = fitted.fragment.height;
+                }
+                top = exclusions.next_bottom(top, height)?;
+            }
+            let (start, fitted) = found?;
+            if top > content_bfc_y + resolved + 1.0 / 128.0 {
+                if at_top && can_escape_top {
+                    // (Moved below floats while margins collapse through.)
+                    return None;
+                }
+                // Moved past floats: like clearance, the margin above no
+                // longer collapses with the box.
+                resolved = top - content_bfc_y;
+                cleared = true;
+            }
+            x = start - bfc_x;
+            result = fitted;
+        }
         float_overlap |= result.float_overlap;
-        // Line boxes and BFC roots must avoid floats (one layout
-        // opportunity per line is S3c); report and fall back.
+        // Paint-wrapped block text and BFC roots must avoid floats too
+        // (IFC line boxes use their line opportunities); fall back.
         let child_style = child_info.style;
         if !exclusions.is_empty()
             && result.fragment.height > 0.0
-            && (inline::is_inline_container(flat, child)
-                || matches!(child_info.kind, ComponentKind::Text { .. })
-                || is_bfc_root(child_style))
+            && (matches!(child_info.kind, ComponentKind::Text { .. }) || is_bfc_root(child_style))
             && exclusions.overlaps(
                 bfc_x + x,
                 content_bfc_y + resolved,

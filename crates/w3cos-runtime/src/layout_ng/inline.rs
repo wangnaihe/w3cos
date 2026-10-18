@@ -1140,6 +1140,11 @@ struct Line {
     /// Top/bottom-aligned subtrees on the line: (root, top, ascent,
     /// descent) relative to the subtree's own baseline.
     subtrees: Vec<(usize, bool, f32, f32)>,
+    /// Line layout opportunity: block offset (beside floats only; else
+    /// lines stack), inline offset and size.
+    top: f32,
+    offset: f32,
+    available: f32,
 }
 
 /// NGLineBoxFragmentBuilder alignment offset; `start` / `end` follow the
@@ -1253,6 +1258,65 @@ pub(super) fn layout_inline(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<InlineResult> {
+    layout_inline_beside(flat, index, space, None)
+}
+
+/// The floats of the enclosing BFC an IFC's line boxes must avoid
+/// (NGLineLayoutOpportunity): the exclusion space and the BFC offset of
+/// the container's content box.
+#[derive(Clone, Copy)]
+pub(super) struct LineFloats<'a> {
+    pub exclusions: &'a super::exclusion::ExclusionSpace,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl LineFloats<'_> {
+    /// The line opportunity for a line box at `top` of block size
+    /// `height` (content-box coordinates): (inline offset, inline size).
+    fn opportunity(&self, top: f32, height: f32, available: f32) -> (f32, f32) {
+        let (left, right) = self.exclusions.band(self.y + top, height);
+        let start = left.map_or(0.0, |l| (l - self.x).max(0.0));
+        let end = right.map_or(available, |r| (r - self.x).min(available));
+        (start, (end - start).max(0.0))
+    }
+
+    /// The next block offset where the band may widen (a float bottom).
+    fn next_offset(&self, top: f32, height: f32) -> Option<f32> {
+        self.exclusions
+            .next_bottom(self.y + top, height)
+            .map(|b| b - self.y)
+    }
+}
+
+/// The IFC shapes whose lines paint re-wraps around floats from the final
+/// rects (resolve_float_text_layouts / forced_break_float_text_layouts):
+/// a sole text leaf, or text leaves alternating with forced breaks.
+fn paint_rewraps_beside_floats(flat: &[FlatNodeInfo], children: &[usize]) -> bool {
+    let text = |k: usize| match flat[k].kind {
+        ComponentKind::Text { content } => Some(content.as_str()),
+        _ => None,
+    };
+    match children {
+        [only] => text(*only).is_some(),
+        _ if children.len() >= 3 && children.len() % 2 == 1 => children
+            .iter()
+            .enumerate()
+            .all(|(n, &k)| text(k).is_some_and(|c| (n % 2 == 1) == (c == "\u{2028}"))),
+        _ => false,
+    }
+}
+
+/// NGInlineLayoutAlgorithm beside floats: each line is broken in the line
+/// layout opportunity at its block offset, and moves down past floats when
+/// not even its first piece fits.  Line tops assume the container's strut
+/// height (checked once the lines are built).
+pub(super) fn layout_inline_beside(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    floats: Option<LineFloats>,
+) -> Option<InlineResult> {
     let available = space.available_inline;
     let container = flat[index].style;
     let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
@@ -1352,6 +1416,13 @@ pub(super) fn layout_inline(
                 if forced { font_height } else { height },
             )
         };
+        if floats.is_some_and(|f| {
+            f.exclusions
+                .overlaps(f.x, f.y, f.x + available, f.y + height)
+        }) {
+            // (Paint wraps the paragraph in one rect.)
+            return None;
+        }
         return Some(InlineResult {
             height,
             max_line_width: available,
@@ -1400,6 +1471,12 @@ pub(super) fn layout_inline(
         let ascent = strut_ascent.max(baseline);
         let single = ascent + strut_descent.max(line - baseline);
         let lines = content.split('\n').count() as f32;
+        if floats.is_some_and(|f| {
+            f.exclusions
+                .overlaps(f.x, f.y, f.x + available, f.y + single * lines)
+        }) {
+            return None;
+        }
         return Some(InlineResult {
             height: single * lines,
             max_line_width: width,
@@ -1611,6 +1688,22 @@ pub(super) fn layout_inline(
     );
     let mut lines: Vec<Vec<usize>> = Vec::new();
     let mut current: Vec<usize> = Vec::new();
+    // NGLineLayoutOpportunity per line: (top, inline offset, inline size).
+    let assumed_line = if floats.is_some() {
+        if quirks {
+            return None;
+        }
+        let (a, d) = strut(container);
+        a + d
+    } else {
+        0.0
+    };
+    let mut opportunities: Vec<(f32, f32, f32)> = Vec::new();
+    let mut line_top = 0.0f32;
+    let mut opportunity = match floats {
+        Some(f) => f.opportunity(line_top, assumed_line, available),
+        None => (0.0, available),
+    };
     let mut i = 0;
     while i < items.len() {
         let item = &items[i];
@@ -1619,6 +1712,14 @@ pub(super) fn layout_inline(
             i += 1;
             continue;
         }
+        if lines.len() > opportunities.len() {
+            // A line was finished: the next one starts below it.
+            opportunities.push((line_top, opportunity.0, opportunity.1));
+            line_top += assumed_line;
+            if let Some(f) = floats {
+                opportunity = f.opportunity(line_top, assumed_line, available);
+            }
+        }
         if item.forced {
             // NGLineBreaker::HandleForcedLineBreak.
             current.push(i);
@@ -1626,6 +1727,7 @@ pub(super) fn layout_inline(
             i += 1;
             continue;
         }
+        let available = opportunity.1;
         current.push(i);
         let fits = line_width(&items, &current) <= available + EPSILON;
         current.pop();
@@ -1637,6 +1739,14 @@ pub(super) fn layout_inline(
             // The break position may depend on UAX #14 classes S2 does not
             // model (ideographic or dictionary opportunities).
             return None;
+        }
+        if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
+            // Not even the first piece fits beside the floats: the line
+            // moves down to where the band widens.
+            let f = floats?;
+            line_top = f.next_offset(line_top, assumed_line)?;
+            opportunity = f.opportunity(line_top, assumed_line, space.available_inline);
+            continue;
         }
         if fits || current.is_empty() || !can_wrap {
             current.push(i);
@@ -1680,6 +1790,26 @@ pub(super) fn layout_inline(
     if !current.is_empty() {
         lines.push(current);
     }
+    if lines.len() > opportunities.len() {
+        opportunities.push((line_top, opportunity.0, opportunity.1));
+    }
+    debug_assert_eq!(lines.len(), opportunities.len());
+    if floats.is_some()
+        && paint_rewraps_beside_floats(flat, &children)
+        && opportunities
+            .iter()
+            .enumerate()
+            .any(|(n, &(top, offset, size))| {
+                (top - n as f32 * assumed_line).abs() > EPSILON
+                    || offset > EPSILON
+                    || size < available - EPSILON
+            })
+    {
+        // Paint re-wraps these shapes around floats itself
+        // (layout::resolve_float_text_layouts): their lines must stay on
+        // the legacy geometry.
+        return None;
+    }
     if fragments
         && lines[..lines.len().saturating_sub(1)]
             .iter()
@@ -1701,6 +1831,7 @@ pub(super) fn layout_inline(
     let mut max_line_width = 0.0f32;
     let mut built = Vec::with_capacity(lines.len());
     for (line_index, mut line) in lines.into_iter().enumerate() {
+        let (line_top, line_offset, available) = opportunities[line_index];
         // Trailing collapsible spaces are removed at the line end, also
         // before a forced break.
         let forced = line.last().is_some_and(|&k| items[k].forced);
@@ -1711,6 +1842,10 @@ pub(super) fn layout_inline(
         line.extend(brk);
         let content_len = line.len() - usize::from(forced);
         if line.is_empty() {
+            if floats.is_some() {
+                // (The assumed line tops counted it.)
+                return None;
+            }
             continue;
         }
         // The item whose trailing spaces hang (the logical line end).
@@ -1827,12 +1962,20 @@ pub(super) fn layout_inline(
                 }
             }
         }
+        if floats.is_some() && (ascent + descent - assumed_line).abs() > EPSILON {
+            // A line taller or shorter than the strut: the opportunities
+            // were computed for the wrong block offsets.
+            return None;
+        }
         built.push(Line {
             items: placed,
             width: align_width,
             ascent,
             descent,
             subtrees,
+            top: line_top,
+            offset: line_offset,
+            available,
         });
     }
 
@@ -1842,7 +1985,11 @@ pub(super) fn layout_inline(
     // (line, inline offset, width, baseline) of each placed item.
     let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; items.len()];
     for (line_index, line) in built.into_iter().enumerate() {
-        let offset = align_offset(container, available - line.width);
+        if floats.is_some() {
+            top = line.top;
+        }
+        let available = line.available;
+        let offset = line.offset + align_offset(container, available - line.width);
         let baseline = top + line.ascent;
         last_line_baseline = Some(baseline);
         for (k, x, width) in line.items {
@@ -1862,7 +2009,7 @@ pub(super) fn layout_inline(
                 // The engine's <br> marker: a zero-height full-width rect at
                 // the line end, painting nothing.
                 out.push((
-                    0.0,
+                    line.offset,
                     top + line.ascent + line.descent,
                     BoxFragment {
                         index: item.index,

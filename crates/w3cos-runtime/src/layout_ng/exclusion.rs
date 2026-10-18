@@ -72,6 +72,35 @@ impl ExclusionSpace {
         })
     }
 
+    /// The band [top, top + height): the rightmost left-float margin edge
+    /// and the leftmost right-float margin edge intersecting it
+    /// (NGExclusionSpace::FindLayoutOpportunity for line boxes).
+    pub fn band(&self, top: f32, height: f32) -> (Option<f32>, Option<f32>) {
+        let mut left: Option<f32> = None;
+        let mut right: Option<f32> = None;
+        for e in &self.exclusions {
+            if e.right <= e.left || e.bottom <= top || e.top >= top + height.max(1.0 / 64.0) {
+                continue;
+            }
+            if e.is_left {
+                left = Some(left.map_or(e.right, |l| l.max(e.right)));
+            } else {
+                right = Some(right.map_or(e.left, |r| r.min(e.left)));
+            }
+        }
+        (left, right)
+    }
+
+    /// The nearest float bottom below `top` among floats intersecting the
+    /// band: where a line moved past floats goes next.
+    pub fn next_bottom(&self, top: f32, height: f32) -> Option<f32> {
+        self.exclusions
+            .iter()
+            .filter(|e| e.right > e.left && e.bottom > top && e.top < top + height.max(1.0 / 64.0))
+            .map(|e| e.bottom)
+            .reduce(f32::min)
+    }
+
     /// PositionFloat over NGLayoutOpportunity bands: the border-box offset
     /// of a float whose margin box is `width` x `height`, in a containing
     /// block spanning `start..end` inline, at or below `block_start`.
