@@ -1,0 +1,60 @@
+name: test262
+
+# M1 item 14 test262 gate (docs/roadmap/aot-port.md). Every test is compiled
+# through the AOT pipeline (front end -> W3IR -> Rust -> rustc) and run natively.
+# - `subset`: aot-port PRs/pushes run the VS Code-priority subset
+#   (tests/test262/subset.txt). Any test outside
+#   tests/test262/expected-failures.txt that fails is a regression.
+# - `full`: built-ins + language + annexB, report uploaded as an artifact.
+#   Nightly runs come from the main-branch trigger (test262-nightly.yml),
+#   since GitHub only fires `schedule` on the default branch.
+on:
+  pull_request:
+    branches: [aot-port]
+  push:
+    branches: [aot-port]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  subset:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test262 subset (no regressions vs expected failures)
+        run: scripts/test262.sh subset --jobs 4 --build-jobs 2 --timeout 30
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-subset
+          path: target/test262-report
+          if-no-files-found: ignore
+
+  full:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test262 full run
+        run: scripts/test262.sh full --jobs 4 --build-jobs 2
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-full
+          path: target/test262-report
+          if-no-files-found: ignore
