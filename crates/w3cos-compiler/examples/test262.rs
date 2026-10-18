@@ -115,6 +115,9 @@ fn parse_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Tests above this size are reported unsupported instead of compiled.
+const MAX_TEST_SOURCE: usize = 64 * 1024;
+
 fn parse_meta(source: &str) -> Meta {
     let mut meta = Meta::default();
     let Some(start) = source.find("/*---") else {
@@ -547,6 +550,50 @@ fn manifest(workspace: &Path) -> String {
     )
 }
 
+/// Upper bound for one batch's `cargo build`.
+const BUILD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// `Command::output` with a deadline; `None` when the child was killed.
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cargo");
+    // Drain pipes on threads so a chatty child cannot block on a full pipe.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
+    let err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        buf
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => return None,
+        }
+    };
+    Some(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<String, String> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -714,13 +761,20 @@ fn build_batch(
         std::fs::write(dir.join("src/main.rs"), crate_source(&code, &map, &slots)).unwrap();
         std::fs::write(dir.join("Cargo.toml"), manifest(workspace)).unwrap();
         let target = ws.work.join(format!("target/slot{slot}"));
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let mut build = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        build
             .args(["build", "--offline", "--quiet", "--message-format=short"])
             .current_dir(&dir)
             .env("CARGO_TARGET_DIR", &target)
-            .env_remove("RUSTFLAGS")
-            .output()
-            .expect("cargo");
+            .env_remove("RUSTFLAGS");
+        let Some(output) = output_with_timeout(build, BUILD_TIMEOUT) else {
+            let mut r = results.lock().unwrap();
+            for &index in &members {
+                r.entry(index)
+                    .or_insert_with(|| Outcome::Fail("build: timeout".into()));
+            }
+            return None;
+        };
         if output.status.success() {
             let bin = dir.join("t262-batch");
             let _ = std::fs::copy(target.join("debug/t262-batch"), &bin);
@@ -954,6 +1008,11 @@ fn main() {
                     let Some(test) = tests.get(index) else { break };
                     let outcome = if test.has_flag("noStrict") {
                         Some(Outcome::Fail("unsupported: sloppy mode".into()))
+                    } else if test.source.len() > MAX_TEST_SOURCE {
+                        // Generated Unicode tables (language/identifiers/*unicode*,
+                        // property escapes) expand to 100+ MB of Rust and stall a
+                        // batch build for most of an hour.
+                        Some(Outcome::Fail("unsupported: oversized test source".into()))
                     } else {
                         let path = ws.write_test_module(test);
                         let early = test
