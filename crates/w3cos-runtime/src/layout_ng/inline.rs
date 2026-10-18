@@ -46,6 +46,10 @@ fn has_marker(style: &Style, key: &str) -> bool {
 }
 
 pub(super) const IFC_MARKER: &str = "--w3cos-internal-inline-formatting-context";
+/// Anonymous block box wrapping an inline run between block siblings
+/// (CSS 2.1 9.2.1.1, Blink LayoutBlockFlow::CreateAnonymousBlock): default
+/// box style with inherited text properties, no percentage containing block.
+pub(super) const ANONYMOUS_BLOCK_MARKER: &str = "--w3cos-internal-anonymous-block-line";
 /// On the root component in quirks mode (w3cos_dom QUIRKS_MODE_MARKER).
 const QUIRKS_MARKER: &str = "--w3cos-internal-quirks-mode";
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";

@@ -148,8 +148,11 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     match info.kind {
         ComponentKind::Root | ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => {
             if inline::is_inline_container(flat, index) {
-                unsupported_style(info.style, &[inline::IFC_MARKER])
-                    .or_else(|| inline::container_reason(flat, index))
+                unsupported_style(
+                    info.style,
+                    &[inline::IFC_MARKER, inline::ANONYMOUS_BLOCK_MARKER],
+                )
+                .or_else(|| inline::container_reason(flat, index))
             } else {
                 unsupported_style(info.style, &[])
             }
@@ -220,6 +223,7 @@ pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
                     key.starts_with("--w3cos-internal")
                         && !is_value_carrier_marker(key)
                         && key.as_str() != inline::IFC_MARKER
+                        && key.as_str() != inline::ANONYMOUS_BLOCK_MARKER
                         && key.as_str() != inline::LINE_WIDTH_MARKER
                 })
                 .map(|key| key.trim_start_matches("--w3cos-internal-").to_string())
@@ -412,10 +416,20 @@ pub(super) fn layout_block(
         }
         h
     };
+    let anonymous_block = style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
     // A definite height, after min/max, is the children's percentage basis.
     let child_space = ConstraintSpace {
         available_inline: metrics.content_width,
-        percentage_block: specified_height.map(clamp_h),
+        // Anonymous blocks are skipped when finding the percentage
+        // containing block (CSS 2.1 10.5).
+        percentage_block: if anonymous_block {
+            space.percentage_block
+        } else {
+            specified_height.map(clamp_h)
+        },
         viewport_w: space.viewport_w,
         viewport_h: space.viewport_h,
     };
