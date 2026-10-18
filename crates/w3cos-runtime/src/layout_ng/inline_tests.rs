@@ -849,3 +849,170 @@ fn inline_box_edges_take_advance_not_line_height() {
         assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
     }
 }
+
+/// Nested inline boxes (NGInlineBoxState stack): text in a box aligns on
+/// the shared baseline with the box's own strut, open/close tags add the
+/// boxes' inline edges, and each box gets one border-box fragment around its
+/// font content area.  Rects from Chrome (Ahem):
+///   <div>AA <span fs10 lh30px>BB <span fs40 lh1>CC</span> DD</span> EE</div>
+///   <div>AA <span padding:3px 7px;border:5px;margin:0 4px>BB
+///        <span padding:0 2px;fs30 lh1>CC</span></span> DD</div>
+///   <div width:100px>AAAA <span fs10 lh1>BB</span> CC</div>
+///   <div center>A <span padding:0 10px;fs30 lh50px>B</span></div>
+#[test]
+fn nested_inline_boxes_share_the_baseline() {
+    let _ahem = AhemGuard::new();
+    let container = |width: f32, align: TextAlign| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            text_align: align,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let styled = |size: f32, lh: LineHeight| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, size, lh);
+        style
+    };
+    let text =
+        |content: &str, size: f32, lh: LineHeight| Component::text(content, styled(size, lh));
+    let px = Spacing::Px;
+    let n1 = LineHeight::Number(1.0);
+    let s3 = Style {
+        padding: Edges {
+            top: px(3.0),
+            right: px(7.0),
+            bottom: px(3.0),
+            left: px(7.0),
+        },
+        margin: Edges {
+            top: px(0.0),
+            right: px(4.0),
+            bottom: px(0.0),
+            left: px(4.0),
+        },
+        border_width: 5.0,
+        ..styled(20.0, n1)
+    };
+    let s4 = Style {
+        padding: Edges {
+            top: px(0.0),
+            right: px(2.0),
+            bottom: px(0.0),
+            left: px(2.0),
+        },
+        ..styled(30.0, n1)
+    };
+    let s6 = Style {
+        padding: Edges {
+            top: px(0.0),
+            right: px(10.0),
+            bottom: px(0.0),
+            left: px(10.0),
+        },
+        ..styled(30.0, LineHeight::Px(50.0))
+    };
+    let lh30 = LineHeight::Px(30.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(300.0, TextAlign::Start),
+                vec![
+                    text("AA ", 20.0, n1),
+                    Component::boxed(
+                        styled(10.0, lh30),
+                        vec![
+                            text("BB ", 10.0, lh30),
+                            Component::boxed(styled(40.0, n1), vec![text("CC", 40.0, n1)]),
+                            text(" DD", 10.0, lh30),
+                        ],
+                    ),
+                    text(" EE", 20.0, n1),
+                ],
+            ),
+            Component::boxed(
+                container(300.0, TextAlign::Start),
+                vec![
+                    text("AA ", 20.0, n1),
+                    Component::boxed(
+                        s3,
+                        vec![
+                            text("BB ", 20.0, n1),
+                            Component::boxed(s4, vec![text("CC", 30.0, n1)]),
+                        ],
+                    ),
+                    text(" DD", 20.0, n1),
+                ],
+            ),
+            Component::boxed(
+                container(100.0, TextAlign::Start),
+                vec![
+                    text("AAAA ", 20.0, n1),
+                    Component::boxed(styled(10.0, n1), vec![text("BB", 10.0, n1)]),
+                    text(" CC", 20.0, n1),
+                ],
+            ),
+            Component::boxed(
+                container(300.0, TextAlign::Center),
+                vec![
+                    text("A ", 20.0, n1),
+                    Component::boxed(s6, vec![text("B", 30.0, LineHeight::Px(50.0))]),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 24] = [
+        (1, [0.0, 0.0, 300.0, 44.0]),
+        (2, [0.0, 16.0, 60.0, 20.0]),
+        (3, [60.0, 24.0, 140.0, 10.0]),
+        (4, [60.0, 24.0, 30.0, 10.0]),
+        (5, [90.0, 0.0, 80.0, 40.0]),
+        (6, [90.0, 0.0, 80.0, 40.0]),
+        (7, [170.0, 24.0, 30.0, 10.0]),
+        (8, [200.0, 16.0, 60.0, 20.0]),
+        (9, [0.0, 44.0, 300.0, 30.0]),
+        (10, [0.0, 52.0, 60.0, 20.0]),
+        (11, [64.0, 44.0, 148.0, 36.0]),
+        (12, [76.0, 52.0, 60.0, 20.0]),
+        (13, [136.0, 44.0, 64.0, 30.0]),
+        (14, [138.0, 44.0, 60.0, 30.0]),
+        (15, [216.0, 52.0, 60.0, 20.0]),
+        (16, [0.0, 74.0, 100.0, 40.0]),
+        (17, [0.0, 74.0, 80.0, 20.0]),
+        (18, [0.0, 102.0, 20.0, 10.0]),
+        (19, [0.0, 102.0, 20.0, 10.0]),
+        (20, [20.0, 94.0, 60.0, 20.0]),
+        (21, [0.0, 114.0, 300.0, 50.0]),
+        (22, [105.0, 132.0, 40.0, 20.0]),
+        (23, [145.0, 124.0, 50.0, 30.0]),
+        (24, [155.0, 124.0, 30.0, 30.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

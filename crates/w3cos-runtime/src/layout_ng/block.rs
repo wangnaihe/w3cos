@@ -129,7 +129,7 @@ fn unsupported_style(style: &Style, allowed: &[&str]) -> Option<&'static str> {
 
 /// Internal markers mean a legacy projection owns this box, except value
 /// carriers and the markers the current stage interprets (`allowed`).
-fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'static str> {
+pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'static str> {
     style
         .custom_properties
         .as_ref()
@@ -147,7 +147,10 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     match info.kind {
         ComponentKind::Root | ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => {
-            if inline::is_inline_container(flat, index) {
+            if inline::is_inline_box(flat, index) {
+                // Validated with its IFC container (container_reason).
+                (!inline::in_inline_container(flat, index)).then_some("display:inline")
+            } else if inline::is_inline_container(flat, index) {
                 unsupported_style(
                     info.style,
                     &[inline::IFC_MARKER, inline::ANONYMOUS_BLOCK_MARKER],
@@ -163,10 +166,7 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         ComponentKind::Text { .. } => {
             // Validated with its container (container_reason).
-            let in_ifc = info
-                .parent
-                .is_some_and(|p| inline::is_inline_container(flat, p));
-            if !in_ifc {
+            if !inline::in_inline_container(flat, index) {
                 Some("ifc:mixed")
             } else {
                 unsupported_marker(info.style, &[inline::LINE_WIDTH_MARKER])

@@ -289,12 +289,145 @@ fn rendered_children<'a>(
     })
 }
 
-/// True when the block container's rendered children are inline text.
+/// An inline box the cascade keeps as a box (a `<span>` around content
+/// with its own font or edges); its text leaves are items of the enclosing
+/// IFC.
+pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
+    matches!(
+        flat[index].kind,
+        ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+    ) && flat[index].style.display == Display::Inline
+}
+
+/// True when the block container's rendered children are inline content.
 pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
-    rendered_children(flat, index).next().is_some_and(|child| {
-        matches!(flat[child].kind, ComponentKind::Text { .. })
-            && flat[child].style.display == Display::Inline
-    })
+    !is_inline_box(flat, index)
+        && rendered_children(flat, index).next().is_some_and(|child| {
+            (matches!(flat[child].kind, ComponentKind::Text { .. })
+                && flat[child].style.display == Display::Inline)
+                || is_inline_box(flat, child)
+        })
+}
+
+/// True when `index` sits (through inline boxes) in an IFC container.
+pub(super) fn in_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let mut parent = flat[index].parent;
+    while let Some(p) = parent {
+        if !is_inline_box(flat, p) {
+            return is_inline_container(flat, p);
+        }
+        parent = flat[p].parent;
+    }
+    false
+}
+
+/// NGInlineNode::CollectInlines: the IFC's leaves in order with the open
+/// and close tags of the inline boxes around them (kOpenTag/kCloseTag
+/// items).  Leaves of other kinds are rejected by the gate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InlineEntry {
+    Open(usize),
+    Leaf(usize),
+    Close(usize),
+}
+
+fn collect_inlines(flat: &[FlatNodeInfo], index: usize) -> Vec<InlineEntry> {
+    fn walk(flat: &[FlatNodeInfo], index: usize, out: &mut Vec<InlineEntry>) {
+        for child in rendered_children(flat, index) {
+            if is_inline_box(flat, child) {
+                out.push(InlineEntry::Open(child));
+                walk(flat, child, out);
+                out.push(InlineEntry::Close(child));
+            } else {
+                out.push(InlineEntry::Leaf(child));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(flat, index, &mut out);
+    out
+}
+
+/// Why an inline box (its open tag at `entries[0]`) is outside S2.
+fn inline_box_reason(
+    flat: &[FlatNodeInfo],
+    entries: &[InlineEntry],
+    container: &Style,
+) -> Option<&'static str> {
+    use w3cos_std::style::Spacing;
+    let InlineEntry::Open(index) = entries[0] else {
+        return None;
+    };
+    let style = flat[index].style;
+    if super::block::unsupported_marker(style, &[]).is_some() {
+        return Some("internal-marker");
+    }
+    if style.position != Position::Static || style.float != Float::None {
+        return Some("text:positioned");
+    }
+    if style.direction != TextDirection::Ltr {
+        return Some("direction");
+    }
+    if style.white_space != container.white_space {
+        return Some("text:white-space");
+    }
+    if !matches!(
+        style.align_self,
+        w3cos_std::style::AlignSelf::Auto | w3cos_std::style::AlignSelf::Baseline
+    ) {
+        return Some("vertical-align");
+    }
+    let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
+    let m = style.margin_lengths();
+    if ![
+        style.padding.top,
+        style.padding.right,
+        style.padding.bottom,
+        style.padding.left,
+        style.margin.left,
+        style.margin.right,
+    ]
+    .into_iter()
+    .all(absolute)
+        || m.left < 0.0
+        || m.right < 0.0
+    {
+        return Some("inline-box:edges");
+    }
+    // The box's strut (NGInlineBoxState text metrics) is taken from text it
+    // holds directly in its own font, which always gets a fragment.
+    let strut_text = rendered_children(flat, index).any(|child| {
+        matches!(flat[child].kind, ComponentKind::Text { content }
+            if !content.trim_matches(' ').is_empty() && content != FORCED_BREAK)
+            && same_font(flat[child].style, style)
+    });
+    if !strut_text {
+        return Some("inline-box:strut");
+    }
+    // An edge next to a collapsible space needs the space handling at
+    // inline box boundaries.
+    let close = entries
+        .iter()
+        .position(|&e| e == InlineEntry::Close(index))
+        .unwrap_or(entries.len());
+    let leaf_text = |e: &InlineEntry| match *e {
+        InlineEntry::Leaf(c) => match flat[c].kind {
+            ComponentKind::Text { content } => Some(content.as_str()),
+            _ => Some(""),
+        },
+        _ => None,
+    };
+    let edges = InlineEdges::of(style);
+    let first = entries[..close].iter().find_map(leaf_text).unwrap_or("");
+    let last = entries[..close]
+        .iter()
+        .rev()
+        .find_map(leaf_text)
+        .unwrap_or("");
+    if (edges.start != 0.0 && first.starts_with(' ')) || (edges.end != 0.0 && last.ends_with(' ')) {
+        return Some("inline-box:edge-space");
+    }
+    None
 }
 
 /// Why this IFC container (and its items) is outside S2a.
@@ -329,9 +462,19 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     ) {
         return Some("text:white-space");
     }
-    let children: Vec<usize> = rendered_children(flat, index).collect();
-    let sole = children.len() == 1;
-    for child in children {
+    let entries = collect_inlines(flat, index);
+    let sole = matches!(entries[..], [InlineEntry::Leaf(_)]);
+    for (position, &entry) in entries.iter().enumerate() {
+        let child = match entry {
+            InlineEntry::Open(_) => {
+                if let Some(reason) = inline_box_reason(flat, &entries[position..], style) {
+                    return Some(reason);
+                }
+                continue;
+            }
+            InlineEntry::Close(_) => continue,
+            InlineEntry::Leaf(child) => child,
+        };
         let info = &flat[child];
         let ComponentKind::Text { content } = info.kind else {
             return Some("ifc:atomic-or-span");
@@ -401,6 +544,11 @@ struct InlineItem {
     forced: bool,
     /// Edges of the inline box this item starts/ends/sits in.
     edges: InlineEdges,
+    /// Inline-start / inline-end edges of the enclosing inline boxes
+    /// opened right before / closed right after this item (NGInlineBoxState
+    /// kOpenTag/kCloseTag advances).
+    box_start: f32,
+    box_end: f32,
     /// A soft-wrap opportunity inside the item's non-space core: NG keeps
     /// one fragment per item, so a line that needs it falls back.
     internal_break: bool,
@@ -595,10 +743,57 @@ pub(super) fn layout_inline(
 ) -> Option<InlineResult> {
     let container = flat[index].style;
     let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
-    let children: Vec<usize> = rendered_children(flat, index).collect();
+    let entries = collect_inlines(flat, index);
+    let children: Vec<usize> = entries
+        .iter()
+        .filter_map(|e| match *e {
+            InlineEntry::Leaf(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let has_boxes = children.len() != entries.len();
+    // Each leaf's open tags before it (outer first) and close tags after it
+    // (inner first).
+    let mut opens: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
+    let mut closes: Vec<Vec<usize>> = vec![Vec::new(); children.len()];
+    {
+        let mut leaf = 0;
+        let mut pending = Vec::new();
+        for entry in &entries {
+            match *entry {
+                InlineEntry::Open(b) => pending.push(b),
+                InlineEntry::Leaf(_) => {
+                    opens[leaf] = std::mem::take(&mut pending);
+                    leaf += 1;
+                }
+                InlineEntry::Close(b) => {
+                    if leaf == 0 {
+                        return None;
+                    }
+                    closes[leaf - 1].push(b);
+                }
+            }
+        }
+        if !pending.is_empty() {
+            return None;
+        }
+    }
+    let start_edges = |boxes: &[usize]| -> f32 {
+        boxes
+            .iter()
+            .map(|&b| InlineEdges::of(flat[b].style).start)
+            .sum()
+    };
+    let end_edges = |boxes: &[usize]| -> f32 {
+        boxes
+            .iter()
+            .map(|&b| InlineEdges::of(flat[b].style).end)
+            .sum()
+    };
 
     // Paragraph leaf: paint wraps the text inside the line-width rect.
-    if let [child] = children[..]
+    if !has_boxes
+        && let [child] = children[..]
         && has_marker(flat[child].style, LINE_WIDTH_MARKER)
     {
         let style = flat[child].style;
@@ -648,7 +843,8 @@ pub(super) fn layout_inline(
     // Preserved newlines in a sole pre / pre-wrap leaf: one line per segment
     // (pre-wrap only when none wraps).  The engine's rect is the first
     // line's content box, as wide as the widest line and aligned by it.
-    if let [child] = children[..]
+    if !has_boxes
+        && let [child] = children[..]
         && let ComponentKind::Text { content } = flat[child].kind
         && content.contains('\n')
     {
@@ -697,7 +893,12 @@ pub(super) fn layout_inline(
     while start < children.len() {
         let first = flat[children[start]].style;
         let mut end = start + 1;
-        while end < children.len() && same_run(first, flat[children[end]].style) {
+        // A box boundary ends the shaping run.
+        while end < children.len()
+            && opens[end].is_empty()
+            && closes[end - 1].is_empty()
+            && same_run(first, flat[children[end]].style)
+        {
             end += 1;
         }
         let texts: Vec<&str> = children[start..end]
@@ -737,7 +938,10 @@ pub(super) fn layout_inline(
             } else {
                 advances[offset]
             };
-            let raw = text_raw + inline_edges;
+            let k = start + offset;
+            let box_start = start_edges(&opens[k]);
+            let box_end = end_edges(&closes[k]);
+            let raw = text_raw + inline_edges + box_start + box_end;
             let (height, baseline) = text_line_metrics(content, style);
             items.push(InlineItem {
                 index: child,
@@ -746,7 +950,7 @@ pub(super) fn layout_inline(
                 raw_hang: if container.white_space == WhiteSpace::Pre {
                     raw
                 } else {
-                    hang_advance(content, text_raw, measure) + inline_edges
+                    hang_advance(content, text_raw, measure) + inline_edges + box_start + box_end
                 },
                 run,
                 starts_space: content.starts_with(' '),
@@ -754,6 +958,8 @@ pub(super) fn layout_inline(
                 whitespace_only: content.trim_end_matches(' ').is_empty(),
                 forced: content == FORCED_BREAK,
                 edges,
+                box_start,
+                box_end,
                 // Preserved leading spaces (pre-wrap) end in an opportunity
                 // inside the item too; collapsible ones vanish at a line start.
                 internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char)
@@ -919,8 +1125,10 @@ pub(super) fn layout_inline(
     }
 
     let mut top = 0.0f32;
-    let mut out = Vec::with_capacity(items.len());
-    for line in built {
+    let mut out = Vec::with_capacity(items.len() + entries.len() - children.len());
+    // (line, inline offset, width, baseline) of each placed item.
+    let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; items.len()];
+    for (line_index, line) in built.into_iter().enumerate() {
         let offset = align_offset(container, available - line.width);
         let baseline = top + line.ascent;
         for (k, x, width) in line.items {
@@ -940,21 +1148,60 @@ pub(super) fn layout_inline(
                 ));
                 continue;
             }
+            placed[k] = Some((line_index, offset + x, width, baseline));
             // The engine's rect is the item's border box: margins excluded,
             // block-axis padding/border around the font content box.
             let e = item.edges;
             out.push((
-                offset + x + e.margin_start,
+                offset + x + item.box_start + e.margin_start,
                 baseline - item.content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
-                    width: width - e.margin_start - e.margin_end,
+                    width: width - item.box_start - item.box_end - e.margin_start - e.margin_end,
                     height: item.font_height + e.top + e.bottom,
                     children: Vec::new(),
                 },
             ));
         }
         top += line.ascent + line.descent;
+    }
+    // Inline box fragments (NGInlineBoxState::CreateBoxFragment): the border
+    // box from the first to the last item's edges, block-axis padding and
+    // border around the box's font content area.  A box split across lines
+    // has several fragments; the engine keeps one rect, so legacy lays it out.
+    if has_boxes {
+        let mut starts: std::collections::HashMap<usize, (usize, f32, f32)> =
+            std::collections::HashMap::new();
+        for (k, boxes) in opens.iter().enumerate() {
+            for (pos, &b) in boxes.iter().enumerate() {
+                let (line, x, _, baseline) = placed[k]?;
+                let start =
+                    x + start_edges(&boxes[..pos]) + InlineEdges::of(flat[b].style).margin_start;
+                starts.insert(b, (line, start, baseline));
+            }
+        }
+        for (k, boxes) in closes.iter().enumerate() {
+            for (pos, &b) in boxes.iter().enumerate() {
+                let (line, x, width, _) = placed[k]?;
+                let (start_line, start, baseline) = starts.get(&b).copied()?;
+                if start_line != line {
+                    return None;
+                }
+                let style = flat[b].style;
+                let e = InlineEdges::of(style);
+                let end = x + width - end_edges(&boxes[pos + 1..]) - e.margin_end;
+                out.push((
+                    start,
+                    baseline - inline_font_content_ascent(style) - e.top,
+                    BoxFragment {
+                        index: b,
+                        width: end - start,
+                        height: inline_font_height(style) + e.top + e.bottom,
+                        children: Vec::new(),
+                    },
+                ));
+            }
+        }
     }
     Some(InlineResult {
         height: top,
