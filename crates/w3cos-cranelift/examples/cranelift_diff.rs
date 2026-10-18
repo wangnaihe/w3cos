@@ -46,10 +46,7 @@ assert.throws = function (expectedErrorConstructor, func, message) {
 
 /// Divergences where the Cranelift backend follows the spec and the rustc
 /// backend does not. Reported, but they do not fail the run.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[(
-    "corpus/tdz",
-    "rustc backend reads an uninitialized function-local `let` without the TDZ ReferenceError",
-)];
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
 
 /// (name, source, bench) — sources report their result by throwing a string.
 const CORPUS: &[(&str, &str, bool)] = &[
@@ -140,6 +137,31 @@ const CORPUS: &[(&str, &str, bool)] = &[
         false,
     ),
     (
+        "tdz-numeric-binding",
+        "function f() { try { x; } catch (e) { return 'tdz:' + e.name; } let x = 1; x = x + 1; return 'no' + x; } throw 'R:' + f();",
+        false,
+    ),
+    (
+        "tdz-const",
+        "function f() { var r; try { r = k * 2; } catch (e) { r = e.name; } const k = 21; return r + ',' + k * 2; } throw 'R:' + f();",
+        false,
+    ),
+    (
+        "var-before-store",
+        "function f() { var r = y; var y = 7; return r + ',' + y; } throw 'R:' + f();",
+        false,
+    ),
+    (
+        "tdz-hoisted-closure",
+        "function f() { var r; try { r = g(); } catch (e) { r = e.name; } const n = 5; return r + ',' + g(); function g() { return n + 1; } } throw 'R:' + f();",
+        false,
+    ),
+    (
+        "const-forwarded-after-init",
+        "function f() { const n = 3; var s = 0; for (var i = 0; i < 10; i++) { s += n; } var h = function () { return n * 2; }; return s + h(); } throw 'R:' + f();",
+        false,
+    ),
+    (
         "this-call-apply",
         "var o = { v: 4, m: function (a) { return this.v + a; } }; var m = o.m; throw 'R:' + o.m(1) + ',' + m.call({ v: 10 }, 2) + ',' + m.apply({ v: 20 }, [3]);",
         false,
@@ -168,6 +190,16 @@ const CORPUS: &[(&str, &str, bool)] = &[
     (
         "bench-fib",
         "function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); } throw 'R:' + fib(25);",
+        true,
+    ),
+    (
+        "bench-const-hoisted",
+        "function outer() { const M = 1000003; const K = 3; return sum(5000000); function sum(n) { var t = 0; for (var i = 0; i < n; i++) { t = (t + i * K) % M; } return t; } } throw 'R:' + outer();",
+        true,
+    ),
+    (
+        "bench-const-literal",
+        "function outer() { return sum(5000000); function sum(n) { var t = 0; for (var i = 0; i < n; i++) { t = (t + i * 3) % 1000003; } return t; } } throw 'R:' + outer();",
         true,
     ),
     (
