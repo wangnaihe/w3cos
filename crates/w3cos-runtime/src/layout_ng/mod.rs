@@ -102,10 +102,31 @@ pub(crate) struct BoxFragment {
     pub children: Vec<(f32, f32, BoxFragment)>,
 }
 
+/// The last line box's baseline (NGBoxFragment::LastBaseline), as an
+/// offset from the border-box top.  `Unknown` where paint lays out the
+/// lines (a wrapped paragraph leaf): an inline-block depending on it falls
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LastBaseline {
+    NoLines,
+    At(f32),
+    Unknown,
+}
+
+impl LastBaseline {
+    pub fn offset(self, by: f32) -> Self {
+        match self {
+            LastBaseline::At(b) => LastBaseline::At(b + by),
+            other => other,
+        }
+    }
+}
+
 /// NGLayoutResult.
 #[derive(Debug, Clone)]
 pub(crate) struct LayoutResult {
     pub fragment: BoxFragment,
+    pub last_baseline: LastBaseline,
     /// Collapsible margins adjoining the top border edge (own margin-top,
     /// plus first-child margins when nothing separates them).  The parent
     /// places the border box after this strut has been resolved.

@@ -7,7 +7,7 @@
 //! (border, padding, in-flow content, BFC root) is reached.  Width follows
 //! CSS2 10.3.3, height 10.6.3, min/max 10.4/10.7, collapsing 8.3.1.
 
-use super::{BoxFragment, ConstraintSpace, LayoutResult, MarginStrut, inline};
+use super::{BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStrut, inline};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::ComponentKind;
 use w3cos_std::style::{
@@ -59,10 +59,15 @@ fn is_value_carrier_marker(key: &str) -> bool {
 /// Why a box is outside the current stage (`None`: supported).  The reason
 /// is reported by `W3COS_LAYOUT_NG_TRACE` for coverage accounting.
 fn unsupported_style(style: &Style, allowed: &[&str]) -> Option<&'static str> {
+    unsupported_box_style(style, allowed, false)
+}
+
+/// `atomic`: an inline-block in an IFC (its display is the IFC's concern).
+fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Option<&'static str> {
     if let Some(reason) = unsupported_marker(style, allowed) {
         return Some(reason);
     }
-    if !matches!(style.display, Display::Block | Display::FlowRoot) {
+    if !atomic && !matches!(style.display, Display::Block | Display::FlowRoot) {
         return Some(match style.display {
             Display::Inline => "display:inline",
             Display::InlineBlock => "display:inline-block",
@@ -150,6 +155,21 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             if inline::is_inline_box(flat, index) {
                 // Validated with its IFC container (container_reason).
                 (!inline::in_inline_container(flat, index)).then_some("display:inline")
+            } else if inline::is_atomic_inline(flat, index) {
+                if !inline::in_inline_container(flat, index) {
+                    return Some("display:inline-block");
+                }
+                let own = if inline::is_inline_container(flat, index) {
+                    unsupported_box_style(
+                        info.style,
+                        &[inline::IFC_MARKER, inline::ANONYMOUS_BLOCK_MARKER],
+                        true,
+                    )
+                    .or_else(|| inline::container_reason(flat, index))
+                } else {
+                    unsupported_box_style(info.style, &[], true)
+                };
+                own.or_else(|| inline::atomic_inline_reason(info.style))
             } else if inline::is_inline_container(flat, index) {
                 unsupported_style(
                     info.style,
@@ -444,14 +464,20 @@ pub(super) fn layout_block(
     let mut cursor = 0.0f32;
     let mut at_top = true; // no in-flow content placed yet
     let mut children = Vec::new();
+    // Offset of the content box from the border box.
+    let content_top = bt + pt;
+    let mut last_baseline = LastBaseline::NoLines;
 
     if let ComponentKind::Text { content } = info.kind {
         // Block-level text leaf: in-flow content of its own.
-        cursor = inline::block_text_height(content, metrics.content_width, style);
+        let (height, baseline) = inline::block_text_layout(content, metrics.content_width, style);
+        cursor = height;
+        last_baseline = baseline.offset(content_top);
         at_top = false;
     } else if inline::is_inline_container(flat, index) {
-        let result = inline::layout_inline(flat, index, metrics.content_width)?;
+        let result = inline::layout_inline(flat, index, &child_space)?;
         cursor = result.height;
+        last_baseline = result.last_baseline.offset(content_top);
         at_top = result.children.is_empty();
         children.extend(
             result
@@ -503,6 +529,9 @@ pub(super) fn layout_block(
             pending = result.end_strut;
             at_top = false;
         }
+        if result.last_baseline != LastBaseline::NoLines {
+            last_baseline = result.last_baseline.offset(bt + pt + y);
+        }
         children.push((x, bt + pt + y, result.fragment));
         child = next;
     }
@@ -551,6 +580,7 @@ pub(super) fn layout_block(
     }
 
     Some(LayoutResult {
+        last_baseline,
         fragment: BoxFragment {
             index,
             width: metrics.content_width + bl + br + pl + pr,

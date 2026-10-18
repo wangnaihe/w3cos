@@ -1156,3 +1156,153 @@ fn line_relative_vertical_align_places_subtrees() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// Inline-blocks as atomic inlines (NGInlineItem kAtomicInline): the margin
+/// box is the item, its baseline the last line box's or, without one, the
+/// bottom margin edge (CSS 2.1 10.8.1); lines may break before and after it.
+/// Rects from Chrome (Ahem):
+///   <div>AA <ib 50x40 margin:3px 4px;border:2px;padding:1px></ib> BB</div>
+///   <div>AA <ib width:60px;fs10 lh1;padding-top:5px>xy</ib> BB</div>
+///   <div width:100px>AAAA<ib 40x10></ib>BB</div>
+///   <div>AA<ib 20x20 margin-bottom:10px></ib></div>
+#[test]
+fn inline_blocks_are_atomic_items() {
+    let _ahem = AhemGuard::new();
+    let container = |width: f32| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let n1 = LineHeight::Number(1.0);
+    let text = |content: &str, size: f32| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, size, LineHeight::Number(1.0));
+        Component::text(content, style)
+    };
+    let px = Spacing::Px;
+    let edges = |t: f32, r: f32, b: f32, l: f32| Edges {
+        top: px(t),
+        right: px(r),
+        bottom: px(b),
+        left: px(l),
+    };
+    let ib = |w: f32, h: Option<f32>, margin: Edges, padding: Edges, border: f32, size: f32| {
+        let mut style = Style {
+            display: Display::InlineBlock,
+            width: Dimension::Px(w),
+            height: h.map_or(Dimension::Auto, Dimension::Px),
+            margin,
+            padding,
+            border_width: border,
+            ..Style::default()
+        };
+        font(&mut style, size, n1);
+        style
+    };
+    let zero = edges(0.0, 0.0, 0.0, 0.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("AA ", 20.0),
+                    Component::boxed(
+                        ib(
+                            50.0,
+                            Some(40.0),
+                            edges(3.0, 4.0, 3.0, 4.0),
+                            edges(1.0, 1.0, 1.0, 1.0),
+                            2.0,
+                            20.0,
+                        ),
+                        vec![],
+                    ),
+                    text(" BB", 20.0),
+                ],
+            ),
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("AA ", 20.0),
+                    Component::boxed(
+                        ib(60.0, None, zero, edges(5.0, 0.0, 0.0, 0.0), 0.0, 10.0),
+                        vec![text("xy", 10.0)],
+                    ),
+                    text(" BB", 20.0),
+                ],
+            ),
+            Component::boxed(
+                container(100.0),
+                vec![
+                    text("AAAA", 20.0),
+                    Component::boxed(ib(40.0, Some(10.0), zero, zero, 0.0, 20.0), vec![]),
+                    text("BB", 20.0),
+                ],
+            ),
+            Component::boxed(
+                container(300.0),
+                vec![
+                    text("AA", 20.0),
+                    Component::boxed(
+                        ib(
+                            20.0,
+                            Some(20.0),
+                            edges(0.0, 0.0, 10.0, 0.0),
+                            zero,
+                            0.0,
+                            20.0,
+                        ),
+                        vec![],
+                    ),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 16] = [
+        (1, [0.0, 0.0, 300.0, 56.0]),
+        (2, [0.0, 36.0, 60.0, 20.0]),
+        (3, [64.0, 3.0, 56.0, 46.0]),
+        (4, [124.0, 36.0, 60.0, 20.0]),
+        (5, [0.0, 56.0, 300.0, 20.0]),
+        (6, [0.0, 56.0, 60.0, 20.0]),
+        (7, [60.0, 59.0, 60.0, 15.0]),
+        (8, [60.0, 64.0, 20.0, 10.0]),
+        (9, [120.0, 56.0, 60.0, 20.0]),
+        (10, [0.0, 76.0, 100.0, 40.0]),
+        (11, [0.0, 76.0, 80.0, 20.0]),
+        (12, [0.0, 102.0, 40.0, 10.0]),
+        (13, [40.0, 96.0, 40.0, 20.0]),
+        (14, [0.0, 116.0, 300.0, 34.0]),
+        (15, [0.0, 130.0, 40.0, 20.0]),
+        (16, [40.0, 116.0, 20.0, 20.0]),
+    ];
+    let mut bad = Vec::new();
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        if [r.x, r.y, r.width, r.height] != want {
+            bad.push(format!(
+                "#{index}: {:?} want {want:?}",
+                [r.x, r.y, r.width, r.height]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

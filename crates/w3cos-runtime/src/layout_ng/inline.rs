@@ -25,7 +25,7 @@
 //! leaf, or the single `text-line-width` leaf of an IFC) is wrapped by paint
 //! inside its rect, so its height comes from the same wrapper paint uses.
 
-use super::BoxFragment;
+use super::{BoxFragment, ConstraintSpace, LastBaseline};
 use crate::layout::{
     FlatNodeInfo, inline_font_baseline_from_line_top, inline_font_content_ascent,
     inline_font_height, inline_style_line_height, inline_used_line_height, text_intrinsic_size,
@@ -386,6 +386,15 @@ pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
     ) && flat[index].style.display == Display::Inline
 }
 
+/// An inline-block box: an atomic inline (NGInlineItem kAtomicInline),
+/// laid out as its own block formatting context.
+pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
+    matches!(
+        flat[index].kind,
+        ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+    ) && flat[index].style.display == Display::InlineBlock
+}
+
 /// True when the block container's rendered children are inline content.
 pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
     !is_inline_box(flat, index)
@@ -393,7 +402,26 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
             (matches!(flat[child].kind, ComponentKind::Text { .. })
                 && flat[child].style.display == Display::Inline)
                 || is_inline_box(flat, child)
+                || is_atomic_inline(flat, child)
         })
+}
+
+/// Why an inline-block (its box and content checked by the block gate)
+/// is outside S2: shrink-to-fit widths need min/max-content sizes (NG
+/// ComputeMinMaxSizes), not here yet; auto inline margins are 0 for inline
+/// blocks; vertical-align other than baseline.
+pub(super) fn atomic_inline_reason(style: &Style) -> Option<&'static str> {
+    use w3cos_std::style::Spacing;
+    if style.width == Dimension::Auto {
+        return Some("inline-block:shrink-to-fit");
+    }
+    if matches!(style.margin.left, Spacing::Auto) || matches!(style.margin.right, Spacing::Auto) {
+        return Some("inline-block:auto-margin");
+    }
+    if valign_reason(style).is_some() || line_relative_align(style).is_some() {
+        return Some("vertical-align");
+    }
+    None
 }
 
 /// True when `index` sits (through inline boxes) in an IFC container.
@@ -574,6 +602,10 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             InlineEntry::Leaf(child) => child,
         };
         let info = &flat[child];
+        if is_atomic_inline(flat, child) {
+            // Validated by the block gate (node_reason).
+            continue;
+        }
         if line_relative_align(info.style).is_some() && !open.is_empty() {
             return Some("vertical-align-nested");
         }
@@ -656,6 +688,9 @@ struct InlineItem {
     /// A soft-wrap opportunity inside the item's non-space core: NG keeps
     /// one fragment per item, so a line that needs it falls back.
     internal_break: bool,
+    /// An atomic inline: its laid-out fragment and inline-start / block-
+    /// start margins (the item's advance and metrics are its margin box).
+    atomic: Option<(BoxFragment, f32, f32)>,
     /// Outside Latin-1: opportunities between such items (ideographs,
     /// dictionary breaks) are not modelled, so a line needing a break
     /// next to one falls back.
@@ -789,6 +824,8 @@ fn align_offset(style: &Style, free: f32) -> f32 {
 pub(super) struct InlineResult {
     pub height: f32,
     pub children: Vec<(f32, f32, BoxFragment)>,
+    /// The last line box's baseline from the content-box top.
+    pub last_baseline: LastBaseline,
 }
 
 /// Height of a paragraph leaf's text at `width` and whether it is a single
@@ -840,8 +877,17 @@ fn has_forced_break(content: &str, style: &Style) -> bool {
 }
 
 /// Content height of a block-level text leaf of content width `width`.
-pub(super) fn block_text_height(content: &str, width: f32, style: &Style) -> f32 {
-    paragraph_height(content, width, style, style, false).0
+/// Content height and last baseline of a block-level text leaf.
+pub(super) fn block_text_layout(content: &str, width: f32, style: &Style) -> (f32, LastBaseline) {
+    let (height, single, ascent) = paragraph_height(content, width, style, style, false);
+    (
+        height,
+        if single {
+            LastBaseline::At(ascent)
+        } else {
+            LastBaseline::Unknown
+        },
+    )
 }
 
 /// NGInlineLayoutAlgorithm for an S2a container of content width
@@ -850,8 +896,9 @@ pub(super) fn block_text_height(content: &str, width: f32, style: &Style) -> f32
 pub(super) fn layout_inline(
     flat: &[FlatNodeInfo],
     index: usize,
-    available: f32,
+    space: &ConstraintSpace,
 ) -> Option<InlineResult> {
+    let available = space.available_inline;
     let container = flat[index].style;
     let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
     let entries = collect_inlines(flat, index);
@@ -948,6 +995,11 @@ pub(super) fn layout_inline(
         };
         return Some(InlineResult {
             height,
+            last_baseline: if single {
+                LastBaseline::At(ascent)
+            } else {
+                LastBaseline::Unknown
+            },
             children: vec![(
                 0.0,
                 y,
@@ -989,6 +1041,7 @@ pub(super) fn layout_inline(
         let lines = content.split('\n').count() as f32;
         return Some(InlineResult {
             height: single * lines,
+            last_baseline: LastBaseline::Unknown,
             children: vec![(
                 align_offset(container, available - width),
                 ascent - inline_font_content_ascent(style),
@@ -1012,6 +1065,65 @@ pub(super) fn layout_inline(
     let mut start = 0;
     let mut run = 0;
     while start < children.len() {
+        if is_atomic_inline(flat, children[start]) {
+            // NGInlineItem kAtomicInline: a block formatting context root
+            // whose margin box is the item.  Its baseline is its last line
+            // box's, or the bottom margin edge without one (CSS 2.1 10.8.1).
+            let k = start;
+            let child = children[k];
+            let style = flat[child].style;
+            let result = super::block::layout_block(flat, child, space, true)?;
+            // Authored margins (no CSS2 10.3.3 over-constraint rule; auto is
+            // gated).
+            let side = |m| {
+                crate::layout::resolve_spacing_for_layout(
+                    m,
+                    available,
+                    style,
+                    space.viewport_w,
+                    space.viewport_h,
+                )
+            };
+            let margin = [
+                side(style.margin.top),
+                side(style.margin.right),
+                side(style.margin.bottom),
+                side(style.margin.left),
+            ];
+            let height = margin[0] + result.fragment.height + margin[2];
+            let ascent = match result.last_baseline {
+                LastBaseline::At(b) => margin[0] + b,
+                LastBaseline::NoLines => height,
+                LastBaseline::Unknown => return None,
+            };
+            let box_start = start_edges(&opens[k]);
+            let box_end = end_edges(&closes[k]);
+            let raw = margin[3] + result.fragment.width + margin[1] + box_start + box_end;
+            items.push(InlineItem {
+                index: child,
+                raw,
+                raw_hang: raw,
+                run,
+                starts_space: false,
+                ends_space: false,
+                whitespace_only: false,
+                forced: false,
+                edges: InlineEdges::default(),
+                box_start,
+                box_end,
+                aligned: aligned[k],
+                internal_break: false,
+                atomic: Some((result.fragment, margin[3], margin[0])),
+                non_latin: false,
+                ascent,
+                descent: height - ascent,
+                content_ascent: 0.0,
+                font_height: 0.0,
+            });
+            run += 1;
+            start += 1;
+            continue;
+        }
         let first = flat[children[start]].style;
         let mut end = start + 1;
         // A box boundary ends the shaping run.
@@ -1089,6 +1201,7 @@ pub(super) fn layout_inline(
                         && content.starts_with(' ')
                         && !content.trim_start_matches(' ').is_empty()),
                 non_latin: !latin1(content),
+                atomic: None,
                 ascent: baseline,
                 descent: height - baseline,
                 content_ascent: inline_font_content_ascent(style),
@@ -1147,7 +1260,10 @@ pub(super) fn layout_inline(
         // between each other).
         let break_at = (1..=current.len()).rev().find(|&j| {
             let next = current.get(j).copied().unwrap_or(i);
-            items[current[j - 1]].ends_space && !items[next].starts_space
+            let prev = current[j - 1];
+            // Atomic inlines break before and after (UAX #14 CB, LB20).
+            (items[prev].ends_space || items[prev].atomic.is_some() || items[next].atomic.is_some())
+                && !items[next].starts_space
         });
         match break_at {
             Some(j) if j == current.len() => lines.push(std::mem::take(&mut current)),
@@ -1286,12 +1402,14 @@ pub(super) fn layout_inline(
     }
 
     let mut top = 0.0f32;
+    let mut last_line_baseline = None;
     let mut out = Vec::with_capacity(items.len() + entries.len() - children.len());
     // (line, inline offset, width, baseline) of each placed item.
     let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; items.len()];
     for (line_index, line) in built.into_iter().enumerate() {
         let offset = align_offset(container, available - line.width);
         let baseline = top + line.ascent;
+        last_line_baseline = Some(baseline);
         for (k, x, width) in line.items {
             let item = &items[k];
             let baseline = match item.aligned {
@@ -1321,6 +1439,14 @@ pub(super) fn layout_inline(
                 continue;
             }
             placed[k] = Some((line_index, offset + x, width, baseline));
+            if let Some((fragment, margin_start, margin_top)) = &item.atomic {
+                out.push((
+                    offset + x + item.box_start + margin_start,
+                    baseline - item.ascent + margin_top,
+                    fragment.clone(),
+                ));
+                continue;
+            }
             // The engine's rect is the item's border box: margins excluded,
             // block-axis padding/border around the font content box.
             let e = item.edges;
@@ -1378,5 +1504,6 @@ pub(super) fn layout_inline(
     Some(InlineResult {
         height: top,
         children: out,
+        last_baseline: last_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
     })
 }
