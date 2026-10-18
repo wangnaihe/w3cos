@@ -19,7 +19,7 @@ use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, TsSyntax};
 use w3cos_ir::{
     BinaryOperator, Binding, BindingId, BindingKind, Block, BlockId, Constant, ExceptionRegion,
     Export as IrExport, Function, FunctionId, GeneratorSuspensionPoint, Import, Instruction,
-    Module, Register, SuspensionId, SuspensionPoint, UnaryOperator,
+    Module, Register, SuspensionId, SuspensionPoint, TypeHint, UnaryOperator,
 };
 
 pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
@@ -27,6 +27,7 @@ pub fn lower_script(source: &str, specifier: &str) -> Result<Module> {
     let strict_mode = module_items_have_use_strict_directive(&parsed.body);
     let annex_b_function_declarations = !strict_mode;
     let mut builder = Builder::entry(false, annex_b_function_declarations, strict_mode, true);
+    builder.type_names = std::rc::Rc::new(collect_type_names(&parsed.body));
     for item in &parsed.body {
         if let ModuleItem::Stmt(statement) = item {
             builder.predeclare_function_binding(statement)?;
@@ -75,6 +76,7 @@ pub(crate) fn lower_module_statements(
     external_bindings: &[(String, bool)],
 ) -> Result<Module> {
     let mut builder = Builder::entry(true, false, true, false);
+    builder.type_names = std::rc::Rc::new(collect_statement_type_names(statements));
     for (name, mutable) in external_bindings {
         builder.declare_external(name, *mutable)?;
     }
@@ -149,6 +151,7 @@ fn prune_unused_module_init_externals(module: &mut Module) {
 pub fn lower_module(source: &str, specifier: &str) -> Result<Module> {
     let parsed = parse(source, specifier)?;
     let mut builder = Builder::entry(true, false, true, false);
+    builder.type_names = std::rc::Rc::new(collect_type_names(&parsed.body));
 
     // Instantiate imports before evaluating declarations, matching the ESM
     // split between linking and execution.
@@ -459,6 +462,7 @@ fn finish_module(mut builder: Builder, specifier: &str, name: &str) -> Result<Mo
         is_async: builder.is_async,
         is_generator: builder.is_generator,
         source_span: None,
+        types: Default::default(),
     }];
     functions.extend(builder.functions);
     let mut module = Module::new(specifier, FunctionId(0), functions);
@@ -774,6 +778,12 @@ struct Builder {
     suspension_points: Vec<SuspensionPoint>,
     generator_suspension_points: Vec<GeneratorSuspensionPoint>,
     terminated: bool,
+    /// Module-level TS interface / type-literal / class field tables used to
+    /// turn annotations into [`TypeHint::Object`] (M1 item 11).
+    type_names: std::rc::Rc<HashMap<String, TypeHint>>,
+    /// Return annotation of the function about to be lowered by
+    /// `lower_nested_function`; consumed (taken) there.
+    pending_return_hint: Option<TypeHint>,
 }
 
 impl Builder {
@@ -824,6 +834,8 @@ impl Builder {
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
+            type_names: Default::default(),
+            pending_return_hint: None,
         }
     }
 
@@ -878,6 +890,8 @@ impl Builder {
             suspension_points: Vec::new(),
             generator_suspension_points: Vec::new(),
             terminated: false,
+            type_names: Default::default(),
+            pending_return_hint: None,
         }
     }
 
@@ -1456,6 +1470,10 @@ impl Builder {
             .iter()
             .map(|parameter| parameter.pat.clone())
             .collect();
+        self.pending_return_hint = Some(return_hint(
+            declaration.function.return_type.as_deref(),
+            &self.type_names,
+        ));
         let value = self.lower_nested_function(
             parameters,
             &body.stmts,
@@ -2090,6 +2108,10 @@ impl Builder {
                                         function.function.body.as_ref().ok_or_else(|| {
                                             anyhow!("runtime function expression has no body")
                                         })?;
+                                    self.pending_return_hint = Some(return_hint(
+                                        function.function.return_type.as_deref(),
+                                        &self.type_names,
+                                    ));
                                     self.lower_nested_function(
                                         parameters,
                                         &body.stmts,
@@ -2103,6 +2125,10 @@ impl Builder {
                                 }
                                 (Pat::Ident(binding), Expr::Arrow(arrow)) => {
                                     let name = Some(binding.id.sym.to_string());
+                                    self.pending_return_hint = Some(return_hint(
+                                        arrow.return_type.as_deref(),
+                                        &self.type_names,
+                                    ));
                                     match arrow.body.as_ref() {
                                         BlockStmtOrExpr::BlockStmt(body) => self
                                             .lower_nested_function(
@@ -3766,6 +3792,8 @@ impl Builder {
                     ));
                 }
                 let parameters = arrow.params.clone();
+                self.pending_return_hint =
+                    Some(return_hint(arrow.return_type.as_deref(), &self.type_names));
                 match arrow.body.as_ref() {
                     BlockStmtOrExpr::BlockStmt(body) => self.lower_nested_function(
                         parameters,
@@ -3801,6 +3829,10 @@ impl Builder {
                     .body
                     .as_ref()
                     .ok_or_else(|| anyhow!("runtime function expression has no body"))?;
+                self.pending_return_hint = Some(return_hint(
+                    function.function.return_type.as_deref(),
+                    &self.type_names,
+                ));
                 self.lower_nested_function(
                     parameters,
                     &body.stmts,
@@ -4669,6 +4701,10 @@ impl Builder {
                         MethodKind::Getter => format!("get {method_name}"),
                         MethodKind::Setter => format!("set {method_name}"),
                     });
+                    self.pending_return_hint = Some(return_hint(
+                        method.function.return_type.as_deref(),
+                        &self.type_names,
+                    ));
                     let value = self.lower_nested_function(
                         parameters,
                         &body.stmts,
@@ -4867,6 +4903,7 @@ impl Builder {
             is_async: false,
             is_generator: false,
             source_span: None,
+            types: Default::default(),
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -4947,6 +4984,7 @@ impl Builder {
             is_async: false,
             is_generator: false,
             source_span: None,
+            types: Default::default(),
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -4987,6 +5025,12 @@ impl Builder {
         );
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
+        child.type_names = std::rc::Rc::clone(&self.type_names);
+        let return_hint = self.pending_return_hint.take().unwrap_or_default();
+        let parameter_hints = parameters
+            .iter()
+            .map(|parameter| parameter_hint(parameter, &self.type_names))
+            .collect::<Vec<_>>();
         let this_binding = if bind_this {
             Some(child.declare_this_binding()?)
         } else {
@@ -5038,6 +5082,13 @@ impl Builder {
 
         self.merge_child_scope(&child);
         let captures = child.capture_order.clone();
+        // Hints are positional over `Function::parameters`, which skips a
+        // trailing rest parameter.
+        let mut parameter_hints = parameter_hints;
+        parameter_hints.truncate(child.parameters.len());
+        while parameter_hints.last().is_some_and(TypeHint::is_unknown) {
+            parameter_hints.pop();
+        }
         let function = Function {
             id: function_id,
             name,
@@ -5056,6 +5107,10 @@ impl Builder {
             is_async: child.is_async,
             is_generator: child.is_generator,
             source_span: None,
+            types: w3cos_ir::FunctionTypes {
+                parameters: parameter_hints,
+                returns: return_hint,
+            },
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -10629,5 +10684,414 @@ mod tests {
             "dynamic assignment must warn: {:?}",
             plan.warnings
         );
+    }
+}
+
+// ---- TypeScript annotations → W3IR type hints (M1 item 11) ----
+
+/// Maximum nesting when expanding named object types into field hints, so
+/// recursive types (`interface Node { next: Node }`) terminate.
+const TYPE_HINT_DEPTH: u32 = 2;
+
+type RawTypeTable = HashMap<String, Vec<(String, Option<swc_ecma_ast::TsType>)>>;
+
+fn ts_type_element_fields(
+    members: &[swc_ecma_ast::TsTypeElement],
+) -> Vec<(String, Option<swc_ecma_ast::TsType>)> {
+    members
+        .iter()
+        .filter_map(|member| match member {
+            swc_ecma_ast::TsTypeElement::TsPropertySignature(property) if !property.optional => {
+                let key = match property.key.as_ref() {
+                    Expr::Ident(identifier) => identifier.sym.to_string(),
+                    _ => return None,
+                };
+                Some((
+                    key,
+                    property
+                        .type_ann
+                        .as_ref()
+                        .map(|annotation| (*annotation.type_ann).clone()),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn class_declared_fields(class: &Class) -> Vec<(String, Option<swc_ecma_ast::TsType>)> {
+    class
+        .body
+        .iter()
+        .filter_map(|member| match member {
+            ClassMember::ClassProp(property)
+                if !property.is_static && !property.is_optional && !property.declare =>
+            {
+                let PropName::Ident(identifier) = &property.key else {
+                    return None;
+                };
+                Some((
+                    identifier.sym.to_string(),
+                    property
+                        .type_ann
+                        .as_ref()
+                        .map(|annotation| (*annotation.type_ann).clone()),
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_raw_decl(declaration: &Decl, table: &mut RawTypeTable) {
+    match declaration {
+        Decl::TsInterface(interface) if interface.extends.is_empty() => {
+            table.insert(
+                interface.id.sym.to_string(),
+                ts_type_element_fields(&interface.body.body),
+            );
+        }
+        Decl::TsTypeAlias(alias) => {
+            if let swc_ecma_ast::TsType::TsTypeLit(literal) = alias.type_ann.as_ref() {
+                table.insert(
+                    alias.id.sym.to_string(),
+                    ts_type_element_fields(&literal.members),
+                );
+            }
+        }
+        Decl::Class(class) if class.class.super_class.is_none() => {
+            let fields = class_declared_fields(&class.class);
+            if !fields.is_empty() {
+                table.insert(class.ident.sym.to_string(), fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_type_table(raw: RawTypeTable) -> HashMap<String, TypeHint> {
+    raw.keys()
+        .map(|name| (name.clone(), resolve_named(name, &raw, TYPE_HINT_DEPTH)))
+        .collect()
+}
+
+fn resolve_named(name: &str, raw: &RawTypeTable, depth: u32) -> TypeHint {
+    let fields = match raw.get(name) {
+        Some(fields) if depth > 0 => fields
+            .iter()
+            .map(|(key, ty)| {
+                let hint = ty
+                    .as_ref()
+                    .map(|ty| hint_from_raw(ty, raw, depth - 1))
+                    .unwrap_or_default();
+                (key.clone(), hint)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    TypeHint::Object {
+        name: Some(name.to_string()),
+        fields,
+    }
+}
+
+fn hint_from_raw(ty: &swc_ecma_ast::TsType, raw: &RawTypeTable, depth: u32) -> TypeHint {
+    use swc_ecma_ast::{TsKeywordTypeKind, TsLit, TsType};
+    match ty {
+        TsType::TsKeywordType(keyword) => match keyword.kind {
+            TsKeywordTypeKind::TsNumberKeyword => TypeHint::Number,
+            TsKeywordTypeKind::TsBooleanKeyword => TypeHint::Bool,
+            TsKeywordTypeKind::TsStringKeyword => TypeHint::String,
+            _ => TypeHint::Unknown,
+        },
+        TsType::TsLitType(literal) => match &literal.lit {
+            TsLit::Number(_) => TypeHint::Number,
+            TsLit::Bool(_) => TypeHint::Bool,
+            TsLit::Str(_) => TypeHint::String,
+            _ => TypeHint::Unknown,
+        },
+        TsType::TsParenthesizedType(inner) => hint_from_raw(&inner.type_ann, raw, depth),
+        TsType::TsUnionOrIntersectionType(
+            swc_ecma_ast::TsUnionOrIntersectionType::TsUnionType(union),
+        ) => {
+            let mut hints = union
+                .types
+                .iter()
+                .map(|member| hint_from_raw(member, raw, depth));
+            let Some(first) = hints.next() else {
+                return TypeHint::Unknown;
+            };
+            if matches!(first, TypeHint::Number | TypeHint::Bool | TypeHint::String)
+                && hints.all(|hint| hint == first)
+            {
+                first
+            } else {
+                TypeHint::Unknown
+            }
+        }
+        TsType::TsTypeRef(reference) if reference.type_params.is_none() => {
+            let swc_ecma_ast::TsEntityName::Ident(identifier) = &reference.type_name else {
+                return TypeHint::Unknown;
+            };
+            let name = identifier.sym.as_ref();
+            if raw.contains_key(name) {
+                resolve_named(name, raw, depth)
+            } else {
+                TypeHint::Unknown
+            }
+        }
+        TsType::TsTypeLit(literal) if depth > 0 => {
+            let fields = ts_type_element_fields(&literal.members)
+                .into_iter()
+                .map(|(key, ty)| {
+                    let hint = ty
+                        .as_ref()
+                        .map(|ty| hint_from_raw(ty, raw, depth - 1))
+                        .unwrap_or_default();
+                    (key, hint)
+                })
+                .collect();
+            TypeHint::Object { name: None, fields }
+        }
+        _ => TypeHint::Unknown,
+    }
+}
+
+/// Interface / object type alias / base-class field tables of a module.
+fn collect_type_names(items: &[ModuleItem]) -> HashMap<String, TypeHint> {
+    let mut raw = RawTypeTable::new();
+    for item in items {
+        match item {
+            ModuleItem::Stmt(Stmt::Decl(declaration)) => collect_raw_decl(declaration, &mut raw),
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                collect_raw_decl(&export.decl, &mut raw)
+            }
+            _ => {}
+        }
+    }
+    resolve_type_table(raw)
+}
+
+fn collect_statement_type_names(statements: &[Stmt]) -> HashMap<String, TypeHint> {
+    let mut raw = RawTypeTable::new();
+    for statement in statements {
+        if let Stmt::Decl(declaration) = statement {
+            collect_raw_decl(declaration, &mut raw);
+        }
+    }
+    resolve_type_table(raw)
+}
+
+/// Re-resolve a TS type against an already-resolved name table.
+fn hint_from_ts(ty: &swc_ecma_ast::TsType, names: &HashMap<String, TypeHint>) -> TypeHint {
+    use swc_ecma_ast::TsType;
+    match ty {
+        TsType::TsTypeRef(reference) if reference.type_params.is_none() => {
+            match &reference.type_name {
+                swc_ecma_ast::TsEntityName::Ident(identifier) => names
+                    .get(identifier.sym.as_ref())
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => TypeHint::Unknown,
+            }
+        }
+        TsType::TsParenthesizedType(inner) => hint_from_ts(&inner.type_ann, names),
+        other => hint_from_raw(other, &RawTypeTable::new(), TYPE_HINT_DEPTH),
+    }
+}
+
+fn return_hint(
+    annotation: Option<&swc_ecma_ast::TsTypeAnn>,
+    names: &HashMap<String, TypeHint>,
+) -> TypeHint {
+    annotation
+        .map(|annotation| hint_from_ts(&annotation.type_ann, names))
+        .unwrap_or_default()
+}
+
+/// A parameter's hint: its annotation, else the type of a literal default
+/// (`x = 0` → Number). Destructuring and rest parameters are `Unknown`.
+fn parameter_hint(pattern: &Pat, names: &HashMap<String, TypeHint>) -> TypeHint {
+    match pattern {
+        Pat::Ident(identifier) if !identifier.id.optional => identifier
+            .type_ann
+            .as_ref()
+            .map(|annotation| hint_from_ts(&annotation.type_ann, names))
+            .unwrap_or_default(),
+        Pat::Assign(assignment) => {
+            let Pat::Ident(identifier) = assignment.left.as_ref() else {
+                return TypeHint::Unknown;
+            };
+            // A default fires for `undefined`, which the guard never admits,
+            // so the hint describes the *passed* argument; use the
+            // annotation, else the literal default's type.
+            if let Some(annotation) = &identifier.type_ann {
+                return hint_from_ts(&annotation.type_ann, names);
+            }
+            match assignment.right.as_ref() {
+                Expr::Lit(Lit::Num(_)) => TypeHint::Number,
+                Expr::Lit(Lit::Bool(_)) => TypeHint::Bool,
+                Expr::Lit(Lit::Str(_)) => TypeHint::String,
+                _ => TypeHint::Unknown,
+            }
+        }
+        _ => TypeHint::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod type_hint_tests {
+    use super::*;
+    use w3cos_ir::types::{IrType, infer, speculable_parameters};
+
+    fn lower(source: &str) -> Module {
+        lower_module(source, "app:///typed.ts").expect("lower")
+    }
+
+    fn named<'a>(module: &'a Module, name: &str) -> &'a Function {
+        module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing function {name}"))
+    }
+
+    #[test]
+    fn number_annotations_become_parameter_and_return_hints() {
+        let module =
+            lower("export function mul(a: number, b: number): number { return a * b + 1; }");
+        let function = named(&module, "mul");
+        assert_eq!(
+            function.types.parameters,
+            vec![TypeHint::Number, TypeHint::Number]
+        );
+        assert_eq!(function.types.returns, TypeHint::Number);
+        assert_eq!(infer(function, false).returns, IrType::Unknown);
+        assert_eq!(infer(function, true).returns, IrType::Number);
+        assert_eq!(speculable_parameters(function, &function.types), vec![0, 1]);
+    }
+
+    #[test]
+    fn javascript_and_unsupported_annotations_stay_unknown() {
+        let module = lower(
+            "export function f(a, b: number | undefined, c: string | number, d?: number, ...rest: number[]) { return a; }",
+        );
+        let function = named(&module, "f");
+        assert!(function.types.is_empty(), "{:?}", function.types);
+    }
+
+    #[test]
+    fn literal_defaults_and_bool_string_annotations() {
+        let module = lower(
+            "export function g(flag: boolean, label: string, count = 0, scale: number = 2) { return count; }",
+        );
+        let function = named(&module, "g");
+        assert_eq!(
+            function.types.parameters,
+            vec![
+                TypeHint::Bool,
+                TypeHint::String,
+                TypeHint::Number,
+                TypeHint::Number
+            ]
+        );
+    }
+
+    #[test]
+    fn interfaces_type_literals_and_classes_become_object_hints() {
+        let module = lower(
+            r#"
+            interface Point { x: number; y: number; label?: string }
+            type Body = { pos: Point; mass: number };
+            class Vec2 { x: number; y: number; constructor(x: number, y: number) { this.x = x; this.y = y; } }
+            export function norm(p: Point, b: Body, v: Vec2): number { return p.x + b.mass + v.y; }
+            "#,
+        );
+        let function = named(&module, "norm");
+        let point = TypeHint::Object {
+            name: Some("Point".into()),
+            fields: vec![
+                ("x".into(), TypeHint::Number),
+                ("y".into(), TypeHint::Number),
+            ],
+        };
+        assert_eq!(function.types.parameters[0], point);
+        let TypeHint::Object { fields, .. } = &function.types.parameters[1] else {
+            panic!("Body hint {:?}", function.types.parameters[1]);
+        };
+        assert_eq!(fields[1], ("mass".into(), TypeHint::Number));
+        // Nested object types expand to the depth limit.
+        assert!(
+            matches!(&fields[0].1, TypeHint::Object { name: Some(name), .. } if name == "Point")
+        );
+        assert_eq!(
+            function.types.parameters[2],
+            TypeHint::Object {
+                name: Some("Vec2".into()),
+                fields: vec![
+                    ("x".into(), TypeHint::Number),
+                    ("y".into(), TypeHint::Number)
+                ],
+            }
+        );
+        let constructor = named(&module, "Vec2.constructor");
+        assert_eq!(
+            constructor.types.parameters,
+            vec![TypeHint::Number, TypeHint::Number]
+        );
+    }
+
+    #[test]
+    fn recursive_interfaces_terminate() {
+        let module = lower(
+            "interface Node { value: number; next: Node }\nexport function head(n: Node): number { return n.value; }",
+        );
+        let function = named(&module, "head");
+        assert!(matches!(
+            function.types.parameters[0],
+            TypeHint::Object { .. }
+        ));
+    }
+
+    #[test]
+    fn methods_and_arrows_carry_hints() {
+        let module = lower(
+            r#"
+            class C { scale(k: number): number { return k * 2; } }
+            export const twice = (n: number): number => n * 2;
+            "#,
+        );
+        assert_eq!(
+            named(&module, "C.scale").types.parameters,
+            vec![TypeHint::Number]
+        );
+        assert_eq!(named(&module, "C.scale").types.returns, TypeHint::Number);
+        let arrow = named(&module, "twice");
+        assert_eq!(arrow.types.parameters, vec![TypeHint::Number]);
+        assert_eq!(arrow.types.returns, TypeHint::Number);
+        assert_eq!(infer(arrow, true).returns, IrType::Number);
+    }
+
+    #[test]
+    fn captured_parameters_are_not_speculated() {
+        let module = lower("export function make(a: number, b: number) { return () => a; }");
+        let function = named(&module, "make");
+        assert_eq!(function.types.parameters.len(), 2);
+        // `a` is copied into a local that the closure captures; the hidden
+        // parameter itself is not captured, so it may still be speculated.
+        let speculable = speculable_parameters(function, &function.types);
+        assert!(speculable.contains(&1));
+    }
+
+    #[test]
+    fn hints_survive_validation_and_serde() {
+        let module = lower("export function f(a: number) { return a; }");
+        module.validate().unwrap();
+        let json = serde_json::to_string(&module).unwrap();
+        let back: Module = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, module);
+        // Untyped functions do not serialize a `types` field.
+        let plain = lower("export function f(a) { return a; }");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("\"types\""));
     }
 }

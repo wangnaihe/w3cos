@@ -8531,6 +8531,7 @@ fn main() {{
             is_async: false,
             is_generator: false,
             source_span: None,
+            types: Default::default(),
         };
 
         let blocks = coalesce_sync_blocks(&function);
@@ -9987,6 +9988,7 @@ fn main() {{
             is_async: false,
             is_generator: false,
             source_span: None,
+            types: Default::default(),
         }
     }
 

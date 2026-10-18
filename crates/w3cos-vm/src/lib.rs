@@ -2393,6 +2393,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             source_span: None,
+            types: Default::default(),
         }
     }
 
@@ -2872,6 +2873,7 @@ mod tests {
                 is_async: true,
                 is_generator: false,
                 source_span: None,
+                types: Default::default(),
             }],
         );
         module.imports.push(Import {
@@ -3292,6 +3294,7 @@ mod tests {
             is_async: false,
             is_generator: true,
             source_span: None,
+            types: Default::default(),
         };
         let module = Module::new("app:///generator.w3ir", FunctionId(0), vec![entry]);
         let generator = Vm::new(module.clone(), Limits::default())
@@ -3373,6 +3376,7 @@ mod tests {
             is_async: true,
             is_generator: true,
             source_span: None,
+            types: Default::default(),
         };
         let generator = Vm::new(
             Module::new("app:///async-generator.w3ir", FunctionId(0), vec![entry]),
