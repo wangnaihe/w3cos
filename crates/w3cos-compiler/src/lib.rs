@@ -2166,7 +2166,8 @@ createRoot(document.getElementById("root")!).render(App());"#,
             bundle_rs.contains("__init_w3ir_0(")
                 && bundle_rs.contains("createRoot_value()")
                 && (bundle_rs.contains("w3cos_core::intrinsics::call(")
-                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion("))
+                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion(")
+                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion_slice("))
                 && bundle_rs.contains("m0__init();"),
             "top-level Web bootstrap must execute through native W3IR module init: {bundle_rs}"
         );

@@ -1310,7 +1310,9 @@ fn collect_decl_exports(decl: &Decl, info: &mut ParsedModuleInfo) {
         }
         Decl::Fn(function) if !function.declare => {
             let name = function.ident.sym.to_string();
-            info.top_level_functions.push(name.clone());
+            if !info.top_level_functions.contains(&name) {
+                info.top_level_functions.push(name.clone());
+            }
             info.exports.push(ExportBinding {
                 exported: name.clone(),
                 local: Some(name),
@@ -1367,9 +1369,12 @@ fn collect_top_level_decl(decl: &Decl, info: &mut ParsedModuleInfo) {
         Decl::Class(class) if !class.declare => {
             info.top_level_classes.push(class.ident.sym.to_string())
         }
-        Decl::Fn(function) if !function.declare => info
-            .top_level_functions
-            .push(function.ident.sym.to_string()),
+        Decl::Fn(function) if !function.declare => {
+            let name = function.ident.sym.to_string();
+            if !info.top_level_functions.contains(&name) {
+                info.top_level_functions.push(name);
+            }
+        }
         Decl::Var(var) if !var.declare => {
             for declaration in &var.decls {
                 collect_pat_names(&declaration.name, &mut info.top_level_variables);

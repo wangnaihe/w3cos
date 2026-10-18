@@ -10,6 +10,11 @@ pub(super) fn project(
     viewport_w: f32,
     viewport_h: f32,
 ) {
+    // Rows only move when a cell holds replaced content; without any
+    // replaced box there is nothing to align (and no tree clone needed).
+    if !flat.iter().any(|node| replaced(node.kind)) {
+        return;
+    }
     if flat.iter().any(|node| {
         node.style.border_collapse
             && matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
@@ -76,6 +81,8 @@ fn apply(
         let cells = flat
             .iter()
             .enumerate()
+            .take(node.subtree_end)
+            .skip(row + 1)
             .filter(|(_, node)| {
                 node.parent == Some(row)
                     && node.style.display == WDisplay::TableCell
@@ -114,6 +121,8 @@ fn apply(
                 let contents = flat
                     .iter()
                     .enumerate()
+                    .take(flat[cell].subtree_end)
+                    .skip(cell + 1)
                     .filter(|(i, _)| descendant(flat, *i, cell) && in_flow(flat, *i, cell))
                     .collect::<Vec<_>>();
                 let images = contents

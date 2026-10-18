@@ -14,6 +14,11 @@ pub(super) struct RuleSet {
     has_sibling_dependencies: bool,
     has_relational_dependencies: bool,
     has_structural_dependencies: bool,
+    /// Container queries or `[style]` selectors: matching can change
+    /// without a class/id/attribute/tree mutation.
+    has_match_volatile_rules: bool,
+    /// Some rule declares `transition*`.
+    has_transition_rules: bool,
 }
 
 enum RuleBucket<'a> {
@@ -72,6 +77,8 @@ impl RuleSet {
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
+        self.has_match_volatile_rules = false;
+        self.has_transition_rules = false;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -99,13 +106,35 @@ impl RuleSet {
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
 
+        self.has_transition_rules |= self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, _)| property.starts_with("transition"));
+        self.has_match_volatile_rules |= self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, _)| property == super::CONTAINER_QUERY_MARKER)
+            || self.rules[index].chain.iter().any(|compound| {
+                compound
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute.name().eq_ignore_ascii_case("style"))
+                    || compound.pseudo_classes.iter().any(|pseudo| match pseudo {
+                        super::PseudoClass::Not(selector) | super::PseudoClass::Has(selector) => {
+                            selector.to_ascii_lowercase().contains("style")
+                        }
+                        _ => false,
+                    })
+            });
+
         // A rule lives in one best subject bucket. Matching gathers the
         // element's buckets plus universal rules, so no per-node RuleSet scan
         // or cross-bucket rule deduplication is required.
+        let class_rules = &self.class_rules;
         let bucket = self.rules[index]
             .chain
             .last()
-            .map(rule_bucket)
+            .map(|subject| rule_bucket(subject, |class| class_rules.get(class).map_or(0, Vec::len)))
             .unwrap_or(RuleBucket::Universal);
         match bucket {
             RuleBucket::Id(id) => self.id_rules.entry(id.to_string()).or_default().push(index),
@@ -160,33 +189,99 @@ impl RuleSet {
         if let Some((_, id)) = node
             .attributes
             .iter()
-            .find(|(name, _)| name.as_str() == "id")
+            .find(|(name, _)| name.as_static() == "id")
             && let Some(indices) = self.id_rules.get(id.as_str())
         {
             candidates.extend(indices);
         }
         for class in &node.class_list {
-            let class = class.as_str();
-            if let Some(indices) = self.class_rules.get(class.as_str()) {
+            if let Some(indices) = self.class_rules.get(class.as_static()) {
                 candidates.extend(indices);
             }
         }
-        for (name, _) in &node.attributes {
-            let name = name.as_str();
-            if let Some(indices) = self
-                .attribute_rules
-                .get(&attribute_index_key(name.as_str()))
-            {
-                candidates.extend(indices);
+        if !self.attribute_rules.is_empty() {
+            for (name, _) in &node.attributes {
+                if let Some(indices) = self
+                    .attribute_rules
+                    .get(&attribute_index_key(name.as_static()))
+                {
+                    candidates.extend(indices);
+                }
             }
         }
-        append_tag_candidates(&self.tag_rules, &node.tag.as_str(), &mut candidates);
+        if !self.tag_rules.is_empty() {
+            append_tag_candidates(&self.tag_rules, node.tag.as_static(), &mut candidates);
+        }
         normalize_candidates(&mut candidates);
         candidates
     }
 
+    /// Visit the element's rule buckets (Blink ElementRuleCollector walks
+    /// the id/class/attribute/tag/universal RuleData lists in place). A rule
+    /// lives in one bucket, but a bucket can be reached twice (duplicate
+    /// class tokens), so callers dedup the few matched rules, not the
+    /// candidates.
+    pub(super) fn for_each_candidate_bucket(
+        &self,
+        document: &Document,
+        node: NodeId,
+        mut visit: impl FnMut(&[usize]),
+    ) {
+        let node = document.get_node(node);
+        if !self.universal_rules.is_empty() {
+            visit(&self.universal_rules);
+        }
+        if !self.id_rules.is_empty()
+            && let Some((_, id)) = node
+                .attributes
+                .iter()
+                .find(|(name, _)| name.as_static() == "id")
+            && let Some(indices) = self.id_rules.get(id.as_str())
+        {
+            visit(indices);
+        }
+        if !self.class_rules.is_empty() {
+            for class in &node.class_list {
+                if let Some(indices) = self.class_rules.get(class.as_static()) {
+                    visit(indices);
+                }
+            }
+        }
+        if !self.attribute_rules.is_empty() {
+            for (name, _) in &node.attributes {
+                let name = name.as_static();
+                let simple = !name
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase() || byte == b':' || byte == b'|');
+                let indices = if simple {
+                    self.attribute_rules.get(name)
+                } else {
+                    self.attribute_rules.get(&attribute_index_key(name))
+                };
+                if let Some(indices) = indices {
+                    visit(indices);
+                }
+            }
+        }
+        if !self.tag_rules.is_empty() {
+            let mut tag_candidates = Vec::new();
+            append_tag_candidates(&self.tag_rules, node.tag.as_static(), &mut tag_candidates);
+            if !tag_candidates.is_empty() {
+                visit(&tag_candidates);
+            }
+        }
+    }
+
     pub(super) fn has_sibling_dependencies(&self) -> bool {
         self.has_sibling_dependencies
+    }
+
+    pub(super) fn has_transition_rules(&self) -> bool {
+        self.has_transition_rules
+    }
+
+    pub(super) fn has_match_volatile_rules(&self) -> bool {
+        self.has_match_volatile_rules
     }
 
     pub(super) fn has_relational_dependencies(&self) -> bool {
@@ -249,14 +344,25 @@ fn pseudo_has_relational_dependency(pseudo: &super::PseudoClass) -> bool {
     }
 }
 
-fn rule_bucket(subject: &CompoundSelector) -> RuleBucket<'_> {
+/// Blink's RuleSet files each rule under one subject key (id, class,
+/// attribute, tag, universal). Any class of the subject compound is a valid
+/// key; take the one whose bucket is currently smallest so `.cell.k5` lands
+/// under `k5` instead of the shared `cell` bucket every cell would scan.
+fn rule_bucket(
+    subject: &CompoundSelector,
+    class_bucket_len: impl Fn(&str) -> usize,
+) -> RuleBucket<'_> {
     if subject.unsupported {
         return RuleBucket::Universal;
     }
     if let Some(id) = &subject.id {
         return RuleBucket::Id(id);
     }
-    if let Some(class) = subject.classes.first() {
+    if let Some(class) = subject
+        .classes
+        .iter()
+        .min_by_key(|class| class_bucket_len(class))
+    {
         return RuleBucket::Class(class);
     }
     if let Some(attribute) = subject.attributes.first() {
@@ -279,8 +385,14 @@ fn append_tag_candidates(
     tag: &str,
     candidates: &mut Vec<usize>,
 ) {
-    let tag = tag.to_ascii_lowercase();
-    if let Some(indices) = tag_rules.get(&tag) {
+    let lowered;
+    let tag = if tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        lowered = tag.to_ascii_lowercase();
+        lowered.as_str()
+    } else {
+        tag
+    };
+    if let Some(indices) = tag_rules.get(tag) {
         candidates.extend(indices);
     }
     if let Some((_, local_name)) = tag.rsplit_once(':')

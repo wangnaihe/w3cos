@@ -261,7 +261,7 @@ pub fn try_generate_with_bodies_and_css(
         if generated.has_async_init {
             async_init_namespaces.insert(module.namespace.clone());
         }
-        out.push_str(&generated.code);
+        out.push_str(&number_site_slots(&generated.code));
         out.push('\n');
     }
     let has_async_init = !async_init_namespaces.is_empty();
@@ -516,9 +516,10 @@ fn generate_module_with_bodies(
     // Android's pthread-key limit is small. Emitting one `thread_local!` for
     // every lowered JS binding exhausts it before `android_main` can start, so
     // keep per-thread ESM values, binding cells and flags in three
-    // module-level registries.
+    // module-level registries, keyed with FxHash (WTF StringHasher analogue)
+    // since every module-binding read goes through them.
     out.push_str(
-        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell>> = std::cell::RefCell::new(::std::collections::HashMap::new());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str>> = std::cell::RefCell::new(::std::collections::HashSet::new());\n    }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
+        "    std::thread_local! {\n        static __W3COS_ESM_VALUES: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::Value, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_BINDINGS: std::cell::RefCell<::std::collections::HashMap<&'static str, w3cos_core::module_registry::BindingCell, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashMap::default());\n        static __W3COS_ESM_FLAGS: std::cell::RefCell<::std::collections::HashSet<&'static str, w3cos_core::FxBuildHasher>> = std::cell::RefCell::new(::std::collections::HashSet::default());\n        static __W3COS_SITE_CACHE: std::cell::RefCell<(Vec<Option<w3cos_core::Value>>, Vec<Option<::std::rc::Rc<w3cos_core::AotCaptureMap>>>, Vec<Option<w3cos_core::module_registry::BindingCell>>)> = std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new()));\n    }\n    #[allow(dead_code)]\n    fn __w3cos_site_value(index: usize, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __W3COS_SITE_CACHE.with(|cache| cache.borrow().0.get(index).and_then(|slot| slot.clone())) { return value; } let value = init(); __W3COS_SITE_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.0.len() <= index { cache.0.resize(index + 1, None); } cache.0[index] = Some(value.clone()); }); value }\n    #[allow(dead_code)]\n    fn __w3cos_site_captures(index: usize, init: impl FnOnce() -> w3cos_core::AotCaptureMap) -> ::std::rc::Rc<w3cos_core::AotCaptureMap> { if let Some(map) = __W3COS_SITE_CACHE.with(|cache| cache.borrow().1.get(index).and_then(|slot| slot.clone())) { return map; } let map = ::std::rc::Rc::new(init()); __W3COS_SITE_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.1.len() <= index { cache.1.resize(index + 1, None); } cache.1[index] = Some(::std::rc::Rc::clone(&map)); }); map }\n    fn __w3cos_esm_get(key: &'static str) -> Option<w3cos_core::Value> { __W3COS_ESM_VALUES.with(|values| values.borrow().get(key).cloned()) }\n    fn __w3cos_esm_get_or_init(key: &'static str, init: impl FnOnce() -> w3cos_core::Value) -> w3cos_core::Value { if let Some(value) = __w3cos_esm_get(key) { return value; } let value = init(); __w3cos_esm_set(key, value.clone()); value }\n    fn __w3cos_esm_set(key: &'static str, value: w3cos_core::Value) { __W3COS_ESM_VALUES.with(|values| { values.borrow_mut().insert(key, value); }); }\n    fn __w3cos_esm_declare_binding(key: &'static str, initialized: bool) { __W3COS_ESM_BINDINGS.with(|bindings| { bindings.borrow_mut().entry(key).or_insert_with(|| if initialized { w3cos_core::module_registry::BindingCell::initialized(w3cos_core::Value::Undefined) } else { w3cos_core::module_registry::BindingCell::uninitialized() }); }); }\n    fn __w3cos_esm_binding(key: &'static str) -> w3cos_core::module_registry::BindingCell { __W3COS_ESM_BINDINGS.with(|bindings| bindings.borrow_mut().entry(key).or_insert_with(w3cos_core::module_registry::BindingCell::uninitialized).clone()) }\n    fn __w3cos_esm_read_binding(key: &'static str) -> w3cos_core::Value { __w3cos_esm_binding(key).read_named(key) }\n    #[allow(dead_code)]\n    fn __w3cos_site_binding(index: usize, key: &'static str) -> w3cos_core::module_registry::BindingCell { if let Some(cell) = __W3COS_SITE_CACHE.with(|cache| cache.borrow().2.get(index).and_then(|slot| slot.clone())) { return cell; } let cell = __w3cos_esm_binding(key); __W3COS_SITE_CACHE.with(|cache| { let mut cache = cache.borrow_mut(); if cache.2.len() <= index { cache.2.resize(index + 1, None); } cache.2[index] = Some(cell.clone()); }); cell }\n    fn __w3cos_esm_write_binding(key: &'static str, value: w3cos_core::Value) -> w3cos_core::Value { __w3cos_esm_binding(key).initialize_or_set(value) }\n    fn __w3cos_esm_flag_replace(key: &'static str, value: bool) -> bool { __W3COS_ESM_FLAGS.with(|flags| { let mut flags = flags.borrow_mut(); let previous = flags.contains(key); if value { flags.insert(key); } else { flags.remove(key); } previous }) }\n",
     );
     let namespace_names: HashSet<String> = module
         .namespace_imports
@@ -619,6 +620,45 @@ fn generate_module_with_bodies(
             error.replace(['\r', '\n'], " ")
         ));
     }
+    // Function declarations are mutable `var`-like bindings (ECMA-262
+    // FunctionDeclarationInstantiation / CreateMutableBinding): a module that
+    // writes one makes it a live cell (`{bundled}:value`, written through
+    // `{bundled}_set`) instead of a constant known call target.
+    REASSIGNED_FUNCTIONS.with(|reassigned| {
+        let names = w3ir_module
+            .as_ref()
+            .and_then(|w3ir| {
+                let entry = w3ir.functions.iter().find(|f| f.id == w3ir.entry)?;
+                Some(
+                    entry
+                        .bindings
+                        .iter()
+                        .filter(|binding| {
+                            bundle.symbols.iter().any(|symbol| {
+                                symbol.module == module.path
+                                    && symbol.kind == SymbolKind::Function
+                                    && symbol.original_name == binding.name
+                            }) && binding_is_reassigned(w3ir, entry.id, binding.id)
+                        })
+                        .map(|binding| binding.name.clone())
+                        .collect::<HashSet<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        *reassigned.borrow_mut() = (module.path.clone(), names);
+    });
+    OWN_CELL_BINDINGS.with(|own| {
+        *own.borrow_mut() = (
+            module.path.clone(),
+            functions
+                .iter()
+                .filter_map(|item| match item {
+                    TopLevelItem::Variable { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
+    });
     let mut value_bindings: HashSet<String> = functions
         .iter()
         .filter_map(|item| match item {
@@ -873,8 +913,10 @@ fn generate_module_with_bodies(
                         // normal module binding. Its initializer executes in
                         // source order inside the W3IR module-init segment.
                         out.push_str(&format!(
-                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
+                            "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_site_binding({}, {:?}).read_named({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                             sym.bundled_name,
+                            next_site_index(),
+                            format!("{}:cell", sym.bundled_name),
                             format!("{}:cell", sym.bundled_name),
                             sym.bundled_name,
                             format!("{}:cell", sym.bundled_name),
@@ -889,8 +931,10 @@ fn generate_module_with_bodies(
                     }
                 } else if find_variable(&functions, &sym.original_name).is_some() {
                     out.push_str(&format!(
-                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
+                        "\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_site_binding({}, {:?}).read_named({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                         sym.bundled_name,
+                        next_site_index(),
+                        format!("{}:cell", sym.bundled_name),
                         format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
                         format!("{}:cell", sym.bundled_name),
@@ -911,9 +955,11 @@ fn generate_module_with_bodies(
                     // (Event = {}));`) assign the namespace object later, and
                     // the write must stick (see emit_module_init).
                     out.push_str(&format!(
-                        "\n    /// variable {} (from ESM) — instantiated before module evaluation\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_esm_read_binding({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
+                        "\n    /// variable {} (from ESM) — instantiated before module evaluation\n    pub fn {}_get() -> w3cos_core::Value {{ __w3cos_site_binding({}, {:?}).read_named({:?}) }}\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_write_binding({:?}, value) }}\n",
                         sym.original_name,
                         sym.bundled_name,
+                        next_site_index(),
+                        format!("{}:cell", sym.bundled_name),
                         format!("{}:cell", sym.bundled_name),
                         sym.bundled_name,
                         format!("{}:cell", sym.bundled_name),
@@ -1305,7 +1351,7 @@ fn module_init_external_bindings(
     let mut insert = |name: &str| {
         bindings.insert(
             name.to_string(),
-            value_bindings.contains(&sanitize_ident(name)),
+            value_bindings.contains(&sanitize_ident(name)) || function_is_reassigned(module, name),
         );
     };
     for (name, _) in &module.local_to_bundled {
@@ -1326,6 +1372,56 @@ fn module_init_external_bindings(
     let mut bindings = bindings.into_iter().collect::<Vec<_>>();
     bindings.sort_by(|left, right| left.0.cmp(&right.0));
     bindings
+}
+
+/// Module-binding accessors capture nothing, so one function object per
+/// call site is enough. Building them per call allocated two functions on
+/// every invocation of a function that reads a module global, and the
+/// arena keeps them (no tracing GC).
+fn cached_stateless_function(function: &str) -> String {
+    format!("__w3cos_site_value({}, || {function})", next_site_index())
+}
+
+/// Call-site cache slot. All sites of a module share one thread-local
+/// registry (`__W3COS_SITE_CACHE`): a `thread_local!` per site would use a
+/// pthread key each on Android, whose key limit is small. Init runs without
+/// the registry borrowed, so nested cached sites are fine.
+///
+/// Returns a unique placeholder; [`number_site_slots`] renumbers them densely
+/// per module so the output is reproducible and each module's registry only
+/// holds its own sites.
+fn next_site_index() -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    format!(
+        "{SITE_SLOT_PREFIX}{}__",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+const SITE_SLOT_PREFIX: &str = "__W3COS_SITE_SLOT_";
+
+/// Replace site placeholders in one module's code with dense indices in
+/// first-appearance order (the same placeholder keeps the same index).
+fn number_site_slots(code: &str) -> String {
+    if !code.contains(SITE_SLOT_PREFIX) {
+        return code.to_string();
+    }
+    let mut numbers: HashMap<&str, usize> = HashMap::new();
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(start) = rest.find(SITE_SLOT_PREFIX) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + SITE_SLOT_PREFIX.len()..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let end = start + SITE_SLOT_PREFIX.len() + digits + 2;
+        let token = &rest[start..end];
+        let next = numbers.len();
+        let index = *numbers.entry(token).or_insert(next);
+        out.push_str(&index.to_string());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn module_init_capture_map(
@@ -1367,8 +1463,9 @@ fn module_init_capture_map(
             } else {
                 context.lower_ident(&import.imported)
             };
-            let setter = value_bindings
-                .contains(&sanitize_ident(&import.imported))
+            let reassigned_function = function_is_reassigned(module, &import.imported);
+            let setter = (value_bindings.contains(&sanitize_ident(&import.imported))
+                || reassigned_function)
                 .then(|| module.lookup(&import.imported))
                 .flatten()
                 .and_then(|bundled| {
@@ -1377,29 +1474,42 @@ fn module_init_capture_map(
                         .iter()
                         .find(|symbol| {
                             symbol.bundled_name == bundled
-                                && symbol.kind == SymbolKind::Variable
+                                && (symbol.kind == SymbolKind::Variable
+                                    || (reassigned_function
+                                        && symbol.kind == SymbolKind::Function))
                         })
                         .map(|_| {
-                            format!(
+                            cached_stateless_function(&format!(
                                 "w3cos_core::Value::function(move |_, arguments| {bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
-                            )
+                            ))
                         })
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
             Ok(format!(
-                "({}, w3cos_core::AotCapture::Accessors(w3cos_core::Value::function(move |_, _| {getter}), {setter}))",
-                import.local.0
+                "({}, w3cos_core::AotCapture::Accessors({}, {setter}))",
+                import.local.0,
+                cached_stateless_function(&format!(
+                    "w3cos_core::Value::function(move |_, _| {getter})"
+                ))
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     if entries.is_empty() {
         Ok("w3cos_core::AotCaptureMap::new()".into())
     } else {
-        Ok(format!(
+        Ok(cached_capture_map(&format!(
             "w3cos_core::AotCaptureMap::from([{}])",
             entries.join(", ")
-        ))
+        )))
     }
+}
+
+/// A capture map whose entries are all stateless module-binding accessors
+/// is the same on every call, so build it once per call site (a deref of a
+/// cached `Rc<AotCaptureMap>`, so `&(...)` borrows the shared map). Building it per
+/// call hashed and allocated a HashMap on every invocation.
+fn cached_capture_map(map: &str) -> String {
+    format!("(*__w3cos_site_captures({}, || {map}))", next_site_index())
 }
 
 /// One emission chunk of a module init, in source order.
@@ -1788,6 +1898,12 @@ enum TopLevelItem {
         name: String,
         is_async: bool,
         is_generator: bool,
+        /// Own `name` (SetFunctionName: the declared identifier, the binding
+        /// name for an anonymous function/arrow initializer, or "default").
+        function_name: String,
+        /// Own `length`: ExpectedArgumentCount, the formals before the first
+        /// default or rest parameter.
+        length: u32,
     },
     Class {
         name: String,
@@ -1909,6 +2025,14 @@ fn parse_module_items(path: &Path) -> ParsedModuleItems {
                                 .unwrap_or_else(|| synthetic_default_export_name(item_index)),
                             is_async: function.function.is_async,
                             is_generator: function.function.is_generator,
+                            function_name: function
+                                .ident
+                                .as_ref()
+                                .map(|ident| ident.sym.to_string())
+                                .unwrap_or_else(|| "default".to_string()),
+                            length: expected_argument_count(
+                                function.function.params.iter().map(|param| &param.pat),
+                            ),
                         });
                     }
                     _ => {}
@@ -1950,10 +2074,17 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
     match decl {
         Decl::Fn(fn_decl) if !fn_decl.declare => {
             let name = fn_decl.ident.sym.to_string();
+            // Same-named declarations bind once; the last one initializes
+            // the binding (FunctionDeclarationInstantiation).
+            items.retain(|item| !matches!(item, TopLevelItem::Function { name: existing, .. } if *existing == name));
             items.push(TopLevelItem::Function {
+                function_name: name.clone(),
                 name,
                 is_async: fn_decl.function.is_async,
                 is_generator: fn_decl.function.is_generator,
+                length: expected_argument_count(
+                    fn_decl.function.params.iter().map(|param| &param.pat),
+                ),
             });
         }
         Decl::Class(class_decl) if !class_decl.declare => {
@@ -1970,11 +2101,24 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                 let Some(init) = &declarator.init else {
                     continue;
                 };
-                let (is_async, is_generator) = match init.as_ref() {
-                    Expr::Arrow(arrow) => (arrow.is_async, false),
-                    Expr::Fn(function) => {
-                        (function.function.is_async, function.function.is_generator)
-                    }
+                let (is_async, is_generator, function_name, length) = match init.as_ref() {
+                    Expr::Arrow(arrow) => (
+                        arrow.is_async,
+                        false,
+                        binding.id.sym.to_string(),
+                        expected_argument_count(arrow.params.iter()),
+                    ),
+                    Expr::Fn(function) => (
+                        function.function.is_async,
+                        function.function.is_generator,
+                        function.ident.as_ref().map_or_else(
+                            || binding.id.sym.to_string(),
+                            |ident| ident.sym.to_string(),
+                        ),
+                        expected_argument_count(
+                            function.function.params.iter().map(|param| &param.pat),
+                        ),
+                    ),
                     Expr::Ident(target) => {
                         items.push(TopLevelItem::Alias {
                             name: binding.id.sym.to_string(),
@@ -2012,6 +2156,8 @@ fn collect_decl_items(decl: &Decl, items: &mut Vec<TopLevelItem>) {
                     name: binding.id.sym.to_string(),
                     is_async,
                     is_generator,
+                    function_name,
+                    length,
                 });
             }
         }
@@ -2076,6 +2222,45 @@ fn emit_shared_module_registration(
     format!(
         "\n    /// Register this native module in the shared AOT/W3VM live-binding ABI.\n    pub fn {namespace}__register_shared_module() {{\n        {namespace}__instantiate_bindings();\n        let mut exports = ::std::collections::HashMap::new();\n{entries}        w3cos_core::module_registry::register({specifier:?}, exports, Some(w3cos_core::Value::function(move |_, _| {evaluator})));\n    }}\n"
     )
+}
+
+/// ExpectedArgumentCount (ECMA-262 15.1.5): formals before the first one
+/// with an initializer or a rest element. A TypeScript `this` parameter is
+/// type-only and not a formal.
+pub(crate) fn expected_argument_count<'a>(params: impl Iterator<Item = &'a Pat>) -> u32 {
+    let mut count = 0;
+    for pat in params {
+        match pat {
+            Pat::Ident(ident) if ident.id.sym == *"this" => continue,
+            Pat::Assign(_) | Pat::Rest(_) => break,
+            _ => count += 1,
+        }
+    }
+    count
+}
+
+/// The own `name` / `length` an ordinary function value is created with.
+fn function_name_and_length(items: &[TopLevelItem], name: &str) -> Option<(String, u32)> {
+    items.iter().find_map(|item| match item {
+        TopLevelItem::Function {
+            name: item_name,
+            function_name,
+            length,
+            ..
+        } if item_name == name => Some((function_name.clone(), *length)),
+        _ => None,
+    })
+}
+
+/// Wrap a function-value expression so the created function owns `name`
+/// and `length`.
+fn named_function_value(items: &[TopLevelItem], name: &str, value: String) -> String {
+    match function_name_and_length(items, name) {
+        Some((function_name, length)) => format!(
+            "{{ let __w3cos_function = {value}; if let Some(__w3cos_f) = __w3cos_function.as_function() {{ __w3cos_f.set_name_and_length({function_name:?}, {length}); }} __w3cos_function }}"
+        ),
+        None => value,
+    }
 }
 
 fn function_flags(items: &[TopLevelItem], name: &str) -> Option<(bool, bool)> {
@@ -2143,15 +2328,34 @@ fn emit_w3ir_generator_symbol(
         "\n    /// generator {} compiled from W3IR suspension metadata\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
+    // A stateless (cached or empty) capture map lets the function value
+    // carry the factory itself (FunctionBody::Aot, V8's code entry on the
+    // JSFunction): a call jumps to the factory without a boxed closure, a
+    // `_call` shim and a per-call capture-map lookup.
+    let value_body = if (captures.starts_with("(*__w3cos_site_captures(")
+        || captures == "w3cos_core::AotCaptureMap::new()")
+        && !LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(std::cell::Cell::get)
+    {
+        format!(
+            "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
+        )
+    } else {
+        format!(
+            "{{ let __w3cos_wrapper = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)); if let Some(__w3cos_f) = __w3cos_wrapper.as_function() {{ __w3cos_f.set_code_entry({factory} as usize); }} __w3cos_wrapper }}",
+            symbol.bundled_name
+        )
+    };
+    let value_body = named_function_value(items, &symbol.original_name, value_body);
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || {value_body})\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
-        symbol.bundled_name,
     ));
-    if symbol.kind == SymbolKind::Variable {
+    // Function declarations are mutable bindings (CreateMutableBinding in
+    // FunctionDeclarationInstantiation); `_set` replaces the live value.
+    {
         output.push_str(&format!(
-            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            "    #[allow(dead_code)]\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
             symbol.bundled_name,
             format!("{}:value", symbol.bundled_name),
         ));
@@ -2222,9 +2426,11 @@ fn emit_w3ir_async_symbol(
         format!("{}:value", symbol.bundled_name),
         symbol.bundled_name,
     ));
-    if symbol.kind == SymbolKind::Variable {
+    // Function declarations are mutable bindings (CreateMutableBinding in
+    // FunctionDeclarationInstantiation); `_set` replaces the live value.
+    {
         output.push_str(&format!(
-            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            "    #[allow(dead_code)]\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
             symbol.bundled_name,
             format!("{}:value", symbol.bundled_name),
         ));
@@ -2264,9 +2470,43 @@ fn emit_w3ir_sync_symbol(
             w3ir_module.ok_or_else(|| "module lowering did not produce W3IR".to_string())?;
         let function = select_w3ir_function(w3ir_module, &symbol.original_name, false, false)
             .ok_or_else(|| "function is missing from the lowered W3IR module".to_string())?;
-        let state_machine =
+        let targets = direct_call_targets(
+            bundle,
+            module,
+            w3ir_module,
+            items,
+            value_bindings,
+            class_names,
+            namespace_names,
+        );
+        let state_machine = crate::w3ir_aot::with_direct_call_targets(targets.clone(), || {
             crate::w3ir_aot::generate_sync_function_from_module(w3ir_module, function, &factory)
-                .map_err(|error| error.to_string())?;
+        })
+        .map_err(|error| error.to_string())?;
+        // Number-parameter entry for known-target sites passing only Numbers
+        // (parameters become bare f64 slots). Falls back to the generic
+        // completion entry when the specialization does not apply.
+        let number_factory = format!("{factory}__num");
+        let number_entry = (std::env::var_os("W3COS_NO_DIRECT_CALLS").is_none()
+            && crate::w3ir_aot::number_specializable(function))
+        .then(|| {
+            crate::w3ir_aot::with_direct_call_targets(targets, || {
+                crate::w3ir_aot::with_number_params(function, || {
+                    crate::w3ir_aot::generate_sync_function_from_module(
+                        w3ir_module,
+                        function,
+                        &number_factory,
+                    )
+                })
+            })
+            .ok()
+        })
+        .flatten()
+        .filter(|code| code.contains("__w3cos_frame.num_bindings["));
+        let (state_machine, number_target) = match number_entry {
+            Some(code) => (format!("{state_machine}\n{code}"), number_factory),
+            None => (state_machine, factory.clone()),
+        };
         let captures = generator_capture_map(
             bundle,
             module,
@@ -2277,27 +2517,43 @@ fn emit_w3ir_sync_symbol(
             namespace_names,
         )
         .ok_or_else(|| "live captures cannot be represented by the native W3IR ABI".to_string())?;
-        Ok::<_, String>((state_machine, captures))
+        Ok::<_, String>((state_machine, captures, number_target))
     })();
-    let (state_machine, captures) = match emitted {
+    let (state_machine, captures, number_target) = match emitted {
         Ok(emitted) => emitted,
         Err(error) => return Some(Err(error)),
     };
     let mut output = String::new();
     output.push_str(&state_machine);
     output.push_str(&format!(
-        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n",
-        symbol.original_name, symbol.bundled_name, symbol.bundled_name,
+        "\n    /// synchronous function {} compiled from W3IR\n    pub fn {}(__args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(w3cos_core::Value::Undefined, &__args, &{captures}) }}\n    fn {}_call(__this: w3cos_core::Value, __args: Vec<w3cos_core::Value>) -> w3cos_core::Value {{ {factory}(__this, &__args, &{captures}) }}\n    /// Known-target entry for direct calls from this module (no Value dispatch).\n    #[allow(dead_code)]\n    fn {}_call_slice(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> w3cos_core::Value {{ {factory}(__this, __args, &{captures}) }}\n    #[allow(dead_code)]\n    fn {}_call_result(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> Result<w3cos_core::Value, w3cos_core::Value> {{ {factory}__result(__this, __args, &{captures}) }}\n    /// Known-target entry for call sites passing exactly the declared number of Number arguments.\n    #[allow(dead_code)]\n    fn {}_call_num(__this: w3cos_core::Value, __args: &[w3cos_core::Value]) -> Result<w3cos_core::Value, w3cos_core::Value> {{ {number_target}__result(__this, __args, &{captures}) }}\n",
+        symbol.original_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name, symbol.bundled_name,
     ));
+    // Same code-entry form as generators above (FunctionBody::Aot).
+    let value_body = if (captures.starts_with("(*__w3cos_site_captures(")
+        || captures == "w3cos_core::AotCaptureMap::new()")
+        && !LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(std::cell::Cell::get)
+    {
+        format!(
+            "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
+        )
+    } else {
+        format!(
+            "{{ let __w3cos_wrapper = w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)); if let Some(__w3cos_f) = __w3cos_wrapper.as_function() {{ __w3cos_f.set_code_entry({factory} as usize); }} __w3cos_wrapper }}",
+            symbol.bundled_name
+        )
+    };
+    let value_body = named_function_value(items, &symbol.original_name, value_body);
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::Value::function(move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || {value_body})\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
-        symbol.bundled_name,
     ));
-    if symbol.kind == SymbolKind::Variable {
+    // Function declarations are mutable bindings (CreateMutableBinding in
+    // FunctionDeclarationInstantiation); `_set` replaces the live value.
+    {
         output.push_str(&format!(
-            "    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
+            "    #[allow(dead_code)]\n    pub fn {}_set(value: w3cos_core::Value) -> w3cos_core::Value {{ __w3cos_esm_set({:?}, value.clone()); value }}\n",
             symbol.bundled_name,
             format!("{}:value", symbol.bundled_name),
         ));
@@ -2310,6 +2566,98 @@ fn emit_w3ir_sync_symbol(
         ));
     }
     Some(Ok(output))
+}
+
+thread_local! {
+    static DIRECT_CALL_TARGET_CACHE: std::cell::RefCell<Option<(std::path::PathBuf, usize, HashMap<u32, String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Module-entry bindings that a call may target directly: ordinary
+/// synchronous function declarations of this module that are never
+/// reassigned anywhere in it. This is exactly the set the capture map
+/// snapshots as constant slots, further limited to sync non-generator
+/// declarations (whose `_call_slice` entry `emit_w3ir_sync_symbol` emits).
+/// Anything else (host imports, synthetic cells, classes, variables,
+/// async/generator functions, reassigned or duplicate declarations) is
+/// left to the dynamic call path.
+fn direct_call_targets(
+    bundle: &EsmBundle,
+    module: &BundledModule,
+    w3ir_module: &w3cos_ir::Module,
+    items: &[TopLevelItem],
+    value_bindings: &HashSet<String>,
+    class_names: &HashSet<String>,
+    namespace_names: &HashSet<String>,
+) -> HashMap<u32, String> {
+    // Escape hatch for differential testing: every call stays dynamic.
+    if std::env::var_os("W3COS_NO_DIRECT_CALLS").is_some() {
+        return HashMap::new();
+    }
+    let key = w3ir_module as *const w3cos_ir::Module as usize;
+    if let Some(cached) = DIRECT_CALL_TARGET_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(path, module_key, _)| path == &module.path && *module_key == key)
+            .map(|(_, _, targets)| targets.clone())
+    }) {
+        return cached;
+    }
+    let mut targets = HashMap::new();
+    if let Some(entry) = w3ir_module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id == w3ir_module.entry)
+    {
+        let context =
+            LowerCtx::new_dynamic_with_bindings(lowering_names(module), value_bindings.clone())
+                .with_classes(class_names.clone())
+                .with_namespaces(namespace_names.clone());
+        for binding in &entry.bindings {
+            if binding.name.starts_with('*')
+                || module
+                    .host_imports
+                    .iter()
+                    .any(|(local, _)| local == &binding.name)
+                || function_flags(items, &binding.name) != Some((false, false))
+            {
+                continue;
+            }
+            let Some(bundled) = module.lookup(&binding.name) else {
+                continue;
+            };
+            let declared_here = bundle.symbols.iter().any(|symbol| {
+                symbol.bundled_name == bundled
+                    && symbol.module == module.path
+                    && symbol.kind == SymbolKind::Function
+            });
+            if !declared_here
+                || !{
+                    // Lowering may name the module-local alias
+                    // (`pub use self::{bundled}_value as {name}_value`).
+                    let lowered = context.lower_ident(&binding.name);
+                    lowered == format!("{bundled}_value()")
+                        || lowered == format!("{}_value()", binding.name)
+                }
+                || binding_is_reassigned(w3ir_module, entry.id, binding.id)
+            {
+                continue;
+            }
+            // `#arity` marks a Number-parameter entry (`_call_num`).
+            let target = match select_w3ir_function(w3ir_module, &binding.name, false, false) {
+                Some(function) if crate::w3ir_aot::number_specializable(function) => {
+                    format!("{bundled}#{}", function.parameters.len())
+                }
+                _ => bundled.to_string(),
+            };
+            targets.insert(binding.id.0, target);
+        }
+    }
+    DIRECT_CALL_TARGET_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some((module.path.clone(), key, targets.clone()));
+    });
+    targets
 }
 
 fn generator_capture_map(
@@ -2392,6 +2740,78 @@ fn entry_bound_w3ir_function<'a>(
     None
 }
 
+std::thread_local! {
+    /// Function declarations of the module being generated that are written
+    /// somewhere besides their hoisted initialization.
+    static REASSIGNED_FUNCTIONS: std::cell::RefCell<(std::path::PathBuf, HashSet<String>)> =
+        std::cell::RefCell::new((std::path::PathBuf::new(), HashSet::new()));
+}
+
+fn function_is_reassigned(module: &BundledModule, name: &str) -> bool {
+    REASSIGNED_FUNCTIONS.with(|reassigned| {
+        let reassigned = reassigned.borrow();
+        reassigned.0 == module.path && reassigned.1.contains(name)
+    })
+}
+
+std::thread_local! {
+    /// Top-level `var`/`let`/`const` items of the module being generated:
+    /// these own a `{bundled}:cell` BindingCell in that module's registry
+    /// (the `find_variable` accessor branch).
+    static OWN_CELL_BINDINGS: std::cell::RefCell<(std::path::PathBuf, HashSet<String>)> =
+        std::cell::RefCell::new((std::path::PathBuf::new(), HashSet::new()));
+}
+
+/// Whether `binding` (an entry-scope binding id) is written anywhere besides
+/// its single hoisted declaration store in the module entry: any write from
+/// another function, or more than one store in the entry.
+fn binding_is_reassigned(
+    module: &w3cos_ir::Module,
+    entry: w3cos_ir::FunctionId,
+    binding: w3cos_ir::BindingId,
+) -> bool {
+    let mut entry_stores = 0usize;
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let target = match instruction {
+                    w3cos_ir::Instruction::StoreBinding {
+                        binding: target, ..
+                    }
+                    | w3cos_ir::Instruction::InitializeBinding {
+                        binding: target, ..
+                    } => target,
+                    _ => continue,
+                };
+                if *target != binding {
+                    continue;
+                }
+                if function.id != entry {
+                    return true;
+                }
+                entry_stores += 1;
+            }
+        }
+    }
+    entry_stores > 1
+}
+
+fn owns_binding_cell(module: &BundledModule, name: &str) -> bool {
+    OWN_CELL_BINDINGS.with(|own| {
+        let own = own.borrow();
+        own.0 == module.path && own.1.contains(name)
+    })
+}
+
+thread_local! {
+    /// Set by `generator_capture_map_with_synthetic` when the map snapshots
+    /// other functions' `_value()` eagerly. Such a function keeps the lazy
+    /// closure `_value` so mutually recursive declarations never evaluate
+    /// each other's values while initializing.
+    static LAST_CAPTURES_SNAPSHOT_FUNCTIONS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn generator_capture_map_with_synthetic(
     bundle: &EsmBundle,
     module: &BundledModule,
@@ -2402,6 +2822,7 @@ fn generator_capture_map_with_synthetic(
     namespace_names: &HashSet<String>,
     synthetic: &HashMap<String, (String, String)>,
 ) -> Option<String> {
+    LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(|flag| flag.set(false));
     if function.captures.is_empty() {
         return Some("w3cos_core::AotCaptureMap::new()".into());
     }
@@ -2415,6 +2836,7 @@ fn generator_capture_map_with_synthetic(
         .with_namespaces(namespace_names.clone());
     let mut ordered_captures = function.captures.clone();
     ordered_captures.sort_by_key(|capture| capture.0);
+    let stateful = std::cell::Cell::new(false);
     let entries = ordered_captures
         .iter()
         .map(|capture| {
@@ -2427,6 +2849,7 @@ fn generator_capture_map_with_synthetic(
                 .iter()
                 .find(|binding| binding.id == *capture)?;
             if let Some((getter, setter)) = synthetic.get(&binding.name) {
+                stateful.set(true);
                 return Some(format!(
                     "({}, w3cos_core::AotCapture::Accessors({getter}, {setter}))",
                     capture.0
@@ -2446,8 +2869,8 @@ fn generator_capture_map_with_synthetic(
                     )
                 })
                 .unwrap_or_else(|| context.lower_ident(&binding.name));
-            let setter = binding
-                .mutable
+            let reassigned_function = function_is_reassigned(module, &binding.name);
+            let setter = (binding.mutable || reassigned_function)
                 .then(|| module.lookup(&binding.name))
                 .flatten()
                 .and_then(|bundled| {
@@ -2456,25 +2879,73 @@ fn generator_capture_map_with_synthetic(
                         .iter()
                         .find(|symbol| {
                             symbol.bundled_name == bundled
-                                && symbol.kind == SymbolKind::Variable
+                                && (symbol.kind == SymbolKind::Variable
+                                    || (reassigned_function
+                                        && symbol.kind == SymbolKind::Function))
                         })
                         .map(|_| {
-                            format!(
+                            cached_stateless_function(&format!(
                                 "w3cos_core::Value::function(move |_, arguments| {bundled}_set(arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined)))"
-                            )
+                            ))
                         })
                 })
                 .unwrap_or_else(|| "w3cos_core::Value::Undefined".into());
+            // A function declaration of this module that is never
+            // reassigned anywhere in the module is a constant once hoisted:
+            // capture its function value directly (V8 treats such script
+            // context slots as constant and calls the known target) instead
+            // of calling a getter closure on every reference.
+            if let Some(bundled) = module.lookup(&binding.name)
+                && load.ends_with("_value()")
+                && bundle.symbols.iter().any(|symbol| {
+                    symbol.bundled_name == bundled
+                        && symbol.module == module.path
+                        && symbol.kind == SymbolKind::Function
+                })
+                && !binding_is_reassigned(w3ir_module, entry.id, *capture)
+            {
+                LAST_CAPTURES_SNAPSHOT_FUNCTIONS.with(|flag| flag.set(true));
+                return Some(format!(
+                    "({}, w3cos_core::AotCapture::Cell(::std::rc::Rc::new(::std::cell::RefCell::new(({load}, true)))))",
+                    capture.0
+                ));
+            }
+            // A mutable module variable of this module captured by a
+            // function reads/writes its BindingCell slot directly (V8
+            // ScriptContext slot load) instead of calling getter/setter
+            // closures. The frame's Cell path keeps TDZ checks.
+            if binding.mutable
+                && owns_binding_cell(module, &binding.name)
+                && let Some(bundled) = module.lookup(&binding.name)
+                && load == format!("{bundled}_get()")
+                && bundle.symbols.iter().any(|symbol| {
+                    symbol.bundled_name == bundled
+                        && symbol.module == module.path
+                        && symbol.kind == SymbolKind::Variable
+                })
+            {
+                return Some(format!(
+                    "({}, w3cos_core::AotCapture::Cell(__w3cos_site_binding({}, {:?}).shared_slot()))",
+                    capture.0,
+                    next_site_index(),
+                    format!("{bundled}:cell")
+                ));
+            }
             Some(format!(
-                "({}, w3cos_core::AotCapture::Accessors(w3cos_core::Value::function(move |_, _| {load}), {setter}))",
-                capture.0
+                "({}, w3cos_core::AotCapture::Accessors({}, {setter}))",
+                capture.0,
+                cached_stateless_function(&format!(
+                    "w3cos_core::Value::function(move |_, _| {load})"
+                ))
             ))
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(format!(
-        "w3cos_core::AotCaptureMap::from([{}])",
-        entries.join(", ")
-    ))
+    let map = format!("w3cos_core::AotCaptureMap::from([{}])", entries.join(", "));
+    Some(if stateful.get() {
+        map
+    } else {
+        cached_capture_map(&map)
+    })
 }
 
 fn find_variable<'a>(items: &'a [TopLevelItem], name: &str) -> Option<&'a Expr> {
@@ -2903,7 +3374,7 @@ fn emit_class(
         out.push_str(&state_machine);
         if w3ir_name.ends_with(".<instance_fields>") {
             instance_initializer = Some(format!(
-                "w3cos_core::Value::aot_function({factory}, {captures})"
+                "w3cos_core::Value::aot_function({factory}, w3cos_core::AotCaptureMap::clone(&{captures}))"
             ));
         } else {
             static_initializers.push(format!("{factory}(__class.clone(), &[], &{captures});"));
@@ -3625,17 +4096,17 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
         let cases = [
             (
                 "sync",
-                "export function copy() { return new.target; }",
+                "export function copy() { return String.raw`a`; }",
                 "synchronous function",
             ),
             (
                 "async",
-                "export async function copy() { return new.target; }",
+                "export async function copy() { return String.raw`a`; }",
                 "async function",
             ),
             (
                 "generator",
-                "export function* copy() { yield new.target; }",
+                "export function* copy() { yield String.raw`a`; }",
                 "generator",
             ),
         ];
@@ -3671,17 +4142,17 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
         let cases = [
             (
                 "method",
-                "export class Broken { copy() { return new.target; } }",
+                "export class Broken { copy() { return String.raw`a`; } }",
                 "Broken.copy",
             ),
             (
                 "async_method",
-                "export class Broken { async copy() { return new.target; } }",
+                "export class Broken { async copy() { return String.raw`a`; } }",
                 "Broken.copy",
             ),
             (
                 "generator_method",
-                "export class Broken { *copy() { yield new.target; } }",
+                "export class Broken { *copy() { yield String.raw`a`; } }",
                 "Broken.copy",
             ),
             (
@@ -3727,6 +4198,100 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
             );
         }
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reassigned_function_declarations_are_mutable_bindings_without_known_targets() {
+        let root = fixture_root("w3cos_esm_codegen_reassigned_functions");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+function swap() { return 1; }
+const before = swap();
+swap = function () { return 2; };
+function inner(x) { return x + 1; }
+function caller(x) { return inner(x) * 10; }
+function twice() { return "a"; }
+function twice() { return "b"; }
+export function result() {
+  const first = caller(1);
+  inner = function (x) { return x + 2; };
+  const thunk = [0].map(() => 1);
+  return before + swap() + first + caller(1) + twice() + thunk[0];
+}
+"#;
+        std::fs::write(root.join("src/app.js"), source).unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = try_generate_with_bodies(&bundle).unwrap();
+        std::fs::write("/tmp/w3cos-reassigned-functions.rs", &code).ok();
+        // Function declarations are mutable bindings: writes go to the live
+        // `{bundled}:value` cell and captures expose a setter.
+        assert!(code.contains("pub fn m0_swap_set(value: w3cos_core::Value)"));
+        assert!(code.contains("m0_inner_set(arguments.first()"));
+        // A reassigned declaration is no longer a known call target.
+        // (The entries are still emitted for the hoisted value; no call
+        // site may bind to them.)
+        assert_eq!(code.matches("m0_inner_call_num(").count(), 1);
+        assert_eq!(code.matches("m0_inner_call_result(").count(), 1);
+        assert_eq!(code.matches("m0_swap_call_num(").count(), 1);
+        assert_eq!(code.matches("m0_swap_call_result(").count(), 1);
+        // NamedEvaluation + SetFunctionLength on closures created inside
+        // functions: `inner = function (x) {}` is named "inner", length 1.
+        assert!(code.contains("__w3cos_f.set_name_and_length(\"inner\", 1)"));
+        assert!(code.contains("__w3cos_f.set_name_and_length(\"\", 0)"));
+        // Duplicate declarations bind once; the last one wins (spec order).
+        assert_eq!(code.matches("pub fn m0_twice(").count(), 1);
+        assert_eq!(code.matches("pub fn m0_swap(").count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn constant_function_declarations_are_called_through_known_target_entries() {
+        let root = fixture_root("w3cos_esm_codegen_known_target_calls");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let source = r#"
+function add(a, b) { return a + b; }
+function* gen() { yield 1; }
+const alias = add;
+export function result() {
+  const viaAlias = alias(1, 2);
+  const direct = add(3, 4);
+  const it = gen();
+  return direct + viaAlias + it.next().value;
+}
+"#;
+        std::fs::write(root.join("src/app.js"), source).unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        let code = try_generate_with_bodies(&bundle).unwrap();
+        // `add` is a never-reassigned ordinary declaration: native entry.
+        assert!(
+            code.contains("m0_add_call_num("),
+            "known-target Number call missing"
+        );
+        // `add(3, 4)` passes two Number registers: the Number-parameter entry
+        // keeps both parameters as bare f64 slots.
+        assert!(code.contains("pub fn m0_add__w3ir_sync_factory__num__result("));
+        assert!(code.contains("__w3cos_frame.num_bindings["));
+        assert!(code.contains("fn m0_add_call_result("));
+        // StackGuard check at every compiled function entry.
+        assert!(code.contains("w3cos_core::intrinsics::check_stack()?;"));
+        // SetFunctionName / SetFunctionLength on the declaration's value.
+        assert!(code.contains("set_name_and_length(\"add\", 2)"));
+        assert!(code.contains("set_name_and_length(\"gen\", 0)"));
+        // `alias` is a binding to a value (not a declaration) and `gen` is a
+        // generator: both keep the generic [[Call]] dispatch.
+        assert!(!code.contains("m0_alias_call_slice"));
+        assert!(!code.contains("catch_js(|| m0_gen_call_slice("));
+        assert!(code.contains("call_completion_slice("));
+        assert!(code.contains("fn m0_add_call_slice(__this: w3cos_core::Value"));
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -9123,6 +9688,78 @@ export function main() { return total; }"#,
             String::from_utf8_lossy(&output.stdout).contains("W3COS_MODULE_INIT_W3IR_CLOSURE_OK"),
             "live module cell assertion should pass: {}",
             String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn generated_function_declaration_captures_are_constant_slots() {
+        let root = fixture_root("w3cos_esm_codegen_fn_snapshot");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.js"),
+            r#"function stable(x) { return x + 1; }
+function swapped(x) { return x * 10; }
+function useBoth(x) { return stable(x) + swapped(x); }
+function isEven(n) { return n === 0 ? true : isOdd(n - 1); }
+function isOdd(n) { return n === 0 ? false : isEven(n - 1); }
+function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }
+function strFold(sum, text) {
+  for (var i = 0; i < text.length; i++) sum = (sum * 31 + text.charCodeAt(i)) % 1000;
+  return sum;
+}
+export function main() {
+  return useBoth(2) * 1000 + useBoth(3) + (isEven(7) ? 100000 : 0) + fact(5) * 1000000 +
+    (isOdd(7) && strFold(0, "ab") === 105 ? 0 : 7);
+}"#,
+        )
+        .unwrap();
+
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.js"));
+        assert!(
+            bundle.is_fully_resolved(),
+            "unresolved: {:?}",
+            bundle.unresolved
+        );
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("RefCell::new((stable_value(), true))")
+                && code.contains("RefCell::new((swapped_value(), true))"),
+            "never-reassigned declarations are captured as constant slots: {code}"
+        );
+
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3cos_fn_snapshot_run\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src/main.rs"),
+            format!(
+                "#![allow(warnings)]\n{code}\nfn main() {{ assert_eq!(run_entry().to_u32(), 120023034); println!(\"W3COS_FN_SNAPSHOT_OK\"); }}\n"
+            ),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("W3COS_FN_SNAPSHOT_OK"),
+            "snapshotted function captures must call the declared functions.\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
         std::fs::remove_dir_all(root).ok();
     }

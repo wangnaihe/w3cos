@@ -1,7 +1,7 @@
 //! Value-level implementations of the core Web Events constructors.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,11 @@ thread_local! {
     static TOUCH_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static TOUCH_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static INPUT_DEVICE_CAPABILITIES_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// One `getModifierState` per realm, like a prototype method in Blink
+    /// (it reads `this`), instead of a fresh closure per event.
+    static GET_MODIFIER_STATE: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// Per-realm `getCoalescedEvents` / `getPredictedEvents` (stateless).
+    static POINTER_EVENT_METHODS: RefCell<Option<[Value; 2]>> = const { RefCell::new(None) };
     static EVENT_TARGET_INSTANCES: RefCell<Vec<EventTargetBinding>> = const { RefCell::new(Vec::new()) };
     static EVENT_SLOTS: RefCell<HashMap<u64, EventSlot>> = RefCell::new(HashMap::new());
     /// The hot `new Event(type)` object. Its slot lives beside it so dispatch
@@ -801,9 +806,25 @@ fn init_value(init: &Value, name: &str, default: Value) -> Value {
     if value.is_undefined() { default } else { value }
 }
 
+/// Store an event-init member on the event itself. Blink keeps these in C++
+/// members filled by the generated dictionary conversion; no JS setter on
+/// the prototype chain runs during construction. An ordinary object (the
+/// only kind `new XEvent()` produces) therefore takes the own-slot write
+/// directly instead of a [[Set]] that probes `__w3cos_setter_*` on every
+/// prototype level per field.
+fn put_field(this: &Value, name: &str, value: Value) {
+    if let Some(object) = this.as_object()
+        && !object.borrow().is_proxy()
+    {
+        object.borrow_mut().set_direct(name, value);
+        return;
+    }
+    this.set_property(name, value);
+}
+
 fn install_fields(this: &Value, init: &Value, fields: &[(&str, Value)]) {
     for (name, default) in fields {
-        this.set_property(name, init_value(init, name, default.clone()));
+        put_field(this, name, init_value(init, name, default.clone()));
     }
 }
 
@@ -826,7 +847,7 @@ fn install_ui_fields(this: &Value, init: &Value) {
             ("pseudoTarget", Value::Null),
         ],
     );
-    this.set_property("sourceCapabilities", source);
+    put_field(this, "sourceCapabilities", source);
 }
 
 pub fn input_device_capabilities_class() -> Value {
@@ -869,19 +890,23 @@ fn install_modifier_fields(this: &Value, init: &Value) {
             ("metaKey", Value::Bool(false)),
         ],
     );
-    this.set_property(
-        "getModifierState",
-        realm_event_function(|this, args| {
-            let property = match arg(&args, 0).to_js_string().as_str() {
-                "Alt" => "altKey",
-                "Control" => "ctrlKey",
-                "Meta" => "metaKey",
-                "Shift" => "shiftKey",
-                _ => return Value::Bool(false),
-            };
-            Value::Bool(this.get_property(property).to_bool())
-        }),
-    );
+    let get_modifier_state = GET_MODIFIER_STATE.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                realm_event_function(|this, args| {
+                    let property = match arg(&args, 0).to_js_string().as_str() {
+                        "Alt" => "altKey",
+                        "Control" => "ctrlKey",
+                        "Meta" => "metaKey",
+                        "Shift" => "shiftKey",
+                        _ => return Value::Bool(false),
+                    };
+                    Value::Bool(this.get_property(property).to_bool())
+                })
+            })
+            .clone()
+    });
+    put_field(this, "getModifierState", get_modifier_state);
 }
 
 fn install_mouse_fields(this: &Value, init: &Value) {
@@ -912,6 +937,192 @@ fn install_mouse_fields(this: &Value, init: &Value) {
             ("y", Value::Number(0.0)),
         ],
     );
+}
+
+fn install_pointer_fields(this: &Value, init: &Value) {
+    install_fields(
+        this,
+        init,
+        &[
+            ("pointerId", Value::Number(0.0)),
+            ("width", Value::Number(1.0)),
+            ("height", Value::Number(1.0)),
+            ("pressure", Value::Number(0.0)),
+            ("tangentialPressure", Value::Number(0.0)),
+            ("tiltX", Value::Number(0.0)),
+            ("tiltY", Value::Number(0.0)),
+            ("twist", Value::Number(0.0)),
+            ("pointerType", Value::string("")),
+            ("isPrimary", Value::Bool(false)),
+            ("altitudeAngle", Value::Number(0.0)),
+            ("azimuthAngle", Value::Number(0.0)),
+            ("persistentDeviceId", Value::Number(0.0)),
+        ],
+    );
+    let methods = POINTER_EVENT_METHODS.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| {
+                [
+                    realm_event_function(|_, _| Value::array(vec![])),
+                    realm_event_function(|_, _| Value::array(vec![])),
+                ]
+            })
+            .clone()
+    });
+    for (method, function) in ["getCoalescedEvents", "getPredictedEvents"]
+        .into_iter()
+        .zip(methods)
+    {
+        put_field(this, method, function);
+    }
+}
+
+thread_local! {
+    /// Per-realm MouseEvent / PointerEvent boilerplates: the default member
+    /// slots plus the dictionary member names in conversion order.
+    static EVENT_TEMPLATES: RefCell<[Option<EventTemplate>; 2]> =
+        const { RefCell::new([None, None]) };
+}
+
+type EventTemplate = (Value, Rc<[String]>, Rc<HashSet<String>>);
+
+/// The own data members of a plain init dictionary, when reading members
+/// one [[Get]] at a time is unobservable: an ordinary object with no own
+/// accessors whose only prototype is an ordinary root (Object.prototype)
+/// that defines none of the members. Absent members then read as
+/// undefined, so only the supplied entries need to be visited.
+fn plain_init_entries(init: &Value, members: &HashSet<String>) -> Option<Vec<(String, Value)>> {
+    let object = init.as_object()?;
+    let object = object.borrow();
+    if object.is_proxy() {
+        return None;
+    }
+    let is_member = |key: &str| key == "sourceCapabilities" || members.contains(key);
+    let prototype = object.get_prototype_of();
+    let no_prototype = |value: &Value| value.is_null() || value.is_undefined();
+    if !no_prototype(&prototype) {
+        let root = prototype.as_object()?;
+        let root = root.borrow();
+        if root.is_proxy() || !no_prototype(&root.get_prototype_of()) {
+            return None;
+        }
+        let shadows = root.any_own_key(|key| {
+            is_member(key)
+                || key
+                    .strip_prefix("__w3cos_getter_")
+                    .is_some_and(|name| is_member(name))
+        });
+        if shadows {
+            return None;
+        }
+    }
+    let mut entries = Vec::new();
+    let mut accessor = false;
+    object.any_own_key(|key| {
+        if key.starts_with("__w3cos_getter_") {
+            accessor = true;
+            return true;
+        }
+        if is_member(key) {
+            entries.push((key.to_string(), object.get_direct(key)));
+        }
+        false
+    });
+    (!accessor).then_some(entries)
+}
+
+/// Construct a MouseEvent (0) or PointerEvent (1) by copying a per-realm
+/// boilerplate of default members (V8 object boilerplate cloning), then
+/// overlaying only the dictionary members the init actually supplies. The
+/// init is still read member by member in Blink's conversion order, so a
+/// getter on the dictionary observes the same sequence of [[Get]]s.
+fn install_from_template(this: &Value, init: &Value, kind: usize) -> bool {
+    let Some(object) = this.as_object() else {
+        return false;
+    };
+    {
+        let object = object.borrow();
+        if object.is_proxy() || !object.is_empty() {
+            return false;
+        }
+    }
+    let (template, members, member_set) = EVENT_TEMPLATES.with(|slot| {
+        slot.borrow_mut()[kind]
+            .get_or_insert_with(|| {
+                let template = Value::object(HashMap::new());
+                install_mouse_fields(&template, &Value::Undefined);
+                if kind == 1 {
+                    install_pointer_fields(&template, &Value::Undefined);
+                }
+                let members = template
+                    .as_object()
+                    .map(|object| object.borrow().keys())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|name| {
+                        !matches!(
+                            name.as_str(),
+                            "sourceCapabilities"
+                                | "getModifierState"
+                                | "getCoalescedEvents"
+                                | "getPredictedEvents"
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let member_set = members.iter().cloned().collect::<HashSet<_>>();
+                (template, Rc::from(members), Rc::new(member_set))
+            })
+            .clone()
+    });
+    let copied = template
+        .as_object()
+        .is_some_and(|template| object.borrow_mut().copy_properties_from(&template.borrow()));
+    if !copied {
+        return false;
+    }
+    if !init.is_object() {
+        return true;
+    }
+    if let Some(entries) = plain_init_entries(init, &member_set) {
+        // Data-only dictionary: the template already holds every default,
+        // and overwriting an existing key keeps its insertion position.
+        for (name, value) in entries {
+            if value.is_undefined() {
+                continue;
+            }
+            if name == "sourceCapabilities" {
+                let source = if value.is_object()
+                    && !w3cos_core::class::instance_of(&value, &input_device_capabilities_class())
+                {
+                    w3cos_core::class::construct(&input_device_capabilities_class(), vec![value])
+                } else {
+                    value
+                };
+                put_field(this, "sourceCapabilities", source);
+            } else {
+                put_field(this, &name, value);
+            }
+        }
+        return true;
+    }
+    let source = init.get_property("sourceCapabilities");
+    if !source.is_undefined() {
+        let source = if source.is_object()
+            && !w3cos_core::class::instance_of(&source, &input_device_capabilities_class())
+        {
+            w3cos_core::class::construct(&input_device_capabilities_class(), vec![source])
+        } else {
+            source
+        };
+        put_field(this, "sourceCapabilities", source);
+    }
+    for name in members.iter() {
+        let value = init.get_property(name);
+        if !value.is_undefined() {
+            put_field(this, name, value);
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -968,7 +1179,11 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
     match kind {
         EventSubclass::Generic => {}
         EventSubclass::Ui => install_ui_fields(this, &init),
-        EventSubclass::Mouse => install_mouse_fields(this, &init),
+        EventSubclass::Mouse => {
+            if !install_from_template(this, &init, 0) {
+                install_mouse_fields(this, &init);
+            }
+        }
         EventSubclass::Keyboard => {
             install_ui_fields(this, &init);
             install_modifier_fields(this, &init);
@@ -987,28 +1202,9 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
             );
         }
         EventSubclass::Pointer => {
-            install_mouse_fields(this, &init);
-            install_fields(
-                this,
-                &init,
-                &[
-                    ("pointerId", Value::Number(0.0)),
-                    ("width", Value::Number(1.0)),
-                    ("height", Value::Number(1.0)),
-                    ("pressure", Value::Number(0.0)),
-                    ("tangentialPressure", Value::Number(0.0)),
-                    ("tiltX", Value::Number(0.0)),
-                    ("tiltY", Value::Number(0.0)),
-                    ("twist", Value::Number(0.0)),
-                    ("pointerType", Value::string("")),
-                    ("isPrimary", Value::Bool(false)),
-                    ("altitudeAngle", Value::Number(0.0)),
-                    ("azimuthAngle", Value::Number(0.0)),
-                    ("persistentDeviceId", Value::Number(0.0)),
-                ],
-            );
-            for method in ["getCoalescedEvents", "getPredictedEvents"] {
-                this.set_property(method, realm_event_function(|_, _| Value::array(vec![])));
+            if !install_from_template(this, &init, 1) {
+                install_mouse_fields(this, &init);
+                install_pointer_fields(this, &init);
             }
         }
         EventSubclass::Wheel => {
@@ -1886,6 +2082,9 @@ fn make_event_target_class() -> Value {
 }
 
 pub(crate) fn reset_realm() {
+    GET_MODIFIER_STATE.with(|slot| *slot.borrow_mut() = None);
+    POINTER_EVENT_METHODS.with(|slot| *slot.borrow_mut() = None);
+    EVENT_TEMPLATES.with(|slot| *slot.borrow_mut() = [None, None]);
     EVENT_SLOTS.with(|slots| slots.borrow_mut().clear());
     EVENT_POOL.with(|pool| *pool.borrow_mut() = None);
     FAST_EVENT_HANDLE.with(|cell| cell.set(u32::MAX));
@@ -1979,6 +2178,57 @@ mod tests {
                 .get_property("when")
                 .is_function()
         );
+    }
+
+    #[test]
+    fn pointer_events_from_boilerplate_keep_members_independent() {
+        let class = event_subclass_class("PointerEvent");
+        let init = Value::object(HashMap::from([
+            ("bubbles".to_string(), Value::Bool(true)),
+            ("clientX".to_string(), Value::Number(7.0)),
+            ("pointerType".to_string(), Value::string("pen")),
+        ]));
+        let first =
+            w3cos_core::class::construct(&class, vec![Value::string("pointermove"), init.clone()]);
+        let second = w3cos_core::class::construct(&class, vec![Value::string("pointerdown")]);
+        assert_eq!(first.get_property("clientX"), Value::Number(7.0));
+        assert_eq!(first.get_property("pointerType").to_js_string(), "pen");
+        assert_eq!(first.get_property("width"), Value::Number(1.0));
+        assert_eq!(first.get_property("bubbles"), Value::Bool(true));
+        assert_eq!(second.get_property("clientX"), Value::Number(0.0));
+        assert_eq!(second.get_property("pointerType").to_js_string(), "");
+        assert_eq!(second.get_property("type").to_js_string(), "pointerdown");
+        first.set_property("clientY", Value::Number(9.0));
+        let third = w3cos_core::class::construct(&class, vec![Value::string("pointerup")]);
+        assert_eq!(third.get_property("clientY"), Value::Number(0.0));
+        assert!(first.get_property("getCoalescedEvents").is_function());
+        assert!(
+            first
+                .get_property("getModifierState")
+                .strict_eq(&second.get_property("getModifierState"))
+        );
+        let mouse = w3cos_core::class::construct(
+            &event_subclass_class("MouseEvent"),
+            vec![Value::string("click"), init],
+        );
+        assert_eq!(mouse.get_property("clientX"), Value::Number(7.0));
+        assert!(mouse.get_property("pointerType").is_undefined());
+
+        // Members inherited by the dictionary still convert ([[Get]] walks
+        // the chain), and accessor members still run.
+        let base = Value::object(HashMap::from([("clientY".to_string(), Value::Number(5.0))]));
+        let derived = Value::object(HashMap::new());
+        w3cos_core::class::set_prototype_of(&derived, &base);
+        derived.set_property(
+            "__w3cos_getter_clientX",
+            realm_event_function(|_, _| Value::Number(11.0)),
+        );
+        let inherited = w3cos_core::class::construct(
+            &event_subclass_class("PointerEvent"),
+            vec![Value::string("pointermove"), derived],
+        );
+        assert_eq!(inherited.get_property("clientY"), Value::Number(5.0));
+        assert_eq!(inherited.get_property("clientX"), Value::Number(11.0));
     }
 
     #[test]

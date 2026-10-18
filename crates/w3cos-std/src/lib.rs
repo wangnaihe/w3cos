@@ -1,6 +1,7 @@
 pub mod background;
 pub mod color;
 pub mod component;
+pub mod fxhash;
 pub mod inline_text;
 pub mod keyboard_inset;
 pub mod safe_area;

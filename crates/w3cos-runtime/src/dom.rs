@@ -398,6 +398,16 @@ pub fn get_descendant_text_content(node: u32) -> String {
     with_document(|doc| doc.descendant_text_content(NodeId::from_u32(node)))
 }
 
+/// Animated style inputs of `node` changed (effect timing/keyframes or the
+/// timeline advanced): restyle it like an inline-style edit.
+pub fn invalidate_animated_style(node: u32) {
+    if !is_connected(node) {
+        return;
+    }
+    with_document_mut(|doc| doc.mark_inline_style_dirty(NodeId::from_u32(node)));
+    mark_dom_dirty();
+}
+
 pub fn set_style_property(node: u32, prop: &str, value: &str) {
     // CSSOM writes notify attribute observers with the previous style
     // attribute. With no observers, serializing that attribute on every
@@ -410,7 +420,8 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
     };
     with_document_mut(|doc| {
         let id = NodeId::from_u32(node);
-        doc.get_style_mut(id).set_property(prop, value);
+        doc.get_style_mut_for_property(id, prop)
+            .set_property(prop, value);
         if inline_style_change_is_local(prop) {
             doc.note_local_style(id);
         } else {
@@ -614,6 +625,11 @@ pub fn parent_node(node: u32) -> Option<u32> {
 
 pub fn tag_name(node: u32) -> String {
     with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_str())
+}
+
+/// Interned tag bytes; the atom arena never frees, so no copy is needed.
+pub fn tag_static(node: u32) -> &'static str {
+    with_document(|doc| doc.get_node(NodeId::from_u32(node)).tag.as_static())
 }
 
 pub fn tag_is(node: u32, expected: &str) -> bool {

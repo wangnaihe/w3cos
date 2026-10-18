@@ -94,6 +94,24 @@ lto = "fat"
 codegen-units = 1
 panic = "unwind"
 strip = "symbols"
+
+# The engine crates are the hot path (value ops, DOM, style, layout). At
+# opt-level "z" their generic std code (iterators, char decoding, hashing,
+# slice compares) stays out of line and the machine outliner splits hot
+# loops: md-stream-append ran 2.4x slower than opt-level 3. opt-level 2
+# keeps them as fast as 3 (measured) for +4.2 MB on a 12.4 MB binary; the
+# generated application code and third-party crates stay at "z".
+[profile.release.package.w3cos-core]
+opt-level = 2
+
+[profile.release.package.w3cos-std]
+opt-level = 2
+
+[profile.release.package.w3cos-dom]
+opt-level = 2
+
+[profile.release.package.w3cos-runtime]
+opt-level = 2
 "#;
 
 /// Replace the standalone `fn main` with the versioned C entry the system
@@ -1389,7 +1407,7 @@ fn gen_animation_rust(value: &str) -> Option<String> {
         _ => "Easing::Ease",
     };
     Some(format!(
-        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None }})",
+        "animation: Some(Animation {{ name: {:?}.to_string(), duration_ms: {}, easing: {easing}, delay_ms: {}, iteration_count: AnimationIterationCount::Once, direction: AnimationDirection::Normal, fill_mode: AnimationFillMode::None, paused: false }})",
         a.name, a.duration_ms, a.delay_ms
     ))
 }
@@ -1935,6 +1953,14 @@ mod tests {
         assert!(toml.contains("codegen-units = 1"), "{toml}");
         assert!(toml.contains("panic = \"unwind\""), "{toml}");
         assert!(toml.contains("strip = \"symbols\""), "{toml}");
+        for engine in ["w3cos-core", "w3cos-std", "w3cos-dom", "w3cos-runtime"] {
+            assert!(
+                toml.contains(&format!(
+                    "[profile.release.package.{engine}]\nopt-level = 2"
+                )),
+                "{engine} must be speed-optimized inside the size profile: {toml}"
+            );
+        }
     }
 
     #[test]

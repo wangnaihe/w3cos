@@ -689,6 +689,17 @@ impl BuiltinObject {
 /// Direct calls and extracted methods must share the same generic builtin
 /// implementation (`const clz32 = Math.clz32` is common in library code).
 pub fn math_value() -> Value {
+    // `Math` is one ordinary object per realm (ECMA-262 §21.3), not a fresh
+    // object per reference: `Math === Math`, and authored properties stick.
+    // Rebuilding it allocated 20 function objects per `Math.x` access that
+    // the arena never reclaims (~130 MB on md-stream).
+    thread_local! {
+        static MATH: std::cell::OnceCell<Value> = const { std::cell::OnceCell::new() };
+    }
+    MATH.with(|math| math.get_or_init(build_math_value).clone())
+}
+
+fn build_math_value() -> Value {
     let mut properties = HashMap::new();
     for method in [
         "min", "max", "abs", "floor", "ceil", "round", "f16round", "trunc", "sqrt", "log", "log2",
@@ -827,28 +838,137 @@ fn dom_element() -> Value {
     element
 }
 
-pub fn parseInt(arguments: Vec<Value>) -> Value {
-    let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-    let parsed = value
-        .to_js_string()
-        .trim()
-        .split(|character: char| !character.is_ascii_digit() && character != '-')
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(f64::NAN);
-    Value::Number(parsed)
+/// ECMAScript StrWhiteSpaceChar: WhiteSpace (incl. U+FEFF and every Zs) or
+/// LineTerminator. Unicode White_Space minus U+0085, plus U+FEFF.
+fn is_str_whitespace(character: char) -> bool {
+    (character.is_whitespace() && character != '\u{85}') || character == '\u{feff}'
 }
 
-pub fn parseFloat(arguments: Vec<Value>) -> Value {
-    let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-    let text = value.to_js_string();
-    let prefix: String = text
-        .chars()
-        .take_while(|character| {
-            character.is_ascii_digit() || matches!(character, '-' | '+' | '.' | 'e' | 'E')
+/// `parseInt ( string, radix )` (ECMA-262 sec-parseint-string-radix).
+pub fn parseInt(arguments: Vec<Value>) -> Value {
+    let input = arguments
+        .first()
+        .cloned()
+        .unwrap_or(Value::Undefined)
+        .to_js_string();
+    let mut text = input.trim_start_matches(is_str_whitespace);
+    let negative = text.starts_with('-');
+    if negative || text.starts_with('+') {
+        text = &text[1..];
+    }
+    let radix = arguments.get(1).map_or(0.0, Value::to_number);
+    let mut radix = if radix.is_finite() {
+        radix.trunc().rem_euclid(4_294_967_296.0) as u32 as i32
+    } else {
+        0
+    };
+    let mut strip_prefix = true;
+    if radix != 0 {
+        if !(2..=36).contains(&radix) {
+            return Value::Number(f64::NAN);
+        }
+        if radix != 16 {
+            strip_prefix = false;
+        }
+    } else {
+        radix = 10;
+    }
+    if strip_prefix && (text.starts_with("0x") || text.starts_with("0X")) {
+        text = &text[2..];
+        radix = 16;
+    }
+    let radix = radix as u32;
+    let end = text
+        .char_indices()
+        .find(|(_, character)| !character.is_digit(radix))
+        .map_or(text.len(), |(index, _)| index);
+    let digits = &text[..end];
+    if digits.is_empty() {
+        return Value::Number(f64::NAN);
+    }
+    let magnitude = if radix == 10 {
+        // Correctly rounded for any length (the spec allows approximation
+        // past 20 significant digits; exact is also conforming).
+        digits.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        digits.chars().fold(0.0_f64, |value, character| {
+            value * radix as f64 + character.to_digit(radix).unwrap() as f64
         })
-        .collect();
-    Value::Number(prefix.parse::<f64>().unwrap_or(f64::NAN))
+    };
+    Value::Number(if negative { -magnitude } else { magnitude })
+}
+
+/// `parseFloat ( string )` (ECMA-262 sec-parsefloat-string): the longest
+/// prefix of the trimmed string that satisfies StrDecimalLiteral.
+pub fn parseFloat(arguments: Vec<Value>) -> Value {
+    let input = arguments
+        .first()
+        .cloned()
+        .unwrap_or(Value::Undefined)
+        .to_js_string();
+    let text = input.trim_start_matches(is_str_whitespace);
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let negative = bytes.first() == Some(&b'-');
+    if matches!(bytes.first(), Some(b'-' | b'+')) {
+        index = 1;
+    }
+    if text[index..].starts_with("Infinity") {
+        return Value::Number(if negative {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    let digits_from = |mut at: usize| {
+        while bytes.get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
+        }
+        at
+    };
+    let integer_end = digits_from(index);
+    let mut end = integer_end;
+    let mut has_digits = integer_end > index;
+    if bytes.get(end) == Some(&b'.') {
+        let fraction_end = digits_from(end + 1);
+        if has_digits || fraction_end > end + 1 {
+            has_digits = true;
+            end = fraction_end;
+        }
+    }
+    if !has_digits {
+        return Value::Number(f64::NAN);
+    }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let mut exponent = end + 1;
+        if matches!(bytes.get(exponent), Some(b'-' | b'+')) {
+            exponent += 1;
+        }
+        let exponent_end = digits_from(exponent);
+        if exponent_end > exponent {
+            end = exponent_end;
+        }
+    }
+    let literal = &text[..end];
+    // Rust's f64 grammar accepts "1." / ".5" / "+1"; it yields -0 for "-0".
+    Value::Number(literal.parse::<f64>().unwrap_or(f64::NAN))
+}
+
+thread_local! {
+    static PARSE_FUNCTIONS: (Value, Value) = (
+        Value::function_named("parseInt", 2, |_, args| parseInt(args)),
+        Value::function_named("parseFloat", 1, |_, args| parseFloat(args)),
+    );
+}
+
+/// The realm's `parseInt` function object (also `Number.parseInt`).
+pub fn parse_int_value() -> Value {
+    PARSE_FUNCTIONS.with(|functions| functions.0.clone())
+}
+
+/// The realm's `parseFloat` function object (also `Number.parseFloat`).
+pub fn parse_float_value() -> Value {
+    PARSE_FUNCTIONS.with(|functions| functions.1.clone())
 }
 
 pub struct Error(pub Value);
@@ -1573,6 +1693,9 @@ mod tests {
             26.0
         );
         let math = math_value();
+        // One Math object per realm: authored properties persist.
+        math.set_property("w3cosProbe", Value::Number(7.0));
+        assert_eq!(math_value().get_property("w3cosProbe").to_number(), 7.0);
         assert_eq!(
             math.get_property("hypot")
                 .call(
@@ -1905,5 +2028,112 @@ mod tests {
             &error_class("AggregateError")
         ));
         assert!(crate::class::instance_of(&aggregate, &error_class("Error")));
+    }
+}
+
+#[cfg(test)]
+mod parse_number_tests {
+    use super::*;
+
+    fn int(text: &str, radix: Option<f64>) -> f64 {
+        let mut arguments = vec![Value::from(text)];
+        if let Some(radix) = radix {
+            arguments.push(Value::Number(radix));
+        }
+        parseInt(arguments).to_number()
+    }
+
+    fn float(text: &str) -> f64 {
+        parseFloat(vec![Value::from(text)]).to_number()
+    }
+
+    fn same(actual: f64, expected: f64) -> bool {
+        (actual.is_nan() && expected.is_nan())
+            || (actual == expected && actual.is_sign_negative() == expected.is_sign_negative())
+    }
+
+    #[test]
+    fn parse_float_takes_longest_str_decimal_literal_prefix() {
+        for (text, expected) in [
+            ("3.14px", 3.14),
+            ("  \n\t\u{feff}\u{a0}42", 42.0),
+            ("1e", 1.0),
+            ("1e+", 1.0),
+            ("1e3x", 1000.0),
+            ("1.e2", 100.0),
+            (".5", 0.5),
+            ("-.5em", -0.5),
+            ("+1.5", 1.5),
+            ("-0", -0.0),
+            ("Infinityx", f64::INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+            ("infinity", f64::NAN),
+            ("inf", f64::NAN),
+            ("nan", f64::NAN),
+            ("0x10", 0.0),
+            (".", f64::NAN),
+            ("-", f64::NAN),
+            ("", f64::NAN),
+            ("\u{85}1", f64::NAN),
+            ("1_000", 1.0),
+        ] {
+            assert!(
+                same(float(text), expected),
+                "parseFloat({text:?}) = {}",
+                float(text)
+            );
+        }
+        assert!(same(parseFloat(vec![]).to_number(), f64::NAN));
+        assert!(same(parseFloat(vec![Value::Number(0.5)]).to_number(), 0.5));
+    }
+
+    #[test]
+    fn parse_int_handles_radix_and_hex_prefix() {
+        for (text, radix, expected) in [
+            ("42px", None, 42.0),
+            ("  -17", None, -17.0),
+            ("0x1F", None, 31.0),
+            ("0X1f", Some(16.0), 31.0),
+            ("0x1F", Some(10.0), 0.0),
+            ("ff", Some(16.0), 255.0),
+            ("101", Some(2.0), 5.0),
+            ("z", Some(36.0), 35.0),
+            ("10", Some(37.0), f64::NAN),
+            ("10", Some(1.0), f64::NAN),
+            ("10", Some(0.0), 10.0),
+            ("10", Some(f64::NAN), 10.0),
+            ("10", Some(4_294_967_312.0), 16.0),
+            ("3.9", None, 3.0),
+            ("-0", None, -0.0),
+            ("0x", None, f64::NAN),
+            ("", None, f64::NAN),
+            ("1e3", None, 1.0),
+            (
+                "123456789012345678901234567890",
+                None,
+                1.2345678901234568e29,
+            ),
+        ] {
+            assert!(
+                same(int(text, radix), expected),
+                "parseInt({text:?}, {radix:?}) = {}",
+                int(text, radix)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_functions_have_stable_identity_name_and_length() {
+        let parse_float = parse_float_value();
+        assert!(parse_float.strict_eq(&parse_float_value()));
+        assert!(!parse_float.strict_eq(&parse_int_value()));
+        assert_eq!(
+            parse_float.get_property("name").to_js_string(),
+            "parseFloat"
+        );
+        assert_eq!(parse_float.get_property("length").to_number(), 1.0);
+        assert_eq!(parse_int_value().get_property("length").to_number(), 2.0);
+        let result = parse_float.call(Value::Undefined, vec![Value::from(" 2.5s")]);
+        assert_eq!(result.to_number(), 2.5);
     }
 }

@@ -17,6 +17,75 @@ use crate::user_agent;
 
 thread_local! {
     static STRUCTURE_TICK: Cell<u64> = const { Cell::new(1) };
+    static CHILD_LOG: RefCell<ChildListLog> = RefCell::new(ChildListLog::default());
+    static DOCUMENT_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One child-list edit, recorded so a cached child-id vector can be patched
+/// instead of rebuilt (Blink's CollectionIndexCache keeps its cached node and
+/// count across edits it can account for; here the edits are replayed).
+#[derive(Clone, Copy, Debug)]
+pub enum ChildListChange {
+    /// `child` linked under `parent` before `before` (0 = at the end).
+    Insert {
+        doc: u64,
+        parent: u32,
+        child: u32,
+        before: u32,
+    },
+    /// `child` unlinked from `parent`.
+    Remove { doc: u64, parent: u32, child: u32 },
+    /// Slot `node` (re)allocated: any cached children are meaningless.
+    Reset { doc: u64, node: u32 },
+}
+
+#[derive(Default)]
+struct ChildListLog {
+    /// Every edit with tick >= `start` is in `entries`.
+    start: u64,
+    entries: std::collections::VecDeque<(u64, ChildListChange)>,
+}
+
+const CHILD_LOG_CAP: usize = 256;
+
+/// Each edit gets its own tick: an edit stamped `t` is reflected in any cache
+/// built at tick > t and missing from any built at tick <= t.
+fn log_child_change(change: ChildListChange) {
+    let tick = structure_tick();
+    CHILD_LOG.with(|log| {
+        let mut log = log.borrow_mut();
+        if log.entries.len() >= CHILD_LOG_CAP
+            && let Some((dropped, _)) = log.entries.pop_front()
+        {
+            log.start = dropped + 1;
+        }
+        log.entries.push_back((tick, change));
+    });
+    bump_structure_tick();
+}
+
+/// Replays the child-list edits made since `tick` (a cache built at that
+/// tick). Returns `false` when the log no longer covers that range or holds
+/// more than `limit` edits; the caller then rebuilds.
+pub fn replay_child_changes_since(
+    tick: u64,
+    limit: usize,
+    mut apply: impl FnMut(ChildListChange),
+) -> bool {
+    CHILD_LOG.with(|log| {
+        let log = log.borrow();
+        if tick < log.start {
+            return false;
+        }
+        let first = log.entries.partition_point(|(stamp, _)| *stamp < tick);
+        if log.entries.len() - first > limit {
+            return false;
+        }
+        for (_, change) in log.entries.range(first..) {
+            apply(*change);
+        }
+        true
+    })
 }
 
 /// Monotonic tree-shape counter. Readers can invalidate a child-id cache
@@ -34,6 +103,75 @@ struct CounterSnapshot {
     scopes: Vec<HashMap<String, i32>>,
 }
 
+/// One component-tree build is a read-only pass over the document, so the
+/// `::marker` counter state of every list item can be collected in a single
+/// document-order traversal instead of one full traversal per marker (which
+/// made `ol > li` quadratic). The memo lives only for the outermost
+/// `to_component_subtree` call on this document and is dropped on return.
+struct CounterMemo {
+    document: usize,
+    depth: u32,
+    filled: bool,
+    recording: bool,
+    markers: HashMap<NodeId, CounterSnapshot>,
+    /// Set while a walk covers only one list-item counter root.
+    partial: bool,
+    /// `list-item` values recorded by those partial walks.
+    list_items: HashMap<NodeId, i32>,
+}
+
+thread_local! {
+    static COUNTER_MEMO: RefCell<Option<CounterMemo>> = const { RefCell::new(None) };
+}
+
+struct CounterMemoScope {
+    active: bool,
+}
+
+impl CounterMemoScope {
+    fn enter(document: *const Document) -> Self {
+        COUNTER_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            match memo.as_mut() {
+                Some(existing) if existing.document == document as usize => {
+                    existing.depth += 1;
+                    Self { active: true }
+                }
+                Some(_) => Self { active: false },
+                None => {
+                    *memo = Some(CounterMemo {
+                        document: document as usize,
+                        depth: 1,
+                        filled: false,
+                        recording: false,
+                        markers: HashMap::new(),
+                        partial: false,
+                        list_items: HashMap::new(),
+                    });
+                    Self { active: true }
+                }
+            }
+        })
+    }
+}
+
+impl Drop for CounterMemoScope {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        COUNTER_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if let Some(existing) = memo.as_mut() {
+                existing.depth -= 1;
+                if existing.depth == 0 {
+                    *memo = None;
+                }
+            }
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GeneratedContentItem {
     Text(String),
@@ -44,11 +182,204 @@ enum GeneratedContentItem {
     Image(String),
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MatchedPropertiesKey {
+    tag: u32,
+    attributes: Vec<(u32, &'static str)>,
+    /// Matched rule indices (Blink MatchedPropertiesCache hashes the matched
+    /// rule list). Valid within one stylesheet generation, which the cache
+    /// epoch enforces.
+    matched: Vec<u32>,
+    /// The element's own inline declarations (Blink's MatchResult includes
+    /// the style attribute's property set), so inline-styled elements share
+    /// entries by content instead of opting out.
+    inline: Vec<(String, String)>,
+}
+
+/// FxHasher (rustc-hash): MPC keys are small integer lists hashed per
+/// restyled element; SipHash dominated the lookup.
+#[derive(Default, Clone, Copy)]
+struct MpcHasher(u64);
+
+impl std::hash::Hasher for MpcHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut tail = 0u64;
+        for (shift, byte) in chunks.remainder().iter().enumerate() {
+            tail |= (*byte as u64) << (shift * 8);
+        }
+        self.add(tail ^ bytes.len() as u64);
+    }
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+impl MpcHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+#[derive(Default)]
+struct MatchedPropertiesCache {
+    epoch: Option<(u64, u64)>,
+    entries: usize,
+    styles: HashMap<
+        MatchedPropertiesKey,
+        Vec<(SharedStyle, SharedStyle)>,
+        std::hash::BuildHasherDefault<MpcHasher>,
+    >,
+}
+
+impl MatchedPropertiesCache {
+    fn validate(&mut self, epoch: (u64, u64)) {
+        if self.epoch != Some(epoch) || self.entries > 8192 {
+            self.epoch = Some(epoch);
+            self.entries = 0;
+            self.styles.clear();
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: &MatchedPropertiesKey,
+        epoch: (u64, u64),
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> Option<(SharedStyle, SharedStyle)> {
+        self.validate(epoch);
+        let inherited = inherited?;
+        let slot = self.styles.get(key)?;
+        // Pointer hits first (parents produced by this cache), then deep
+        // equality, so a long text slot stays cheap.
+        slot.iter()
+            .find(|(parent, _)| std::ptr::eq(&**parent, inherited))
+            .or_else(|| slot.iter().find(|(parent, _)| **parent == *inherited))
+            .cloned()
+    }
+
+    fn insert(
+        &mut self,
+        key: MatchedPropertiesKey,
+        epoch: (u64, u64),
+        inherited: Option<&SharedStyle>,
+        style: &SharedStyle,
+    ) {
+        self.validate(epoch);
+        let Some(inherited) = inherited else {
+            return;
+        };
+        // Text runs sit under every distinct inline parent style.
+        let limit = if key.attributes.is_empty() && key.matched.is_empty() {
+            64
+        } else {
+            8
+        };
+        let slot = self.styles.entry(key).or_default();
+        if slot.len() < limit {
+            slot.push((inherited.clone(), style.clone()));
+            self.entries += 1;
+        }
+    }
+}
+
+#[derive(Default)]
+struct StyleForMemo {
+    key: Option<(u64, u64, u64)>,
+    styles: HashMap<u32, w3cos_std::style::Style>,
+}
+
+/// Immutable, reference-counted computed style (Blink's scoped_refptr<const
+/// ComputedStyle>): the per-node cache, the matched-properties cache and the
+/// layout walk share one allocation instead of deep-cloning `Style`.
+pub type SharedStyle = std::rc::Rc<w3cos_std::style::Style>;
+
+/// Properties that are not inherited (CSS property index "Inherited: no").
+/// Conservative: anything unlisted is treated as possibly inherited.
+fn is_known_non_inherited_property(property: &str) -> bool {
+    let property = property.trim();
+    if property.starts_with("--") {
+        return false;
+    }
+    matches!(
+        property,
+        "opacity"
+            | "transform"
+            | "left"
+            | "top"
+            | "right"
+            | "bottom"
+            | "width"
+            | "height"
+            | "min-width"
+            | "min-height"
+            | "max-width"
+            | "max-height"
+            | "display"
+            | "position"
+            | "z-index"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
+            | "box-shadow"
+            | "filter"
+            | "will-change"
+            | "translate"
+            | "scale"
+            | "rotate"
+    ) || [
+        "margin",
+        "padding",
+        "animation",
+        "transition",
+        "background",
+        "border",
+        "flex",
+        "grid",
+        "outline",
+        "align-",
+        "justify-",
+    ]
+    .iter()
+    .any(|prefix| property.starts_with(prefix))
+        && !property.starts_with("border-collapse")
+        && !property.starts_with("border-spacing")
+}
+
+/// Parent-style equality with Blink's pointer fast path: styles produced by
+/// the same cache entry are the same allocation.
+#[inline]
+fn same_style(shared: &SharedStyle, other: &w3cos_std::style::Style) -> bool {
+    std::ptr::eq(&**shared, other) || **shared == *other
+}
+
 struct CachedComputedStyle {
     node_revision: u64,
     stylesheet_generation: u64,
-    inherited_style: Option<w3cos_std::style::Style>,
-    style: w3cos_std::style::Style,
+    inherited_style: Option<SharedStyle>,
+    style: SharedStyle,
 }
 
 struct SelectorContextCache {
@@ -93,7 +424,10 @@ impl CounterSnapshot {
     }
 }
 
-fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String>) -> String {
+fn resolve_css_variables<S: std::hash::BuildHasher>(
+    value: &str,
+    custom_properties: &HashMap<String, String, S>,
+) -> String {
     let mut current = value.to_string();
     for _ in 0..10 {
         let Some(start) = current.find("var(") else {
@@ -380,6 +714,63 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
     }
 }
 
+/// Per-node subtree extent cache (see `Document::extent`).
+#[derive(Default)]
+struct ExtentCache {
+    /// `true` (or out of range) = must recompute.
+    dirty: Vec<bool>,
+    value: Vec<(f32, f32)>,
+    /// Descendants-only extent, valid while `dirty[idx]` is false and the
+    /// slot was written by `descendant_extent` (scrollWidth/Height of a
+    /// container with thousands of clean children answers in O(1)).
+    descendants: Vec<Option<Option<(f32, f32)>>>,
+}
+
+impl ExtentCache {
+    /// Mark dirty; false when it already was (the chain above is dirty too).
+    fn mark(&mut self, idx: usize) -> bool {
+        match self.dirty.get_mut(idx) {
+            Some(slot) if !*slot => {
+                *slot = true;
+                true
+            }
+            Some(_) => false,
+            // Never computed: nothing above can be clean because of it, but
+            // keep walking so a clean ancestor learns about this child.
+            None => true,
+        }
+    }
+
+    fn forget(&mut self, idx: usize) {
+        if let Some(slot) = self.dirty.get_mut(idx) {
+            *slot = true;
+        }
+    }
+
+    fn clean(&self, idx: usize) -> Option<(f32, f32)> {
+        (self.dirty.get(idx) == Some(&false)).then(|| self.value[idx])
+    }
+
+    fn store(&mut self, idx: usize, value: (f32, f32)) {
+        if self.dirty.len() <= idx {
+            self.dirty.resize(idx + 1, true);
+            self.value.resize(idx + 1, (0.0, 0.0));
+            self.descendants.resize(idx + 1, None);
+        }
+        self.dirty[idx] = false;
+        self.value[idx] = value;
+        self.descendants[idx] = None;
+    }
+
+    fn clean_descendants(&self, idx: usize) -> Option<Option<(f32, f32)>> {
+        if self.dirty.get(idx) == Some(&false) {
+            self.descendants.get(idx).copied().flatten()
+        } else {
+            None
+        }
+    }
+}
+
 /// W3C Document — the root of the DOM tree.
 ///
 /// Performance characteristics (Chrome/Blink inspired):
@@ -389,11 +780,19 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
 /// - HashMap indexes: O(1) getElementById, querySelector by class/tag
 /// - Node freelist: bounded memory with slot recycling
 pub struct Document {
+    /// Distinguishes documents in the shared child-list log.
+    serial: u64,
     nodes: Vec<Option<DomNode>>,
     /// Bump arena for unique per-page strings (ids and text tails). Capacity
     /// is reserved up front so the create loop does not malloc.
     page_strings: Vec<u8>,
     styles: Vec<Arc<CSSStyleDeclaration>>,
+    /// Cached max right/bottom edge of each node's subtree for scrollWidth /
+    /// scrollHeight. Blink keeps scrollable overflow on the layout box and
+    /// only recomputes it for boxes whose subtree laid out again; here a
+    /// rect write or child-list edit marks the ancestor chain dirty
+    /// (stopping at an already-dirty ancestor, like ChildNeedsLayout).
+    extent: std::cell::RefCell<ExtentCache>,
     /// Layout rects computed by the layout engine after each pass.
     /// Indexed by NodeId — same arena as nodes/styles.
     layout_rects: Vec<DOMRect>,
@@ -411,6 +810,9 @@ pub struct Document {
     scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
+    /// Bumps only for text edits that keep every used box (repaint-only).
+    /// A retained component tree compares it to know its text is stale.
+    repaint_text_generation: u64,
     /// Bumps only when used geometry can change. A definite box can repaint
     /// new text without solving layout again.
     layout_generation: u64,
@@ -424,10 +826,31 @@ pub struct Document {
     text_stable_epoch: u32,
     text_stable_stamp: Vec<u32>,
     style_revision_clock: u64,
+    /// `style_revision_clock` at the last invalidation that can change
+    /// selector matching (everything except inline-style-only edits).
+    last_match_change: u64,
+    /// Per-node matched rule lists, reused while `last_match_change` and the
+    /// stylesheet generation hold. Blink keeps matching results across
+    /// inherited-only recalcs the same way (a custom property on the root
+    /// does not re-run selector matching for descendants' rule sets).
+    matched_rules_cache: RefCell<Vec<Option<(u64, u64, Vec<u32>)>>>,
     style_revisions: Vec<u64>,
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    /// `computed_style_for` results keyed by (style clock, stylesheet
+    /// generation, style-write epoch). Any style-affecting mutation moves one
+    /// of them, so within an unchanged document the ancestor chain is
+    /// resolved once instead of per query (Blink keeps ComputedStyle on the
+    /// element until StyleRecalc; this is the same lifetime).
+    style_for_memo: RefCell<StyleForMemo>,
+    matched_properties_cache: RefCell<MatchedPropertiesCache>,
+    style_write_epoch: u64,
+    /// MatchedPropertiesCache epoch. Inline declarations are part of the MPC
+    /// key, so an inline edit never makes an entry wrong; edits that change
+    /// what descendants inherit still flush it so stale parent slots do not
+    /// pile up deep-compare misses.
+    mpc_epoch: u64,
     /// Sibling selector contexts are rebuilt for every node during a tree walk.
     /// Caching one pass, and skipping the sibling chain when no rule needs it,
     /// keeps that walk linear.
@@ -495,6 +918,22 @@ mod replaced_table_tests;
 mod form_control_tests;
 
 impl Document {
+    /// The element's own inline style sets a transition.
+    pub fn inline_declares_transition(&self, id: NodeId) -> bool {
+        self.styles.get(id.0 as usize).is_some_and(|style| {
+            style.inner.transition.is_some()
+                || style
+                    .inline_declarations
+                    .iter()
+                    .any(|(property, _)| property.starts_with("transition"))
+        })
+    }
+
+    /// Identity in [`ChildListChange`] records.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// Host readability preferences, separate from author-specified sizes.
     /// Zero leaves the corresponding minimum disabled.
     pub fn set_font_size_minimums(&mut self, hard: f32, logical: f32) {
@@ -510,6 +949,8 @@ impl Document {
             self.minimum_font_size = hard;
             self.minimum_logical_font_size = logical;
             self.computed_style_cache.borrow_mut().clear();
+            self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+            self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
         }
     }
 
@@ -530,6 +971,8 @@ impl Document {
         }
         self.normal_line_height_provider = Some((provider, revision));
         self.computed_style_cache.borrow_mut().clear();
+        self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+        self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
     }
 
     /// Query host-decoded CSS images when lowering generated marker content.
@@ -539,7 +982,12 @@ impl Document {
     }
 
     pub fn new() -> Self {
+        let serial = DOCUMENT_SERIAL.with(|serial| {
+            serial.set(serial.get() + 1);
+            serial.get()
+        });
         let mut doc = Self {
+            serial,
             nodes: Vec::new(),
             page_strings: Vec::new(),
             styles: Vec::new(),
@@ -548,21 +996,29 @@ impl Document {
             free_list: Vec::new(),
             dirty: Vec::new(),
             precise_dirty: Vec::new(),
+            extent: std::cell::RefCell::new(ExtentCache::default()),
             precise_epoch: 1,
             precise_stamp: Vec::new(),
             scope_epoch: 1,
             scope_stamp: Vec::new(),
             structure_generation: 0,
+            repaint_text_generation: 0,
             layout_generation: 0,
             geometry_epoch: 1,
             cascade_generation: 0,
             text_stable_epoch: 1,
             text_stable_stamp: Vec::new(),
             style_revision_clock: 0,
+            last_match_change: 0,
+            matched_rules_cache: RefCell::new(Vec::new()),
             style_revisions: Vec::new(),
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
+            style_for_memo: RefCell::new(StyleForMemo::default()),
+            matched_properties_cache: RefCell::new(MatchedPropertiesCache::default()),
+            style_write_epoch: 0,
+            mpc_epoch: 0,
             selector_context_cache: RefCell::new(SelectorContextCache {
                 style_clock: 0,
                 stylesheet_generation: 0,
@@ -787,6 +1243,12 @@ impl Document {
         self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: child.as_u32(),
+            before: 0,
+        });
 
         let parent_changed = old_parent != Some(parent);
         if let Some(old_parent) = old_parent
@@ -914,6 +1376,12 @@ impl Document {
         } else {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: new_child.as_u32(),
+            before: ref_child.as_u32(),
+        });
 
         if let Some(old_parent) = old_parent
             && old_parent != parent
@@ -956,6 +1424,13 @@ impl Document {
 
         self.get_node_mut(child).prev_sibling = 0;
         self.get_node_mut(child).next_sibling = 0;
+        if let Some(parent) = parent {
+            log_child_change(ChildListChange::Remove {
+                doc: self.serial,
+                parent: parent.as_u32(),
+                child: child.as_u32(),
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1114,6 +1589,12 @@ impl Document {
         self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: child.as_u32(),
+            before: 0,
+        });
     }
 
     /// Single text child stored as the parent's tail. Bytes are bump-copied
@@ -1184,6 +1665,12 @@ impl Document {
         self.get_node_mut(child).next_sibling = 0;
         self.get_node_mut(child).parent = Some(parent);
         self.get_node_mut(parent).last_child = Some(child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: child.as_u32(),
+            before: 0,
+        });
         true
     }
 
@@ -1342,15 +1829,21 @@ impl Document {
         }
         let initial_style = shared_ua_style(node.tag);
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         let style_revision = self.style_revision_clock;
         let id = if let Some(slot) = self.free_list.pop() {
             node.id = NodeId(slot);
             let idx = slot as usize;
             self.nodes[idx] = Some(node);
+            log_child_change(ChildListChange::Reset {
+                doc: self.serial,
+                node: slot,
+            });
             self.styles[idx] = initial_style;
             self.layout_rects[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
             self.style_revisions[idx] = style_revision;
+            self.extent.get_mut().forget(idx);
             NodeId(slot)
         } else {
             let id = NodeId(self.nodes.len() as u32);
@@ -1390,9 +1883,80 @@ impl Document {
     pub fn set_layout_rect(&mut self, id: NodeId, rect: DOMRect) {
         let idx = id.0 as usize;
         if idx < self.layout_rects.len() {
+            // Relayout rewrites every rect it visits; an unchanged rect keeps
+            // the cached overflow extent of its ancestors valid (Blink only
+            // recomputes overflow for boxes whose geometry changed).
+            let moved = self.layout_rects[idx] != rect;
             self.layout_rects[idx] = rect;
             self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+            if moved {
+                self.mark_extent_dirty(id);
+            }
         }
+    }
+
+    fn mark_extent_dirty(&mut self, id: NodeId) {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if !self.extent.get_mut().mark(node.0 as usize) {
+                break;
+            }
+            current = self
+                .nodes
+                .get(node.0 as usize)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|node| node.parent);
+        }
+    }
+
+    /// Max (right, bottom) layout edge over the descendants of `id`, or None
+    /// without descendants. Clean subtrees answer from the cache.
+    pub fn descendant_extent(&self, id: NodeId) -> Option<(f32, f32)> {
+        let mut cache = self.extent.borrow_mut();
+        let idx = id.0 as usize;
+        if let Some(hit) = cache.clean_descendants(idx) {
+            return hit;
+        }
+        let mut out: Option<(f32, f32)> = None;
+        let mut child = self.get_node(id).first_child;
+        while let Some(cid) = child {
+            let (right, bottom) = self.subtree_extent(cid, &mut cache);
+            out = Some(match out {
+                Some((r, b)) => (r.max(right), b.max(bottom)),
+                None => (right, bottom),
+            });
+            child = crate::node::sib(self.get_node(cid).next_sibling);
+        }
+        // Children are clean now, so this node's own subtree entry can be
+        // stored too (a dirty mark below will reach it again).
+        let rect = self.get_layout_rect(id);
+        let (mut right, mut bottom) = (rect.x + rect.width, rect.y + rect.height);
+        if let Some((r, b)) = out {
+            right = right.max(r);
+            bottom = bottom.max(b);
+        }
+        cache.store(idx, (right, bottom));
+        cache.descendants[idx] = Some(out);
+        out
+    }
+
+    fn subtree_extent(&self, id: NodeId, cache: &mut ExtentCache) -> (f32, f32) {
+        let idx = id.0 as usize;
+        if let Some(hit) = cache.clean(idx) {
+            return hit;
+        }
+        let rect = self.get_layout_rect(id);
+        let mut right = rect.x + rect.width;
+        let mut bottom = rect.y + rect.height;
+        let mut child = self.get_node(id).first_child;
+        while let Some(cid) = child {
+            let (r, b) = self.subtree_extent(cid, cache);
+            right = right.max(r);
+            bottom = bottom.max(b);
+            child = crate::node::sib(self.get_node(cid).next_sibling);
+        }
+        cache.store(idx, (right, bottom));
+        (right, bottom)
     }
 
     pub fn geometry_epoch(&self) -> u64 {
@@ -1435,6 +1999,7 @@ impl Document {
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
     pub fn free_node(&mut self, id: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         self.style_revisions[id.0 as usize] = self.style_revision_clock;
         self.image_render_sources.remove(&id);
         self.embedded_document_hosts.remove(&id);
@@ -1541,6 +2106,23 @@ impl Document {
     }
 
     pub fn get_style_mut(&mut self, id: NodeId) -> &mut CSSStyleDeclaration {
+        self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+        self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
+        Arc::make_mut(&mut self.styles[id.0 as usize])
+    }
+
+    /// `get_style_mut` for a write of one property. A known non-inherited
+    /// property cannot change any descendant's inherited input, so the
+    /// MatchedPropertiesCache (keyed by inline content) survives it.
+    pub fn get_style_mut_for_property(
+        &mut self,
+        id: NodeId,
+        property: &str,
+    ) -> &mut CSSStyleDeclaration {
+        self.style_write_epoch = self.style_write_epoch.wrapping_add(1);
+        if !is_known_non_inherited_property(property) {
+            self.mpc_epoch = self.mpc_epoch.wrapping_add(1);
+        }
         Arc::make_mut(&mut self.styles[id.0 as usize])
     }
 
@@ -1663,6 +2245,7 @@ impl Document {
 
     fn touch_style_revision(&mut self, id: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         let revision = self.style_revision_clock;
         if let Some(slot) = self.style_revisions.get_mut(id.0 as usize) {
             *slot = revision;
@@ -1687,7 +2270,11 @@ impl Document {
     /// Inline declarations cannot change selector matching, but inherited
     /// values and custom properties require the complete descendant subtree.
     pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
+        let last_match_change = self.last_match_change;
         self.invalidate_style_subtree(id);
+        if stylesheet::matched_rules_survive_inline_style_edits() {
+            self.last_match_change = last_match_change;
+        }
         self.record_layout_dirty(id);
         self.note_cascade_change();
     }
@@ -1742,6 +2329,13 @@ impl Document {
         if stylesheet::has_structural_dependencies() || stylesheet::has_relational_dependencies() {
             return true;
         }
+        // A text node never has a specified width/height (they are not
+        // inherited and no rule matches it), so its box always follows the
+        // text, like LayoutText::SetText marking NeedsLayout. Skip resolving
+        // the whole ancestor style chain per appendData.
+        if self.get_node(id).node_type == NodeType::Text {
+            return true;
+        }
         let style = self.computed_style_for(id);
         // Both axes must be specified lengths. An auto width on a
         // shrink-to-fit box still grows with the text.
@@ -1778,6 +2372,8 @@ impl Document {
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
+        // A child-list edit changes the subtree extent without a rect write.
+        self.mark_extent_dirty(id);
         let scope = self.find_layout_scope(id);
         remember_dirty(
             &mut self.scope_stamp,
@@ -1806,6 +2402,11 @@ impl Document {
     /// The next paint must read new text, and the used boxes stay valid.
     pub fn note_repaint_without_layout(&mut self) {
         self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.repaint_text_generation = self.repaint_text_generation.wrapping_add(1);
+    }
+
+    pub fn repaint_text_generation(&self) -> u64 {
+        self.repaint_text_generation
     }
 
     /// Inherited or selector-matched styles may have changed below `id`.
@@ -1829,6 +2430,12 @@ impl Document {
     pub fn take_precise_dirty(&mut self) -> Vec<NodeId> {
         bump_dirty_epoch(&mut self.precise_epoch, &mut self.precise_stamp);
         std::mem::take(&mut self.precise_dirty)
+    }
+
+    /// Changes on every `take_precise_dirty`. A retained layout that saw the
+    /// previous value knows no other consumer drained mutations it missed.
+    pub fn precise_drain_epoch(&self) -> u32 {
+        self.precise_epoch
     }
 
     pub fn precise_dirty_contains(&self, id: NodeId) -> bool {
@@ -1908,6 +2515,7 @@ impl Document {
 
     fn invalidate_style_subtree(&mut self, root: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
+        self.last_match_change = self.style_revision_clock;
         let revision = self.style_revision_clock;
         thread_local! {
             static INVALIDATE_STACK: std::cell::RefCell<Vec<NodeId>> =
@@ -2093,6 +2701,7 @@ impl Document {
 
     /// Lower one connected DOM subtree while preserving selector ancestry.
     pub fn to_component_subtree(&self, id: NodeId) -> w3cos_std::Component {
+        let _counter_memo = CounterMemoScope::enter(self as *const Document);
         let mut lineage = Vec::new();
         let mut current = self.get_node(id).parent;
         while let Some(parent) = current {
@@ -2104,7 +2713,10 @@ impl Document {
         lineage.reverse();
         let mut ancestors = lineage
             .into_iter()
-            .map(|ancestor| self.selector_context(ancestor))
+            .map(|ancestor| {
+                let _ = ancestor;
+                stylesheet::SelectorContext::default()
+            })
             .collect();
         let inherited = (Some(id) != self.document_element_id())
             .then(|| self.get_node(id).parent)
@@ -2310,15 +2922,142 @@ impl Document {
     fn computed_style(
         &self,
         id: NodeId,
+        // Kept for call-site shape only: matching walks the live tree
+        // (SelectorChecker on the Element), so the component walk passes
+        // empty placeholder contexts instead of building per-ancestor copies.
         _ancestors: &[stylesheet::SelectorContext],
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
+        (*self.computed_style_impl(id, inherited, None)).clone()
+    }
+
+    /// Shared-style variant for walks that hold the parent's `SharedStyle`.
+    pub fn computed_style_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        self.computed_style_impl(id, inherited.map(|style| &**style), inherited)
+    }
+
+    /// Animation cascade origin (Blink StyleResolver::ApplyAnimatedStyle with
+    /// the base-computed-style split): the pre-animation base style is
+    /// cascaded and shared through the MatchedPropertiesCache as usual; sampled
+    /// keyframe values from CSS animations and script effects are layered on
+    /// top per element, below `!important` declarations.
+    fn apply_animated_style(
+        &self,
+        id: NodeId,
+        base: SharedStyle,
+        matched_rules: &[u32],
+    ) -> SharedStyle {
+        if base.animation.is_none() && !crate::animation::node_has_script_effects(id.0) {
+            return base;
+        }
+        if self.get_node(id).node_type != NodeType::Element {
+            return base;
+        }
+        let mut declaration = CSSStyleDeclaration {
+            inner: (*base).clone(),
+            inline_declarations: Vec::new(),
+        };
+        let animated =
+            crate::animation::animated_declarations(id.0, base.animation.as_ref(), &|property| {
+                declaration.get_property(property)
+            });
+        if animated.is_empty() {
+            return base;
+        }
+        for (property, value) in &animated {
+            if declaration_value_is_valid(property, value) {
+                declaration.set_property(property, value);
+            }
+        }
+        let inline = &self.styles[id.0 as usize];
+        let inline_important = inline
+            .inline_declarations
+            .iter()
+            .filter_map(|(property, raw)| {
+                let (value, important) = stylesheet::declaration_value_and_importance(raw);
+                important.then(|| (property.clone(), value.to_string()))
+            });
+        let important: Vec<(String, String)> =
+            stylesheet::important_declarations_for_rules(matched_rules)
+                .into_iter()
+                .chain(inline_important)
+                .collect();
+        for (property, value) in important {
+            if animated
+                .iter()
+                .any(|(name, _)| css_property_eq(name, &property))
+            {
+                declaration.set_property(&property, &value);
+            }
+        }
+        SharedStyle::new(declaration.inner)
+    }
+
+    /// Matched rule indices for an element, memoized until selector matching
+    /// can change (Blink's cached MatchResult).
+    fn cached_matched_rules(&self, id: NodeId, stylesheet_generation: u64) -> Vec<u32> {
+        let index = id.0 as usize;
+        let cached = self
+            .matched_rules_cache
+            .borrow()
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|(clock, generation, _)| {
+                *clock == self.last_match_change && *generation == stylesheet_generation
+            })
+            .map(|(_, _, rules)| rules.clone());
+        if let Some(rules) = cached {
+            return rules;
+        }
+        let rules = stylesheet::matching_rule_indices_for_node(self, id);
+        let mut cache = self.matched_rules_cache.borrow_mut();
+        if cache.len() <= index {
+            cache.resize(index + 1, None);
+        }
+        cache[index] = Some((self.last_match_change, stylesheet_generation, rules.clone()));
+        rules
+    }
+
+    /// Whether a style edit on `id` can start a CSS transition: only a
+    /// matched rule, a pseudo-element rule or the inline style can give the
+    /// element (or its pseudos) a `transition` (it is not inherited).
+    pub fn may_start_transition(&self, id: NodeId) -> bool {
+        if self.inline_declares_transition(id) {
+            return true;
+        }
+        if !stylesheet::has_transition_rules() {
+            return false;
+        }
+        if stylesheet::pseudo_rules_declare_transition() {
+            return true;
+        }
+        if self.get_node(id).node_type != NodeType::Element {
+            return false;
+        }
+        let rules = self.cached_matched_rules(id, stylesheet::generation());
+        stylesheet::rules_declare_transition(&rules)
+    }
+
+    fn computed_style_impl(
+        &self,
+        id: NodeId,
+        inherited: Option<&w3cos_std::style::Style>,
+        inherited_shared: Option<&SharedStyle>,
+    ) -> SharedStyle {
         let node_revision = self.style_revisions[id.0 as usize];
         let stylesheet_generation = stylesheet::generation();
         if let Some(cached) = self.computed_style_cache.borrow().get(&id)
             && cached.node_revision == node_revision
             && cached.stylesheet_generation == stylesheet_generation
-            && cached.inherited_style.as_ref() == inherited
+            && match (&cached.inherited_style, inherited) {
+                (None, None) => true,
+                (Some(parent), Some(inherited)) => same_style(parent, inherited),
+                _ => false,
+            }
         {
             #[cfg(test)]
             self.computed_style_cache_hits
@@ -2331,11 +3070,32 @@ impl Document {
 
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
-        let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            stylesheet::matching_cascade_declarations_for_node(self, id)
+        let matched_rules = if stylesheet::has_rules() && node.node_type == NodeType::Element {
+            self.cached_matched_rules(id, stylesheet_generation)
         } else {
             Vec::new()
         };
+        let mpc_key = self.matched_properties_key(id, inline, &matched_rules, inherited);
+        if let Some(key) = &mpc_key
+            && let Some((parent, style)) = self.matched_properties_cache.borrow_mut().get(
+                key,
+                (stylesheet_generation, self.mpc_epoch),
+                inherited,
+            )
+        {
+            let style = self.apply_animated_style(id, style, &matched_rules);
+            self.computed_style_cache.borrow_mut().insert(
+                id,
+                CachedComputedStyle {
+                    node_revision,
+                    stylesheet_generation,
+                    inherited_style: Some(inherited_shared.cloned().unwrap_or(parent)),
+                    style: style.clone(),
+                },
+            );
+            return style;
+        }
+        let matched = stylesheet::cascade_declarations_for_rules(&matched_rules);
         let mut author_declarations =
             Vec::with_capacity(matched.len() + inline.inline_declarations.len());
         let mut important = Vec::new();
@@ -2370,12 +3130,12 @@ impl Document {
         }
         author_declarations.extend(important);
         let mut merged =
-            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_str()));
+            CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_static()));
         // Textfield UA borders remain inset when author backgrounds disable
         // automatic theme painting. Do not apply textfield geometry to other
         // input types; author border declarations below still take precedence.
         if user_agent::control_appearance(
-            &node.tag.as_str(),
+            &node.tag.as_static(),
             node.get_attribute("type"),
             std::iter::empty(),
         ) == "textfield"
@@ -2384,7 +3144,7 @@ impl Document {
         }
         if node.is_html_element {
             table_presentation::inherit_section_colors(
-                &node.tag.as_str(),
+                &node.tag.as_static(),
                 &mut merged.inner,
                 inherited,
             );
@@ -2393,11 +3153,11 @@ impl Document {
         // HTML's nested-list UA rule is a descendant selector, not a
         // direct-parent rule. Apply it before user/author declarations so
         // explicit margins still win, including through an intervening box.
-        if node.is_html_element && matches!(node.tag.as_str().as_str(), "ul" | "ol") {
+        if node.is_html_element && matches!(node.tag.as_static(), "ul" | "ol") {
             let mut ancestor = node.parent;
             while let Some(parent) = ancestor {
                 let parent = self.get_node(parent);
-                if parent.is_html_element && matches!(parent.tag.as_str().as_str(), "ul" | "ol") {
+                if parent.is_html_element && matches!(parent.tag.as_static(), "ul" | "ol") {
                     merged.inner.margin.top = w3cos_std::style::Spacing::Px(0.0);
                     merged.inner.margin.bottom = w3cos_std::style::Spacing::Px(0.0);
                     break;
@@ -2409,11 +3169,11 @@ impl Document {
         // is not a hyperlink; visited styling is not inferred from history.
         let ua_link = node.node_type == NodeType::Element
             && node.is_html_element
-            && matches!(node.tag.as_str().as_str(), "a" | "area")
+            && matches!(node.tag.as_static(), "a" | "area")
             && node
                 .attributes
                 .iter()
-                .any(|(name, _)| name.as_str().eq_ignore_ascii_case("href"));
+                .any(|(name, _)| name.as_static().eq_ignore_ascii_case("href"));
         if ua_link {
             merged.set_property("color", "#0000ee");
             merged.set_property("text-decoration", "underline");
@@ -2423,11 +3183,11 @@ impl Document {
         // generated-content tests still exercise this behavior for XHTML
         // serialization as well as text/html.
         let body_text_hint = if node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("body")
+            && node.tag.as_static().eq_ignore_ascii_case("body")
         {
             node.attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("text"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("text"))
                 .map(|(_, value)| value.as_str())
         } else {
             None
@@ -2436,12 +3196,12 @@ impl Document {
             user_normal.push(("color".to_string(), value.to_string(), 0));
         }
         let font_color_hint = (node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("font")
+            && node.tag.as_static().eq_ignore_ascii_case("font")
             && node.is_html_element)
             .then(|| {
                 node.attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("color"))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case("color"))
                     .map(|(_, value)| value.as_str())
             })
             .flatten()
@@ -2450,12 +3210,12 @@ impl Document {
             user_normal.push(("color".to_string(), value.to_string(), 0));
         }
         let font_size_hint = (node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("font")
+            && node.tag.as_static().eq_ignore_ascii_case("font")
             && node.is_html_element)
             .then(|| {
                 node.attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("size"))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case("size"))
                     .and_then(|(_, value)| parse_html_font_size_attribute(value.as_str()))
             })
             .flatten();
@@ -2463,11 +3223,11 @@ impl Document {
             user_normal.push(("font-size".to_string(), value.to_string(), 0));
         }
         let body_background_hint = if node.node_type == NodeType::Element
-            && node.tag.as_str().eq_ignore_ascii_case("body")
+            && node.tag.as_static().eq_ignore_ascii_case("body")
         {
             node.attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("bgcolor"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("bgcolor"))
                 .map(|(_, value)| value.as_str())
         } else {
             None
@@ -2480,34 +3240,34 @@ impl Document {
             .then(|| {
                 node.attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case("dir"))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case("dir"))
                     .map(|(_, value)| value.trim().to_ascii_lowercase())
             })
             .flatten()
             .filter(|value| matches!(value.as_str(), "ltr" | "rtl"));
         if let Some(value) = &direction_hint {
             user_normal.push(("direction".to_string(), value.to_string(), 0));
-            if node.is_html_element && !matches!(node.tag.as_str().as_str(), "bdi" | "bdo") {
+            if node.is_html_element && !matches!(node.tag.as_static(), "bdi" | "bdo") {
                 user_normal.push(("unicode-bidi".to_string(), "isolate".to_string(), 0));
             }
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && matches!(node.tag.as_str().as_str(), "td" | "th")
+            && matches!(node.tag.as_static(), "td" | "th")
             && node
                 .attributes
                 .iter()
-                .any(|(name, _)| name.as_str().eq_ignore_ascii_case("nowrap"))
+                .any(|(name, _)| name.as_static().eq_ignore_ascii_case("nowrap"))
         {
             user_normal.push(("white-space".to_string(), "nowrap".to_string(), 0));
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && matches!(node.tag.as_str().as_str(), "td" | "th")
+            && matches!(node.tag.as_static(), "td" | "th")
             && let Some(value) = node
                 .attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("valign"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("valign"))
                 .map(|(_, value)| value.trim().to_ascii_lowercase())
                 .filter(|value| matches!(value.as_str(), "top" | "middle" | "bottom" | "baseline"))
         {
@@ -2519,11 +3279,11 @@ impl Document {
         // stylesheets, not UA defaults that normal user rules can override.
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && node.tag.as_str().eq_ignore_ascii_case("br")
+            && node.tag.as_static().eq_ignore_ascii_case("br")
             && let Some(value) = node
                 .attributes
                 .iter()
-                .find(|(name, _)| name.as_str().eq_ignore_ascii_case("clear"))
+                .find(|(name, _)| name.as_static().eq_ignore_ascii_case("clear"))
                 .and_then(|(_, value)| {
                     let value = value.as_str();
                     if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("both") {
@@ -2543,7 +3303,7 @@ impl Document {
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && node.tag.as_str().eq_ignore_ascii_case("table")
+            && node.tag.as_static().eq_ignore_ascii_case("table")
         {
             // HTML table dimensions are cascaded presentational hints.
             // Keep it inside the cascade so authored auto/percent/important
@@ -2552,7 +3312,7 @@ impl Document {
                 let Some(dimension) = node
                     .attributes
                     .iter()
-                    .find(|(name, _)| name.as_str().eq_ignore_ascii_case(property))
+                    .find(|(name, _)| name.as_static().eq_ignore_ascii_case(property))
                     .and_then(|(_, value)| parse_html_dimension_attribute(value))
                 else {
                     continue;
@@ -2602,6 +3362,27 @@ impl Document {
                 custom_properties.insert(prop.clone(), value.clone());
             }
         }
+        // Blink resolves var() references (CSSVariableResolver) before any
+        // longhand is applied, so validity checks that decide inheritance
+        // (e.g. whether `color` is declared) see the substituted value.
+        let author_declarations = if author_declarations
+            .iter()
+            .any(|(prop, value, _)| !prop.starts_with("--") && value.contains("var("))
+        {
+            author_declarations
+                .into_iter()
+                .map(|(prop, value, specificity)| {
+                    if !prop.starts_with("--") && value.contains("var(") {
+                        let value = resolve_css_variables(&value, &custom_properties);
+                        (prop, value, specificity)
+                    } else {
+                        (prop, value, specificity)
+                    }
+                })
+                .collect()
+        } else {
+            author_declarations
+        };
         for (prop, value, _specificity) in &author_declarations {
             if !prop.starts_with("--") {
                 let value = resolve_css_variables(value, &custom_properties);
@@ -2660,7 +3441,7 @@ impl Document {
             (!custom_properties.is_empty()).then_some(custom_properties);
         let mut style = merged.to_style();
 
-        let control_tag = node.tag.as_str();
+        let control_tag = node.tag.as_static();
         let control_appearance = user_agent::control_appearance(
             &control_tag,
             node.get_attribute("type"),
@@ -2674,7 +3455,7 @@ impl Document {
                 .custom_properties
                 .as_ref()
                 .is_some_and(|p| p.contains_key(user_agent::CONTROL_APPEARANCE_PROPERTY))
-            || matches!(control_tag.as_str(), "input" | "button")
+            || matches!(control_tag, "input" | "button")
         {
             style
                 .custom_properties
@@ -2716,25 +3497,25 @@ impl Document {
                 // declaration exists. Explicit author inherit/unset still
                 // requests inheritance rather than keeping the UA default.
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "table"
+                    && node.tag.as_static() == "table"
                     && css_property_eq(property, "border-spacing")
                 {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && (ua_link || node.tag.as_str() == "hr")
+                    && (ua_link || node.tag.as_static() == "hr")
                     && css_property_eq(property, "color")
                 {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "nobr"
+                    && node.tag.as_static() == "nobr"
                     && css_property_eq(property, "white-space")
                 {
                     return true;
                 }
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "pre"
+                    && node.tag.as_static() == "pre"
                     && matches!(property, "white-space" | "font-family")
                     && !(font_shorthand_inherits && css_property_eq(property, "font-family"))
                 {
@@ -2744,7 +3525,7 @@ impl Document {
                 // inherited alignment, and explicit inherit/unset bypasses
                 // the UA default even when the parent alignment is start.
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "th"
+                    && node.tag.as_static() == "th"
                     && css_property_eq(property, "text-align")
                     && parent.text_align == w3cos_std::style::TextAlign::Start
                 {
@@ -2753,7 +3534,7 @@ impl Document {
                 // Caption has its own UA center declaration, independent of
                 // table alignment. Author inherit/unset still bypasses it.
                 if winning_author_value.is_none()
-                    && node.tag.as_str() == "caption"
+                    && node.tag.as_static() == "caption"
                     && css_property_eq(property, "text-align")
                 {
                     return true;
@@ -2766,7 +3547,7 @@ impl Document {
                         && value.trim().eq_ignore_ascii_case("currentcolor"))
                 })
             };
-            inherit_text_style(&mut style, parent, &node.tag.as_str(), declares);
+            inherit_text_style(&mut style, parent, &node.tag.as_static(), declares);
             // Explicit inheritance is an author declaration, not merely the
             // absence of a font declaration. It overrides UA font defaults
             // on strong/em/headings, while later winning longhands remain.
@@ -2896,7 +3677,7 @@ impl Document {
         let mut font_parent = inherited.cloned().unwrap_or_default();
         font_parent.font_size = specified_font_size(&font_parent);
         let ua_font_size_override = matches!(
-            node.tag.as_str().as_str(),
+            node.tag.as_static(),
             "button" | "input" | "select" | "textarea" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
         );
         if font_size_token.is_some_and(|value| {
@@ -2936,10 +3717,10 @@ impl Document {
                 let Some(property) = crate::css_style::multicol_property_name(property) else {
                     continue;
                 };
-                let empty = HashMap::new();
+                let empty = w3cos_std::style::CustomPropertyMap::default();
                 let value = resolve_css_variables(
                     value,
-                    style.custom_properties.as_ref().unwrap_or(&empty),
+                    style.custom_properties.as_deref().unwrap_or(&empty),
                 );
                 if !crate::css_style::valid_multicol_declaration(property, &value) {
                     continue;
@@ -4248,16 +5029,102 @@ impl Document {
                 style.line_height = ratio;
             }
         }
+        let style = SharedStyle::new(style);
+        let inherited_style = inherited_shared
+            .cloned()
+            .or_else(|| inherited.map(|parent| SharedStyle::new(parent.clone())));
+        if let Some(key) = mpc_key {
+            self.matched_properties_cache.borrow_mut().insert(
+                key,
+                (stylesheet_generation, self.mpc_epoch),
+                inherited_style.as_ref(),
+                &style,
+            );
+        }
+        let style = self.apply_animated_style(id, style, &matched_rules);
         self.computed_style_cache.borrow_mut().insert(
             id,
             CachedComputedStyle {
                 node_revision,
                 stylesheet_generation,
-                inherited_style: inherited.cloned(),
+                inherited_style,
                 style: style.clone(),
             },
         );
         style
+    }
+
+    /// Key for the matched-properties cache, or `None` when the computed
+    /// style may depend on more than the element's own tag, attributes,
+    /// matched declarations and parent style. Mirrors Blink's
+    /// MatchedPropertiesCache: elements that matched the same declarations
+    /// under an equal parent style share one computed style instead of
+    /// re-running the cascade (a re-rendered markdown block creates dozens
+    /// of identical `span.tok-*` elements per chunk).
+    fn matched_properties_key(
+        &self,
+        id: NodeId,
+        inline: &Arc<CSSStyleDeclaration>,
+        matched: &[u32],
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> Option<MatchedPropertiesKey> {
+        let node = self.get_node(id);
+        let inherited = inherited?;
+        // Text nodes have no own declarations: like Blink's LayoutText, which
+        // shares its parent's ComputedStyle, their style is a function of the
+        // parent style alone, so every text run under an equal parent shares
+        // one entry (a markdown history has tens of thousands of them).
+        if node.node_type == NodeType::Text {
+            if !node.attributes.is_empty()
+                || !node.attribute_namespaces.is_empty()
+                || !matched.is_empty()
+                || inherited.display == w3cos_std::style::Display::Contents
+                || !Arc::ptr_eq(inline, &shared_ua_style(node.tag))
+            {
+                return None;
+            }
+            return Some(MatchedPropertiesKey {
+                tag: node.tag.as_u32(),
+                attributes: Vec::new(),
+                matched: Vec::new(),
+                inline: Vec::new(),
+            });
+        }
+        if node.node_type != NodeType::Element
+            || !node.is_html_element
+            || !node.attribute_namespaces.is_empty()
+            // Display: contents makes blockification walk further ancestors.
+            || inherited.display == w3cos_std::style::Display::Contents
+            // Sibling and structural selectors (:nth-child, +, ~) only decide
+            // which declarations matched, and the key is those declarations
+            // (Blink's MPC is keyed the same way). :has() stays conservative.
+            || stylesheet::has_relational_dependencies()
+            // Per-tag UA rules that look at ancestors (nested lists, table
+            // hints, form controls) opt out.
+            || !matches!(
+                node.tag.as_static(),
+                "span" | "strong" | "em" | "b" | "i" | "u" | "s" | "code" | "a" | "p"
+                    | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre"
+                    | "blockquote" | "li" | "small" | "sub" | "sup" | "mark" | "del"
+                    | "ins" | "kbd" | "samp" | "var" | "q" | "cite" | "br" | "hr"
+            )
+        {
+            return None;
+        }
+        Some(MatchedPropertiesKey {
+            tag: node.tag.as_u32(),
+            attributes: node
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.as_u32(), value.as_str()))
+                .collect(),
+            matched: matched.to_vec(),
+            inline: if Arc::ptr_eq(inline, &shared_ua_style(node.tag)) {
+                Vec::new()
+            } else {
+                inline.inline_declarations.clone()
+            },
+        })
     }
 
     #[cfg(test)]
@@ -4309,17 +5176,41 @@ impl Document {
             return None;
         }
         Some(std::cell::Ref::map(cache, |cache| {
-            &cache.get(&id).expect("style cache entry").style
+            &*cache.get(&id).expect("style cache entry").style
         }))
     }
 
     pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+        let key = (
+            self.style_revision_clock,
+            stylesheet::generation(),
+            self.style_write_epoch,
+        );
+        {
+            let mut memo = self.style_for_memo.borrow_mut();
+            if memo.key != Some(key) || memo.styles.len() > 65_536 {
+                memo.key = Some(key);
+                memo.styles.clear();
+            }
+            if let Some(style) = memo.styles.get(&id.0) {
+                #[cfg(test)]
+                self.computed_style_cache_hits
+                    .set(self.computed_style_cache_hits.get() + 1);
+                return style.clone();
+            }
+        }
         let mut ancestor_ids = Vec::new();
         let document_element = self.document_element_id();
         let mut current = (Some(id) != document_element)
             .then(|| self.get_node(id).parent)
             .flatten();
+        let mut inherited = None;
         while let Some(parent) = current {
+            // Resume from the nearest ancestor already resolved this epoch.
+            if let Some(style) = self.style_for_memo.borrow().styles.get(&parent.0) {
+                inherited = Some(style.clone());
+                break;
+            }
             ancestor_ids.push(parent);
             if Some(parent) == document_element {
                 break;
@@ -4327,17 +5218,25 @@ impl Document {
             current = self.get_node(parent).parent;
         }
         ancestor_ids.reverse();
-        let mut ancestors = Vec::new();
-        let mut inherited = None;
+        // `computed_style` ignores the selector contexts (matching walks the
+        // tree itself); do not build them.
         for ancestor in ancestor_ids {
             if self.get_node(ancestor).node_type != NodeType::Element {
                 continue;
             }
-            let style = self.computed_style(ancestor, &ancestors, inherited.as_ref());
+            let style = self.computed_style(ancestor, &[], inherited.as_ref());
+            self.style_for_memo
+                .borrow_mut()
+                .styles
+                .insert(ancestor.0, style.clone());
             inherited = Some(style);
-            ancestors.push(self.selector_context(ancestor));
         }
-        self.computed_style(id, &ancestors, inherited.as_ref())
+        let style = self.computed_style(id, &[], inherited.as_ref());
+        self.style_for_memo
+            .borrow_mut()
+            .styles
+            .insert(id.0, style.clone());
+        style
     }
 
     /// Cascade one element from an already-computed parent style.
@@ -4351,6 +5250,15 @@ impl Document {
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::style::Style {
         self.computed_style(id, &[], inherited)
+    }
+
+    /// `computed_style_inherited` for walks that keep styles shared.
+    pub fn computed_style_inherited_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        self.computed_style_shared(id, inherited)
     }
 
     fn apply_font_size_minimums(&self, style: &mut w3cos_std::Style) {
@@ -4957,8 +5865,10 @@ impl Document {
             "square" => "▪".to_string(),
             "decimal" => format!(
                 "{}. ",
-                self.counter_snapshot_at(id, pseudo_element.unwrap_or("::marker"))
-                    .value("list-item")
+                match pseudo_element.unwrap_or("::marker") {
+                    "::marker" => self.list_item_marker_value(id),
+                    pseudo => self.counter_snapshot_at(id, pseudo).value("list-item"),
+                }
             ),
             "none" => return None,
             "string" => strings.into_iter().next()?,
@@ -5397,6 +6307,30 @@ impl Document {
                 scopes: scopes.clone(),
             });
         }
+        if target_pseudo == "::marker"
+            && Self::counter_memo_recording(self)
+            && self.computed_style_for(id).display == w3cos_std::style::Display::ListItem
+        {
+            // Same traversal state the targeted walk would return for `id`.
+            COUNTER_MEMO.with(|memo| {
+                if let Some(memo) = memo.borrow_mut().as_mut() {
+                    if memo.partial {
+                        let value = CounterSnapshot {
+                            scopes: scopes.clone(),
+                        }
+                        .value("list-item");
+                        memo.list_items.insert(id, value);
+                    } else {
+                        memo.markers.insert(
+                            id,
+                            CounterSnapshot {
+                                scopes: scopes.clone(),
+                            },
+                        );
+                    }
+                }
+            });
+        }
         let sibling_scope_base = scopes.len();
         if let Some(snapshot) =
             self.visit_pseudo_counters(id, "::before", target, target_pseudo, scopes, true)
@@ -5456,7 +6390,139 @@ impl Document {
         None
     }
 
+    fn counter_memo_recording(document: &Document) -> bool {
+        COUNTER_MEMO.with(|memo| {
+            memo.borrow().as_ref().is_some_and(|memo| {
+                memo.recording && memo.document == document as *const _ as usize
+            })
+        })
+    }
+
+    /// `list-item` value for an outside `::marker`.
+    ///
+    /// Each `ol`/`ul` resets `list-item` in its own scope, so no box outside
+    /// that element can change the value seen by its descendants. Inside a
+    /// component-tree build, walk just that list root once and memoize every
+    /// item in it, instead of a document-wide counter walk (which made every
+    /// subtree rebuild under an ordered list O(document)).
+    fn list_item_marker_value(&self, target: NodeId) -> i32 {
+        let me = self as *const Document as usize;
+        let (hit, can_walk) = COUNTER_MEMO.with(|memo| {
+            let memo = memo.borrow();
+            match memo.as_ref() {
+                Some(memo) if memo.document == me && !memo.recording => (
+                    memo.list_items.get(&target).copied().or_else(|| {
+                        memo.markers
+                            .get(&target)
+                            .map(|snapshot| snapshot.value("list-item"))
+                    }),
+                    !memo.filled,
+                ),
+                _ => (None, false),
+            }
+        });
+        if let Some(value) = hit {
+            return value;
+        }
+        if can_walk && let Some(root) = self.list_item_counter_root(target) {
+            let set = |recording: bool| {
+                COUNTER_MEMO.with(|memo| {
+                    if let Some(memo) = memo.borrow_mut().as_mut() {
+                        memo.recording = recording;
+                        memo.partial = recording;
+                    }
+                })
+            };
+            set(true);
+            let mut scopes = vec![HashMap::new()];
+            let _ = self.visit_counter_tree(root, NodeId(u32::MAX), "::marker", &mut scopes, false);
+            set(false);
+            let hit = COUNTER_MEMO.with(|memo| {
+                memo.borrow()
+                    .as_ref()
+                    .and_then(|memo| memo.list_items.get(&target).copied())
+            });
+            if let Some(value) = hit {
+                return value;
+            }
+        }
+        self.counter_snapshot_at(target, "::marker")
+            .value("list-item")
+    }
+
+    /// Nearest ancestor that resets `list-item`, when `target` itself does not.
+    fn list_item_counter_root(&self, target: NodeId) -> Option<NodeId> {
+        let resets_list_item = |id: NodeId| {
+            self.element_counter_reset_names(id)
+                .iter()
+                .any(|name| name == "list-item")
+        };
+        if resets_list_item(target) {
+            return None;
+        }
+        let mut current = self.get_node(target).parent;
+        while let Some(id) = current {
+            let node = self.get_node(id);
+            if node.node_type != NodeType::Element {
+                return None;
+            }
+            if resets_list_item(id) {
+                return Some(id);
+            }
+            current = node.parent;
+        }
+        None
+    }
+
     fn counter_snapshot_at(&self, target: NodeId, pseudo_element: &str) -> CounterSnapshot {
+        if pseudo_element == "::marker" {
+            let me = self as *const Document as usize;
+            let state = COUNTER_MEMO.with(|memo| {
+                let memo = memo.borrow();
+                match memo.as_ref() {
+                    Some(memo) if memo.document == me && !memo.recording => {
+                        Some((memo.filled, memo.markers.get(&target).cloned()))
+                    }
+                    _ => None,
+                }
+            });
+            match state {
+                Some((_, Some(snapshot))) => return snapshot,
+                Some((false, None)) => {
+                    COUNTER_MEMO.with(|memo| {
+                        if let Some(memo) = memo.borrow_mut().as_mut() {
+                            memo.recording = true;
+                        }
+                    });
+                    // A target that never matches: walk the whole document once.
+                    let mut scopes = vec![HashMap::new()];
+                    for child in self.children_ids(NodeId(0)) {
+                        let _ = self.visit_counter_tree(
+                            child,
+                            NodeId(u32::MAX),
+                            "::marker",
+                            &mut scopes,
+                            false,
+                        );
+                    }
+                    let hit = COUNTER_MEMO.with(|memo| {
+                        let mut memo = memo.borrow_mut();
+                        let memo = memo.as_mut().expect("counter memo");
+                        memo.recording = false;
+                        memo.filled = true;
+                        memo.markers.get(&target).cloned()
+                    });
+                    if let Some(snapshot) = hit {
+                        return snapshot;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.counter_snapshot_uncached(target, pseudo_element)
+    }
+
+    fn counter_snapshot_uncached(&self, target: NodeId, pseudo_element: &str) -> CounterSnapshot {
         let mut scopes = vec![HashMap::new()];
         for child in self.children_ids(NodeId(0)) {
             if let Some(snapshot) =
@@ -6004,7 +7070,7 @@ impl Document {
                 .collect();
         }
         let mut child_ancestors = ancestors.to_vec();
-        child_ancestors.push(self.selector_context(parent_id));
+        child_ancestors.push(stylesheet::SelectorContext::default());
         let participates_in_inline_flow = child_ids
             .iter()
             .map(|child_id| {
@@ -6087,7 +7153,7 @@ impl Document {
                                 return None;
                             }
                             let mut grandchild_ancestors = child_ancestors.clone();
-                            grandchild_ancestors.push(self.selector_context(*child_id));
+                            grandchild_ancestors.push(stylesheet::SelectorContext::default());
                             let contains_in_flow_block =
                                 self.children_ids(*child_id).iter().any(|grandchild_id| {
                                     let grandchild = self.get_node(*grandchild_id);
@@ -6285,7 +7351,7 @@ impl Document {
             if child.node_type == NodeType::Element {
                 let child_style = self.computed_style(child_id, ancestors, Some(parent_style));
                 if child_style.display == w3cos_std::style::Display::Contents {
-                    ancestors.push(self.selector_context(child_id));
+                    ancestors.push(stylesheet::SelectorContext::default());
                     let nested_ids = self.render_child_ids(
                         child_id,
                         self.children_ids(child_id),
@@ -7357,7 +8423,7 @@ impl Document {
                         if grandchild_ids.len() == 1 {
                             let grandchild = self.get_node(grandchild_ids[0]);
                             if grandchild.node_type == NodeType::Text {
-                                ancestors.push(self.selector_context(id));
+                                ancestors.push(stylesheet::SelectorContext::default());
                                 let child_style =
                                     self.computed_style(child_ids[0], ancestors, Some(&style));
                                 ancestors.pop();
@@ -7381,7 +8447,7 @@ impl Document {
                     }
                 }
                 let pushed = if node.node_type == NodeType::Element {
-                    ancestors.push(self.selector_context(id));
+                    ancestors.push(stylesheet::SelectorContext::default());
                     true
                 } else {
                     false
@@ -8585,7 +9651,7 @@ impl Document {
                         first
                             .style
                             .custom_properties
-                            .get_or_insert_with(std::collections::HashMap::new)
+                            .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-text-line-width".to_string(),
                                 "1".to_string(),
@@ -8644,7 +9710,7 @@ impl Document {
                         children[0]
                             .style
                             .custom_properties
-                            .get_or_insert_with(std::collections::HashMap::new)
+                            .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-text-line-width".to_string(),
                                 "1".to_string(),
@@ -8676,7 +9742,7 @@ impl Document {
                         trailing
                             .style
                             .custom_properties
-                            .get_or_insert_with(std::collections::HashMap::new)
+                            .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-text-line-width".to_string(),
                                 "1".to_string(),
@@ -8852,7 +9918,7 @@ impl Document {
                                     other => other,
                                 };
                                 line_item_style.custom_properties =
-                                    Some(std::collections::HashMap::from([(
+                                    Some(w3cos_std::style::CustomProperties::from_iter([(
                                         "--w3cos-internal-inline-line-item".to_string(),
                                         "1".to_string(),
                                     )]));
@@ -11906,7 +12972,7 @@ mod inline_line_extra_ascent_tests {
         // `promote_vertical_align_line_box_extension` has already run on the
         // fragment by the time the line is annotated.
         style.display = w3cos_std::style::Display::InlineFlex;
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-vertical-align-length".to_string(),
             format!("{offset} {}", offset - 4.0),
         )]));
@@ -11930,7 +12996,7 @@ mod inline_line_extra_ascent_tests {
     fn vertical_align_line_extension_does_not_clip_glyph_ink() {
         for offset in [40.0, -40.0] {
             let mut style = text_style();
-            style.custom_properties = Some(std::collections::HashMap::from([(
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-length".to_string(),
                 format!("{offset} {}", offset - 4.0),
             )]));
@@ -12610,27 +13676,58 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     if left == right {
         return true;
     }
-    let mut left = left.clone();
-    let mut right = right.clone();
-    for style in [&mut left, &mut right] {
-        // Source identity is not a CSS paint difference. Coalescing carries
-        // its boundaries separately rather than keeping transparent wrappers.
-        if let Some(properties) = style.custom_properties.as_mut() {
-            properties.remove(w3cos_std::inline_text::SOURCE_RUN);
-            properties.remove(w3cos_std::inline_text::FRAGMENT_ENDS);
-            if properties.is_empty() {
-                style.custom_properties = None;
-            }
+    // Source identity is not a CSS paint difference. Coalescing carries its
+    // boundaries separately rather than keeping transparent wrappers.
+    fn source_key(key: &str) -> bool {
+        key == w3cos_std::inline_text::SOURCE_RUN || key == w3cos_std::inline_text::FRAGMENT_ENDS
+    }
+    fn custom_without_source_eq(
+        left: Option<&w3cos_std::style::CustomProperties>,
+        right: Option<&w3cos_std::style::CustomProperties>,
+    ) -> bool {
+        let count = |map: Option<&w3cos_std::style::CustomProperties>| {
+            map.map_or(0, |map| map.keys().filter(|key| !source_key(key)).count())
+        };
+        if count(left) != count(right) {
+            return false;
         }
-        if style
+        let (Some(left), Some(right)) = (left, right) else {
+            return true;
+        };
+        left.iter()
+            .filter(|(key, _)| !source_key(key))
+            .all(|(key, value)| right.get(key) == Some(value))
+    }
+    fn background(style: &w3cos_std::style::Style) -> Option<&str> {
+        style
             .background_image
             .as_deref()
-            .is_some_and(|image| image.eq_ignore_ascii_case("none"))
-        {
-            style.background_image = None;
-        }
+            .filter(|image| !image.eq_ignore_ascii_case("none"))
     }
-    left == right
+    if background(left) != background(right)
+        || !custom_without_source_eq(
+            left.custom_properties.as_ref(),
+            right.custom_properties.as_ref(),
+        )
+    {
+        return false;
+    }
+    // Compare every other field without deep-copying the 1 KB Style (the
+    // old path cloned both sides on each probe): bitwise views whose two
+    // excluded fields are blanked, never dropped, so the shared heap data
+    // stays owned by `left` / `right`.
+    // SAFETY: the views are only read through `PartialEq` and are wrapped in
+    // ManuallyDrop; the overwritten fields are replaced without dropping and
+    // the replacement `None`s own nothing.
+    unsafe {
+        let mut left_view = std::mem::ManuallyDrop::new(std::ptr::read(left));
+        let mut right_view = std::mem::ManuallyDrop::new(std::ptr::read(right));
+        for view in [&mut *left_view, &mut *right_view] {
+            std::ptr::write(&mut view.custom_properties, None);
+            std::ptr::write(&mut view.background_image, None);
+        }
+        *left_view == *right_view
+    }
 }
 
 fn equivalent_text_paint_style(
@@ -12733,7 +13830,7 @@ fn group_unbroken_ascii_inline_words(
             style.white_space = WhiteSpace::NoWrap;
             style
                 .custom_properties
-                .get_or_insert_with(std::collections::HashMap::new)
+                .get_or_insert_with(Default::default)
                 .insert(
                     "--w3cos-internal-unbroken-inline-word".to_string(),
                     "1".to_string(),
@@ -13760,7 +14857,7 @@ fn split_collapsible_space_after_nonbreaking_run(component: &mut w3cos_std::Comp
 fn mark_bidi_visual_order(style: &mut w3cos_std::style::Style) {
     style
         .custom_properties
-        .get_or_insert_with(std::collections::HashMap::new)
+        .get_or_insert_with(Default::default)
         .insert(
             "--w3cos-internal-bidi-visual-order".to_string(),
             "1".to_string(),
@@ -13878,6 +14975,28 @@ fn empty_inline_box_has_no_area(
         .all(|width| width.unwrap_or(0.0) == 0.0)
 }
 
+/// Necessary condition for `coalesce_passive_inline_text_children` to leave
+/// exactly one Text child: every surviving child must unwrap (through
+/// single-child Row/Box wrappers, or the anonymous-table text shortcut) to a
+/// Text leaf. Looser than the real unwrap, so `false` is exact and lets the
+/// caller skip deep-cloning the whole subtree (block containers such as a
+/// chat log of thousands of messages fail on the first child).
+fn may_coalesce_to_single_text(component: &w3cos_std::Component) -> bool {
+    use w3cos_std::component::ComponentKind;
+    component.children.iter().all(|child| {
+        let mut fragment = child;
+        while matches!(fragment.kind, ComponentKind::Row | ComponentKind::Box)
+            && fragment.children.len() == 1
+        {
+            fragment = &fragment.children[0];
+        }
+        matches!(fragment.kind, ComponentKind::Text { .. })
+            || child.style.display == w3cos_std::style::Display::None
+            || empty_inline_box_has_no_area(child, &component.style)
+            || plain_anonymous_inline_table_text(child).is_some()
+    })
+}
+
 fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool {
     use unicode_bidi::BidiInfo;
     use w3cos_std::component::ComponentKind;
@@ -13953,7 +15072,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         component
             .style
             .custom_properties
-            .get_or_insert_with(std::collections::HashMap::new)
+            .get_or_insert_with(Default::default)
             .insert(
                 "--w3cos-internal-bidi-font-runs".to_string(),
                 "1".to_string(),
@@ -13998,14 +15117,14 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         component
             .style
             .custom_properties
-            .get_or_insert_with(std::collections::HashMap::new)
+            .get_or_insert_with(Default::default)
             .insert(
                 "--w3cos-internal-bidi-font-runs".to_string(),
                 "1".to_string(),
             );
         return true;
     }
-    if style_bidi_control.is_none() {
+    if style_bidi_control.is_none() && may_coalesce_to_single_text(component) {
         // Keep a coalescible plain-text run in logical order. The font backend
         // applies Unicode Bidi to the resulting single run; converting it to
         // visual order here would make that backend reorder it a second time.
@@ -14018,6 +15137,35 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         }
     }
     if component.children.len() < 2 && style_bidi_control.is_none() {
+        return false;
+    }
+    // Blink's BidiParagraph is only run when the inline formatting context
+    // needs bidi (NGInlineNode::IsBidiEnabled: an RTL paragraph, a bidi
+    // control/embedding, or strong RTL / Arabic number text). Decide that on
+    // the borrowed children before building owned units below; every path
+    // past this point returns `false` when no such content exists.
+    let is_bidi_character = |character: char| {
+        is_bidi_control(character)
+            || matches!(
+                unicode_bidi::bidi_class(character),
+                unicode_bidi::BidiClass::R
+                    | unicode_bidi::BidiClass::AL
+                    | unicode_bidi::BidiClass::AN
+            )
+    };
+    let bidi_text = |content: &str| !content.is_ascii() && content.chars().any(is_bidi_character);
+    if style_bidi_control.is_none()
+        && component.style.direction != TextDirection::Rtl
+        && !component.children.iter().any(|child| {
+            bidi_control_for(&child.style).is_some()
+                || match &child.kind {
+                    ComponentKind::Text { content } => bidi_text(content),
+                    _ => child.children.iter().any(|text| {
+                        matches!(&text.kind, ComponentKind::Text { content } if bidi_text(content))
+                    }),
+                }
+        })
+    {
         return false;
     }
 
@@ -17012,6 +18160,74 @@ mod generated_counter_format_tests {
                 .value("list-item"),
             1
         );
+    }
+
+    #[test]
+    fn memoized_marker_counters_match_the_targeted_walk() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".skip", &[("counter-increment", "list-item 3")]);
+        let mut document = Document::new();
+        let mut items = Vec::new();
+        for outer in 0..3 {
+            let list = document.create_element("ol");
+            for index in 0..4 {
+                let item = document.create_element("li");
+                if index == 2 {
+                    item.class_list_add(&mut document, "skip");
+                }
+                list.append_child(&mut document, item);
+                items.push(item.id);
+                if outer == 1 && index == 1 {
+                    let nested = document.create_element("ol");
+                    for _ in 0..2 {
+                        let inner = document.create_element("li");
+                        nested.append_child(&mut document, inner);
+                        items.push(inner.id);
+                    }
+                    item.append_child(&mut document, nested);
+                }
+            }
+            document.body().append_child(&mut document, list);
+        }
+        let expected: Vec<i32> = items
+            .iter()
+            .map(|id| {
+                document
+                    .counter_snapshot_uncached(*id, "::marker")
+                    .value("list-item")
+            })
+            .collect();
+        // Inside one component-tree build every marker reads the single
+        // document-order traversal.
+        let _scope = CounterMemoScope::enter(&document as *const Document);
+        let memoized: Vec<i32> = items
+            .iter()
+            .map(|id| {
+                document
+                    .counter_snapshot_at(*id, "::marker")
+                    .value("list-item")
+            })
+            .collect();
+        assert_eq!(memoized, expected);
+        assert_eq!(&expected[..4], &[1, 2, 5, 6]);
+        COUNTER_MEMO.with(|memo| {
+            assert!(memo.borrow().as_ref().is_some_and(|memo| memo.filled));
+        });
+        drop(_scope);
+        // A subtree build walks only each item's list root.
+        let _scope = CounterMemoScope::enter(&document as *const Document);
+        let per_list: Vec<i32> = items
+            .iter()
+            .rev()
+            .map(|id| document.list_item_marker_value(*id))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(per_list, expected);
+        drop(_scope);
+        COUNTER_MEMO.with(|memo| assert!(memo.borrow().is_none()));
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
@@ -21652,7 +22868,7 @@ mod image_component_tests {
             Style {
                 display: Display::Block,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21745,7 +22961,7 @@ mod image_component_tests {
             Style {
                 display: Display::Block,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21787,7 +23003,7 @@ mod image_component_tests {
                 direction: TextDirection::Rtl,
                 flex_wrap: FlexWrap::Wrap,
                 justify_content: JustifyContent::FlexEnd,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21831,7 +23047,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21899,7 +23115,7 @@ mod image_component_tests {
                 Style {
                     display: Display::Inline,
                     flex_wrap: w3cos_std::style::FlexWrap::Wrap,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -21940,7 +23156,7 @@ mod image_component_tests {
                 float: w3cos_std::style::Float::Right,
                 width: w3cos_std::style::Dimension::Percent(50.0),
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22019,7 +23235,7 @@ mod image_component_tests {
                 Style {
                     display: Display::Flex,
                     flex_wrap: FlexWrap::Wrap,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -22079,7 +23295,7 @@ mod image_component_tests {
                 Style {
                     display: Display::Flex,
                     flex_wrap: FlexWrap::Wrap,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -22115,7 +23331,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22180,7 +23396,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22241,7 +23457,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22297,7 +23513,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22328,7 +23544,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -23094,6 +24310,47 @@ mod image_component_tests {
     }
 
     #[test]
+    fn matched_rules_reuse_survives_inline_edits_but_not_class_changes() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("width", "var(--w)")]);
+        crate::stylesheet::register_rule(".alt .cell", &[("width", "120px")]);
+        let mut document = Document::new();
+        let root = document.create_element("div");
+        let cell = document.create_element("div");
+        cell.set_class_name(&mut document, "cell");
+        root.append_child(&mut document, cell);
+        document.body().append_child(&mut document, root);
+        let set_w = |document: &mut Document, value: &str| {
+            document.get_style_mut(root.id).set_property("--w", value);
+            document.mark_inline_style_dirty(root.id);
+        };
+        set_w(&mut document, "10px");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(10.0)
+        );
+        // Inline-only edit: matched rules are reused, values still update.
+        set_w(&mut document, "20px");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(20.0)
+        );
+        // An ancestor class change must re-run matching.
+        root.set_class_name(&mut document, "alt");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(120.0)
+        );
+        root.set_class_name(&mut document, "");
+        set_w(&mut document, "30px");
+        assert_eq!(
+            document.computed_style_for(cell.id).width,
+            w3cos_std::style::Dimension::Px(30.0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn multicol_properties_inherit_only_explicitly_in_cascade_order() {
         crate::stylesheet::clear_rules();
         let mut document = Document::new();
@@ -23344,7 +24601,7 @@ mod image_component_tests {
     fn synthetic_pieces_of_one_text_source_do_not_create_authored_boundaries() {
         let style = w3cos_std::Style {
             display: Display::Inline,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-text-source-run".into(),
                 "pseudo:42:before:1".into(),
             )])),
@@ -23408,7 +24665,7 @@ mod image_component_tests {
         ] {
             let aligned = Style {
                 align_self: alignment,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     marker.into(),
                     value.into(),
                 )])),
@@ -25554,7 +26811,7 @@ mod image_component_tests {
             display: Display::Inline,
             ..w3cos_std::Style::default()
         };
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-vertical-align-keyword".into(),
             "top".into(),
         )]));
@@ -28208,5 +29465,39 @@ mod tree_mutation_tests {
         }
         assert_eq!(document.nodes.capacity(), capacity);
         assert!(document.nodes.len() <= capacity);
+    }
+}
+
+#[cfg(test)]
+mod extent_cache_tests {
+    use super::*;
+    use crate::dom_rect::DOMRect;
+
+    #[test]
+    fn cached_scroll_extent_follows_rect_writes_and_removals() {
+        let mut document = Document::new();
+        let scroller = document.create_element("div");
+        document.body().append_child(&mut document, scroller);
+        document.set_layout_rect(scroller.id, DOMRect::new(0.0, 0.0, 100.0, 50.0));
+        let mut rows = Vec::new();
+        for index in 0..4 {
+            let row = document.create_element("div");
+            scroller.append_child(&mut document, row);
+            document.set_layout_rect(row.id, DOMRect::new(0.0, index as f32 * 40.0, 100.0, 40.0));
+            rows.push(row);
+        }
+        assert_eq!(scroller.scroll_height(&document), 160.0);
+        // Cached: a second read without changes returns the same value.
+        assert_eq!(scroller.scroll_height(&document), 160.0);
+        document.set_layout_rect(rows[3].id, DOMRect::new(0.0, 120.0, 100.0, 90.0));
+        assert_eq!(scroller.scroll_height(&document), 210.0);
+        let inner = document.create_element("span");
+        rows[1].append_child(&mut document, inner);
+        document.set_layout_rect(inner.id, DOMRect::new(0.0, 300.0, 250.0, 10.0));
+        assert_eq!(scroller.scroll_height(&document), 310.0);
+        assert_eq!(scroller.scroll_width(&document), 250.0);
+        rows[1].remove_child(&mut document, &inner);
+        assert_eq!(scroller.scroll_height(&document), 210.0);
+        assert_eq!(scroller.scroll_width(&document), 100.0);
     }
 }

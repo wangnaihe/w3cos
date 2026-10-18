@@ -219,7 +219,10 @@ enum OneListener {
 }
 
 struct ListenerStore {
-    items: Vec<JsListener>,
+    /// Removed listeners leave a `None` tombstone so `index` positions stay
+    /// valid; `retain`/compaction squeezes them out.
+    items: Vec<Option<JsListener>>,
+    dead: usize,
     /// Built on the first mutation. `None` keeps the thread-local initializer const.
     index: Option<HashMap<(u32, EventType), Vec<u32>>>,
     /// Node id to a single non-capture listener. Misses fall back to `index`.
@@ -231,6 +234,7 @@ impl ListenerStore {
     const fn new() -> Self {
         Self {
             items: Vec::new(),
+            dead: 0,
             index: None,
             ones: Vec::new(),
             capture_count: 0,
@@ -249,7 +253,72 @@ impl ListenerStore {
             .or_default()
             .push(idx);
         Self::note_one(&mut self.ones, &listener);
-        self.items.push(listener);
+        self.items.push(Some(listener));
+    }
+
+    /// DOM `addEventListener` dedupe: the same (type, callback, capture)
+    /// on one target is registered once.
+    fn contains(&self, node: u32, event_type: EventType, handler: &Value, capture: bool) -> bool {
+        let Some(idxs) = self
+            .index
+            .as_ref()
+            .and_then(|index| index.get(&(node, event_type)))
+        else {
+            return false;
+        };
+        idxs.iter().any(|&idx| {
+            self.items[idx as usize].as_ref().is_some_and(|listener| {
+                !listener.inline
+                    && listener.capture == capture
+                    && Value::function_identity_eq(&listener.handler, handler)
+            })
+        })
+    }
+
+    /// DOM `removeEventListener`: drop the one listener whose type, callback
+    /// identity and capture flag match. Inline handlers are not matched.
+    fn remove_one(
+        &mut self,
+        node: u32,
+        event_type: EventType,
+        handler: &Value,
+        capture: bool,
+    ) -> bool {
+        let Some(idxs) = self
+            .index
+            .as_mut()
+            .and_then(|index| index.get_mut(&(node, event_type)))
+        else {
+            return false;
+        };
+        let Some(slot) = idxs.iter().position(|&idx| {
+            self.items[idx as usize].as_ref().is_some_and(|listener| {
+                !listener.inline
+                    && listener.capture == capture
+                    && Value::function_identity_eq(&listener.handler, handler)
+            })
+        }) else {
+            return false;
+        };
+        let idx = idxs.remove(slot) as usize;
+        if idxs.is_empty() {
+            self.index.as_mut().unwrap().remove(&(node, event_type));
+        }
+        let removed = self.items[idx].take().expect("indexed listener is live");
+        if removed.capture {
+            self.capture_count = self.capture_count.saturating_sub(1);
+        }
+        // `Many` is always safe: dispatch then reads the exact index.
+        if let Some(one) = self.ones.get_mut(node as usize) {
+            if one.is_some() {
+                *one = Some(OneListener::Many);
+            }
+        }
+        self.dead += 1;
+        if self.dead > 64 && self.dead * 2 > self.items.len() {
+            self.retain(|_| true);
+        }
+        true
     }
 
     fn note_one(ones: &mut Vec<Option<OneListener>>, listener: &JsListener) {
@@ -281,19 +350,22 @@ impl ListenerStore {
     }
 
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
-        self.items.retain(|listener| pred(listener));
+        self.items
+            .retain(|listener| listener.as_ref().is_some_and(|listener| pred(listener)));
+        self.dead = 0;
         self.reindex();
     }
 
     fn clear(&mut self) {
         self.items.clear();
+        self.dead = 0;
         self.index = None;
         self.ones.clear();
         self.capture_count = 0;
     }
 
     fn iter(&self) -> impl Iterator<Item = &JsListener> {
-        self.items.iter()
+        self.items.iter().flatten()
     }
 
     fn has_capture(&self) -> bool {
@@ -309,7 +381,7 @@ impl ListenerStore {
         };
         idxs.iter()
             .filter_map(|&idx| {
-                let listener = &self.items[idx as usize];
+                let listener = self.items[idx as usize].as_ref()?;
                 capture
                     .is_none_or(|flag| listener.capture == flag)
                     .then(|| listener.handler.clone())
@@ -335,7 +407,9 @@ impl ListenerStore {
         };
         let mut total = 0usize;
         for &idx in idxs {
-            let listener = &self.items[idx as usize];
+            let Some(listener) = self.items[idx as usize].as_ref() else {
+                continue;
+            };
             if !capture.is_none_or(|flag| listener.capture == flag) {
                 continue;
             }
@@ -351,6 +425,9 @@ impl ListenerStore {
         let mut index: HashMap<(u32, EventType), Vec<u32>> = HashMap::new();
         self.capture_count = 0;
         for (idx, listener) in self.items.iter().enumerate() {
+            let Some(listener) = listener else {
+                continue;
+            };
             if listener.capture {
                 self.capture_count = self.capture_count.saturating_add(1);
             }
@@ -361,7 +438,7 @@ impl ListenerStore {
         }
         self.index = Some(index);
         self.ones.clear();
-        for listener in &self.items {
+        for listener in self.items.iter().flatten() {
             Self::note_one(&mut self.ones, listener);
         }
     }
@@ -456,11 +533,15 @@ thread_local! {
     /// address a recycled node id after navigation.
     static BRIDGE_REALM_GENERATION: Cell<u32> = const { Cell::new(1) };
     /// node id → memoized element Value (identity: `a === b` via Rc::ptr_eq).
-    static ELEMENT_VALUES: RefCell<HashMap<u32, ElementMemo>> = RefCell::new(HashMap::new());
+    static ELEMENT_VALUES: RefCell<w3cos_std::fxhash::FxHashMap<u32, ElementMemo>> =
+        RefCell::new(Default::default());
     /// (node, key) → JS expando properties assigned through the set trap
     /// (plus bridge-cached "style"/"classList"/"__ctx2d" values).
-    static ELEMENT_PROPS: RefCell<HashMap<(u32, String), Value>> = RefCell::new(HashMap::new());
-    static KNOWN_EXPANDS: RefCell<HashMap<(u32, u8), Value>> = RefCell::new(HashMap::new());
+    /// Fx-hashed: probed per node by removal lifecycle walks.
+    static ELEMENT_PROPS: RefCell<w3cos_std::fxhash::FxHashMap<(u32, String), Value>> =
+        RefCell::new(Default::default());
+    static KNOWN_EXPANDS: RefCell<w3cos_std::fxhash::FxHashMap<(u32, u8), Value>> =
+        RefCell::new(Default::default());
     // Navigation-owned origin decision, never a writable JS document URL.
     static OBJECT_DOCUMENT_READABLE: RefCell<HashMap<u32, bool>> = RefCell::new(HashMap::new());
     /// Processing-instruction attributes are projected from `data`, but values
@@ -1223,6 +1304,9 @@ fn dom_imm_get(node: u32, key: &str) -> Value {
     if let Some(cached) = cached_tree_method(node, key) {
         return cached;
     }
+    if let Some(method) = shared_attribute_method(node, key) {
+        return method;
+    }
     let computed = element_computed_get(node, key);
     remember_tree_method(node, key, &computed);
     if !computed.is_undefined() {
@@ -1257,18 +1341,30 @@ fn dom_imm_set(node: u32, key: &str, value: Value) -> bool {
 // object borrows before user code so it can redefine the receiver/prototype.
 fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Option<Value> {
     let mut current = prototype.clone();
-    let mut seen = std::collections::HashSet::new();
+    // A cycle can only come from a proxy-free chain mutated behind
+    // setPrototypeOf's back; bound the walk instead of hashing identities
+    // per level (the old HashSet allocated on every DOM property miss).
+    let mut depth = 0u32;
     while let Some(object) = current.as_object() {
-        if !seen.insert(object.identity()) {
+        depth += 1;
+        if depth > 4096 {
             return None;
         }
         let (proxy, getter, data, accessor, next) = {
             let object = object.borrow();
+            // One combined probe (data, getter or setter slot) decides the
+            // level; the separate getter/data reads run only on a hit.
+            let accessor = object.has_own_property(key);
+            let (getter, data) = if accessor {
+                (object.own_getter(key), object.own_data(key))
+            } else {
+                (None, None)
+            };
             (
                 object.has_get_trap(),
-                object.own_getter(key),
-                object.own_data(key),
-                object.has_own_property(key),
+                getter,
+                data,
+                accessor,
                 object.get_prototype_of(),
             )
         };
@@ -1298,7 +1394,7 @@ fn inherited_prototype_value(node: u32, key: &str, receiver: &Value) -> Option<V
 fn cached_node_prototype(node: u32) -> Value {
     thread_local! {
         static DIV_PROTO: RefCell<Option<(u32, Value)>> = const { RefCell::new(None) };
-        static OTHER: RefCell<(u32, HashMap<(u16, String), Value>)> =
+        static OTHER: RefCell<(u32, HashMap<(u16, &'static str), Value>)> =
             RefCell::new((0, HashMap::new()));
     }
     // Namespaces/local names choose a different prototype even for identical
@@ -1321,9 +1417,9 @@ fn cached_node_prototype(node: u32) -> Value {
         });
     }
     let tag = if node_type == 1 {
-        dom::tag_name(node)
+        dom::tag_static(node)
     } else {
-        String::new()
+        ""
     };
     let key = (node_type, tag);
     OTHER.with(|cache| {
@@ -2524,7 +2620,7 @@ fn element_or_null(node: Option<u32>) -> Value {
 // Child ids for one parent, invalidated by `structure_generation`. Indexed
 // `childNodes[n]` on a stable parent is then O(1) instead of a sibling walk.
 thread_local! {
-    static CHILD_INDEX: RefCell<Option<(u32, u64, Vec<u32>)>> = const { RefCell::new(None) };
+    static CHILD_INDEX: RefCell<Option<(u32, u64, Vec<u32>, u64)>> = const { RefCell::new(None) };
     static COLLECTION_ROOTS: RefCell<HashMap<u64, (u32, Value)>> = RefCell::new(HashMap::new());
     static LENGTH_SHADOWS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
@@ -2533,29 +2629,104 @@ fn ensure_child_index(parent: u32) {
     // Direct document mutations bump this counter inside `note_structure_change`,
     // so a cache hit does not borrow the document.
     let generation = w3cos_dom::document::structure_tick();
-    let fresh = CHILD_INDEX.with(|cache| {
+    let cached = CHILD_INDEX.with(|cache| {
         cache
             .borrow()
             .as_ref()
-            .is_some_and(|(node, cached_generation, _)| {
-                *node == parent && *cached_generation == generation
-            })
+            .map(|(node, cached_generation, _, doc)| (*node, *cached_generation, *doc))
     });
-    if fresh {
-        return;
+    if let Some((node, cached_generation, doc)) = cached
+        && node == parent
+    {
+        if cached_generation == generation {
+            return;
+        }
+        // Blink's CollectionIndexCache survives edits it can account for;
+        // patch the cached ids with the logged child-list edits instead of
+        // walking every sibling again after each insertBefore/removeChild.
+        if dom::with_document(|document| document.serial()) == doc
+            && CHILD_INDEX.with(|cache| patch_child_index(&mut cache.borrow_mut(), generation))
+        {
+            return;
+        }
     }
-    let ids = dom::with_document(|document| {
+    let (ids, doc) = dom::with_document(|document| {
         let mut ids = Vec::new();
         let mut child = document.get_node(NodeId::from_u32(parent)).first_child;
         while let Some(id) = child {
             ids.push(id.as_u32());
             child = w3cos_dom::node::sib(document.get_node(id).next_sibling);
         }
-        ids
+        (ids, document.serial())
     });
     CHILD_INDEX.with(|cache| {
-        *cache.borrow_mut() = Some((parent, generation, ids));
+        *cache.borrow_mut() = Some((parent, generation, ids, doc));
     });
+}
+
+fn patch_child_index(cache: &mut Option<(u32, u64, Vec<u32>, u64)>, generation: u64) -> bool {
+    use w3cos_dom::document::ChildListChange;
+    let Some((parent, cached_generation, ids, doc)) = cache.as_mut() else {
+        return false;
+    };
+    let (parent, doc) = (*parent, *doc);
+    let mut valid = true;
+    let replayed =
+        w3cos_dom::document::replay_child_changes_since(*cached_generation, 64, |change| {
+            if !valid {
+                return;
+            }
+            match change {
+                ChildListChange::Insert {
+                    doc: d,
+                    parent: p,
+                    child,
+                    before,
+                } => {
+                    if d != doc {
+                        valid = false;
+                    } else if p == parent {
+                        let at = if before == 0 {
+                            Some(ids.len())
+                        } else {
+                            ids.iter().position(|&id| id == before)
+                        };
+                        match at {
+                            Some(at) => ids.insert(at, child),
+                            None => valid = false,
+                        }
+                    }
+                }
+                ChildListChange::Remove {
+                    doc: d,
+                    parent: p,
+                    child,
+                } => {
+                    if d != doc {
+                        valid = false;
+                    } else if p == parent {
+                        match ids.iter().position(|&id| id == child) {
+                            Some(at) => {
+                                ids.remove(at);
+                            }
+                            None => valid = false,
+                        }
+                    }
+                }
+                ChildListChange::Reset { doc: d, node } => {
+                    if d != doc || node == parent || ids.contains(&node) {
+                        valid = false;
+                    }
+                }
+            }
+        });
+    if replayed && valid {
+        *cached_generation = generation;
+        true
+    } else {
+        *cache = None;
+        false
+    }
 }
 
 fn child_node_at(node: u32, index: usize) -> Option<u32> {
@@ -2564,7 +2735,7 @@ fn child_node_at(node: u32, index: usize) -> Option<u32> {
         cache
             .borrow()
             .as_ref()
-            .and_then(|(_, _, ids)| ids.get(index).copied())
+            .and_then(|(_, _, ids, _)| ids.get(index).copied())
     })
 }
 
@@ -2574,7 +2745,7 @@ fn child_node_count(node: u32) -> usize {
         cache
             .borrow()
             .as_ref()
-            .map(|(_, _, ids)| ids.len())
+            .map(|(_, _, ids, _)| ids.len())
             .unwrap_or(0)
     })
 }
@@ -3392,22 +3563,78 @@ fn cached_subtree_id_matches(root: u32, include_root: bool, id: &str) -> Vec<u32
 }
 
 fn query_selector_all_scoped(scope: Option<u32>, selector: &str) -> Vec<u32> {
+    query_selector_scoped(scope, selector, usize::MAX)
+}
+
+/// `querySelector`: the first match in tree order, without testing the rest
+/// of the subtree.
+fn query_selector_first_scoped(scope: Option<u32>, selector: &str) -> Option<u32> {
+    query_selector_scoped(scope, selector, 1).into_iter().next()
+}
+
+fn query_selector_scoped(scope: Option<u32>, selector: &str, limit: usize) -> Vec<u32> {
     let selector = w3cos_dom::stylesheet::trim_css_whitespace(selector);
     if let Some(id) = simple_id_selector(selector) {
         let root = scope.unwrap_or_else(document_element_id);
-        return cached_subtree_id_matches(root, scope.is_none(), &id);
+        let mut matches = cached_subtree_id_matches(root, scope.is_none(), &id);
+        matches.truncate(limit);
+        return matches;
     }
-    if selector_uses_runtime_state(selector) && selector_chain_parts(selector).is_empty() {
+    // The selector text is the same for every candidate: classify it once.
+    let runtime_parts =
+        selector_uses_runtime_state(selector).then(|| selector_chain_parts(selector));
+    if runtime_parts.as_ref().is_some_and(|parts| parts.is_empty()) {
         return Vec::new();
+    }
+    if runtime_parts.is_none() {
+        // Parse once, walk sibling links (Blink SelectorQuery).
+        return dom::with_document(|document| {
+            let mut matches = Vec::new();
+            let root = match scope {
+                Some(scope) => NodeId::from_u32(scope),
+                None => {
+                    let root = NodeId::from_u32(document_element_id());
+                    if document.get_node(root).node_type == w3cos_dom::node::NodeType::Element
+                        && document.matches_selector(root, selector) == Ok(true)
+                    {
+                        matches.push(root.as_u32());
+                    }
+                    root
+                }
+            };
+            if matches.len() < limit {
+                matches.extend(
+                    w3cos_dom::stylesheet::query_selector_descendants(
+                        selector,
+                        document,
+                        root,
+                        limit - matches.len(),
+                    )
+                    .into_iter()
+                    .map(|id| id.as_u32()),
+                );
+            }
+            matches
+        });
     }
     let candidates = scope.map_or_else(
         || inclusive_descendant_elements(document_element_id()),
         descendant_elements,
     );
-    candidates
-        .into_iter()
-        .filter(|candidate| query_selector_matches(*candidate, selector, scope))
-        .collect()
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let matched = match &runtime_parts {
+            Some(parts) => matches_selector_chain_in_scope(candidate, parts, scope),
+            None => dom::matches_selector(candidate, selector).is_ok_and(|matched| matched),
+        };
+        if matched {
+            matches.push(candidate);
+            if matches.len() >= limit {
+                break;
+            }
+        }
+    }
+    matches
 }
 
 fn query_selector_argument(args: &[Value], validation_node: u32) -> String {
@@ -3985,6 +4212,12 @@ fn element_qualified_name(node: u32) -> String {
 }
 
 fn normalized_attribute_name(node: u32, name: &str) -> String {
+    // ASCII-lowercasing is the identity for names without uppercase bytes,
+    // so both branches agree and the owner-document lookup can be skipped
+    // (Blink: Element::LowercaseIfNecessary).
+    if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return name.to_string();
+    }
     let owner_document = get_expando(node, "ownerDocument").unwrap_or_else(document_value);
     if namespace_uri(node) == crate::html_parser_state::HTML_NAMESPACE
         && owner_document.get_property("contentType").to_js_string() == "text/html"
@@ -4327,6 +4560,80 @@ fn remember_tree_method(node: u32, key: &str, value: &Value) {
     TREE_METHOD_CACHE.with(|cache| {
         cache.borrow_mut().insert((node, slot), value.clone());
     });
+}
+
+thread_local! {
+    static ATTRIBUTE_METHODS: RefCell<(u32, [Option<Value>; 3])> =
+        const { RefCell::new((u32::MAX, [None, None, None])) };
+}
+
+/// One attribute-method function object per realm for every HTML element,
+/// like V8's FunctionTemplate methods on `Element.prototype`: the receiver
+/// carries the node, so `el.setAttribute(...)` no longer allocates a closure
+/// per property get. Only reached after own properties, expandos and the
+/// prototype chain missed, so author overrides still win.
+fn shared_attribute_method(node: u32, key: &str) -> Option<Value> {
+    let slot = match key {
+        "getAttribute" => 0,
+        "setAttribute" => 1,
+        "hasAttribute" => 2,
+        _ => return None,
+    };
+    if dom::node_type(node) != 1 || is_svg_node(node) {
+        return None;
+    }
+    let generation = realm_generation();
+    ATTRIBUTE_METHODS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != generation {
+            *cache = (generation, [None, None, None]);
+        }
+        if let Some(method) = cache.1[slot].clone() {
+            return Some(method);
+        }
+        let name: &'static str = ["getAttribute", "setAttribute", "hasAttribute"][slot];
+        let method = func(move |this, args| {
+            let Some(receiver) = node_id_of(&this) else {
+                type_error("Illegal invocation");
+            };
+            if dom::node_type(receiver) != 1 || is_svg_node(receiver) {
+                return element_computed_get(receiver, name).call(this, args);
+            }
+            match slot {
+                0 => {
+                    let name = normalized_attribute_name(receiver, &arg(&args, 0).to_js_string());
+                    match dom::get_attribute(receiver, &name) {
+                        Some(value) => Value::from(value),
+                        None => Value::Null,
+                    }
+                }
+                1 => {
+                    let requested_name = arg(&args, 0).to_js_string();
+                    if !valid_attribute_name(&requested_name) {
+                        dom_exception("Attribute name is not valid", "InvalidCharacterError");
+                    }
+                    let name = normalized_attribute_name(receiver, &requested_name);
+                    let value = arg(&args, 1).to_js_string();
+                    apply_html_attribute(receiver, &name, &value);
+                    #[cfg(feature = "dynamic-js")]
+                    if let Some(event_type) =
+                        name.strip_prefix("on").filter(|event| !event.is_empty())
+                    {
+                        crate::dynamic_script::update_inline_event_handler(
+                            receiver, event_type, &value,
+                        );
+                    }
+                    Value::Undefined
+                }
+                _ => {
+                    let name = normalized_attribute_name(receiver, &arg(&args, 0).to_js_string());
+                    Value::Bool(dom::has_attribute(receiver, &name))
+                }
+            }
+        });
+        cache.1[slot] = Some(method.clone());
+        Some(method)
+    })
 }
 
 fn shared_element_proxy() -> w3cos_core::ProxyHandler {
@@ -4778,15 +5085,19 @@ fn prototype_chain_has_authored_lifecycle(mut prototype: Value) -> bool {
 
 fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
     let mut found = false;
-    let mut prototype_cache = HashMap::<u64, bool>::new();
+    let mut prototype_cache = w3cos_std::fxhash::FxHashMap::<u64, bool>::default();
+    // Reuse the probe keys instead of allocating two Strings per node.
+    let mut upgraded = (0u32, "__w3cos_custom_element_upgraded".to_string());
+    let mut disconnected = (0u32, "disconnectedCallback".to_string());
     walk_subtree(root, &mut |node| {
         if found {
             return;
         }
+        upgraded.0 = node;
+        disconnected.0 = node;
         let direct = ELEMENT_PROPS.with(|props| {
             let props = props.borrow();
-            props.contains_key(&(node, "__w3cos_custom_element_upgraded".to_string()))
-                || props.contains_key(&(node, "disconnectedCallback".to_string()))
+            props.contains_key(&upgraded) || props.contains_key(&disconnected)
         });
         if direct {
             found = true;
@@ -5432,11 +5743,7 @@ fn parsed_document_value(
             if query_selector_matches(root, &selector, Some(root)) {
                 return element_value(root);
             }
-            element_or_null(
-                query_selector_all_scoped(Some(root), &selector)
-                    .into_iter()
-                    .next(),
-            )
+            element_or_null(query_selector_first_scoped(Some(root), &selector))
         }),
     );
     props.insert(
@@ -7533,6 +7840,8 @@ fn number_compat_class() -> Value {
     let class =
         Value::function(|_, args| Value::Number(args.first().map(Value::to_number).unwrap_or(0.0)));
     class.set_property("name", Value::string("Number"));
+    class.set_property("parseInt", w3cos_core::parse_int_value());
+    class.set_property("parseFloat", w3cos_core::parse_float_value());
     class.set_property(
         "isFinite",
         Value::function(|_, args| {
@@ -9298,6 +9607,12 @@ pub(crate) fn invalidate_scroll_size_cache() {
 }
 
 fn forced_scroll_size(node: u32) -> (f64, f64) {
+    // scrollWidth/scrollHeight flush pending style and layout like every
+    // other geometry getter. Without this an appended child was invisible to
+    // scrollHeight (and to the scrollTop clamp) until something else flushed.
+    if dom::is_document_dirty() {
+        let _ = crate::incremental_layout::flush();
+    }
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
@@ -10871,11 +11186,7 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         }),
         "querySelector" => func(move |_, args| {
             let sel = query_selector_argument(&args, node);
-            element_or_null(
-                query_selector_all_scoped(Some(node), &sel)
-                    .into_iter()
-                    .next(),
-            )
+            element_or_null(query_selector_first_scoped(Some(node), &sel))
         }),
         "querySelectorAll" => func(move |_, args| {
             let sel = query_selector_argument(&args, node);
@@ -11011,7 +11322,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "removeEventListener" => func(move |_, args| {
-            js_remove_event_listener(node, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                node,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
         "dispatchEvent" => func(move |_, args| Value::Bool(js_dispatch_event(node, arg(&args, 0)))),
@@ -11437,27 +11753,203 @@ pub(crate) fn sync_style_element(node: u32) {
     let owner = node as u64;
     w3cos_dom::stylesheet::clear_owner(owner);
     if !dom::is_connected(node) {
+        MEDIA_DEPENDENT_STYLE_OWNERS.with(|owners| owners.borrow_mut().remove(&node));
         return;
     }
     let css = dom::get_descendant_text_content(node);
     register_author_sheet(owner, &css);
 }
 
+thread_local! {
+    /// `<style>` owners whose registered rules depend on `@media`; they are
+    /// re-registered when the viewport changes (Blink: MediaQueryEvaluator
+    /// results feed RuleSet invalidation on viewport resize).
+    static MEDIA_DEPENDENT_STYLE_OWNERS: RefCell<std::collections::BTreeMap<u32, Vec<(String, bool)>>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
+}
+
 fn register_author_sheet(owner: u64, css: &str) {
-    for block in css.split('}') {
-        let Some((selector, body)) = block.split_once('{') else {
-            continue;
+    let css = strip_css_comments(css);
+    let mut media_queries = Vec::new();
+    register_author_blocks(owner, &css, &mut media_queries);
+    if let Ok(node) = u32::try_from(owner) {
+        MEDIA_DEPENDENT_STYLE_OWNERS.with(|owners| {
+            let mut owners = owners.borrow_mut();
+            if !media_queries.is_empty() {
+                owners.insert(node, media_queries);
+            } else {
+                owners.remove(&node);
+            }
+        });
+    }
+}
+
+/// Re-register `<style>` sheets with `@media` blocks after a viewport change.
+pub(crate) fn refresh_author_media_rules() {
+    // Only sheets whose media query results flipped are re-registered.
+    let owners = MEDIA_DEPENDENT_STYLE_OWNERS.with(|owners| {
+        owners
+            .borrow()
+            .iter()
+            .filter(|(_, queries)| {
+                queries
+                    .iter()
+                    .any(|(query, matched)| media_query_matches(query) != *matched)
+            })
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>()
+    });
+    for node in owners {
+        sync_style_element(node);
+    }
+}
+
+fn strip_css_comments(css: &str) -> std::borrow::Cow<'_, str> {
+    if !css.contains("/*") {
+        return std::borrow::Cow::Borrowed(css);
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        match rest[start + 2..].find("*/") {
+            Some(end) => rest = &rest[start + 2 + end + 2..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Byte index of the `}` closing the block whose `{` is at `open`, honouring
+/// nested blocks and quoted strings.
+fn css_block_end(css: &str, open: usize) -> Option<usize> {
+    let bytes = css.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(q) => {
+                if byte == b'\\' {
+                    index += 1;
+                } else if byte == q {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Split at `separator` outside parentheses and strings.
+fn split_css_top_level(text: &str, separator: u8) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(q) => {
+                if byte == b'\\' {
+                    index += 1;
+                } else if byte == q {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ if byte == separator && depth <= 0 => {
+                    parts.push(&text[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+fn register_author_blocks(owner: u64, css: &str, media_queries: &mut Vec<(String, bool)>) {
+    let mut cursor = 0;
+    while cursor < css.len() {
+        let Some(open) = css[cursor..].find('{').map(|offset| cursor + offset) else {
+            break;
         };
-        let selector = selector.trim();
-        if selector.is_empty() {
+        // Statement at-rules (`@import ...;`, `@charset ...;`) end at `;`.
+        let mut prelude_start = cursor;
+        if let Some(semicolon) = css[cursor..open].rfind(';') {
+            prelude_start = cursor + semicolon + 1;
+        }
+        let prelude = css[prelude_start..open].trim();
+        let Some(close) = css_block_end(css, open) else {
+            break;
+        };
+        let body = &css[open + 1..close];
+        cursor = close + 1;
+        if let Some(at_rule) = prelude.strip_prefix('@') {
+            let name_end = at_rule
+                .find(|character: char| character.is_whitespace() || character == '(')
+                .unwrap_or(at_rule.len());
+            let name = at_rule[..name_end].to_ascii_lowercase();
+            match name.as_str() {
+                "font-face" => {
+                    let _ = crate::font_face::parse_and_register(body);
+                }
+                "media" => {
+                    let query = at_rule[name_end..].trim();
+                    let matched = media_query_matches(query);
+                    media_queries.push((query.to_string(), matched));
+                    if matched {
+                        register_author_blocks(owner, body, media_queries);
+                    }
+                }
+                "supports" | "layer" => register_author_blocks(owner, body, media_queries),
+                "keyframes" | "-webkit-keyframes" => {
+                    let keyframes_name = at_rule[name_end..]
+                        .trim()
+                        .trim_matches(|character| character == '"' || character == '\'');
+                    if !keyframes_name.is_empty() && keyframes_name != "none" {
+                        w3cos_dom::animation::register_keyframes(
+                            owner,
+                            keyframes_name,
+                            w3cos_dom::animation::parse_keyframes_body(body),
+                        );
+                    }
+                }
+                // @page, ... are not style rules.
+                _ => {}
+            }
             continue;
         }
-        if selector.starts_with("@font-face") {
-            let _ = crate::font_face::parse_and_register(body);
+        if prelude.is_empty() {
             continue;
         }
         let mut declarations = Vec::new();
-        for decl in body.split(';') {
+        for decl in split_css_top_level(body, b';') {
             let Some((property, value)) = decl.split_once(':') else {
                 continue;
             };
@@ -11475,7 +11967,7 @@ fn register_author_sheet(owner: u64, css: &str) {
             .iter()
             .map(|(property, value)| (property.as_str(), value.as_str()))
             .collect::<Vec<_>>();
-        w3cos_dom::stylesheet::register_rule_for_owner(owner, selector, &pairs);
+        w3cos_dom::stylesheet::register_rule_for_owner(owner, prelude, &pairs);
     }
 }
 
@@ -12888,6 +13380,12 @@ fn motion_style(node: u32, pseudo: Option<&str>) -> w3cos_std::style::Style {
 
 fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
     let mut snapshots = Vec::new();
+    // `transition` is not inherited: only a rule or this element's inline
+    // style can give it (or its pseudos) one. Blink starts transitions from
+    // the style diff in recalc; here the three-style snapshot is skipped.
+    if !dom::with_document(|document| document.may_start_transition(NodeId::from_u32(node))) {
+        return snapshots;
+    }
     for pseudo in [None, Some("::before"), Some("::after")] {
         let style = motion_style(node, pseudo);
         let Some(transition) = style.transition.clone() else {
@@ -13016,7 +13514,7 @@ fn scan_css_animations() {
                 from,
                 to,
                 started_at: Instant::now(),
-                delay: Duration::from_millis(u64::from(animation.delay_ms)),
+                delay: Duration::from_millis(animation.delay_ms.max(0) as u64),
                 duration: Duration::from_millis(u64::from(animation.duration_ms)),
                 easing: animation.easing,
                 direction: animation.direction,
@@ -13901,16 +14399,23 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
         false
     };
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().push(JsListener {
+    let added = LISTENERS.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.contains(node, et, &handler, capture) {
+            return false;
+        }
+        l.push(JsListener {
             node,
             event_type: et,
             handler,
             capture,
             inline: false,
-        })
+        });
+        true
     });
-    ensure_native_registration(node, et);
+    if added {
+        ensure_native_registration(node, et);
+    }
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -13956,14 +14461,19 @@ fn ensure_native_registration(node: u32, et: EventType) {
     });
 }
 
-/// v1 limitation: removes ALL bridge listeners for (node, type) — individual
-/// JS function identity cannot be compared (`Value` equality on functions is
-/// always false).
-fn js_remove_event_listener(node: u32, type_name: &str) {
+/// Removes the listener matching (type, callback identity, capture), as the
+/// DOM "remove an event listener" steps require. Other callbacks stay.
+fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
+    let capture = if let Some(b) = options.as_bool() {
+        b
+    } else if options.is_object() {
+        options.get_property("capture").to_bool()
+    } else {
+        false
+    };
     let et = event_type_for(type_name);
     LISTENERS.with(|l| {
-        l.borrow_mut()
-            .retain(|jl| !(jl.node == node && jl.event_type == et));
+        l.borrow_mut().remove_one(node, et, &handler, capture);
     });
 }
 
@@ -14392,9 +14902,45 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     // [target, parent, ..., root], crossing shadow boundaries only for
     // composed events.
     let chain = shadow_event_chain(target, ev.composed);
-    let stopped = |v: &Value| v.get_property("__sp").to_bool();
-    let immediate = |v: &Value| v.get_property("__sip").to_bool();
+    // Blink keeps target/currentTarget/eventPhase in the Event's own fields
+    // and the bindings read them through prototype accessors. Without shadow
+    // trees there is nothing to retarget, so a slotted event updates its slot
+    // per path node instead of writing four own properties per listener hop.
+    // The stop flags are mirrored into the slot by every writer of `__sp`.
+    let slot_path = slotted
+        && SHADOW_ROOTS.with(|roots| roots.borrow().is_empty())
+        && js_ev.as_object().is_some_and(|object| {
+            let object = object.borrow();
+            [
+                "target",
+                "srcElement",
+                "currentTarget",
+                "eventPhase",
+                "__sp",
+                "__sip",
+            ]
+            .iter()
+            .all(|key| !object.has_own_property(key))
+        });
+    let stopped = |v: &Value| {
+        if slot_path {
+            crate::web_events::event_stopped(v)
+        } else {
+            v.get_property("__sp").to_bool()
+        }
+    };
+    let immediate = |v: &Value| {
+        if slot_path {
+            crate::web_events::event_stopped_immediate(v)
+        } else {
+            v.get_property("__sip").to_bool()
+        }
+    };
     let set_current_target = |event: &Value, id: u32, phase: f64| {
+        if slot_path {
+            let _ = crate::web_events::set_dispatch_nodes(event, target, id, phase as u8);
+            return;
+        }
         event.set_property("target", element_value(retarget_shadow_event(target, id)));
         event.set_property("srcElement", event.get_property("target"));
         event.set_property("currentTarget", element_value(id));
@@ -14402,9 +14948,10 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     };
 
     // Phase 1: capture, root → parent (skip target). Ancestors with no
-    // capture listeners are not wrapped.
+    // capture listeners are not wrapped. `chain[0]` is the target, so drop
+    // it before reversing; the target's capture listeners run in phase 2.
     if has_capture {
-        for &id in chain.iter().rev().skip(1) {
+        for &id in chain.iter().skip(1).rev() {
             if stopped(&js_ev) {
                 break;
             }
@@ -18130,7 +18677,12 @@ fn build_document_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -19064,6 +19616,7 @@ pub fn set_viewport(width: f64, height: f64) {
             .call_method("dispatchEvent", vec![event]);
     }
     refresh_media_query_lists();
+    refresh_author_media_rules();
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::refresh_stylesheet_media_queries();
     #[cfg(feature = "dynamic-js")]
@@ -19086,6 +19639,7 @@ pub fn set_device_pixel_ratio(dpr: f64) {
         v.set((w, h, dpr));
     });
     refresh_media_query_lists();
+    refresh_author_media_rules();
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::refresh_stylesheet_media_queries();
     #[cfg(feature = "dynamic-js")]
@@ -19551,6 +20105,10 @@ fn build_window_value() -> Value {
             )
         }),
     );
+    // parseInt/parseFloat are single realm functions shared with the Number
+    // constructor (ECMA-262: Number.parseFloat is the same object as parseFloat).
+    props.insert("parseInt".to_string(), w3cos_core::parse_int_value());
+    props.insert("parseFloat".to_string(), w3cos_core::parse_float_value());
     props.insert("Promise".to_string(), promise_constructor_value());
     props.insert("BarProp".to_string(), bar_prop_class());
     for name in [
@@ -21459,7 +22017,12 @@ fn build_window_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -21596,6 +22159,12 @@ pub fn tick_timers() -> usize {
 /// batch the same timestamp and defers callbacks registered by a callback to
 /// the next frame, matching browser rAF batching semantics.
 pub fn run_animation_frame() -> usize {
+    // DocumentAnimations::UpdateAnimationTimingForAnimationFrame: elements
+    // whose animated style depends on the timeline restyle each frame.
+    crate::animations_web::resolve_pending_plays();
+    for node in w3cos_dom::animation::take_time_dependent_nodes() {
+        crate::dom::invalidate_animated_style(node);
+    }
     tick_css_motions();
     let callbacks: Vec<Value> = RAF_QUEUE
         .with(|q| std::mem::take(&mut *q.borrow_mut()))
@@ -21630,6 +22199,7 @@ thread_local! {
     static HEADLESS_ENTRY_MARK: Cell<Option<HeadlessEntryMark>> = const { Cell::new(None) };
 }
 
+#[cfg(not(target_os = "macos"))]
 fn process_cpu_ms() -> f64 {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
@@ -21654,6 +22224,7 @@ fn process_cpu_ms() -> f64 {
     (utime + stime) as f64 * 1000.0 / ticks as f64
 }
 
+#[cfg(not(target_os = "macos"))]
 fn process_rss_kb() -> (u64, u64) {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return (0, 0);
@@ -21676,6 +22247,45 @@ fn process_rss_kb() -> (u64, u64) {
         }
     }
     (rss, hwm)
+}
+
+// macOS has no /proc. getrusage gives user+system CPU and the peak RSS
+// (bytes on Darwin); proc_pidinfo(PROC_PIDTASKINFO) gives the current RSS.
+#[cfg(target_os = "macos")]
+fn process_cpu_ms() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0.0;
+    }
+    let tv = |t: libc::timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+    tv(usage.ru_utime) + tv(usage.ru_stime)
+}
+
+#[cfg(target_os = "macos")]
+fn process_rss_kb() -> (u64, u64) {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    let rss = if got == size {
+        info.pti_resident_size / 1024
+    } else {
+        0
+    };
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let hwm = if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } == 0 {
+        usage.ru_maxrss as u64 / 1024
+    } else {
+        0
+    };
+    (rss, hwm.max(rss))
 }
 
 fn headless_viewport() -> (u32, u32) {
@@ -22431,6 +23041,35 @@ mod tests {
     }
 
     #[test]
+    fn attribute_methods_are_shared_and_use_the_receiver() {
+        setup();
+        let document = document_value();
+        let a = document.call_method("createElement", vec![Value::string("div")]);
+        let b = document.call_method("createElement", vec![Value::string("span")]);
+        let set_a = a.get_property("setAttribute");
+        let set_b = b.get_property("setAttribute");
+        assert!(
+            set_a.strict_eq(&set_b),
+            "one setAttribute per realm, like Element.prototype"
+        );
+        // The receiver, not the node the method was read from, is mutated.
+        let _ = set_a.call(b.clone(), vec![Value::string("Data-V"), Value::string("7")]);
+        assert!(
+            a.call_method("getAttribute", vec![Value::string("data-v")])
+                .is_null()
+        );
+        assert_eq!(
+            b.call_method("getAttribute", vec![Value::string("DATA-V")])
+                .to_js_string(),
+            "7"
+        );
+        assert_eq!(
+            b.call_method("hasAttribute", vec![Value::string("data-v")]),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn dom_list_prologue_takes_fused_create() {
         setup();
         seal_dom_shape_baseline();
@@ -22901,6 +23540,34 @@ mod tests {
         );
         assert_eq!(child_texts(&root), before);
         w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn scroll_height_flushes_appended_children() {
+        setup();
+        set_viewport(1024.0, 768.0);
+        w3cos_dom::stylesheet::clear_rules();
+        let doc = document_value();
+        let scroller = create_in_body("div");
+        let style = scroller.get_property("style");
+        style.set_property("width", Value::string("300px"));
+        style.set_property("height", Value::string("200px"));
+        style.set_property("overflow", Value::string("auto"));
+        let add_rows = |count: usize| {
+            for _ in 0..count {
+                let row = doc.call_method("createElement", vec![Value::string("div")]);
+                row.get_property("style")
+                    .set_property("height", Value::string("20px"));
+                scroller.call_method("appendChild", vec![row]);
+            }
+        };
+        add_rows(20);
+        assert_eq!(scroller.get_property("scrollHeight").to_number(), 400.0);
+        add_rows(20);
+        // The appended rows are part of the scrollable overflow immediately.
+        assert_eq!(scroller.get_property("scrollHeight").to_number(), 800.0);
+        scroller.set_property("scrollTop", Value::Number(100000.0));
+        assert_eq!(scroller.get_property("scrollTop").to_number(), 600.0);
     }
 
     #[test]
@@ -23514,6 +24181,24 @@ mod tests {
         assert_eq!(
             is_nan.call(Value::Undefined, vec![Value::string("not a number")]),
             Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn global_parse_float_and_parse_int_are_shared_with_number() {
+        setup();
+        let window = window_value();
+        let parse_float = window.get_property("parseFloat");
+        let parse_int = window.get_property("parseInt");
+        assert!(parse_float.strict_eq(&window.get_property("Number").get_property("parseFloat")));
+        assert!(parse_int.strict_eq(&window.get_property("Number").get_property("parseInt")));
+        assert_eq!(
+            parse_float.call(Value::Undefined, vec![Value::string(" 0.5px")]),
+            Value::Number(0.5)
+        );
+        assert_eq!(
+            parse_int.call(Value::Undefined, vec![Value::string("0x10")]),
+            Value::Number(16.0)
         );
     }
 
@@ -26121,6 +26806,31 @@ mod tests {
         assert_eq!(doctype.get_property("name"), Value::string("foo"));
         assert!(document.get_property("firstChild") == doctype);
         assert!(doctype.get_property("nextSibling") == document.get_property("documentElement"));
+    }
+
+    #[test]
+    fn query_selector_returns_the_first_tree_order_match() {
+        setup();
+        let doc = document_value();
+        let host = create_in_body("div");
+        host.set_property(
+            "innerHTML",
+            Value::string(
+                "<p class=\"x\"><b class=\"y\" data-i=\"1\"></b></p><b class=\"y\" data-i=\"2\"></b><i class=\"y\" data-i=\"3\"></i>",
+            ),
+        );
+        for selector in [".y", "b.y", "p > .y", "[data-i]", "i, b", ".missing, i"] {
+            let first = host.call_method("querySelector", vec![Value::string(selector)]);
+            let all = host.call_method("querySelectorAll", vec![Value::string(selector)]);
+            assert!(first == all.get_property("0"), "{selector}");
+            let first_doc = doc.call_method("querySelector", vec![Value::string(selector)]);
+            let all_doc = doc.call_method("querySelectorAll", vec![Value::string(selector)]);
+            assert!(first_doc == all_doc.get_property("0"), "{selector}");
+        }
+        assert!(
+            host.call_method("querySelector", vec![Value::string(".missing")])
+                .is_null()
+        );
     }
 
     #[test]
@@ -28839,23 +29549,89 @@ try {
         let btn_id = node_id_of(&btn).unwrap();
         let count = Rc::new(Cell::new(0));
         let count2 = count.clone();
+        let handler = func(move |_, _| {
+            count2.set(count2.get() + 1);
+            Value::Undefined
+        });
         btn.call_method(
             "addEventListener",
-            vec![
-                Value::string("click"),
-                func(move |_, _| {
-                    count2.set(count2.get() + 1);
-                    Value::Undefined
-                }),
-            ],
+            vec![Value::string("click"), handler.clone()],
         );
-        btn.call_method("removeEventListener", vec![Value::string("click")]);
+        btn.call_method("removeEventListener", vec![Value::string("click"), handler]);
         dom::with_document_mut(|doc| {
             let mut ev = Event::click(NodeId::from_u32(btn_id), 0.0, 0.0);
             doc.dispatch_event_bubbling(&mut ev);
         });
         drain_microtasks();
         assert_eq!(count.get(), 0);
+    }
+
+    #[test]
+    fn remove_event_listener_matches_callback_and_capture() {
+        setup();
+        let target = create_in_body("div");
+        let hits = Rc::new(Cell::new(0));
+        let make = |weight: i32| {
+            let hits = hits.clone();
+            func(move |_, _| {
+                hits.set(hits.get() + weight);
+                Value::Undefined
+            })
+        };
+        let first = make(1);
+        let second = make(10);
+        let add = |handler: &Value, capture: bool| {
+            target.call_method(
+                "addEventListener",
+                vec![Value::string("ping"), handler.clone(), Value::Bool(capture)],
+            );
+        };
+        add(&first, false);
+        // Same (type, callback, capture) is registered once.
+        add(&first, false);
+        add(&second, false);
+        let third = make(100);
+        add(&third, true);
+        let fire = || {
+            let event = w3cos_core::class::construct(
+                &crate::web_events::event_class(),
+                vec![Value::string("ping")],
+            );
+            target.call_method("dispatchEvent", vec![event]);
+            drain_microtasks();
+        };
+        fire();
+        assert_eq!(hits.get(), 111);
+        hits.set(0);
+        // No callback matches nothing; the capture flag must match too.
+        target.call_method("removeEventListener", vec![Value::string("ping")]);
+        target.call_method(
+            "removeEventListener",
+            vec![Value::string("ping"), third.clone(), Value::Bool(false)],
+        );
+        fire();
+        assert_eq!(hits.get(), 111);
+        hits.set(0);
+        target.call_method(
+            "removeEventListener",
+            vec![Value::string("ping"), third.clone(), Value::Bool(true)],
+        );
+        fire();
+        assert_eq!(hits.get(), 11);
+        hits.set(0);
+        for _ in 0..200 {
+            add(&first, true);
+            target.call_method(
+                "removeEventListener",
+                vec![Value::string("ping"), first.clone(), Value::Bool(true)],
+            );
+        }
+        target.call_method(
+            "removeEventListener",
+            vec![Value::string("ping"), first.clone()],
+        );
+        fire();
+        assert_eq!(hits.get(), 10);
     }
 
     #[test]
@@ -31399,6 +32175,77 @@ try {
     }
 
     #[test]
+    fn css_animations_and_waapi_effects_reach_computed_style_and_layout() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let style = document.call_method("createElement", vec![Value::string("style")]);
+        style.set_property(
+            "textContent",
+            Value::string(
+                "@keyframes fade{from{opacity:1}to{opacity:0}}\
+                 @keyframes grow{0%{width:10px}100%{width:110px}}\
+                 .a{position:absolute;width:10px;height:4px}\
+                 .fade{animation:fade 1000ms linear 0s 1 normal both paused}\
+                 .grow{animation:grow 1000ms linear both paused}\
+                 .imp{animation:fade 1000ms linear both paused;opacity:0.25 !important}",
+            ),
+        );
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![style]);
+        let computed = |element: &Value, property: &str| {
+            window_value()
+                .call_method("getComputedStyle", vec![element.clone()])
+                .get_property(property)
+                .to_js_string()
+        };
+        let fade = create_in_body("div");
+        fade.set_property("className", Value::string("a fade"));
+        assert_eq!(computed(&fade, "opacity"), "1");
+        // A paused CSS animation holds current time 0; a negative delay
+        // seeks into the active interval.
+        fade.get_property("style")
+            .set_property("animationDelay", Value::string("-300ms"));
+        assert_eq!(computed(&fade, "opacity"), "0.7");
+        let grow = create_in_body("div");
+        grow.set_property("className", Value::string("a grow"));
+        grow.get_property("style")
+            .set_property("animationDelay", Value::string("-0.5s"));
+        assert_eq!(grow.get_property("offsetWidth").to_number(), 60.0);
+        let important = create_in_body("div");
+        important.set_property("className", Value::string("a imp"));
+        assert_eq!(computed(&important, "opacity"), "0.25");
+
+        let target = create_in_body("div");
+        let animation = target.call_method(
+            "animate",
+            vec![
+                Value::array(vec![
+                    Value::object(HashMap::from([("opacity".into(), Value::Number(1.0))])),
+                    Value::object(HashMap::from([("opacity".into(), Value::Number(0.0))])),
+                ]),
+                Value::object(HashMap::from([
+                    ("duration".into(), Value::Number(1000.0)),
+                    ("fill".into(), Value::string("both")),
+                ])),
+            ],
+        );
+        animation.call_method("pause", Vec::new());
+        assert_eq!(animation.get_property("currentTime"), Value::Number(0.0));
+        animation.set_property("currentTime", Value::Number(500.0));
+        assert_eq!(animation.get_property("currentTime"), Value::Number(500.0));
+        assert_eq!(computed(&target, "opacity"), "0.5");
+        assert_eq!(animation.get_property("playState").to_js_string(), "paused");
+        let listed = target.call_method("getAnimations", Vec::new());
+        assert!(listed.iter().any(|item| item.strict_eq(&animation)));
+        animation.call_method("cancel", Vec::new());
+        assert_eq!(computed(&target, "opacity"), "1");
+        assert_eq!(animation.get_property("currentTime"), Value::Null);
+        w3cos_dom::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn set_attribute_style_updates_the_inline_style_declaration() {
         setup();
         let div = create_in_body("div");
@@ -31814,5 +32661,37 @@ try {
             hits.get()
         );
         assert_eq!(hits.get(), 400);
+    }
+}
+
+#[cfg(test)]
+mod author_sheet_block_tests {
+    use super::*;
+
+    #[test]
+    fn block_end_honours_nesting_and_strings() {
+        let css = "@media (x){.a{content:'}'}.b{c:d}} .z{}";
+        let open = css.find('{').unwrap();
+        assert_eq!(&css[css_block_end(css, open).unwrap() + 1..], " .z{}");
+    }
+
+    #[test]
+    fn declarations_split_outside_parens_and_strings() {
+        assert_eq!(
+            split_css_top_level("a:url(data:x;y);b:'p;q';c:d", b';'),
+            vec!["a:url(data:x;y)", "b:'p;q'", "c:d"]
+        );
+    }
+
+    #[test]
+    fn media_blocks_record_their_queries_and_skip_unknown_at_rules() {
+        let css = strip_css_comments(
+            "/* } */@charset \"x\";@keyframes k{from{top:0}to{top:1px}}\
+             @media (min-width: 100000px){.never{height:1px}}.a{height:2px}",
+        );
+        let mut queries = Vec::new();
+        register_author_blocks(u64::MAX - 7, &css, &mut queries);
+        assert_eq!(queries, vec![("(min-width: 100000px)".to_string(), false)]);
+        w3cos_dom::stylesheet::clear_owner(u64::MAX - 7);
     }
 }

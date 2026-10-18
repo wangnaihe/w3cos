@@ -203,10 +203,10 @@ impl Kind {
             Self::BigInt64 => {
                 return crate::bigint::to_i64(value)
                     .unwrap_or_else(|| {
-                        crate::throw_value(Value::object(HashMap::from([(
-                            "name".into(),
-                            Value::string("TypeError"),
-                        )])))
+                        crate::throw_value(crate::error_instance(
+                            "TypeError",
+                            vec![Value::string("Cannot convert value to a BigInt")],
+                        ))
                     })
                     .to_le_bytes()
                     .to_vec();
@@ -214,10 +214,10 @@ impl Kind {
             Self::BigUint64 => {
                 return crate::bigint::to_u64(value)
                     .unwrap_or_else(|| {
-                        crate::throw_value(Value::object(HashMap::from([(
-                            "name".into(),
-                            Value::string("TypeError"),
-                        )])))
+                        crate::throw_value(crate::error_instance(
+                            "TypeError",
+                            vec![Value::string("Cannot convert value to a BigInt")],
+                        ))
                     })
                     .to_le_bytes()
                     .to_vec();
@@ -804,6 +804,15 @@ pub fn shared_array_buffer_class() -> Value {
         *slot.borrow_mut() = Some(class.clone());
         class
     })
+}
+
+/// Whether `value` is the storage of a live typed-array view. Cheap when no
+/// typed array exists in the realm.
+pub(crate) fn is_typed_array_view(value: &Value) -> bool {
+    if VIEWS.with(|views| views.borrow().is_empty()) {
+        return false;
+    }
+    view_for(value).is_some()
 }
 
 fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, Value)> {

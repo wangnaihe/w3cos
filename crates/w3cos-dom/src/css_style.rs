@@ -867,11 +867,83 @@ impl CSSStyleDeclaration {
 
             // Animation shorthand and the longhand used by browser pages.
             "animation" => self.inner.animation = parse_animation(value),
+            // Longhands (CSS Animations 1 §4). A longhand without a prior
+            // shorthand creates the animation with initial values; with a
+            // name of `none` it stays inert.
             "animation-delay" | "animationDelay" => {
-                if let Some(animation) = self.inner.animation.as_mut()
-                    && let Some(delay_ms) = parse_time_ms(value)
-                {
-                    animation.delay_ms = delay_ms;
+                if let Some(delay_ms) = parse_signed_time_ms(value) {
+                    animation_longhand(&mut self.inner.animation).delay_ms = delay_ms;
+                }
+            }
+            "animation-name" | "animationName" => {
+                let name = value.trim();
+                if !name.is_empty() {
+                    animation_longhand(&mut self.inner.animation).name = name.to_string();
+                }
+            }
+            "animation-duration" | "animationDuration" => {
+                if let Some(duration_ms) = parse_time_ms(value) {
+                    animation_longhand(&mut self.inner.animation).duration_ms = duration_ms;
+                }
+            }
+            "animation-timing-function" | "animationTimingFunction" => {
+                if let Some(easing) = parse_easing(value.trim()) {
+                    animation_longhand(&mut self.inner.animation).easing = easing;
+                }
+            }
+            "animation-play-state" | "animationPlayState" => {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "paused" => animation_longhand(&mut self.inner.animation).paused = true,
+                    "running" => animation_longhand(&mut self.inner.animation).paused = false,
+                    _ => {}
+                }
+            }
+            "animation-fill-mode" | "animationFillMode" => {
+                use w3cos_std::style::AnimationFillMode;
+                let fill = match value.trim().to_ascii_lowercase().as_str() {
+                    "none" => Some(AnimationFillMode::None),
+                    "forwards" => Some(AnimationFillMode::Forwards),
+                    "backwards" => Some(AnimationFillMode::Backwards),
+                    "both" => Some(AnimationFillMode::Both),
+                    _ => None,
+                };
+                if let Some(fill) = fill {
+                    animation_longhand(&mut self.inner.animation).fill_mode = fill;
+                }
+            }
+            "animation-direction" | "animationDirection" => {
+                use w3cos_std::style::AnimationDirection;
+                let direction = match value.trim().to_ascii_lowercase().as_str() {
+                    "normal" => Some(AnimationDirection::Normal),
+                    "reverse" => Some(AnimationDirection::Reverse),
+                    "alternate" => Some(AnimationDirection::Alternate),
+                    "alternate-reverse" => Some(AnimationDirection::AlternateReverse),
+                    _ => None,
+                };
+                if let Some(direction) = direction {
+                    animation_longhand(&mut self.inner.animation).direction = direction;
+                }
+            }
+            "animation-iteration-count" | "animationIterationCount" => {
+                use w3cos_std::style::AnimationIterationCount;
+                let value = value.trim();
+                let count = if value.eq_ignore_ascii_case("infinite") {
+                    Some(AnimationIterationCount::Infinite)
+                } else {
+                    value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|count| *count >= 0.0)
+                        .map(|count| {
+                            if count == 1.0 {
+                                AnimationIterationCount::Once
+                            } else {
+                                AnimationIterationCount::Count(count as u32)
+                            }
+                        })
+                };
+                if let Some(count) = count {
+                    animation_longhand(&mut self.inner.animation).iteration_count = count;
                 }
             }
 
@@ -4293,8 +4365,9 @@ fn parse_animation(value: &str) -> Option<w3cos_std::style::Animation> {
     if parts.is_empty() || value.trim().eq_ignore_ascii_case("none") {
         return None;
     }
-    let mut times = parts.iter().filter_map(|part| parse_time_ms(part));
-    let duration_ms = times.next().unwrap_or(0);
+    // The first <time> is the duration, the second the (signed) delay.
+    let mut times = parts.iter().filter_map(|part| parse_signed_time_ms(part));
+    let duration_ms = times.next().unwrap_or(0).max(0) as u32;
     let delay_ms = times.next().unwrap_or(0);
     let easing = parts
         .iter()
@@ -4358,7 +4431,39 @@ fn parse_animation(value: &str) -> Option<w3cos_std::style::Animation> {
         iteration_count,
         direction,
         fill_mode,
+        paused: parts.iter().any(|part| part.eq_ignore_ascii_case("paused")),
     })
+}
+
+fn animation_longhand(
+    slot: &mut Option<w3cos_std::style::Animation>,
+) -> &mut w3cos_std::style::Animation {
+    use w3cos_std::style::{
+        Animation, AnimationDirection, AnimationFillMode, AnimationIterationCount, Easing,
+    };
+    slot.get_or_insert_with(|| Animation {
+        name: "none".to_string(),
+        duration_ms: 0,
+        easing: Easing::Ease,
+        delay_ms: 0,
+        iteration_count: AnimationIterationCount::Once,
+        direction: AnimationDirection::Normal,
+        fill_mode: AnimationFillMode::None,
+        paused: false,
+    })
+}
+
+fn parse_signed_time_ms(value: &str) -> Option<i32> {
+    let value = value.trim();
+    let ms = if let Some(ms) = value.strip_suffix("ms") {
+        ms.parse::<f64>().ok()?
+    } else if let Some(seconds) = value.strip_suffix('s') {
+        seconds.parse::<f64>().ok()? * 1000.0
+    } else {
+        return None;
+    };
+    ms.is_finite()
+        .then(|| ms.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32)
 }
 
 fn parse_time_ms(value: &str) -> Option<u32> {
@@ -4375,7 +4480,7 @@ fn parse_time_ms(value: &str) -> Option<u32> {
     }
 }
 
-fn parse_easing(value: &str) -> Option<w3cos_std::style::Easing> {
+pub(crate) fn parse_easing(value: &str) -> Option<w3cos_std::style::Easing> {
     use w3cos_std::style::{Easing, StepPosition};
     match value.trim() {
         "linear" => Some(Easing::Linear),

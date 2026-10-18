@@ -195,9 +195,9 @@ impl JsObject {
         if !self.has_getter_properties {
             return None;
         }
-        self.properties
-            .get(format!("__w3cos_getter_{key}").as_str())
-            .cloned()
+        let mut buf = [0u8; 96];
+        let getter_key = crate::value::accessor_key(&mut buf, "__w3cos_getter_", key);
+        self.properties.get(&getter_key).cloned()
     }
 
     /// Own data only, without invoking accessors, traps, or prototype lookup.
@@ -249,6 +249,26 @@ impl JsObject {
         }
         self.properties.insert(JsString::intern(key), value);
         self.refresh_heap_accounting();
+    }
+
+    /// True when `f` holds for any own string key, in insertion order,
+    /// without allocating the key list.
+    pub fn any_own_key(&self, mut f: impl FnMut(&str) -> bool) -> bool {
+        self.properties.any_key(|key| f(key.as_str()))
+    }
+
+    /// V8 boilerplate copy (object-literal AllocationSite): give an empty
+    /// ordinary object the exact own properties, in the same insertion
+    /// order, of a template object. Returns false (and changes nothing)
+    /// when `self` already has own properties or is a proxy.
+    pub fn copy_properties_from(&mut self, template: &JsObject) -> bool {
+        if !self.properties.is_empty() || self.proxy_handler.is_some() {
+            return false;
+        }
+        self.properties = template.properties.clone();
+        self.has_getter_properties |= template.has_getter_properties;
+        self.refresh_heap_accounting();
+        true
     }
 
     pub fn may_have_getter_properties(&self) -> bool {
