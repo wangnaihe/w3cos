@@ -147,8 +147,8 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
     None
 }
 
-/// S2a measures with the primary font only; other scripts (font fallback,
-/// bidi, CJK/Thai breaking) stay on the legacy path for now.
+/// Text whose break opportunities S2 finds itself: Latin-1 (spaces).  Other
+/// scripts are laid out only where no line break decision depends on them.
 fn latin1(content: &str) -> bool {
     content.chars().all(|c| {
         // Control characters (form feed, C1) have their own rendering
@@ -156,6 +156,41 @@ fn latin1(content: &str) -> bool {
         let control = c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c);
         // (Newlines are gated by the content checks.)
         ((c as u32) < 0x100 && !control) || matches!(c, '\n' | '\u{2028}' | '\u{2029}')
+    })
+}
+
+/// Characters S2 lays out.  Shaping and font fallback are the engine's
+/// (Skia measures the run with fallback fonts, as paint draws it), and a
+/// paragraph leaf is wrapped by paint itself; but strong right-to-left
+/// characters and bidi controls need bidi reordering (UAX #9), other space
+/// separators have their own collapsing and hanging rules (CSS Text 3 4.1),
+/// and control characters their own rendering: those stay on legacy.
+fn supported_script(content: &str) -> bool {
+    content.chars().all(|c| {
+        let u = c as u32;
+        if matches!(c, '\n' | '\u{2028}' | '\u{2029}') {
+            return true;
+        }
+        if c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c) {
+            return false;
+        }
+        if u < 0x100 {
+            return true;
+        }
+        let rtl = (0x0590..=0x08FF).contains(&u)
+            || (0xFB1D..=0xFDFF).contains(&u)
+            || (0xFE70..=0xFEFF).contains(&u)
+            || (0x10800..=0x10FFF).contains(&u)
+            || (0x1E800..=0x1EFFF).contains(&u);
+        let bidi_control = matches!(u, 0x061C | 0x200E | 0x200F)
+            || (0x202A..=0x202E).contains(&u)
+            || (0x2066..=0x2069).contains(&u);
+        let other_space = matches!(u, 0x1680 | 0x180E | 0x205F | 0x3000)
+            || (0x2000..=0x200D).contains(&u)
+            || u == 0x202F
+            || (0x2060..=0x2064).contains(&u);
+        let special = (0xD800..=0xDFFF).contains(&u) || (0xFFF0..=0xFFFF).contains(&u);
+        !(rtl || bidi_control || other_space || special)
     })
 }
 
@@ -182,7 +217,7 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     if content.is_empty() || content.contains(['\n', '\r', '\t']) {
         return Some("text:content");
     }
-    if !latin1(content) {
+    if !supported_script(content) {
         return Some("text:script");
     }
     text_style_reason(style)
@@ -273,7 +308,7 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
     {
         return Some("text:content");
     }
-    if !latin1(content) {
+    if !supported_script(content) {
         return Some("text:script");
     }
     if has_marker(style, LINE_WIDTH_MARKER) {
@@ -603,6 +638,10 @@ struct InlineItem {
     /// A soft-wrap opportunity inside the item's non-space core: NG keeps
     /// one fragment per item, so a line that needs it falls back.
     internal_break: bool,
+    /// Outside Latin-1: opportunities between such items (ideographs,
+    /// dictionary breaks) are not modelled, so a line needing a break
+    /// next to one falls back.
+    non_latin: bool,
     ascent: f32,
     descent: f32,
     content_ascent: f32,
@@ -1031,6 +1070,7 @@ pub(super) fn layout_inline(
                     || (hang_preserved
                         && content.starts_with(' ')
                         && !content.trim_start_matches(' ').is_empty()),
+                non_latin: !latin1(content),
                 ascent: baseline,
                 descent: height - baseline,
                 content_ascent: inline_font_content_ascent(style),
@@ -1068,6 +1108,11 @@ pub(super) fn layout_inline(
         current.pop();
         if !fits && can_wrap && item.internal_break {
             // NGLineBreaker would break inside this item.
+            return None;
+        }
+        if !fits && can_wrap && (item.non_latin || current.iter().any(|&k| items[k].non_latin)) {
+            // The break position may depend on UAX #14 classes S2 does not
+            // model (ideographic or dictionary opportunities).
             return None;
         }
         if fits || current.is_empty() || !can_wrap {
