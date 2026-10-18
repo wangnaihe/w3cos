@@ -1920,6 +1920,14 @@ impl Document {
         let mut out: Option<(f32, f32)> = None;
         let mut child = self.get_node(id).first_child;
         while let Some(cid) = child {
+            if self.is_viewport_fixed(cid) {
+                // Still resolve (and cache) the subtree: the dirty-mark walk
+                // stops at an already-dirty node, so an unstored subtree
+                // would never propagate later rect writes to its ancestors.
+                let _ = self.subtree_extent(cid, &mut cache);
+                child = crate::node::sib(self.get_node(cid).next_sibling);
+                continue;
+            }
             let (right, bottom) = self.subtree_extent(cid, &mut cache);
             out = Some(match out {
                 Some((r, b)) => (r.max(right), b.max(bottom)),
@@ -1940,6 +1948,34 @@ impl Document {
         out
     }
 
+    /// css-overflow-3 scrollable overflow: a `position: fixed` box whose
+    /// containing block is the viewport (no transformed/filtered ancestor,
+    /// css-transforms-1 "fixed containing block") is not part of any
+    /// element's scrollable overflow. Blink: LayoutBox::AddLayoutOverflow
+    /// skips such children (they belong to the LayoutView's fixed layer).
+    fn is_viewport_fixed(&self, id: NodeId) -> bool {
+        let fixed = match self.cached_style(id) {
+            Some(style) => style.position == w3cos_std::style::Position::Fixed,
+            None => return false,
+        };
+        if !fixed {
+            return false;
+        }
+        let mut current = self.get_node(id).parent;
+        while let Some(ancestor) = current {
+            if let Some(style) = self.cached_style(ancestor)
+                && (!style.transform.is_identity()
+                    || style.filter.is_some()
+                    || style.will_change.transform
+                    || style.will_change.filter)
+            {
+                return false;
+            }
+            current = self.get_node(ancestor).parent;
+        }
+        true
+    }
+
     fn subtree_extent(&self, id: NodeId, cache: &mut ExtentCache) -> (f32, f32) {
         let idx = id.0 as usize;
         if let Some(hit) = cache.clean(idx) {
@@ -1950,6 +1986,14 @@ impl Document {
         let mut bottom = rect.y + rect.height;
         let mut child = self.get_node(id).first_child;
         while let Some(cid) = child {
+            if self.is_viewport_fixed(cid) {
+                // Still resolve (and cache) the subtree: the dirty-mark walk
+                // stops at an already-dirty node, so an unstored subtree
+                // would never propagate later rect writes to its ancestors.
+                let _ = self.subtree_extent(cid, cache);
+                child = crate::node::sib(self.get_node(cid).next_sibling);
+                continue;
+            }
             let (r, b) = self.subtree_extent(cid, cache);
             right = right.max(r);
             bottom = bottom.max(b);
@@ -29499,5 +29543,38 @@ mod extent_cache_tests {
         rows[1].remove_child(&mut document, &inner);
         assert_eq!(scroller.scroll_height(&document), 210.0);
         assert_eq!(scroller.scroll_width(&document), 100.0);
+    }
+
+    fn fixed_child_scroll_width(transformed_body: bool) -> (f32, f32) {
+        let mut document = Document::new();
+        let body = document.body();
+        let root = document.get_node(body.id).parent.unwrap_or(body.id);
+        let fixed = document.create_element("div");
+        body.append_child(&mut document, fixed);
+        document
+            .get_style_mut(fixed.id)
+            .set_property("position", "fixed");
+        if transformed_body {
+            document
+                .get_style_mut(body.id)
+                .set_property("transform", "translateX(1px)");
+        }
+        document.set_layout_rect(root, DOMRect::new(0.0, 0.0, 784.0, 600.0));
+        document.set_layout_rect(body.id, DOMRect::new(8.0, 8.0, 768.0, 0.0));
+        document.set_layout_rect(fixed.id, DOMRect::new(0.0, 0.0, 1568.0, 1200.0));
+        let mut inherited = None;
+        for id in [root, body.id, fixed.id] {
+            inherited = Some(document.computed_style_shared(id, inherited.as_ref()));
+        }
+        let html = Element::new(root);
+        (html.scroll_width(&document), html.scroll_height(&document))
+    }
+
+    #[test]
+    fn viewport_fixed_descendants_are_not_scrollable_overflow() {
+        assert_eq!(fixed_child_scroll_width(false), (784.0, 600.0));
+        // A transformed ancestor is the fixed box's containing block, so the
+        // box is ordinary overflow of that ancestor's scrollers.
+        assert_eq!(fixed_child_scroll_width(true), (1568.0, 1200.0));
     }
 }
