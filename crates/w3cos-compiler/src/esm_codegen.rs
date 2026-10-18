@@ -5066,6 +5066,146 @@ fn main() {
     }
 
     #[test]
+    fn generated_typed_versions_match_generic_semantics_and_fall_back() {
+        let root = fixture_root("w3cos_esm_codegen_typed_versions");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/app.ts"),
+            r#"export function neg(x: number): number { const y = x; return -y; }
+export function add(a: number, b: number): any { const s = a + b; return s; }
+export function bits(a: number, b: number): number { const r = (a | 0) + (b | 0); return r; }
+export function div(a: number, b: number): number { const q = a / b; return q; }
+export function rem(a: number, b: number): number { const m = a % b; return m; }
+export function count(n: number): number { let c = 0; for (let i = 0; i < n; i++) c++; return c; }
+export function twice(x: number): number { x = x * 2; return x + 0; }
+export function reassignStr(x: number): any { if (x > 1) { x = "big" as any; } return x; }
+export function dflt(x = 5): number { const d = x * 2; return d; }
+export function lt(a: number, b: number): boolean { const r = a < b; return r; }
+export function seq(a: number, b: number): boolean { const r = a === b; return r; }
+export function poly(a: number, b: number, c: number): number {
+  let acc = 0;
+  for (let i = 0; i < 10; i++) acc = acc * a + b - c / (i + 1);
+  return acc;
+}
+"#,
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("src/app.ts"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
+        let code = generate_with_bodies(&bundle);
+        assert!(
+            code.contains("record_typed_entry") && code.contains("FrameTyped"),
+            "typed functions should get a typed version:\n{code}"
+        );
+        // A later non-numeric store into the *local* (`x = "big"`) is fine:
+        // only the hidden parameter slot is speculated, and the local copy
+        // stays boxed when any store into it is not a number.
+        let crate_dir = root.join("bundle_run");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        let core_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/w3cos-core");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"bundle_run\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\n\n[workspace]\n"
+            ),
+        )
+        .unwrap();
+        let main_rs = format!(
+            "#![allow(dead_code, unused_imports, unused_variables, unused_mut, non_upper_case_globals, unreachable_code, clippy::all)]\n{code}\n{}",
+            r#"
+fn main() {
+    use w3cos_core::Value;
+    let _ = run_entry();
+    let n = |v: f64| Value::Number(v);
+    let s = |v: &str| Value::string(v);
+    let num = |v: Value| v.to_number();
+    let neg_zero = |v: f64| v == 0.0 && v.is_sign_negative();
+    w3cos_core::typed::reset_stats();
+
+    // -0 survives the typed version.
+    assert!(neg_zero(num(m0::m0_neg(vec![n(0.0)]))));
+    assert!(!neg_zero(num(m0::m0_neg(vec![n(-0.0)]))));
+    assert!(num(m0::m0_neg(vec![n(f64::NAN)])).is_nan());
+    // Guard failure: string argument -> generic version (ToNumber).
+    assert_eq!(num(m0::m0_neg(vec![s("4")])), -4.0);
+
+    assert_eq!(num(m0::m0_add(vec![n(1.0), n(2.0)])), 3.0);
+    assert_eq!(num(m0::m0_add(vec![n(9007199254740992.0), n(1.0)])), 9007199254740992.0);
+    assert!(num(m0::m0_add(vec![n(f64::NAN), n(1.0)])).is_nan());
+    // `+` with a string concatenates (generic version).
+    assert_eq!(m0::m0_add(vec![s("1"), n(2.0)]).to_js_string(), "12");
+    assert_eq!(m0::m0_add(vec![n(1.0), n(2.0), n(3.0)]).to_number(), 3.0);
+
+    // ToInt32 wraps, the sum of two int32s does not.
+    assert_eq!(num(m0::m0_bits(vec![n(2147483647.0), n(1.0)])), 2147483648.0);
+    assert_eq!(num(m0::m0_bits(vec![n(4294967301.0), n(0.0)])), 5.0);
+    assert_eq!(num(m0::m0_bits(vec![n(-2147483649.0), n(0.0)])), 2147483647.0);
+
+    assert_eq!(num(m0::m0_div(vec![n(1.0), n(0.0)])), f64::INFINITY);
+    assert_eq!(num(m0::m0_div(vec![n(1.0), n(-0.0)])), f64::NEG_INFINITY);
+    assert!(num(m0::m0_div(vec![n(0.0), n(0.0)])).is_nan());
+    assert!(neg_zero(num(m0::m0_rem(vec![n(-1.0), n(1.0)]))));
+    assert_eq!(num(m0::m0_rem(vec![n(5.5), n(2.0)])), 1.5);
+    assert!(num(m0::m0_rem(vec![n(1.0), n(0.0)])).is_nan());
+
+    assert_eq!(num(m0::m0_count(vec![n(5.0)])), 5.0);
+    assert_eq!(num(m0::m0_count(vec![n(2.5)])), 3.0);
+    assert_eq!(num(m0::m0_count(vec![n(f64::NAN)])), 0.0);
+    assert_eq!(num(m0::m0_count(vec![s("3")])), 3.0);
+    assert_eq!(num(m0::m0_count(vec![])), 0.0);
+    assert_eq!(num(m0::m0_count(vec![Value::Undefined])), 0.0);
+
+    assert_eq!(num(m0::m0_twice(vec![n(21.0)])), 42.0);
+    assert_eq!(num(m0::m0_twice(vec![n(1e308)])), f64::INFINITY);
+    assert_eq!(num(m0::m0_twice(vec![Value::Bool(true)])), 2.0);
+
+    assert_eq!(m0::m0_reassignStr(vec![n(2.0)]).to_js_string(), "big");
+    assert_eq!(num(m0::m0_reassignStr(vec![n(1.0)])), 1.0);
+
+    assert_eq!(num(m0::m0_dflt(vec![])), 10.0);
+    assert_eq!(num(m0::m0_dflt(vec![n(3.0)])), 6.0);
+    assert_eq!(num(m0::m0_dflt(vec![Value::Undefined])), 10.0);
+
+    assert_eq!(m0::m0_lt(vec![n(f64::NAN), n(1.0)]).to_bool(), false);
+    assert_eq!(m0::m0_lt(vec![n(-0.0), n(0.0)]).to_bool(), false);
+    assert_eq!(m0::m0_lt(vec![s("10"), s("9")]).to_bool(), true);
+    assert_eq!(m0::m0_seq(vec![n(0.0), n(-0.0)]).to_bool(), true);
+    assert_eq!(m0::m0_seq(vec![n(f64::NAN), n(f64::NAN)]).to_bool(), false);
+    assert_eq!(m0::m0_seq(vec![s("1"), n(1.0)]).to_bool(), false);
+
+    let typed = num(m0::m0_poly(vec![n(1.5), n(2.0), n(3.0)]));
+    let generic = num(m0::m0_poly(vec![s("1.5"), n(2.0), n(3.0)]));
+    assert_eq!(typed.to_bits(), generic.to_bits(), "typed {typed} vs generic {generic}");
+
+    let stats = w3cos_core::typed::stats();
+    println!("TYPED_STATS typed={} guard_failures={}", stats.typed, stats.guard_failures);
+    assert!(stats.typed >= 20, "{stats:?}");
+    assert!(stats.guard_failures >= 8, "{stats:?}");
+    println!("W3COS_TYPED_VERSIONS_E2E_OK");
+}
+"#
+        );
+        std::fs::write(crate_dir.join("src/main.rs"), main_rs).unwrap();
+        let output = std::process::Command::new("cargo")
+            .arg("run")
+            .arg("--offline")
+            .current_dir(&crate_dir)
+            .output()
+            .expect("cargo should be available");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}");
+        assert!(
+            output.status.success() && stdout.contains("W3COS_TYPED_VERSIONS_E2E_OK"),
+            "typed versions bundle should build and run.\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn generated_bundle_frees_escaping_values_at_their_last_release() {
         let root = fixture_root("w3cos_esm_codegen_arena_rc");
         std::fs::create_dir_all(root.join("src")).unwrap();

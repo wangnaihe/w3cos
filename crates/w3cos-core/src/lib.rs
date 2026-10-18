@@ -17,6 +17,7 @@ mod object;
 pub mod page_arena;
 pub mod promise;
 mod property_map;
+pub mod typed;
 /// Hidden-class (shape) diagnostics.
 pub mod shapes {
     pub use crate::property_map::{
