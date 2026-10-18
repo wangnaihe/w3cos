@@ -2552,6 +2552,18 @@ impl Value {
         Value::Imm(Immediate::from_function_handle(handle))
     }
 
+    /// A host callable with its own `name` / `length` (CreateBuiltinFunction).
+    pub fn function_named(
+        name: &'static str,
+        length: u32,
+        f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+    ) -> Self {
+        let data = FunctionData::new(f);
+        data.set_name_and_length(name, length);
+        let handle = crate::page_arena::alloc_function(data);
+        Value::Imm(Immediate::from_function_handle(handle))
+    }
+
     /// Create a host callable whose implementation borrows its arguments.
     pub fn function_slice(f: impl Fn(Value, &[Value]) -> Value + 'static) -> Self {
         let handle =

@@ -27,7 +27,8 @@ pub use aot_slots::SparseSlots;
 pub use builtins::{
     Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, Set, array_value,
     console, dispatch_resize_observers, dispatch_resize_observers_bounded, document, error_class,
-    error_instance, json_value, math_value, object_value, parseFloat, parseInt, reset_constructors,
+    error_instance, json_value, math_value, object_value, parse_float_value, parse_int_value,
+    parseFloat, parseInt, reset_constructors,
 };
 pub use fxhash::{FxBuildHasher, FxHashMap};
 pub use js_string::JsString;

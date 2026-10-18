@@ -7840,6 +7840,8 @@ fn number_compat_class() -> Value {
     let class =
         Value::function(|_, args| Value::Number(args.first().map(Value::to_number).unwrap_or(0.0)));
     class.set_property("name", Value::string("Number"));
+    class.set_property("parseInt", w3cos_core::parse_int_value());
+    class.set_property("parseFloat", w3cos_core::parse_float_value());
     class.set_property(
         "isFinite",
         Value::function(|_, args| {
@@ -20095,6 +20097,10 @@ fn build_window_value() -> Value {
             )
         }),
     );
+    // parseInt/parseFloat are single realm functions shared with the Number
+    // constructor (ECMA-262: Number.parseFloat is the same object as parseFloat).
+    props.insert("parseInt".to_string(), w3cos_core::parse_int_value());
+    props.insert("parseFloat".to_string(), w3cos_core::parse_float_value());
     props.insert("Promise".to_string(), promise_constructor_value());
     props.insert("BarProp".to_string(), bar_prop_class());
     for name in [
@@ -24161,6 +24167,24 @@ mod tests {
         assert_eq!(
             is_nan.call(Value::Undefined, vec![Value::string("not a number")]),
             Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn global_parse_float_and_parse_int_are_shared_with_number() {
+        setup();
+        let window = window_value();
+        let parse_float = window.get_property("parseFloat");
+        let parse_int = window.get_property("parseInt");
+        assert!(parse_float.strict_eq(&window.get_property("Number").get_property("parseFloat")));
+        assert!(parse_int.strict_eq(&window.get_property("Number").get_property("parseInt")));
+        assert_eq!(
+            parse_float.call(Value::Undefined, vec![Value::string(" 0.5px")]),
+            Value::Number(0.5)
+        );
+        assert_eq!(
+            parse_int.call(Value::Undefined, vec![Value::string("0x10")]),
+            Value::Number(16.0)
         );
     }
 
