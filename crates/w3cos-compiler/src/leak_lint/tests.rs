@@ -99,8 +99,11 @@ fn object_keyed_maps_become_weakmaps_only_without_iteration() {
             (4, "object-keyed-map", W, Some("weakmap")),
             (5, "object-keyed-map", W, None), // iterated, never evicted
             (25, "object-keyed-map", W, Some("weakmap")),
+            (30, "object-keyed-map", W, None), // exported: other modules may iterate it
+            (32, "object-keyed-map", W, None), // public field
         ]
     );
+    assert!(fixed.contains("export const shared = new Map<IEditor, number>();"));
     assert!(fixed.contains("private readonly cache = new WeakMap<IEditor, string>();"));
     assert!(fixed.contains("private readonly all: Map<IEditor, number> = new Map();"));
     assert!(fixed.contains("private readonly byId = new Map<string, IEditor>();"));

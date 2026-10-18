@@ -26,3 +26,12 @@ export class Counter {
 	parent: number = 0;
 	bump(): void { this.parent = 1; }
 }
+
+export class Overlay {
+	private container: HTMLElement | undefined;
+	private parentBounds: IBounds;
+	show(container: HTMLElement, bounds: IBounds): void {
+		this.container = container;
+		this.parentBounds = bounds;
+	}
+}

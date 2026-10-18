@@ -26,3 +26,9 @@ const views = new Map<HTMLElement, number>();
 export function viewIndex(el: HTMLElement): number | undefined {
 	return views.get(el);
 }
+
+export const shared = new Map<IEditor, number>();
+export class Public {
+	readonly byEditor = new Map<IEditor, string>();
+	find(e: IEditor): string | undefined { return this.byEditor.get(e); }
+}

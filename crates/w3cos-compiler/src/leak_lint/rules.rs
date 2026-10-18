@@ -162,9 +162,71 @@ fn is_back_name(name: &str) -> bool {
     }
     BACK_NAMES.contains(&bare)
         || ["parent", "owner"].iter().any(|p| {
-            bare.strip_prefix(p)
-                .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
+            bare.strip_prefix(p).is_some_and(|rest| {
+                rest.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && OWNER_SUFFIXES.iter().any(|s| rest.ends_with(s))
+            })
         })
+}
+
+/// `parentEditor`, `_parentContextKeyService`, ... (not `parentBounds`, `parentData`).
+const OWNER_SUFFIXES: &[&str] = &[
+    "Editor",
+    "Widget",
+    "View",
+    "Session",
+    "Thread",
+    "Node",
+    "Service",
+    "Item",
+    "Model",
+    "Group",
+    "Part",
+    "Pane",
+    "Controller",
+    "Instance",
+    "Tree",
+    "Scope",
+    "Context",
+    "Window",
+    "Host",
+];
+
+/// Back pointers to DOM nodes or plain values do not close an ownership
+/// cycle the lint can reason about (the DOM tree is owned by the runtime).
+fn is_non_owner_type(t: &TsType, local_types: &HashSet<String>) -> bool {
+    match t {
+        TsType::TsUnionOrIntersectionType(TsUnionOrIntersectionType::TsUnionType(u)) => {
+            let rest: Vec<_> = u
+                .types
+                .iter()
+                .filter(|t| {
+                    !matches!(&***t, TsType::TsKeywordType(k) if matches!(k.kind, TsKeywordTypeKind::TsUndefinedKeyword | TsKeywordTypeKind::TsNullKeyword))
+                })
+                .collect();
+            !rest.is_empty() && rest.iter().all(|t| is_non_owner_type(t, local_types))
+        }
+        TsType::TsTypeRef(r) => match &r.type_name {
+            TsEntityName::Ident(i) => {
+                let name = i.sym.as_ref();
+                matches!(
+                    name,
+                    "Node"
+                        | "Element"
+                        | "Document"
+                        | "Window"
+                        | "URI"
+                        | "Event"
+                        | "ShadowRoot"
+                        | "DocumentFragment"
+                ) || name.starts_with("HTML")
+                    || name.starts_with("SVG")
+                    || name.ends_with("Element")
+            }
+            _ => false,
+        },
+        t => key_kind(t, local_types) == KeyKind::Primitive,
+    }
 }
 
 fn is_disposable_ctor(name: &str) -> bool {
@@ -308,6 +370,8 @@ struct Facts {
     registered: HashSet<String>,
     /// Setters that store into a `WeakRef` (e.g. produced by `--fix weak-back-pointer`).
     weak_setters: HashSet<String>,
+    /// Names re-exported via `export { a }`.
+    exported: HashSet<String>,
 }
 
 struct IdentFinder(&'static str, bool);
@@ -337,6 +401,12 @@ impl Visit for Facts {
             }
         }
         n.visit_children_with(self);
+    }
+
+    fn visit_export_named_specifier(&mut self, n: &ExportNamedSpecifier) {
+        if let ModuleExportName::Ident(i) = &n.orig {
+            self.exported.insert(i.sym.to_string());
+        }
     }
 
     fn visit_ts_interface_decl(&mut self, n: &TsInterfaceDecl) {
@@ -470,6 +540,7 @@ struct ClassInfo {
     writes: HashSet<String>,
     member_names: HashSet<String>,
     field_names: HashSet<String>,
+    private_fields: HashSet<String>,
     /// Map-typed field annotation: name -> span of `Map` in the annotation
     map_fields: HashMap<String, (Span, KeyKind)>,
     reported_back_writes: HashSet<String>,
@@ -494,6 +565,8 @@ struct Linter<'a> {
     classes: Vec<ClassInfo>,
     /// Is `this` the instance of `classes.last()`?
     instance: Vec<bool>,
+    /// Inside `export const ...`
+    exporting: bool,
     findings: Vec<Finding>,
     edits: Vec<Edit>,
 }
@@ -569,6 +642,7 @@ impl Linter<'_> {
         let mut declares_dispose = false;
         let mut member_names = HashSet::new();
         let mut field_names = HashSet::new();
+        let mut private_fields = HashSet::new();
         let mut map_fields = HashMap::new();
         let mut has_register = false;
         for member in &class.body {
@@ -600,6 +674,9 @@ impl Linter<'_> {
                                 (span, key_kind(key, &self.facts.local_types)),
                             );
                         }
+                        if p.accessibility == Some(Accessibility::Private) {
+                            private_fields.insert(name.clone());
+                        }
                         member_names.insert(name.clone());
                         field_names.insert(name);
                     }
@@ -628,12 +705,14 @@ impl Linter<'_> {
             writes: scan.writes,
             member_names,
             field_names,
+            private_fields,
             map_fields,
             reported_back_writes: HashSet::new(),
         }
     }
 
     // ── rule: object-keyed Map ──
+    #[allow(clippy::too_many_arguments)]
     fn check_map(
         &mut self,
         span: Span,
@@ -642,6 +721,7 @@ impl Linter<'_> {
         ctor_span: Span,
         key: KeyKind,
         annotation: Option<Span>,
+        private: bool,
     ) {
         if key != KeyKind::Object {
             return;
@@ -653,7 +733,16 @@ impl Linter<'_> {
             && methods
                 .iter()
                 .all(|m| matches!(m.as_str(), "get" | "set" | "has" | "delete"));
-        if cache_only {
+        if cache_only && !private {
+            self.report(
+                span,
+                "object-keyed-map",
+                Severity::Warning,
+                format!("`{label}` is a Map keyed by objects and only used via get/set/has/delete in this file: every key (and value) stays alive until removed"),
+                "use a WeakMap if no other module iterates it (not auto-fixed: the map is visible outside this file)",
+                None,
+            );
+        } else if cache_only {
             let (start, end) = self.range(ctor_span);
             self.edits.push(Edit {
                 start,
@@ -755,7 +844,7 @@ impl Linter<'_> {
         });
         if p.type_ann
             .as_ref()
-            .is_some_and(|t| key_kind(&t.type_ann, &self.facts.local_types) == KeyKind::Primitive)
+            .is_some_and(|t| is_non_owner_type(&t.type_ann, &self.facts.local_types))
         {
             return;
         }
@@ -823,7 +912,7 @@ impl Linter<'_> {
                             && let TsParamPropParam::Ident(i) = &p.param
                             && is_back_name(&i.id.sym)
                             && i.type_ann.as_ref().is_none_or(|t| {
-                                key_kind(&t.type_ann, &self.facts.local_types) != KeyKind::Primitive
+                                !is_non_owner_type(&t.type_ann, &self.facts.local_types)
                             })
                         {
                             self.report(
@@ -917,6 +1006,9 @@ impl Linter<'_> {
                 ctor,
                 kind,
                 annotation_span,
+                self.classes
+                    .last()
+                    .is_some_and(|c| c.private_fields.contains(name)),
             );
         }
     }
@@ -954,6 +1046,12 @@ impl Visit for Linter<'_> {
         self.classes.pop();
     }
 
+    fn visit_export_decl(&mut self, n: &ExportDecl) {
+        self.exporting = true;
+        n.visit_children_with(self);
+        self.exporting = false;
+    }
+
     fn visit_function(&mut self, n: &Function) {
         self.instance.push(false);
         n.visit_children_with(self);
@@ -973,7 +1071,16 @@ impl Visit for Linter<'_> {
                 .map(|k| key_kind(k, &self.facts.local_types))
                 .unwrap_or(KeyKind::Unknown);
             let name = binding.id.sym.to_string();
-            self.check_map(n.span, &name, &name, ctor, kind, annotation.map(|(s, _)| s));
+            let local = !self.exporting && !self.facts.exported.contains(&name);
+            self.check_map(
+                n.span,
+                &name,
+                &name,
+                ctor,
+                kind,
+                annotation.map(|(s, _)| s),
+                local,
+            );
         }
         n.visit_children_with(self);
     }
@@ -1142,6 +1249,7 @@ pub(super) fn lint(source: &str, file: &str) -> FileResult {
         facts,
         classes: Vec::new(),
         instance: Vec::new(),
+        exporting: false,
         findings: Vec::new(),
         edits: Vec::new(),
     };
