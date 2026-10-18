@@ -253,6 +253,19 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
      - **性能**：set 1403 → 15 ns；realistic_sample 3474 → 1571 ms；稳态 IC 命中率约 100%。详见 `docs/perf/shapes-ic.md`。
      - **未做**：freeze/seal/writable/configurable（之前就没有建模）、加属性转移 IC、方法调用 IC、两层及以上的原型链、动态键。
 11. W3IR typed 节点 + "推测类型 + 双版本"降级。
+   - **第 1 步（已完成，#132）**：
+     - `w3cos_ir::types`：每个 `Function` 带 `FunctionTypes`（参数和返回值的 TS 提示：number/boolean/string/对象字段表）。`FORMAT_VERSION` 升到 20。
+     - 降级时记录 TS 注解。interface、对象类型别名、基类字段声明都转成 `Object` 提示；字面量默认值也算提示。
+     - `infer` 做寄存器/绑定类型推断，格为 Bottom/Int32/Number/Bool/String/Object/Unknown。Int32 只来自位运算；`+ - * / %` 和取负因为溢出、-0、NaN 一律算 Number。
+     - `speculable_parameters` 限定可推测的参数：没被闭包捕获、函数里没有 `arguments`、同步且不是生成器。
+   - **第 2 步（已完成）**：
+     - **双版本**：同步函数中带 number 提示、可推测的参数，用"种子化"的 `EscapePlan` 生成 typed 版本，参数直接作为 `f64` 的 `num_bindings`。只有 typed 版本拆箱的算术/比较指令比通用版本多时才生成。
+     - **入口守卫**：所有推测参数都是 `Number` 才走 typed 版本，否则走通用版本（含全部强制转换语义）。只在入口检查，不需要函数中途 deopt。
+     - **统计与开关**：`w3cos_core::typed::stats()` 统计 typed 调用数和守卫失败数；`W3COS_AOT_NO_TYPED=1` 关闭双版本，用于 A/B。
+     - **顺带修复**：原有的数值位运算快路径用了饱和的 `as i32`，现改为 ECMAScript ToInt32（`f64_to_int32`）。
+     - **性能**：loop 538 → 12 ms，mandel 745 → 4.4 ms，calls 388 → 100 ms，fib 129 → 97 ms；nbody（对象字段）不变；realistic_sample 约 −4%（在噪声范围内），probe −8%。
+     - **覆盖**：scenarios.ts 46 个函数中 5 个生成了 typed 版本，守卫失败 0%。泄漏 CI 仍零残留。详见 `docs/perf/typed-w3ir.md`。
+     - **未做**：按 shape 直接取槽位偏移（目前由 #131 的 IC 覆盖）、属性读取/调用结果/返回值的推测（需要函数中途 deopt）、原生 i32 代码生成、AOT 函数之间的 f64 直接调用、async/生成器/bool/string 的特化。
 12. CommonJS 静态链接 + Node 解析算法（`exports` 条件含 `w3cos`/`node`）。
 13. Cranelift 后端 B（W3IR → 机器码），与 rustc 后端结果对拍（test262 子集）。
 14. test262 门禁（目标先 80%，VS Code 用到的特性优先），与 Porffor 等对照公开结果。

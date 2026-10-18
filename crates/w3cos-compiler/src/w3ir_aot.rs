@@ -374,8 +374,15 @@ fn is_eval_binding(id: u32) -> bool {
 }
 
 fn analyze_function(function: &Function) -> EscapePlan {
+    analyze_function_seeded(function, &HashSet::new())
+}
+
+/// `seeds`: parameter bindings the caller guarantees hold a `Number` at
+/// entry (the typed variant of a dual-version function). They become
+/// native `num_bindings` when every later store is numeric too.
+fn analyze_function_seeded(function: &Function, seeds: &HashSet<u32>) -> EscapePlan {
     let constants = NUMERIC_CONSTANTS.with(|constants| constants.borrow().clone());
-    let numeric_bindings = numeric_local_bindings(function, &constants);
+    let numeric_bindings = numeric_local_bindings(function, &constants, seeds);
     let len = function.registers as usize;
     let mut classes = vec![RegClass::Bottom; len];
     let mut changed = true;
@@ -477,7 +484,11 @@ fn captured_binding_ids(function: &Function) -> HashSet<u32> {
     captured
 }
 
-fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) -> HashSet<u32> {
+fn numeric_local_bindings(
+    function: &Function,
+    constants: &HashMap<u32, f64>,
+    seeds: &HashSet<u32>,
+) -> HashSet<u32> {
     let captured = captured_binding_ids(function);
     let mut reserved = HashSet::new();
     reserved.extend(function.parameters.iter().map(|binding| binding.0));
@@ -491,7 +502,7 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
     if let Some(binding) = function.this_binding {
         reserved.insert(binding.0);
     }
-    let eligible = function
+    let mut eligible = function
         .bindings
         .iter()
         .filter(|binding| {
@@ -503,6 +514,18 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
         })
         .map(|binding| binding.id.0)
         .collect::<HashSet<_>>();
+    eligible.extend(
+        seeds
+            .iter()
+            .copied()
+            .filter(|id| {
+                function
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.0 == *id)
+            })
+            .filter(|id| !captured.contains(id)),
+    );
     let mut numeric = eligible.clone();
     loop {
         let classes = register_classes(function, &numeric, constants);
@@ -512,10 +535,15 @@ fn numeric_local_bindings(function: &Function, constants: &HashMap<u32, f64>) ->
             .filter(|(_, class)| **class == RegClass::Number)
             .map(|(index, _)| index as u32)
             .collect::<HashSet<_>>();
-        let dominated = loads_after_numeric_store(function, &numeric, &number_regs);
+        let dominated = loads_after_numeric_store(function, &numeric, &number_regs, seeds);
         let mut next = HashSet::new();
         for id in &eligible {
-            if dominated.contains(id) && stores_are_numbers(function, *id, &number_regs) {
+            let stores_ok = if seeds.contains(id) {
+                stores_are_numbers_or_none(function, *id, &number_regs)
+            } else {
+                stores_are_numbers(function, *id, &number_regs)
+            };
+            if dominated.contains(id) && stores_ok {
                 next.insert(*id);
             }
         }
@@ -573,11 +601,41 @@ fn stores_are_numbers(function: &Function, binding: u32, number_regs: &HashSet<u
     saw_store
 }
 
+/// A seeded parameter holds a Number at entry; any later store must be one.
+fn stores_are_numbers_or_none(
+    function: &Function,
+    binding: u32,
+    number_regs: &HashSet<u32>,
+) -> bool {
+    function.blocks.iter().all(|block| {
+        block
+            .instructions
+            .iter()
+            .all(|instruction| match instruction {
+                Instruction::InitializeBinding { binding: id, value }
+                | Instruction::StoreBinding { binding: id, value }
+                    if id.0 == binding =>
+                {
+                    number_regs.contains(&value.0)
+                }
+                _ => true,
+            })
+    })
+}
+
 fn loads_after_numeric_store(
     function: &Function,
     candidates: &HashSet<u32>,
     number_regs: &HashSet<u32>,
+    seeds: &HashSet<u32>,
 ) -> HashSet<u32> {
+    let entry_state = || {
+        candidates
+            .iter()
+            .copied()
+            .filter(|id| seeds.contains(id))
+            .collect::<HashSet<u32>>()
+    };
     let mut succs: HashMap<w3cos_ir::BlockId, Vec<w3cos_ir::BlockId>> = HashMap::new();
     let mut preds: HashMap<w3cos_ir::BlockId, Vec<w3cos_ir::BlockId>> = HashMap::new();
     for block in &function.blocks {
@@ -607,7 +665,7 @@ fn loads_after_numeric_store(
         changed = false;
         for block in &function.blocks {
             let mut state = if block.id == function.entry {
-                HashSet::new()
+                entry_state()
             } else {
                 let mut incoming: Option<HashSet<u32>> = None;
                 let mut saw_pred = false;
@@ -660,7 +718,7 @@ fn loads_after_numeric_store(
             continue;
         }
         let mut state = if block.id == function.entry {
-            HashSet::new()
+            entry_state()
         } else {
             let mut incoming: Option<HashSet<u32>> = None;
             for pred in preds.get(&block.id).into_iter().flatten() {
@@ -2325,20 +2383,28 @@ pub fn generate_sync_function_from_module(
     )
 }
 
-fn generate_sync_function_with_factories(
+/// One emitted sync variant: the frame type + `impl` block, and the entry
+/// statements that build and run a frame (ending in the call's `Value`).
+struct SyncVariant {
+    items: String,
+    entry: String,
+}
+
+/// Parameters of a typed (speculated) variant: `(position, binding)` pairs
+/// whose argument the entry guard proved to be a `Number`.
+type SpeculatedParameters = Vec<(usize, u32)>;
+
+fn emit_sync_variant(
     function: &Function,
-    rust_name: &str,
+    type_name: &str,
     factories: &HashMap<FunctionId, String>,
     module_specifier: Option<&str>,
-) -> Result<String> {
-    let rust_name = sanitize_identifier(rust_name);
-    let type_name = format!("{}Frame", upper_camel(&rust_name));
-    let shared = shared_numeric_ids(function);
-    SHARED_NUMBERS.with(|numbers| *numbers.borrow_mut() = shared.clone());
-    let _shared_guard = SharedNumberGuard;
-    let plan = analyze_function(function);
+    plan: &EscapePlan,
+    shared: &HashSet<u32>,
+    speculated: &SpeculatedParameters,
+) -> Result<SyncVariant> {
     let back_edges = analyze_and_warn(function, module_specifier);
-    let (num_field, num_init) = emit_unboxed_reg_storage(&plan);
+    let (num_field, num_init) = emit_unboxed_reg_storage(plan);
     let storage = slot_storage(function);
     let slot_fields = emit_slot_fields(storage);
     let slot_bindings_new = emit_bindings_new(storage);
@@ -2357,9 +2423,9 @@ fn generate_sync_function_with_factories(
                     function,
                     factories,
                     module_specifier,
-                    &type_name,
+                    type_name,
                     storage,
-                    &plan,
+                    plan,
                     &back_edges,
                 )
                 .ok()
@@ -2375,9 +2441,9 @@ fn generate_sync_function_with_factories(
                 factories,
                 EmissionMode::Sync,
                 module_specifier,
-                &type_name,
+                type_name,
                 storage,
-                &plan,
+                plan,
                 &back_edges,
             )?
         };
@@ -2424,7 +2490,7 @@ fn generate_sync_function_with_factories(
         .this_binding
         .is_some_and(|binding| !binding_is_used(function, binding.0));
     for binding in &function.bindings {
-        if num_binding_slot(&plan, binding.id.0).is_some() || shared.contains(&binding.id.0) {
+        if num_binding_slot(plan, binding.id.0).is_some() || shared.contains(&binding.id.0) {
             continue;
         }
         if skip_unread_this && function.this_binding == Some(binding.id) {
@@ -2443,7 +2509,16 @@ fn generate_sync_function_with_factories(
         ));
     }
     let mut parameter_initializers = String::new();
+    let mut typed_parameter_stores = String::new();
     for (index, binding) in function.parameters.iter().enumerate() {
+        if speculated.iter().any(|(_, id)| *id == binding.0) {
+            if let Some(slot) = num_binding_slot(plan, binding.0) {
+                typed_parameter_stores.push_str(&format!(
+                    "    __w3cos_frame.num_bindings[{slot}] = __w3cos_typed_{index};\n"
+                ));
+                continue;
+            }
+        }
         parameter_initializers.push_str(&emit_binding_assign(
             storage,
             binding.0,
@@ -2478,10 +2553,10 @@ fn generate_sync_function_with_factories(
             "std::rc::Rc::new(std::cell::RefCell::new((__this, true)))",
         ));
     }
-    let (num_cells_field, num_cells_local, num_cells_init) = emit_num_cells(&shared);
-    let fast_prefix = emit_number_bump_prefix(function);
-
-    Ok(format!(
+    let (num_cells_field, num_cells_local, num_cells_init) = emit_num_cells(shared);
+    let registers_field = emit_registers_field(plan.n_val);
+    let registers_init = emit_registers_init(plan.n_val);
+    let items = format!(
         r#"
 struct {type_name} {{
 {registers_field}
@@ -2493,23 +2568,161 @@ impl {type_name} {{
 {run_body}
     }}
 }}
+"#
+    );
+    let frame = format!(
+        "{type_name} {{\n{registers_init}\n{num_init}        bindings,\n        capture_getters,\n        capture_setters,\n{num_cells_init}{block_initializer}\n    }}"
+    );
+    let run = if typed_parameter_stores.is_empty() {
+        format!("    {frame}.run()")
+    } else {
+        format!(
+            "    let mut __w3cos_frame = {frame};\n{typed_parameter_stores}    __w3cos_frame.run()"
+        )
+    };
+    let entry = format!(
+        "{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}{run}.unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))\n"
+    );
+    Ok(SyncVariant { items, entry })
+}
 
+/// `W3COS_AOT_NO_TYPED=1` disables dual-version emission (A/B knob).
+fn typed_versions_enabled() -> bool {
+    std::env::var_os("W3COS_AOT_NO_TYPED").is_none()
+}
+
+/// Number-hinted parameters a typed variant may speculate on, when doing so
+/// unboxes more of the function than the generic variant already does.
+fn typed_variant_plan(
+    function: &Function,
+    generic: &EscapePlan,
+) -> Option<(SpeculatedParameters, EscapePlan)> {
+    if !typed_versions_enabled() {
+        return None;
+    }
+    let speculated = w3cos_ir::types::speculable_parameters(function, &function.types)
+        .into_iter()
+        .filter(|index| *function.types.parameter(*index) == w3cos_ir::TypeHint::Number)
+        .map(|index| (index, function.parameters[index].0))
+        .collect::<Vec<_>>();
+    if speculated.is_empty() {
+        return None;
+    }
+    let seeds = speculated.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
+    let plan = analyze_function_seeded(function, &seeds);
+    // Keep only parameters that actually became native bindings.
+    let speculated = speculated
+        .into_iter()
+        .filter(|(_, id)| num_binding_slot(&plan, *id).is_some())
+        .collect::<Vec<_>>();
+    if speculated.is_empty()
+        || unboxed_operations(function, &plan) <= unboxed_operations(function, generic)
+    {
+        return None;
+    }
+    Some((speculated, plan))
+}
+
+/// Arithmetic / comparison instructions whose result the plan keeps
+/// unboxed. A typed variant must unbox strictly more of them to pay for its
+/// entry guard and extra code.
+fn unboxed_operations(function: &Function, plan: &EscapePlan) -> usize {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                Instruction::Add { .. } | Instruction::Binary { .. } | Instruction::Unary { .. }
+            )
+        })
+        .filter_map(written_register_id)
+        .filter(|register| plan.number.contains(register) || plan.bools.contains(register))
+        .count()
+}
+
+fn generate_sync_function_with_factories(
+    function: &Function,
+    rust_name: &str,
+    factories: &HashMap<FunctionId, String>,
+    module_specifier: Option<&str>,
+) -> Result<String> {
+    let rust_name = sanitize_identifier(rust_name);
+    let type_name = format!("{}Frame", upper_camel(&rust_name));
+    let shared = shared_numeric_ids(function);
+    SHARED_NUMBERS.with(|numbers| *numbers.borrow_mut() = shared.clone());
+    let _shared_guard = SharedNumberGuard;
+    let plan = analyze_function(function);
+    let fast_prefix = emit_number_bump_prefix(function);
+    let generic = emit_sync_variant(
+        function,
+        &type_name,
+        factories,
+        module_specifier,
+        &plan,
+        &shared,
+        &Vec::new(),
+    )?;
+    let typed = match typed_variant_plan(function, &plan) {
+        Some((speculated, typed_plan)) => {
+            let typed_type = format!("{type_name}Typed");
+            let variant = emit_sync_variant(
+                function,
+                &typed_type,
+                factories,
+                module_specifier,
+                &typed_plan,
+                &shared,
+                &speculated,
+            )?;
+            Some((speculated, variant))
+        }
+        None => None,
+    };
+    let generic_items = &generic.items;
+    let generic_entry = &generic.entry;
+    let Some((speculated, typed)) = typed else {
+        return Ok(format!(
+            r#"{generic_items}
 pub fn {rust_name}(
     __this: w3cos_core::Value,
     __args: &[w3cos_core::Value],
     __captures: &w3cos_core::AotCaptureMap,
 ) -> w3cos_core::Value {{
-{fast_prefix}{num_cells_local}{slot_bindings_new}{binding_initializers}{parameter_initializers}{slot_capture_init}    {type_name} {{
-{registers_init}
-{num_init}        bindings,
-        capture_getters,
-        capture_setters,
-{num_cells_init}{block_initializer}
-    }}.run().unwrap_or_else(|__w3cos_exception| w3cos_core::throw_value(__w3cos_exception))
-}}
-"#,
-        registers_field = emit_registers_field(plan.n_val),
-        registers_init = emit_registers_init(plan.n_val),
+{fast_prefix}{generic_entry}}}
+"#
+        ));
+    };
+    // Entry guard: every speculated argument must already be a Number
+    // (missing arguments are `undefined` and fail the guard).
+    let guard_values = speculated
+        .iter()
+        .map(|(index, _)| format!("__args.get({index}).and_then(w3cos_core::Value::as_number)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let guard_patterns = speculated
+        .iter()
+        .map(|(index, _)| format!("Some(__w3cos_typed_{index})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let typed_items = &typed.items;
+    let typed_entry = &typed.entry;
+    Ok(format!(
+        r#"{generic_items}{typed_items}
+pub fn {rust_name}(
+    __this: w3cos_core::Value,
+    __args: &[w3cos_core::Value],
+    __captures: &w3cos_core::AotCaptureMap,
+) -> w3cos_core::Value {{
+{fast_prefix}    if let ({guard_patterns},) = ({guard_values},) {{
+        w3cos_core::typed::record_typed_entry();
+        return {{
+{typed_entry}        }};
+    }}
+    w3cos_core::typed::record_guard_failure();
+{generic_entry}}}
+"#
     ))
 }
 
@@ -7550,22 +7763,34 @@ fn emit_binary_operator(
         {
             let expr = match operator {
                 BinaryOperator::LeftShift => {
-                    format!("(({left} as i32) << (({right} as i32) as u32 & 31)) as f64")
+                    format!(
+                        "w3cos_core::intrinsics::f64_to_int32({left}).wrapping_shl(w3cos_core::intrinsics::f64_to_uint32({right}) & 31) as f64"
+                    )
                 }
                 BinaryOperator::SignedRightShift => {
-                    format!("(({left} as i32) >> (({right} as i32) as u32 & 31)) as f64")
+                    format!(
+                        "w3cos_core::intrinsics::f64_to_int32({left}).wrapping_shr(w3cos_core::intrinsics::f64_to_uint32({right}) & 31) as f64"
+                    )
                 }
                 BinaryOperator::UnsignedRightShift => {
-                    format!("(({left} as u32) >> (({right} as i32) as u32 & 31)) as f64")
+                    format!(
+                        "w3cos_core::intrinsics::f64_to_uint32({left}).wrapping_shr(w3cos_core::intrinsics::f64_to_uint32({right}) & 31) as f64"
+                    )
                 }
                 BinaryOperator::BitwiseOr => {
-                    format!("(({left} as i32) | ({right} as i32)) as f64")
+                    format!(
+                        "(w3cos_core::intrinsics::f64_to_int32({left}) | w3cos_core::intrinsics::f64_to_int32({right})) as f64"
+                    )
                 }
                 BinaryOperator::BitwiseXor => {
-                    format!("(({left} as i32) ^ ({right} as i32)) as f64")
+                    format!(
+                        "(w3cos_core::intrinsics::f64_to_int32({left}) ^ w3cos_core::intrinsics::f64_to_int32({right})) as f64"
+                    )
                 }
                 BinaryOperator::BitwiseAnd => {
-                    format!("(({left} as i32) & ({right} as i32)) as f64")
+                    format!(
+                        "(w3cos_core::intrinsics::f64_to_int32({left}) & w3cos_core::intrinsics::f64_to_int32({right})) as f64"
+                    )
                 }
                 _ => unreachable!(),
             };
@@ -9327,6 +9552,80 @@ fn main() {{
             }
         }
         assert_eq!(depth, 0, "unbalanced fused loop: {generated}");
+    }
+
+    fn typed_emission(source: &str, name: &str) -> String {
+        let module = crate::w3ir_lowering::lower_module(source, "app:///typed.ts").unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some(name))
+            .unwrap();
+        if function.is_async {
+            generate_async_function_from_module(&module, function, "typed_probe").unwrap()
+        } else if function.is_generator {
+            generate_generator_from_module(&module, function, "typed_probe").unwrap()
+        } else {
+            generate_sync_function_from_module(&module, function, "typed_probe").unwrap()
+        }
+    }
+
+    #[test]
+    fn number_hinted_parameters_get_a_guarded_typed_version() {
+        let code = typed_emission(
+            "export function axpy(a: number, x: number, y: number): number { let s = 0; for (let i = 0; i < x; i++) s += a * i + y; return s; }",
+            "axpy",
+        );
+        assert!(code.contains("struct TypedProbeFrameTyped"), "{code}");
+        assert!(code.contains("struct TypedProbeFrame "), "{code}");
+        assert!(
+            code.contains("__args.get(0).and_then(w3cos_core::Value::as_number)")
+                && code.contains("__args.get(2).and_then(w3cos_core::Value::as_number)"),
+            "{code}"
+        );
+        assert!(code.contains("record_typed_entry") && code.contains("record_guard_failure"));
+        assert!(code.contains("__w3cos_frame.num_bindings["), "{code}");
+    }
+
+    #[test]
+    fn untyped_or_unspeculable_functions_keep_one_version() {
+        for (source, name) in [
+            ("export function f(a, b) { return a * b; }", "f"),
+            // String / bool / object hints do not get a typed version.
+            (
+                "export function f(a: string, b: boolean) { return a + b; }",
+                "f",
+            ),
+            // `arguments` aliases parameters in sloppy functions.
+            (
+                "export function f(a: number) { return arguments.length + a; }",
+                "f",
+            ),
+            // No arithmetic on the parameter: nothing to unbox.
+            ("export function f(a: number): any { return [a]; }", "f"),
+            ("export async function f(a: number) { return a * 2; }", "f"),
+            ("export function* f(a: number) { yield a * 2; }", "f"),
+        ] {
+            let code = typed_emission(source, name);
+            assert!(
+                !code.contains("record_typed_entry"),
+                "{source} should not get a typed version:\n{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn bitwise_numeric_fast_paths_use_ecmascript_to_int32() {
+        let code = typed_emission(
+            "export function f(a: number, b: number): number { const r = (a | 0) ^ (b << 3) | (a >>> 1); return r; }",
+            "f",
+        );
+        assert!(code.contains("f64_to_int32"), "{code}");
+        assert!(code.contains("f64_to_uint32"), "{code}");
+        assert!(
+            !code.contains(" as i32)"),
+            "saturating casts are not ToInt32:\n{code}"
+        );
     }
 
     #[test]

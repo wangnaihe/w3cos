@@ -71,11 +71,27 @@ pub fn type_of(value: &Value) -> Value {
 }
 
 fn to_uint32(value: &Value) -> u32 {
-    let number = value.to_number();
+    f64_to_uint32(value.to_number())
+}
+
+/// ECMAScript ToUint32 on an unboxed number (AOT numeric fast paths).
+/// Rust `as u32` saturates, which is wrong for out-of-range inputs.
+#[inline(always)]
+pub fn f64_to_uint32(number: f64) -> u32 {
+    let fast = number as i32;
+    if fast as f64 == number {
+        return fast as u32;
+    }
     if !number.is_finite() || number == 0.0 {
         return 0;
     }
     number.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+/// ECMAScript ToInt32 on an unboxed number (wraps modulo 2^32).
+#[inline(always)]
+pub fn f64_to_int32(number: f64) -> i32 {
+    f64_to_uint32(number) as i32
 }
 
 fn to_int32(value: &Value) -> i32 {
@@ -1406,5 +1422,29 @@ mod call_completion_tests {
         let outcome = call_with_arguments_completion(&noop, Value::Undefined, &Value::Number(1.0));
         let err = outcome.expect_err("non-array args");
         assert_eq!(err.get_property("name").to_js_string(), "TypeError");
+    }
+}
+
+#[cfg(test)]
+mod f64_int_conversion_tests {
+    use super::{f64_to_int32, f64_to_uint32};
+
+    #[test]
+    fn to_int32_wraps_like_ecmascript() {
+        assert_eq!(f64_to_int32(4294967301.0), 5);
+        assert_eq!(f64_to_int32(2147483648.0), -2147483648);
+        assert_eq!(f64_to_int32(-2147483649.0), 2147483647);
+        assert_eq!(f64_to_int32(-1.5), -1);
+        assert_eq!(f64_to_int32(-0.0), 0);
+        assert_eq!(f64_to_int32(f64::NAN), 0);
+        assert_eq!(f64_to_int32(f64::INFINITY), 0);
+        assert_eq!(f64_to_int32(f64::NEG_INFINITY), 0);
+        assert_eq!(
+            f64_to_int32(1e21),
+            (1e21_f64).rem_euclid(4294967296.0) as u32 as i32
+        );
+        assert_eq!(f64_to_uint32(-1.0), 4294967295);
+        assert_eq!(f64_to_uint32(4294967296.0), 0);
+        assert_eq!(f64_to_uint32(3.9), 3);
     }
 }
