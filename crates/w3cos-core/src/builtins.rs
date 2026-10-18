@@ -687,7 +687,31 @@ impl BuiltinObject {
 ///
 /// Direct calls and extracted methods must share the same generic builtin
 /// implementation (`const clz32 = Math.clz32` is common in library code).
+///
+/// `Math` is a singleton: `Math === Math`, and properties user code adds to
+/// it stay visible. The value is cached per thread and per page-arena epoch
+/// (a [`crate::page_arena::reset`] retires arena objects, so the next page
+/// builds a fresh one). Building it allocates ~30 properties, which used to
+/// dominate numeric code that calls `Math.*` in a loop.
 pub fn math_value() -> Value {
+    let epoch = crate::page_arena::current_epoch();
+    let cached = MATH_VALUE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, _)| *cached_epoch == epoch)
+            .map(|(_, value)| value.clone())
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let value = build_math_value();
+    // Drop the retired value outside the borrow.
+    let retired = MATH_VALUE.with(|cell| cell.replace(Some((epoch, value.clone()))));
+    drop(retired);
+    value
+}
+
+fn build_math_value() -> Value {
     let mut properties = HashMap::new();
     for method in [
         "min", "max", "abs", "floor", "ceil", "round", "f16round", "trunc", "sqrt", "log", "log2",
@@ -704,6 +728,7 @@ pub fn math_value() -> Value {
 }
 
 thread_local! {
+    static MATH_VALUE: RefCell<Option<(u32, Value)>> = const { RefCell::new(None) };
     static MATH_RANDOM_STATE: RefCell<u64> = const { RefCell::new(0x4d59_5df4_d0f3_3173) };
 }
 
@@ -1538,6 +1563,29 @@ mod monaco_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn math_value_is_a_per_page_singleton() {
+        let first = math_value();
+        let second = math_value();
+        assert!(first.strict_eq(&second), "Math === Math");
+        first.set_property("__w3cos_test_marker", Value::Number(7.0));
+        assert_eq!(
+            math_value().get_property("__w3cos_test_marker").to_number(),
+            7.0
+        );
+        let sqrt = math_value().get_property("sqrt");
+        assert_eq!(
+            sqrt.call(Value::Undefined, vec![Value::Number(9.0)])
+                .to_number(),
+            3.0
+        );
+        drop((first, second, sqrt));
+        crate::page_arena::reset();
+        let fresh = math_value();
+        assert!(fresh.get_property("__w3cos_test_marker").is_undefined());
+        assert_eq!(fresh.get_property("PI").to_number(), std::f64::consts::PI);
+    }
 
     #[test]
     fn math_round_and_common_numeric_methods() {
