@@ -9,6 +9,7 @@ pub mod esm_resolver;
 pub mod leak_lint;
 pub mod media_query;
 pub mod mobile_codegen;
+pub mod node_resolution;
 pub mod npm_bridge;
 pub mod parser;
 pub mod scope_analysis;

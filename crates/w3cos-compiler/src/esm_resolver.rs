@@ -4,12 +4,15 @@
 //! compile time so the compiler can load real package sources, build a module
 //! graph, and then lower the combined SWC AST into w3cos/Rust.
 
+use crate::node_resolution::{
+    PackageJson, ResolveKind, TargetResolution, is_node_builtin, resolve_package_exports,
+    resolve_package_imports,
+};
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
-use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use swc_common::{FileName, SourceMap, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
@@ -678,17 +681,8 @@ fn visit_module(
     order.push(path.to_path_buf());
 }
 
-#[derive(Debug, Deserialize)]
-struct PackageJson {
-    #[serde(default)]
-    main: Option<String>,
-    #[serde(default)]
-    module: Option<String>,
-    #[serde(default)]
-    browser: Option<Value>,
-    #[serde(default)]
-    exports: Option<Value>,
-}
+/// Extensions probed (by appending) for extensionless paths, in order.
+const SOURCE_EXTENSIONS: [&str; 7] = ["ts", "tsx", "js", "mjs", "cjs", "jsx", "json"];
 
 #[derive(Debug, Clone)]
 pub struct EsmResolver {
@@ -697,7 +691,9 @@ pub struct EsmResolver {
     /// Memoizes `resolve(specifier, from_dir)` — Monaco-scale graphs re-resolve
     /// the same specifier thousands of times through re-export chains, and each
     /// uncached call costs filesystem syscalls.
-    resolve_cache: RefCell<HashMap<(String, PathBuf), ResolvedModule>>,
+    resolve_cache: RefCell<HashMap<(String, PathBuf, ResolveKind), ResolvedModule>>,
+    /// Parsed `package.json` per directory (`None`: absent or invalid).
+    package_cache: RefCell<HashMap<PathBuf, Option<Rc<PackageJson>>>>,
 }
 
 impl EsmResolver {
@@ -706,6 +702,7 @@ impl EsmResolver {
             project_root: project_root.into(),
             runtime_modules: HashSet::new(),
             resolve_cache: RefCell::new(HashMap::new()),
+            package_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -729,20 +726,40 @@ impl EsmResolver {
     }
 
     pub fn resolve(&self, specifier: &str, from_dir: &Path) -> Result<ResolvedModule> {
+        self.resolve_with(specifier, from_dir, ResolveKind::Import)
+    }
+
+    /// Resolve `specifier` the way Node resolves an `import` or a `require()`
+    /// of it from a file in `from_dir`.
+    pub fn resolve_with(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        kind: ResolveKind,
+    ) -> Result<ResolvedModule> {
         let from_dir = normalize_path(from_dir);
-        let key = (specifier.to_string(), from_dir.clone());
+        let key = (specifier.to_string(), from_dir.clone(), kind);
         if let Some(hit) = self.resolve_cache.borrow().get(&key) {
             return Ok(hit.clone());
         }
-        let resolved = self.resolve_uncached(specifier, &from_dir)?;
+        let resolved = self.resolve_uncached(specifier, &from_dir, kind)?;
         self.resolve_cache
             .borrow_mut()
             .insert(key, resolved.clone());
         Ok(resolved)
     }
 
-    fn resolve_uncached(&self, specifier: &str, from_dir: &Path) -> Result<ResolvedModule> {
-        if specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/')
+    fn resolve_uncached(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        kind: ResolveKind,
+    ) -> Result<ResolvedModule> {
+        if specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier.starts_with('/')
+            || specifier == "."
+            || specifier == ".."
         {
             let candidate = if specifier.starts_with('/') {
                 PathBuf::from(specifier)
@@ -762,8 +779,24 @@ impl EsmResolver {
                 package_name: None,
             });
         }
-
-        self.resolve_package(specifier, from_dir)
+        if specifier.starts_with('#') {
+            return self.resolve_package_imports(specifier, from_dir, kind);
+        }
+        if specifier.starts_with("node:") {
+            return Err(anyhow!(
+                "`{specifier}` is a Node builtin module; builtins are provided by the runtime, not compiled from source"
+            ));
+        }
+        match self.resolve_package(specifier, from_dir, kind) {
+            Ok(resolved) => Ok(resolved),
+            // A bare builtin name only resolves to the builtin when no
+            // package of that name is installed (`events`, `buffer`, ...
+            // polyfills are common in web dependency trees).
+            Err(error) if is_node_builtin(specifier) => Err(error.context(format!(
+                "`{specifier}` is a Node builtin module; builtins are provided by the runtime, not compiled from source"
+            ))),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn build_graph_from_entry(&self, entry: &Path) -> Result<ModuleGraph> {
@@ -824,15 +857,24 @@ impl EsmResolver {
         Ok(())
     }
 
-    fn resolve_package(&self, specifier: &str, from_dir: &Path) -> Result<ResolvedModule> {
+    fn resolve_package(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        kind: ResolveKind,
+    ) -> Result<ResolvedModule> {
         let (package_name, subpath) = split_package_specifier(specifier)?;
-        let package_dir = self.find_package_dir(&package_name, from_dir)?;
-
-        let entry = if let Some(subpath) = subpath {
-            self.resolve_package_subpath(&package_dir, &subpath)?
-        } else {
-            self.resolve_package_entry(&package_dir)?
+        // Self-reference: a module inside a package with `exports` may import
+        // that package by its own name.
+        let package_dir = match self.find_package_scope(from_dir) {
+            Some((scope, package))
+                if package.name() == Some(package_name.as_str()) && package.exports.is_some() =>
+            {
+                scope
+            }
+            _ => self.find_package_dir(&package_name, from_dir)?,
         };
+        let entry = self.resolve_in_package_dir(&package_dir, subpath.as_deref(), kind)?;
 
         Ok(ResolvedModule {
             specifier: specifier.to_string(),
@@ -842,38 +884,147 @@ impl EsmResolver {
         })
     }
 
-    fn resolve_package_subpath(&self, package_dir: &Path, subpath: &str) -> Result<PathBuf> {
-        let package_json_path = package_dir.join("package.json");
-        if let Ok(package_json) = std::fs::read_to_string(&package_json_path) {
-            let package: PackageJson = serde_json::from_str(&package_json).with_context(|| {
-                format!("Invalid package.json at {}", package_json_path.display())
-            })?;
-            let export_key = format!("./{subpath}");
-            if let Some(entry) = package
-                .exports
-                .as_ref()
-                .and_then(|exports| resolve_exports_key(exports, &export_key))
-            {
-                return self
-                    .resolve_path_like(&package_dir.join(entry.trim_start_matches("./")))
-                    .with_context(|| {
-                        format!(
-                            "Could not resolve package export `{export_key}` in {}",
-                            package_dir.display()
-                        )
-                    });
+    /// PACKAGE_RESOLVE once the package directory is known: `exports` first,
+    /// then (leniently, also when `exports` has no matching key) the legacy
+    /// subpath / entry-field lookup. A `null` export target is an error.
+    fn resolve_in_package_dir(
+        &self,
+        package_dir: &Path,
+        subpath: Option<&str>,
+        kind: ResolveKind,
+    ) -> Result<PathBuf> {
+        let package = self.package_json(package_dir);
+        let export_key = match subpath {
+            Some(subpath) => format!("./{subpath}"),
+            None => ".".to_string(),
+        };
+        if let Some(exports) = package
+            .as_ref()
+            .and_then(|package| package.exports.as_ref())
+        {
+            match resolve_package_exports(exports, &export_key, kind.conditions()) {
+                TargetResolution::Found(target) => {
+                    return self
+                        .resolve_path_like(&package_dir.join(target.trim_start_matches("./")))
+                        .with_context(|| {
+                            format!(
+                                "Could not resolve package export `{export_key}` -> `{target}` in {}",
+                                package_dir.display()
+                            )
+                        });
+                }
+                TargetResolution::Blocked => {
+                    return Err(anyhow!(
+                        "Package subpath `{export_key}` is not exported (null target) by {}",
+                        package_dir.display()
+                    ));
+                }
+                TargetResolution::NoMatch => {}
             }
         }
+        match subpath {
+            Some(subpath) => self.resolve_path_like(&package_dir.join(subpath)),
+            None => self.resolve_package_entry(package_dir, package.as_deref(), kind),
+        }
+    }
 
-        self.resolve_path_like(&package_dir.join(subpath))
+    /// `#name` specifiers: PACKAGE_IMPORTS_RESOLVE against the `imports` field
+    /// of the nearest package scope.
+    fn resolve_package_imports(
+        &self,
+        specifier: &str,
+        from_dir: &Path,
+        kind: ResolveKind,
+    ) -> Result<ResolvedModule> {
+        let (scope, package) = self.find_package_scope(from_dir).ok_or_else(|| {
+            anyhow!(
+                "Package import `{specifier}` used outside a package scope ({})",
+                from_dir.display()
+            )
+        })?;
+        let imports = package.imports.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Package import `{specifier}`: {} has no `imports` field",
+                scope.display()
+            )
+        })?;
+        match resolve_package_imports(imports, specifier, kind.conditions()) {
+            TargetResolution::Found(target) if target.starts_with("./") => {
+                let path = self
+                    .resolve_path_like(&scope.join(target.trim_start_matches("./")))
+                    .with_context(|| {
+                        format!(
+                            "Could not resolve package import `{specifier}` -> `{target}` in {}",
+                            scope.display()
+                        )
+                    })?;
+                Ok(ResolvedModule {
+                    specifier: specifier.to_string(),
+                    path,
+                    kind: ModuleKind::Relative,
+                    package_name: package.name().map(str::to_string),
+                })
+            }
+            TargetResolution::Found(target) => {
+                let mut resolved = self.resolve_with(&target, &scope, kind)?;
+                resolved.specifier = specifier.to_string();
+                Ok(resolved)
+            }
+            TargetResolution::Blocked | TargetResolution::NoMatch => Err(anyhow!(
+                "Package import `{specifier}` is not defined in {}",
+                scope.join("package.json").display()
+            )),
+        }
+    }
+
+    /// Parsed `package.json` of `dir`, cached.
+    fn package_json(&self, dir: &Path) -> Option<Rc<PackageJson>> {
+        if let Some(hit) = self.package_cache.borrow().get(dir) {
+            return hit.clone();
+        }
+        let parsed = std::fs::read_to_string(dir.join("package.json"))
+            .ok()
+            .and_then(|source| PackageJson::parse(&source).ok())
+            .map(Rc::new);
+        self.package_cache
+            .borrow_mut()
+            .insert(dir.to_path_buf(), parsed.clone());
+        parsed
+    }
+
+    /// Nearest directory at or above `dir` with a `package.json` (Node's
+    /// "package scope"). The search stops at a `node_modules` directory.
+    pub fn find_package_scope(&self, dir: &Path) -> Option<(PathBuf, Rc<PackageJson>)> {
+        let mut dir = normalize_path(dir);
+        loop {
+            if dir.file_name().is_some_and(|name| name == "node_modules") {
+                return None;
+            }
+            if let Some(package) = self.package_json(&dir) {
+                return Some((dir, package));
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
+    /// Whether `.js` files next to `path` are ESM by `"type": "module"`.
+    pub fn is_in_type_module_scope(&self, path: &Path) -> bool {
+        path.parent()
+            .and_then(|dir| self.find_package_scope(dir))
+            .is_some_and(|(_, package)| package.is_type_module())
     }
 
     fn find_package_dir(&self, package_name: &str, from_dir: &Path) -> Result<PathBuf> {
         let mut dir = from_dir.to_path_buf();
         loop {
-            let candidate = dir.join("node_modules").join(package_name);
-            if candidate.join("package.json").exists() || candidate.exists() {
-                return Ok(candidate);
+            // `node_modules/node_modules/x` is never searched.
+            if !dir.file_name().is_some_and(|name| name == "node_modules") {
+                let candidate = dir.join("node_modules").join(package_name);
+                if candidate.is_dir() {
+                    return Ok(candidate);
+                }
             }
             if !dir.pop() {
                 break;
@@ -881,7 +1032,7 @@ impl EsmResolver {
         }
 
         let candidate = self.project_root.join("node_modules").join(package_name);
-        if candidate.join("package.json").exists() || candidate.exists() {
+        if candidate.is_dir() {
             return Ok(candidate);
         }
 
@@ -891,36 +1042,76 @@ impl EsmResolver {
         ))
     }
 
-    fn resolve_package_entry(&self, package_dir: &Path) -> Result<PathBuf> {
-        let package_json_path = package_dir.join("package.json");
-        let package_json = std::fs::read_to_string(&package_json_path)
-            .with_context(|| format!("Could not read {}", package_json_path.display()))?;
-        let package: PackageJson = serde_json::from_str(&package_json)
-            .with_context(|| format!("Invalid package.json at {}", package_json_path.display()))?;
-
-        let entry = package
-            .exports
-            .as_ref()
-            .and_then(resolve_exports_root)
-            .or(package.module)
-            .or_else(|| resolve_browser_string(package.browser.as_ref()))
-            .or(package.main)
-            .unwrap_or_else(|| "index.js".to_string());
-
-        let entry = entry.trim_start_matches("./");
-        self.resolve_path_like(&package_dir.join(entry))
-            .with_context(|| {
-                format!(
-                    "Could not resolve package entry `{}` in {}",
-                    entry,
-                    package_dir.display()
-                )
-            })
+    /// Package root without a matching `exports` entry. ESM imports prefer the
+    /// bundler `module` field and a string `browser` field; `require()` uses
+    /// `main` like Node. Both end at `index`.
+    fn resolve_package_entry(
+        &self,
+        package_dir: &Path,
+        package: Option<&PackageJson>,
+        kind: ResolveKind,
+    ) -> Result<PathBuf> {
+        let mut fields: Vec<&str> = Vec::new();
+        if let Some(package) = package {
+            if kind == ResolveKind::Import {
+                fields.extend(package.module_field());
+                fields.extend(package.browser_string());
+            }
+            fields.extend(package.main());
+        }
+        for field in &fields {
+            if let Ok(path) =
+                self.resolve_path_like(&package_dir.join(field.trim_start_matches("./")))
+            {
+                return Ok(path);
+            }
+        }
+        self.resolve_index(package_dir).ok_or_else(|| {
+            anyhow!(
+                "Could not resolve package entry ({}) in {}",
+                if fields.is_empty() {
+                    "index".to_string()
+                } else {
+                    fields.join(", ")
+                },
+                package_dir.display()
+            )
+        })
     }
 
+    /// LOAD_AS_FILE then LOAD_AS_DIRECTORY, with the extension set widened to
+    /// the TypeScript and ESM sources the compiler accepts.
     fn resolve_path_like(&self, candidate: &Path) -> Result<PathBuf> {
+        if let Some(path) = self.resolve_file(candidate) {
+            return Ok(path);
+        }
+        if candidate.is_dir() {
+            if let Some(main) = self
+                .package_json(candidate)
+                .as_ref()
+                .and_then(|p| p.main().map(str::to_string))
+            {
+                let main_path = candidate.join(main.trim_start_matches("./"));
+                if let Some(path) = self.resolve_file(&main_path).or_else(|| {
+                    main_path
+                        .is_dir()
+                        .then(|| self.resolve_index(&main_path))
+                        .flatten()
+                }) {
+                    return Ok(path);
+                }
+            }
+            if let Some(index) = self.resolve_index(candidate) {
+                return Ok(index);
+            }
+        }
+
+        Err(anyhow!("Could not resolve path {}", candidate.display()))
+    }
+
+    fn resolve_file(&self, candidate: &Path) -> Option<PathBuf> {
         if candidate.is_file() {
-            return Ok(normalize_path(candidate));
+            return Some(normalize_path(candidate));
         }
 
         // Probe source extensions by *appending* to the file name. This must
@@ -928,32 +1119,24 @@ impl EsmResolver {
         // like `editor.api` are common (monaco-editor), and the real file is
         // `editor.api.js` — `Path::extension` would wrongly treat `.api` as
         // the source extension and skip probing.
-        for ext in ["ts", "tsx", "js", "mjs", "jsx"] {
+        for ext in SOURCE_EXTENSIONS {
             let mut appended = candidate.as_os_str().to_owned();
             appended.push(".");
             appended.push(ext);
             let with_ext = PathBuf::from(appended);
             if with_ext.is_file() {
-                return Ok(normalize_path(&with_ext));
+                return Some(normalize_path(&with_ext));
             }
         }
+        None
+    }
 
-        if candidate.is_dir() {
-            for name in [
-                "index.ts",
-                "index.tsx",
-                "index.js",
-                "index.mjs",
-                "index.jsx",
-            ] {
-                let index = candidate.join(name);
-                if index.is_file() {
-                    return Ok(normalize_path(&index));
-                }
-            }
-        }
-
-        Err(anyhow!("Could not resolve path {}", candidate.display()))
+    fn resolve_index(&self, dir: &Path) -> Option<PathBuf> {
+        SOURCE_EXTENSIONS
+            .iter()
+            .map(|ext| dir.join(format!("index.{ext}")))
+            .find(|index| index.is_file())
+            .map(|index| normalize_path(&index))
     }
 }
 
@@ -982,38 +1165,6 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     out
-}
-
-fn resolve_exports_root(exports: &Value) -> Option<String> {
-    match exports {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(map) => {
-            if let Some(root) = map.get(".") {
-                return resolve_exports_root(root);
-            }
-            for key in ["import", "module", "browser", "default"] {
-                if let Some(value) = map.get(key).and_then(Value::as_str) {
-                    return Some(value.to_string());
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn resolve_exports_key(exports: &Value, key: &str) -> Option<String> {
-    let Value::Object(map) = exports else {
-        return None;
-    };
-    map.get(key).and_then(resolve_exports_root)
-}
-
-fn resolve_browser_string(browser: Option<&Value>) -> Option<String> {
-    match browser {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    }
 }
 
 fn split_package_specifier(specifier: &str) -> Result<(String, Option<String>)> {
@@ -2242,6 +2393,165 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             import.local == "plugin" && import.imported == "*" && import.specifier == specifier
         }));
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn write_tree(root: &Path, files: &[(&str, &str)]) {
+        for (path, contents) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+    }
+
+    #[test]
+    fn node_resolution_algorithm_end_to_end() {
+        use crate::node_resolution::ResolveKind::{Import, Require};
+        let root = fixture_root("w3cos_node_resolution_algorithm");
+        write_tree(
+            &root,
+            &[
+                (
+                    "package.json",
+                    r##"{"name":"app","exports":{".":"./src/main.js","./util":"./src/util.js"},"imports":{"#cfg":{"w3cos":"./src/cfg.w3cos.js","default":"./src/cfg.js"},"#dep":"dual","#lib/*":"./src/lib/*.js","#gone":null}}"##,
+                ),
+                ("src/main.js", ""),
+                ("src/util.js", ""),
+                ("src/cfg.js", ""),
+                ("src/cfg.w3cos.js", ""),
+                ("src/lib/a.js", ""),
+                ("src/deep/x/y.js", ""),
+                ("src/data.json", "{}"),
+                ("src/legacy.cjs", ""),
+                ("src/dir/package.json", r#"{"main":"./entry"}"#),
+                ("src/dir/entry.js", ""),
+                ("src/idx/index.js", ""),
+                // Dual package: ordered conditions, nested conditions,
+                // patterns, `null` block.
+                (
+                    "node_modules/dual/package.json",
+                    r#"{"name":"dual","main":"./legacy-main.js","module":"./legacy-module.js","exports":{".":{"types":"./i.d.ts","node":{"import":"./esm/node.mjs","require":"./cjs/node.cjs"},"default":"./esm/index.js"},"./features/*":{"require":"./cjs/features/*.cjs","default":"./esm/features/*.js"},"./features/internal/*":null,"./package.json":"./package.json"}}"#,
+                ),
+                ("node_modules/dual/esm/node.mjs", ""),
+                ("node_modules/dual/cjs/node.cjs", ""),
+                ("node_modules/dual/esm/features/a.js", ""),
+                ("node_modules/dual/cjs/features/a.cjs", ""),
+                ("node_modules/dual/esm/features/internal/s.js", ""),
+                // Legacy package: no exports.
+                (
+                    "node_modules/legacy/package.json",
+                    r#"{"name":"legacy","main":"lib/main.js","module":"es/index.js"}"#,
+                ),
+                ("node_modules/legacy/lib/main.js", ""),
+                ("node_modules/legacy/es/index.js", ""),
+                ("node_modules/legacy/lib/sub.js", ""),
+                ("node_modules/noentry/index.js", ""),
+                // A nested node_modules shadows the outer one for files
+                // below it (walk-up order).
+                (
+                    "src/deep/node_modules/legacy/package.json",
+                    r#"{"main":"near.js"}"#,
+                ),
+                ("src/deep/node_modules/legacy/near.js", ""),
+                (
+                    "node_modules/events/package.json",
+                    r#"{"main":"events.js"}"#,
+                ),
+                ("node_modules/events/events.js", ""),
+            ],
+        );
+        let resolver = EsmResolver::new(&root);
+        let src = root.join("src");
+        let path = |spec: &str, from: &Path, kind| {
+            resolver
+                .resolve_with(spec, from, kind)
+                .unwrap_or_else(|e| panic!("{spec}: {e:#}"))
+                .path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        };
+
+        assert_eq!(path("dual", &src, Import), "node_modules/dual/esm/node.mjs");
+        assert_eq!(
+            path("dual", &src, Require),
+            "node_modules/dual/cjs/node.cjs"
+        );
+        assert_eq!(
+            path("dual/features/a", &src, Import),
+            "node_modules/dual/esm/features/a.js"
+        );
+        assert_eq!(
+            path("dual/features/a", &src, Require),
+            "node_modules/dual/cjs/features/a.cjs"
+        );
+        let blocked = resolver
+            .resolve_with("dual/features/internal/s", &src, Import)
+            .unwrap_err();
+        assert!(
+            format!("{blocked:#}").contains("not exported"),
+            "{blocked:#}"
+        );
+
+        assert_eq!(
+            path("legacy", &src, Import),
+            "node_modules/legacy/es/index.js"
+        );
+        assert_eq!(
+            path("legacy", &src, Require),
+            "node_modules/legacy/lib/main.js"
+        );
+        assert_eq!(
+            path("legacy/lib/sub", &src, Require),
+            "node_modules/legacy/lib/sub.js"
+        );
+        assert_eq!(
+            path("noentry", &src, Require),
+            "node_modules/noentry/index.js"
+        );
+        assert_eq!(
+            path("legacy", &src.join("deep/x"), Require),
+            "src/deep/node_modules/legacy/near.js"
+        );
+
+        // Self-reference through the package's own `exports`.
+        assert_eq!(path("app", &src.join("deep"), Require), "src/main.js");
+        assert_eq!(path("app/util", &src, Import), "src/util.js");
+
+        // `imports`: conditions (w3cos first), bare package target, patterns, null.
+        assert_eq!(
+            path("#cfg", &src.join("deep/x"), Import),
+            "src/cfg.w3cos.js"
+        );
+        assert_eq!(
+            path("#dep", &src, Require),
+            "node_modules/dual/cjs/node.cjs"
+        );
+        assert_eq!(path("#lib/a", &src, Import), "src/lib/a.js");
+        assert!(resolver.resolve_with("#gone", &src, Import).is_err());
+        assert!(resolver.resolve_with("#missing", &src, Import).is_err());
+
+        // File and directory completion.
+        assert_eq!(path("./data", &src, Require), "src/data.json");
+        assert_eq!(path("./legacy", &src, Require), "src/legacy.cjs");
+        assert_eq!(path("./dir", &src, Require), "src/dir/entry.js");
+        assert_eq!(path("./idx", &src, Require), "src/idx/index.js");
+        assert_eq!(
+            path("../dir", &src.join("idx"), Require),
+            "src/dir/entry.js"
+        );
+
+        // Builtins: `node:` always; bare names only when no package exists.
+        let fs = resolver.resolve_with("fs", &src, Require).unwrap_err();
+        assert!(format!("{fs:#}").contains("Node builtin"), "{fs:#}");
+        assert!(resolver.resolve_with("node:events", &src, Require).is_err());
+        assert_eq!(
+            path("events", &src, Require),
+            "node_modules/events/events.js"
+        );
+
+        assert!(!resolver.is_in_type_module_scope(&src.join("main.js")));
         std::fs::remove_dir_all(root).ok();
     }
 }
