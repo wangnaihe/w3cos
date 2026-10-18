@@ -19,9 +19,10 @@
 //! margin collapsing (siblings, parent/first-child, parent/last-child,
 //! empty boxes), auto/px/percent widths and heights, min/max sizes,
 //! box-sizing, auto horizontal margins.  Anything else makes
-//! [`supports_tree`] return false and the legacy engine runs.
+//! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod inline;
 
 use crate::layout::{FlatNodeInfo, LayoutRect};
 use std::sync::OnceLock;
@@ -125,18 +126,30 @@ pub(crate) fn layout_tree(
     viewport_h: f32,
 ) -> Option<Vec<(LayoutRect, usize)>> {
     let _ = root;
-    let supported = !flat.is_empty() && block::supports_tree(flat);
+    let reason = if flat.is_empty() {
+        Some("empty")
+    } else {
+        block::unsupported_tree(flat)
+    };
     if trace() {
-        eprintln!(
-            "[layout-ng] {} ({} boxes)",
-            if supported { "ng" } else { "fallback" },
-            flat.len()
-        );
+        match reason {
+            None => eprintln!("[layout-ng] ng ({} boxes)", flat.len()),
+            Some(_) => eprintln!(
+                "[layout-ng] fallback {} ({} boxes)",
+                block::unsupported_reasons(flat).join(","),
+                flat.len()
+            ),
+        }
     }
-    if !supported {
+    if reason.is_some() {
         return None;
     }
-    let (x, y, fragment) = block::layout_root(flat, viewport_w, viewport_h);
+    let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
+        if trace() {
+            eprintln!("[layout-ng] fallback runtime ({} boxes)", flat.len());
+        }
+        return None;
+    };
     let mut out = Vec::with_capacity(flat.len());
     flatten(&fragment, x, y, &mut out);
     Some(out)
@@ -203,5 +216,7 @@ pub(crate) fn verify(
     diffs
 }
 
+#[cfg(test)]
+mod inline_tests;
 #[cfg(test)]
 mod tests;

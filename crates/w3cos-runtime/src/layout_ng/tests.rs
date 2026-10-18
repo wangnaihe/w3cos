@@ -485,3 +485,66 @@ fn generated_block_trees_match_chrome() {
         &failures[..failures.len().min(5)]
     );
 }
+
+/// Exploration aid: `W3COS_NG_PROBE=file.html cargo test probe_html -- --nocapture`
+/// prints the component tree and legacy rects of a document.
+#[cfg(feature = "dynamic-js")]
+#[test]
+fn probe_html() {
+    let Some(path) = std::env::var_os("W3COS_NG_PROBE") else {
+        return;
+    };
+    let html = std::fs::read_to_string(path).expect("probe html");
+    let root = crate::browser_page_domain::load_html_snapshot(&html, "file:///probe.html")
+        .expect("snapshot");
+    let flat = pre_flatten(&root);
+    let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy layout");
+    let reasons = block::unsupported_reasons(&flat);
+    println!("reasons: {reasons:?}");
+    let ng = if reasons.is_empty() {
+        layout_tree(&root, &flat, 800.0, 600.0)
+    } else {
+        None
+    };
+    if let Some(ng) = &ng {
+        println!("verify diffs: {}", verify(&flat, &legacy, ng));
+    }
+    let mut depth = vec![0usize; flat.len()];
+    for (i, n) in flat.iter().enumerate() {
+        if let Some(p) = n.parent {
+            depth[i] = depth[p] + 1;
+        }
+        let r = legacy.iter().find(|(_, j)| *j == i).map(|(r, _)| *r);
+        let kind = match n.kind {
+            w3cos_std::ComponentKind::Text { content } => format!("Text {content:?}"),
+            other => format!("{other:?}").chars().take(30).collect(),
+        };
+        println!(
+            "{:3} {}{} disp={:?} ws={:?} lh={:?}/{}/{:?} fs={} ta={:?} h={:?} minh={:?} -> {:?} ng {:?} {}",
+            i,
+            "  ".repeat(depth[i]),
+            kind,
+            n.style.display,
+            n.style.white_space,
+            n.style.line_height,
+            n.style.line_height_is_normal,
+            n.style.line_height_computed_px,
+            n.style.font_size,
+            n.style.text_align,
+            n.style.height,
+            n.style.min_height,
+            r.map(|r| (r.x, r.y, r.width, r.height)),
+            ng.as_ref()
+                .and_then(|ng| ng.iter().find(|(_, j)| *j == i))
+                .map(|(r, _)| (r.x, r.y, r.width, r.height)),
+            n.style
+                .custom_properties
+                .iter()
+                .flat_map(|p| p.keys())
+                .filter(|k| k.starts_with("--w3cos-internal"))
+                .map(|k| k.trim_start_matches("--w3cos-internal-"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+}

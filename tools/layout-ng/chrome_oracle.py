@@ -11,8 +11,22 @@ usage: chrome_oracle.py DUMP.jsonl [--show N] [--write-golden OUT.json]
 --write-golden stores Chrome's rects per case (the checked-in expectations
 the Rust test compares NG against).
 """
-import json, os, sys
+import base64, json, os, sys
 from playwright.sync_api import sync_playwright
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FONTS = {
+    "Ahem": os.path.join(HERE, "../../crates/w3cos-runtime/src/layout_ng/testdata/Ahem.ttf"),
+}
+
+
+def font_faces(names):
+    css = ""
+    for name in names:
+        with open(FONTS[name], "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+        css += f"@font-face{{font-family:{name};src:url(data:font/ttf;base64,{data})}}"
+    return f"<style>{css}</style>" if css else ""
 
 EPS = 1.0 / 64.0
 
@@ -40,7 +54,11 @@ def main():
         )
         page = browser.new_page(viewport={"width": 800, "height": 600})
         for case in cases:
-            page.set_content("<!doctype html><html><body style='margin:0'>" + case["html"] + "</body></html>")
+            page.set_content(
+                "<!doctype html><html><head>" + font_faces(case.get("fonts", []))
+                + "</head><body style='margin:0'>" + case["html"] + "</body></html>"
+            )
+            page.evaluate("() => document.fonts.ready.then(() => true)")
             chrome = page.evaluate(
                 """() => Object.fromEntries([...document.querySelectorAll('[id^=n]')].map(e => {
                     const r = e.getBoundingClientRect();
@@ -48,8 +66,11 @@ def main():
                 }))"""
             )
             golden[str(case["case"])] = {k: [round(x * 64) for x in v] for k, v in chrome.items()}
-            ng_ok = all(same(chrome[k], case["ng"].get(k)) for k in chrome)
-            legacy_ok = all(same(chrome[k], case["legacy"].get(k)) for k in chrome)
+            # A collapsible space removed at a line edge: no NG fragment,
+            # zero-width Chrome rect.
+            ok = lambda c, k: same(chrome[k], c.get(k)) or (k not in c and abs(chrome[k][2]) <= EPS)
+            ng_ok = all(ok(case["ng"], k) for k in chrome)
+            legacy_ok = all(ok(case["legacy"], k) for k in chrome)
             stats["cases"] += 1
             stats["ng_ok"] += ng_ok
             stats["legacy_ok"] += legacy_ok
@@ -58,7 +79,7 @@ def main():
                 shown += 1
                 print(f"--- case {case['case']} (legacy {'ok' if legacy_ok else 'differs'})")
                 for k in sorted(chrome, key=int):
-                    if not same(chrome[k], case["ng"].get(k)):
+                    if not ok(case["ng"], k):
                         print(f"  n{k}: chrome {chrome[k]} ng {case['ng'].get(k)} legacy {case['legacy'].get(k)}")
         browser.close()
     if "--write-golden" in sys.argv:

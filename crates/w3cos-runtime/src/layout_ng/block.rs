@@ -7,81 +7,239 @@
 //! (border, padding, in-flow content, BFC root) is reached.  Width follows
 //! CSS2 10.3.3, height 10.6.3, min/max 10.4/10.7, collapsing 8.3.1.
 
-use super::{BoxFragment, ConstraintSpace, LayoutResult, MarginStrut};
+use super::{BoxFragment, ConstraintSpace, LayoutResult, MarginStrut, inline};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::ComponentKind;
 use w3cos_std::style::{
     BoxSizing, Clear, Dimension, Display, Float, Overflow, Position, Spacing, Style, TextDirection,
 };
 
-fn supported_dimension(d: Dimension) -> bool {
-    matches!(
-        d,
-        Dimension::Auto | Dimension::Px(_) | Dimension::Percent(_)
-    )
+fn supported_dimension(_d: Dimension) -> bool {
+    // Every Dimension unit resolves like legacy `to_taffy_dim`.
+    true
 }
 
 fn supported_spacing(s: Spacing, allow_auto: bool) -> bool {
     match s {
-        Spacing::Px(_) | Spacing::Percent(_) => true,
+        Spacing::Px(_)
+        | Spacing::Percent(_)
+        | Spacing::Rem(_)
+        | Spacing::Em(_)
+        | Spacing::Ch(_)
+        | Spacing::Vw(_)
+        | Spacing::Vh(_) => true,
         Spacing::Auto => allow_auto,
+        // env() insets depend on host state the legacy path owns.
         _ => false,
     }
 }
 
-fn supported_style(style: &Style) -> bool {
-    matches!(style.display, Display::Block | Display::FlowRoot)
-        && style.position == Position::Static
-        && style.float == Float::None
-        && style.clear == Clear::None
-        && style.overflow == Overflow::Visible
-        && style.overflow_x.is_none_or(|o| o == Overflow::Visible)
-        && style.overflow_y.is_none_or(|o| o == Overflow::Visible)
-        && style.column_count.is_none()
-        && style.column_width == Dimension::Auto
-        && style.direction == TextDirection::Ltr
-        && [
-            style.width,
-            style.height,
-            style.min_width,
-            style.min_height,
-            style.max_width,
-            style.max_height,
-        ]
-        .into_iter()
-        .all(supported_dimension)
-        && [style.margin.top, style.margin.right, style.margin.bottom, style.margin.left]
-            .into_iter()
-            .all(|s| supported_spacing(s, true))
-        && [style.padding.top, style.padding.right, style.padding.bottom, style.padding.left]
-            .into_iter()
-            .all(|s| supported_spacing(s, false))
-        // Internal markers mean a legacy projection owns this box.
-        && style.custom_properties.as_ref().is_none_or(|props| {
-            !props.keys().any(|key| key.starts_with("--w3cos-internal"))
-        })
+/// Internal custom properties that only carry computed values for the
+/// CSSOM, font selection or paint; they never mean a legacy layout
+/// projection owns the box.
+fn is_value_carrier_marker(key: &str) -> bool {
+    let name = key.trim_start_matches("--w3cos-internal-");
+    matches!(
+        name,
+        "font-size-origin"
+            | "font-specified-size"
+            | "html-standard-font"
+            | "list-style-image"
+            | "text-language"
+            | "text-decoration-color"
+            | "z-index-specified"
+            | "computed-height-percent"
+            | "background-inherit"
+            | "text-source-run"
+            | "text-fragment-ends"
+    ) || name.starts_with("decoration-owner")
 }
 
-/// True when every rendered node is a block box this stage lays out.
-pub(super) fn supports_tree(flat: &[FlatNodeInfo]) -> bool {
+/// Why a box is outside the current stage (`None`: supported).  The reason
+/// is reported by `W3COS_LAYOUT_NG_TRACE` for coverage accounting.
+fn unsupported_style(style: &Style, allowed: &[&str]) -> Option<&'static str> {
+    if let Some(reason) = unsupported_marker(style, allowed) {
+        return Some(reason);
+    }
+    if !matches!(style.display, Display::Block | Display::FlowRoot) {
+        return Some(match style.display {
+            Display::Inline => "display:inline",
+            Display::InlineBlock => "display:inline-block",
+            Display::Flex | Display::InlineFlex => "display:flex",
+            Display::Grid => "display:grid",
+            _ => "display:other",
+        });
+    }
+    if style.position != Position::Static {
+        return Some("position");
+    }
+    if style.float != Float::None {
+        return Some("float");
+    }
+    if style.clear != Clear::None {
+        return Some("clear");
+    }
+    if style.overflow != Overflow::Visible
+        || style.overflow_x.is_some_and(|o| o != Overflow::Visible)
+        || style.overflow_y.is_some_and(|o| o != Overflow::Visible)
+    {
+        return Some("overflow");
+    }
+    if style.column_count.is_some() || style.column_width != Dimension::Auto {
+        return Some("columns");
+    }
+    if style.direction != TextDirection::Ltr {
+        return Some("direction");
+    }
+    if ![
+        style.width,
+        style.height,
+        style.min_width,
+        style.min_height,
+        style.max_width,
+        style.max_height,
+    ]
+    .into_iter()
+    .all(supported_dimension)
+    {
+        return Some("size-unit");
+    }
+    if ![
+        style.margin.top,
+        style.margin.right,
+        style.margin.bottom,
+        style.margin.left,
+    ]
+    .into_iter()
+    .all(|s| supported_spacing(s, true))
+        || ![
+            style.padding.top,
+            style.padding.right,
+            style.padding.bottom,
+            style.padding.left,
+        ]
+        .into_iter()
+        .all(|s| supported_spacing(s, false))
+    {
+        return Some("spacing-unit");
+    }
+    None
+}
+
+/// Internal markers mean a legacy projection owns this box, except value
+/// carriers and the markers the current stage interprets (`allowed`).
+fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'static str> {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| {
+            props.keys().any(|key| {
+                key.starts_with("--w3cos-internal")
+                    && !is_value_carrier_marker(key)
+                    && !allowed.contains(&key.as_str())
+            })
+        })
+        .then_some("internal-marker")
+}
+
+fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    match info.kind {
+        ComponentKind::Root | ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => {
+            if inline::is_inline_container(flat, index) {
+                unsupported_style(info.style, &[inline::IFC_MARKER])
+                    .or_else(|| inline::container_reason(flat, index))
+            } else {
+                unsupported_style(info.style, &[])
+            }
+        }
+        ComponentKind::Text { content } if info.style.display != Display::Inline => {
+            unsupported_style(info.style, &[])
+                .or_else(|| inline::block_text_reason(content, info.style))
+        }
+        ComponentKind::Text { .. } => {
+            // Validated with its container (container_reason).
+            let in_ifc = info
+                .parent
+                .is_some_and(|p| inline::is_inline_container(flat, p));
+            if !in_ifc {
+                Some("ifc:mixed")
+            } else {
+                unsupported_marker(info.style, &[inline::LINE_WIDTH_MARKER])
+            }
+        }
+        ComponentKind::Image { .. } => Some("image"),
+        _ => Some("kind:other"),
+    }
+}
+
+/// Visit rendered nodes (display:none subtrees emit nothing in either
+/// engine) until `f` returns true.
+fn walk_rendered(flat: &[FlatNodeInfo], mut f: impl FnMut(usize) -> bool) {
     let mut index = 0;
     while index < flat.len() {
         let info = &flat[index];
         if info.style.display == Display::None {
-            // Not rendered: the legacy engine emits nothing for the subtree.
             index = info.subtree_end.max(index + 1);
             continue;
         }
-        if !matches!(
-            info.kind,
-            ComponentKind::Root | ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
-        ) || !supported_style(info.style)
-        {
-            return false;
+        if f(index) {
+            return;
         }
         index += 1;
     }
-    true
+}
+
+/// `None` when every rendered node is a box this stage lays out, otherwise
+/// the first reason the legacy engine must run.
+pub(super) fn unsupported_tree(flat: &[FlatNodeInfo]) -> Option<&'static str> {
+    let mut reason = None;
+    walk_rendered(flat, |index| {
+        reason = node_reason(flat, index);
+        reason.is_some()
+    });
+    reason
+}
+
+/// Every distinct reason in the tree (trace mode only); internal markers
+/// are reported by name.
+pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
+    let mut reasons = Vec::new();
+    walk_rendered(flat, |index| {
+        let info = &flat[index];
+        let Some(reason) = node_reason(flat, index) else {
+            return false;
+        };
+        let names: Vec<String> = if reason == "internal-marker" {
+            info.style
+                .custom_properties
+                .iter()
+                .flat_map(|props| props.keys())
+                .filter(|key| {
+                    key.starts_with("--w3cos-internal")
+                        && !is_value_carrier_marker(key)
+                        && key.as_str() != inline::IFC_MARKER
+                        && key.as_str() != inline::LINE_WIDTH_MARKER
+                })
+                .map(|key| key.trim_start_matches("--w3cos-internal-").to_string())
+                .collect()
+        } else {
+            vec![reason.to_string()]
+        };
+        for name in names {
+            if !reasons.contains(&name) {
+                reasons.push(name);
+            }
+        }
+        false
+    });
+    reasons.sort_unstable();
+    reasons
+}
+
+#[cfg(test)]
+pub(super) fn supports_tree(flat: &[FlatNodeInfo]) -> bool {
+    unsupported_tree(flat).is_none()
 }
 
 fn border(style: &Style) -> [f32; 4] {
@@ -98,11 +256,22 @@ fn layout_unit(v: f32) -> f32 {
     w3cos_std::style::used_box_spacing(v)
 }
 
-fn resolve_dim(d: Dimension, basis: Option<f32>) -> Option<f32> {
+/// Used length of a size property (legacy `to_taffy_dim` units).
+fn resolve_dim(
+    d: Dimension,
+    basis: Option<f32>,
+    style: &Style,
+    space: &ConstraintSpace,
+) -> Option<f32> {
     match d {
+        Dimension::Auto => None,
         Dimension::Px(v) => Some(v),
         Dimension::Percent(p) => basis.map(|b| layout_unit(b * p / 100.0)),
-        _ => None,
+        Dimension::Rem(v) => Some(v * 16.0),
+        Dimension::Em(v) => Some(v * style.font_size),
+        Dimension::Ch(v) => Some(v * style.ch_advance()),
+        Dimension::Vw(v) => Some(v * space.viewport_w / 100.0),
+        Dimension::Vh(v) => Some(v * space.viewport_h / 100.0),
     }
 }
 
@@ -136,14 +305,14 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
         BoxSizing::BorderBox => (w - edges).max(0.0),
         BoxSizing::ContentBox => w,
     };
-    let specified = resolve_dim(style.width, Some(cb)).map(to_content);
+    let specified = resolve_dim(style.width, Some(cb), style, space).map(to_content);
     let mut content_width = specified
         .unwrap_or(cb - margin[1] - margin[3] - edges)
         .max(0.0);
-    if let Some(max) = resolve_dim(style.max_width, Some(cb)).map(to_content) {
+    if let Some(max) = resolve_dim(style.max_width, Some(cb), style, space).map(to_content) {
         content_width = content_width.min(max);
     }
-    if let Some(min) = resolve_dim(style.min_width, Some(cb)).map(to_content) {
+    if let Some(min) = resolve_dim(style.min_width, Some(cb), style, space).map(to_content) {
         content_width = content_width.max(min);
     }
     let auto_left = style.margin.left == Spacing::Auto;
@@ -182,16 +351,16 @@ pub(super) fn layout_root(
     flat: &[FlatNodeInfo],
     viewport_w: f32,
     viewport_h: f32,
-) -> (f32, f32, BoxFragment) {
+) -> Option<(f32, f32, BoxFragment)> {
     let space = ConstraintSpace {
         available_inline: viewport_w,
         percentage_block: Some(viewport_h),
         viewport_w,
         viewport_h,
     };
-    let result = layout_block(flat, 0, &space, true);
+    let result = layout_block(flat, 0, &space, true)?;
     let metrics = resolve_inline(flat[0].style, &space);
-    (metrics.margin[3], metrics.margin[0], result.fragment)
+    Some((metrics.margin[3], metrics.margin[0], result.fragment))
 }
 
 pub(super) fn layout_block(
@@ -199,7 +368,7 @@ pub(super) fn layout_block(
     index: usize,
     space: &ConstraintSpace,
     force_bfc_root: bool,
-) -> LayoutResult {
+) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
     let metrics = resolve_inline(style, space);
@@ -211,9 +380,26 @@ pub(super) fn layout_block(
         BoxSizing::BorderBox => (h - bt - bb - pt - pb).max(0.0),
         BoxSizing::ContentBox => h,
     };
-    let specified_height = resolve_dim(style.height, space.percentage_block).map(to_content_h);
-    let min_h = resolve_dim(style.min_height, space.percentage_block).map(to_content_h);
-    let max_h = resolve_dim(style.max_height, space.percentage_block).map(to_content_h);
+    let specified_height =
+        resolve_dim(style.height, space.percentage_block, style, space).map(to_content_h);
+    // DOM lowering gives an authored IFC block `min-height: font-size *
+    // line-height` so its flex-row form keeps the initial strut.  The NG
+    // line box already contains that strut (in LayoutUnits), so the
+    // synthetic floor is not a real constraint here.
+    let synthetic_strut_floor = style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(inline::IFC_MARKER))
+        && style.min_height == Dimension::Px(style.font_size * style.line_height)
+        && style.height == Dimension::Auto
+        && style.max_height == Dimension::Auto;
+    let min_h = if synthetic_strut_floor {
+        None
+    } else {
+        resolve_dim(style.min_height, space.percentage_block, style, space).map(to_content_h)
+    };
+    let max_h =
+        resolve_dim(style.max_height, space.percentage_block, style, space).map(to_content_h);
     let clamp_h = |mut h: f32| {
         if let Some(max) = max_h {
             h = h.min(max);
@@ -239,7 +425,26 @@ pub(super) fn layout_block(
     let mut at_top = true; // no in-flow content placed yet
     let mut children = Vec::new();
 
-    let mut child = index + 1;
+    if let ComponentKind::Text { content } = info.kind {
+        // Block-level text leaf: in-flow content of its own.
+        cursor = inline::block_text_height(content, metrics.content_width, style);
+        at_top = false;
+    } else if inline::is_inline_container(flat, index) {
+        let result = inline::layout_inline(flat, index, metrics.content_width)?;
+        cursor = result.height;
+        at_top = result.children.is_empty();
+        children.extend(
+            result
+                .children
+                .into_iter()
+                .map(|(x, y, fragment)| (bl + pl + x, bt + pt + y, fragment)),
+        );
+    }
+    let mut child = if inline::is_inline_container(flat, index) {
+        info.subtree_end
+    } else {
+        index + 1
+    };
     while child < info.subtree_end {
         let child_info = &flat[child];
         let next = child_info.subtree_end.max(child + 1);
@@ -247,7 +452,7 @@ pub(super) fn layout_block(
             child = next;
             continue;
         }
-        let result = layout_block(flat, child, &child_space, false);
+        let result = layout_block(flat, child, &child_space, false)?;
         let child_metrics = resolve_inline(child_info.style, &child_space);
         let x = bl + pl + child_metrics.margin[3];
         let y;
@@ -327,7 +532,7 @@ pub(super) fn layout_block(
         start_strut = own;
     }
 
-    LayoutResult {
+    Some(LayoutResult {
         fragment: BoxFragment {
             index,
             width: metrics.content_width + bl + br + pl + pr,
@@ -337,5 +542,5 @@ pub(super) fn layout_block(
         start_strut,
         end_strut,
         self_collapsing,
-    }
+    })
 }

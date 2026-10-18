@@ -1,0 +1,290 @@
+//! S2a inline formatting context: generated IFC corpus judged against
+//! Chrome (tools/layout-ng/chrome_oracle.py, Ahem so glyph advances and
+//! font metrics are exact in both engines).
+
+use super::*;
+use crate::layout::pre_flatten;
+use w3cos_std::style::{Dimension, Display, Edges, Spacing, Style, TextAlign, WhiteSpace};
+
+const AHEM_OWNER: u64 = 0x1a70_75ce_a4e1;
+
+/// Registers the pinned WPT Ahem face for the guard's lifetime.
+pub(super) struct AhemGuard;
+
+impl AhemGuard {
+    pub(super) fn new() -> Self {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        ))
+        .expect("Ahem fixture");
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                AHEM_OWNER,
+                crate::font_face::FontFace {
+                    family: "Ahem".into(),
+                    src: crate::font_face::FontSource::Bytes(bytes),
+                    ..Default::default()
+                },
+            )
+            .expect("register Ahem");
+        AhemGuard
+    }
+}
+
+impl Drop for AhemGuard {
+    fn drop(&mut self) {
+        crate::font_face::FontRegistry::global().clear_owner(AHEM_OWNER);
+    }
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn pick(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn of<T: Copy>(&mut self, choices: &[T]) -> T {
+        choices[self.pick(choices.len() as u64) as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LineHeight {
+    Number(f32),
+    Px(f32),
+}
+
+fn font(style: &mut Style, size: f32, line_height: LineHeight) {
+    style.font_family = Some("Ahem".into());
+    style.font_size = size;
+    style.line_height_is_normal = false;
+    match line_height {
+        LineHeight::Number(n) => {
+            style.line_height = n;
+            style.line_height_computed_px = None;
+        }
+        LineHeight::Px(px) => {
+            style.line_height = px / size;
+            style.line_height_computed_px = Some(px);
+        }
+    }
+}
+
+fn line_height_css(style: &Style) -> String {
+    match style.line_height_computed_px {
+        Some(px) => format!("{px}px"),
+        None => format!("{}", style.line_height),
+    }
+}
+
+/// One generated case: a block root with IFC containers of Ahem words.
+fn random_case(rng: &mut Rng) -> Component {
+    let mut containers = Vec::new();
+    for _ in 0..1 + rng.pick(3) {
+        // Sizes with an integral 0.8em Ahem ascent: Blink rounds font
+        // ascent/descent to integers, the non-Skia test backend does not,
+        // and that font-backend precision is not what this corpus tests.
+        let size = rng.of(&[10.0, 15.0, 20.0]);
+        let line_height = if rng.pick(2) == 0 {
+            LineHeight::Number(rng.of(&[1.0, 1.25, 2.0]))
+        } else {
+            LineHeight::Px(rng.of(&[12.0, 20.0, 37.0]))
+        };
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(rng.of(&[40.0, 75.0, 120.0, 200.0, 333.0])),
+            text_align: rng.of(&[TextAlign::Start, TextAlign::Center, TextAlign::Right]),
+            white_space: if rng.pick(10) == 0 {
+                WhiteSpace::NoWrap
+            } else {
+                WhiteSpace::Normal
+            },
+            ..Style::default()
+        };
+        let m = rng.of(&[0.0, 5.0, 10.0]);
+        style.margin = Edges {
+            top: Spacing::Px(m),
+            right: Spacing::Px(0.0),
+            bottom: Spacing::Px(m),
+            left: Spacing::Px(0.0),
+        };
+        font(&mut style, size, line_height);
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let mut items = Vec::new();
+        let count = 1 + rng.pick(10);
+        for i in 0..count {
+            let mut text = "X".repeat(1 + rng.pick(6) as usize);
+            let separator = rng.pick(10);
+            let last = i + 1 == count;
+            if separator < 6 && !last {
+                text.push(' ');
+            }
+            let mut item = Style {
+                display: Display::Inline,
+                white_space: style.white_space,
+                text_align: style.text_align,
+                ..Style::default()
+            };
+            if rng.pick(5) == 0 {
+                let own = rng.of(&[10.0, 15.0, 25.0, 30.0, 40.0]);
+                let lh = if rng.pick(2) == 0 {
+                    line_height
+                } else {
+                    LineHeight::Number(1.0)
+                };
+                font(&mut item, own, lh);
+            } else {
+                font(&mut item, size, line_height);
+            }
+            items.push(Component::text(text, item.clone()));
+            if (6..8).contains(&separator) && !last {
+                items.push(Component::text(" ", item));
+            }
+        }
+        containers.push(Component::boxed(style, items));
+    }
+    let root = Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    Component::boxed(root, containers)
+}
+
+fn case_html(flat: &[crate::layout::FlatNodeInfo]) -> String {
+    let mut html = String::from("<div id=n0 style=\"display:flow-root\">");
+    let mut i = 1;
+    while i < flat.len() {
+        let s = flat[i].style;
+        let Dimension::Px(width) = s.width else {
+            unreachable!()
+        };
+        let Spacing::Px(margin) = s.margin.top else {
+            unreachable!()
+        };
+        html.push_str(&format!(
+            "<div id=n{i} style=\"width:{width}px;margin:{margin}px 0;font:{}px/{} Ahem;text-align:{};white-space:{}\">",
+            s.font_size,
+            line_height_css(s),
+            match s.text_align {
+                TextAlign::Center => "center",
+                TextAlign::Right => "right",
+                _ => "start",
+            },
+            if s.white_space == WhiteSpace::NoWrap { "nowrap" } else { "normal" },
+        ));
+        let end = flat[i].subtree_end;
+        for t in i + 1..end {
+            let ts = flat[t].style;
+            let w3cos_std::ComponentKind::Text { content } = flat[t].kind else {
+                unreachable!()
+            };
+            html.push_str(&format!(
+                "<span id=n{t} style=\"font-size:{}px;line-height:{}\">{}</span>",
+                ts.font_size,
+                line_height_css(ts),
+                content
+            ));
+        }
+        html.push_str("</div>");
+        i = end;
+    }
+    html.push_str("</div>");
+    html
+}
+
+const CASES: usize = 300;
+const SEED: u64 = 0x5eed_1a70_0115_0002;
+
+fn rects_json(set: &[(LayoutRect, usize)]) -> String {
+    let mut v: Vec<_> = set
+        .iter()
+        .map(|(r, i)| (*i, [r.x, r.y, r.width, r.height]))
+        .collect();
+    v.sort_by_key(|(i, _)| *i);
+    v.into_iter()
+        .map(|(i, r)| format!("\"{i}\":{r:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Every generated IFC is inside S2a, and NG lays it out.  With
+/// W3COS_NG_INLINE_DUMP=path the cases (HTML + NG/legacy rects) are written
+/// for the Chrome oracle.
+#[test]
+fn generated_inline_trees_are_supported() {
+    let _ahem = AhemGuard::new();
+    let mut rng = Rng(SEED);
+    let dump = std::env::var_os("W3COS_NG_INLINE_DUMP");
+    let mut lines = String::new();
+    for case in 0..CASES {
+        let root = random_case(&mut rng);
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "case {case}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        if dump.is_some() {
+            let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+            lines.push_str(&format!(
+                "{{\"case\":{case},\"fonts\":[\"Ahem\"],\"html\":{:?},\"legacy\":{{{}}},\"ng\":{{{}}}}}\n",
+                case_html(&flat),
+                rects_json(&legacy),
+                rects_json(&ng)
+            ));
+        }
+    }
+    if let Some(path) = dump {
+        std::fs::write(path, lines).expect("dump");
+    }
+}
+
+/// Checked-in Chrome expectations (testdata/generated-inline-chrome.json;
+/// rects in 1/64 px).  A whitespace-only item removed at a line edge has no
+/// NG fragment and a zero-width Chrome rect.
+#[test]
+fn generated_inline_trees_match_chrome() {
+    let golden: std::collections::HashMap<String, std::collections::HashMap<String, [i64; 4]>> =
+        serde_json::from_str(include_str!("testdata/generated-inline-chrome.json"))
+            .expect("golden json");
+    let _ahem = AhemGuard::new();
+    let mut rng = Rng(SEED);
+    let mut failures = Vec::new();
+    for case in 0..CASES {
+        let root = random_case(&mut rng);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        let expected = &golden[&case.to_string()];
+        for (key, want) in expected {
+            let index: usize = key.parse().expect("index");
+            let got = ng
+                .iter()
+                .find(|(_, i)| *i == index)
+                .map(|(r, _)| [r.x, r.y, r.width, r.height].map(|v| (v * 64.0).round() as i64));
+            let ok = match got {
+                Some(got) => got == *want,
+                None => want[2] == 0,
+            };
+            if !ok {
+                failures.push((case, index, got, *want));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} boxes differ from Chrome, first: {:?}",
+        failures.len(),
+        &failures[..failures.len().min(5)]
+    );
+}
