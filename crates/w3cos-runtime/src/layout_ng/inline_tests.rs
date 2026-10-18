@@ -574,3 +574,106 @@ fn pre_wrap_spaces_at_block_end_hang_conditionally() {
         assert_eq!((r.x, r.width), (x, width), "#{index}");
     }
 }
+
+/// NGLineBreaker forced breaks: a `<br>` leaf ends the line, adds no
+/// advance, removes collapsible spaces before it; consecutive breaks make an
+/// empty strut-height line; a final break adds none.  Rects from Chrome.
+#[test]
+fn forced_breaks_end_lines() {
+    let _ahem = AhemGuard::new();
+    let container = |line_height: f32, align: TextAlign| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            text_align: align,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(line_height));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str, size: f32, line_height: f32| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, size, LineHeight::Number(line_height));
+        Component::text(content, style)
+    };
+    let br = "\u{2028}";
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                container(1.0, TextAlign::Start),
+                vec![
+                    text("XX", 20.0, 1.0),
+                    text("Y", 10.0, 1.0),
+                    text(br, 20.0, 1.0),
+                    text("XXX", 20.0, 1.0),
+                ],
+            ),
+            Component::boxed(
+                container(1.0, TextAlign::Start),
+                vec![
+                    text("XX ", 20.0, 1.0),
+                    text("Y", 10.0, 1.0),
+                    text(" ", 20.0, 1.0),
+                    text(br, 20.0, 1.0),
+                    text("XXX ", 20.0, 1.0),
+                    text("Y", 10.0, 1.0),
+                ],
+            ),
+            Component::boxed(
+                container(2.0, TextAlign::Center),
+                vec![
+                    text("XX", 20.0, 2.0),
+                    text("Y", 10.0, 2.0),
+                    text(br, 20.0, 2.0),
+                    text(br, 20.0, 2.0),
+                    text("XXX", 20.0, 2.0),
+                ],
+            ),
+            Component::boxed(
+                container(1.0, TextAlign::Start),
+                vec![
+                    text("XX", 20.0, 1.0),
+                    text("Y", 10.0, 1.0),
+                    text(br, 20.0, 1.0),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // (index, [x, y, w, h]) from Chrome (text rects; containers).
+    let expected: [(usize, [f32; 4]); 16] = [
+        (1, [0.0, 0.0, 300.0, 40.0]),
+        (2, [0.0, 0.0, 40.0, 20.0]),
+        (3, [40.0, 8.0, 10.0, 10.0]),
+        (5, [0.0, 20.0, 60.0, 20.0]),
+        (6, [0.0, 40.0, 300.0, 40.0]),
+        (7, [0.0, 40.0, 60.0, 20.0]),
+        (8, [60.0, 48.0, 10.0, 10.0]),
+        (11, [0.0, 60.0, 80.0, 20.0]),
+        (12, [80.0, 68.0, 10.0, 10.0]),
+        (13, [0.0, 80.0, 300.0, 120.0]),
+        (14, [125.0, 90.0, 40.0, 20.0]),
+        (15, [165.0, 98.0, 10.0, 10.0]),
+        (18, [120.0, 170.0, 60.0, 20.0]),
+        (19, [0.0, 200.0, 300.0, 20.0]),
+        (20, [0.0, 200.0, 40.0, 20.0]),
+        (21, [40.0, 208.0, 10.0, 10.0]),
+    ];
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
+    }
+}

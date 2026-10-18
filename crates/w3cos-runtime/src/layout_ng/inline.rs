@@ -52,6 +52,8 @@ pub(super) const IFC_MARKER: &str = "--w3cos-internal-inline-formatting-context"
 pub(super) const ANONYMOUS_BLOCK_MARKER: &str = "--w3cos-internal-anonymous-block-line";
 /// On the root component in quirks mode (w3cos_dom QUIRKS_MODE_MARKER).
 const QUIRKS_MARKER: &str = "--w3cos-internal-quirks-mode";
+/// A `<br>` the cascade keeps as its own leaf (Blink NGInlineItem kControl).
+const FORCED_BREAK: &str = "\u{2028}";
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
 
 fn zero_edges(style: &Style) -> bool {
@@ -187,7 +189,7 @@ fn inline_text_reason(content: &str, style: &Style, sole: bool) -> Option<&'stat
         }
         // Items may hold internal soft-wrap opportunities (the breaker falls
         // back when it would need one), but no forced break.
-        if content.contains(['\u{2028}', '\u{2029}']) {
+        if content.contains(['\u{2028}', '\u{2029}']) && content != FORCED_BREAK {
             return Some("text:internal-break");
         }
     }
@@ -268,6 +270,18 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if let Some(reason) = inline_text_reason(content, info.style, sole) {
             return Some(reason);
         }
+        if content == FORCED_BREAK {
+            // NGLineBreaker forced break: the item adds no metrics, so its
+            // font must be the strut's (a <br> in a differently sized inline
+            // box would need that box's strut, NGInlineBoxState).  Quirks
+            // empty-line rules and preserved spaces before it: legacy.
+            if !same_font(info.style, style)
+                || !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+                || has_marker(flat[0].style, QUIRKS_MARKER)
+            {
+                return Some("text:forced-break");
+            }
+        }
     }
     None
 }
@@ -308,6 +322,8 @@ struct InlineItem {
     starts_space: bool,
     ends_space: bool,
     whitespace_only: bool,
+    /// A forced line break (`<br>`): ends the line, zero advance.
+    forced: bool,
     /// A soft-wrap opportunity inside the item's non-space core: NG keeps
     /// one fragment per item, so a line that needs it falls back.
     internal_break: bool,
@@ -390,7 +406,7 @@ fn hang_advance(content: &str, raw: f32, style: &Style) -> f32 {
 fn line_width(items: &[InlineItem], line: &[usize]) -> f32 {
     let end = line
         .iter()
-        .rposition(|&k| !items[k].whitespace_only)
+        .rposition(|&k| !items[k].whitespace_only && !items[k].forced)
         .map_or(0, |p| p + 1);
     let mut width = 0.0f32;
     let mut slice = 0.0f32;
@@ -504,9 +520,13 @@ pub(super) fn layout_inline(
             (ascent - inline_font_content_ascent(style), font_height)
         } else {
             let line = inline_used_line_height(inline_style_line_height(style));
+            // Paint steps forced (U+2028, a coalesced <br>) lines itself
+            // from the first line's content box; soft-wrapped paragraphs
+            // cover all their lines.
+            let forced = content.contains('\u{2028}');
             (
                 crate::layout::inline_upper_leading(line, font_height),
-                height,
+                if forced { font_height } else { height },
             )
         };
         return Some(InlineResult {
@@ -550,7 +570,12 @@ pub(super) fn layout_inline(
         for (offset, &child) in children[start..end].iter().enumerate() {
             let style = flat[child].style;
             let content = texts[offset];
-            let raw = advances[offset];
+            // A forced break has no advance (kControl item).
+            let raw = if content == FORCED_BREAK {
+                0.0
+            } else {
+                advances[offset]
+            };
             let (height, baseline) = text_line_metrics(content, style);
             items.push(InlineItem {
                 index: child,
@@ -565,6 +590,7 @@ pub(super) fn layout_inline(
                 starts_space: content.starts_with(' '),
                 ends_space: content.ends_with(' '),
                 whitespace_only: content.trim_end_matches(' ').is_empty(),
+                forced: content == FORCED_BREAK,
                 // Preserved leading spaces (pre-wrap) end in an opportunity
                 // inside the item too; collapsible ones vanish at a line start.
                 internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char)
@@ -593,6 +619,13 @@ pub(super) fn layout_inline(
         let item = &items[i];
         if !preserve && current.is_empty() && item.whitespace_only {
             // A collapsible space at the start of a line is removed.
+            i += 1;
+            continue;
+        }
+        if item.forced {
+            // NGLineBreaker::HandleForcedLineBreak.
+            current.push(i);
+            lines.push(std::mem::take(&mut current));
             i += 1;
             continue;
         }
@@ -654,10 +687,15 @@ pub(super) fn layout_inline(
     let line_count = lines.len();
     let mut built = Vec::with_capacity(lines.len());
     for (line_index, mut line) in lines.into_iter().enumerate() {
-        // Trailing collapsible spaces are removed at the line end.
+        // Trailing collapsible spaces are removed at the line end, also
+        // before a forced break.
+        let forced = line.last().is_some_and(|&k| items[k].forced);
+        let brk = if forced { line.pop() } else { None };
         while !preserve && line.last().is_some_and(|&k| items[k].whitespace_only) {
             line.pop();
         }
+        line.extend(brk);
+        let content_len = line.len() - usize::from(forced);
         if line.is_empty() {
             continue;
         }
@@ -668,7 +706,7 @@ pub(super) fn layout_inline(
         let mut slice = 0.0f32;
         for (position, &k) in line.iter().enumerate() {
             let item = &items[k];
-            let last_on_line = position + 1 == line.len();
+            let last_on_line = position + 1 >= content_len;
             // Hanging preserved spaces keep their advance in the fragment.
             let advance = if last_on_line && !hang_preserved {
                 item.raw_hang
@@ -724,6 +762,21 @@ pub(super) fn layout_inline(
         let baseline = top + line.ascent;
         for (k, x, width) in line.items {
             let item = &items[k];
+            if item.forced {
+                // The engine's <br> marker: a zero-height full-width rect at
+                // the line end, painting nothing.
+                out.push((
+                    0.0,
+                    top + line.ascent + line.descent,
+                    BoxFragment {
+                        index: item.index,
+                        width: available,
+                        height: 0.0,
+                        children: Vec::new(),
+                    },
+                ));
+                continue;
+            }
             out.push((
                 offset + x,
                 baseline - item.content_ascent,
