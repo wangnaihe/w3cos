@@ -11,8 +11,9 @@ WPT checkout (sparse) needs: `common resources fonts images infrastructure
 css/support css/reference css/CSS2 css/css-{flexbox,grid,tables,display,
 position,sizing,overflow,text,inline} dom/nodes`.
 
-Baseline pass set: `tests/wpt/layout-baseline-pass.txt` (origin/main f111676, the
-#113 squash; same tree as fa6d696). Previous main 4a91b5a shown for reference.
+Baseline pass set: `tests/wpt/layout-baseline-pass.txt` (origin/main c33c102,
+the #124 squash; 3857 passes, a superset of f111676's 3854: the 3 #113
+regressions fixed, none lost). Earlier mains shown for reference.
 Gate: the candidate's pass set must be a superset of it (zero regressions).
 
 ```sh
@@ -27,23 +28,23 @@ chunks, so an interrupted run resumes where it stopped.
 
 ## Baseline counts (2026-10-18, Apple Silicon Mac, --jobs 8)
 
-| dir | total | main f111676 (baseline) | main 4a91b5a (before #113) |
-|---|---:|---:|---:|
-| css/CSS2/floats | 120 | 107 | 107 |
-| css/CSS2/floats-clear | 215 | 187 | 187 |
-| css/CSS2/linebox | 198 | 57 | 57 |
-| css/CSS2/margin-padding-clear | 682 | 665 | 665 |
-| css/CSS2/normal-flow | 810 | 752 | 752 |
-| css/css-display | 242 | 102 | 102 |
-| css/css-flexbox | 1350 | 445 | 444 |
-| css/css-grid | 2281 | 475 | 476 |
-| css/css-inline | 234 | 43 | 43 |
-| css/css-overflow | 651 | 154 | 156 |
-| css/css-position | 350 | 113 | 113 |
-| css/css-sizing | 733 | 169 | 168 |
-| css/css-tables | 297 | 114 | 114 |
-| css/css-text | 1615 | 471 | 469 |
-| **all** | 9778 | 3854 | 3853 |
+| dir | total | main c33c102 (baseline) | main f111676 | main 4a91b5a (before #113) |
+|---|---:|---:|---:|---:|
+| css/CSS2/floats | 120 | 107 | 107 | 107 |
+| css/CSS2/floats-clear | 215 | 187 | 187 | 187 |
+| css/CSS2/linebox | 198 | 57 | 57 | 57 |
+| css/CSS2/margin-padding-clear | 682 | 665 | 665 | 665 |
+| css/CSS2/normal-flow | 810 | 752 | 752 | 752 |
+| css/css-display | 242 | 102 | 102 | 102 |
+| css/css-flexbox | 1350 | 445 | 445 | 444 |
+| css/css-grid | 2281 | 476 | 475 | 476 |
+| css/css-inline | 234 | 43 | 43 | 43 |
+| css/css-overflow | 651 | 156 | 154 | 156 |
+| css/css-position | 350 | 113 | 113 | 113 |
+| css/css-sizing | 733 | 169 | 169 | 168 |
+| css/css-tables | 297 | 114 | 114 | 114 |
+| css/css-text | 1615 | 471 | 471 | 469 |
+| **all** | 9778 | 3857 | 3854 | 3853 |
 
 Wall time: 4a91b5a ~46 min (09:47–10:33 Asia/Shanghai, machine shared with other
 work), f111676 css3 part 17 min.

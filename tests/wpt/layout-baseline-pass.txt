@@ -1,4 +1,4 @@
-# path	kind -- layout WPT tests passing on origin/main f111676 (= fa6d696 tree; WPT fa5393bb9f5f), see layout-baseline.md
+# path	kind -- layout WPT tests passing on origin/main c33c102 (#124 squash; WPT fa5393bb9f5f), see layout-baseline.md
 css/CSS2/floats-clear/adjacent-floats-001.xht	reftest
 css/CSS2/floats-clear/adjoining-float-before-clearance.html	reftest
 css/CSS2/floats-clear/adjoining-float-nested-forced-clearance-002.html	reftest
@@ -2736,6 +2736,7 @@ css/css-grid/grid-model/grid-overflow-padding-002.html	reftest
 css/css-grid/grid-overflowing-item-below-container-is-painted.html	reftest
 css/css-grid/grid-overflowing-item-in-both-axes-is-painted.html	reftest
 css/css-grid/grid-overflowing-item-right-of-container-is-painted.html	reftest
+css/css-grid/grid-relayout-with-nested-grid.html	reftest
 css/css-grid/grid-tracks-fractional-fr.html	testharness
 css/css-grid/grid-with-content-dynamic-display-001.html	reftest
 css/css-grid/grid-with-content-dynamic-display-002.html	reftest
@@ -2894,6 +2895,7 @@ css/css-overflow/overflow-body-propagation-008.html	reftest
 css/css-overflow/overflow-body-propagation-011.html	reftest
 css/css-overflow/overflow-body-propagation-012.html	reftest
 css/css-overflow/overflow-body-propagation-016.html	reftest
+css/css-overflow/overflow-canvas.html	reftest
 css/css-overflow/overflow-clip-hit-testing.html	testharness
 css/css-overflow/overflow-clip-margin-002.html	reftest
 css/css-overflow/overflow-clip-margin-003.html	reftest
@@ -2950,6 +2952,7 @@ css/css-overflow/scroll-markers/scroll-markers-under-content-visibility-auto.htm
 css/css-overflow/scroll-markers/scroll-target-group-008.html	reftest
 css/css-overflow/scroll-markers/scroll-target-group-inline-targets.html	reftest
 css/css-overflow/scrollable-overflow-empty-newline-span.html	reftest
+css/css-overflow/scrollable-overflow-fixed-positioned-initial-containing-block.html	testharness
 css/css-overflow/scrollable-overflow-transform-011.html	reftest
 css/css-overflow/scrollable-overflow-vertical-rl-dynamic.html	testharness
 css/css-overflow/scrollable-overflow-with-nested-elements-002.html	testharness
