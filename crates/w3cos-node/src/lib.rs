@@ -27,8 +27,17 @@ pub const MODULES: &[(&str, &str)] = &[
         include_str!("../js/w3cos_worker.js"),
     ),
     // Native-module replacements (see `NATIVE_REPLACEMENTS`).
+    (
+        "internal/w3cos_native_keymap",
+        include_str!("../js/native_keymap.js"),
+    ),
+    (
+        "internal/w3cos_policy_watcher",
+        include_str!("../js/policy_watcher.js"),
+    ),
     ("internal/w3cos_spdlog", include_str!("../js/spdlog.js")),
     ("internal/w3cos_sqlite3", include_str!("../js/sqlite3.js")),
+    ("internal/w3cos_watcher", include_str!("../js/watcher.js")),
     ("net", include_str!("../js/net.js")),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),
@@ -60,6 +69,12 @@ pub const ELECTRON: &str = include_str!("../js/electron.js");
 /// (M3 item 20). These resolve to the glue even when the package is
 /// installed, since its `.node` binary cannot load into an AOT app.
 pub const NATIVE_REPLACEMENTS: &[(&str, &str)] = &[
+    ("@parcel/watcher", "internal/w3cos_watcher"),
+    ("@w3cos/watcher", "internal/w3cos_watcher"),
+    ("native-keymap", "internal/w3cos_native_keymap"),
+    ("@w3cos/native-keymap", "internal/w3cos_native_keymap"),
+    ("@vscode/policy-watcher", "internal/w3cos_policy_watcher"),
+    ("@w3cos/policy-watcher", "internal/w3cos_policy_watcher"),
     ("@vscode/spdlog", "internal/w3cos_spdlog"),
     ("@w3cos/spdlog", "internal/w3cos_spdlog"),
     ("@vscode/sqlite3", "internal/w3cos_sqlite3"),
