@@ -4472,6 +4472,10 @@ fn global_value_expr(name: &str) -> Option<String> {
         "String" => "w3cos_core::string_value()".to_string(),
         "Number" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"MAX_SAFE_INTEGER\".to_string(), w3cos_core::Value::Number(9007199254740991.0)), (\"MIN_SAFE_INTEGER\".to_string(), w3cos_core::Value::Number(-9007199254740991.0)), (\"EPSILON\".to_string(), w3cos_core::Value::Number(f64::EPSILON)), (\"MAX_VALUE\".to_string(), w3cos_core::Value::Number(f64::MAX)), (\"MIN_VALUE\".to_string(), w3cos_core::Value::Number(5e-324)), (\"POSITIVE_INFINITY\".to_string(), w3cos_core::Value::Number(f64::INFINITY)), (\"NEGATIVE_INFINITY\".to_string(), w3cos_core::Value::Number(f64::NEG_INFINITY)), (\"NaN\".to_string(), w3cos_core::Value::Number(f64::NAN)), (\"isFinite\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_finite())))), (\"isInteger\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_finite() && value.fract() == 0.0)))), (\"isNaN\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_nan())))), (\"isSafeInteger\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_finite() && value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0))))]), |_this, __args| w3cos_core::Value::Number(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number()))".to_string(),
         "Boolean" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_bool()))".to_string(),
+        // As values (`typeof parseFloat`, `[...].map(parseFloat)`, CommonJS
+        // modules reading the global); direct calls stay static Rust calls.
+        "parseFloat" => "w3cos_core::named_function(\"parseFloat\", 1, |_this, __args| w3cos_core::parseFloat(__args))".to_string(),
+        "parseInt" => "w3cos_core::named_function(\"parseInt\", 2, |_this, __args| w3cos_core::parseInt(__args))".to_string(),
         "isNaN" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number().is_nan()))".to_string(),
         "isFinite" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number().is_finite()))".to_string(),
         // `Set` as a value: the real ES6 Set class (see Map above);
@@ -4636,8 +4640,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).
         // CommonJS/Node artifacts that appear in UMD-wrapped sources.
-        // `process.env.X` / `process.argv` feature probes must stay total.
-        "process" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"env\".to_string(), w3cos_core::Value::object(::std::collections::HashMap::new())), (\"argv\".to_string(), w3cos_core::Value::array(Vec::new()))])) /* builtin stub */".to_string(),
+        // `process` is one host-backed object per page (env, argv, cwd, exit).
+        "process" => "w3cos_core::process_value()".to_string(),
         "require" | "module" | "exports" | "global" | "Buffer" | "__dirname"
         | "__filename"
         // AMD (`define`/`define.amd`) and Worker (`importScripts`) globals:
