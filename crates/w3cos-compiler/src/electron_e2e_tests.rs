@@ -176,3 +176,60 @@ fn version_normalization() {
         "Chromium <v>, x"
     );
 }
+
+const PLATFORM: &[(&str, &str)] = example!(
+    "electron-platform",
+    ["package.json", "main.js", "page.html", "data.json"]
+);
+
+/// Electron 44.9.0 (`electron --no-sandbox examples/electron-platform` under
+/// xvfb), byte for byte: `vscode-file://` through `protocol.handle` +
+/// `net.fetch` + `loadURL`, nativeTheme, screen, safeStorage.
+const PLATFORM_ELECTRON: &str = r#"screen-before-ready-throws true
+theme system boolean false false false false
+dark dark true
+light light false
+bad-source TypeError "Error processing argument at index 0, conversion failure from blue"
+after-bad light
+updates 1
+display-keys accelerometerSupport,bounds,colorDepth,colorSpace,depthPerComponent,detected,displayFrequency,id,internal,label,maximumCursorSize,monochrome,nativeOrigin,rotation,scaleFactor,size,touchSupport,workArea,workAreaSize
+display number string number number 0 0 true true 0 false unknown false true
+all true true true
+nearest true true
+cursor number number function function
+ss true string
+ss-enc true false
+ss-dec secret ✓ token
+ss-empty ""
+ss-dec-type Error "Expected the first argument of decryptString() to be a buffer"
+ss-dec-bad Error "Error while decrypting the ciphertext provided to safeStorage.decryptString. Ciphertext does not appear to be encrypted."
+ss-enc-type TypeError "Error processing argument at index 0, conversion failure from "
+handled-before false
+handled-after true
+handler vscode-app data.json GET
+fetch 200 true {"answer":42}
+handler other x GET
+denied 403 denied
+double-handle Failed to register protocol: vscode-file
+handler vscode-app page.html GET
+loaded true vscode-file page
+handled-unhandled false
+"#;
+
+#[test]
+fn electron_protocol_theme_screen_safe_storage_match_electron() {
+    let root = write_fixture("w3cos_electron_platform", PLATFORM);
+    // A throwaway keyring: the test must not create the user's key.
+    let keyring = root.join("keyring");
+    let keyring = keyring.to_str().unwrap();
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_platform",
+        &[("W3COS_KEYRING_DIR", keyring)],
+    );
+    let expected: Vec<&str> = PLATFORM_ELECTRON.lines().collect();
+    assert_eq!(lines, expected);
+    assert!(root.join("keyring/safe-storage.key").is_file());
+    std::fs::remove_dir_all(root).ok();
+}
