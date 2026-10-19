@@ -279,7 +279,8 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 
 ### M3 Code-OSS workbench 启动
 19. `child_process`、`net`（UDS）、`worker_threads`、`MessageChannelMain`/`utilityProcess`。
-    - **进展（第一刀：child_process + net + 权限层）**：`child_process`（spawn/exec/execFile/promisify 与 spawnSync/execSync/execFileSync）和 `net`（TCP + UDS 的 Server/Socket，半关闭，地址）都建在宿主的非阻塞 I/O 上，由一个共享的 poll 循环驱动。每次 spawn、listen、connect 都先过宿主权限层（`node_host_io::set_permission_policy`；没有策略时按 `W3COS_NODE_DENY` 判定），被拒时抛 Node 权限模型的 `ERR_ACCESS_DENIED`。e2e 测试逐行对比 Node 20.19 的输出。编译器顺带修了 `class X extends 普通函数` 的 `super()`，以及 `Array.from(Set/Map)`。说明见 `docs/W3COS_NODE_IO.md`。`fork` 和 IPC 归第二刀（worker_threads、MessageChannelMain、utilityProcess）。
+    - **进展（第一刀：child_process + net + 权限层）**：`child_process`（spawn/exec/execFile/promisify 与 spawnSync/execSync/execFileSync）和 `net`（TCP + UDS 的 Server/Socket，半关闭，地址）都建在宿主的非阻塞 I/O 上，由一个共享的 poll 循环驱动。每次 spawn、listen、connect 都先过宿主权限层（`node_host_io::set_permission_policy`；没有策略时按 `W3COS_NODE_DENY` 判定），被拒时抛 Node 权限模型的 `ERR_ACCESS_DENIED`。e2e 测试逐行对比 Node 20.19 的输出。编译器顺带修了 `class X extends 普通函数` 的 `super()`，以及 `Array.from(Set/Map)`。说明见 `docs/W3COS_NODE_IO.md`。`fork` 和 IPC 还没做。
+    - **进展（第二刀：worker_threads + utilityProcess + MessageChannelMain）**：worker 是带独立 realm 的 OS 线程，线程里重新跑程序的 `run_entry`，入口记录开头的引导代码再分派到 worker 模块。编译器静态识别 `new Worker(...)` 和 `utilityProcess.fork(...)` 的路径并把 worker 文件链接进来。消息走结构化克隆。`new Worker` 同样先过权限层（scope `worker`）。e2e 测试对比 Node 20.19 和 Electron 44.9.0。不支持的部分（eval worker、动态路径、跨线程转移 port、`fork`）见 `docs/W3COS_NODE_IO.md`。
 20. `@w3cos/sqlite3`、`@w3cos/spdlog`、`@w3cos/watcher`（parcel API → `fs_watch.rs`）、`native-keymap`、杂项 stub。
 21. `vscode-file://` 协议、`nativeTheme`、`screen`、`safeStorage`。
 22. CSS/DOM 缺口清零（按 `docs/vscode-compat.md` 2.1 与 `docs/monaco-gap-report.md`：adoptedStyleSheets、Drag and Drop、scrollTo 等）。
