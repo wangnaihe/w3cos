@@ -5,6 +5,9 @@ mod cjs_e2e_tests;
 pub mod codegen;
 pub mod css_parser;
 pub mod css_values;
+pub mod electron_app;
+#[cfg(test)]
+mod electron_e2e_tests;
 pub mod esm_codegen;
 pub mod esm_css;
 pub mod esm_lowering;

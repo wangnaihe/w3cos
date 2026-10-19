@@ -32,6 +32,11 @@ It is not a root `Navigator` member (`navigator.process`), not a global
 `w3cos`, and not `chrome.*` or `electron.*`. Those names either look like
 a standard API or import another vendor's permission model.
 
+Electron apps keep their own API as a module: `require('electron')` /
+`@w3cos/electron` is an AOT-compiled adapter that maps onto standard
+objects first (File System Access pickers, `alert`/`confirm`,
+`window.open`, `document.title`). See `docs/W3COS_ELECTRON.md`.
+
 ## Permission model
 
 Every method checks one named capability before it touches the host.

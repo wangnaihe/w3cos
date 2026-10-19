@@ -708,6 +708,10 @@ pub struct EsmResolver {
     commonjs_requested: RefCell<HashMap<PathBuf, BTreeSet<String>>>,
     /// Literal `require()`s that did not resolve (they throw when called).
     commonjs_diagnostics: RefCell<Vec<String>>,
+    /// Electron renderer-side scripts (preloads, `<script src>` files): classic
+    /// scripts loaded on demand, so marker-free files become CommonJS records
+    /// too (see [`crate::cjs::classify_as`]).
+    classic_scripts: RefCell<HashSet<PathBuf>>,
 }
 
 impl EsmResolver {
@@ -720,6 +724,7 @@ impl EsmResolver {
             commonjs: RefCell::new(HashMap::new()),
             commonjs_requested: RefCell::new(HashMap::new()),
             commonjs_diagnostics: RefCell::new(Vec::new()),
+            classic_scripts: RefCell::new(HashSet::new()),
         }
     }
 
@@ -798,6 +803,11 @@ impl EsmResolver {
         }
         if specifier.starts_with('#') {
             return self.resolve_package_imports(specifier, from_dir, kind);
+        }
+        if crate::electron_app::is_electron_specifier(specifier) {
+            let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
+            self.classic_scripts.borrow_mut().extend(scripts);
+            return Ok(resolved);
         }
         if specifier.starts_with("node:") {
             if let Some(resolved) = node_builtin_module(specifier, &self.project_root)? {
@@ -939,7 +949,12 @@ impl EsmResolver {
         let Ok(source) = std::fs::read_to_string(path) else {
             return Ok(false);
         };
-        let analysis = crate::cjs::classify(path, &source, self.is_in_type_module_scope(path))?;
+        let analysis = crate::cjs::classify_as(
+            path,
+            &source,
+            self.is_in_type_module_scope(path),
+            self.classic_scripts.borrow().contains(path),
+        )?;
         let Some(analysis) = analysis.map(Rc::new) else {
             self.commonjs.borrow_mut().insert(path.to_path_buf(), None);
             module_source::clear(path);
@@ -1732,23 +1747,47 @@ fn node_builtin_module(specifier: &str, project_root: &Path) -> Result<Option<Re
     };
     let name = w3cos_node::module_name(specifier);
     let path = node_builtin_dir(project_root)?.join(format!("{}.js", name.replace('/', "__")));
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
-        // Unique per writer: parallel resolutions in one process (tests,
-        // threaded builds) must not share a temp file.
-        static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let writer = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let temp = path.with_extension(format!("js.{}.{writer}", std::process::id()));
-        std::fs::write(&temp, source)
-            .with_context(|| format!("writing Node builtin `{name}` to {}", temp.display()))?;
-        std::fs::rename(&temp, &path)
-            .with_context(|| format!("installing Node builtin `{name}` at {}", path.display()))?;
-    }
+    install_glue_file(&path, source)?;
     Ok(Some(ResolvedModule {
         specifier: specifier.to_string(),
         path,
         kind: ModuleKind::Package,
         package_name: Some(format!("node:{name}")),
     }))
+}
+
+/// Write `source` at `path` unless it is already there.
+fn install_glue_file(path: &Path, source: &str) -> Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() != Some(source) {
+        // Unique per writer: parallel resolutions in one process (tests,
+        // threaded builds) must not share a temp file.
+        static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let writer = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("js.{}.{writer}", std::process::id()));
+        std::fs::write(&temp, source)
+            .with_context(|| format!("writing glue module {}", temp.display()))?;
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("installing glue module {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `electron` / `@w3cos/electron`: the Electron glue from `w3cos-node`, next
+/// to this project's generated `electron_app.js` (pages and renderer-side
+/// scripts, see `electron_app.rs`), which the glue requires.
+fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModule, Vec<PathBuf>)> {
+    let dir = node_builtin_dir(project_root)?;
+    let (source, scripts) = crate::electron_app::app_module(project_root);
+    install_glue_file(&dir.join("electron_app.js"), &source)?;
+    let path = dir.join("electron.js");
+    install_glue_file(&path, w3cos_node::ELECTRON)?;
+    let resolved = ResolvedModule {
+        specifier: specifier.to_string(),
+        path,
+        kind: ModuleKind::Package,
+        package_name: Some("electron".to_string()),
+    };
+    Ok((resolved, scripts))
 }
 
 fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
@@ -1763,7 +1802,8 @@ fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
     };
     let glue = fnv(&mut w3cos_node::MODULES
         .iter()
-        .flat_map(|(name, source)| name.bytes().chain(source.bytes())));
+        .flat_map(|(name, source)| name.bytes().chain(source.bytes()))
+        .chain(w3cos_node::ELECTRON.bytes()));
     // Per project too: a CommonJS file's synthesized record is keyed by its
     // path process-wide and names the project's loader, so two projects
     // compiled in one process must not share builtin paths.

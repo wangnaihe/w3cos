@@ -275,6 +275,7 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
 16. `fs`/`stream`/`crypto`/`zlib`。
 17. `@w3cos/electron`：app、BrowserWindow、ipcMain/ipcRenderer、contextBridge/preload、Menu、dialog。
 18. electron-quick-start + electron-api-demos 子集 AOT 编译运行，进 CI（截图为不透明 PNG）。
+    - **进展（17/18 第一刀）**：`require('electron')` / `@w3cos/electron` 解析到 `crates/w3cos-node/js/electron.js`（即使装了 `electron` npm 包）；编译器扫描项目的 HTML、`<script src>` 和 preload，生成 `electron_app.js`（页面在编译期拆成 title/head/body，本地样式表内联，渲染端脚本按需求值）。已有 app 生命周期、BrowserWindow/webContents、ipcMain/ipcRenderer（invoke/handle、send/on、reply、sendSync，结构化克隆，每条消息一个 task）、contextBridge、dialog（File System Access 选择器、`alert`/`confirm`）、shell.openExternal（`window.open`）、Menu 模型。`examples/electron-quick-start`（上游原样，CC0）与 `examples/electron-ipc` 在 CI 里无头运行，并与 Electron 44.9.0 的输出逐行对比。说明与缺口见 `docs/W3COS_ELECTRON.md`；截图、electron-api-demos 子集、多窗口待做。
 
 ### M3 Code-OSS workbench 启动
 19. `child_process`、`net`（UDS）、`worker_threads`、`MessageChannelMain`/`utilityProcess`。

@@ -20,6 +20,16 @@ pub(crate) fn write_fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
 /// Compile `entry` under `root`, run it, and return the `console.*` lines
 /// (and an `UNCAUGHT ...` line if evaluation threw).
 pub(crate) fn compile_and_run(root: &Path, entry: &Path, crate_name: &str) -> Vec<String> {
+    compile_and_run_with_env(root, entry, crate_name, &[])
+}
+
+/// [`compile_and_run`] with extra environment variables for the app.
+pub(crate) fn compile_and_run_with_env(
+    root: &Path,
+    entry: &Path,
+    crate_name: &str,
+    env: &[(&str, &str)],
+) -> Vec<String> {
     let resolver = EsmResolver::new(root);
     let parsed = resolver
         .parse_graph_from_entry(entry)
@@ -102,6 +112,7 @@ fn main() {{
         .current_dir(&crate_dir)
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("W3COS_JS_CONSOLE", "1")
+        .envs(env.iter().copied())
         .output()
         .expect("cargo should be available");
     let stderr = String::from_utf8_lossy(&output.stderr);
