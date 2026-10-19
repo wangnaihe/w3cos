@@ -38,7 +38,7 @@ pub fn node_host_value() -> Value {
     value
 }
 
-fn arg(args: &[Value], index: usize) -> Value {
+pub(crate) fn arg(args: &[Value], index: usize) -> Value {
     args.get(index).cloned().unwrap_or(Value::Undefined)
 }
 
@@ -60,6 +60,11 @@ fn code_for(error: &io::Error) -> (&'static str, &'static str) {
         io::ErrorKind::IsADirectory => ("EISDIR", "illegal operation on a directory"),
         io::ErrorKind::DirectoryNotEmpty => ("ENOTEMPTY", "directory not empty"),
         io::ErrorKind::InvalidInput => ("EINVAL", "invalid argument"),
+        io::ErrorKind::ConnectionRefused => ("ECONNREFUSED", "connection refused"),
+        io::ErrorKind::ConnectionReset => ("ECONNRESET", "connection reset by peer"),
+        io::ErrorKind::AddrInUse => ("EADDRINUSE", "address already in use"),
+        io::ErrorKind::BrokenPipe => ("EPIPE", "broken pipe"),
+        io::ErrorKind::TimedOut => ("ETIMEDOUT", "connection timed out"),
         _ => ("EIO", "i/o error"),
     }
 }
@@ -81,7 +86,12 @@ fn code_for_errno(raw: i32) -> Option<(&'static str, &'static str)> {
         30 => ("EROFS", "read-only file system"),
         36 => ("ENAMETOOLONG", "name too long"),
         39 => ("ENOTEMPTY", "directory not empty"),
+        32 => ("EPIPE", "broken pipe"),
         40 => ("ELOOP", "too many symbolic links encountered"),
+        98 => ("EADDRINUSE", "address already in use"),
+        104 => ("ECONNRESET", "connection reset by peer"),
+        110 => ("ETIMEDOUT", "connection timed out"),
+        111 => ("ECONNREFUSED", "connection refused"),
         _ => return None,
     })
 }
@@ -104,6 +114,11 @@ fn code_for_errno(raw: i32) -> Option<(&'static str, &'static str)> {
         62 => ("ELOOP", "too many symbolic links encountered"),
         63 => ("ENAMETOOLONG", "name too long"),
         66 => ("ENOTEMPTY", "directory not empty"),
+        32 => ("EPIPE", "broken pipe"),
+        48 => ("EADDRINUSE", "address already in use"),
+        54 => ("ECONNRESET", "connection reset by peer"),
+        60 => ("ETIMEDOUT", "connection timed out"),
+        61 => ("ECONNREFUSED", "connection refused"),
         _ => return None,
     })
 }
@@ -118,7 +133,12 @@ fn throw_io(error: io::Error, syscall: &str, path: Option<&str>, dest: Option<&s
     crate::throw_value(node_error(&error, syscall, path, dest))
 }
 
-fn node_error(error: &io::Error, syscall: &str, path: Option<&str>, dest: Option<&str>) -> Value {
+pub(crate) fn node_error(
+    error: &io::Error,
+    syscall: &str,
+    path: Option<&str>,
+    dest: Option<&str>,
+) -> Value {
     let (code, description) = code_for(error);
     let mut message = format!("{code}: {description}, {syscall}");
     if let Some(path) = path {
@@ -160,7 +180,7 @@ fn custom_error(code: &'static str, raw: i32) -> io::Error {
 }
 
 /// Bytes of a string (UTF-8), ArrayBuffer or ArrayBuffer view.
-fn data_bytes(value: &Value) -> Vec<u8> {
+pub(crate) fn data_bytes(value: &Value) -> Vec<u8> {
     if let Some(text) = value.as_js_string() {
         return text.as_str().as_bytes().to_vec();
     }
@@ -382,7 +402,7 @@ pub(crate) fn fill_random(buffer: &mut [u8]) {
     });
 }
 
-fn define(host: &Value, name: &str, f: impl Fn(Vec<Value>) -> Value + 'static) {
+pub(crate) fn define(host: &Value, name: &str, f: impl Fn(Vec<Value>) -> Value + 'static) {
     host.set_property(name, crate::named_function(name, 0, move |_, args| f(args)));
 }
 
@@ -839,6 +859,7 @@ fn build_host() -> Value {
             }
         }
     });
+    crate::node_host_io::install(&host);
     host
 }
 

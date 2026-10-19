@@ -214,9 +214,21 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
 /// `super(...)` inside a derived constructor: run the parent class's raw
 /// constructor (stored under `"__w3cos_ctor"`) on the already-allocated
 /// `this`. Returns `this` so the call is usable in expression position.
+/// Hidden marker on compiled `function` declarations (see
+/// `builtins::named_constructor_function`).
+pub const FUNCTION_CONSTRUCTOR_MARKER: &str = "__w3cos_function_ctor";
+
 pub fn super_ctor(this: &Value, parent_class: &Value, args: Vec<Value>) -> Value {
     let ctor = parent_class.get_property("__w3cos_ctor");
-    ctor.call(this.clone(), args);
+    if ctor.is_callable() {
+        ctor.call(this.clone(), args);
+    } else if parent_class.is_ordinary_constructor_function() {
+        // `class X extends F` with an ES5 constructor `function F() {...}`:
+        // F's body initializes the already-allocated instance (its
+        // prototype chain includes F.prototype, so `this instanceof F`
+        // guards hold).
+        parent_class.call(this.clone(), args);
+    }
     run_pending_class_initializer(this);
     this.clone()
 }
@@ -791,6 +803,27 @@ mod tests {
         });
         let instance = construct(&ctor, vec![Value::Number(9.0)]);
         assert_eq!(instance.get_property("v").to_number(), 9.0);
+    }
+
+    #[test]
+    fn super_ctor_runs_a_compiled_es5_parent_function() {
+        let parent = crate::named_constructor_function("Base", 1, |this, args| {
+            this.set_property("base", args.first().cloned().unwrap_or(Value::Undefined));
+            Value::Undefined
+        });
+        let instance = Value::object(HashMap::new());
+        super_ctor(&instance, &parent, vec![Value::Number(7.0)]);
+        assert_eq!(instance.get_property("base").to_number(), 7.0);
+        // The marker stays out of the function's own keys.
+        let keys = parent.as_function().expect("function").keys();
+        assert!(!keys.iter().any(|key| key == FUNCTION_CONSTRUCTOR_MARKER));
+        // Host constructors keep running only through `__w3cos_ctor`.
+        let host = Value::function(|this, _| {
+            this.set_property("host", Value::Bool(true));
+            Value::Undefined
+        });
+        super_ctor(&instance, &host, vec![]);
+        assert!(instance.get_property("host").is_undefined());
     }
 
     #[test]

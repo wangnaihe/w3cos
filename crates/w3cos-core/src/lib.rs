@@ -14,6 +14,7 @@ pub mod json;
 pub mod leak_detector;
 pub mod module_registry;
 pub mod node_host;
+pub mod node_host_io;
 mod number_proto;
 mod object;
 pub mod page_arena;

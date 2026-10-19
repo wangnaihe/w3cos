@@ -972,6 +972,7 @@ fn array_from(arguments: &[Value]) -> Value {
         .is_undefined()
         || source.is_array()
         || source.is_string()
+        || crate::collections::iter_collection(&source).is_some()
         || !source
             .get_property("__w3cosIterableSnapshot")
             .is_undefined()
@@ -2365,6 +2366,21 @@ mod tests {
     }
 
     #[test]
+    fn array_from_snapshots_native_set_and_map() {
+        let set = crate::class::construct(&crate::collections::set_class(), vec![]);
+        set.call_method("add", vec![Value::Number(1.0)]);
+        set.call_method("add", vec![Value::string("two")]);
+        let values = array_value().call_method("from", vec![set]);
+        assert_eq!(values.get_property("length").to_number(), 2.0);
+        assert_eq!(values.get_property("1").to_js_string(), "two");
+        let map = crate::class::construct(&crate::collections::map_class(), vec![]);
+        map.call_method("set", vec![Value::string("k"), Value::Number(3.0)]);
+        let entries = array_value().call_method("from", vec![map]);
+        assert_eq!(entries.get_property("length").to_number(), 1.0);
+        assert_eq!(entries.get_property("0").get_property("1").to_number(), 3.0);
+    }
+
+    #[test]
     fn array_from_applies_mapping_function_with_index_and_this_argument() {
         let this_argument = Value::object(HashMap::from([(
             "prefix".to_string(),
@@ -2590,5 +2606,8 @@ pub fn named_constructor_function(
     let prototype = Value::object(HashMap::new());
     define_builtin(&prototype, "constructor", function.clone());
     function.set_property("prototype", prototype);
+    // Marks a compiled `function` declaration: `class X extends F` runs F's
+    // body on the new instance (`super(...)`), which host constructors skip.
+    function.set_property(crate::class::FUNCTION_CONSTRUCTOR_MARKER, Value::Bool(true));
     function
 }

@@ -18,6 +18,8 @@ pub mod mobile_codegen;
 pub mod module_source;
 #[cfg(test)]
 mod node_builtins_e2e_tests;
+#[cfg(test)]
+mod node_io_e2e_tests;
 pub mod node_resolution;
 pub mod npm_bridge;
 pub mod parser;

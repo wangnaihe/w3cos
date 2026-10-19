@@ -1734,12 +1734,32 @@ impl FunctionData {
                 && matches!(&self.body, FunctionBody::Aot { factory, .. } if aot_function_meta(*factory).is_some()))
     }
 
+    /// Ordinary `function` (not arrow / method / host): `super(...)` from a
+    /// derived class runs its body on the instance.
+    pub(crate) fn is_ordinary_constructor(&self) -> bool {
+        match &self.body {
+            FunctionBody::Aot { factory, .. } => {
+                aot_function_meta(*factory).is_some_and(|(_, _, constructor)| constructor)
+            }
+            _ => self
+                .props
+                .borrow()
+                .get(crate::class::FUNCTION_CONSTRUCTOR_MARKER)
+                .is_some_and(Value::to_bool),
+        }
+    }
+
     pub fn keys(&self) -> Vec<String> {
         // `name` / `length` are non-enumerable on functions.
         self.props
             .borrow()
             .keys()
-            .filter(|key| !matches!(key.as_str(), "name" | "length"))
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "name" | "length" | crate::class::FUNCTION_CONSTRUCTOR_MARKER
+                )
+            })
             .map(|key| key.as_str().to_string())
             .collect()
     }
@@ -2987,6 +3007,13 @@ impl Value {
     /// Host / DOM sites should keep using [`Value::function`] / [`Value::callable`].
     pub fn aot_function(factory: AotFactory, captures: AotCaptureMap) -> Self {
         Self::arena_function(FunctionData::from_aot(factory, captures))
+    }
+
+    /// True for an ordinary JS `function` value (see
+    /// `FunctionData::is_ordinary_constructor`).
+    pub(crate) fn is_ordinary_constructor_function(&self) -> bool {
+        self.as_function()
+            .is_some_and(|function| function.data().is_ordinary_constructor())
     }
 
     /// Intern a captured numeric increment. Calling it adds `addend` to `cell`.
