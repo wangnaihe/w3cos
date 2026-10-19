@@ -621,6 +621,10 @@ pub struct DomFast {
     pub create_element: fn(&Value, &str) -> Value,
     pub create_text: fn(&Value, &str) -> Value,
     pub append_child: fn(&Value, &Value) -> Value,
+    /// Guarded builtin `appendChild` / `removeChild`. `remove == false`
+    /// selects append. `None` means an authored surface or non-DOM receiver
+    /// requires the ordinary method lookup.
+    pub mutate_child_guarded: fn(&Value, &Value, bool) -> Option<Value>,
     pub set_data: fn(&Value, &str, &Value) -> bool,
     /// `name` + raw text. The bytes are not a `Value`, so a `"prefix" + i`
     /// store can format into a stack buffer and skip the page-string intern.
@@ -758,6 +762,23 @@ pub fn dom_append_child(parent: &Value, child: &Value) -> Value {
     } else {
         parent.call_method("appendChild", vec![child.clone()])
     }
+}
+
+/// Use the native tree mutation only while the runtime can prove that both
+/// builtin methods remain unshadowed on this exact parent. Otherwise perform
+/// the ordinary lookup, preserving getters, proxies, and authored methods.
+pub fn dom_append_child_guarded(parent: &Value, child: &Value) -> Value {
+    DOM_FAST
+        .get()
+        .and_then(|fast| (fast.mutate_child_guarded)(parent, child, false))
+        .unwrap_or_else(|| parent.call_method("appendChild", vec![child.clone()]))
+}
+
+pub fn dom_remove_child_guarded(parent: &Value, child: &Value) -> Value {
+    DOM_FAST
+        .get()
+        .and_then(|fast| (fast.mutate_child_guarded)(parent, child, true))
+        .unwrap_or_else(|| parent.call_method("removeChild", vec![child.clone()]))
 }
 
 pub fn dom_set_data(object: &Value, name: &str, value: &Value) -> bool {

@@ -8191,11 +8191,27 @@ fn emit_instruction(
                 let mut reads = vec![object.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-                let expr = format!(
-                    "{}.call_method_slice({literal:?}, &[{}])",
-                    uses.emit(object.0),
-                    emit_arguments_from(&mut uses, arguments)
-                );
+                let expr = if matches!(mode, EmissionMode::Sync)
+                    && arguments.len() == 1
+                    && matches!(literal.as_str(), "appendChild" | "removeChild")
+                {
+                    let intrinsic = if literal == "appendChild" {
+                        "dom_append_child_guarded"
+                    } else {
+                        "dom_remove_child_guarded"
+                    };
+                    format!(
+                        "w3cos_core::intrinsics::{intrinsic}(&{}, &{})",
+                        uses.emit(object.0),
+                        uses.emit(arguments[0].0)
+                    )
+                } else {
+                    format!(
+                        "{}.call_method_slice({literal:?}, &[{}])",
+                        uses.emit(object.0),
+                        emit_arguments_from(&mut uses, arguments)
+                    )
+                };
                 if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
                     return Ok(format!("self.registers[{}] = {expr};", register(*dst)));
                 }
@@ -9907,6 +9923,44 @@ fn main() {{
         assert!(
             !generated.contains("w3cos_core::intrinsics::get_property_checked(&self.registers"),
             "proven string keys must not go through the Value-key intrinsic: {generated}"
+        );
+    }
+
+    #[test]
+    fn emits_guarded_builtin_dom_tree_mutations_for_literal_calls() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function cycle(parent, child) {
+                    parent.appendChild(child);
+                    if (child.parentNode !== parent) throw new Error("append");
+                    parent.removeChild(child);
+                    if (child.parentNode !== null) throw new Error("remove");
+                    return child;
+                }
+                cycle;
+            "#,
+            "app:///guarded-tree-mutation-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("cycle"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "cycle_aot").unwrap();
+        assert!(
+            generated.contains("dom_append_child_guarded")
+                && generated.contains("dom_remove_child_guarded"),
+            "literal tree mutations must use the guarded intrinsic: {generated}"
+        );
+        assert!(
+            !generated.contains("call_method_slice(\"appendChild\"")
+                && !generated.contains("call_method_slice(\"removeChild\""),
+            "the hot literal calls must skip ordinary method dispatch: {generated}"
+        );
+        assert!(
+            generated.contains("get_property_checked_ic(\"parentNode\""),
+            "parentNode observations must stay ordinary property reads: {generated}"
         );
     }
 

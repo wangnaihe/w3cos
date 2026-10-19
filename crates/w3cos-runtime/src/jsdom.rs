@@ -1500,6 +1500,7 @@ fn ensure_dom_fast() {
         create_element: fast_create_element,
         create_text: fast_create_text,
         append_child: fast_append_child,
+        mutate_child_guarded: fast_mutate_child_guarded,
         set_data: fast_set_data,
         set_data_str: fast_set_data_str,
         build_appended: fast_build_appended,
@@ -1590,6 +1591,56 @@ fn fast_append_child(parent: &Value, child: &Value) -> Value {
     };
     insert_child_or_fragment(parent_id, child_id, None);
     child.clone()
+}
+
+thread_local! {
+    /// The tree-method proof is scoped to one exact DOM parent, realm, and
+    /// authored-shape epoch. Hot loops pay the silent lookup once; any watched
+    /// method/property/prototype mutation invalidates the stamp globally.
+    static TREE_MUTATION_GUARD: std::cell::Cell<Option<(u32, u32, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn fast_mutate_child_guarded(parent: &Value, child: &Value, remove: bool) -> Option<Value> {
+    let parent_id = if let Some(node) = parent.live_dom_node() {
+        node
+    } else {
+        let node = node_id_of(parent)?;
+        let wrapper = memoized_element(node)?;
+        let wrapper_object = wrapper.object_ref_raw()?;
+        let parent_object = parent.object_ref_raw()?;
+        if !wrapper_object.ptr_eq(&parent_object) {
+            return None;
+        }
+        node
+    };
+    let child_id = node_id_of(child)?;
+    let generation = realm_generation();
+    let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+    let cached = TREE_MUTATION_GUARD.with(std::cell::Cell::get);
+    if cached != Some((generation, parent_id, epoch)) {
+        if !matches!(silent_lookup(parent, "appendChild"), SilentLookup::Missing)
+            || !matches!(silent_lookup(parent, "removeChild"), SilentLookup::Missing)
+        {
+            return None;
+        }
+        TREE_MUTATION_GUARD.with(|guard| guard.set(Some((generation, parent_id, epoch))));
+    }
+    if !remove {
+        insert_child_or_fragment(parent_id, child_id, None);
+        return Some(child.clone());
+    }
+    if dom::parent_node(child_id) != Some(parent_id) {
+        dom_exception("The node is not a child of this parent", "NotFoundError");
+    }
+    let was_connected = dom::is_connected(child_id);
+    let notify_disconnected = was_connected && disconnected_lifecycle_may_be_observable(child_id);
+    dom::remove_child(parent_id, child_id);
+    release_element_subtree(child_id);
+    if notify_disconnected {
+        crate::custom_elements_web::disconnected_subtree(child);
+    }
+    Some(child.clone())
 }
 
 fn fast_set_data(object: &Value, name: &str, value: &Value) -> bool {
@@ -21756,9 +21807,7 @@ fn silent_builtin_wrapper(wrapper: &Value, key: &str) -> SilentLookup {
         if object.own_getter(key).is_some() || object.own_data(&setter).is_some() {
             return SilentLookup::Blocked;
         }
-        if let Some(data) = object.own_data(key)
-            && !data.is_undefined()
-        {
+        if object.own_data(key).is_some() {
             return SilentLookup::Blocked;
         }
         match object.untrapped_prototype() {
@@ -22392,6 +22441,159 @@ mod tests {
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn guarded_tree_mutation_preserves_builtin_results_and_parent_checks() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let parent = element_value(node_id_of(&parent).unwrap());
+        let other = document.call_method("createElement", vec![Value::string("div")]);
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+
+        assert!(
+            w3cos_core::intrinsics::dom_append_child_guarded(&parent, &child).strict_eq(&child)
+        );
+        assert!(child.get_property("parentNode").strict_eq(&parent));
+        let error = w3cos_core::catch_js(|| {
+            w3cos_core::intrinsics::dom_remove_child_guarded(&other, &child)
+        });
+        assert!(error.is_err(), "wrong-parent removeChild must throw");
+        assert!(child.get_property("parentNode").strict_eq(&parent));
+        assert!(
+            w3cos_core::intrinsics::dom_remove_child_guarded(&parent, &child).strict_eq(&child)
+        );
+        assert!(child.get_property("parentNode").is_null());
+    }
+
+    #[test]
+    fn guarded_tree_mutation_falls_back_to_own_method() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+        let calls = Rc::new(Cell::new(0u32));
+        let seen = Rc::clone(&calls);
+        parent.set_property(
+            "appendChild",
+            Value::function(move |_, _| {
+                seen.set(seen.get() + 1);
+                Value::string("authored")
+            }),
+        );
+
+        let result = w3cos_core::intrinsics::dom_append_child_guarded(&parent, &child);
+        assert_eq!(result.to_js_string(), "authored");
+        assert_eq!(calls.get(), 1);
+        assert!(child.get_property("parentNode").is_null());
+    }
+
+    #[test]
+    fn guarded_tree_mutation_runs_an_own_getter_once() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+        let gets = Rc::new(Cell::new(0u32));
+        let seen = Rc::clone(&gets);
+        let getter = Value::function(move |_, _| {
+            seen.set(seen.get() + 1);
+            Value::function(|_, _| Value::string("getter"))
+        });
+        let descriptor = Value::object(HashMap::from([("get".to_string(), getter)]));
+        w3cos_core::class::define_property(&parent, "appendChild", &descriptor);
+
+        let result = w3cos_core::intrinsics::dom_append_child_guarded(&parent, &child);
+        assert_eq!(result.to_js_string(), "getter");
+        assert_eq!(gets.get(), 1, "fallback must run the getter exactly once");
+        assert!(child.get_property("parentNode").is_null());
+    }
+
+    #[test]
+    fn guarded_tree_mutation_rejects_a_forged_dom_wrapper() {
+        setup();
+        let document = document_value();
+        let real = document.call_method("createElement", vec![Value::string("div")]);
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+        let calls = Rc::new(Cell::new(0u32));
+        let seen = Rc::clone(&calls);
+        let fake = Value::object(HashMap::from([
+            (
+                "__node_id".to_string(),
+                Value::Number(node_id_of(&real).unwrap() as f64),
+            ),
+            (
+                "__w3cos_realm_generation".to_string(),
+                Value::Number(realm_generation() as f64),
+            ),
+            (
+                "appendChild".to_string(),
+                Value::function(move |_, _| {
+                    seen.set(seen.get() + 1);
+                    Value::string("fake")
+                }),
+            ),
+        ]));
+
+        let result = w3cos_core::intrinsics::dom_append_child_guarded(&fake, &child);
+        assert_eq!(result.to_js_string(), "fake");
+        assert_eq!(calls.get(), 1);
+        assert!(child.get_property("parentNode").is_null());
+    }
+
+    #[test]
+    fn guarded_tree_mutation_invalidates_for_own_undefined_method() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let parent = element_value(node_id_of(&parent).unwrap());
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+        w3cos_core::intrinsics::dom_append_child_guarded(&parent, &child);
+        w3cos_core::intrinsics::dom_remove_child_guarded(&parent, &child);
+        let descriptor = Value::object(HashMap::from([("value".to_string(), Value::Undefined)]));
+        w3cos_core::class::define_property(&parent, "appendChild", &descriptor);
+
+        let result = w3cos_core::intrinsics::dom_append_child_guarded(&parent, &child);
+        assert!(
+            result.is_undefined(),
+            "ordinary non-callable result must win"
+        );
+        assert!(child.get_property("parentNode").is_null());
+    }
+
+    #[test]
+    fn guarded_tree_mutation_never_swallows_proxy_get() {
+        setup();
+        let document = document_value();
+        let parent = document.call_method("createElement", vec![Value::string("div")]);
+        let child = document.call_method("createElement", vec![Value::string("span")]);
+        let gets = Rc::new(Cell::new(0u32));
+        let seen = Rc::clone(&gets);
+        let handler = ProxyBuilder::new()
+            .get(move |_, key, _| {
+                if key == "appendChild" {
+                    seen.set(seen.get() + 1);
+                    Value::function(|_, _| Value::string("proxied"))
+                } else {
+                    Value::Undefined
+                }
+            })
+            .build();
+        let proxy = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
+            HashMap::new(),
+            handler,
+        ))));
+        w3cos_core::class::set_prototype_of(&parent, &proxy);
+
+        let result = w3cos_core::intrinsics::dom_append_child_guarded(&parent, &child);
+        assert_eq!(result.to_js_string(), "proxied");
+        assert_eq!(
+            gets.get(),
+            1,
+            "fallback must run the authored get trap exactly once"
+        );
+        assert!(child.get_property("parentNode").is_null());
     }
 
     #[test]
