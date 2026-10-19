@@ -7666,9 +7666,9 @@ fn emit_instruction(
         ),
         Instruction::CreateObject { dst, properties } => {
             let constructor = if plan.local_allocs.contains(&dst.0) {
-                "local_object"
+                "local_object_literal"
             } else {
-                "object"
+                "object_literal"
             };
             let reads: Vec<u32> = properties
                 .iter()
@@ -9482,8 +9482,9 @@ fn main() {{
             "object/array literals must not emit Value::Object/Array(Rc::new(...)): {generated}"
         );
         assert!(
-            generated.contains("w3cos_core::Value::object(std::collections::HashMap::new())"),
-            "empty object literals must intern via Value::object(HashMap::new()): {generated}"
+            generated
+                .contains("w3cos_core::Value::object_literal(std::collections::HashMap::new())"),
+            "empty object literals must intern via Value::object_literal(HashMap::new()): {generated}"
         );
         assert!(
             generated.contains("w3cos_core::Value::array(vec!["),

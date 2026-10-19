@@ -5148,7 +5148,7 @@ export function makePoint(v: number) {
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("w3cos_core::Value::local_object("),
+            code.contains("w3cos_core::Value::local_object_literal("),
             "non-escaping literal should be a refcounted local:\n{code}"
         );
 
@@ -5524,6 +5524,9 @@ export function makeCycles(n: number): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     let base = live();
     for _ in 0..5 {
@@ -5699,6 +5702,9 @@ export function clearStash(): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     let base = live();
     let n = |v: Value| v.to_number();
@@ -5827,6 +5833,9 @@ export function pipeline(n: number): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     macro_rules! steady {
         ($name:expr, $f:expr, $arg:expr, $expect:expr) => {{
@@ -6102,6 +6111,9 @@ export function getAsync(): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     let n = |v: Value| v.to_number();
     let check = || {

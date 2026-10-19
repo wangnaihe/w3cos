@@ -18,6 +18,8 @@ thread_local! {
 /// `page_arena::reset` makes the next realm observe empty keys.
 pub fn reset_constructors() {
     OBJECT_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    let retired = OBJECT_PROTOTYPE.with(|slot| slot.borrow_mut().take());
+    drop(retired);
     ARRAY_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     STRING_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     ERROR_CLASSES.with(|slot| slot.borrow_mut().take());
@@ -79,7 +81,36 @@ fn build_object_value() -> Value {
             }),
         ),
     ]));
-    for method in ["hasOwnProperty", "isPrototypeOf"] {
+    prototype.set_property(
+        "toString",
+        Value::function(|this, _| Value::from(object_to_string(&this))),
+    );
+    prototype.set_property(
+        "toLocaleString",
+        Value::function(|this, _| this.call_method("toString", Vec::new())),
+    );
+    prototype.set_property("valueOf", Value::function(|this, _| this));
+    prototype.set_property(
+        "propertyIsEnumerable",
+        Value::function(|this, arguments| {
+            let key = arguments
+                .first()
+                .map(Value::to_js_string)
+                .unwrap_or_default();
+            let descriptor = crate::class::get_own_property_descriptor(&this, &key);
+            Value::Bool(
+                !descriptor.is_undefined() && descriptor.get_property("enumerable").to_bool(),
+            )
+        }),
+    );
+    for method in [
+        "hasOwnProperty",
+        "isPrototypeOf",
+        "toString",
+        "toLocaleString",
+        "valueOf",
+        "propertyIsEnumerable",
+    ] {
         crate::class::define_property(
             &prototype,
             method,
@@ -201,12 +232,108 @@ fn build_object_value() -> Value {
             object
         }),
     );
-    Value::callable(properties, |_, arguments| {
-        arguments
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Value::object(HashMap::new()))
+    let prototype = properties.get("prototype").cloned();
+    let constructor = Value::callable(properties, |_, arguments| match arguments.first() {
+        Some(value) if !value.is_undefined() && !value.is_null() => value.clone(),
+        _ => Value::object_literal(HashMap::new()),
+    });
+    if let Some(prototype) = prototype {
+        crate::class::define_property(
+            &prototype,
+            "constructor",
+            &Value::object(HashMap::from([
+                ("value".into(), constructor.clone()),
+                ("writable".into(), Value::Bool(true)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(true)),
+            ])),
+        );
+    }
+    constructor
+}
+
+/// `Object.prototype.toString`: `[object <Tag>]` from the value's kind and
+/// the runtime's brand markers (Date, RegExp, Error, Map, Set).
+pub fn object_to_string(value: &Value) -> String {
+    let tag = if value.is_undefined() {
+        "Undefined"
+    } else if value.is_null() {
+        "Null"
+    } else if value.is_array() {
+        "Array"
+    } else if value.is_string() {
+        "String"
+    } else if value.is_number() {
+        "Number"
+    } else if value.is_bool() {
+        "Boolean"
+    } else if value.is_function() {
+        "Function"
+    } else if has_own(value, "__w3cos_date_milliseconds") {
+        "Date"
+    } else if has_own(value, "__w3cos_regexp_source") {
+        "RegExp"
+    } else if crate::class::instance_of(value, &error_class("Error")) {
+        "Error"
+    } else if crate::class::instance_of(value, &crate::collections::map_class()) {
+        "Map"
+    } else if crate::class::instance_of(value, &crate::collections::set_class()) {
+        "Set"
+    } else if value.is_callable() {
+        "Function"
+    } else {
+        "Object"
+    };
+    format!("[object {tag}]")
+}
+
+fn has_own(value: &Value, key: &str) -> bool {
+    !crate::class::get_own_property_descriptor(value, key).is_undefined()
+}
+
+thread_local! {
+    static OBJECT_PROTOTYPE: RefCell<Option<(u32, crate::value::JsObjectRef)>> =
+        const { RefCell::new(None) };
+    static BUILDING_OBJECT_PROTOTYPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `Object.prototype` if this page's `Object` already exists, without
+/// building it. Function `prototype` objects use this: creating a function
+/// must not allocate the whole `Object` realm.
+pub(crate) fn object_prototype_ref_if_built() -> Option<crate::value::JsObjectRef> {
+    let epoch = crate::page_arena::current_epoch();
+    OBJECT_PROTOTYPE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, proto)| *cached_epoch == epoch && proto.is_live())
+            .map(|(_, proto)| proto.clone())
     })
+}
+
+/// `Object.prototype` as a prototype link for new object literals, cached
+/// per page epoch (the realm's `Object` is rebuilt after a page reset).
+pub(crate) fn object_prototype_ref() -> Option<crate::value::JsObjectRef> {
+    let epoch = crate::page_arena::current_epoch();
+    let cached = OBJECT_PROTOTYPE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, proto)| *cached_epoch == epoch && proto.is_live())
+            .map(|(_, proto)| proto.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    // Building `Object` creates functions, whose `prototype` objects ask
+    // for `Object.prototype` again: those few stay prototype-less.
+    if BUILDING_OBJECT_PROTOTYPE.with(|flag| flag.replace(true)) {
+        return None;
+    }
+    let proto = object_value().get_property("prototype").as_object();
+    BUILDING_OBJECT_PROTOTYPE.with(|flag| flag.set(false));
+    let proto = proto?;
+    let retired = OBJECT_PROTOTYPE.with(|slot| slot.replace(Some((epoch, proto.clone()))));
+    drop(retired);
+    Some(proto)
 }
 
 /// Define a non-enumerable data property (`writable`/`configurable` true),

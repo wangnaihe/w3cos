@@ -1562,6 +1562,9 @@ pub struct FunctionData {
     /// Own string-keyed data properties. Ordinary functions keep ≤4 inline
     /// (prototype, and often length/name) without a HashMap spill.
     props: RefCell<PropertyMap>,
+    /// `Object.defineProperty(fn, key, { get, set })` accessors (rare: boxed
+    /// so ordinary functions pay one pointer).
+    accessors: RefCell<Option<Box<HashMap<String, (Value, Value)>>>>,
     allocation: HeapAllocation,
 }
 
@@ -1635,7 +1638,7 @@ impl FunctionData {
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
         // constructing instances.
-        props.insert(JsString::intern("prototype"), Value::object(HashMap::new()));
+        props.insert(JsString::intern("prototype"), Value::function_prototype());
         let allocation = HeapAllocation::new(
             HeapKind::Function,
             function_heap_bytes(&props, captures_ref),
@@ -1643,8 +1646,43 @@ impl FunctionData {
         Self {
             body,
             props: RefCell::new(props),
+            accessors: RefCell::new(None),
             allocation,
         }
+    }
+
+    /// The `(getter, setter)` pair of an accessor property (each may be
+    /// `Undefined`).
+    pub fn accessor(&self, key: &str) -> Option<(Value, Value)> {
+        self.accessors
+            .borrow()
+            .as_ref()
+            .and_then(|accessors| accessors.get(key).cloned())
+    }
+
+    /// Install (or update one side of) an accessor property, replacing a
+    /// data property of the same name.
+    pub fn define_accessor(&self, key: &str, getter: Option<Value>, setter: Option<Value>) {
+        self.delete_property(key);
+        let mut accessors = self.accessors.borrow_mut();
+        let accessors = accessors.get_or_insert_with(Default::default);
+        let entry = accessors
+            .entry(key.to_string())
+            .or_insert((Value::Undefined, Value::Undefined));
+        if let Some(getter) = getter {
+            entry.0 = getter;
+        }
+        if let Some(setter) = setter {
+            entry.1 = setter;
+        }
+    }
+
+    /// Drop an accessor property (a data definition replaces it).
+    pub fn remove_accessor(&self, key: &str) -> bool {
+        self.accessors
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|accessors| accessors.remove(key).is_some())
     }
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
@@ -1691,6 +1729,7 @@ impl FunctionData {
 
     pub fn has_own_property(&self, key: &str) -> bool {
         self.props.borrow().contains_key(key)
+            || self.accessor(key).is_some()
             || (matches!(key, "name" | "length")
                 && matches!(&self.body, FunctionBody::Aot { factory, .. } if aot_function_meta(*factory).is_some()))
     }
@@ -1858,6 +1897,18 @@ impl JsFunction {
 
     pub fn has_own_property(&self, key: &str) -> bool {
         self.data().has_own_property(key)
+    }
+
+    pub fn accessor(&self, key: &str) -> Option<(Value, Value)> {
+        self.data().accessor(key)
+    }
+
+    pub fn define_accessor(&self, key: &str, getter: Option<Value>, setter: Option<Value>) {
+        self.data().define_accessor(key, getter, setter)
+    }
+
+    pub fn remove_accessor(&self, key: &str) -> bool {
+        self.data().remove_accessor(key)
     }
 
     /// Own property names installed on this function object.
@@ -2373,10 +2424,17 @@ impl Value {
             _ if self.as_function().is_some() => {
                 let function = self.as_function().expect("function");
                 if key == "prototype" && function.data().wants_lazy_prototype() {
-                    let prototype = Value::object(HashMap::new());
+                    let prototype = Value::function_prototype();
                     crate::builtins::define_builtin(&prototype, "constructor", self.clone());
                     function.set_property("prototype", prototype.clone());
                     return prototype;
+                }
+                if let Some((getter, _)) = function.accessor(key) {
+                    return if getter.is_callable() {
+                        getter.call(self.clone(), Vec::new())
+                    } else {
+                        Value::Undefined
+                    };
                 }
                 function.get_property(key)
             }
@@ -2522,9 +2580,14 @@ impl Value {
             // JS functions are objects: properties attach to the function
             // value (decorator ids, constructor statics).
             _ if self.as_function().is_some() => {
-                self.as_function()
-                    .expect("function")
-                    .set_property(key, value);
+                let function = self.as_function().expect("function");
+                if let Some((_, setter)) = function.accessor(key) {
+                    if setter.is_callable() {
+                        setter.call(self.clone(), vec![value]);
+                    }
+                    return true;
+                }
+                function.set_property(key, value);
                 true
             }
             _ => false,
@@ -2792,6 +2855,39 @@ impl Value {
 
     pub fn object(props: HashMap<String, Value>) -> Self {
         Self::arena_object(crate::JsObject::from_map(props))
+    }
+
+    /// An object literal / `new Object()`: like [`Self::object`], with
+    /// `Object.prototype` as its prototype (`{} instanceof Object`,
+    /// `({}).hasOwnProperty`, `({}).constructor === Object`).
+    pub fn object_literal(props: HashMap<String, Value>) -> Self {
+        let mut object = crate::JsObject::from_map(props);
+        object.prototype = crate::builtins::object_prototype_ref();
+        Self::arena_object(object)
+    }
+
+    /// Arena object whose prototype is `prototype` (when it is an object),
+    /// set at creation: unlike `Object.setPrototypeOf` this does not
+    /// invalidate inline caches.
+    pub fn object_with_prototype(prototype: &Value, props: HashMap<String, Value>) -> Self {
+        let mut object = crate::JsObject::from_map(props);
+        object.prototype = prototype.as_object();
+        Self::arena_object(object)
+    }
+
+    /// A fresh function's `prototype` object: inherits `Object.prototype`
+    /// once the page's `Object` exists (see `object_prototype_ref_if_built`).
+    pub(crate) fn function_prototype() -> Self {
+        let mut object = crate::JsObject::from_map(HashMap::new());
+        object.prototype = crate::builtins::object_prototype_ref_if_built();
+        Self::arena_object(object)
+    }
+
+    /// Non-escaping object literal; see [`Self::local_object`].
+    pub fn local_object_literal(props: HashMap<String, Value>) -> Self {
+        let mut object = crate::JsObject::from_map(props);
+        object.prototype = crate::builtins::object_prototype_ref();
+        Value::Object(Rc::new(RefCell::new(object)))
     }
 
     /// Arena object with a shared proxy. Own properties are written directly
@@ -4212,7 +4308,7 @@ macro_rules! js_object {
     ($($key:expr => $value:expr),* $(,)?) => {{
         let mut properties = ::std::collections::HashMap::new();
         $(properties.insert(($key).to_string(), $crate::Value::from($value));)*
-        $crate::Value::object(properties)
+        $crate::Value::object_literal(properties)
     }};
 }
 
