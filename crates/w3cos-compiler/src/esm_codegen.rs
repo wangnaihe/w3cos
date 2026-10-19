@@ -2001,18 +2001,26 @@ fn resolve_namespace_symbol(
             .iter()
             .any(|namespace| namespace.local == local_name)
     {
-        return (
-            defining_module.to_path_buf(),
-            bundle
-                .symbols
-                .iter()
-                .find(|symbol| {
-                    symbol.module == defining_module && symbol.original_name == local_name
-                })
-                .map(|symbol| symbol.bundled_name.clone())
-                .unwrap_or_else(|| sanitize_ident(local_name)),
-            NamespacePropShape::NamespaceValue,
-        );
+        // A re-exported `import * as ns` binding is backed by an export cell
+        // (`{bundled}_get`) when the bundler recorded a symbol for it;
+        // otherwise only the lazy namespace accessor `{m}_ns_{local}()`
+        // exists, which has the zero-arg call shape of a class value.
+        return match bundle
+            .symbols
+            .iter()
+            .find(|symbol| symbol.module == defining_module && symbol.original_name == local_name)
+        {
+            Some(symbol) => (
+                defining_module.to_path_buf(),
+                symbol.bundled_name.clone(),
+                NamespacePropShape::NamespaceValue,
+            ),
+            None => (
+                defining_module.to_path_buf(),
+                namespace_fn_name(module, local_name),
+                NamespacePropShape::ClassValue,
+            ),
+        };
     }
     let Some(sym) = bundle
         .symbols
@@ -5038,6 +5046,36 @@ fn main() {{
             "3:false:9:true"
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reexported_namespace_import_registers_through_namespace_accessor() {
+        let root = fixture_root("w3cos_esm_codegen_reexported_namespace_import");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        std::fs::write(
+            root.join("src/icons.js"),
+            "export const a = 1;\nexport const b = 2;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &entry,
+            "import * as icons from \"./icons.js\";\nexport const n = icons.a;\nexport { icons };\n",
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        let code = generate_with_bodies(&bundle);
+        let line = code
+            .lines()
+            .find(|line| line.contains("exports.insert(\"icons\""))
+            .unwrap_or_else(|| panic!("icons export registration: {code}"));
+        assert!(
+            line.contains("_ns_icons()"),
+            "namespace accessor getter: {line}"
+        );
+        assert!(!line.contains(" icons_get()"), "dangling icons_get: {line}");
     }
 
     #[test]
