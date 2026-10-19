@@ -1,7 +1,9 @@
 //! Native-module replacements from `w3cos-node` (M3 item 20): each fixture
 //! under `fixtures/node_native/` is AOT-compiled and must print what Node
 //! 20.19 prints with the real native package installed
-//! (`@vscode/sqlite3` 5.1.14-vscode, `@vscode/spdlog` 0.15.8).
+//! (`@vscode/sqlite3` 5.1.14-vscode, `@vscode/spdlog` 0.15.8,
+//! `@parcel/watcher` 2.6.0, `native-keymap` 3.3.9 with the US layout,
+//! `@vscode/policy-watcher` 1.6.0).
 
 use crate::cjs_e2e_tests::{compile_and_run_with_env, write_fixture};
 
@@ -73,5 +75,55 @@ done
 fn vscode_spdlog_matches_native_spdlog() {
     let lines = run("spdlog", include_str!("fixtures/node_native/spdlog.js"));
     let expected: Vec<&str> = SPDLOG_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+const WATCHER_NODE: &str = r#"api function function function function
+subscribed function
+create ["create:a.txt"]
+update ["update:a.txt"]
+nested ["create:sub/deep/b.txt"]
+ignored []
+rename ["create:c.txt","delete:a.txt"]
+delete ["delete:existing.txt"]
+after unsubscribe []
+snapshot object false true
+since ["create:since.txt","delete:c.txt"]
+done
+"#;
+
+#[test]
+fn parcel_watcher_matches_parcel_watcher() {
+    let lines = run("watcher", include_str!("fixtures/node_native/watcher.js"));
+    let expected: Vec<&str> = WATCHER_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+const KEYMAP_POLICY_NODE: &str = r#"keys 183 PrivacyScreenToggle,MicrophoneMuteToggle,KeyboardBacklightToggle,Sleep,WakeUp,DisplayToggleIntExt,KeyA,KeyB
+KeyA {"value":"a","withShift":"A","withAltGr":"a","withShiftAltGr":"A","withLevel5":"a","withLevel3Level5":"a"}
+KeyZ {"value":"z","withShift":"Z","withAltGr":"z","withShiftAltGr":"Z","withLevel5":"z","withLevel3Level5":"z"}
+Digit2 {"value":"2","withShift":"@","withAltGr":"2","withShiftAltGr":"@","withLevel5":"2","withLevel3Level5":"2"}
+Minus {"value":"-","withShift":"_","withAltGr":"-","withShiftAltGr":"_","withLevel5":"-","withLevel3Level5":"-"}
+BracketLeft {"value":"[","withShift":"{","withAltGr":"[","withShiftAltGr":"{","withLevel5":"[","withLevel3Level5":"["}
+Quote {"value":"'","withShift":"\"","withAltGr":"'","withShiftAltGr":"\"","withLevel5":"'","withLevel3Level5":"'"}
+Backquote {"value":"`","withShift":"~","withAltGr":"`","withShiftAltGr":"~","withLevel5":"`","withLevel3Level5":"`"}
+IntlBackslash {"value":"<","withShift":">","withAltGr":"|","withShiftAltGr":"¦","withLevel5":"<","withLevel3Level5":"|"}
+Space {"value":" ","withShift":" ","withAltGr":" ","withShiftAltGr":" ","withLevel5":" ","withLevel3Level5":" "}
+Enter {"value":"\r","withShift":"\r","withAltGr":"\r","withShiftAltGr":"\r","withLevel5":"\r","withLevel3Level5":"\r"}
+Numpad5 {"value":"","withShift":"","withAltGr":"","withShiftAltGr":"","withLevel5":"","withLevel3Level5":""}
+F12 {"value":"","withShift":"","withAltGr":"","withShiftAltGr":"","withLevel5":"","withLevel3Level5":""}
+chars 127 "..aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ1!2@3#4$5%6^7&8*9(0)\r\r\u001b\u001b\b\b\t  -_=+[{]}\\|;:'\"`~,<.>/?//**--++\r\r<>==..(())"
+layout {"model":"pc105","group":0,"layout":"us","variant":"","options":"","rules":"evdev"}
+iso undefined
+policy TypeError Unsupported platform
+"#;
+
+#[test]
+fn native_keymap_and_policy_watcher_match_linux_natives() {
+    let lines = run(
+        "keymap_policy",
+        include_str!("fixtures/node_native/keymap_policy.js"),
+    );
+    let expected: Vec<&str> = KEYMAP_POLICY_NODE.lines().collect();
     assert_eq!(lines, expected);
 }
