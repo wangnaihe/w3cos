@@ -8822,7 +8822,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -8965,7 +8965,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9081,7 +9081,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9212,7 +9212,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9461,7 +9461,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9640,7 +9640,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
