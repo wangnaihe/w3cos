@@ -283,6 +283,7 @@ VS Code 依赖 tree-sitter-wasm、oniguruma WASM，扩展里也大量用 WASM。
     - **进展（第二刀：worker_threads + utilityProcess + MessageChannelMain）**：worker 是带独立 realm 的 OS 线程，线程里重新跑程序的 `run_entry`，入口记录开头的引导代码再分派到 worker 模块。编译器静态识别 `new Worker(...)` 和 `utilityProcess.fork(...)` 的路径并把 worker 文件链接进来。消息走结构化克隆。`new Worker` 同样先过权限层（scope `worker`）。e2e 测试对比 Node 20.19 和 Electron 44.9.0。不支持的部分（eval worker、动态路径、跨线程转移 port、`fork`）见 `docs/W3COS_NODE_IO.md`。
 20. `@w3cos/sqlite3`、`@w3cos/spdlog`、`@w3cos/watcher`（parcel API → `fs_watch.rs`）、`native-keymap`、杂项 stub。
     - **进展（第一刀：sqlite3 + spdlog）**：`@vscode/sqlite3`（以及 `@w3cos/sqlite3`）提供 node-sqlite3 的 API，跑在 runtime 自带的 SQLite 上，宿主函数经 `node_host::register_extension` 挂到 `__w3cos_node_host`。`@vscode/spdlog` 是纯 JS 实现的滚动文件日志，级别、pattern 和滚动规则都与 spdlog 一致。即使包已经装上，编译器也会把这些说明符解析到 glue。e2e 测试对比 Node 20.19 加真实原生包的输出。core 顺带补了 Date 的日历字段 getter（`getFullYear` … `getTimezoneOffset`）。说明见 `docs/W3COS_NATIVE_MODULES.md`。watcher、native-keymap、policy-watcher 归第二刀。
+    - **进展（第二刀：watcher + native-keymap + policy-watcher）**：`@parcel/watcher` 的 subscribe、ignore、批内合并和快照，建在 `fs_watch.rs` 的递归观察器上（轮询后端，这次把 diff 改成了按路径查表）。`native-keymap` 返回与 Linux 原生模块一致的 US（pc105）键位表。`@vscode/policy-watcher` 与 Linux 原生行为一致，抛 `Unsupported platform`。e2e 测试对比真实原生包的输出。
 21. `vscode-file://` 协议、`nativeTheme`、`screen`、`safeStorage`。
 22. CSS/DOM 缺口清零（按 `docs/vscode-compat.md` 2.1 与 `docs/monaco-gap-report.md`：adoptedStyleSheets、Drag and Drop、scrollTo 等）。
 23. **里程碑验收**：Code-OSS（`--disable-extensions`）AOT 编译并显示 workbench，记录启动与内存首组数据。
