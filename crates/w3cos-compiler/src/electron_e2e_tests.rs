@@ -233,3 +233,55 @@ fn electron_protocol_theme_screen_safe_storage_match_electron() {
     assert!(root.join("keyring/safe-storage.key").is_file());
     std::fs::remove_dir_all(root).ok();
 }
+
+const DOM_GAPS: &[(&str, &str)] = example!(
+    "electron-dom-gaps",
+    [
+        "package.json",
+        "main.js",
+        "preload.js",
+        "renderer.js",
+        "index.html"
+    ]
+);
+
+/// Electron 44.9.0 (`electron --no-sandbox examples/electron-dom-gaps` under
+/// xvfb), byte for byte: the renderer-side CSSOM / DOM surface Code-OSS and
+/// Monaco lean on (constructable + adopted sheets, var()/inheritance,
+/// `:is()`/`:where()`, inline `!important`, client/scroll geometry, DnD
+/// DataTransfer, focus/tabIndex, `queryCommandSupported`).
+const DOM_GAPS_ELECTRON: &str = r#"adopted.ctor => [2,"rgb(255, 0, 0)","4px",1,3,"rgb(0, 0, 255)","rgb(255, 0, 0)","rgb(0, 0, 0)"]
+adopted.replace => "function"
+stylesheets => [1,true,":root"]
+style.inject => ["7px",2,"0px"]
+computed.var => ["rgb(1, 2, 3)","6px","rgb(1, 2, 3)"]
+computed.inherit => ["rgb(9, 8, 7)","20px"]
+computed.nth => ["700/list-item","400/none","700/list-item","400/list-item"]
+computed.setProperty => ["rgb(4, 5, 6)","rgb(4, 5, 6)","important","rgb(7, 7, 7)","--fg: rgb(4, 5, 6); color: rgb(7, 7, 7) !important;","rgb(1, 2, 3)"]
+selectors => [2,2,1,2,1,true,true,2]
+innerHTML => "<li data-x=\"abc\">four</li>|<span id=\"child\">child</span>"
+rect => [130,50,130,126,50]
+scroll.element => [500,50,30,100,20,110,true,0]
+scroll.window => ["number",0,"object","function"]
+dnd.datatransfer => ["hello","hello","text/plain,application/vnd.code.tree",2,"none","none",0,"application/vnd.code.tree","none","none"]
+dnd.events => [true,false,true,"dragstart:true:true:x true dragenter:true:true:x true dragover:true:true:x false drop:true:true:x true dragend:true:true:x true"]
+svg => ["http://www.w3.org/2000/svg","svg","svg","path",true,"0 0 16 16","http://www.w3.org/1999/xhtml"]
+clipboard.event => ["copy",true,"c","function",true]
+globals => ["function","function","function","function","function","function","aGk=","hi",2]
+css.ns => [true,true,false,"a\\.b\\#c","\\31 x"]
+focus => [true,0,-1,0,"0",true]
+dialog => [true,false,"x","function"]
+shadow => [true,"s","open"]
+misc => [true,"object","function","function"]
+idle number boolean
+"#;
+
+#[test]
+fn electron_renderer_dom_gaps_match_electron() {
+    let root = write_fixture("w3cos_electron_dom_gaps", DOM_GAPS);
+    let lines =
+        compile_and_run_with_env(&root, &root.join("main.js"), "w3cos_electron_dom_gaps", &[]);
+    let expected: Vec<&str> = DOM_GAPS_ELECTRON.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
