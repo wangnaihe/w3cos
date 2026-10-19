@@ -214,7 +214,7 @@ Platform work:
 - [ ] ESM module system (static import/export)
 
 VS Code work:
-- [ ] Create @electron/shim stub (window creation, basic lifecycle)
+- [x] Create @electron/shim stub (window creation, basic lifecycle) — `@w3cos/electron`, see `docs/W3COS_ELECTRON.md`
 - [ ] Identify and stub Node.js fs calls for initial render
 
 ### Phase B — Code Editing Works (+6 months)
