@@ -708,6 +708,9 @@ pub struct EsmResolver {
     commonjs_requested: RefCell<HashMap<PathBuf, BTreeSet<String>>>,
     /// Literal `require()`s that did not resolve (they throw when called).
     commonjs_diagnostics: RefCell<Vec<String>>,
+    /// ES modules served as `createRequire`-rewritten text: still ES
+    /// modules for facade-name collection.
+    create_require_rewritten: RefCell<HashSet<PathBuf>>,
     /// Electron renderer-side scripts (preloads, `<script src>` files): classic
     /// scripts loaded on demand, so marker-free files become CommonJS records
     /// too (see [`crate::cjs::classify_as`]).
@@ -729,6 +732,7 @@ impl EsmResolver {
             commonjs: RefCell::new(HashMap::new()),
             commonjs_requested: RefCell::new(HashMap::new()),
             commonjs_diagnostics: RefCell::new(Vec::new()),
+            create_require_rewritten: RefCell::new(HashSet::new()),
             entry: RefCell::new(None),
             worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
@@ -880,7 +884,9 @@ impl EsmResolver {
             return Ok(());
         }
 
-        self.prepare_commonjs(&module.path)?;
+        if !self.prepare_commonjs(&module.path)? {
+            self.prepare_create_require(&module.path)?;
+        }
         let source = module_source::read(&module.path)
             .with_context(|| format!("Could not read ESM module {}", module.path.display()))?;
         let imports = module_source::synthesized_imports(&module.path)
@@ -902,7 +908,11 @@ impl EsmResolver {
                 continue;
             }
             let resolved = self.resolve(&import, from_dir)?;
-            if !module_source::is_synthesized(&module.path)
+            if (!module_source::is_synthesized(&module.path)
+                || self
+                    .create_require_rewritten
+                    .borrow()
+                    .contains(&module.path))
                 && self.prepare_commonjs(&resolved.path)?
             {
                 // ESM → CommonJS: the facade also exports the names this
@@ -1074,6 +1084,53 @@ impl EsmResolver {
         module_source::set_synthesized(crate::cjs::record_path(path), record, imports);
         self.write_commonjs_facade(path);
         Ok(true)
+    }
+
+    /// Serve an ES module that requires through `createRequire` as text
+    /// whose literal `require` calls are static imports (see
+    /// [`crate::create_require`]).
+    fn prepare_create_require(&self, path: &Path) -> Result<()> {
+        if crate::cjs::is_virtual(path) || self.create_require_rewritten.borrow().contains(path) {
+            return Ok(());
+        }
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return Ok(());
+        };
+        let calls = crate::create_require::find_calls(path, &source);
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut targets = Vec::with_capacity(calls.len());
+        for call in &calls {
+            use crate::create_require::Target;
+            targets.push(match self.resolve_with(&call.specifier, dir, ResolveKind::Require) {
+                Ok(resolved) => {
+                    if resolved.path.extension().is_some_and(|ext| ext == "json")
+                        || self.prepare_commonjs(&resolved.path)?
+                    {
+                        Target::Default
+                    } else {
+                        Target::Namespace
+                    }
+                }
+                Err(error) => {
+                    self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: require(`{}`) via createRequire is unresolved and throws when called: {error:#}",
+                        path.display(),
+                        call.specifier
+                    ));
+                    Target::Missing
+                }
+            });
+        }
+        let text = crate::create_require::rewrite(&source, &calls, &targets);
+        let imports = collect_static_imports(&text);
+        module_source::set_synthesized(path.to_path_buf(), text, imports);
+        self.create_require_rewritten
+            .borrow_mut()
+            .insert(path.to_path_buf());
+        Ok(())
     }
 
     fn write_commonjs_facade(&self, path: &Path) {
