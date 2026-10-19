@@ -170,6 +170,8 @@ pub fn append_child(parent: u32, child: u32) {
             crate::dynamic_script::notify_script_mutated(parent);
             if inserted_style {
                 crate::jsdom::sync_style_element(child);
+            } else if first_child(child).is_some() && is_connected(parent) {
+                crate::jsdom::sync_style_tree(child);
             }
             return;
         }
@@ -196,7 +198,46 @@ pub fn append_child(parent: u32, child: u32) {
     crate::dynamic_script::notify_node_inserted(child);
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::notify_script_mutated(parent);
-    crate::jsdom::sync_style_element(child);
+    if is_connected(parent) || old_parent.is_some_and(is_connected) {
+        crate::jsdom::sync_style_tree(child);
+    } else {
+        crate::jsdom::sync_style_element(child);
+    }
+}
+
+/// Tree order of two nodes of one tree (ancestors first).
+pub fn tree_order(a: u32, b: u32) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a == b {
+        return Ordering::Equal;
+    }
+    let path = |node: u32| {
+        let mut path = vec![node];
+        let mut current = node;
+        while let Some(parent) = parent_node(current) {
+            path.push(parent);
+            current = parent;
+        }
+        path.reverse();
+        path
+    };
+    let (path_a, path_b) = (path(a), path(b));
+    let mut depth = 0;
+    while depth < path_a.len() && depth < path_b.len() && path_a[depth] == path_b[depth] {
+        depth += 1;
+    }
+    if depth == path_a.len() {
+        return Ordering::Less;
+    }
+    if depth == path_b.len() {
+        return Ordering::Greater;
+    }
+    if depth == 0 {
+        return a.cmp(&b);
+    }
+    let siblings = children(path_a[depth - 1]);
+    let position = |node: u32| siblings.iter().position(|sibling| *sibling == node);
+    position(path_a[depth]).cmp(&position(path_b[depth]))
 }
 
 pub fn remove_child(parent: u32, child: u32) {
@@ -213,7 +254,11 @@ pub fn remove_child(parent: u32, child: u32) {
         crate::dynamic_script::notify_node_removed(child);
         #[cfg(feature = "dynamic-js")]
         crate::dynamic_script::notify_script_mutated(parent);
-        crate::jsdom::sync_style_element(child);
+        if first_child(child).is_some() && is_connected(parent) {
+            crate::jsdom::sync_style_tree(child);
+        } else {
+            crate::jsdom::sync_style_element(child);
+        }
     }
 }
 
@@ -250,6 +295,9 @@ pub fn insert_before(parent: u32, new_child: u32, ref_child: u32) {
     crate::dynamic_script::notify_node_inserted(new_child);
     #[cfg(feature = "dynamic-js")]
     crate::dynamic_script::notify_script_mutated(parent);
+    if is_connected(parent) || old_parent.is_some_and(is_connected) {
+        crate::jsdom::sync_style_tree(new_child);
+    }
 }
 
 pub fn set_attribute(node: u32, name: &str, value: &str) {

@@ -51,11 +51,15 @@ const show = (label) => {
   show('after unsubscribe');
 
   const snapshot = path.join(os.tmpdir(), 'w3cos-watch-snapshot-' + process.pid);
-  const written = await watcher.writeSnapshot(root, snapshot);
+  const ignore = [path.join(root, 'node_modules'), '**/*.log'];
+  const written = await watcher.writeSnapshot(root, snapshot, { ignore });
   console.log('snapshot', typeof written, written === snapshot, fs.existsSync(snapshot));
   fs.writeFileSync(path.join(root, 'since.txt'), '');
   fs.unlinkSync(path.join(root, 'c.txt'));
-  const since = await watcher.getEventsSince(root, snapshot);
+  // Also write under ignored paths: must not appear in getEventsSince.
+  fs.writeFileSync(path.join(root, 'node_modules', 'ignored.js'), 'x');
+  fs.writeFileSync(path.join(root, 'sub', 'trace.log'), 'x');
+  const since = await watcher.getEventsSince(root, snapshot, { ignore });
   console.log('since', JSON.stringify(since.map((e) => e.type + ':' + rel(e.path)).sort()));
   fs.rmSync(snapshot, { force: true });
   fs.rmSync(root, { recursive: true, force: true });
