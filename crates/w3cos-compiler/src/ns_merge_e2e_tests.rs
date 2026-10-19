@@ -2,7 +2,10 @@
 use crate::cjs_e2e_tests::{compile_and_run, write_fixture};
 
 const FILES: &[(&str, &str)] = &[
-    ("package.json", include_str!("fixtures/ns_merge/package.json")),
+    (
+        "package.json",
+        include_str!("fixtures/ns_merge/package.json"),
+    ),
     ("main.js", include_str!("fixtures/ns_merge/main.js")),
 ];
 

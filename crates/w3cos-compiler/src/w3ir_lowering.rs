@@ -4257,12 +4257,7 @@ impl Builder {
         }
         let dst = self.register();
         let this_value = self.constant(Constant::Undefined);
-        self.emit_call(
-            dst,
-            tag,
-            this_value,
-            LoweredArguments::Registers(arguments),
-        );
+        self.emit_call(dst, tag, this_value, LoweredArguments::Registers(arguments));
         Ok(dst)
     }
 

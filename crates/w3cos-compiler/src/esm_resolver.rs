@@ -1646,14 +1646,16 @@ impl EsmResolver {
         let src_root = self.project_root.join("src");
         let rel = normalized.strip_prefix(&src_root).ok()?;
         let mut out = self.project_root.join("out").join(rel);
-        if out.extension().is_none_or(|ext| ext == "ts" || ext == "tsx") {
+        if out
+            .extension()
+            .is_none_or(|ext| ext == "ts" || ext == "tsx")
+        {
             out.set_extension("js");
         }
         out.is_file().then_some(out)
     }
 
     fn prefer_transpiled_out(&self, path: &Path) -> PathBuf {
-
         let Ok(src_root) = path.strip_prefix(self.project_root.join("src")) else {
             return path.to_path_buf();
         };
@@ -1671,7 +1673,6 @@ impl EsmResolver {
     }
 
     fn resolve_path_like(&self, candidate: &Path) -> Result<PathBuf> {
-
         if let Some(path) = self.resolve_file(candidate) {
             return Ok(path);
         }
@@ -3338,10 +3339,7 @@ const d = import(computed);
 "#;
         assert_eq!(
             collect_dynamic_import_literals(source),
-            vec![
-                "./lazy.js".to_string(),
-                "./lazy2.js".to_string(),
-            ]
+            vec!["./lazy.js".to_string(), "./lazy2.js".to_string(),]
         );
     }
 
@@ -3356,21 +3354,23 @@ const d = import(computed);
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("package.json"),
-            r#"{"type":"module"}"#,
-        )
-        .unwrap();
+        std::fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
         std::fs::write(
             root.join("entry.js"),
             "export async function main() { return import('./lazy.js'); }
 ",
         )
         .unwrap();
-        std::fs::write(root.join("lazy.js"), "export const value = 42;
-").unwrap();
+        std::fs::write(
+            root.join("lazy.js"),
+            "export const value = 42;
+",
+        )
+        .unwrap();
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("entry.js")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("entry.js"))
+            .unwrap();
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("entry.js"));
         assert_eq!(bundle.modules.len(), 2);
         assert_eq!(bundle.lazy_start, Some(1));
@@ -3413,16 +3413,25 @@ export function main() { return new DisposableStore().n; }
         )
         .unwrap();
         let resolver = EsmResolver::new(&root);
-        let parsed = resolver.parse_graph_from_entry(&root.join("entry.js")).unwrap();
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("entry.js"))
+            .unwrap();
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("entry.js"));
         assert!(
             bundle.unresolved.is_empty(),
             "unresolved: {:#?}",
             bundle.unresolved
         );
-        let entry = bundle.modules.iter().find(|m| m.path.ends_with("entry.js")).unwrap();
+        let entry = bundle
+            .modules
+            .iter()
+            .find(|m| m.path.ends_with("entry.js"))
+            .unwrap();
         assert!(
-            entry.local_to_bundled.iter().any(|(local, _)| local == "DisposableStore"),
+            entry
+                .local_to_bundled
+                .iter()
+                .any(|(local, _)| local == "DisposableStore"),
             "entry bindings: {:#?}",
             entry.local_to_bundled
         );

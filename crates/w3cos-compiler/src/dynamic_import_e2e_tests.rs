@@ -7,10 +7,7 @@ const FILES: &[(&str, &str)] = &[
         "package.json",
         include_str!("fixtures/dynamic_import/package.json"),
     ),
-    (
-        "lazy.js",
-        include_str!("fixtures/dynamic_import/lazy.js"),
-    ),
+    ("lazy.js", include_str!("fixtures/dynamic_import/lazy.js")),
     ("main.js", include_str!("fixtures/dynamic_import/main.js")),
 ];
 
