@@ -338,7 +338,7 @@ const ADVANCED_FILES: &[(&str, &str)] = &[
         r##"const esm = require("./esm.mjs");
 console.log("require(esm)", esm.value, typeof esm.default, esm.default());
 try { require("dgram"); } catch (e) { console.log("builtin", e.code); }
-try { require("node:http2"); } catch (e) { console.log("node: builtin", e.code); }
+try { require("node:repl"); } catch (e) { console.log("node: builtin", e.code); }
 console.log("#cfg", require("#cfg").which);
 console.log("w3cos condition", require("cond-pkg"));
 const reexp = require("./reexport-user.mjs");
