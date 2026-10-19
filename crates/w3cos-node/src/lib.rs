@@ -26,6 +26,9 @@ pub const MODULES: &[(&str, &str)] = &[
         "internal/w3cos_worker",
         include_str!("../js/w3cos_worker.js"),
     ),
+    // Native-module replacements (see `NATIVE_REPLACEMENTS`).
+    ("internal/w3cos_spdlog", include_str!("../js/spdlog.js")),
+    ("internal/w3cos_sqlite3", include_str!("../js/sqlite3.js")),
     ("net", include_str!("../js/net.js")),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),
@@ -52,6 +55,24 @@ pub const MODULES: &[(&str, &str)] = &[
 /// writes the app's pages and renderer scripts as `./electron_app.js` next
 /// to it.
 pub const ELECTRON: &str = include_str!("../js/electron.js");
+
+/// npm packages whose native addon w3cos replaces with glue from `MODULES`
+/// (M3 item 20). These resolve to the glue even when the package is
+/// installed, since its `.node` binary cannot load into an AOT app.
+pub const NATIVE_REPLACEMENTS: &[(&str, &str)] = &[
+    ("@vscode/spdlog", "internal/w3cos_spdlog"),
+    ("@w3cos/spdlog", "internal/w3cos_spdlog"),
+    ("@vscode/sqlite3", "internal/w3cos_sqlite3"),
+    ("@w3cos/sqlite3", "internal/w3cos_sqlite3"),
+];
+
+/// The glue module replacing the native package `specifier`, if any.
+pub fn native_replacement(specifier: &str) -> Option<&'static str> {
+    NATIVE_REPLACEMENTS
+        .iter()
+        .find(|(package, _)| *package == specifier)
+        .map(|(_, module)| *module)
+}
 
 /// The builtin's name without a `node:` prefix.
 pub fn module_name(specifier: &str) -> &str {
@@ -88,6 +109,18 @@ mod tests {
                 rest = &rest[end..];
             }
         }
+    }
+
+    #[test]
+    fn native_replacements_name_glue_modules() {
+        for (package, module) in NATIVE_REPLACEMENTS {
+            assert!(is_available(module), "{package} -> missing {module}");
+        }
+        assert_eq!(
+            native_replacement("@vscode/sqlite3"),
+            Some("internal/w3cos_sqlite3")
+        );
+        assert_eq!(native_replacement("sqlite3"), None);
     }
 
     #[test]
