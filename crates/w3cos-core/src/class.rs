@@ -577,6 +577,24 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
         if let Some(node) = crate::intrinsics::dom_node_id(obj) {
             crate::intrinsics::pin_dom(node);
         }
+    } else if let Some(function) = obj.as_function() {
+        // Function objects (constructor statics such as
+        // `EventEmitter.defaultMaxListeners`) take data and accessor
+        // definitions too.
+        let field = |name: &str| {
+            descriptor
+                .as_object()
+                .filter(|desc| desc.borrow().properties.contains_key(name))
+                .map(|_| descriptor.get_property(name))
+        };
+        let getter = field("get");
+        let setter = field("set");
+        if getter.is_some() || setter.is_some() {
+            function.define_accessor(key, getter, setter);
+        } else if let Some(value) = field("value") {
+            function.remove_accessor(key);
+            function.set_property(key, value);
+        }
     }
     obj.clone()
 }
