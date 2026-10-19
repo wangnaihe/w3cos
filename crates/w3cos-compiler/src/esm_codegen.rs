@@ -2177,7 +2177,7 @@ fn emit_w3ir_generator_symbol(
         symbol.original_name, symbol.bundled_name, symbol.bundled_name,
     ));
     output.push_str(&format!(
-        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::named_function({:?}, {arity}, move |__this, __args| {}_call(__this, __args)))\n    }}\n",
+        "    pub fn {}_value() -> w3cos_core::Value {{\n        __w3cos_esm_get_or_init({:?}, || w3cos_core::named_generator_function({:?}, {arity}, move |__this, __args| {}_call(__this, __args)))\n    }}\n",
         symbol.bundled_name,
         format!("{}:value", symbol.bundled_name),
         symbol.original_name,
