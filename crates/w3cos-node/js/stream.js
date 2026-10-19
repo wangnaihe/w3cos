@@ -1183,7 +1183,7 @@ function pipeline() {
     if (err) destroys.forEach(function (d) { d(error); });
     remaining--;
     if (remaining === 0 || (err && remaining >= 0 && error === err)) {
-      if (remaining === 0 || err) nextTick(function () { callback(error, last); });
+      if (remaining === 0 || err) nextTick(function () { callback(error === null ? undefined : error, undefined); });
     }
   }
   const last = streams[streams.length - 1];

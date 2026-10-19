@@ -13,6 +13,7 @@ pub const MODULES: &[(&str, &str)] = &[
         "module.exports = require('assert').strict;\n",
     ),
     ("buffer", include_str!("../js/buffer.js")),
+    ("crypto", include_str!("../js/crypto.js")),
     ("events", include_str!("../js/events.js")),
     ("fs", include_str!("../js/fs.js")),
     ("fs/promises", "module.exports = require('fs').promises;\n"),
@@ -32,6 +33,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("url", include_str!("../js/url.js")),
     ("util", include_str!("../js/util.js")),
     ("util/types", include_str!("../js/util_types.js")),
+    ("zlib", include_str!("../js/zlib.js")),
 ];
 
 /// The builtin's name without a `node:` prefix.
@@ -76,5 +78,7 @@ mod tests {
         assert!(source("node:path").is_some());
         assert!(source("node:timers/promises").is_some());
         assert!(source("fs").is_some());
+        assert!(source("node:crypto").is_some());
+        assert!(source("zlib").is_some());
     }
 }

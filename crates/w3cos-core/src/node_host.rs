@@ -794,7 +794,209 @@ fn build_host() -> Value {
         fill_random(&mut bytes);
         crate::binary::array_buffer_value(bytes)
     });
+    define(&host, "hash", |args| {
+        let algorithm = arg(&args, 0).to_js_string();
+        match digest(&algorithm, &data_bytes(&arg(&args, 1))) {
+            Some(bytes) => crate::binary::array_buffer_value(bytes),
+            None => Value::Undefined,
+        }
+    });
+    define(&host, "hmac", |args| {
+        let algorithm = arg(&args, 0).to_js_string();
+        let key = data_bytes(&arg(&args, 1));
+        match hmac_digest(&algorithm, &key, &data_bytes(&arg(&args, 2))) {
+            Some(bytes) => crate::binary::array_buffer_value(bytes),
+            None => Value::Undefined,
+        }
+    });
+    define(&host, "pbkdf2", |args| {
+        let password = data_bytes(&arg(&args, 0));
+        let salt = data_bytes(&arg(&args, 1));
+        let iterations = arg(&args, 2).to_number().max(1.0) as u32;
+        let length = arg(&args, 3).to_number().max(0.0) as usize;
+        let algorithm = arg(&args, 4).to_js_string();
+        match pbkdf2(&algorithm, &password, &salt, iterations, length) {
+            Some(bytes) => crate::binary::array_buffer_value(bytes),
+            None => Value::Undefined,
+        }
+    });
+    define(&host, "zlib", |args| {
+        let op = arg(&args, 0).to_js_string();
+        let data = data_bytes(&arg(&args, 1));
+        let level = arg(&args, 2);
+        let level = if level.is_undefined() || level.to_number() < 0.0 {
+            6
+        } else {
+            level.to_number().min(9.0) as u32
+        };
+        match zlib(&op, &data, level) {
+            Ok(bytes) => crate::binary::array_buffer_value(bytes),
+            Err((code, errno, message)) => {
+                let error = crate::builtins::error_instance("Error", vec![Value::from(message)]);
+                error.set_property("errno", Value::Number(f64::from(errno)));
+                error.set_property("code", Value::from(code));
+                crate::throw_value(error)
+            }
+        }
+    });
     host
+}
+
+/// Canonical digest name for Node's spellings (`SHA256`, `sha-256`, `RSA-SHA1`).
+fn digest_name(algorithm: &str) -> Option<&'static str> {
+    let lower = algorithm.to_ascii_lowercase();
+    let lower = lower.strip_prefix("rsa-").unwrap_or(&lower);
+    Some(match lower {
+        "md5" => "md5",
+        "sha1" | "sha-1" => "sha1",
+        "sha224" | "sha-224" => "sha224",
+        "sha256" | "sha-256" => "sha256",
+        "sha384" | "sha-384" => "sha384",
+        "sha512" | "sha-512" => "sha512",
+        _ => return None,
+    })
+}
+
+fn digest(algorithm: &str, data: &[u8]) -> Option<Vec<u8>> {
+    use sha2::Digest;
+    Some(match digest_name(algorithm)? {
+        "md5" => md5::Md5::digest(data).to_vec(),
+        "sha1" => sha1::Sha1::digest(data).to_vec(),
+        "sha224" => sha2::Sha224::digest(data).to_vec(),
+        "sha256" => sha2::Sha256::digest(data).to_vec(),
+        "sha384" => sha2::Sha384::digest(data).to_vec(),
+        _ => sha2::Sha512::digest(data).to_vec(),
+    })
+}
+
+fn mac<M: hmac::Mac + hmac::digest::KeyInit>(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = <M as hmac::Mac>::new_from_slice(key).expect("HMAC takes any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hmac_digest(algorithm: &str, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    use hmac::Hmac;
+    Some(match digest_name(algorithm)? {
+        "md5" => mac::<Hmac<md5::Md5>>(key, data),
+        "sha1" => mac::<Hmac<sha1::Sha1>>(key, data),
+        "sha224" => mac::<Hmac<sha2::Sha224>>(key, data),
+        "sha256" => mac::<Hmac<sha2::Sha256>>(key, data),
+        "sha384" => mac::<Hmac<sha2::Sha384>>(key, data),
+        _ => mac::<Hmac<sha2::Sha512>>(key, data),
+    })
+}
+
+/// PBKDF2 (RFC 8018) over HMAC-`algorithm`.
+fn pbkdf2(
+    algorithm: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: usize,
+) -> Option<Vec<u8>> {
+    digest_name(algorithm)?;
+    let mut out = Vec::with_capacity(length);
+    let mut block = 1u32;
+    while out.len() < length {
+        let mut input = salt.to_vec();
+        input.extend_from_slice(&block.to_be_bytes());
+        let mut u = hmac_digest(algorithm, password, &input)?;
+        let mut t = u.clone();
+        for _ in 1..iterations {
+            u = hmac_digest(algorithm, password, &u)?;
+            for (acc, byte) in t.iter_mut().zip(&u) {
+                *acc ^= byte;
+            }
+        }
+        out.extend_from_slice(&t);
+        block += 1;
+    }
+    out.truncate(length);
+    Some(out)
+}
+
+type ZlibError = (&'static str, i32, String);
+
+fn zlib_data_error(error: io::Error, raw: bool) -> ZlibError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        return ("Z_BUF_ERROR", -5, "unexpected end of file".into());
+    }
+    let message = if raw {
+        "invalid block type"
+    } else {
+        "incorrect data check"
+    };
+    ("Z_DATA_ERROR", -3, message.into())
+}
+
+fn header_error() -> ZlibError {
+    ("Z_DATA_ERROR", -3, "incorrect header check".into())
+}
+
+/// RFC 1950 header: CM 8, window <= 32K, FCHECK, no preset dictionary.
+fn valid_zlib_header(data: &[u8]) -> bool {
+    data.len() < 2
+        || (data[0] & 0x0f == 8
+            && data[0] >> 4 <= 7
+            && (u16::from(data[0]) << 8 | u16::from(data[1])) % 31 == 0
+            && data[1] & 0x20 == 0)
+}
+
+/// One-shot (de)compression for `zlib`'s `*Sync` / callback APIs.
+fn zlib(op: &str, data: &[u8], level: u32) -> Result<Vec<u8>, ZlibError> {
+    use flate2::Compression;
+    use flate2::read::{
+        DeflateDecoder, DeflateEncoder, GzDecoder, MultiGzDecoder, ZlibDecoder, ZlibEncoder,
+    };
+    let level = Compression::new(level);
+    let mut out = Vec::new();
+    let read = |mut reader: Box<dyn Read + '_>, out: &mut Vec<u8>| reader.read_to_end(out);
+    let result = match op {
+        "deflate" => read(Box::new(ZlibEncoder::new(data, level)), &mut out),
+        "deflateRaw" => read(Box::new(DeflateEncoder::new(data, level)), &mut out),
+        "gzip" => read(
+            Box::new(
+                flate2::GzBuilder::new()
+                    .operating_system(3)
+                    .read(data, level),
+            ),
+            &mut out,
+        ),
+        "inflate" => {
+            if !valid_zlib_header(data) {
+                return Err(header_error());
+            }
+            read(Box::new(ZlibDecoder::new(data)), &mut out)
+        }
+        "inflateRaw" => read(Box::new(DeflateDecoder::new(data)), &mut out),
+        "gunzip" => {
+            if data.len() >= 2 && data[..2] != [0x1f, 0x8b] {
+                return Err(header_error());
+            }
+            read(Box::new(MultiGzDecoder::new(data)), &mut out)
+        }
+        "unzip" => {
+            if data.starts_with(&[0x1f, 0x8b]) {
+                read(Box::new(GzDecoder::new(data)), &mut out)
+            } else if !valid_zlib_header(data) {
+                return Err(header_error());
+            } else {
+                read(Box::new(ZlibDecoder::new(data)), &mut out)
+            }
+        }
+        _ => {
+            return Err((
+                "ERR_INVALID_ARG_VALUE",
+                -22,
+                format!("unknown zlib op {op}"),
+            ));
+        }
+    };
+    match result {
+        Ok(_) => Ok(out),
+        Err(error) => Err(zlib_data_error(error, op == "inflateRaw")),
+    }
 }
 
 trait FalseFlag {
@@ -826,6 +1028,42 @@ mod tests {
         assert_eq!(
             error.get_property("message").to_js_string(),
             "ENOENT: no such file or directory, open '/nope'"
+        );
+    }
+
+    #[test]
+    fn digests_and_kdfs_match_known_vectors() {
+        let hex = |bytes: Vec<u8>| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(
+            hex(digest("SHA-256", b"abc").unwrap()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(hmac_digest("md5", b"key", b"msg").unwrap()),
+            "18e3548c59ad40dd03907b7aeee71d67"
+        );
+        assert_eq!(
+            hex(pbkdf2("sha1", b"password", b"salt", 2, 20).unwrap()),
+            "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"
+        );
+        assert!(digest("nope", b"").is_none());
+    }
+
+    #[test]
+    fn zlib_round_trips_and_rejects_garbage() {
+        for (enc, dec) in [
+            ("deflate", "inflate"),
+            ("deflateRaw", "inflateRaw"),
+            ("gzip", "gunzip"),
+        ] {
+            let packed = zlib(enc, b"hello hello hello", 6).unwrap();
+            assert_eq!(zlib(dec, &packed, 6).unwrap(), b"hello hello hello");
+        }
+        let gz = zlib("gzip", b"x", 6).unwrap();
+        assert_eq!(zlib("unzip", &gz, 6).unwrap(), b"x");
+        assert_eq!(
+            zlib("inflate", b"garbage", 6).unwrap_err().0,
+            "Z_DATA_ERROR"
         );
     }
 

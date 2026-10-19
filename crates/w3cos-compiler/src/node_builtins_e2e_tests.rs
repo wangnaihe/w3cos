@@ -530,3 +530,218 @@ fn node_fs_matches_node() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+const CRYPTO_MAIN: &str = r##"'use strict';
+const crypto = require('crypto');
+const nc = require('node:crypto');
+console.log('same', crypto === nc);
+for (const alg of ['md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512']) {
+  console.log(alg, crypto.createHash(alg).update('hello ').update('world').digest('hex'));
+}
+console.log('empty', crypto.createHash('sha256').digest('hex'));
+console.log('b64', crypto.createHash('sha1').update('abc').digest('base64'));
+console.log('b64url', crypto.createHash('sha256').update('abc').digest('base64url'));
+const d = crypto.createHash('md5').update(Buffer.from([1, 2, 3])).digest();
+console.log('buf', Buffer.isBuffer(d), d.length, d.toString('hex'));
+console.log('enc', crypto.createHash('sha1').update('68656c6c6f', 'hex').digest('hex'));
+console.log('u8', crypto.createHash('sha1').update(new Uint8Array([104, 105])).digest('hex'));
+console.log('upper', crypto.createHash('SHA256').update('x').digest('hex'));
+console.log('dashed', crypto.createHash('sha-256').update('x').digest('hex') === crypto.createHash('sha256').update('x').digest('hex'));
+const long = 'a'.repeat(1000);
+console.log('long', crypto.createHash('sha512').update(long).digest('hex').slice(0, 32));
+const h = crypto.createHash('sha256').update('part1');
+const c = h.copy();
+c.update('part2');
+console.log('copy', h.digest('hex').slice(0, 16), c.digest('hex').slice(0, 16));
+try { h.update('x'); } catch (e) { console.log('finalized', e.code, e.message); }
+try { h.digest(); } catch (e) { console.log('finalized2', e.code, e.message); }
+try { crypto.createHash('nope'); } catch (e) { console.log('unsupported', e.message); }
+console.log('hmac', crypto.createHmac('sha256', 'key').update('The quick brown fox jumps over the lazy dog').digest('hex'));
+console.log('hmac-md5', crypto.createHmac('md5', 'key').update('msg').digest('hex'));
+console.log('hmac-long-key', crypto.createHmac('sha1', 'k'.repeat(100)).update('m').digest('hex'));
+console.log('hmac512', crypto.createHmac('sha512', Buffer.from('secret')).update('a').update('b').digest('base64'));
+console.log('pbkdf2', crypto.pbkdf2Sync('password', 'salt', 1000, 32, 'sha256').toString('hex'));
+console.log('pbkdf2-sha1', crypto.pbkdf2Sync('password', 'salt', 2, 20, 'sha1').toString('hex'));
+const r = crypto.randomBytes(16);
+console.log('random', Buffer.isBuffer(r), r.length);
+const u = crypto.randomUUID();
+console.log('uuid', /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u));
+const arr = new Uint32Array(4);
+console.log('grv', crypto.getRandomValues(arr) === arr, arr.length);
+console.log('webcrypto', typeof crypto.webcrypto.getRandomValues, typeof crypto.webcrypto.randomUUID);
+const fill = Buffer.alloc(8);
+console.log('fill', crypto.randomFillSync(fill, 2, 4) === fill, fill[0], fill[1], fill[6], fill[7]);
+let okInt = true;
+for (let i = 0; i < 200; i++) { const n = crypto.randomInt(3, 7); if (n < 3 || n >= 7 || n !== Math.floor(n)) okInt = false; }
+console.log('randomInt', okInt, crypto.randomInt(1) === 0);
+console.log('tse', crypto.timingSafeEqual(Buffer.from('abc'), Buffer.from('abc')), crypto.timingSafeEqual(Buffer.from('abc'), Buffer.from('abd')));
+try { crypto.timingSafeEqual(Buffer.from('a'), Buffer.from('ab')); } catch (e) { console.log('tse-len', e.code, e.name, e.message); }
+const hashes = crypto.getHashes();
+console.log('hashes', ['md5', 'sha1', 'sha256', 'sha512'].every((x) => hashes.includes(x)));
+crypto.randomBytes(4, (err, buf) => {
+  console.log('random-cb', err, buf.length);
+  crypto.pbkdf2('pw', 'salt', 1, 8, 'sha512', (err2, key) => {
+    console.log('pbkdf2-cb', err2, key.toString('hex'));
+  });
+});
+"##;
+
+/// `node main.cjs` (v20.19.2) output for `CRYPTO_MAIN`.
+const CRYPTO_NODE_OUTPUT: &str = r##"same true
+md5 5eb63bbbe01eeed093cb22bb8f5acdc3
+sha1 2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
+sha224 2f05477fc24bb4faefd86517156dafdecec45b8ad3cf2522a563582b
+sha256 b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9
+sha384 fdbd8e75a67f29f701a4e040385e2e23986303ea10239211af907fcbb83578b3e417cb71ce646efd0819dd8c088de1bd
+sha512 309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f
+empty e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+b64 qZk+NkcGgWq6PiVxeFDCbJzQ2J0=
+b64url ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0
+buf true 16 5289df737df57326fcdd22597afb1fac
+enc aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d
+u8 c22b5f9178342609428d6f51b2c5af4c0bde6a42
+upper 2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881
+dashed true
+long 67ba5535a46e3f86dbfbed8cbbaf0125
+copy 59e0a3cc7a0c45f9 4986fc0feee88f7e
+finalized ERR_CRYPTO_HASH_FINALIZED Digest already called
+finalized2 ERR_CRYPTO_HASH_FINALIZED Digest already called
+unsupported Digest method not supported
+hmac f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
+hmac-md5 18e3548c59ad40dd03907b7aeee71d67
+hmac-long-key 014f08e9aabf7980d07a205a4c638743915ff915
+hmac512 ZNyU2swDduB7NCka3KCRHI+QM4YW4etuGJN/wUQzN40zUwsrnddcXuptyH3cGddTBiU31g9gHbw3jVs7ltNClQ==
+pbkdf2 632c2812e46d4604102ba7618e9d6d7d2f8128f6266b4a03264d2a0460b7dcb3
+pbkdf2-sha1 ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957
+random true 16
+uuid true
+grv true 4
+webcrypto function function
+fill true 0 0 0 0
+randomInt true true
+tse true false
+tse-len ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH RangeError Input buffers must have the same byte length
+hashes true
+random-cb null 4
+pbkdf2-cb null 9bbcdf4f0b03e358
+"##;
+
+#[test]
+fn node_crypto_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_crypto_e2e",
+        &[
+            ("package.json", r#"{"name":"node-crypto"}"#),
+            ("main.cjs", CRYPTO_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_crypto_e2e");
+    let expected: Vec<&str> = CRYPTO_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+const ZLIB_MAIN: &str = r##"'use strict';
+const zlib = require('zlib');
+const { promisify } = require('util');
+const { pipeline, Readable, Writable } = require('stream');
+const text = 'hello zlib! '.repeat(50);
+const input = Buffer.from(text);
+const pairs = [
+  ['deflateSync', 'inflateSync'], ['deflateRawSync', 'inflateRawSync'],
+  ['gzipSync', 'gunzipSync'], ['gzipSync', 'unzipSync'], ['deflateSync', 'unzipSync'],
+];
+for (const [enc, dec] of pairs) {
+  const packed = zlib[enc](input);
+  const out = zlib[dec](packed);
+  console.log(enc, dec, Buffer.isBuffer(packed), packed.length < input.length, out.toString() === text);
+}
+console.log('gzip header', zlib.gzipSync('x').subarray(0, 10).toString('hex'));
+console.log('zlib header', zlib.deflateSync('x').subarray(0, 2).toString('hex'),
+  zlib.deflateSync('x', { level: 1 }).subarray(0, 2).toString('hex'),
+  zlib.deflateSync('x', { level: 9 }).subarray(0, 2).toString('hex'));
+console.log('level0', zlib.deflateRawSync('abc', { level: 0 }).toString('hex'));
+console.log('string input', zlib.inflateSync(zlib.deflateSync('héllo')).toString());
+console.log('u8 input', zlib.inflateRawSync(zlib.deflateRawSync(new Uint8Array([1, 2, 3]))).toString('hex'));
+const fromNode = Buffer.from('H4sIAAAAAAAAA8tIzcnJVyjPL8pJAQCFEUoNCwAAAA==', 'base64');
+console.log('node gzip', zlib.gunzipSync(fromNode).toString());
+const fromNodeDeflate = Buffer.from('eJzLSM3JyVcozy/KSQEAGgsEXQ==', 'base64');
+console.log('node deflate', zlib.inflateSync(fromNodeDeflate).toString());
+console.log('empty', zlib.inflateSync(zlib.deflateSync(Buffer.alloc(0))).length, zlib.gunzipSync(zlib.gzipSync('')).length);
+try { zlib.inflateSync(Buffer.from('not compressed')); } catch (e) {
+  console.log('bad', e.name, e.code, e.errno, e.message);
+}
+try { zlib.gunzipSync(Buffer.from('nope nope')); } catch (e) {
+  console.log('bad gzip', e.code, e.errno, e.message);
+}
+const truncated = zlib.deflateSync(input).subarray(0, 10);
+try { zlib.inflateSync(truncated); } catch (e) {
+  console.log('truncated', e.code, e.errno, e.message);
+}
+console.log('constants', zlib.constants.Z_BEST_COMPRESSION, zlib.constants.Z_DEFAULT_COMPRESSION, zlib.Z_BEST_SPEED, zlib.constants.Z_SYNC_FLUSH);
+console.log('types', typeof zlib.createGzip, typeof zlib.createGunzip, typeof zlib.createDeflate, typeof zlib.createInflate);
+zlib.deflate(input, (err, packed) => {
+  console.log('cb deflate', err, packed.length < input.length);
+  zlib.inflate(packed, { }, (err2, out) => {
+    console.log('cb inflate', err2, out.toString() === text);
+    zlib.inflate(Buffer.from('zzz'), (err3, out3) => {
+      console.log('cb error', err3.code, out3);
+      promisify(zlib.gzip)('promised').then((gz) => promisify(zlib.gunzip)(gz)).then((buf) => {
+        console.log('promisify', buf.toString());
+        const chunks = [];
+        pipeline(
+          Readable.from([Buffer.from('stream '), Buffer.from('data '), Buffer.from('here')]),
+          zlib.createGzip(),
+          zlib.createGunzip(),
+          new Writable({ write(chunk, enc, cb) { chunks.push(chunk); cb(); } }),
+          (err4) => {
+            console.log('pipeline', err4, Buffer.concat(chunks).toString());
+          },
+        );
+      });
+    });
+  });
+});
+"##;
+
+/// `node main.cjs` (v20.19.2) output for `ZLIB_MAIN`. Compressed bytes are
+/// only compared where zlib and miniz_oxide agree (headers, stored blocks).
+const ZLIB_NODE_OUTPUT: &str = r##"deflateSync inflateSync true true true
+deflateRawSync inflateRawSync true true true
+gzipSync gunzipSync true true true
+gzipSync unzipSync true true true
+deflateSync unzipSync true true true
+gzip header 1f8b0800000000000003
+zlib header 789c 7801 78da
+level0 010300fcff616263
+string input héllo
+u8 input 010203
+node gzip hello world
+node deflate hello world
+empty 0 0
+bad Error Z_DATA_ERROR -3 incorrect header check
+bad gzip Z_DATA_ERROR -3 incorrect header check
+truncated Z_BUF_ERROR -5 unexpected end of file
+constants 9 -1 1 2
+types function function function function
+cb deflate null true
+cb inflate null true
+cb error Z_DATA_ERROR undefined
+promisify promised
+pipeline undefined stream data here
+"##;
+
+#[test]
+fn node_zlib_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_zlib_e2e",
+        &[
+            ("package.json", r#"{"name":"node-zlib"}"#),
+            ("main.cjs", ZLIB_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_zlib_e2e");
+    let expected: Vec<&str> = ZLIB_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
