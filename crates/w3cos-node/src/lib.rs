@@ -7,6 +7,7 @@
 
 /// (module name, CommonJS source). Subpath modules use their full name.
 pub const MODULES: &[(&str, &str)] = &[
+    ("buffer", include_str!("../js/buffer.js")),
     ("events", include_str!("../js/events.js")),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),

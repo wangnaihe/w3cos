@@ -134,3 +134,64 @@ fn node_builtins_match_node() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+const BUFFER_MAIN: &str = r##"const { Buffer } = require("buffer");
+const b = Buffer.from("héllo wörld");
+console.log("from", b.length, b.toString(), b.toString("hex"), b.toString("base64"), b.toString("base64url"), b.toString("latin1").length);
+console.log("is", Buffer.isBuffer(b), b instanceof Uint8Array, b instanceof Buffer, Buffer.isBuffer(new Uint8Array(2)), Buffer.isEncoding("UTF-8"), Buffer.isEncoding("nope"));
+console.log("decode", Buffer.from("68656c6c6f", "hex").toString(), Buffer.from("aGVsbG8=", "base64").toString(), Buffer.from("aGVsbG8", "base64url").toString(), Buffer.from("hi", "utf16le").toString("hex"), Buffer.from([0xe2, 0x82, 0xac, 0xff]).toString());
+console.log("bytes", Buffer.byteLength("héllo"), Buffer.byteLength("abcd", "hex"), Buffer.byteLength("€"), Buffer.alloc(4).toString("hex"), Buffer.alloc(5, "ab").toString(), Buffer.alloc(3, 7).toString("hex"));
+const c = Buffer.concat([Buffer.from("ab"), Buffer.from("cd"), Buffer.from("ef")]);
+console.log("concat", c.toString(), Buffer.concat([Buffer.from("abc")], 2).toString(), Buffer.compare(Buffer.from("a"), Buffer.from("b")), c.equals(Buffer.from("abcdef")), c.compare(Buffer.from("abd")));
+const s = c.subarray(1, 4); s[0] = 0x42;
+console.log("slice", s.toString(), c.toString(), c.slice(-2).toString(), Buffer.isBuffer(s), s.length, c.subarray(4, 2).length);
+const w = Buffer.alloc(8); const n = w.write("hey", 2);
+console.log("write", n, w.toString("hex"), w.write("zz", "latin1"), w.toString("utf8", 0, 2));
+console.log("index", c.indexOf("cd"), c.indexOf(0x65), c.lastIndexOf("e"), c.includes("Bc"), c.indexOf("zz"), c.indexOf(Buffer.from("ef")));
+const r = Buffer.alloc(16);
+r.writeUInt16LE(0x1234, 0); r.writeUInt32BE(0xdeadbeef, 2); r.writeInt8(-2, 6); r.writeDoubleLE(1.5, 8);
+console.log("rw", r.readUInt16LE(0), r.readUInt16BE(0), r.readUInt32BE(2).toString(16), r.readInt8(6), r.readUInt8(6), r.readDoubleLE(8), r.readUint32LE(2), r.toString("hex"));
+try { r.readUInt32LE(14); } catch (e) { console.log("range", e.code, e.name); }
+try { Buffer.from({}); } catch (e) { console.log("type", e.code); }
+try { b.toString("bogus"); } catch (e) { console.log("enc", e.code); }
+console.log("json", JSON.stringify(Buffer.from("hi")), Buffer.from(JSON.parse(JSON.stringify(Buffer.from("ok")))).toString());
+const cp = Buffer.alloc(6, "."); console.log("copy", Buffer.from("xyz").copy(cp, 2), cp.toString(), Buffer.from("abcd").swap16().toString(), Buffer.from("abcd").swap32().toString());
+console.log("inspect", require("util").inspect(Buffer.from("hi")), Buffer.from("hi").inspect());
+console.log("ab", Buffer.from(new Uint8Array([1, 2, 3]).buffer, 1).toString("hex"), Buffer.from(Buffer.from("x")).toString(), Object.prototype.toString.call(b));
+console.log("fill", Buffer.alloc(4).fill("ab").toString(), Buffer.alloc(4).fill(0x41, 1, 3).toString("hex"), typeof Buffer.poolSize, require("node:buffer").kMaxLength > 0);
+"##;
+
+/// `node main.cjs` (v20.19.2).
+const BUFFER_NODE_OUTPUT: &str = r##"from 13 héllo wörld 68c3a96c6c6f2077c3b6726c64 aMOpbGxvIHfDtnJsZA== aMOpbGxvIHfDtnJsZA 13
+is true true true false true false
+decode hello hello hello 68006900 €�
+bytes 6 2 3 00000000 ababa 070707
+concat abcdef ab -1 true -1
+slice Bcd aBcdef ef true 3 0
+write 3 0000686579000000 2 zz
+index 2 4 4 true -1 4
+rw 4660 13330 deadbeef -2 254 1.5 4022250974 3412deadbeeffe00000000000000f83f
+range ERR_OUT_OF_RANGE RangeError
+type ERR_INVALID_ARG_TYPE
+enc ERR_UNKNOWN_ENCODING
+json {"type":"Buffer","data":[104,105]} ok
+copy 3 ..xyz. badc dcba
+inspect <Buffer 68 69> <Buffer 68 69>
+ab 0203 x [object Uint8Array]
+fill abab 00414100 number true
+"##;
+
+#[test]
+fn node_buffer_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_buffer_e2e",
+        &[
+            ("package.json", r#"{"name":"node-buffer"}"#),
+            ("main.cjs", BUFFER_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_buffer_e2e");
+    let expected: Vec<&str> = BUFFER_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
