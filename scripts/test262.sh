@@ -4,9 +4,13 @@
 #   scripts/test262.sh fetch            # checkout the pinned commit into $TEST262_DIR
 #   scripts/test262.sh subset [args]    # CI gate: VS Code-priority subset vs expected failures
 #   scripts/test262.sh full [args]      # full built-ins + language + annexB run, writes reports
+#                                       # (--shard i/n splits it across jobs)
 #   scripts/test262.sh update-expected  # regenerate tests/test262/expected-failures.txt
 #
 # TEST262_DIR defaults to target/test262; reports go to $TEST262_OUT (target/test262-report).
+# Children run under memory caps (--mem-limit-mb 2048 per test,
+# --build-mem-limit-mb 6144 per batch build) with timeouts that kill the
+# whole process group; a hung or runaway test is a failure and the run goes on.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 LOCK=$(tr -d '[:space:]' < tests/test262/test262.lock)
@@ -48,7 +52,9 @@ case "$cmd" in
   full)
     fetch
     mkdir -p "$OUT"
-    runner --report "$OUT/full.json" --summary "$OUT/full.md" "$@"
+    # Caller flags come first and win. The deadline keeps the run (and its
+    # report) inside a 6 h hosted-runner job even if batches turn slow.
+    runner --report "$OUT/full.json" --summary "$OUT/full.md" "$@" --deadline-min 300
     ;;
   *) echo "usage: $0 fetch|subset|full|update-expected" >&2; exit 2 ;;
 esac

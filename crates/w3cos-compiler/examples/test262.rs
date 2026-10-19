@@ -8,7 +8,8 @@
 //!     --test262 <checkout> [--subset tests/test262/subset.txt | <path-prefix>...] \
 //!     [--jobs 8] [--batch 150] [--timeout 10] [--report out/test262.json] \
 //!     [--summary out/test262.md] [--expected tests/test262/expected-failures.txt] \
-//!     [--update-expected]
+//!     [--update-expected] [--shard 0/4] [--mem-limit-mb 2048] \
+//!     [--build-mem-limit-mb 6144] [--batch-timeout 900] [--deadline-min 300]
 //! ```
 //!
 //! Design: compiling one crate per test is far too slow (the harness alone
@@ -22,17 +23,28 @@
 //! Tests are compiled as module code (strict), which is how w3cos compiles
 //! everything; `noStrict`-only tests are reported as failures with reason
 //! `unsupported: sloppy mode`.
+//!
+//! Resource limits (so one runaway test or batch cannot take down a CI
+//! runner): every child runs in its own process group under `ulimit -v`
+//! (`--mem-limit-mb` for test binaries, `--build-mem-limit-mb` for front
+//! ends and batch builds) and a timeout kills the whole group. A batch's run
+//! phase has its own deadline (`--batch-timeout`), and `--deadline-min`
+//! stops scheduling batches so the report is still written inside a job
+//! limit. A watchdog prints what every slot is doing (batch, phase, test)
+//! when no batch has finished for two minutes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use swc_common::{FileName, SourceMap, sync::Lrc};
-use swc_ecma_ast::{Decl, ModuleItem, Pat, Stmt};
+use swc_ecma_ast::{Decl, Pat, Stmt};
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax};
 use w3cos_compiler::esm_codegen::try_generate_with_bodies;
 use w3cos_compiler::esm_resolver::{EsmBundle, EsmResolver};
@@ -390,10 +402,87 @@ fn front_end(root: &Path, entry: &Path) -> Result<String, String> {
     }
 }
 
+/// Address-space caps in KiB (0 = unlimited), set once from the arguments.
+struct Limits {
+    test_mem_kb: u64,
+    build_mem_kb: u64,
+}
+
+static LIMITS: OnceLock<Limits> = OnceLock::new();
+
+fn limits() -> &'static Limits {
+    LIMITS.get_or_init(|| Limits {
+        test_mem_kb: 0,
+        build_mem_kb: 0,
+    })
+}
+
+/// `program` under `ulimit -v` in its own process group. Hitting the cap
+/// fails that one child (allocation failure, a crash or a rustc error)
+/// instead of pushing the whole machine into OOM.
+fn limited(program: impl AsRef<OsStr>, mem_kb: u64) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(r#"ulimit -v "$0" 2>/dev/null; exec "$@""#)
+        .arg(if mem_kb == 0 {
+            "unlimited".to_string()
+        } else {
+            mem_kb.to_string()
+        })
+        .arg(program);
+    command.process_group(0);
+    command
+}
+
+/// Kill a `limited` child and everything it started (cargo -> rustc).
+fn kill_group(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// What each build slot / test worker is doing, for the watchdog.
+static ACTIVITY: Mutex<BTreeMap<String, (String, Instant)>> = Mutex::new(BTreeMap::new());
+
+fn activity(key: &str, what: Option<String>) {
+    let mut map = ACTIVITY.lock().unwrap();
+    match what {
+        Some(what) => {
+            map.insert(key.to_string(), (what, Instant::now()));
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+}
+
+fn mem_available_mb() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = info.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+fn watchdog_report(stalled: Duration) -> String {
+    let mut text = format!(
+        "test262: watchdog: no batch finished for {:.0?}; MemAvailable {} MB",
+        stalled,
+        mem_available_mb().map_or("?".into(), |m| m.to_string())
+    );
+    for (key, (what, since)) in ACTIVITY.lock().unwrap().iter() {
+        text.push_str(&format!("\n  {key}: {what} ({:.0?})", since.elapsed()));
+    }
+    text
+}
+
 /// Front end in a child process (`--frontend-one`), so a compiler hang or
 /// stack overflow on one test cannot stall the run.
 fn front_end_isolated(root: &Path, entry: &Path, timeout: Duration) -> Result<String, String> {
-    let mut command = Command::new(std::env::current_exe().unwrap());
+    let mut command = limited(std::env::current_exe().unwrap(), limits().build_mem_kb);
     command.arg("--frontend-one").arg(root).arg(entry);
     match run_with_timeout(command, timeout) {
         Ok(output) => match output.lines().last() {
@@ -579,8 +668,7 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Option<std::p
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
@@ -600,24 +688,31 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<String, S
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
+    // Drain stdout while the child runs: a test printing more than a pipe
+    // buffer would otherwise block and be reported as a timeout.
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if start.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 return Err("timeout".into());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return Err(format!("wait: {e}")),
+            Err(e) => {
+                kill_group(&mut child);
+                return Err(format!("wait: {e}"));
+            }
         }
     }
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
-    }
-    Ok(out)
+    let out = reader.join().unwrap_or_default();
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn judge(test: &TestCase, output: &str) -> Outcome {
@@ -699,7 +794,11 @@ fn build_batch(
         let entry_path = tree.join(format!("__batch_{batch_index}.js"));
         std::fs::write(&entry_path, entry).unwrap();
         let code_path = dir.join("bundle.rs");
-        let mut command = Command::new(std::env::current_exe().unwrap());
+        activity(
+            &format!("slot{slot}"),
+            Some(format!("b{batch_index} front end")),
+        );
+        let mut command = limited(std::env::current_exe().unwrap(), limits().build_mem_kb);
         command
             .arg("--frontend-one")
             .arg(&tree)
@@ -767,7 +866,17 @@ fn build_batch(
             let _ = std::fs::copy(workspace.join("Cargo.lock"), &lock);
         }
         let target = ws.work.join(format!("target/slot{slot}"));
-        let mut build = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        activity(
+            &format!("slot{slot}"),
+            Some(format!(
+                "b{batch_index} cargo build ({} tests)",
+                members.len()
+            )),
+        );
+        let mut build = limited(
+            std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
+            limits().build_mem_kb,
+        );
         build
             .args(["build", "--offline", "--quiet", "--message-format=short"])
             .current_dir(&dir)
@@ -951,6 +1060,31 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30),
     );
+    let mb = |name: &str, default: u64| -> u64 {
+        arg(&args, name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+            * 1024
+    };
+    let _ = LIMITS.set(Limits {
+        test_mem_kb: mb("--mem-limit-mb", 2048),
+        build_mem_kb: mb("--build-mem-limit-mb", 6144),
+    });
+    let batch_timeout = Duration::from_secs(
+        arg(&args, "--batch-timeout")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900),
+    );
+    let deadline: Option<Duration> = arg(&args, "--deadline-min")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|m| Duration::from_secs(m * 60));
+    // `--shard i/n`: every n-th test starting at i, for splitting a full run
+    // across CI jobs.
+    let shard: Option<(usize, usize)> = arg(&args, "--shard").and_then(|v| {
+        let (i, n) = v.split_once('/')?;
+        let (i, n) = (i.parse().ok()?, n.parse().ok()?);
+        (n > 0 && i < n).then_some((i, n))
+    });
 
     // Selection: --subset file of prefixes, positional prefixes, or the
     // default conformance roots.
@@ -983,6 +1117,14 @@ fn main() {
     }
     files.sort();
     files.dedup();
+    if let Some((i, n)) = shard {
+        files = files
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| index % n == i)
+            .map(|(_, f)| f)
+            .collect();
+    }
     if let Some(limit) = limit {
         files.truncate(limit);
     }
@@ -1004,8 +1146,11 @@ fn main() {
         })
         .collect();
     eprintln!(
-        "test262: {} tests, jobs {jobs}, batch {batch_size}",
-        tests.len()
+        "test262: {} tests, jobs {jobs}, batch {batch_size}, shard {}, mem cap test {} MB / build {} MB",
+        tests.len(),
+        shard.map_or("-".into(), |(i, n)| format!("{i}/{n}")),
+        limits().test_mem_kb / 1024,
+        limits().build_mem_kb / 1024
     );
     let _ = std::fs::remove_dir_all(work.join("tree"));
     let _ = std::fs::remove_dir_all(work.join("batches"));
@@ -1096,15 +1241,65 @@ fn main() {
         batches.into_iter().enumerate().collect::<Vec<_>>(),
     ));
     let done_batches = AtomicUsize::new(0);
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let skipped_batches = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        for slot in 0..build_jobs {
-            let (ws, results, batches, tests, workspace, done_batches) =
-                (&ws, &results, &batches, &tests, &workspace, &done_batches);
+        // Watchdog: name the slow batch/test when nothing finishes.
+        {
+            let (done_batches, finished) = (&done_batches, &finished);
+            scope.spawn(move || {
+                let mut last_done = 0;
+                let mut last_change = Instant::now();
+                let mut last_report = Instant::now();
+                while !finished.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let done = done_batches.load(Ordering::Relaxed);
+                    if done != last_done {
+                        last_done = done;
+                        last_change = Instant::now();
+                    } else if last_change.elapsed() >= Duration::from_secs(120)
+                        && last_report.elapsed() >= Duration::from_secs(60)
+                    {
+                        last_report = Instant::now();
+                        eprintln!("{}", watchdog_report(last_change.elapsed()));
+                    }
+                }
+            });
+        }
+        let workers: Vec<_> = (0..build_jobs).map(|slot| {
+            let (ws, results, batches, tests, workspace, done_batches, skipped_batches) = (
+                &ws,
+                &results,
+                &batches,
+                &tests,
+                &workspace,
+                &done_batches,
+                &skipped_batches,
+            );
             scope.spawn(move || {
                 loop {
                     let Some((batch_index, batch)) = batches.lock().unwrap().pop() else {
                         break;
                     };
+                    if deadline.is_some_and(|d| started.elapsed() > d) {
+                        // Out of time: leave the rest as "not run" and still
+                        // write the report.
+                        let mut r = results.lock().unwrap();
+                        for &index in &batch.tests {
+                            r.entry(index)
+                                .or_insert_with(|| Outcome::Fail("not run: deadline".into()));
+                        }
+                        skipped_batches.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    eprintln!(
+                        "test262: b{batch_index} start: {} tests from {}",
+                        batch.tests.len(),
+                        batch
+                            .tests
+                            .first()
+                            .map_or("-", |&index| tests[index].rel.as_str())
+                    );
                     let built = build_batch(
                         ws,
                         workspace,
@@ -1118,9 +1313,12 @@ fn main() {
                         // Run this batch's tests with a small per-batch pool.
                         let per = (jobs / build_jobs).max(1);
                         let cursor = AtomicUsize::new(0);
+                        let run_started = Instant::now();
                         std::thread::scope(|inner| {
-                            for _ in 0..per {
-                                inner.spawn(|| {
+                            for worker in 0..per {
+                                let (cursor, members, bin) = (&cursor, &members, &bin);
+                                inner.spawn(move || {
+                                    let key = format!("slot{slot}.t{worker}");
                                     loop {
                                         let pos = cursor.fetch_add(1, Ordering::Relaxed);
                                         let Some(&index) = members.get(pos) else {
@@ -1129,30 +1327,66 @@ fn main() {
                                         if results.lock().unwrap().contains_key(&index) {
                                             continue;
                                         }
-                                        let mut command = Command::new(&bin);
-                                        command.arg(pos.to_string());
-                                        let outcome = match run_with_timeout(command, timeout) {
-                                            Ok(output) => judge(&tests[index], &output),
-                                            Err(error) => Outcome::Fail(error),
+                                        let outcome = if run_started.elapsed() > batch_timeout {
+                                            Outcome::Fail("timeout: batch run deadline".into())
+                                        } else {
+                                            activity(
+                                                &key,
+                                                Some(format!(
+                                                    "b{batch_index} test {}",
+                                                    tests[index].rel
+                                                )),
+                                            );
+                                            let mut command =
+                                                limited(bin, limits().test_mem_kb);
+                                            command.arg(pos.to_string());
+                                            match run_with_timeout(command, timeout) {
+                                                Ok(output) => judge(&tests[index], &output),
+                                                Err(error) => {
+                                                    if error == "timeout" {
+                                                        eprintln!(
+                                                            "test262: timeout: {}",
+                                                            tests[index].rel
+                                                        );
+                                                    }
+                                                    Outcome::Fail(error)
+                                                }
+                                            }
                                         };
                                         results.lock().unwrap().insert(index, outcome);
                                     }
+                                    activity(&key, None);
                                 });
                             }
                         });
-                        if std::env::var_os("W3COS_T262_KEEP").is_none() {
-                            let _ = std::fs::remove_file(&bin);
+                        if run_started.elapsed() > batch_timeout {
+                            eprintln!(
+                                "test262: b{batch_index} hit the batch run deadline ({batch_timeout:?})"
+                            );
                         }
+                    }
+                    activity(&format!("slot{slot}"), None);
+                    if std::env::var_os("W3COS_T262_KEEP").is_none() {
+                        // Binary and any sources a failed build left behind.
+                        let _ = std::fs::remove_dir_all(ws.work.join(format!("batches/b{batch_index}")));
                     }
                     let done = done_batches.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
-                        "test262: batch {done}/{total_batches} ({:.0?})",
+                        "test262: batch {done}/{total_batches} (b{batch_index}, {:.0?})",
                         started.elapsed()
                     );
                 }
-            });
+            })
+        }).collect();
+        for worker in workers {
+            let _ = worker.join();
         }
+        finished.store(true, Ordering::Relaxed);
     });
+    let skipped = skipped_batches.load(Ordering::Relaxed);
+    if skipped > 0 {
+        eprintln!("test262: deadline reached, {skipped} batch(es) not run");
+    }
 
     // Report.
     let results = results.lock().unwrap();
@@ -1209,8 +1443,9 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     let mut summary = format!(
-        "# test262 (AOT pipeline)\n\n- test262: `{commit}`\n- selection: {}\n- passed: **{} / {} ({:.2}%)**\n- elapsed: {:.0?}\n\n## Failure stages\n\n| stage | tests |\n|---|---:|\n",
+        "# test262 (AOT pipeline)\n\n- test262: `{commit}`\n- selection: {}{}\n- passed: **{} / {} ({:.2}%)**\n- elapsed: {:.0?}\n\n## Failure stages\n\n| stage | tests |\n|---|---:|\n",
         prefixes.join(", "),
+        shard.map_or(String::new(), |(i, n)| format!(" (shard {i}/{n})")),
         passed.len(),
         total,
         pct(passed.len(), total),
