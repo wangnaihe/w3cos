@@ -148,6 +148,10 @@ enum PseudoClass {
     Lang(String),
     Has(String),
     Not(String),
+    /// `:is()` (and `:matches()`): any selector of the list.
+    Is(String),
+    /// `:where()`: `:is()` without specificity.
+    Where(String),
     NthChild(String),
     NthLastChild(String),
     NthOfType(String),
@@ -280,8 +284,12 @@ impl CompoundSelector {
 
     fn specificity(&self) -> u32 {
         let ids = u32::from(self.id.is_some());
-        let classes =
-            (self.classes.len() + self.attributes.len() + self.pseudo_classes.len()) as u32;
+        let pseudo_classes = self
+            .pseudo_classes
+            .iter()
+            .filter(|pseudo| !matches!(pseudo, PseudoClass::Where(_)))
+            .count();
+        let classes = (self.classes.len() + self.attributes.len() + pseudo_classes) as u32;
         let tags = u32::from(self.tag.is_some());
         ids * 1_000_000 + classes * 1_000 + tags
     }
@@ -1382,6 +1390,10 @@ fn pseudo_matches_node(
             selector_matches_node_with_target(selector, document, node, target_id)
                 .is_ok_and(|matched| !matched)
         }
+        PseudoClass::Is(selector) | PseudoClass::Where(selector) => {
+            selector_matches_node_with_target(selector, document, node, target_id)
+                .is_ok_and(|matched| matched)
+        }
         PseudoClass::NthChild(expression) => {
             matches_nth_position(&element_siblings(), node, expression, false)
         }
@@ -2191,6 +2203,25 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                             return None;
                         }
                         compound.pseudo_classes.push(PseudoClass::Not(argument))
+                    }
+                    (false, true, "is" | "matches" | "where") => {
+                        let argument = trim_css_whitespace(&argument).to_string();
+                        // Forgiving list: invalid entries are dropped.
+                        let valid = split_selector_group(&argument)
+                            .into_iter()
+                            .filter(|selector| parse_selector_chain(selector).is_some())
+                            .collect::<Vec<_>>();
+                        if valid.is_empty() {
+                            compound.unsupported = true;
+                        } else if name == "where" {
+                            compound
+                                .pseudo_classes
+                                .push(PseudoClass::Where(valid.join(", ")))
+                        } else {
+                            compound
+                                .pseudo_classes
+                                .push(PseudoClass::Is(valid.join(", ")))
+                        }
                     }
                     (false, true, "nth-child") => compound
                         .pseudo_classes

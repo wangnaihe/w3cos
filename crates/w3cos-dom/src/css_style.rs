@@ -177,6 +177,16 @@ impl CSSStyleDeclaration {
         if invalid_cssom_declaration(name, value) {
             return;
         }
+        // An empty custom property write is CSSOM removal: drop the inline
+        // declaration so the inherited / author value shows through again.
+        if name.starts_with("--") && value.trim().is_empty() {
+            self.inline_declarations
+                .retain(|(existing, _)| existing != name);
+            if let Some(properties) = self.inner.custom_properties.as_mut() {
+                properties.remove(name);
+            }
+            return;
+        }
         // CSSOM setProperty replaces an existing declaration of the same name.
         // Appending every write makes animated properties grow without bound
         // and forces later cascade scans to walk the discarded values.
@@ -1469,7 +1479,163 @@ impl CSSStyleDeclaration {
                 .filter
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
-            _ => String::new(),
+            _ => self.box_and_text_property(name).unwrap_or_default(),
+        }
+    }
+
+    /// Computed values of the box-model, font and interaction longhands
+    /// (Code-OSS sizes views from `getComputedStyle()` padding / border /
+    /// margin widths) and of custom properties.
+    fn box_and_text_property(&self, name: &str) -> Option<String> {
+        let style = &self.inner;
+        if let Some(custom) = name.strip_prefix("--") {
+            let _ = custom;
+            return Some(
+                style
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|properties| properties.get(name))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        let kebab = camel_to_kebab_name(name);
+        let name = kebab.as_str();
+        let side = |prefix: &str| -> Option<usize> {
+            match name.strip_prefix(prefix)? {
+                "top" => Some(0),
+                "right" => Some(1),
+                "bottom" => Some(2),
+                "left" => Some(3),
+                _ => None,
+            }
+        };
+        let edge = |edges: &Edges, index: usize| match index {
+            0 => edges.top.clone(),
+            1 => edges.right.clone(),
+            2 => edges.bottom.clone(),
+            _ => edges.left.clone(),
+        };
+        if let Some(index) = side("padding-") {
+            return Some(self.spacing_to_computed_css(&edge(&style.padding, index), false));
+        }
+        if let Some(index) = side("margin-") {
+            return Some(self.spacing_to_computed_css(&edge(&style.margin, index), true));
+        }
+        if let Some(rest) = name.strip_prefix("border-") {
+            let (side_name, part) = rest.split_once('-')?;
+            let index = match side_name {
+                "top" => 0,
+                "right" => 1,
+                "bottom" => 2,
+                "left" => 3,
+                _ => return None,
+            };
+            let line = style.border_styles[index];
+            return match part {
+                "width" => {
+                    let drawn = !matches!(
+                        line,
+                        None | Some(w3cos_std::style::BorderLineStyle::None)
+                            | Some(w3cos_std::style::BorderLineStyle::Hidden)
+                    );
+                    let width = [
+                        style.border_top_width,
+                        style.border_right_width,
+                        style.border_bottom_width,
+                        style.border_left_width,
+                    ][index]
+                        .unwrap_or(style.border_width);
+                    Some(format!("{}px", if drawn { width } else { 0.0 }))
+                }
+                "style" => Some(line.map_or_else(
+                    || "none".to_string(),
+                    |line| debug_kebab(&format!("{line:?}")),
+                )),
+                "color" => {
+                    let current = style.border_current_color.is_some_and(|sides| sides[index]);
+                    let color = if current {
+                        style.color
+                    } else {
+                        [
+                            style.border_top_color,
+                            style.border_right_color,
+                            style.border_bottom_color,
+                            style.border_left_color,
+                        ][index]
+                            .unwrap_or(style.border_color)
+                    };
+                    Some(color_to_hex(color))
+                }
+                _ => None,
+            };
+        }
+        Some(match name {
+            "font-weight" => style.font_weight.to_string(),
+            "font-style" => debug_kebab(&format!("{:?}", style.font_style)),
+            "font-family" => style.font_family.clone().unwrap_or_default(),
+            "line-height" => {
+                if style.line_height_is_normal {
+                    "normal".to_string()
+                } else {
+                    format!(
+                        "{}px",
+                        style
+                            .line_height_computed_px
+                            .unwrap_or(style.line_height * style.font_size)
+                    )
+                }
+            }
+            "letter-spacing" => {
+                if style.letter_spacing == 0.0 {
+                    "normal".to_string()
+                } else {
+                    format!("{}px", style.letter_spacing)
+                }
+            }
+            "white-space" => debug_kebab(&format!("{:?}", style.white_space)),
+            "text-align" => debug_kebab(&format!("{:?}", style.text_align)),
+            "text-overflow" => debug_kebab(&format!("{:?}", style.text_overflow)),
+            "word-break" => debug_kebab(&format!("{:?}", style.word_break)),
+            "visibility" => debug_kebab(&format!("{:?}", style.visibility)),
+            "cursor" => debug_kebab(&format!("{:?}", style.cursor)),
+            "pointer-events" => debug_kebab(&format!("{:?}", style.pointer_events)),
+            "user-select" => debug_kebab(&format!("{:?}", style.user_select)),
+            "align-self" => debug_kebab(&format!("{:?}", style.align_self)),
+            "order" => style.order.to_string(),
+            "flex-basis" => dimension_to_css(&style.flex_basis),
+            "z-index" => {
+                if matches!(style.position, Position::Static) && style.z_index == 0 {
+                    "auto".to_string()
+                } else {
+                    style.z_index.to_string()
+                }
+            }
+            "row-gap" => gap_to_css(style.row_gap.unwrap_or(style.gap)),
+            "column-gap" => gap_to_css(style.column_gap.unwrap_or(style.gap)),
+            "outline-width" => format!(
+                "{}px",
+                if matches!(style.outline_style, w3cos_std::style::OutlineStyle::None) {
+                    0.0
+                } else {
+                    style.outline_width
+                }
+            ),
+            "outline-style" => debug_kebab(&format!("{:?}", style.outline_style)),
+            "outline-color" => color_to_hex(style.outline_color),
+            _ => return None,
+        })
+    }
+
+    fn spacing_to_computed_css(&self, spacing: &Spacing, margin: bool) -> String {
+        match spacing {
+            Spacing::Px(value) => format!("{value}px"),
+            Spacing::Percent(value) => format!("{value}%"),
+            Spacing::Rem(value) => format!("{}px", value * 16.0),
+            Spacing::Em(value) => format!("{}px", value * self.inner.font_size),
+            Spacing::Ch(value) => format!("{}px", value * self.inner.ch_advance()),
+            Spacing::Auto if margin => "0px".to_string(),
+            _ => "0px".to_string(),
         }
     }
 
@@ -5751,5 +5917,50 @@ fn table_display_values_round_trip_without_falling_back_to_flex() {
         declaration.set_property("display", value);
         assert_eq!(declaration.inner.display, expected);
         assert_eq!(declaration.get_property("display"), value);
+    }
+}
+
+/// `PreWrap` -> `pre-wrap`, `NotAllowed` -> `not-allowed`.
+fn debug_kebab(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len() + 4);
+    for (index, c) in debug.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn camel_to_kebab_name(name: &str) -> String {
+    if name.contains('-') {
+        return name.to_string();
+    }
+    debug_kebab(name)
+}
+
+fn color_to_hex(color: Color) -> String {
+    if color.a == 255 {
+        format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+    } else {
+        format!(
+            "rgba({}, {}, {}, {})",
+            color.r,
+            color.g,
+            color.b,
+            (f32::from(color.a) / 255.0 * 1000.0).round() / 1000.0
+        )
+    }
+}
+
+fn gap_to_css(gap: f32) -> String {
+    if gap == 0.0 {
+        "normal".to_string()
+    } else {
+        format!("{gap}px")
     }
 }

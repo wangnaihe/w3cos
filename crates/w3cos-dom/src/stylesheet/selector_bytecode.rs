@@ -176,6 +176,8 @@ fn encode_pseudo(out: &mut Vec<u8>, pseudo: &PseudoClass) {
         PseudoClass::Focus => (22, None),
         PseudoClass::FocusVisible => (23, None),
         PseudoClass::FocusWithin => (24, None),
+        PseudoClass::Is(value) => (25, Some(value.as_str())),
+        PseudoClass::Where(value) => (26, Some(value.as_str())),
     };
     out.push(kind);
     if let Some(argument) = argument {
@@ -210,6 +212,8 @@ fn decode_pseudo(decoder: &mut Decoder<'_>) -> Option<PseudoClass> {
         22 => PseudoClass::Focus,
         23 => PseudoClass::FocusVisible,
         24 => PseudoClass::FocusWithin,
+        25 => PseudoClass::Is(decoder.string()?),
+        26 => PseudoClass::Where(decoder.string()?),
         _ => return None,
     })
 }
