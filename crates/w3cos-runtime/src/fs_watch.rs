@@ -239,9 +239,13 @@ fn watch_loop(root: PathBuf, options: ObserveOptions, inner: Arc<ObserverInner>)
             }
         };
 
-        // Detect created / modified
+        // Detect created / modified (by path lookup: trees can be large).
+        let before: std::collections::HashMap<&Path, &EntrySnapshot> =
+            prev.iter().map(|e| (e.path.as_path(), e)).collect();
+        let after: std::collections::HashSet<&Path> =
+            curr.iter().map(|e| e.path.as_path()).collect();
         for entry in &curr {
-            let prev_entry = prev.iter().find(|e| e.path == entry.path);
+            let prev_entry = before.get(entry.path.as_path());
             match prev_entry {
                 None => {
                     push_record(
@@ -275,7 +279,7 @@ fn watch_loop(root: PathBuf, options: ObserveOptions, inner: Arc<ObserverInner>)
 
         // Detect deleted
         for entry in &prev {
-            if !curr.iter().any(|e| e.path == entry.path) {
+            if !after.contains(entry.path.as_path()) {
                 push_record(
                     &inner,
                     FileSystemChangeRecord {
@@ -289,6 +293,7 @@ fn watch_loop(root: PathBuf, options: ObserveOptions, inner: Arc<ObserverInner>)
             }
         }
 
+        drop((before, after));
         prev = curr;
     }
 }
