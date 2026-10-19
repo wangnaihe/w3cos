@@ -319,7 +319,7 @@ fn layout_float(
             let w = match sizes.min {
                 Some(min) => sizes.max.min(available.max(min)),
                 None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
-                None => return None,
+                None => return super::bail("float-shrink-min"),
             };
             clamp_inline(style, space, edges, w.max(0.0))
         }
@@ -818,7 +818,7 @@ fn shrink_to_fit(
     let width = match sizes.min {
         Some(min) => sizes.max.min(available.max(min)),
         None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
-        None => return None,
+        None => return super::bail("shrink-min"),
     };
     Some(clamp_inline(style, space, edges, width.max(0.0)))
 }
@@ -846,10 +846,11 @@ pub(super) fn layout_root(
         margin_base: 0.0,
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
+        adjoining_from: 0,
     };
     let result = layout_block(flat, 0, &space, true)?;
     if result.float_overlap {
-        return None;
+        return super::bail("float-overlap");
     }
     let metrics = resolve_inline(flat[0].style, &space);
     let (x, y) = (metrics.margin[3], metrics.margin[0]);
@@ -993,12 +994,20 @@ fn layout_block_in(
         margin_base: 0.0,
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
+        adjoining_from: 0,
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;
     // Past clearance our top is resolved: margins that would collapse
     // through it resolve at our border box instead.
     let forced = space.forced_bfc && !bfc_root;
+    // Floats placed from here on while our top is unresolved adjoin it;
+    // a resolved top (border, padding, BFC root, clearance) starts anew.
+    let adjoining_from = if can_escape_top && !forced {
+        space.adjoining_from
+    } else {
+        exclusions.len()
+    };
     let mut start_strut = MarginStrut::default();
     start_strut.append(metrics.margin[0]);
     let mut pending = MarginStrut::default();
@@ -1162,16 +1171,13 @@ fn layout_block_in(
             // down (Blink HasClearancePastAdjoiningFloats resolves the BFC
             // block offset without the child's margin first, then applies
             // clearance).  Not implemented: stay on legacy.
-            let mut combined = margin_strut;
-            combined.merge(start_strut);
-            combined.merge(pending);
             let (left, right) = match child_info.style.clear {
                 Clear::Left => (true, false),
                 Clear::Right => (false, true),
                 _ => (true, true),
             };
-            if exclusions.has_float_from(margin_base + combined.sum(), left, right) {
-                return None;
+            if exclusions.has_float_since(adjoining_from, left, right) {
+                return super::bail("adjoining-clearance");
             }
         }
         let place = |start: MarginStrut| {
@@ -1233,10 +1239,12 @@ fn layout_block_in(
             nested.margin_strut.merge(start_strut);
             nested.margin_strut.merge(pending);
             nested.forced_bfc = forced;
+            nested.adjoining_from = adjoining_from;
         } else {
             nested.margin_base = content_bfc_y + cursor;
             nested.margin_strut = pending;
             nested.forced_bfc = estimate_cleared;
+            nested.adjoining_from = exclusions.len();
         }
         let mut result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
         let (mut resolved, mut cleared) = place(result.start_strut)?;
@@ -1262,7 +1270,7 @@ fn layout_block_in(
             result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
             let (again, c) = place(result.start_strut)?;
             if (again - resolved).abs() > 1.0 / 128.0 {
-                return None;
+                return super::bail("relayout-mismatch");
             }
             (resolved, cleared) = (again, c);
         }
@@ -1276,7 +1284,7 @@ fn layout_block_in(
                 || matches!(style.margin.left, Spacing::Auto)
                 || matches!(style.margin.right, Spacing::Auto)
             {
-                return None;
+                return super::bail("bfc-root-float-margins");
             }
             let m = &child_metrics;
             let edges = m.border[1] + m.border[3] + m.padding[1] + m.padding[3];
@@ -1370,7 +1378,7 @@ fn layout_block_in(
         if cleared {
             if result.self_collapsing {
                 // (Clearance on a box that collapses through.)
-                return None;
+                return super::bail("clearance-self-collapsing");
             }
             if at_top && can_escape_top {
                 start_strut.merge(pending);
@@ -1431,7 +1439,7 @@ fn layout_block_in(
     };
     if bfc_root && float_overlap {
         // (Line boxes or a BFC root beside a float.)
-        return None;
+        return super::bail("float-overlap");
     }
     // CSS2 10.6.7: a BFC root's auto height includes its floats.
     let auto_content = match exclusions.max_bottom() {

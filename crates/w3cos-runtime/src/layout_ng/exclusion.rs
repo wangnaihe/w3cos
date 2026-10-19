@@ -36,13 +36,19 @@ impl ExclusionSpace {
         self.exclusions.is_empty()
     }
 
-    /// A float on the given side(s) has its margin box top at or below
-    /// `top` (Blink's adjoining float types: floats placed at a BFC block
-    /// offset that is not resolved yet).
-    pub fn has_float_from(&self, top: f32, left: bool, right: bool) -> bool {
+    /// The number of floats placed so far (an index for `has_float_since`).
+    pub fn len(&self) -> usize {
+        self.exclusions.len()
+    }
+
+    /// A float on the given side(s) was placed at index `from` or later
+    /// (Blink's adjoining float types, with `from` where the unresolved
+    /// BFC block offset started).
+    pub fn has_float_since(&self, from: usize, left: bool, right: bool) -> bool {
         self.exclusions
             .iter()
-            .any(|e| ((e.is_left && left) || (!e.is_left && right)) && e.top >= top - 1.0 / 128.0)
+            .skip(from)
+            .any(|e| (e.is_left && left) || (!e.is_left && right))
     }
 
     pub fn snapshot(&self) -> Snapshot {

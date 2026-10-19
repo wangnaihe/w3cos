@@ -1382,4 +1382,57 @@ fn first_children_beside_floats_match_chrome() {
     assert_eq!(rect(2), [0.0, 100.0, 800.0, 10.0]);
     assert_eq!(rect(3), [0.0, 100.0, 800.0, 10.0]);
     assert_eq!(rect(4), [0.0, 100.0, 30.0, 30.0]);
+
+    // no-clearance-adjoining-opposite-float: only floats placed while the
+    // BFC offset is unresolved adjoin (the left float precedes the chain,
+    // the adjoining one is on the other side), so the 150px margin takes
+    // the box past the left float without clearance.
+    let block = || Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    let mut cleared = Style {
+        display: Display::Block,
+        clear: Clear::Left,
+        height: px(10.0),
+        ..Style::default()
+    };
+    cleared.margin.top = S::Px(150.0);
+    let root = Component::boxed(
+        block(),
+        vec![
+            leaf(Style {
+                display: Display::Block,
+                float: Float::Left,
+                width: px(10.0),
+                height: px(100.0),
+                ..Style::default()
+            }),
+            Component::boxed(
+                block(),
+                vec![
+                    Component::boxed(
+                        block(),
+                        vec![leaf(Style {
+                            display: Display::Block,
+                            float: Float::Right,
+                            width: px(10.0),
+                            height: px(200.0),
+                            ..Style::default()
+                        })],
+                    ),
+                    Component::boxed(block(), vec![Component::boxed(cleared, vec![])]),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |index: usize| {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    assert_eq!(rect(2), [0.0, 150.0, 800.0, 10.0]);
+    assert_eq!(rect(4), [790.0, 150.0, 10.0, 200.0]);
+    assert_eq!(rect(6), [0.0, 150.0, 800.0, 10.0]);
 }

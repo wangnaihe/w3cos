@@ -87,6 +87,10 @@ pub(crate) struct ConstraintSpace {
     /// clearance, so its BFC block offset is resolved at its border box
     /// (`bfc_y`) and nothing collapses through its top any more.
     pub forced_bfc: bool,
+    /// Blink's adjoining object types: the exclusion-space index from
+    /// which floats were placed while our BFC block offset is still
+    /// unresolved (the margin strut that started at `margin_base`).
+    pub adjoining_from: usize,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.
@@ -171,6 +175,19 @@ pub(crate) struct LayoutResult {
     pub float_overlap: bool,
 }
 
+thread_local! {
+    /// Why the last layout pass gave up at runtime (trace accounting).
+    static RUNTIME_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// A runtime fallback with its reason, reported by
+/// `W3COS_LAYOUT_NG_TRACE` as `fallback runtime:<reason>`.
+#[cold]
+pub(crate) fn bail<T>(reason: &'static str) -> Option<T> {
+    RUNTIME_REASON.with(|r| r.set(reason));
+    None
+}
+
 /// Entry point used by `LayoutEngine::compute`.  Returns `None` when the tree
 /// is outside the supported stage, so the legacy engine runs.
 pub(crate) fn layout_tree(
@@ -227,9 +244,15 @@ pub(crate) fn layout_tree(
     if reason.is_some() {
         return None;
     }
+    RUNTIME_REASON.with(|r| r.set(""));
     let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
         if trace() {
-            eprintln!("[layout-ng] fallback runtime ({} boxes)", flat.len());
+            let reason = RUNTIME_REASON.with(|r| r.get());
+            let sep = if reason.is_empty() { "" } else { ":" };
+            eprintln!(
+                "[layout-ng] fallback runtime{sep}{reason} ({} boxes)",
+                flat.len()
+            );
         }
         return None;
     };

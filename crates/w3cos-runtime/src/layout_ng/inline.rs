@@ -1357,7 +1357,7 @@ pub(super) fn layout_inline_beside(
                 }
                 InlineEntry::Close(b) => {
                     if leaf == 0 {
-                        return None;
+                        return super::bail("inline-empty-box");
                     }
                     closes[leaf - 1].push(b);
                     stack.pop();
@@ -1365,7 +1365,7 @@ pub(super) fn layout_inline_beside(
             }
         }
         if !pending.is_empty() {
-            return None;
+            return super::bail("inline-unclosed");
         }
     }
     let start_edges = |boxes: &[usize]| -> f32 {
@@ -1389,7 +1389,7 @@ pub(super) fn layout_inline_beside(
     {
         let style = flat[child].style;
         let ComponentKind::Text { content } = flat[child].kind else {
-            return None;
+            return super::bail("line-width-text");
         };
         let (height, single, ascent) =
             paragraph_height(content, available, style, container, quirks);
@@ -1421,7 +1421,7 @@ pub(super) fn layout_inline_beside(
                 .overlaps(f.x, f.y, f.x + available, f.y + height)
         }) {
             // (Paint wraps the paragraph in one rect.)
-            return None;
+            return super::bail("float-paint-paragraph");
         }
         return Some(InlineResult {
             height,
@@ -1460,7 +1460,7 @@ pub(super) fn layout_inline_beside(
                 .split('\n')
                 .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
         {
-            return None;
+            return super::bail("line-width-overflow");
         }
         let (strut_ascent, strut_descent) = if quirks {
             (f32::NEG_INFINITY, f32::NEG_INFINITY)
@@ -1475,7 +1475,7 @@ pub(super) fn layout_inline_beside(
             f.exclusions
                 .overlaps(f.x, f.y, f.x + available, f.y + single * lines)
         }) {
-            return None;
+            return super::bail("float-paint-paragraph");
         }
         return Some(InlineResult {
             height: single * lines,
@@ -1510,7 +1510,7 @@ pub(super) fn layout_inline_beside(
     };
     let reorder = needs_reorder(&levels);
     if reorder && has_boxes {
-        return None;
+        return super::bail("reorder-boxes");
     }
     // CollectInlines: group word pieces into authored runs and shape each
     // run once.
@@ -1528,7 +1528,7 @@ pub(super) fn layout_inline_beside(
             let result = super::block::layout_block(flat, child, space, true)?;
             if !result.oof.is_empty() {
                 // (Out-of-flow descendants carried through a line box.)
-                return None;
+                return super::bail("inline-oof");
             }
             // Authored margins (no CSS2 10.3.3 over-constraint rule; auto is
             // gated).
@@ -1551,7 +1551,7 @@ pub(super) fn layout_inline_beside(
             let ascent = match result.last_baseline {
                 LastBaseline::At(b) => margin[0] + b,
                 LastBaseline::NoLines => height,
-                LastBaseline::Unknown => return None,
+                LastBaseline::Unknown => return super::bail("atomic-baseline"),
             };
             let box_start = start_edges(&opens[k]);
             let box_end = end_edges(&closes[k]);
@@ -1691,7 +1691,7 @@ pub(super) fn layout_inline_beside(
     // NGLineLayoutOpportunity per line: (top, inline offset, inline size).
     let assumed_line = if floats.is_some() {
         if quirks {
-            return None;
+            return super::bail("float-quirks");
         }
         let (a, d) = strut(container);
         a + d
@@ -1733,12 +1733,12 @@ pub(super) fn layout_inline_beside(
         current.pop();
         if !fits && can_wrap && item.internal_break {
             // NGLineBreaker would break inside this item.
-            return None;
+            return super::bail("internal-break");
         }
         if !fits && can_wrap && (item.non_latin || current.iter().any(|&k| items[k].non_latin)) {
             // The break position may depend on UAX #14 classes S2 does not
             // model (ideographic or dictionary opportunities).
-            return None;
+            return super::bail("non-latin-break");
         }
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
             // Not even the first piece fits beside the floats: the line
@@ -1755,7 +1755,7 @@ pub(super) fn layout_inline_beside(
         }
         if item.starts_space && !item.whitespace_only {
             // The opportunity lies after this item's leading space.
-            return None;
+            return super::bail("leading-space");
         }
         // Last soft-wrap opportunity: after an item ending in a space, at the
         // end of a space run (preserved spaces in pre-wrap do not break
@@ -1776,7 +1776,7 @@ pub(super) fn layout_inline_beside(
                     .iter()
                     .any(|&k| items[k].starts_space && !items[k].whitespace_only)
                 {
-                    return None;
+                    return super::bail("leading-space");
                 }
                 current = rest;
             }
@@ -1808,7 +1808,7 @@ pub(super) fn layout_inline_beside(
         // Paint re-wraps these shapes around floats itself
         // (layout::resolve_float_text_layouts): their lines must stay on
         // the legacy geometry.
-        return None;
+        return super::bail("float-paint-rewrap");
     }
     if fragments
         && lines[..lines.len().saturating_sub(1)]
@@ -1816,7 +1816,7 @@ pub(super) fn layout_inline_beside(
             .any(|line| !line.last().is_some_and(|&k| items[k].forced))
     {
         // A soft wrap the cascade's line estimate may not have made.
-        return None;
+        return super::bail("soft-wrap-estimate");
     }
 
     // Line boxes (NGLineBoxFragmentBuilder): run slices start on LayoutUnit
@@ -1844,7 +1844,7 @@ pub(super) fn layout_inline_beside(
         if line.is_empty() {
             if floats.is_some() {
                 // (The assumed line tops counted it.)
-                return None;
+                return super::bail("float-empty-line");
             }
             continue;
         }
@@ -1856,7 +1856,7 @@ pub(super) fn layout_inline_beside(
         {
             // Spaces at another level inside the line would sit apart from
             // their item after reordering.
-            return None;
+            return super::bail("bidi-space");
         }
         // UAX #9 L1/L2: the line's items in visual order (the <br> stays
         // at the end; it paints nothing).
@@ -1933,7 +1933,7 @@ pub(super) fn layout_inline_beside(
             && content_width > available + EPSILON
             && line.iter().any(|&k| items[k].internal_break)
         {
-            return None;
+            return super::bail("internal-break");
         }
         max_line_width = max_line_width.max(content_width);
         // CSS Text 3 4.1.3: before a forced break or the end of the block,
@@ -1965,7 +1965,7 @@ pub(super) fn layout_inline_beside(
         if floats.is_some() && (ascent + descent - assumed_line).abs() > EPSILON {
             // A line taller or shorter than the strut: the opportunities
             // were computed for the wrong block offsets.
-            return None;
+            return super::bail("float-line-height");
         }
         built.push(Line {
             items: placed,
@@ -2068,7 +2068,7 @@ pub(super) fn layout_inline_beside(
                 let (line, x, width, _) = placed[k]?;
                 let (start_line, start, baseline) = starts.get(&b).copied()?;
                 if start_line != line {
-                    return None;
+                    return super::bail("split-box-line");
                 }
                 let style = flat[b].style;
                 let e = InlineEdges::of(style);

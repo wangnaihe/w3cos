@@ -115,6 +115,7 @@ pub(super) fn layout_out_of_flow(
         margin_base: 0.0,
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
+        adjoining_from: 0,
     };
     let (w, h) = (cb.width, cb.height);
     let spacing = |s: Spacing| match s {
@@ -177,7 +178,7 @@ pub(super) fn layout_out_of_flow(
                 let fit = match sizes.min {
                     Some(min) => sizes.max.min(available.max(min)),
                     None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
-                    None => return None,
+                    None => return super::bail("oof-shrink-min"),
                 };
                 clamp_inline_size(style, &space, edges_h, fit.max(0.0))
             }
@@ -262,7 +263,7 @@ pub(super) fn layout_out_of_flow(
     if !result.oof.is_empty() {
         // (Its own absolute descendants were resolved inside: it is
         // positioned.  Fixed descendants would need carrying further.)
-        return None;
+        return super::bail("oof-nested");
     }
     Some((cb.x + x + margin_left, cb.y + y, result.fragment))
 }
