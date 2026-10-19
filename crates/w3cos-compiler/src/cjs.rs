@@ -42,7 +42,13 @@ pub struct CjsAnalysis {
     /// Specifiers whose exports are re-exported wholesale
     /// (`module.exports = require(x)`, `__exportStar(require(x), exports)`).
     pub reexports: Vec<String>,
+    /// Node globals the file reads without declaring (`Buffer`): the record
+    /// binds them from their builtin module, as Node's globals would.
+    pub implicit_globals: Vec<String>,
 }
+
+/// Free Node globals backed by a builtin: (global, specifier, member).
+pub const IMPLICIT_GLOBALS: &[(&str, &str, &str)] = &[("Buffer", "node:buffer", "Buffer")];
 
 /// Classify `source` at `path`. Returns `Some` for CommonJS:
 /// - `.cjs` files;
@@ -125,6 +131,18 @@ pub fn classify(
         requires: scan.requires,
         ..Default::default()
     };
+    for (global, specifier, _) in IMPLICIT_GLOBALS {
+        if scan.globals_read.contains(*global) && !declares_top_level(&statements, global) {
+            analysis.implicit_globals.push((*global).to_string());
+            if !analysis
+                .requires
+                .iter()
+                .any(|existing| existing == specifier)
+            {
+                analysis.requires.push((*specifier).to_string());
+            }
+        }
+    }
     let mut lexer = ExportLexer::default();
     for statement in &statements {
         lexer.statement(statement);
@@ -147,6 +165,36 @@ pub fn strip_hashbang(source: &str) -> &str {
 struct RequireScan {
     requires: Vec<String>,
     uses_commonjs: bool,
+    /// Implicit-global names that appear as identifiers.
+    globals_read: BTreeSet<String>,
+}
+
+/// Does a top-level statement declare `name` (var/let/const/function/class)?
+fn declares_top_level(statements: &[Stmt], name: &str) -> bool {
+    fn pat_binds(pat: &Pat, name: &str) -> bool {
+        match pat {
+            Pat::Ident(ident) => ident.id.sym == *name,
+            Pat::Array(array) => array
+                .elems
+                .iter()
+                .flatten()
+                .any(|elem| pat_binds(elem, name)),
+            Pat::Object(object) => object.props.iter().any(|prop| match prop {
+                ObjectPatProp::KeyValue(kv) => pat_binds(&kv.value, name),
+                ObjectPatProp::Assign(assign) => assign.key.id.sym == *name,
+                ObjectPatProp::Rest(rest) => pat_binds(&rest.arg, name),
+            }),
+            Pat::Rest(rest) => pat_binds(&rest.arg, name),
+            Pat::Assign(assign) => pat_binds(&assign.left, name),
+            _ => false,
+        }
+    }
+    statements.iter().any(|statement| match statement {
+        Stmt::Decl(Decl::Var(var)) => var.decls.iter().any(|decl| pat_binds(&decl.name, name)),
+        Stmt::Decl(Decl::Fn(function)) => function.ident.sym == *name,
+        Stmt::Decl(Decl::Class(class)) => class.ident.sym == *name,
+        _ => false,
+    })
 }
 
 fn literal_string(expr: &Expr) -> Option<String> {
@@ -206,6 +254,12 @@ impl Visit for RequireScan {
     fn visit_ident(&mut self, ident: &Ident) {
         if matches!(&*ident.sym, "require" | "module" | "exports") {
             self.uses_commonjs = true;
+        }
+        if IMPLICIT_GLOBALS
+            .iter()
+            .any(|(global, _, _)| ident.sym == **global)
+        {
+            self.globals_read.insert(ident.sym.to_string());
         }
     }
 }
@@ -444,6 +498,37 @@ pub fn record_source(
     targets: &[(String, RequireTarget)],
     runtime: &Path,
 ) -> (String, Vec<String>) {
+    record_source_with_globals(file, body, targets, runtime, &[])
+}
+
+/// [`record_source`] plus bindings for `implicit_globals` (see
+/// [`CjsAnalysis::implicit_globals`]) at the top of the module body.
+pub fn record_source_with_globals(
+    file: &Path,
+    body: &str,
+    targets: &[(String, RequireTarget)],
+    runtime: &Path,
+    implicit_globals: &[String],
+) -> (String, Vec<String>) {
+    let prelude: String = IMPLICIT_GLOBALS
+        .iter()
+        .filter(|(global, _, _)| implicit_globals.iter().any(|name| name == global))
+        .map(|(global, specifier, member)| {
+            format!(
+                "var {global} = require({}).{member};\n",
+                js_string(specifier)
+            )
+        })
+        .collect::<String>();
+    // Keep a leading "use strict" directive first in the function body.
+    let leading = strip_hashbang(body).trim_start();
+    let prelude = if !prelude.is_empty()
+        && (leading.starts_with("'use strict'") || leading.starts_with("\"use strict\""))
+    {
+        format!("\"use strict\";\n{prelude}")
+    } else {
+        prelude
+    };
     let filename = file.to_string_lossy();
     let dirname = file
         .parent()
@@ -497,7 +582,7 @@ pub fn record_source(
         "function __w3cos_cjs_require(specifier) {{\n  switch (specifier) {{\n{require_cases}  }}\n  return __w3cos_cjs_missing(specifier, {file});\n}}\n\
 function __w3cos_cjs_resolve(specifier) {{\n  switch (specifier) {{\n{resolve_cases}  }}\n  return undefined;\n}}\n\
 export default function __w3cos_cjs_record() {{\n  return __w3cos_cjs_load({file}, {dir}, __w3cos_cjs_factory, __w3cos_cjs_require, __w3cos_cjs_resolve);\n}}\n\
-function __w3cos_cjs_factory(exports, require, module, __filename, __dirname) {{\n{body}\n}}\n",
+function __w3cos_cjs_factory(exports, require, module, __filename, __dirname) {{\n{prelude}{body}\n}}\n",
         file = js_string(&filename),
         dir = js_string(&dirname),
         body = strip_hashbang(body),
@@ -668,6 +753,31 @@ tslib_1.__exportStar(require("./star2"), exports);
         assert!(source.contains("export const a = __w3cos_cjs_exports.a;"));
         assert_eq!(source.matches("export const").count(), 1);
         assert_eq!(imports, ["/p/x.js.w3cos-cjs.js"]);
+    }
+
+    #[test]
+    fn free_buffer_reads_bind_the_builtin() {
+        let free = analyze("/p/a.js", "module.exports = Buffer.from('x');").unwrap();
+        assert_eq!(free.implicit_globals, ["Buffer"]);
+        assert!(free.requires.contains(&"node:buffer".to_string()));
+        for declared in [
+            "const { Buffer } = require('buffer'); module.exports = Buffer;",
+            "const Buffer = require('safe-buffer').Buffer; module.exports = Buffer;",
+            "function Buffer() {} module.exports = Buffer;",
+        ] {
+            let analysis = analyze("/p/b.js", declared).unwrap();
+            assert!(analysis.implicit_globals.is_empty(), "{declared}");
+        }
+        let (source, _) = record_source_with_globals(
+            Path::new("/p/a.js"),
+            "'use strict';\nmodule.exports = Buffer;",
+            &[],
+            Path::new("/p/__w3cos_cjs_runtime__.js"),
+            &["Buffer".to_string()],
+        );
+        assert!(source.contains(
+            "__dirname) {\n\"use strict\";\nvar Buffer = require(\"node:buffer\").Buffer;\n'use strict';"
+        ));
     }
 
     #[test]

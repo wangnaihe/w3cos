@@ -500,7 +500,7 @@ mod tests {
             1,
             1,
         );
-        assert!(generated.contains("w3cos_core::Value::local_object("));
+        assert!(generated.contains("w3cos_core::Value::local_object_literal("));
     }
 
     #[test]

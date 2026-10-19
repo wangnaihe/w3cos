@@ -4457,7 +4457,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // Facade objects exposing the builtin entry points as properties, so
         // `Promise.resolve(x)` / `JSON.parse(s)` work through plain member
         // calls (and the facades can be passed around as values).
-        "Promise" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_race(__args)))]), |_this, __args| w3cos_core::intrinsics::promise_new(__args))".to_string(),
+        "Promise" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"resolve\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_resolve(__args))), (\"reject\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_reject(__args))), (\"all\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_all(__args))), (\"race\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::intrinsics::promise_race(__args))), (\"__w3cos_promise_class\".to_string(), w3cos_core::Value::Bool(true))]), |_this, __args| w3cos_core::intrinsics::promise_new(__args))".to_string(),
         "JSON" => "w3cos_core::json_value()".to_string(),
         "Intl" => "w3cos_core::web::intl_value()".to_string(),
         "URL" => "w3cos_core::web::url_class()".to_string(),
@@ -4642,6 +4642,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // CommonJS/Node artifacts that appear in UMD-wrapped sources.
         // `process` is one host-backed object per page (env, argv, cwd, exit).
         "process" => "w3cos_core::process_value()".to_string(),
+        // Native host functions for w3cos-node's fs/crypto glue.
+        "__w3cos_node_host" => "w3cos_core::node_host::node_host_value()".to_string(),
         "require" | "module" | "exports" | "global" | "Buffer" | "__dirname"
         | "__filename"
         // AMD (`define`/`define.amd`) and Worker (`importScripts`) globals:

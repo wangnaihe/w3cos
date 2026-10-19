@@ -150,6 +150,17 @@ impl SerializeContext {
 
 /// `None` = the value is dropped from the output (undefined / function).
 fn serialize(context: &mut SerializeContext, key: &str, value: &Value) -> Option<String> {
+    // SerializeJSONProperty step 2: an object's callable `toJSON` runs first.
+    let to_json = if value.as_object().is_some() || value.as_array().is_some() {
+        value.get_property("toJSON")
+    } else {
+        Value::Undefined
+    };
+    let value = if to_json.is_callable() {
+        &to_json.call(value.clone(), vec![Value::from(key.to_string())])
+    } else {
+        value
+    };
     let value = if context.replacer.is_function() {
         context.replacer.call(
             Value::Undefined,

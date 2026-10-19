@@ -174,6 +174,13 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
     if crate::binary::typed_array_instance_of(obj, class_value) {
         return true;
     }
+    // Runtime promises carry no prototype object: recognise the `Promise`
+    // global by its marker.
+    if crate::promise::status(obj).is_some()
+        && class_value.get_property("__w3cos_promise_class").to_bool()
+    {
+        return true;
+    }
     // Ordinary JavaScript closures are represented by `Value::Function`, not
     // `JsObject`, so they do not participate in the object prototype walk
     // below.  They are nevertheless Function instances in JavaScript.  Keep
@@ -525,6 +532,9 @@ pub fn define_field(this: &Value, key: &str, value: Value) {
 
 /// Set `obj`'s prototype link from generated code (`obj` must be an object).
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
+    if crate::binary::set_typed_array_prototype(obj, proto) {
+        return;
+    }
     crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
@@ -537,6 +547,11 @@ pub fn set_prototype_of(obj: &Value, proto: &Value) {
 /// `Object.getPrototypeOf(obj)`: the object's prototype link, or `Null`
 /// (matching JS for non-objects, which throw — kept total here).
 pub fn get_prototype_of(obj: &Value) -> Value {
+    if obj.as_array().is_some()
+        && let Some(prototype) = crate::binary::typed_array_prototype(obj)
+    {
+        return prototype;
+    }
     obj.as_object()
         .map(|object| object.borrow().get_prototype_of())
         .unwrap_or(Value::Null)
@@ -576,6 +591,24 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
         }
         if let Some(node) = crate::intrinsics::dom_node_id(obj) {
             crate::intrinsics::pin_dom(node);
+        }
+    } else if let Some(function) = obj.as_function() {
+        // Function objects (constructor statics such as
+        // `EventEmitter.defaultMaxListeners`) take data and accessor
+        // definitions too.
+        let field = |name: &str| {
+            descriptor
+                .as_object()
+                .filter(|desc| desc.borrow().properties.contains_key(name))
+                .map(|_| descriptor.get_property(name))
+        };
+        let getter = field("get");
+        let setter = field("set");
+        if getter.is_some() || setter.is_some() {
+            function.define_accessor(key, getter, setter);
+        } else if let Some(value) = field("value") {
+            function.remove_accessor(key);
+            function.set_property(key, value);
         }
     }
     obj.clone()

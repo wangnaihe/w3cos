@@ -240,11 +240,7 @@ pub fn define_private_accessor(
 }
 
 pub fn create_object(properties: Vec<(Value, Value)>) -> Value {
-    let object = Value::object(HashMap::new());
-    crate::class::set_prototype_of(
-        &object,
-        &crate::builtins::object_value().get_property("prototype"),
-    );
+    let object = Value::object_literal(HashMap::new());
     for (key, value) in properties {
         set_property(&object, &key, value);
     }

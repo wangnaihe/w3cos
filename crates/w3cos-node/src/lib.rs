@@ -7,16 +7,33 @@
 
 /// (module name, CommonJS source). Subpath modules use their full name.
 pub const MODULES: &[(&str, &str)] = &[
+    ("assert", include_str!("../js/assert.js")),
+    (
+        "assert/strict",
+        "module.exports = require('assert').strict;\n",
+    ),
+    ("buffer", include_str!("../js/buffer.js")),
+    ("crypto", include_str!("../js/crypto.js")),
     ("events", include_str!("../js/events.js")),
+    ("fs", include_str!("../js/fs.js")),
+    ("fs/promises", "module.exports = require('fs').promises;\n"),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),
     ("path/posix", "module.exports = require('path');\n"),
     ("process", include_str!("../js/process.js")),
+    ("querystring", include_str!("../js/querystring.js")),
+    ("stream", include_str!("../js/stream.js")),
+    (
+        "stream/promises",
+        "module.exports = require('stream').promises;\n",
+    ),
+    ("string_decoder", include_str!("../js/string_decoder.js")),
     ("timers", include_str!("../js/timers.js")),
     ("timers/promises", include_str!("../js/timers_promises.js")),
     ("url", include_str!("../js/url.js")),
     ("util", include_str!("../js/util.js")),
     ("util/types", include_str!("../js/util_types.js")),
+    ("zlib", include_str!("../js/zlib.js")),
 ];
 
 /// The builtin's name without a `node:` prefix.
@@ -60,6 +77,8 @@ mod tests {
     fn node_prefix_is_accepted() {
         assert!(source("node:path").is_some());
         assert!(source("node:timers/promises").is_some());
-        assert!(source("fs").is_none());
+        assert!(source("fs").is_some());
+        assert!(source("node:crypto").is_some());
+        assert!(source("zlib").is_some());
     }
 }

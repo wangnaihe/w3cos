@@ -13,6 +13,8 @@ pub mod json;
 #[cfg(feature = "leak-detector")]
 pub mod leak_detector;
 pub mod module_registry;
+pub mod node_host;
+mod number_proto;
 mod object;
 pub mod page_arena;
 pub mod promise;
