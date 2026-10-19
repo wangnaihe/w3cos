@@ -860,6 +860,7 @@ fn build_host() -> Value {
         }
     });
     crate::node_host_io::install(&host);
+    crate::node_workers::install(&host);
     host
 }
 
