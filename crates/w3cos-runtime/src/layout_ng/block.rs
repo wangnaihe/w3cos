@@ -845,6 +845,7 @@ pub(super) fn layout_root(
         bfc_y: 0.0,
         margin_base: 0.0,
         margin_strut: MarginStrut::default(),
+        forced_bfc: false,
     };
     let result = layout_block(flat, 0, &space, true)?;
     if result.float_overlap {
@@ -991,9 +992,13 @@ fn layout_block_in(
         bfc_y: 0.0,
         margin_base: 0.0,
         margin_strut: MarginStrut::default(),
+        forced_bfc: false,
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;
+    // Past clearance our top is resolved: margins that would collapse
+    // through it resolve at our border box instead.
+    let forced = space.forced_bfc && !bfc_root;
     let mut start_strut = MarginStrut::default();
     start_strut.append(metrics.margin[0]);
     let mut pending = MarginStrut::default();
@@ -1151,15 +1156,21 @@ fn layout_block_in(
         // when the hypothetical position is above it; the cleared box's
         // top margin then no longer collapses with what precedes it.
         let clear = clearance_offset(child_info.style, exclusions);
-        if clear.is_some() && at_top && can_escape_top {
-            // Floats at our still-unresolved position are adjoining: the
-            // cleared box's margin must not drag them down (Blink resolves
-            // the BFC block offset without the child's margin first, then
-            // applies clearance).  Not implemented: stay on legacy.
+        if clear.is_some() && at_top && can_escape_top && !forced {
+            // Floats on the cleared side at our still-unresolved position
+            // are adjoining: the cleared box's margin must not drag them
+            // down (Blink HasClearancePastAdjoiningFloats resolves the BFC
+            // block offset without the child's margin first, then applies
+            // clearance).  Not implemented: stay on legacy.
             let mut combined = margin_strut;
             combined.merge(start_strut);
             combined.merge(pending);
-            if exclusions.last_float_top() >= margin_base + combined.sum() - 1.0 / 128.0 {
+            let (left, right) = match child_info.style.clear {
+                Clear::Left => (true, false),
+                Clear::Right => (false, true),
+                _ => (true, true),
+            };
+            if exclusions.has_float_from(margin_base + combined.sum(), left, right) {
                 return None;
             }
         }
@@ -1171,8 +1182,13 @@ fn layout_block_in(
                 combined.merge(start_strut);
                 combined.merge(pending);
                 combined.merge(start);
+                let top = if forced {
+                    content_bfc_y
+                } else {
+                    margin_base + combined.sum()
+                };
                 return match clear {
-                    Some(c) if margin_base + combined.sum() < c - 1.0 / 128.0 => None,
+                    Some(c) if top < c - 1.0 / 128.0 => None,
                     _ => Some((0.0, false)),
                 };
             }
@@ -1193,7 +1209,7 @@ fn layout_block_in(
         own_top.append(child_metrics.margin[0]);
         // (Clearance separating a first child from margins that would
         // collapse through us is not implemented.)
-        let (estimate, _) = place(own_top)?;
+        let (estimate, estimate_cleared) = place(own_top)?;
         let snapshot = exclusions.snapshot();
         let mut nested = child_space;
         nested.bfc_x = bfc_x + x;
@@ -1201,6 +1217,9 @@ fn layout_block_in(
         // Margins collapsing through us: the child (and we) end up past
         // all of them, wherever our own estimate put us.
         let collapsed_top = |start: MarginStrut| {
+            if forced {
+                return content_bfc_y;
+            }
             let mut combined = margin_strut;
             combined.merge(start_strut);
             combined.merge(pending);
@@ -1213,9 +1232,11 @@ fn layout_block_in(
             nested.margin_strut = margin_strut;
             nested.margin_strut.merge(start_strut);
             nested.margin_strut.merge(pending);
+            nested.forced_bfc = forced;
         } else {
             nested.margin_base = content_bfc_y + cursor;
             nested.margin_strut = pending;
+            nested.forced_bfc = estimate_cleared;
         }
         let mut result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
         let (mut resolved, mut cleared) = place(result.start_strut)?;
@@ -1226,11 +1247,18 @@ fn layout_block_in(
                 content_bfc_y + resolved
             }
         };
+        let resolved_forced = if at_top && can_escape_top {
+            forced
+        } else {
+            cleared
+        };
         if result.bfc_dependent
-            && (resolved_bfc(resolved, result.start_strut) - nested.bfc_y).abs() > 1.0 / 128.0
+            && ((resolved_bfc(resolved, result.start_strut) - nested.bfc_y).abs() > 1.0 / 128.0
+                || resolved_forced != nested.forced_bfc)
         {
             exclusions.restore(snapshot);
             nested.bfc_y = resolved_bfc(resolved, result.start_strut);
+            nested.forced_bfc = resolved_forced;
             result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
             let (again, c) = place(result.start_strut)?;
             if (again - resolved).abs() > 1.0 / 128.0 {

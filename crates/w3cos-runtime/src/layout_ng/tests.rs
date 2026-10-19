@@ -1331,4 +1331,55 @@ fn first_children_beside_floats_match_chrome() {
     );
     let flat = pre_flatten(&root);
     assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+
+    // margin-collapse-039 shape: past clearance (ForcedBfcBlockOffset) the
+    // first child's margin no longer collapses through the cleared box, so
+    // a float inside it sits at the cleared border edge, below the float.
+    let mut first = Style {
+        display: Display::Block,
+        height: px(10.0),
+        ..Style::default()
+    };
+    first.margin.top = S::Px(50.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            leaf(Style {
+                display: Display::Block,
+                float: Float::Left,
+                width: px(100.0),
+                height: px(100.0),
+                ..Style::default()
+            }),
+            Component::boxed(
+                Style {
+                    display: Display::Block,
+                    clear: Clear::Left,
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    first,
+                    vec![leaf(Style {
+                        display: Display::Block,
+                        float: Float::Left,
+                        width: px(30.0),
+                        height: px(30.0),
+                        ..Style::default()
+                    })],
+                )],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |index: usize| {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    assert_eq!(rect(2), [0.0, 100.0, 800.0, 10.0]);
+    assert_eq!(rect(3), [0.0, 100.0, 800.0, 10.0]);
+    assert_eq!(rect(4), [0.0, 100.0, 30.0, 30.0]);
 }

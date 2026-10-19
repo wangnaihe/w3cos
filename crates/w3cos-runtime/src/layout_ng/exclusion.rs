@@ -36,9 +36,13 @@ impl ExclusionSpace {
         self.exclusions.is_empty()
     }
 
-    /// The top of the most recently placed float (0 when none).
-    pub fn last_float_top(&self) -> f32 {
-        self.last_float_top
+    /// A float on the given side(s) has its margin box top at or below
+    /// `top` (Blink's adjoining float types: floats placed at a BFC block
+    /// offset that is not resolved yet).
+    pub fn has_float_from(&self, top: f32, left: bool, right: bool) -> bool {
+        self.exclusions
+            .iter()
+            .any(|e| ((e.is_left && left) || (!e.is_left && right)) && e.top >= top - 1.0 / 128.0)
     }
 
     pub fn snapshot(&self) -> Snapshot {

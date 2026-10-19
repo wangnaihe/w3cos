@@ -83,6 +83,10 @@ pub(crate) struct ConstraintSpace {
     /// margins collapse through us (CSS2 9.5.2 clearance).
     pub margin_base: f32,
     pub margin_strut: MarginStrut,
+    /// NGConstraintSpace::ForcedBfcBlockOffset: the box was placed past
+    /// clearance, so its BFC block offset is resolved at its border box
+    /// (`bfc_y`) and nothing collapses through its top any more.
+    pub forced_bfc: bool,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.
