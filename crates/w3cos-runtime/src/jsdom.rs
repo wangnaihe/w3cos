@@ -19486,6 +19486,8 @@ fn build_window_value() -> Value {
     // Native-module replacements for Node glue (`@vscode/sqlite3`,
     // `@parcel/watcher`).
     w3cos_core::node_host::register_extension(crate::node_sqlite::install);
+    // Electron `safeStorage` on the local keyring.
+    w3cos_core::node_host::register_extension(crate::node_safe_storage::install);
     #[cfg(all(
         any(target_os = "macos", target_os = "linux", target_os = "windows"),
         not(target_env = "ohos")
