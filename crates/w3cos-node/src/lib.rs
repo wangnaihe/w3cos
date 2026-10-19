@@ -8,16 +8,30 @@
 /// (module name, CommonJS source). Subpath modules use their full name.
 pub const MODULES: &[(&str, &str)] = &[
     ("assert", include_str!("../js/assert.js")),
+    ("async_hooks", include_str!("../js/async_hooks.js")),
     (
         "assert/strict",
         "module.exports = require('assert').strict;\n",
     ),
     ("buffer", include_str!("../js/buffer.js")),
     ("child_process", include_str!("../js/child_process.js")),
+    ("console", include_str!("../js/console.js")),
     ("crypto", include_str!("../js/crypto.js")),
+    (
+        "diagnostics_channel",
+        include_str!("../js/diagnostics_channel.js"),
+    ),
+    ("dns", include_str!("../js/dns.js")),
+    (
+        "dns/promises",
+        "module.exports = require('dns').promises;\n",
+    ),
     ("events", include_str!("../js/events.js")),
     ("fs", include_str!("../js/fs.js")),
     ("fs/promises", "module.exports = require('fs').promises;\n"),
+    ("http", include_str!("../js/http.js")),
+    ("http2", include_str!("../js/http2.js")),
+    ("https", include_str!("../js/https.js")),
     // Shared poll loop for host-backed handles (child processes, sockets).
     ("internal/w3cos_poll", include_str!("../js/w3cos_poll.js")),
     // Structured clone and worker boot for `worker_threads`.
@@ -38,12 +52,20 @@ pub const MODULES: &[(&str, &str)] = &[
     ("internal/w3cos_spdlog", include_str!("../js/spdlog.js")),
     ("internal/w3cos_sqlite3", include_str!("../js/sqlite3.js")),
     ("internal/w3cos_watcher", include_str!("../js/watcher.js")),
+    (
+        "internal/w3cos_unsupported",
+        include_str!("../js/w3cos_unsupported.js"),
+    ),
+    ("module", include_str!("../js/module.js")),
     ("net", include_str!("../js/net.js")),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),
     ("path/posix", "module.exports = require('path');\n"),
+    ("perf_hooks", include_str!("../js/perf_hooks.js")),
     ("process", include_str!("../js/process.js")),
     ("querystring", include_str!("../js/querystring.js")),
+    ("readline", include_str!("../js/readline.js")),
+    ("sqlite", include_str!("../js/sqlite.js")),
     ("stream", include_str!("../js/stream.js")),
     (
         "stream/promises",
@@ -52,9 +74,12 @@ pub const MODULES: &[(&str, &str)] = &[
     ("string_decoder", include_str!("../js/string_decoder.js")),
     ("timers", include_str!("../js/timers.js")),
     ("timers/promises", include_str!("../js/timers_promises.js")),
+    ("tls", include_str!("../js/tls.js")),
+    ("tty", include_str!("../js/tty.js")),
     ("url", include_str!("../js/url.js")),
     ("util", include_str!("../js/util.js")),
     ("util/types", include_str!("../js/util_types.js")),
+    ("v8", include_str!("../js/v8.js")),
     ("worker_threads", include_str!("../js/worker_threads.js")),
     ("zlib", include_str!("../js/zlib.js")),
 ];
@@ -78,6 +103,8 @@ pub const NATIVE_REPLACEMENTS: &[(&str, &str)] = &[
     ("@vscode/spdlog", "internal/w3cos_spdlog"),
     ("@w3cos/spdlog", "internal/w3cos_spdlog"),
     ("@vscode/sqlite3", "internal/w3cos_sqlite3"),
+    // Electron's unpatched `fs` (no asar redirection): w3cos has no asar.
+    ("original-fs", "fs"),
     ("@w3cos/sqlite3", "internal/w3cos_sqlite3"),
 ];
 

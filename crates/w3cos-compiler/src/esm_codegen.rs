@@ -23,8 +23,9 @@ fn json_value_expr(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "w3cos_core::Value::Null".to_string(),
         serde_json::Value::Bool(value) => format!("w3cos_core::Value::Bool({value})"),
+        // `{:?}` keeps the float literal form (`1.0`, `1e300`).
         serde_json::Value::Number(value) => format!(
-            "w3cos_core::Value::Number({})",
+            "w3cos_core::Value::Number({:?})",
             value.as_f64().unwrap_or_default()
         ),
         serde_json::Value::String(value) => {
@@ -57,8 +58,10 @@ fn emit_literal_imports(module: &BundledModule) -> String {
             let value = serde_json::from_str(source)
                 .map(|value| json_value_expr(&value))
                 .unwrap_or_else(|_| "w3cos_core::Value::Undefined".to_string());
+            // One value per module instance: every import of the JSON file
+            // (and every `require` of it) sees the same object.
             format!(
-                "    pub fn {}_get() -> w3cos_core::Value {{ {value} }}\n",
+                "    pub fn {}_get() -> w3cos_core::Value {{ thread_local! {{ static VALUE: ::std::cell::OnceCell<w3cos_core::Value> = const {{ ::std::cell::OnceCell::new() }}; }} VALUE.with(|cell| cell.get_or_init(|| {value}).clone()) }}\n",
                 sanitize_ident(local)
             )
         })
@@ -860,8 +863,25 @@ fn generate_module_with_bodies(
                         // every referencing module sees one uniform shape
                         // (the target may be a fn, class accessor, or a
                         // variable accessor — resolve the final form).
-                        let (target_module, target_bundled, shape) =
+                        let (mut target_module, mut target_bundled, mut shape) =
                             resolve_namespace_symbol(bundle, &module.path, target, parse_cache, 0);
+                        if matches!(shape, NamespacePropShape::Missing)
+                            && let Some(imported) = module.lookup(target)
+                            && let Some(imported_sym) =
+                                bundle.symbols.iter().find(|s| s.bundled_name == imported)
+                            && imported_sym.module != module.path
+                        {
+                            // `const y = x` where `x` is an import binding
+                            // (e.g. a CommonJS facade's default export):
+                            // resolve the binding in its defining module.
+                            (target_module, target_bundled, shape) = resolve_namespace_symbol(
+                                bundle,
+                                &imported_sym.module.clone(),
+                                &imported_sym.original_name.clone(),
+                                parse_cache,
+                                1,
+                            );
+                        }
                         let owner_ns = bundle
                             .modules
                             .iter()
