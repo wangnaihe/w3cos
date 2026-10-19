@@ -64,6 +64,8 @@
 | EditContext | 3 个文件 | ❌（monaco 有特性检测，可降级到 textarea 路径） |
 | new Worker | 3 | ⏸️ editor.api 范围内可避免 |
 
+> **M3 第 22 项复核（`examples/electron-dom-gaps`，逐行对比 Electron 44.9.0）**：上表中 activeElement、queryCommandSupported、createElementNS（SVG）、queueMicrotask、structuredClone、AbortController、requestIdleCallback、DragEvent/ClipboardEvent 与 DataTransfer、getComputedStyle 级联（含 `var()`、继承、`!important`）、atob/btoa、动态 `<style>` 注入以及 adoptedStyleSheets 均已在运行时实现，并由该 e2e 测试覆盖。`execCommand('copy')` 的剪贴板 shim 和 EditContext 不在这次范围内。
+
 **关键架构缺口**：编译产物里的 `document` 全局当前是 `w3cos_core::builtins::document` **假对象**（返回 no-op Value::object），不连真实 w3cos-dom Document。Monaco 要渲染必须建「Value 级 DOM 桥」：编译代码的 DOM 调用落到真实 Document 节点上。
 
 ## 4. 解析器现状（本次会话修复，全部带单测）
