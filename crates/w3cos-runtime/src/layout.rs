@@ -103,6 +103,9 @@ struct TextMeasureKey {
     min_width: Option<u32>,
     white_space: u8,
     word_break: u8,
+    line_break: u8,
+    break_spaces: bool,
+    hanging_punctuation_last: bool,
 }
 
 struct WrappedTextMeasure {
@@ -600,11 +603,12 @@ pub(crate) fn resolve_float_text_layouts(
             continue;
         }
         let widths: Vec<_> = bands.iter().map(|band| band.width).collect();
-        let lines = text_layout::wrap_text_with_run_width_and_line_widths(
+        let lines = text_layout::wrap_text_with_run_width_and_line_widths_in(
             text,
             content.width,
             &widths,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             |run| text_intrinsic_size(run, style).0,
         );
         let bottom_edge = spacing(parent_style.padding.bottom, &parent_style)
@@ -4238,6 +4242,9 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WWordBreak::BreakWord => 2,
             WWordBreak::KeepAll => 3,
         },
+        line_break: style.line_break as u8,
+        break_spaces: style.break_spaces,
+        hanging_punctuation_last: style.hanging_punctuation_last,
     }
 }
 

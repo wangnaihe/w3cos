@@ -381,6 +381,10 @@ pub struct Style {
     // CSS Text (#31)
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
+    /// `white-space: break-spaces`: line breaking allows a break after every
+    /// space (Blink BreakSpaceType::kAfterEverySpace).
+    #[serde(default)]
+    pub break_spaces: bool,
     pub line_height: f32,
     /// Retained CSS keyword; old wire styles and native numeric builders default to false.
     #[serde(default)]
@@ -410,6 +414,12 @@ pub struct Style {
     #[serde(default)]
     pub font_feature_kern: Option<bool>,
     pub word_break: WordBreak,
+    /// CSS `line-break` (inherited).
+    #[serde(default)]
+    pub line_break: LineBreak,
+    /// `hanging-punctuation: last` (inherited).
+    #[serde(default)]
+    pub hanging_punctuation_last: bool,
     #[serde(default)]
     pub direction: TextDirection,
     #[serde(default)]
@@ -556,6 +566,7 @@ impl Default for Style {
             opacity: 1.0,
             text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
+            break_spaces: false,
             line_height: 1.2,
             line_height_is_normal: false,
             line_height_computed_px: None,
@@ -571,6 +582,8 @@ impl Default for Style {
             font_kerning: true,
             font_feature_kern: None,
             word_break: WordBreak::Normal,
+            line_break: LineBreak::Auto,
+            hanging_punctuation_last: false,
             direction: TextDirection::Ltr,
             unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
@@ -743,6 +756,9 @@ impl Style {
             font_kerning,
             font_feature_kern,
             word_break,
+            line_break,
+            hanging_punctuation_last,
+            break_spaces,
             direction,
             unicode_bidi,
             custom_properties,
@@ -865,6 +881,9 @@ impl Style {
             font_kerning: font_kerning_b,
             font_feature_kern: font_feature_kern_b,
             word_break: word_break_b,
+            line_break: line_break_b,
+            hanging_punctuation_last: hanging_punctuation_last_b,
+            break_spaces: break_spaces_b,
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
             custom_properties: custom_properties_b,
@@ -985,6 +1004,9 @@ impl Style {
             && font_kerning == font_kerning_b
             && font_feature_kern == font_feature_kern_b
             && word_break == word_break_b
+            && line_break == line_break_b
+            && hanging_punctuation_last == hanging_punctuation_last_b
+            && break_spaces == break_spaces_b
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
             && custom_properties == custom_properties_b
@@ -1728,6 +1750,17 @@ pub enum WordBreak {
     BreakAll,
     BreakWord,
     KeepAll,
+}
+
+/// CSS Text 3 `line-break`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LineBreak {
+    #[default]
+    Auto,
+    Loose,
+    Normal,
+    Strict,
+    Anywhere,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

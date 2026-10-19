@@ -204,6 +204,11 @@ fn is_soft_wrap_char(c: char) -> bool {
 
 /// Text style requirements shared by every S2a text leaf.
 fn text_style_reason(style: &Style) -> Option<&'static str> {
+    if style.break_spaces {
+        // BreakSpaceType::kAfterEverySpace is only modelled by the legacy
+        // wrapper (crate::line_break).
+        return Some("text:break-spaces");
+    }
     if style.position != Position::Static || style.float != Float::None {
         return Some("text:positioned");
     }

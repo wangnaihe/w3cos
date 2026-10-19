@@ -959,8 +959,13 @@ impl CSSStyleDeclaration {
                     );
             }
             "white-space" | "whiteSpace" => {
-                if let Some(white_space) = parse_white_space(value) {
+                if value.trim().eq_ignore_ascii_case("break-spaces") {
+                    // Only the break-after-every-space opportunities are
+                    // modelled; space preservation keeps the previous value.
+                    self.inner.break_spaces = true;
+                } else if let Some(white_space) = parse_white_space(value) {
                     self.inner.white_space = white_space;
+                    self.inner.break_spaces = false;
                 }
             }
             "line-height" | "lineHeight" => {
@@ -1114,6 +1119,21 @@ impl CSSStyleDeclaration {
                 self.inner.font_feature_kern = parse_kern_feature_override(value);
             }
             "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+            "hanging-punctuation" | "hangingPunctuation" => {
+                self.inner.hanging_punctuation_last = value
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("last"));
+            }
+            "line-break" | "lineBreak" => {
+                use w3cos_std::style::LineBreak;
+                self.inner.line_break = match value.trim().to_ascii_lowercase().as_str() {
+                    "loose" => LineBreak::Loose,
+                    "normal" => LineBreak::Normal,
+                    "strict" => LineBreak::Strict,
+                    "anywhere" => LineBreak::Anywhere,
+                    _ => LineBreak::Auto,
+                };
+            }
             "direction" => {
                 self.inner.direction = if value.trim().eq_ignore_ascii_case("rtl") {
                     TextDirection::Rtl
@@ -1132,7 +1152,14 @@ impl CSSStyleDeclaration {
                 };
             }
             "overflow-wrap" | "overflowWrap" | "word-wrap" | "wordWrap" => {
-                self.inner.word_break = parse_overflow_wrap(value)
+                // overflow-wrap and word-break share one field: `normal` must
+                // not undo `word-break: break-word / break-all / keep-all`.
+                let wrap = parse_overflow_wrap(value);
+                if wrap == w3cos_std::style::WordBreak::BreakWord
+                    && self.inner.word_break == w3cos_std::style::WordBreak::Normal
+                {
+                    self.inner.word_break = wrap;
+                }
             }
 
             // Interaction

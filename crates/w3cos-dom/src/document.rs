@@ -12538,9 +12538,16 @@ fn inherit_text_style(
     }
     if !declares("white-space") {
         style.white_space = parent.white_space;
+        style.break_spaces = parent.break_spaces;
     }
     if !declares("word-break") && !declares("overflow-wrap") && !declares("word-wrap") {
         style.word_break = parent.word_break;
+    }
+    if !declares("line-break") {
+        style.line_break = parent.line_break;
+    }
+    if !declares("hanging-punctuation") {
+        style.hanging_punctuation_last = parent.hanging_punctuation_last;
     }
     if !declares("direction") {
         style.direction = parent.direction;
@@ -13806,6 +13813,7 @@ fn equivalent_text_paint_style(
         && left.font_style == right.font_style
         && left.font_variant == right.font_variant
         && left.white_space == right.white_space
+        && left.break_spaces == right.break_spaces
         && left.line_height == right.line_height
         && left.line_height_is_normal == right.line_height_is_normal
         && left.line_height_computed_px == right.line_height_computed_px
@@ -13816,6 +13824,7 @@ fn equivalent_text_paint_style(
         && left.text_decoration == right.text_decoration
         && left.text_overflow == right.text_overflow
         && left.word_break == right.word_break
+        && left.line_break == right.line_break
         && left.direction == right.direction
         && left.unicode_bidi == right.unicode_bidi
         && left.visibility == right.visibility
@@ -16331,6 +16340,9 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             w3cos_std::inline_text::append_source_fragment_ends(&mut ends, previous_content.len(), content, &fragment.style, &mut previous_source);
             previous_content.push_str(content);
             w3cos_std::inline_text::set_fragment_ends(&mut previous.style, previous_content, &ends);
+            // hanging-punctuation: last concerns the paragraph's final
+            // character, which now comes from this fragment.
+            previous.style.hanging_punctuation_last = fragment.style.hanging_punctuation_last;
             previous.on_click = w3cos_std::EventAction::None;
             true
         });

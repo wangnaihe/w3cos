@@ -4149,12 +4149,13 @@ fn draw_text_in_rect_with_line_painter(
             ink_bounds: vec![measure_ink(text)],
         })
     } else {
-        text_layout::retained_text_paint_layout_with_run_width_and_line_widths(
+        text_layout::retained_text_paint_layout_with_run_width_and_line_widths_in(
             text,
             continuation_content.width,
             &line_widths,
             style.font_size,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             registry.cascade_cache_key(style, text)
                 ^ 0x534b_4941_5445_5801
                 ^ w3cos_std::inline_text::metadata_cache_key(style),
@@ -6183,11 +6184,12 @@ fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(
         } else {
             inner_width
         };
-        let lines = text_layout::wrap_text_with_run_width_and_first_line(
+        let lines = text_layout::wrap_text_with_run_width_and_first_line_in(
             text,
             continuation_width,
             first_line_width,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             |line| measure_skia_text_advance(line, primary, style),
         );
         let used_line_count = text_layout::used_text_line_count(text, style, &lines);
