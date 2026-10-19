@@ -712,6 +712,11 @@ pub struct EsmResolver {
     /// scripts loaded on demand, so marker-free files become CommonJS records
     /// too (see [`crate::cjs::classify_as`]).
     classic_scripts: RefCell<HashSet<PathBuf>>,
+    /// The graph entry: its CommonJS record links every worker module (see
+    /// [`crate::cjs::worker_boot_prelude`]).
+    entry: RefCell<Option<PathBuf>>,
+    /// Statically named worker modules found so far, in discovery order.
+    worker_entries: RefCell<Vec<PathBuf>>,
 }
 
 impl EsmResolver {
@@ -724,6 +729,8 @@ impl EsmResolver {
             commonjs: RefCell::new(HashMap::new()),
             commonjs_requested: RefCell::new(HashMap::new()),
             commonjs_diagnostics: RefCell::new(Vec::new()),
+            entry: RefCell::new(None),
+            worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
         }
     }
@@ -834,6 +841,7 @@ impl EsmResolver {
 
     pub fn build_graph_from_entry(&self, entry: &Path) -> Result<ModuleGraph> {
         let entry = self.resolve_entry(entry)?;
+        *self.entry.borrow_mut() = Some(entry.path.clone());
         let mut graph = ModuleGraph::default();
         let mut visited = HashSet::new();
         self.visit_module(entry, &mut visited, &mut graph)?;
@@ -987,18 +995,74 @@ impl EsmResolver {
                 )),
             }
         }
+        for specifier in &analysis.worker_entries {
+            match self.resolve_with(specifier, dir, ResolveKind::Require) {
+                Ok(resolved) => {
+                    let known = self.worker_entries.borrow().contains(&resolved.path);
+                    if !known {
+                        // Node runs a worker file as a script: a marker-free
+                        // file is CommonJS too (not an eagerly evaluated ESM
+                        // module of the main program).
+                        self.classic_scripts
+                            .borrow_mut()
+                            .insert(resolved.path.clone());
+                        if self.prepare_commonjs(&resolved.path)? {
+                            self.worker_entries.borrow_mut().push(resolved.path.clone());
+                        } else {
+                            self.commonjs_diagnostics.borrow_mut().push(format!(
+                                "{}: worker module `{specifier}` is an ES module; w3cos runs CommonJS worker files only",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                Err(error) => self.commonjs_diagnostics.borrow_mut().push(format!(
+                    "{}: worker module `{specifier}` is unresolved: {error:#}",
+                    path.display()
+                )),
+            }
+        }
+        let mut prelude = String::new();
+        let is_entry = self.entry.borrow().as_deref() == Some(path);
+        if is_entry && !self.worker_entries.borrow().is_empty() {
+            // The entry's require closure has been classified by now, so
+            // every CommonJS-reachable worker module is known.
+            let workers = self.worker_entries.borrow().clone();
+            if let Ok(boot) =
+                self.resolve_with("node:internal/w3cos_worker", dir, ResolveKind::Require)
+            {
+                targets.push((
+                    "node:internal/w3cos_worker".to_string(),
+                    RequireTarget::CommonJs(boot.path.clone()),
+                ));
+                self.prepare_commonjs(&boot.path)?;
+                for worker in workers.iter().filter(|worker| worker.as_path() != path) {
+                    let target = RequireTarget::CommonJs(worker.clone());
+                    targets.push((
+                        format!(
+                            "{}{}",
+                            crate::cjs::WORKER_TARGET_PREFIX,
+                            worker.to_string_lossy()
+                        ),
+                        target,
+                    ));
+                }
+                prelude = crate::cjs::worker_boot_prelude(path, &workers);
+            }
+        }
         let runtime = crate::cjs::runtime_path(&self.project_root);
         module_source::set_synthesized(
             runtime.clone(),
             crate::cjs::RUNTIME_SOURCE.to_string(),
             Vec::new(),
         );
-        let (record, imports) = crate::cjs::record_source_with_globals(
+        let (record, imports) = crate::cjs::record_source_with_prelude(
             path,
             &source,
             &targets,
             &runtime,
             &analysis.implicit_globals,
+            &prelude,
         );
         module_source::set_synthesized(crate::cjs::record_path(path), record, imports);
         self.write_commonjs_facade(path);

@@ -139,6 +139,30 @@ fn electron_ipc_round_trip_matches_electron() {
     std::fs::remove_dir_all(root).ok();
 }
 
+const UTILITY: &[(&str, &str)] =
+    example!("electron-utility", ["package.json", "main.js", "child.js"]);
+
+/// Electron 44.9.0 (`electron --no-sandbox examples/electron-utility`).
+const UTILITY_ELECTRON: &str = r#"channel {"hello":"port","list":[1,2]} 0
+forked undefined null null
+spawn number true
+message {"step":"ready","args":["--mode","sum"],"type":"utility"}
+message {"step":"sum","value":5,"ports":0}
+kill true
+exit number undefined
+will-quit
+"#;
+
+#[test]
+fn electron_utility_process_and_message_channel_match_electron() {
+    let root = write_fixture("w3cos_electron_utility", UTILITY);
+    let lines =
+        compile_and_run_with_env(&root, &root.join("main.js"), "w3cos_electron_utility", &[]);
+    let expected: Vec<&str> = UTILITY_ELECTRON.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn version_normalization() {
     assert_eq!(

@@ -1,4 +1,4 @@
-//! `child_process` and `net` from `w3cos-node` (M3 item 19, slice 1): each
+//! `child_process`, `net` and `worker_threads` from `w3cos-node` (M3 item 19): each
 //! fixture under `fixtures/node_io/` is AOT-compiled and must print what
 //! Node 20.19 prints for the same file (`node fixtures/node_io/<name>.js`;
 //! the permission fixture under `node --experimental-permission
@@ -7,14 +7,14 @@
 use crate::cjs_e2e_tests::{compile_and_run_with_env, write_fixture};
 
 fn run(name: &str, source: &str, env: &[(&str, &str)]) -> Vec<String> {
+    run_files(name, &[("main.js", source)], env)
+}
+
+fn run_files(name: &str, files: &[(&str, &str)], env: &[(&str, &str)]) -> Vec<String> {
     let crate_name = format!("w3cos_node_io_{name}");
-    let root = write_fixture(
-        &crate_name,
-        &[
-            ("package.json", r#"{"name":"node-io"}"#),
-            ("main.js", source),
-        ],
-    );
+    let mut all = vec![("package.json", r#"{"name":"node-io"}"#)];
+    all.extend_from_slice(files);
+    let root = write_fixture(&crate_name, &all);
     let lines = compile_and_run_with_env(&root, &root.join("main.js"), &crate_name, env);
     std::fs::remove_dir_all(root).ok();
     lines
@@ -112,5 +112,72 @@ fn classes_extending_es5_constructors_match_node() {
         &[],
     );
     let expected: Vec<&str> = ES5_SUPER_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+const WORKER_THREADS_NODE: &str = r#"main true 0 null null
+t1 ready false number true [6,[1,2],1000,1]
+t1 square 49
+t1 clone [1,"two"] bigint true true undefined true true -Infinity
+t1 clone2 true false hi true 1.5,-2 true bad true a+b gi true {"deep":[[1],{"x":null}]}
+t1 exit 3 online,ready,square,clone -1
+t2 error true TypeError boom from worker
+t2 exit 1
+t3 first busy
+t3 exit 1
+t3 terminate 1
+t4 receive {"message":{"a":1}} undefined
+t4 message ["hello",1]
+t4 closed
+t5 message from self self true
+t5 exit 0
+t6 path ERR_WORKER_PATH TypeError
+done
+"#;
+
+#[test]
+fn node_worker_threads_matches_node() {
+    let lines = run_files(
+        "worker_threads",
+        &[
+            (
+                "main.js",
+                include_str!("fixtures/node_io/worker_threads/main.js"),
+            ),
+            (
+                "worker.js",
+                include_str!("fixtures/node_io/worker_threads/worker.js"),
+            ),
+        ],
+        &[],
+    );
+    let expected: Vec<&str> = WORKER_THREADS_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
+const WORKER_PERMISSION_NODE: &str = r#"has worker false
+denied ERR_ACCESS_DENIED WorkerThreads Access to this API has been restricted
+done
+"#;
+
+/// `node --experimental-permission --allow-fs-read=*` (no `--allow-worker`)
+/// vs `W3COS_NODE_DENY=worker`.
+#[test]
+fn node_worker_permission_matches_node_permission_model() {
+    let lines = run_files(
+        "worker_permission",
+        &[
+            (
+                "main.js",
+                include_str!("fixtures/node_io/worker_permission/main.js"),
+            ),
+            (
+                "worker.js",
+                include_str!("fixtures/node_io/worker_permission/worker.js"),
+            ),
+        ],
+        &[("W3COS_NODE_DENY", "worker")],
+    );
+    let expected: Vec<&str> = WORKER_PERMISSION_NODE.lines().collect();
     assert_eq!(lines, expected);
 }

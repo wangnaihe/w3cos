@@ -69,9 +69,14 @@ proc.getgid = function getgid() { return hostValue('gid', 1000); };
 proc.geteuid = proc.getuid;
 proc.getegid = proc.getgid;
 
+// Inside a worker thread `process.exit()` ends only that worker.
+const nodeHost = typeof __w3cos_node_host === 'object' ? __w3cos_node_host : null;
+const inWorker = nodeHost !== null && typeof nodeHost.workerContext === 'function' && nodeHost.workerContext() !== null;
+
 proc.exit = function exit(code) {
   if (code !== undefined) proc.exitCode = code;
   proc.emit('exit', proc.exitCode === undefined ? 0 : proc.exitCode);
+  if (inWorker) return nodeHost.workerExit(proc.exitCode === undefined ? 0 : proc.exitCode);
   if (typeof hostExit === 'function') return hostExit(proc.exitCode === undefined ? 0 : proc.exitCode);
 };
 

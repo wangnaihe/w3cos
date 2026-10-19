@@ -322,15 +322,29 @@ pub fn try_generate_with_bodies_and_css(
     } else {
         "w3cos_core::Value::Undefined".to_string()
     };
+    // `worker_threads`: a worker thread re-runs this entry in a fresh realm
+    // (`w3cos_core::node_workers`), so bundles with the worker glue hand the
+    // entry to the host.
+    let register_entry = if bundle.modules.iter().any(|module| {
+        module
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("internal__w3cos_worker.js"))
+    }) {
+        " w3cos_core::node_workers::register_entry(run_entry);"
+    } else {
+        ""
+    };
     if has_async_init {
         out.push_str(&format!(
             "fn __w3cos_run_entry_body() -> w3cos_core::Value {{ {entry_call} }}\n\
-             pub fn run_entry() -> w3cos_core::Value {{ run_entry_async() }}\n"
+             pub fn run_entry() -> w3cos_core::Value {{{register_entry} run_entry_async() }}\n"
         ));
     } else {
         out.push_str(&format!(
             "fn __w3cos_run_entry_body() -> w3cos_core::Value {{{init_calls} {entry_call} }}\n\
-             pub fn run_entry() -> w3cos_core::Value {{ register_styles();{register_calls} __w3cos_run_entry_body() }}\n"
+             pub fn run_entry() -> w3cos_core::Value {{{register_entry} register_styles();{register_calls} __w3cos_run_entry_body() }}\n"
         ));
     }
 

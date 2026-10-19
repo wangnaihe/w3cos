@@ -20,6 +20,12 @@ pub const MODULES: &[(&str, &str)] = &[
     ("fs/promises", "module.exports = require('fs').promises;\n"),
     // Shared poll loop for host-backed handles (child processes, sockets).
     ("internal/w3cos_poll", include_str!("../js/w3cos_poll.js")),
+    // Structured clone and worker boot for `worker_threads`.
+    ("internal/w3cos_clone", include_str!("../js/w3cos_clone.js")),
+    (
+        "internal/w3cos_worker",
+        include_str!("../js/w3cos_worker.js"),
+    ),
     ("net", include_str!("../js/net.js")),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),
@@ -37,6 +43,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("url", include_str!("../js/url.js")),
     ("util", include_str!("../js/util.js")),
     ("util/types", include_str!("../js/util_types.js")),
+    ("worker_threads", include_str!("../js/worker_threads.js")),
     ("zlib", include_str!("../js/zlib.js")),
 ];
 

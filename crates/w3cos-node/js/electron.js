@@ -704,6 +704,118 @@ class Menu extends EventEmitter {
   closePopup() { this.emit('menu-will-close'); }
 }
 
+// --- MessageChannelMain / utilityProcess -----------------------------------------
+// Ports carry structured clones between main-process code; a utility process
+// is an isolated worker thread (its own realm, `process.parentPort`) running a
+// module the compiler linked in (`utilityProcess.fork(path.join(__dirname,
+// 'child.js'))`). There is no second OS process: `pid` is this process's.
+
+const workerThreads = require('worker_threads');
+const structuredCodec = require('node:internal/w3cos_clone');
+
+class MessagePortMain extends EventEmitter {
+  constructor() {
+    super();
+    this._other = null;
+    this._queue = [];
+    this._started = false;
+    this._closed = false;
+    this._scheduled = false;
+  }
+  postMessage(message, transfer) {
+    if (Array.isArray(transfer) && transfer.length > 0) throw unsupported('Transferring MessagePortMain objects');
+    const data = structuredCodec.serialize(message);
+    const other = this._other;
+    if (this._closed || other === null || other._closed) return;
+    other._queue.push(data);
+    other._schedule();
+  }
+  _schedule() {
+    if (!this._started || this._scheduled || this._queue.length === 0) return;
+    this._scheduled = true;
+    task(() => {
+      this._scheduled = false;
+      if (!this._started || this._closed || this._queue.length === 0) return;
+      const data = structuredCodec.deserialize(this._queue.shift());
+      this.emit('message', { data, ports: [] });
+      this._schedule();
+    });
+  }
+  start() {
+    if (this._started || this._closed) return;
+    this._started = true;
+    this._schedule();
+  }
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    const other = this._other;
+    if (other !== null && !other._closed) {
+      other._closed = true;
+      task(() => other.emit('close'));
+    }
+  }
+}
+
+class MessageChannelMain {
+  constructor() {
+    this.port1 = new MessagePortMain();
+    this.port2 = new MessagePortMain();
+    this.port1._other = this.port2;
+    this.port2._other = this.port1;
+  }
+}
+
+const utilityChildren = new Set();
+
+class UtilityProcess extends EventEmitter {
+  constructor(modulePath, args, options) {
+    super();
+    const opts = options || {};
+    this.pid = undefined;
+    this.stdout = null;
+    this.stderr = null;
+    this._exited = false;
+    this._worker = new workerThreads.Worker(modulePath, {
+      workerData: { args: Array.isArray(args) ? args.map(String) : [], serviceName: opts.serviceName },
+      name: opts.serviceName,
+      w3cosKind: 'utility',
+    });
+    utilityChildren.add(this);
+    this._worker.on('online', () => {
+      this.pid = process.pid;
+      this.emit('spawn');
+    });
+    this._worker.on('message', (message) => this.emit('message', message));
+    this._worker.on('error', (error) => this.emit('error', 'FatalError', error && error.stack ? String(error.stack) : String(error)));
+    this._worker.on('exit', (code) => {
+      this._exited = true;
+      this.pid = undefined;
+      utilityChildren.delete(this);
+      this.emit('exit', code);
+    });
+  }
+  postMessage(message, transfer) {
+    if (Array.isArray(transfer) && transfer.length > 0) throw unsupported('Transferring MessagePortMain objects');
+    this._worker.postMessage(message);
+  }
+  kill() {
+    if (this._exited) return false;
+    this._worker.terminate();
+    return true;
+  }
+}
+
+const utilityProcess = {
+  fork(modulePath, args, options) {
+    return new UtilityProcess(String(modulePath), args, options);
+  },
+};
+
+app.on('quit', () => {
+  for (const child of Array.from(utilityChildren)) child.kill();
+});
+
 // --- nativeTheme -----------------------------------------------------------------
 
 const nativeTheme = new EventEmitter();
@@ -735,4 +847,7 @@ module.exports = {
   Menu,
   MenuItem,
   nativeTheme,
+  MessageChannelMain,
+  MessagePortMain,
+  utilityProcess,
 };

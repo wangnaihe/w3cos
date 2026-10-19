@@ -19476,6 +19476,13 @@ pub fn window_value() -> Value {
 }
 
 fn build_window_value() -> Value {
+    // `worker_threads` workers run this runtime's event loop on their own
+    // thread (see `w3cos_core::node_workers`).
+    w3cos_core::node_workers::register_event_loop(w3cos_core::node_workers::EventLoopHooks {
+        drain_microtasks,
+        tick_timers,
+        next_timer_deadline,
+    });
     let mut props: HashMap<String, Value> = HashMap::new();
 
     props.insert("document".to_string(), document_value());
