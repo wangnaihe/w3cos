@@ -8,6 +8,7 @@
 //! (border, padding, in-flow content, BFC root) is reached.  Width follows
 //! CSS2 10.3.3, height 10.6.3, min/max 10.4/10.7, collapsing 8.3.1.
 
+use super::Why;
 use super::exclusion::ExclusionSpace;
 use super::oof::{self, ContainingBlock, OofCandidate};
 use super::{BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStrut, inline};
@@ -194,7 +195,7 @@ fn float_group_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static st
     if unsupported_marker(style, &FLOAT_GROUP_MARKERS).is_some() {
         return Some("float-group:marker");
     }
-    let parent = info.parent?;
+    let parent = info.parent.why("float-parent")?;
     if inline::is_inline_container(flat, parent)
         || matches!(flat[parent].kind, ComponentKind::Text { .. })
         || is_float_group(flat[parent].style)
@@ -315,7 +316,7 @@ fn layout_float(
         ),
         None => {
             let available = space.available_inline - ml - mr - edges;
-            let sizes = intrinsic_sizes(flat, index, space)?;
+            let sizes = intrinsic_sizes(flat, index, space).why("float-intrinsic")?;
             let w = match sizes.min {
                 Some(min) => sizes.max.min(available.max(min)),
                 None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
@@ -324,7 +325,8 @@ fn layout_float(
             clamp_inline(style, space, edges, w.max(0.0))
         }
     };
-    let result = layout_block_sized(flat, index, space, true, Some((width, None)))?;
+    let result =
+        layout_block_sized(flat, index, space, true, Some((width, None))).why("float-layout")?;
     let margin_w = ml + result.fragment.width + mr;
     let margin_h = mt + result.fragment.height + mb;
     let (x, y) = exclusions.place_float(
@@ -785,7 +787,7 @@ pub(super) fn intrinsic_sizes(
                 BoxSizing::BorderBox => (w - edges).max(0.0),
                 BoxSizing::ContentBox => w,
             }),
-            None => intrinsic_sizes(flat, child, space)?,
+            None => intrinsic_sizes(flat, child, space).why("intrinsic")?,
         };
         sizes.encompass(content.map(|w| clamp_inline(style, space, edges, w) + edges + margins));
     }
@@ -814,7 +816,7 @@ fn shrink_to_fit(
     let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
     let available =
         space.available_inline - side(style.margin.left) - side(style.margin.right) - edges;
-    let sizes = intrinsic_sizes(flat, index, space)?;
+    let sizes = intrinsic_sizes(flat, index, space).why("shrink-intrinsic")?;
     let width = match sizes.min {
         Some(min) => sizes.max.min(available.max(min)),
         None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
@@ -848,7 +850,7 @@ pub(super) fn layout_root(
         forced_bfc: false,
         adjoining_from: 0,
     };
-    let result = layout_block(flat, 0, &space, true)?;
+    let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
         return super::bail("float-overlap");
     }
@@ -920,7 +922,7 @@ fn layout_block_in(
     if let Some((width, _)) = sized {
         metrics.content_width = width;
     } else if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
-        metrics.content_width = shrink_to_fit(flat, index, space, &metrics)?;
+        metrics.content_width = shrink_to_fit(flat, index, space, &metrics).why("shrink-to-fit")?;
     }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
@@ -1032,7 +1034,7 @@ fn layout_block_in(
             x: bfc_x + bl + pl,
             y: bfc_y + bt + pt,
         });
-        let result = inline::layout_inline_beside(flat, index, &child_space, floats)?;
+        let result = inline::layout_inline_beside(flat, index, &child_space, floats).why("ifc")?;
         cursor = result.height;
         last_baseline = result.last_baseline.offset(content_top);
         at_top = result.children.is_empty();
@@ -1109,7 +1111,8 @@ fn layout_block_in(
                     exclusions,
                     bfc_x + bl + pl,
                     block_start,
-                )?;
+                )
+                .why("float-layout")?;
                 let (dx, dy) = oof::relative_offset(float_style, &child_space);
                 let (fx, fy) = (fx - bfc_x + dx, fy - bfc_y + dy);
                 oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
@@ -1215,7 +1218,7 @@ fn layout_block_in(
         own_top.append(child_metrics.margin[0]);
         // (Clearance separating a first child from margins that would
         // collapse through us is not implemented.)
-        let (estimate, estimate_cleared) = place(own_top)?;
+        let (estimate, estimate_cleared) = place(own_top).why("place-estimate")?;
         let snapshot = exclusions.snapshot();
         let mut nested = child_space;
         nested.bfc_x = bfc_x + x;
@@ -1246,8 +1249,9 @@ fn layout_block_in(
             nested.forced_bfc = estimate_cleared;
             nested.adjoining_from = exclusions.len();
         }
-        let mut result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
-        let (mut resolved, mut cleared) = place(result.start_strut)?;
+        let mut result =
+            layout_block_in(flat, child, &nested, false, None, exclusions).why("child-layout")?;
+        let (mut resolved, mut cleared) = place(result.start_strut).why("place")?;
         let resolved_bfc = |resolved: f32, start: MarginStrut| {
             if at_top && can_escape_top {
                 collapsed_top(start)
@@ -1267,8 +1271,9 @@ fn layout_block_in(
             exclusions.restore(snapshot);
             nested.bfc_y = resolved_bfc(resolved, result.start_strut);
             nested.forced_bfc = resolved_forced;
-            result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
-            let (again, c) = place(result.start_strut)?;
+            result = layout_block_in(flat, child, &nested, false, None, exclusions)
+                .why("child-relayout")?;
+            let (again, c) = place(result.start_strut).why("place-relayout")?;
             if (again - resolved).abs() > 1.0 / 128.0 {
                 return super::bail("relayout-mismatch");
             }
@@ -1329,7 +1334,8 @@ fn layout_block_in(
                         false,
                         Some((content, None)),
                         exclusions,
-                    )?;
+                    )
+                    .why("bfc-root-fit")?;
                     if (fitted.fragment.height - height).abs() <= 1.0 / 128.0 {
                         found = Some((start, fitted));
                         break 'opportunities;
@@ -1337,9 +1343,11 @@ fn layout_block_in(
                     // A different height covers different floats: retry.
                     height = fitted.fragment.height;
                 }
-                top = exclusions.next_bottom(top, height)?;
+                top = exclusions
+                    .next_bottom(top, height)
+                    .why("bfc-root-no-opportunity")?;
             }
-            let (start, fitted) = found?;
+            let (start, fitted) = found.why("bfc-root-no-opportunity")?;
             if top > hypothetical + 1.0 / 128.0 {
                 if at_top && can_escape_top {
                     // The margins still collapse through us at the
@@ -1500,7 +1508,8 @@ fn layout_block_in(
             false,
             space.viewport_w,
             space.viewport_h,
-        )?;
+        )
+        .why("oof-resolve")?;
         children.extend(placed);
         oof_candidates = rest;
     }

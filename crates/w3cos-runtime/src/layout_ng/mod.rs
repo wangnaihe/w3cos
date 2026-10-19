@@ -188,6 +188,31 @@ pub(crate) fn bail<T>(reason: &'static str) -> Option<T> {
     None
 }
 
+/// Labels a `None` from a helper that has no reason of its own; a reason
+/// recorded deeper (`bail`) is kept.
+pub(crate) trait Why {
+    fn why(self, reason: &'static str) -> Self;
+}
+
+impl<T> Why for Option<T> {
+    #[inline]
+    fn why(self, reason: &'static str) -> Self {
+        if self.is_none() {
+            note(reason);
+        }
+        self
+    }
+}
+
+#[cold]
+fn note(reason: &'static str) {
+    RUNTIME_REASON.with(|r| {
+        if r.get().is_empty() {
+            r.set(reason);
+        }
+    });
+}
+
 /// Entry point used by `LayoutEngine::compute`.  Returns `None` when the tree
 /// is outside the supported stage, so the legacy engine runs.
 pub(crate) fn layout_tree(

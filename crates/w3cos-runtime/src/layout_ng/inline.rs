@@ -25,6 +25,7 @@
 //! leaf, or the single `text-line-width` leaf of an IFC) is wrapped by paint
 //! inside its rect, so its height comes from the same wrapper paint uses.
 
+use super::Why;
 use super::block::MinMax;
 use super::{BoxFragment, ConstraintSpace, LastBaseline};
 use crate::layout::{
@@ -172,7 +173,7 @@ fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style
     if style.align_self != w3cos_std::style::AlignSelf::Center {
         return Some(0.0);
     }
-    let x_height = x_height(parent)?;
+    let x_height = x_height(parent).why("x-height")?;
     let half = w3cos_std::style::used_box_spacing((ascent - descent) / 2.0);
     Some(half - (x_height / 2.0 * 64.0).round() / 64.0)
 }
@@ -1525,7 +1526,8 @@ pub(super) fn layout_inline_beside(
             let k = start;
             let child = children[k];
             let style = flat[child].style;
-            let result = super::block::layout_block(flat, child, space, true)?;
+            let result =
+                super::block::layout_block(flat, child, space, true).why("atomic-layout")?;
             if !result.oof.is_empty() {
                 // (Out-of-flow descendants carried through a line box.)
                 return super::bail("inline-oof");
@@ -1557,7 +1559,8 @@ pub(super) fn layout_inline_beside(
             let box_end = end_edges(&closes[k]);
             let raw = margin[3] + result.fragment.width + margin[1] + box_start + box_end;
             let parent = parents[k].map_or(container, |b| flat[b].style);
-            let shift = vertical_align_shift(style, ascent, height - ascent, parent)?;
+            let shift = vertical_align_shift(style, ascent, height - ascent, parent)
+                .why("vertical-align")?;
             items.push(InlineItem {
                 index: child,
                 raw,
@@ -1642,7 +1645,8 @@ pub(super) fn layout_inline_beside(
             let raw = text_raw + inline_edges + box_start + box_end;
             let (height, baseline) = text_line_metrics(content, style);
             let parent = parents[k].map_or(container, |b| flat[b].style);
-            let shift = vertical_align_shift(style, baseline, height - baseline, parent)?;
+            let shift = vertical_align_shift(style, baseline, height - baseline, parent)
+                .why("vertical-align")?;
             items.push(InlineItem {
                 index: child,
                 raw,
@@ -1743,8 +1747,10 @@ pub(super) fn layout_inline_beside(
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
             // Not even the first piece fits beside the floats: the line
             // moves down to where the band widens.
-            let f = floats?;
-            line_top = f.next_offset(line_top, assumed_line)?;
+            let f = floats.why("line-opportunity")?;
+            line_top = f
+                .next_offset(line_top, assumed_line)
+                .why("line-opportunity")?;
             opportunity = f.opportunity(line_top, assumed_line, space.available_inline);
             continue;
         }
@@ -1997,7 +2003,11 @@ pub(super) fn layout_inline_beside(
             let baseline = match item.aligned {
                 None => baseline,
                 Some((root, _)) => {
-                    let &(_, top_aligned, a, d) = line.subtrees.iter().find(|s| s.0 == root)?;
+                    let &(_, top_aligned, a, d) = line
+                        .subtrees
+                        .iter()
+                        .find(|s| s.0 == root)
+                        .why("line-subtree")?;
                     if top_aligned {
                         top + a
                     } else {
@@ -2057,7 +2067,7 @@ pub(super) fn layout_inline_beside(
             std::collections::HashMap::new();
         for (k, boxes) in opens.iter().enumerate() {
             for (pos, &b) in boxes.iter().enumerate() {
-                let (line, x, _, baseline) = placed[k]?;
+                let (line, x, _, baseline) = placed[k].why("inline-box-placement")?;
                 let start =
                     x + start_edges(&boxes[..pos]) + InlineEdges::of(flat[b].style).margin_start;
                 starts.insert(b, (line, start, baseline));
@@ -2065,8 +2075,9 @@ pub(super) fn layout_inline_beside(
         }
         for (k, boxes) in closes.iter().enumerate() {
             for (pos, &b) in boxes.iter().enumerate() {
-                let (line, x, width, _) = placed[k]?;
-                let (start_line, start, baseline) = starts.get(&b).copied()?;
+                let (line, x, width, _) = placed[k].why("inline-box-placement")?;
+                let (start_line, start, baseline) =
+                    starts.get(&b).copied().why("inline-box-placement")?;
                 if start_line != line {
                     return super::bail("split-box-line");
                 }
@@ -2149,7 +2160,7 @@ pub(super) fn inline_min_max(
         )
         .map(|result| result.max_line_width)
     };
-    let max = at(super::block::INDEFINITE_INLINE)?;
+    let max = at(super::block::INDEFINITE_INLINE).why("inline-intrinsic")?;
     Some(MinMax {
         min: at(0.0).map(|min| min.min(max)),
         max,
