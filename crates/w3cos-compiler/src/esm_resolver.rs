@@ -1083,6 +1083,11 @@ impl EsmResolver {
             for specifier in collect_dynamic_import_literals(&source) {
                 self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
             }
+            // Code-OSS workbench: `new URL(\`vs/workbench/....js\`, baseUrl)` then
+            // `import(workbenchUrl)` — seed the URL's JS path as a lazy module.
+            for specifier in collect_new_url_js_literals(&source) {
+                self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
+            }
         }
 
         Ok(())
@@ -1108,13 +1113,16 @@ impl EsmResolver {
         }
         let resolved = match self.resolve(specifier, from_dir) {
             Ok(resolved) => resolved,
-            Err(error) => {
-                self.commonjs_diagnostics.borrow_mut().push(format!(
-                    "{}: import('{specifier}') does not resolve: {error}",
-                    referrer.display()
-                ));
-                return;
-            }
+            Err(error) => match self.resolve_out_rooted_url(specifier, referrer) {
+                Some(resolved) => resolved,
+                None => {
+                    self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: import('{specifier}') does not resolve: {error}",
+                        referrer.display()
+                    ));
+                    return;
+                }
+            },
         };
         let target = resolved.path.clone();
         let nodes_before = graph.nodes.len();
@@ -1133,6 +1141,33 @@ impl EsmResolver {
             specifier: specifier.to_string(),
             target,
         });
+    }
+
+    /// Resolve a path-like specifier (e.g. `vs/workbench/workbench.desktop.main.js`)
+    /// against `<project>/out/` when the referrer lives under that tree. Used for
+    /// Code-OSS `new URL(path, vscode-file://…/out/)` seeds.
+    fn resolve_out_rooted_url(&self, specifier: &str, referrer: &Path) -> Option<ResolvedModule> {
+        if specifier.starts_with('.')
+            || specifier.starts_with('/')
+            || specifier.starts_with("node:")
+            || specifier.contains("://")
+            || !specifier.contains('/')
+        {
+            return None;
+        }
+        let out_root = self.project_root.join("out");
+        if !referrer.starts_with(&out_root) {
+            return None;
+        }
+        let candidate = out_root.join(specifier);
+        let path = self.resolve_path_like(&candidate).ok()?;
+        let path = self.prefer_transpiled_out(&path);
+        Some(ResolvedModule {
+            specifier: specifier.to_string(),
+            path,
+            kind: ModuleKind::Relative,
+            package_name: None,
+        })
     }
 
     /// Literal dynamic-import edges of the last built graph.
@@ -1864,6 +1899,94 @@ pub fn collect_dynamic_import_literals(source: &str) -> Vec<String> {
                     found.push(specifier);
                 }
                 index = after;
+            }
+            _ => index += 1,
+        }
+    }
+    found
+}
+
+/// Collect JS module paths from `new URL("….js", base)` / `new URL('….js', base)` /
+/// `` new URL(`….js`, base) `` (no `${…}` interpolations). Code-OSS builds the
+/// workbench entry as `new URL(\`vs/workbench/workbench.desktop.main.js\`, baseUrl)`
+/// then `import(workbenchUrl)`; seeding those paths links the renderer graph.
+pub fn collect_new_url_js_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut found: Vec<String> = Vec::new();
+    let mut index = 0;
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'n' if bytes[index..].starts_with(b"new")
+                && (index == 0 || !is_ident(bytes[index - 1]))
+                && !bytes.get(index + 3).copied().is_some_and(is_ident) =>
+            {
+                let mut cursor = index + 3;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if !bytes[cursor..].starts_with(b"URL")
+                    || bytes.get(cursor + 3).copied().is_some_and(is_ident)
+                {
+                    index += 1;
+                    continue;
+                }
+                cursor += 3;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'(') {
+                    index += 1;
+                    continue;
+                }
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                let Some(&quote @ (b'\'' | b'"' | b'`')) = bytes.get(cursor) else {
+                    index += 1;
+                    continue;
+                };
+                let start = cursor + 1;
+                let end_rel = match bytes[start..].iter().position(|&b| b == quote) {
+                    Some(n) => n,
+                    None => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                let lit = &source[start..start + end_rel];
+                // Skip template interpolations and non-JS assets (css, etc.).
+                if !lit.contains("${")
+                    && (lit.ends_with(".js") || lit.ends_with(".mjs") || lit.ends_with(".cjs"))
+                    && !found.contains(&lit.to_string())
+                {
+                    found.push(lit.to_string());
+                }
+                index = start + end_rel + 1;
             }
             _ => index += 1,
         }
@@ -3323,6 +3446,25 @@ export function main() {{ bump(); return value + plugin.value; }}"#
 
         assert!(!resolver.is_in_type_module_scope(&src.join("main.js")));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn collect_new_url_js_literals_picks_js_paths() {
+        let source = r#"
+const baseUrl = new URL(`${root}/out/`);
+const workbenchUrl = new URL(`vs/workbench/workbench.desktop.main.js`, baseUrl).href;
+const cssUrl = new URL("skin.css", baseUrl).href;
+const other = new URL("./lazy.js", import.meta.url);
+const skip = new URL(`vs/${name}.js`, baseUrl);
+import("./literal.js");
+"#;
+        assert_eq!(
+            collect_new_url_js_literals(source),
+            vec![
+                "vs/workbench/workbench.desktop.main.js".to_string(),
+                "./lazy.js".to_string(),
+            ]
+        );
     }
 
     #[test]
