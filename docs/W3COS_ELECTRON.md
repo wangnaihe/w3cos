@@ -79,6 +79,60 @@ output with Electron 44.9.0. Version numbers are normalized:
 is the API level the adapter is tested against (44.9.0), and there is no
 `process.versions.chrome`.
 
+## Platform services: protocol, nativeTheme, screen, safeStorage
+
+These are the main-process services Code-OSS needs before it can show its
+workbench (roadmap M3 item 21).
+
+- **`protocol` / `net` / `session`.** Code-OSS registers `vscode-file` as a
+  privileged scheme and serves the workbench from
+  `vscode-file://vscode-app/<absolute path>`. Handlers run in-process.
+  `protocol.handle(scheme, handler)` takes a Request and returns a Response,
+  usually `net.fetch('file://…')`. `registerFileProtocol` /
+  `interceptFileProtocol` take the legacy `callback({ path })` form.
+  `loadURL()` of a handled scheme asks the handler which file backs the URL
+  and shows that compiled page; `getURL()` keeps the `vscode-file://` URL.
+  `net.fetch()` and renderer `fetch()` of a privileged scheme with
+  `supportFetchAPI` go through the handler too. A Response that did not
+  come from a file (for example a 403 from the handler) cannot become a
+  page, because pages are compiled in, so that load fails `ERR_FAILED`.
+  Registering a scheme twice, or a built-in scheme, throws
+  `Failed to register protocol: <scheme>`, as Electron does.
+  `registerSchemesAsPrivileged` must run before `ready`.
+  `session.defaultSession` (also `webContents.session`) carries `protocol`,
+  `fetch` and no-op cache, proxy and permission hooks.
+- **`nativeTheme`.** `themeSource` accepts `system` / `light` / `dark` and
+  rejects other values with Electron's conversion `TypeError`.
+  `shouldUseDarkColors` follows the source, or `prefers-color-scheme` for
+  `system`. Changes made within one turn emit a single `updated` event.
+  High-contrast, inverted, forced-colors and reduced-transparency report
+  `false`.
+- **`screen`.** One display: the surface the window system gives the app
+  (`window.screen`, `devicePixelRatio`). It has Electron's full `Display`
+  shape (bounds, workArea, size, scaleFactor, rotation, …).
+  `getDisplayNearestPoint` / `getDisplayMatching` return that display, and
+  `getCursorScreenPoint` is the last pointer position. Like Electron, the
+  module throws when used before `ready`.
+- **`safeStorage`.** Uses the runtime's local keyring instead of the OS
+  keychain, libsecret or kwallet, so encryption is always available, works
+  offline, and the secret never leaves the machine
+  (`w3cos-runtime/src/node_safe_storage.rs`). Blobs are sealed with
+  AES-256-GCM: a `w3c1` prefix, a random nonce, then the ciphertext and
+  tag. The key is 32 random bytes in `<keyring>/safe-storage.key`, file mode
+  0600 inside a 0700 directory, created on first use. `<keyring>` is
+  `$W3COS_KEYRING_DIR`, otherwise `$XDG_DATA_HOME/w3cos/keyring`.
+  `getSelectedStorageBackend()` is `w3cos_keyring`.
+  `setUsePlainTextEncryption` is a no-op. Errors match Electron's messages:
+  a non-Buffer argument, data that is not a w3cos blob ("does not appear to
+  be encrypted"), or a tampered blob ("Decryption failed."). Blobs written
+  by Electron's own backends cannot be read.
+
+The CI test compiles `examples/electron-platform` and compares its output
+line for line with Electron 44.9.0, run under xvfb with the Linux
+`basic_text` backend (`password-store=basic` plus
+`setUsePlainTextEncryption(true)`). The test uses a throwaway
+`W3COS_KEYRING_DIR`.
+
 ## Known gaps
 
 - One renderer realm per process. A second `BrowserWindow` exists (ids,
@@ -96,7 +150,9 @@ is the API level the adapter is tested against (44.9.0), and there is no
   tracked but do not resize or hide the native window yet; the w3cos window
   keeps the shell viewport size.
 - `Menu` / `MenuItem` keep the model only (no native menu bar);
-  `nativeTheme.shouldUseDarkColors` reads `prefers-color-scheme`.
-- Not provided yet: `utilityProcess`, `MessageChannelMain`, `protocol`,
-  `session`/`net`, `clipboard`, `screen`, `Tray`, `safeStorage`,
-  `autoUpdater`, `crashReporter`.
+  `nativeTheme.themeSource` does not yet override the renderer's
+  `prefers-color-scheme`.
+- `screen` reports one display and emits no `display-*` events yet.
+- `net.fetch` of http(s) uses the runtime's `fetch`; `session.webRequest`
+  hooks are accepted but never called.
+- Not provided yet: `clipboard`, `Tray`, `autoUpdater`, `crashReporter`.
