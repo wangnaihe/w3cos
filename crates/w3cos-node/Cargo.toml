@@ -1,0 +1,8 @@
+[package]
+name = "w3cos-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Node.js builtin modules for W3C OS AOT apps (JS glue compiled with the app)"
+
+[dependencies]
