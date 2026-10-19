@@ -245,6 +245,28 @@ pub fn try_generate_with_bodies_and_css(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
 ) -> Result<String, EsmCodegenError> {
+    let parts = generate_parts(bundle, css_rules)?;
+    let mut out = parts.header;
+    for (_, code) in &parts.modules {
+        out.push_str(code);
+        out.push('\n');
+    }
+    out.push_str(&parts.tail);
+    Ok(out)
+}
+
+/// Generated bundle pieces: a header, one `mod mN { … }` per ESM module (in
+/// bundle order, keyed by namespace) and the entry/registration tail.
+struct GeneratedParts {
+    header: String,
+    modules: Vec<(String, String)>,
+    tail: String,
+}
+
+fn generate_parts(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+) -> Result<GeneratedParts, EsmCodegenError> {
     let mut out = String::new();
     // Generated bundles intentionally use source-shaped JS identifiers and
     // mutable temporaries; suppressing those mechanical Rust warnings keeps
@@ -257,15 +279,16 @@ pub fn try_generate_with_bodies_and_css(
         bundle.symbols.len()
     ));
 
+    let header = std::mem::take(&mut out);
     let mut parse_cache = ModuleParseCache::default();
     let mut async_init_namespaces = HashSet::new();
+    let mut modules = Vec::with_capacity(bundle.modules.len());
     for module in &bundle.modules {
         let generated = generate_module_with_bodies(bundle, module, &mut parse_cache)?;
         if generated.has_async_init {
             async_init_namespaces.insert(module.namespace.clone());
         }
-        out.push_str(&generated.code);
-        out.push('\n');
+        modules.push((module.namespace.clone(), generated.code));
     }
     let has_async_init = !async_init_namespaces.is_empty();
 
@@ -401,7 +424,220 @@ pub fn try_generate_with_bodies_and_css(
         ));
     }
 
-    Ok(out)
+    Ok(GeneratedParts {
+        header,
+        modules,
+        tail: out,
+    })
+}
+
+/// One generated library crate holding a contiguous run of ESM modules.
+#[derive(Debug, Clone)]
+pub struct SplitSegment {
+    /// Crate name, e.g. `w3cos_seg_3`.
+    pub name: String,
+    /// Names of earlier segment crates this one references.
+    pub deps: Vec<String>,
+    /// `lib.rs` source.
+    pub code: String,
+    /// Module namespaces (`mN`) it defines.
+    pub modules: Vec<String>,
+}
+
+/// A bundle split across several crates so Code-OSS scale graphs stay
+/// buildable: rustc's front end is largely serial per crate, and one
+/// multi-GB crate does not fit in memory. Segments are contiguous runs of
+/// the module reference graph's strongly connected components in
+/// dependency-first order, so crate dependencies are acyclic; references
+/// keep their `super::mN::` spelling because each segment root imports
+/// every foreign module it uses.
+#[derive(Debug, Clone)]
+pub struct SplitBundle {
+    pub segments: Vec<SplitSegment>,
+    /// Source of the root module (`esm_bundle.rs`): re-exports every
+    /// module and holds `run_entry` / registration / dynamic import glue.
+    pub root: String,
+}
+
+fn module_references(code: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let bytes = code.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = code[from..].find("super::m") {
+        let start = from + offset + "super::".len();
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start + 1 && code[end..].starts_with("::") {
+            found.push(&code[start..end]);
+        }
+        from = end;
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Tarjan SCCs over `edges` (index lists), emitted dependencies-first.
+fn strongly_connected_components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let count = edges.len();
+    let mut index = vec![usize::MAX; count];
+    let mut low = vec![0usize; count];
+    let mut on_stack = vec![false; count];
+    let mut stack = Vec::new();
+    let mut components = Vec::new();
+    let mut next = 0usize;
+    for root in 0..count {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(top) = work.last_mut() {
+            let node = top.0;
+            if top.1 < edges[node].len() {
+                let target = edges[node][top.1];
+                top.1 += 1;
+                if index[target] == usize::MAX {
+                    index[target] = next;
+                    low[target] = next;
+                    next += 1;
+                    stack.push(target);
+                    on_stack[target] = true;
+                    work.push((target, 0));
+                } else if on_stack[target] {
+                    low[node] = low[node].min(index[target]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                components.push(component);
+            }
+        }
+    }
+    components
+}
+
+/// Generate a bundle split into library crates of roughly `segment_bytes`
+/// of Rust source each (a module or reference cycle is never divided).
+pub fn try_generate_split_with_bodies_and_css(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+    segment_bytes: usize,
+) -> Result<SplitBundle, EsmCodegenError> {
+    let parts = generate_parts(bundle, css_rules)?;
+    Ok(split_parts(parts, segment_bytes))
+}
+
+fn split_parts(parts: GeneratedParts, segment_bytes: usize) -> SplitBundle {
+    let position: HashMap<&str, usize> = parts
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, (namespace, _))| (namespace.as_str(), index))
+        .collect();
+    let edges: Vec<Vec<usize>> = parts
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, (_, code))| {
+            module_references(code)
+                .into_iter()
+                .filter_map(|namespace| position.get(namespace).copied())
+                .filter(|target| *target != index)
+                .collect()
+        })
+        .collect();
+    let mut segment_of = vec![0usize; parts.modules.len()];
+    let mut members: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut size = 0usize;
+    for component in strongly_connected_components(&edges) {
+        let bytes: usize = component.iter().map(|&m| parts.modules[m].1.len()).sum();
+        if size > 0 && size + bytes > segment_bytes.max(1) {
+            members.push(Vec::new());
+            size = 0;
+        }
+        size += bytes;
+        let segment = members.len() - 1;
+        for module in component {
+            segment_of[module] = segment;
+            members.last_mut().expect("segment").push(module);
+        }
+    }
+    let segment_name = |segment: usize| format!("w3cos_seg_{segment}");
+    let mut segments = Vec::with_capacity(members.len());
+    for (segment, modules) in members.iter().enumerate() {
+        let mut imports = std::collections::BTreeSet::new();
+        let mut deps = std::collections::BTreeSet::new();
+        for &module in modules {
+            for &target in &edges[module] {
+                let target_segment = segment_of[target];
+                if target_segment != segment {
+                    debug_assert!(
+                        target_segment < segment,
+                        "segment order is dependency-first"
+                    );
+                    deps.insert(target_segment);
+                    imports.insert((target_segment, target));
+                }
+            }
+        }
+        let mut code = String::from(
+            "#![allow(warnings)]\n// Generated by w3cos esm_codegen (split segment)\n",
+        );
+        for (target_segment, target) in &imports {
+            code.push_str(&format!(
+                "use {}::{};\n",
+                segment_name(*target_segment),
+                parts.modules[*target].0
+            ));
+        }
+        for &module in modules {
+            let (namespace, module_code) = &parts.modules[module];
+            code.push_str(&module_code.replacen(
+                &format!("\nmod {namespace} {{"),
+                &format!("\npub mod {namespace} {{"),
+                1,
+            ));
+            code.push('\n');
+        }
+        segments.push(SplitSegment {
+            name: segment_name(segment),
+            deps: deps.into_iter().map(segment_name).collect(),
+            code,
+            modules: modules
+                .iter()
+                .map(|&m| parts.modules[m].0.clone())
+                .collect(),
+        });
+    }
+    let mut root = parts.header;
+    for (index, (namespace, _)) in parts.modules.iter().enumerate() {
+        root.push_str(&format!(
+            "pub use {}::{namespace};\n",
+            segment_name(segment_of[index])
+        ));
+    }
+    root.push_str(&parts.tail);
+    SplitBundle { segments, root }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,7 +861,10 @@ fn generate_module_with_bodies(
                         owner.namespace, bundled, local
                     ));
                 }
-            } else if sym.kind == SymbolKind::Function {
+            } else if sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Variable {
+                // Function declarations and function-shaped variables
+                // (`const f = () => …`, lowered as native functions) both
+                // expose `{bundled}_value`; captures read it by local name.
                 let local = sanitize_ident(local);
                 if emitted_uses.insert(local.clone()) {
                     out.push_str(&format!(
@@ -3421,6 +3660,66 @@ fn emit_class(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_parts_keeps_cycles_together_and_orders_dependencies_first() {
+        let module = |namespace: &str, refs: &[&str]| {
+            let body = refs
+                .iter()
+                .map(|r| format!("    pub use super::{r}::{r}_x;\n"))
+                .collect::<String>();
+            (
+                namespace.to_string(),
+                format!(
+                    "/// ESM module: /{namespace}.js\nmod {namespace} {{\n{body}    pub fn {namespace}_x() {{}}\n}}\n"
+                ),
+            )
+        };
+        let parts = GeneratedParts {
+            header: "#![allow(warnings)]\n".into(),
+            // m0 -> m1 <-> m2 -> m3
+            modules: vec![
+                module("m0", &["m1"]),
+                module("m1", &["m2"]),
+                module("m2", &["m1", "m3"]),
+                module("m3", &[]),
+            ],
+            tail: "pub fn run_entry() {}\n".into(),
+        };
+        let split = split_parts(parts, 1);
+        let segment_of = |namespace: &str| {
+            split
+                .segments
+                .iter()
+                .position(|segment| segment.modules.iter().any(|m| m == namespace))
+                .unwrap()
+        };
+        assert_eq!(
+            segment_of("m1"),
+            segment_of("m2"),
+            "a cycle is never divided"
+        );
+        assert!(segment_of("m3") < segment_of("m2"));
+        assert!(segment_of("m2") < segment_of("m0"));
+        for segment in &split.segments {
+            for dep in &segment.deps {
+                let index: usize = dep.trim_start_matches("w3cos_seg_").parse().unwrap();
+                assert!(index < segment_of(&segment.modules[0]));
+            }
+            assert!(segment.code.contains("\npub mod "));
+        }
+        let m0 = &split.segments[segment_of("m0")];
+        assert!(
+            m0.code
+                .contains(&format!("use w3cos_seg_{}::m1;", segment_of("m1")))
+        );
+        assert!(
+            split
+                .root
+                .contains(&format!("pub use w3cos_seg_{}::m3;", segment_of("m3")))
+        );
+        assert!(split.root.ends_with("pub fn run_entry() {}\n"));
+    }
+
     use super::*;
     use crate::esm_resolver::EsmResolver;
     use std::path::PathBuf;
@@ -5605,7 +5904,8 @@ export function makeCycles(n: number): number {
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("w3cos_core::weak::weak_capture_getter"),
+            code.contains("w3cos_core::weak::weak_capture_getter")
+                || code.contains("w3cos_core::aot_frame::nest_capture_weak("),
             "holder.run is a unique back-edge:\n{code}"
         );
 
@@ -10401,7 +10701,8 @@ export function main() { return total; }"#,
         assert!(
             code.contains("__init_w3ir_0(")
                 && !code.contains("__init_w3ir_1(")
-                && code.contains("capture_getters.get")
+                && (code.contains("capture_getters.get")
+                    || code.contains("aot_frame::load(&self.capture_getters"))
                 && !code.contains("W3IR module-init chunk"),
             "module-init closure must compile through W3IR: {code}"
         );
@@ -10536,14 +10837,14 @@ export function main() {
         );
         let code = generate_with_bodies(&bundle);
         assert_eq!(
-            code.matches("struct M0InitW3ir0Frame").count(),
+            code.matches("struct M0U2InitW3ir0Frame").count(),
             1,
             "the first bounded segment should produce one W3IR AOT frame"
         );
         assert!(
-            code.matches("struct M0InitW3ir32Frame").count() == 1
-                && code.matches("struct M0InitW3ir64Frame").count() == 1
-                && !code.contains("struct M0InitW3ir65Frame")
+            code.matches("struct M0U2InitW3ir32Frame").count() == 1
+                && code.matches("struct M0U2InitW3ir64Frame").count() == 1
+                && !code.contains("struct M0U2InitW3ir65Frame")
                 && code.matches("m0__init_w3ir_0(").count() == 2
                 && code.matches("m0__init_w3ir_32(").count() == 2
                 && code.matches("m0__init_w3ir_64(").count() == 2
