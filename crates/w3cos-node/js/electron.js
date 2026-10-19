@@ -243,7 +243,7 @@ class WebContents extends EventEmitter {
     this._loading = false;
     this._destroyed = false;
     this._windowOpenHandler = null;
-    this.session = { clearCache() { return Promise.resolve(); }, setPermissionRequestHandler() {} };
+    this.session = session.defaultSession;
   }
   getURL() { return this._url; }
   getTitle() {
@@ -271,6 +271,14 @@ class WebContents extends EventEmitter {
     if (href.startsWith('file://')) {
       const file = decodeURIComponent(href.slice('file://'.length).split(/[?#]/)[0]);
       return this._load(href, path.relative(assets.root, file));
+    }
+    if (protocolHandlers.has(schemeOf(href))) {
+      // e.g. Code-OSS's `vscode-file://vscode-app/<path>/workbench.html`: the
+      // handler decides which file backs the page.
+      return protocolFile(href).then(
+        (file) => this._load(href, file === null ? null : path.relative(assets.root, file)),
+        () => this._load(href, null),
+      );
     }
     return this._load(href, null);
   }
@@ -816,16 +824,360 @@ app.on('quit', () => {
   for (const child of Array.from(utilityChildren)) child.kill();
 });
 
-// --- nativeTheme -----------------------------------------------------------------
+// --- protocol / net ---------------------------------------------------------------
+//
+// Code-OSS serves its workbench and resources from `vscode-file://vscode-app/
+// <absolute path>` through a protocol handler. Handlers run in-process: a
+// `protocol.handle()` handler gets a Request and returns a Response (usually
+// `net.fetch()` of a file:// URL); `loadURL()` of a handled scheme shows the
+// compiled page for the file the handler resolved to, and `net.fetch()` /
+// renderer `fetch()` of a privileged scheme go through the handler too.
 
-const nativeTheme = new EventEmitter();
-nativeTheme.themeSource = 'system';
-Object.defineProperty(nativeTheme, 'shouldUseDarkColors', {
-  get() {
-    if (nativeTheme.themeSource !== 'system') return nativeTheme.themeSource === 'dark';
-    return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches === true;
+const fs = require('fs');
+const { fileURLToPath, pathToFileURL } = require('url');
+
+const BUILTIN_SCHEMES = ['http', 'https', 'file', 'ws', 'wss', 'data', 'blob', 'about', 'javascript'];
+const protocolHandlers = new Map();
+const fileInterceptors = new Map();
+const privilegedSchemes = new Map();
+// Responses produced by `net.fetch(file://...)`, to the file they read.
+const responseFiles = new WeakMap();
+
+function schemeOf(href) {
+  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(String(href));
+  return match ? match[1].toLowerCase() : '';
+}
+
+function netError(code) {
+  const error = new TypeError('net::' + code);
+  error.code = code;
+  return error;
+}
+
+function makeRequest(href, init) {
+  const options = init || {};
+  if (typeof Request === 'function') {
+    try { return new Request(href, options); } catch (_) { /* fall back below */ }
+  }
+  return {
+    url: href,
+    method: String(options.method || 'GET').toUpperCase(),
+    headers: options.headers || {},
+    body: options.body === undefined ? null : options.body,
+  };
+}
+
+function makeResponse(body, init) {
+  if (typeof Response === 'function') return new Response(body, init);
+  const bytes = body === null || body === undefined ? Buffer.alloc(0) : Buffer.from(body);
+  const status = init && init.status !== undefined ? init.status : 200;
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    statusText: (init && init.statusText) || '',
+    headers: (init && init.headers) || {},
+    text() { return Promise.resolve(bytes.toString('utf8')); },
+    json() { return Promise.resolve(JSON.parse(bytes.toString('utf8'))); },
+    arrayBuffer() { return Promise.resolve(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length)); },
+  };
+}
+
+function fetchFile(href) {
+  let file;
+  try { file = fileURLToPath(href); } catch (_) { return Promise.reject(netError('ERR_INVALID_URL')); }
+  return fs.promises.readFile(file).then(
+    (data) => {
+      const response = makeResponse(data, { status: 200 });
+      responseFiles.set(response, file);
+      return response;
+    },
+    () => Promise.reject(netError('ERR_FILE_NOT_FOUND')),
+  );
+}
+
+// A legacy (`registerFileProtocol` / `interceptFileProtocol`) handler as a
+// Request -> Response handler.
+function fileProtocolHandler(handler) {
+  return (request) => new Promise((resolve, reject) => {
+    handler(request, (result) => {
+      const target = typeof result === 'string' ? result : (result && result.path);
+      if (typeof target !== 'string' || target === '') {
+        reject(netError('ERR_FILE_NOT_FOUND'));
+        return;
+      }
+      fetchFile(pathToFileURL(target).href).then(resolve, reject);
+    });
+  });
+}
+
+function runHandler(handler, href, init) {
+  return Promise.resolve()
+    .then(() => handler(makeRequest(href, init)))
+    .then((response) => {
+      if (response === null || response === undefined) throw netError('ERR_FAILED');
+      return response;
+    });
+}
+
+const net = {
+  fetch(input, init) {
+    const href = typeof input === 'string' ? input : String(input && input.url !== undefined ? input.url : input);
+    const scheme = schemeOf(href);
+    const bypass = init && init.bypassCustomProtocolHandlers;
+    const handler = bypass ? undefined : (scheme === 'file' ? fileInterceptors.get('file') : protocolHandlers.get(scheme));
+    if (handler) return runHandler(handler, href, init);
+    if (scheme === 'file') return fetchFile(href);
+    if (typeof originalFetch === 'function') return originalFetch(href, init);
+    return Promise.reject(netError('ERR_UNKNOWN_URL_SCHEME'));
   },
-});
+  isOnline() { return true; },
+  get online() { return true; },
+};
+
+// Which file a URL of a handled scheme resolves to (null: not a file).
+function protocolFile(href) {
+  return net.fetch(href).then((response) => {
+    const file = responseFiles.get(response);
+    return file === undefined ? null : file;
+  });
+}
+
+// Renderer `fetch()` of a privileged custom scheme goes through its handler.
+const originalFetch = typeof fetch === 'function' ? fetch : undefined;
+if (originalFetch !== undefined) {
+  globalThis.fetch = function fetch(input, init) {
+    const href = typeof input === 'string' ? input : String(input && input.url !== undefined ? input.url : input);
+    const scheme = schemeOf(href);
+    const privileges = privilegedSchemes.get(scheme);
+    if (protocolHandlers.has(scheme) && privileges && privileges.supportFetchAPI) return net.fetch(href, init);
+    return originalFetch(input, init);
+  };
+}
+
+function registerHandler(map, scheme, handler, verb) {
+  const name = String(scheme);
+  if (map.has(name) || (map === protocolHandlers && BUILTIN_SCHEMES.indexOf(name) >= 0)) {
+    if (verb === 'boolean') return false;
+    throw new Error('Failed to register protocol: ' + name);
+  }
+  map.set(name, handler);
+  return verb === 'boolean' ? true : undefined;
+}
+
+const protocol = {
+  registerSchemesAsPrivileged(schemes) {
+    if (app._ready) {
+      throw new Error('protocol.registerSchemesAsPrivileged should be called before app is ready');
+    }
+    for (const entry of schemes || []) {
+      privilegedSchemes.set(String(entry.scheme), Object.assign({}, entry.privileges || {}));
+    }
+  },
+  handle(scheme, handler) { registerHandler(protocolHandlers, scheme, handler, 'throw'); },
+  unhandle(scheme) {
+    if (!protocolHandlers.delete(String(scheme))) throw new Error('Failed to unregister protocol: ' + scheme);
+  },
+  isProtocolHandled(scheme) { return protocolHandlers.has(String(scheme)); },
+  registerFileProtocol(scheme, handler) {
+    return registerHandler(protocolHandlers, scheme, fileProtocolHandler(handler), 'boolean');
+  },
+  unregisterProtocol(scheme) { return protocolHandlers.delete(String(scheme)); },
+  isProtocolRegistered(scheme) { return protocolHandlers.has(String(scheme)); },
+  interceptFileProtocol(scheme, handler) {
+    return registerHandler(fileInterceptors, scheme, fileProtocolHandler(handler), 'boolean');
+  },
+  uninterceptProtocol(scheme) { return fileInterceptors.delete(String(scheme)); },
+  isProtocolIntercepted(scheme) { return fileInterceptors.has(String(scheme)); },
+};
+
+const session = {
+  defaultSession: {
+    protocol,
+    fetch: net.fetch,
+    clearCache() { return Promise.resolve(); },
+    clearStorageData() { return Promise.resolve(); },
+    setPermissionRequestHandler() {},
+    setPermissionCheckHandler() {},
+    setProxy() { return Promise.resolve(); },
+    resolveProxy() { return Promise.resolve('DIRECT'); },
+    getUserAgent() { return typeof navigator === 'object' && navigator !== null ? String(navigator.userAgent) : ''; },
+    setUserAgent() {},
+    webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+  },
+  fromPartition() { return session.defaultSession; },
+};
+
+// --- nativeTheme ------------------------------------------------------------------
+
+const THEME_SOURCES = ['system', 'light', 'dark'];
+
+function conversionFailure(value) {
+  return new TypeError('Error processing argument at index 0, conversion failure from ' +
+    (typeof value === 'string' ? value : ''));
+}
+
+function systemPrefersDark() {
+  return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches === true;
+}
+
+class NativeTheme extends EventEmitter {
+  constructor() {
+    super();
+    this._source = 'system';
+    this._updatePending = false;
+    if (typeof matchMedia === 'function') {
+      const query = matchMedia('(prefers-color-scheme: dark)');
+      if (query && typeof query.addEventListener === 'function') {
+        query.addEventListener('change', () => { if (this._source === 'system') this._scheduleUpdate(); });
+      }
+    }
+  }
+  get themeSource() { return this._source; }
+  set themeSource(value) {
+    if (typeof value !== 'string' || THEME_SOURCES.indexOf(value) < 0) throw conversionFailure(value);
+    if (value === this._source) return;
+    this._source = value;
+    this._scheduleUpdate();
+  }
+  get shouldUseDarkColors() {
+    return this._source === 'system' ? systemPrefersDark() : this._source === 'dark';
+  }
+  get shouldUseDarkColorsForSystemIntegratedUI() { return this.shouldUseDarkColors; }
+  get shouldUseHighContrastColors() { return false; }
+  get shouldUseInvertedColorScheme() { return false; }
+  get inForcedColorsMode() { return false; }
+  get prefersReducedTransparency() { return false; }
+  // Changes within one turn produce one `updated`, like Electron.
+  _scheduleUpdate() {
+    if (this._updatePending) return;
+    this._updatePending = true;
+    setTimeout(() => {
+      this._updatePending = false;
+      this.emit('updated');
+    }, 0);
+  }
+}
+
+const nativeTheme = new NativeTheme();
+
+// --- screen -----------------------------------------------------------------------
+//
+// One display, the surface the window system gives this app (`window.screen`).
+
+function ensureReadyFor(moduleName) {
+  if (!app._ready) throw new Error("The '" + moduleName + "' module can't be used before the app 'ready' event");
+}
+
+function primaryDisplay() {
+  const s = typeof globalThis.screen === 'object' && globalThis.screen !== null ? globalThis.screen : {};
+  const width = Number(s.width) > 0 ? Number(s.width) : 1920;
+  const height = Number(s.height) > 0 ? Number(s.height) : 1080;
+  const availWidth = Number(s.availWidth) > 0 ? Number(s.availWidth) : width;
+  const availHeight = Number(s.availHeight) > 0 ? Number(s.availHeight) : height;
+  const colorDepth = Number(s.colorDepth) > 0 ? Number(s.colorDepth) : 24;
+  const scaleFactor = typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  return {
+    accelerometerSupport: 'unknown',
+    bounds: { x: 0, y: 0, width, height },
+    colorDepth,
+    colorSpace: '{primaries:BT709, transfer:SRGB, matrix:RGB, range:FULL}',
+    depthPerComponent: colorDepth >= 30 ? 10 : 8,
+    detected: true,
+    displayFrequency: 60,
+    id: 1,
+    internal: false,
+    label: '',
+    maximumCursorSize: { width: 0, height: 0 },
+    monochrome: false,
+    nativeOrigin: { x: 0, y: 0 },
+    rotation: 0,
+    scaleFactor,
+    size: { width, height },
+    touchSupport: 'unknown',
+    workArea: { x: 0, y: 0, width: availWidth, height: availHeight },
+    workAreaSize: { width: availWidth, height: availHeight },
+  };
+}
+
+let cursorPoint = { x: 0, y: 0 };
+if (typeof addEventListener === 'function') {
+  addEventListener('mousemove', (event) => {
+    if (event && typeof event.screenX === 'number') cursorPoint = { x: event.screenX, y: event.screenY };
+  });
+}
+
+function scalePoint(point, factor) {
+  return { x: Math.round(point.x * factor), y: Math.round(point.y * factor) };
+}
+
+function scaleRect(rect, factor) {
+  return {
+    x: Math.round(rect.x * factor),
+    y: Math.round(rect.y * factor),
+    width: Math.round(rect.width * factor),
+    height: Math.round(rect.height * factor),
+  };
+}
+
+class Screen extends EventEmitter {
+  getPrimaryDisplay() { ensureReadyFor('screen'); return primaryDisplay(); }
+  getAllDisplays() { ensureReadyFor('screen'); return [primaryDisplay()]; }
+  getDisplayNearestPoint() { return this.getPrimaryDisplay(); }
+  getDisplayMatching() { return this.getPrimaryDisplay(); }
+  getCursorScreenPoint() { ensureReadyFor('screen'); return Object.assign({}, cursorPoint); }
+  dipToScreenPoint(point) { return scalePoint(point, primaryDisplay().scaleFactor); }
+  screenToDipPoint(point) { return scalePoint(point, 1 / primaryDisplay().scaleFactor); }
+  dipToScreenRect(_win, rect) { return scaleRect(rect, primaryDisplay().scaleFactor); }
+  screenToDipRect(_win, rect) { return scaleRect(rect, 1 / primaryDisplay().scaleFactor); }
+}
+
+const screen = new Screen();
+
+// --- safeStorage ------------------------------------------------------------------
+//
+// Sealed with the runtime's local keyring (AES-256-GCM, see
+// `w3cos-runtime/src/node_safe_storage.rs`) instead of the OS keychain.
+
+const nodeHost = typeof __w3cos_node_host === 'object' ? __w3cos_node_host : null;
+const DECRYPT_ERRORS = {
+  notEncrypted: 'Ciphertext does not appear to be encrypted.',
+  failed: 'Decryption failed.',
+  unavailable: 'Decryption is not available.',
+};
+
+function keyringAvailable() {
+  return nodeHost !== null && typeof nodeHost.safeStorageEncrypt === 'function';
+}
+
+const safeStorage = {
+  isEncryptionAvailable() { return keyringAvailable(); },
+  isAsyncEncryptionAvailable() { return Promise.resolve(keyringAvailable()); },
+  getSelectedStorageBackend() { return keyringAvailable() ? nodeHost.safeStorageBackend() : 'unknown'; },
+  setUsePlainTextEncryption() {},
+  encryptString(plainText) {
+    if (typeof plainText !== 'string') throw conversionFailure(plainText);
+    const result = keyringAvailable() ? nodeHost.safeStorageEncrypt(plainText) : { error: {} };
+    if (result.error) {
+      throw new Error('Error while encrypting the text provided to safeStorage.encryptString. Encryption is not available.');
+    }
+    return Buffer.from(result.blob);
+  },
+  decryptString(encrypted) {
+    if (!Buffer.isBuffer(encrypted)) throw new Error('Expected the first argument of decryptString() to be a buffer');
+    const result = keyringAvailable() ? nodeHost.safeStorageDecrypt(encrypted) : { error: { code: 'unavailable' } };
+    if (result.error) {
+      throw new Error('Error while decrypting the ciphertext provided to safeStorage.decryptString. ' +
+        (DECRYPT_ERRORS[result.error.code] || DECRYPT_ERRORS.failed));
+    }
+    return result.text;
+  },
+  encryptStringAsync(plainText) {
+    return new Promise((resolve) => resolve(safeStorage.encryptString(plainText)));
+  },
+  decryptStringAsync(encrypted) {
+    return new Promise((resolve) => resolve({ shouldReEncrypt: false, result: safeStorage.decryptString(encrypted) }));
+  },
+};
 
 module.exports = {
   app,
@@ -847,6 +1199,11 @@ module.exports = {
   Menu,
   MenuItem,
   nativeTheme,
+  screen,
+  safeStorage,
+  protocol,
+  net,
+  session,
   MessageChannelMain,
   MessagePortMain,
   utilityProcess,
