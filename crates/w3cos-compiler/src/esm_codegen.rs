@@ -465,6 +465,7 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
         return String::new();
     }
     let mut arms = String::new();
+    let mut fallback = String::from("{ let __s = __specifier.as_str(); ");
     for edge in &bundle.dynamic_imports {
         let referrer = edge.referrer.to_string_lossy();
         let specifier = &edge.specifier;
@@ -473,15 +474,26 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
         for &index in &edge.evaluation_order {
             let path = bundle.modules[index].path.to_string_lossy();
             evals.push_str(&format!(
-                "                let _ = w3cos_core::module_registry::evaluate({path:?});\n"
+                "let _ = w3cos_core::module_registry::evaluate({path:?}); "
             ));
         }
-        arms.push_str(&format!(
-            "            ({referrer:?}, {specifier:?}) => {{\n{evals}                w3cos_core::module_registry::namespace({target:?})\n                    .unwrap_or(w3cos_core::Value::Undefined)\n            }}\n"
+        let load = format!(
+            "{evals}w3cos_core::module_registry::namespace({target:?}).unwrap_or(w3cos_core::Value::Undefined)"
+        );
+        arms.push_str(&format!("({referrer:?}, {specifier:?}) => {{ {load} }}, "));
+        // Computed vscode-file / file URL: match by absolute target or by /<specifier> suffix.
+        let spec_len = specifier.len();
+        fallback.push_str(&format!(
+            "if __s == {target:?} || __s.ends_with({specifier:?}) && (__s.len() == {spec_len} || __s.as_bytes().get(__s.len().saturating_sub({spec_len} + 1)) == Some(&b'/')) {{ {load} }} else ",
+            spec_len = spec_len,
+            specifier = specifier,
+            target = target,
+            load = load,
         ));
     }
+    fallback.push_str("{ w3cos_core::Value::Undefined } }");
     format!(
-        " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}            _ => w3cos_core::Value::Undefined, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
+        " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}_ => {fallback}, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
     )
 }
 

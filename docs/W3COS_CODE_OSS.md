@@ -138,6 +138,14 @@ Next blockers: live-binding resolution for VS Code barrel/`export *` chains;
 computed `import(url)` for the workbench renderer; deeper network builtins at
 runtime.
 
-### Slice 2 progress (box)
-- Soft-skip `out/**/test/**`, `*.test.*`, and test-only `node_modules` (sinon/mocha) when entry is under `out/` — avoids OOM codegen of sinon-esm (~1MB → 13GB RSS).
+### Slice 2 progress (#158)
+- Soft-skip `out/**/test/**`, `*.test.*`, and test-only `node_modules` (sinon/mocha) when entry is under `out/`.
+- `electron_app` also skips `test`/`build`/`src`/… dirs so test preloads are not scanned into the main graph.
 - Literal `import()` linking + live-binding follow + TS namespace merge mutability + TaggedTpl desugar.
+- `out/main.js` graph (Code-OSS e97039dd): **modules=2833 unresolved=0 dyn=32**; codegen ok (`rust_bytes≈1.34e9`).
+
+### Slice 3 progress (`new URL` workbench seeds)
+- Collect `new URL("….js"|`….js`, base)` literals as dynamic-import seeds; resolve path-like specs against `<project>/out/` when the referrer is under `out/`.
+- DYNAMIC_IMPORT adapter also matches computed `vscode-file://` / absolute-path suffixes.
+- `out/vs/code/electron-browser/workbench/workbench.js` graph: **modules=4651 unresolved=0 dyn=1** (seeds `vs/workbench/workbench.desktop.main.js`).
+
