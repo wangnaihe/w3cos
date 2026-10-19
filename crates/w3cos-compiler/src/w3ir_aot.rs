@@ -8830,11 +8830,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -8973,11 +8968,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9089,11 +9079,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9220,11 +9205,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9469,11 +9449,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9648,11 +9623,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
