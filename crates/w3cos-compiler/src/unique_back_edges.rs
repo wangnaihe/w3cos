@@ -410,6 +410,7 @@ mod tests {
 
     fn is_rewritten(generated: &str) -> bool {
         generated.contains("w3cos_core::weak::weak_capture_getter")
+            || generated.contains("w3cos_core::aot_frame::nest_capture_weak(")
     }
 
     #[test]
