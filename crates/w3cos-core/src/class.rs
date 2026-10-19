@@ -174,6 +174,13 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
     if crate::binary::typed_array_instance_of(obj, class_value) {
         return true;
     }
+    // Runtime promises carry no prototype object: recognise the `Promise`
+    // global by its marker.
+    if crate::promise::status(obj).is_some()
+        && class_value.get_property("__w3cos_promise_class").to_bool()
+    {
+        return true;
+    }
     // Ordinary JavaScript closures are represented by `Value::Function`, not
     // `JsObject`, so they do not participate in the object prototype walk
     // below.  They are nevertheless Function instances in JavaScript.  Keep

@@ -1051,12 +1051,18 @@ impl BuiltinObject {
                     .cast_unsigned()
                     .leading_zeros() as f64,
             ),
-            (BuiltinKind::Object, "is") => Value::Bool(
-                arguments
-                    .first()
-                    .zip(arguments.get(1))
-                    .is_some_and(|(left, right)| left.strict_eq(right)),
-            ),
+            (BuiltinKind::Object, "is") => {
+                // SameValue: NaN equals NaN, +0 and -0 differ.
+                let left = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let right = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                Value::Bool(match (left.as_number(), right.as_number()) {
+                    (Some(a), Some(b)) => {
+                        (a.is_nan() && b.is_nan())
+                            || (a == b && a.is_sign_negative() == b.is_sign_negative())
+                    }
+                    _ => left.strict_eq(&right),
+                })
+            }
             (BuiltinKind::Object, "keys") => arguments
                 .first()
                 .map(object_keys)
@@ -1565,28 +1571,31 @@ pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
     } else {
         message_value.to_js_string()
     };
-    let value = Value::object(HashMap::from([
-        ("name".to_string(), Value::string(name)),
-        ("message".to_string(), Value::string(&message)),
-        (
-            "stack".to_string(),
-            Value::from(if message.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}: {message}")
-            }),
-        ),
-    ]));
+    // `message` / `stack` are own non-enumerable data properties; `name`
+    // comes from the prototype (so Object.keys(new Error("x")) is empty).
+    let value = Value::object(HashMap::new());
+    if !message_value.is_undefined() {
+        define_builtin(&value, "message", Value::string(&message));
+    }
+    define_builtin(
+        &value,
+        "stack",
+        Value::from(if message.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}: {message}")
+        }),
+    );
     if name == "AggregateError" {
         let errors = arguments.first().cloned().unwrap_or(Value::Undefined);
-        value.set_property("errors", Value::array(errors.iter().collect()));
+        define_builtin(&value, "errors", Value::array(errors.iter().collect()));
     }
     let cause = arguments
         .get(options_index)
         .map(|options| options.get_property("cause"))
         .unwrap_or(Value::Undefined);
     if !cause.is_undefined() {
-        value.set_property("cause", cause);
+        define_builtin(&value, "cause", cause);
     }
     crate::class::set_prototype_of(&value, &error_class(name).get_property("prototype"));
     value
@@ -2542,6 +2551,8 @@ pub fn named_function(
     f: impl Fn(Value, Vec<Value>) -> Value + 'static,
 ) -> Value {
     let function = Value::function(f);
+    // Built-in functions are not constructors: no own `prototype`.
+    function.delete_property("prototype");
     function.set_property("name", Value::string(name));
     function.set_property("length", Value::Number(length as f64));
     function
