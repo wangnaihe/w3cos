@@ -907,8 +907,17 @@ fn array_like_snapshot(value: &Value) -> Vec<Value> {
     if !length.is_finite() || length <= 0.0 {
         return Vec::new();
     }
+    // Missing indices stay holes (HasProperty before each Get, in order),
+    // so callbacks skip them like the spec's array-like iteration.
     (0..length.floor() as usize)
-        .map(|index| value.get_property(&index.to_string()))
+        .map(|index| {
+            let key = index.to_string();
+            if Value::string(&key).js_in(value).to_bool() {
+                value.get_property(&key)
+            } else {
+                crate::value::array_hole()
+            }
+        })
         .collect()
 }
 

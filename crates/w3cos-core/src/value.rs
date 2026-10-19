@@ -2389,11 +2389,11 @@ impl Value {
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
-                let getter = o
-                    .borrow()
-                    .get(&format!("__w3cos_getter_{key}"), receiver)
-                    .clone();
-                getter.call(receiver.clone(), vec![])
+                let getter = o.borrow().chain_getter(key);
+                match getter {
+                    Some(getter) if getter.is_callable() => getter.call(receiver.clone(), vec![]),
+                    _ => Value::Undefined,
+                }
             };
         }
         if let Some(arr) = self.as_array() {

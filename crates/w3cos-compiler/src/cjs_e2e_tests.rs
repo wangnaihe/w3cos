@@ -326,7 +326,7 @@ const ADVANCED_FILES: &[(&str, &str)] = &[
         "src/main.cjs",
         r##"const esm = require("./esm.mjs");
 console.log("require(esm)", esm.value, typeof esm.default, esm.default());
-try { require("fs"); } catch (e) { console.log("builtin", e.code); }
+try { require("net"); } catch (e) { console.log("builtin", e.code); }
 try { require("node:child_process"); } catch (e) { console.log("node: builtin", e.code); }
 console.log("#cfg", require("#cfg").which);
 console.log("w3cos condition", require("cond-pkg"));
