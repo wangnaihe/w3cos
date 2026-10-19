@@ -686,6 +686,21 @@ pub fn date_class() -> Value {
             ("configurable".into(), Value::Bool(true)),
         ])),
     );
+    crate::builtins::define_builtin(
+        &prototype,
+        "toJSON",
+        crate::named_function("toJSON", 1, |this, _| {
+            if this
+                .get_property("__w3cos_date_milliseconds")
+                .to_number()
+                .is_finite()
+            {
+                this.call_method("toISOString", Vec::new())
+            } else {
+                Value::Null
+            }
+        }),
+    );
     value.set_property("prototype", prototype);
     let retired = DATE_CLASS.with(|slot| slot.replace(Some((epoch, value.clone()))));
     drop(retired);

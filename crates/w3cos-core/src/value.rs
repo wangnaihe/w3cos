@@ -2388,6 +2388,9 @@ impl Value {
             };
         }
         if let Some(arr) = self.as_array() {
+            if let Some(value) = crate::binary::typed_array_prototype_property(self, key) {
+                return value;
+            }
             if let Some(value) = crate::binary::typed_array_property(self, key) {
                 return value;
             }
@@ -2419,6 +2422,22 @@ impl Value {
                 } else {
                     Value::Undefined
                 }
+            }
+            _ if self.as_number().is_some() || self.as_bool().is_some() => {
+                let methods: &[&'static str] = if self.as_bool().is_some() {
+                    &["toString", "toLocaleString", "valueOf"]
+                } else {
+                    crate::number_proto::NUMBER_METHODS
+                };
+                methods
+                    .iter()
+                    .find(|name| **name == key)
+                    .map(|name| crate::number_proto::primitive_method_value(name))
+                    .unwrap_or_else(|| {
+                        crate::object_value()
+                            .get_property("prototype")
+                            .get_property(key)
+                    })
             }
             // JS functions are objects: read attached properties.
             _ if self.as_function().is_some() => {
@@ -3173,6 +3192,11 @@ impl Value {
                 _ => false,
             });
         }
+        if let Some(method) = crate::binary::typed_array_prototype_property(self, key)
+            && method.is_callable()
+        {
+            return method.call(self.clone(), args);
+        }
         if crate::binary::is_typed_array(self)
             && let Some(result) = crate::binary::typed_array_call_method(self, key, args.clone())
         {
@@ -3599,6 +3623,15 @@ impl Value {
                 return Value::Undefined;
             }
             _ => {}
+        }
+        if let Some(number) = self.as_number() {
+            if let Some(result) = crate::number_proto::number_method(number, key, &args) {
+                return result;
+            }
+        } else if let Some(flag) = self.as_bool() {
+            if let Some(result) = crate::number_proto::boolean_method(flag, key) {
+                return result;
+            }
         }
         self.get_property(key).call(self.clone(), args)
     }

@@ -259,6 +259,8 @@ pub fn object_to_string(value: &Value) -> String {
         "Undefined"
     } else if value.is_null() {
         "Null"
+    } else if let Some(name) = crate::binary::typed_array_name(value) {
+        name
     } else if value.is_array() {
         "Array"
     } else if value.is_string() {
@@ -1391,14 +1393,53 @@ fn dom_element() -> Value {
 
 pub fn parseInt(arguments: Vec<Value>) -> Value {
     let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-    let parsed = value
-        .to_js_string()
-        .trim()
-        .split(|character: char| !character.is_ascii_digit() && character != '-')
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(f64::NAN);
-    Value::Number(parsed)
+    let text = value.to_js_string();
+    let mut rest = text.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let mut sign = 1.0;
+    if let Some(stripped) = rest.strip_prefix('-') {
+        sign = -1.0;
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_prefix('+') {
+        rest = stripped;
+    }
+    let radix_arg = arguments.get(1).map(Value::to_number).unwrap_or(0.0);
+    let mut radix = if radix_arg.is_finite() {
+        (radix_arg.trunc() as i64 as i32) as u32
+    } else {
+        0
+    };
+    let mut strip_prefix = true;
+    if radix != 0 {
+        if !(2..=36).contains(&radix) {
+            return Value::Number(f64::NAN);
+        }
+        if radix != 16 {
+            strip_prefix = false;
+        }
+    } else {
+        radix = 10;
+    }
+    if strip_prefix && (rest.starts_with("0x") || rest.starts_with("0X")) {
+        rest = &rest[2..];
+        radix = 16;
+    }
+    let digits: Vec<u32> = rest.chars().map_while(|c| c.to_digit(radix)).collect();
+    if digits.is_empty() {
+        return Value::Number(f64::NAN);
+    }
+    let number = if radix == 10 {
+        // Decimal: let the float parser round the full digit string.
+        let text: String = digits
+            .iter()
+            .map(|d| char::from_digit(*d, 10).expect("digit"))
+            .collect();
+        text.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        digits
+            .iter()
+            .fold(0.0, |acc, d| acc * f64::from(radix) + f64::from(*d))
+    };
+    Value::Number(sign * number)
 }
 
 pub fn parseFloat(arguments: Vec<Value>) -> Value {

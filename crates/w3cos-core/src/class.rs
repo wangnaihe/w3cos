@@ -525,6 +525,9 @@ pub fn define_field(this: &Value, key: &str, value: Value) {
 
 /// Set `obj`'s prototype link from generated code (`obj` must be an object).
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
+    if crate::binary::set_typed_array_prototype(obj, proto) {
+        return;
+    }
     crate::intrinsics::bump_dom_shape();
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
@@ -537,6 +540,11 @@ pub fn set_prototype_of(obj: &Value, proto: &Value) {
 /// `Object.getPrototypeOf(obj)`: the object's prototype link, or `Null`
 /// (matching JS for non-objects, which throw — kept total here).
 pub fn get_prototype_of(obj: &Value) -> Value {
+    if obj.as_array().is_some()
+        && let Some(prototype) = crate::binary::typed_array_prototype(obj)
+    {
+        return prototype;
+    }
     obj.as_object()
         .map(|object| object.borrow().get_prototype_of())
         .unwrap_or(Value::Null)

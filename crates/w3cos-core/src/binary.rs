@@ -248,12 +248,18 @@ struct View {
     offset: usize,
     length: usize,
     kind: Kind,
+    /// Prototype installed with `Object.setPrototypeOf` (Node's `Buffer`
+    /// instances are Uint8Arrays whose prototype is `Buffer.prototype`).
+    prototype: Option<Value>,
 }
 
 thread_local! {
     static NEXT_BUFFER_ID: RefCell<u64> = const { RefCell::new(1) };
     static BUFFERS: RefCell<HashMap<u64, Rc<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
     static VIEWS: RefCell<Vec<View>> = const { RefCell::new(Vec::new()) };
+    /// Set once any typed array gets a custom prototype: array property
+    /// reads skip the view lookup until then.
+    static ANY_VIEW_PROTOTYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CLASSES: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
     static ARRAY_BUFFER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static SHARED_ARRAY_BUFFER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -874,6 +880,7 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
             offset,
             length,
             kind,
+            prototype: None,
         })
     });
     value
@@ -973,6 +980,73 @@ pub fn typed_array_class(name: &str) -> Value {
 
 pub fn typed_array_value(values: Vec<Value>) -> Value {
     construct_typed_array(Kind::Uint8, &[Value::array(values)])
+}
+
+/// The prototype installed on a typed array with `Object.setPrototypeOf`,
+/// if any.
+pub fn typed_array_prototype(value: &Value) -> Option<Value> {
+    if !ANY_VIEW_PROTOTYPE.with(|flag| flag.get()) {
+        return None;
+    }
+    let candidate = value.as_array()?;
+    VIEWS.with(|views| {
+        views.borrow().iter().find_map(|view| {
+            let storage = view.storage.upgrade()?;
+            if storage.ptr_eq(&candidate) {
+                view.prototype.clone()
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// `Object.setPrototypeOf(typedArray, proto)`. Returns false when `value`
+/// is not a typed array.
+pub fn set_typed_array_prototype(value: &Value, prototype: &Value) -> bool {
+    let Some(candidate) = value.as_array() else {
+        return false;
+    };
+    VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        for view in views.iter_mut() {
+            if view
+                .storage
+                .upgrade()
+                .is_some_and(|storage| storage.ptr_eq(&candidate))
+            {
+                view.prototype =
+                    (prototype.is_object() || prototype.is_function()).then(|| prototype.clone());
+                if view.prototype.is_some() {
+                    ANY_VIEW_PROTOTYPE.with(|flag| flag.set(true));
+                }
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// A non-index property found on an installed prototype chain.
+pub(crate) fn typed_array_prototype_property(value: &Value, key: &str) -> Option<Value> {
+    if !ANY_VIEW_PROTOTYPE.with(|flag| flag.get())
+        || key == "length"
+        || key.bytes().next().is_some_and(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let prototype = typed_array_prototype(value)?;
+    let found = prototype.get_property_with_receiver(key, value);
+    (!found.is_undefined()).then_some(found)
+}
+
+/// `Uint8Array`, `Float64Array`, ... for a typed array value.
+pub fn typed_array_name(value: &Value) -> Option<&'static str> {
+    let (_, _, _, kind, _) = view_for(value)?;
+    TYPED_ARRAY_NAMES
+        .iter()
+        .find(|name| Kind::from_name(name) == kind)
+        .copied()
 }
 
 pub fn is_typed_array(value: &Value) -> bool {
@@ -1302,6 +1376,19 @@ pub fn typed_array_instance_of(value: &Value, class: &Value) -> bool {
     let Some((_, _, _, kind, _)) = view_for(value) else {
         return false;
     };
+    if let Some(prototype) = typed_array_prototype(value) {
+        let target = class.get_property("prototype");
+        let mut current = prototype;
+        for _ in 0..64 {
+            if current.strict_eq(&target) {
+                return true;
+            }
+            if !current.is_object() {
+                break;
+            }
+            current = crate::class::get_prototype_of(&current);
+        }
+    }
     class
         .get_property("__w3cos_typed_array_name")
         .to_js_string()
