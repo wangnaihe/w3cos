@@ -16,7 +16,8 @@ leak-detector = []
 
 [dependencies]
 serde_json = { workspace = true }
-chrono = { workspace = true }
+# `clock`: local-time Date getters (`getHours`, `getTimezoneOffset`).
+chrono = { workspace = true, features = ["clock"] }
 chrono-tz = { workspace = true }
 base64 = "0.22"
 regex = "1"

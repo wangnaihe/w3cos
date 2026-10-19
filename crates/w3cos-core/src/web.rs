@@ -742,35 +742,89 @@ fn build_date_class() -> Value {
     )
 }
 
+/// Calendar field getters (`getFullYear` ... `getUTCMilliseconds`,
+/// `getTimezoneOffset`) for a Date at `milliseconds`; NaN when invalid.
+fn date_field_getters(milliseconds: f64) -> Vec<(String, Value)> {
+    use chrono::{Datelike, Timelike};
+    fn field<Tz: chrono::TimeZone>(
+        zone: Tz,
+        milliseconds: f64,
+        pick: fn(&chrono::DateTime<Tz>) -> f64,
+    ) -> f64 {
+        if !milliseconds.is_finite() {
+            return f64::NAN;
+        }
+        zone.timestamp_millis_opt(milliseconds.floor() as i64)
+            .single()
+            .map_or(f64::NAN, |instant| pick(&instant))
+    }
+    macro_rules! getters {
+        ($($local:literal, $utc:literal => $pick:expr;)*) => {
+            vec![$(
+                (
+                    $local.to_string(),
+                    Value::function(move |_, _| {
+                        Value::Number(field(chrono::Local, milliseconds, $pick))
+                    }),
+                ),
+                (
+                    $utc.to_string(),
+                    Value::function(move |_, _| {
+                        Value::Number(field(chrono::Utc, milliseconds, $pick))
+                    }),
+                ),
+            )*]
+        };
+    }
+    let mut getters = getters! {
+        "getFullYear", "getUTCFullYear" => |d| f64::from(d.year());
+        "getMonth", "getUTCMonth" => |d| f64::from(d.month0());
+        "getDate", "getUTCDate" => |d| f64::from(d.day());
+        "getDay", "getUTCDay" => |d| f64::from(d.weekday().num_days_from_sunday());
+        "getHours", "getUTCHours" => |d| f64::from(d.hour());
+        "getMinutes", "getUTCMinutes" => |d| f64::from(d.minute());
+        "getSeconds", "getUTCSeconds" => |d| f64::from(d.second());
+        "getMilliseconds", "getUTCMilliseconds" => |d| f64::from(d.timestamp_subsec_millis());
+    };
+    getters.push((
+        "getTimezoneOffset".to_string(),
+        Value::function(move |_, _| {
+            Value::Number(field(chrono::Local, milliseconds, |d| {
+                -f64::from(d.offset().local_minus_utc()) / 60.0
+            }))
+        }),
+    ));
+    getters
+}
+
 pub fn date_value(milliseconds: f64) -> Value {
-    Value::object_with_prototype(
-        &date_prototype(),
-        HashMap::from([
-            (
-                "__w3cos_date_milliseconds".into(),
-                Value::Number(milliseconds),
-            ),
-            (
-                "getTime".into(),
-                Value::function(move |_, _| Value::Number(milliseconds)),
-            ),
-            (
-                "valueOf".into(),
-                Value::function(move |_, _| Value::Number(milliseconds)),
-            ),
-            (
-                "toISOString".into(),
-                Value::function(move |_, _| {
-                    let text = chrono::Utc
-                        .timestamp_millis_opt(milliseconds.floor() as i64)
-                        .single()
-                        .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-                        .unwrap_or_else(|| "Invalid Date".to_string());
-                    Value::from(text)
-                }),
-            ),
-        ]),
-    )
+    let mut fields: HashMap<String, Value> = date_field_getters(milliseconds).into_iter().collect();
+    fields.extend([
+        (
+            "__w3cos_date_milliseconds".into(),
+            Value::Number(milliseconds),
+        ),
+        (
+            "getTime".into(),
+            Value::function(move |_, _| Value::Number(milliseconds)),
+        ),
+        (
+            "valueOf".into(),
+            Value::function(move |_, _| Value::Number(milliseconds)),
+        ),
+        (
+            "toISOString".into(),
+            Value::function(move |_, _| {
+                let text = chrono::Utc
+                    .timestamp_millis_opt(milliseconds.floor() as i64)
+                    .single()
+                    .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                    .unwrap_or_else(|| "Invalid Date".to_string());
+                Value::from(text)
+            }),
+        ),
+    ]);
+    Value::object_with_prototype(&date_prototype(), fields)
 }
 
 fn now_milliseconds() -> f64 {
@@ -3031,6 +3085,29 @@ mod tests {
     /// Test helper: unwrap a caught JS-exception payload into its Value.
     fn payload_value(payload: Box<dyn std::any::Any + Send>) -> Value {
         crate::promise::payload_to_value(payload)
+    }
+
+    #[test]
+    fn date_has_calendar_field_getters() {
+        let get = |date: &Value, key: &str| date.call_method(key, vec![]).to_number();
+        // 2001-02-03T04:05:06.007Z, a Saturday.
+        let date = date_value(981_173_106_007.0);
+        assert_eq!(get(&date, "getUTCFullYear"), 2001.0);
+        assert_eq!(get(&date, "getUTCMonth"), 1.0);
+        assert_eq!(get(&date, "getUTCDate"), 3.0);
+        assert_eq!(get(&date, "getUTCDay"), 6.0);
+        assert_eq!(get(&date, "getUTCHours"), 4.0);
+        assert_eq!(get(&date, "getUTCMinutes"), 5.0);
+        assert_eq!(get(&date, "getUTCSeconds"), 6.0);
+        assert_eq!(get(&date, "getUTCMilliseconds"), 7.0);
+        // Local fields agree with the zone offset.
+        let offset = get(&date, "getTimezoneOffset");
+        let local_minutes = get(&date, "getHours") * 60.0 + get(&date, "getMinutes");
+        assert_eq!(
+            (4.0 * 60.0 + 5.0 - offset - local_minutes).rem_euclid(1440.0),
+            0.0
+        );
+        assert!(get(&date_value(f64::NAN), "getFullYear").is_nan());
     }
 
     #[test]
