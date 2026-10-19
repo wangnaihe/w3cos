@@ -11510,6 +11510,16 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
             dom::set_text_content(node, &text);
         }
         "nodeValue" => {}
+        // HTML: the setter replaces the children with one Text node, like
+        // `textContent` (line breaks stay text; `<br>` insertion is a gap).
+        "innerText" if matches!(dom::node_type(node), 1 | 11) => {
+            let text = if value.is_null() {
+                String::new()
+            } else {
+                value.to_js_string()
+            };
+            apply_text_content(node, &text);
+        }
         "innerText" => {
             clear_children(node);
             dom::set_text_content(node, &value.to_js_string());
