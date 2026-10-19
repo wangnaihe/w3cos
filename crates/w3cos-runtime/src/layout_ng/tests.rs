@@ -1191,3 +1191,144 @@ fn bfc_roots_avoid_floats() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// A BFC root that is its parent's first in-flow child moves below floats
+/// inside the parent while the margins still collapse through it, and a
+/// cleared first child whose large margin collapses through its parent is
+/// estimated at the collapsed position (display-flow-root-002,
+/// no-clearance-due-to-large-margin; Chrome rects).
+#[test]
+fn first_children_beside_floats_match_chrome() {
+    use w3cos_std::style::{Clear, Dimension as D, Display, Float, Spacing as S, Style};
+    let px = D::Px;
+    let float = |float: Float| Style {
+        display: Display::Block,
+        float,
+        width: px(250.0),
+        height: px(100.0),
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            Style {
+                display: Display::Block,
+                width: px(400.0),
+                ..Style::default()
+            },
+            vec![
+                leaf(float(Float::Right)),
+                leaf(float(Float::Left)),
+                leaf(Style {
+                    display: Display::FlowRoot,
+                    width: px(0.0),
+                    height: px(200.0),
+                    ..Style::default()
+                }),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |index: usize| {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    assert_eq!(rect(1), [0.0, 0.0, 400.0, 300.0]);
+    assert_eq!(rect(2), [150.0, 0.0, 250.0, 100.0]);
+    assert_eq!(rect(3), [0.0, 100.0, 250.0, 100.0]);
+    assert_eq!(rect(4), [250.0, 100.0, 0.0, 200.0]);
+
+    let mut cleared = Style {
+        display: Display::Block,
+        height: px(18.0),
+        clear: Clear::Left,
+        ..Style::default()
+    };
+    cleared.margin.top = S::Px(150.0);
+    let mut padded = Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    padded.padding.top = S::Px(1.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            leaf(Style {
+                display: Display::Block,
+                float: Float::Left,
+                width: px(100.0),
+                height: px(100.0),
+                ..Style::default()
+            }),
+            Component::boxed(
+                padded,
+                vec![Component::boxed(
+                    Style {
+                        display: Display::Block,
+                        ..Style::default()
+                    },
+                    vec![Component::boxed(cleared, vec![])],
+                )],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |index: usize| {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    assert_eq!(rect(3), [0.0, 151.0, 800.0, 18.0]);
+    assert_eq!(rect(4), [0.0, 151.0, 800.0, 18.0]);
+
+    // adjoining-float-before-clearance: the float sits at the unresolved
+    // position the cleared box's margin would collapse through; that needs
+    // the BFC offset resolved before clearance, so it stays on legacy.
+    let mut cleared = Style {
+        display: Display::Block,
+        height: px(50.0),
+        clear: Clear::Left,
+        ..Style::default()
+    };
+    cleared.margin.top = S::Px(400.0);
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            Style {
+                display: Display::Block,
+                width: px(100.0),
+                ..Style::default()
+            },
+            vec![
+                Component::boxed(
+                    Style {
+                        display: Display::Block,
+                        ..Style::default()
+                    },
+                    vec![leaf(Style {
+                        display: Display::Block,
+                        float: Float::Left,
+                        width: px(100.0),
+                        height: px(50.0),
+                        ..Style::default()
+                    })],
+                ),
+                Component::boxed(cleared, vec![]),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+}

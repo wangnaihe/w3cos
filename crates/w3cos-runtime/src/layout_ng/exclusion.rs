@@ -36,6 +36,11 @@ impl ExclusionSpace {
         self.exclusions.is_empty()
     }
 
+    /// The top of the most recently placed float (0 when none).
+    pub fn last_float_top(&self) -> f32 {
+        self.last_float_top
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot(self.exclusions.len(), self.last_float_top)
     }

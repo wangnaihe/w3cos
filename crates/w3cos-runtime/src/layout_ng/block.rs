@@ -1151,6 +1151,18 @@ fn layout_block_in(
         // when the hypothetical position is above it; the cleared box's
         // top margin then no longer collapses with what precedes it.
         let clear = clearance_offset(child_info.style, exclusions);
+        if clear.is_some() && at_top && can_escape_top {
+            // Floats at our still-unresolved position are adjoining: the
+            // cleared box's margin must not drag them down (Blink resolves
+            // the BFC block offset without the child's margin first, then
+            // applies clearance).  Not implemented: stay on legacy.
+            let mut combined = margin_strut;
+            combined.merge(start_strut);
+            combined.merge(pending);
+            if exclusions.last_float_top() >= margin_base + combined.sum() - 1.0 / 128.0 {
+                return None;
+            }
+        }
         let place = |start: MarginStrut| {
             if at_top && can_escape_top {
                 // The margins still collapse through us: the hypothetical
@@ -1186,7 +1198,17 @@ fn layout_block_in(
         let mut nested = child_space;
         nested.bfc_x = bfc_x + x;
         nested.bfc_y = content_bfc_y + estimate;
+        // Margins collapsing through us: the child (and we) end up past
+        // all of them, wherever our own estimate put us.
+        let collapsed_top = |start: MarginStrut| {
+            let mut combined = margin_strut;
+            combined.merge(start_strut);
+            combined.merge(pending);
+            combined.merge(start);
+            margin_base + combined.sum()
+        };
         if at_top && can_escape_top {
+            nested.bfc_y = collapsed_top(own_top);
             nested.margin_base = margin_base;
             nested.margin_strut = margin_strut;
             nested.margin_strut.merge(start_strut);
@@ -1197,9 +1219,18 @@ fn layout_block_in(
         }
         let mut result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
         let (mut resolved, mut cleared) = place(result.start_strut)?;
-        if result.bfc_dependent && (resolved - estimate).abs() > 1.0 / 128.0 {
+        let resolved_bfc = |resolved: f32, start: MarginStrut| {
+            if at_top && can_escape_top {
+                collapsed_top(start)
+            } else {
+                content_bfc_y + resolved
+            }
+        };
+        if result.bfc_dependent
+            && (resolved_bfc(resolved, result.start_strut) - nested.bfc_y).abs() > 1.0 / 128.0
+        {
             exclusions.restore(snapshot);
-            nested.bfc_y = content_bfc_y + resolved;
+            nested.bfc_y = resolved_bfc(resolved, result.start_strut);
             result = layout_block_in(flat, child, &nested, false, None, exclusions)?;
             let (again, c) = place(result.start_strut)?;
             if (again - resolved).abs() > 1.0 / 128.0 {
@@ -1221,12 +1252,24 @@ fn layout_block_in(
             }
             let m = &child_metrics;
             let edges = m.border[1] + m.border[3] + m.padding[1] + m.padding[3];
-            let (ml, mr) = (m.margin[3], m.margin[1]);
+            // Authored margins: the used ones absorb the over-constraint
+            // of CSS2 10.3.3, which the opportunity replaces.
+            let authored = |s: Spacing| {
+                resolve_spacing_for_layout(
+                    s,
+                    child_space.available_inline,
+                    style,
+                    child_space.viewport_w,
+                    child_space.viewport_h,
+                )
+            };
+            let (ml, mr) = (authored(style.margin.left), authored(style.margin.right));
             let cb_x = bfc_x + bl + pl;
             // Margins may overlap floats; the border box may not.
             let line_start = cb_x + ml;
             let line_end = cb_x + metrics.content_width - mr;
-            let mut top = content_bfc_y + resolved;
+            let hypothetical = resolved_bfc(resolved, result.start_strut);
+            let mut top = hypothetical;
             let mut height = result.fragment.height;
             let mut found = None;
             'opportunities: for _ in 0..64 {
@@ -1261,14 +1304,19 @@ fn layout_block_in(
                 top = exclusions.next_bottom(top, height)?;
             }
             let (start, fitted) = found?;
-            if top > content_bfc_y + resolved + 1.0 / 128.0 {
+            if top > hypothetical + 1.0 / 128.0 {
                 if at_top && can_escape_top {
-                    // (Moved below floats while margins collapse through.)
-                    return None;
+                    // The margins still collapse through us at the
+                    // hypothetical position (our top); the box sits below.
+                    start_strut.merge(pending);
+                    start_strut.merge(fitted.start_strut);
+                    pending = MarginStrut::default();
+                    resolved = top - hypothetical;
+                } else {
+                    resolved = top - content_bfc_y;
                 }
                 // Moved past floats: like clearance, the margin above no
                 // longer collapses with the box.
-                resolved = top - content_bfc_y;
                 cleared = true;
             }
             x = start - bfc_x;
