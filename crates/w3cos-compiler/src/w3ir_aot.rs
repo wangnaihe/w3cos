@@ -2160,7 +2160,7 @@ fn emit_registers_field(n: u32) -> String {
 
 fn emit_registers_init(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
-        "        registers: std::array::from_fn(|_| w3cos_core::Value::Undefined),\n".to_string()
+        format!("        registers: [const {{ w3cos_core::Value::Undefined }}; {n}],\n")
     } else {
         format!("        registers: vec![w3cos_core::Value::Undefined; {n}],\n")
     }
@@ -2210,7 +2210,7 @@ fn emit_bindings_new(storage: SlotStorage) -> String {
 
 fn inline_bindings_new(len: usize) -> String {
     format!(
-        "    let mut bindings: [Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>; {len}] = std::array::from_fn(|_| None);\n"
+        "    let mut bindings: [Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>; {len}] = [const {{ None }}; {len}];\n"
     )
 }
 
@@ -2231,14 +2231,14 @@ fn emit_capture_init(storage: SlotStorage) -> String {
     const BIND: &str = "    w3cos_core::aot_frame::bind_captures(__captures, {ids}, &mut capture_getters, &mut capture_setters, &mut bindings);\n";
     match storage {
         SlotStorage::Dense(len) if len <= INLINE_FRAME => format!(
-            "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n{}",
+            "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n{}",
             BIND.replace("{ids}", "&[]")
         ),
         SlotStorage::Packed(ids, len) => {
             let len = len as usize;
             let slots = if len <= INLINE_FRAME {
                 format!(
-                    "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n"
+                    "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n"
                 )
             } else {
                 format!(
@@ -10015,7 +10015,7 @@ fn main() {{
             SlotStorage::Dense(_) => {
                 assert!(
                     add_generated.contains("vec![None;")
-                        || add_generated.contains("std::array::from_fn"),
+                        || add_generated.contains("[const { None };"),
                     "dense 0..n BindingIds should index a compact slot array: {add_generated}"
                 );
             }
@@ -10027,7 +10027,7 @@ fn main() {{
             }
             SlotStorage::Packed(_, _) => {
                 assert!(
-                    add_generated.contains("std::array::from_fn")
+                    add_generated.contains("[const { None };")
                         || add_generated.contains("vec![None;"),
                     "sparse add should pack slots: {add_generated}"
                 );
@@ -10037,7 +10037,7 @@ fn main() {{
             SlotStorage::Dense(_) => {
                 assert!(
                     inner_generated.contains("vec![None;")
-                        || inner_generated.contains("std::array::from_fn"),
+                        || inner_generated.contains("[const { None };"),
                     "unexpected dense inner captures: {inner_generated}"
                 );
             }
@@ -10053,7 +10053,7 @@ fn main() {{
             }
             SlotStorage::Packed(_, _) => {
                 assert!(
-                    (inner_generated.contains("std::array::from_fn")
+                    (inner_generated.contains("[const { None };")
                         || inner_generated.contains("vec![None;"))
                         && (inner_generated.contains("AotCapture::Cell")
                             || inner_generated.contains("w3cos_core::aot_frame::bind_captures(")),
