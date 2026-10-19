@@ -811,6 +811,13 @@ impl EsmResolver {
         if specifier.starts_with('#') {
             return self.resolve_package_imports(specifier, from_dir, kind);
         }
+        if let Some(module) = w3cos_node::native_replacement(specifier) {
+            let mut resolved = node_builtin_module(module, &self.project_root)?
+                .expect("native replacement glue is a w3cos-node module");
+            resolved.specifier = specifier.to_string();
+            resolved.package_name = Some(specifier.to_string());
+            return Ok(resolved);
+        }
         if crate::electron_app::is_electron_specifier(specifier) {
             let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
             self.classic_scripts.borrow_mut().extend(scripts);

@@ -402,7 +402,31 @@ pub(crate) fn fill_random(buffer: &mut [u8]) {
     });
 }
 
-pub(crate) fn define(host: &Value, name: &str, f: impl Fn(Vec<Value>) -> Value + 'static) {
+/// Host functions added by crates above core (the runtime's SQLite and file
+/// watcher bridges), installed on every `__w3cos_node_host` built afterwards.
+static EXTENSIONS: std::sync::Mutex<Vec<fn(&Value)>> = std::sync::Mutex::new(Vec::new());
+
+/// Register `install` to add functions to `__w3cos_node_host` (idempotent).
+pub fn register_extension(install: fn(&Value)) {
+    {
+        let mut extensions = EXTENSIONS.lock().unwrap();
+        if !extensions
+            .iter()
+            .any(|known| std::ptr::fn_addr_eq(*known, install))
+        {
+            extensions.push(install);
+        }
+    }
+    // A host object this thread built before the call gets it too
+    // (defining the functions again is harmless).
+    let current = HOST_VALUE.with(|cell| cell.borrow().as_ref().map(|(_, value)| value.clone()));
+    if let Some(host) = current {
+        install(&host);
+    }
+}
+
+/// Add a host function `name` to `host` (for `register_extension` installers).
+pub fn define(host: &Value, name: &str, f: impl Fn(Vec<Value>) -> Value + 'static) {
     host.set_property(name, crate::named_function(name, 0, move |_, args| f(args)));
 }
 
@@ -861,6 +885,9 @@ fn build_host() -> Value {
     });
     crate::node_host_io::install(&host);
     crate::node_workers::install(&host);
+    for install in EXTENSIONS.lock().unwrap().iter() {
+        install(&host);
+    }
     host
 }
 
