@@ -2428,6 +2428,7 @@ impl Value {
     /// function is reachable through the prototype chain, the setter is
     /// invoked with the object as receiver instead of storing directly.
     pub fn try_set_property(&self, key: &str, value: Value) -> bool {
+        crate::intrinsics::bump_matches_shape_for_key(key);
         if dom_shape_method_key(key) {
             crate::intrinsics::bump_dom_shape();
         }
@@ -2540,6 +2541,7 @@ impl Value {
 
     /// Delete an own property and return the JavaScript-style success value.
     pub fn delete_property(&self, key: &str) -> Value {
+        crate::intrinsics::bump_matches_shape_for_key(key);
         if dom_shape_method_key(key) || dom_shape_data_key(key) {
             crate::intrinsics::bump_dom_shape();
         }

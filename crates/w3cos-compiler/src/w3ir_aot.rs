@@ -8193,12 +8193,13 @@ fn emit_instruction(
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
                 let expr = if matches!(mode, EmissionMode::Sync)
                     && arguments.len() == 1
-                    && matches!(literal.as_str(), "appendChild" | "removeChild")
+                    && matches!(literal.as_str(), "appendChild" | "removeChild" | "matches")
                 {
-                    let intrinsic = if literal == "appendChild" {
-                        "dom_append_child_guarded"
-                    } else {
-                        "dom_remove_child_guarded"
+                    let intrinsic = match literal.as_str() {
+                        "appendChild" => "dom_append_child_guarded",
+                        "removeChild" => "dom_remove_child_guarded",
+                        "matches" => "dom_matches_guarded",
+                        _ => unreachable!("guarded DOM literal filtered above"),
                     };
                     format!(
                         "w3cos_core::intrinsics::{intrinsic}(&{}, &{})",
@@ -9931,6 +9932,120 @@ fn main() {{
         assert!(
             generated.contains("get_property_checked_ic(\"parentNode\""),
             "parentNode observations must stay ordinary property reads: {generated}"
+        );
+    }
+
+    #[test]
+    fn emits_guarded_builtin_matches_for_literal_call() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function check(element, selector) {
+                    return element.matches(selector);
+                }
+                check;
+            "#,
+            "app:///guarded-matches-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("check"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "check_aot").unwrap();
+        assert!(
+            generated.contains("dom_matches_guarded"),
+            "literal matches must use the guarded intrinsic: {generated}"
+        );
+        assert!(
+            !generated.contains("call_method_slice(\"matches\""),
+            "the hot literal call must skip ordinary method dispatch: {generated}"
+        );
+
+        for (name, source) in [
+            (
+                "zero",
+                "function zero(element) { return element.matches(); } zero;",
+            ),
+            (
+                "two",
+                "function two(element, selector, scope) { return element.matches(selector, scope); } two;",
+            ),
+        ] {
+            let fallback_module = crate::w3ir_lowering::lower_script(
+                source,
+                &format!("app:///guarded-matches-{name}-fallback.js"),
+            )
+            .unwrap();
+            let fallback_function = fallback_module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(name))
+                .unwrap();
+            let fallback = generate_sync_function_from_module(
+                &fallback_module,
+                fallback_function,
+                &format!("{name}_aot"),
+            )
+            .unwrap();
+            assert!(
+                fallback.contains("call_method_slice(\"matches\""),
+                "{name}-argument matches must retain ordinary dispatch: {fallback}"
+            );
+            assert!(
+                !fallback.contains("dom_matches_guarded"),
+                "{name}-argument matches must not use the guarded intrinsic: {fallback}"
+            );
+        }
+
+        let computed_module = crate::w3ir_lowering::lower_script(
+            "function computed(element, name, selector) { return element[name](selector); } computed;",
+            "app:///guarded-matches-computed-fallback.js",
+        )
+        .unwrap();
+        let computed_function = computed_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("computed"))
+            .unwrap();
+        let computed = generate_sync_function_from_module(
+            &computed_module,
+            computed_function,
+            "computed_aot",
+        )
+        .unwrap();
+        assert!(
+            computed.contains("call_method_completion"),
+            "nonliteral matches must retain computed ordinary dispatch: {computed}"
+        );
+        assert!(
+            !computed.contains("dom_matches_guarded"),
+            "nonliteral matches must not use the guarded intrinsic: {computed}"
+        );
+
+        let async_module = crate::w3ir_lowering::lower_script(
+            "async function async_check(element, selector) { return element.matches(selector); } async_check;",
+            "app:///guarded-matches-async-fallback.js",
+        )
+        .unwrap();
+        let async_function = async_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("async_check"))
+            .unwrap();
+        let async_generated = generate_async_function_from_module(
+            &async_module,
+            async_function,
+            "async_check_aot",
+        )
+        .unwrap();
+        assert!(
+            async_generated.contains("call_method_slice(\"matches\""),
+            "async matches must retain ordinary dispatch: {async_generated}"
+        );
+        assert!(
+            !async_generated.contains("dom_matches_guarded"),
+            "async matches must not use the guarded intrinsic: {async_generated}"
         );
     }
 
