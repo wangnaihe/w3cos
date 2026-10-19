@@ -60,6 +60,14 @@ struct EscapePlan {
     n_num_bindings: u32,
     /// Binding id → number that is stored exactly once as a literal.
     constants: HashMap<u32, f64>,
+    /// Constant `let` / `const` / `class` bindings whose loads in this
+    /// function are not proven to follow the initialization: the constant is
+    /// still used, after an initialized check (TDZ).
+    guarded: HashSet<u32>,
+    /// Guarded bindings captured from an outer function → slot in the
+    /// frame's `tdz_ready` cache. A captured cell is fixed for the frame and
+    /// initialization is one-way, so one successful check is enough.
+    tdz_cache: HashMap<u32, usize>,
     /// `CreateObject` / `CreateArray` destinations proven not to escape the
     /// frame ([`crate::alloc_escape`]): allocated as refcounted host values
     /// so they are freed at their last reference instead of page reset.
@@ -69,6 +77,9 @@ struct EscapePlan {
 thread_local! {
     static NUMERIC_CONSTANTS: std::cell::RefCell<HashMap<u32, f64>> =
         std::cell::RefCell::new(HashMap::new());
+    /// (function, binding) pairs whose constant loads need a TDZ check.
+    static GUARDED_CONSTANTS: std::cell::RefCell<HashSet<(u32, u32)>> =
+        std::cell::RefCell::new(HashSet::new());
     static MODULE_FUNCTIONS: std::cell::RefCell<Vec<Function>> = std::cell::RefCell::new(Vec::new());
     /// Binding ids named `eval` across `MODULE_FUNCTIONS`, computed lazily
     /// (keyed by the module function count) for allocation escape analysis.
@@ -90,6 +101,7 @@ impl Drop for NumericConstantGuard {
         });
         if self.0 {
             NUMERIC_CONSTANTS.with(|constants| constants.borrow_mut().clear());
+            GUARDED_CONSTANTS.with(|guarded| guarded.borrow_mut().clear());
             MODULE_FUNCTIONS.with(|functions| functions.borrow_mut().clear());
             EVAL_BINDINGS.with(|cache| *cache.borrow_mut() = None);
         }
@@ -573,6 +585,14 @@ fn analyze_function_seeded(function: &Function, seeds: &HashSet<u32>) -> EscapeP
         num_binding_of.insert(id, n_num_bindings);
         n_num_bindings += 1;
     }
+    let guarded: HashSet<u32> = GUARDED_CONSTANTS.with(|guarded| {
+        guarded
+            .borrow()
+            .iter()
+            .filter(|(owner, _)| *owner == function.id.0)
+            .map(|(_, binding)| *binding)
+            .collect()
+    });
     EscapePlan {
         bools,
         num_of,
@@ -590,8 +610,24 @@ fn analyze_function_seeded(function: &Function, seeds: &HashSet<u32>) -> EscapeP
         num_binding_of,
         n_num_bindings,
         constants,
+        tdz_cache: tdz_cache(function, &guarded),
+        guarded,
         number,
     }
+}
+
+fn tdz_cache(function: &Function, guarded: &HashSet<u32>) -> HashMap<u32, usize> {
+    let mut captured: Vec<u32> = guarded
+        .iter()
+        .copied()
+        .filter(|binding| !function.bindings.iter().any(|own| own.id.0 == *binding))
+        .collect();
+    captured.sort_unstable();
+    captured
+        .into_iter()
+        .enumerate()
+        .map(|(slot, binding)| (binding, slot))
+        .collect()
 }
 
 /// `let`/`var` bindings stay writable from every nested closure, including
@@ -925,14 +961,247 @@ fn loads_after_numeric_store(
         .collect()
 }
 
-fn module_numeric_constants(functions: &[Function]) -> HashMap<u32, f64> {
+/// Where a binding is written: (function, block, instruction index).
+type Site = (u32, u32, usize);
+
+/// Proves that a single binding store has executed before a load, so the
+/// load may be replaced by the stored constant. Without that proof the load
+/// must stay: it observes `undefined` (`var`) or throws the TDZ
+/// `ReferenceError` (`let` / `const` / `class`).
+struct StoreDominance {
+    /// Per function: block -> blocks that dominate it (itself included).
+    dominators: HashMap<u32, HashMap<u32, HashSet<u32>>>,
+    /// Per function: every `CreateClosure` site that instantiates it.
+    created_at: HashMap<u32, Vec<Site>>,
+}
+
+impl StoreDominance {
+    fn new(functions: &[Function]) -> Self {
+        let mut created_at: HashMap<u32, Vec<Site>> = HashMap::new();
+        let mut dominators = HashMap::new();
+        for function in functions {
+            for block in &function.blocks {
+                for (index, instruction) in block.instructions.iter().enumerate() {
+                    if let Instruction::CreateClosure {
+                        function: child, ..
+                    } = instruction
+                    {
+                        created_at.entry(child.0).or_default().push((
+                            function.id.0,
+                            block.id.0,
+                            index,
+                        ));
+                    }
+                }
+            }
+            dominators.insert(function.id.0, block_dominators(function));
+        }
+        Self {
+            dominators,
+            created_at,
+        }
+    }
+
+    /// True when `store` has run whenever the instruction at `load` runs.
+    fn store_precedes(&self, store: Site, load: Site) -> bool {
+        self.precedes(store, load, 0)
+    }
+
+    fn precedes(&self, store: Site, load: Site, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if store.0 == load.0 {
+            if store.1 == load.1 {
+                return store.2 < load.2;
+            }
+            return self
+                .dominators
+                .get(&load.0)
+                .and_then(|doms| doms.get(&load.1))
+                .is_some_and(|doms| doms.contains(&store.1));
+        }
+        // Another function: every closure instantiating it must be created
+        // after the store (hoisted declarations are created first, so they
+        // keep the checked load).
+        match self.created_at.get(&load.0) {
+            Some(sites) if !sites.is_empty() => sites
+                .iter()
+                .all(|site| self.precedes(store, *site, depth + 1)),
+            _ => false,
+        }
+    }
+}
+
+/// Iterative dominator sets over normal, exception and suspension edges.
+/// Blocks unreachable from the entry are dominated by nothing.
+fn block_dominators(function: &Function) -> HashMap<u32, HashSet<u32>> {
+    let mut preds: HashMap<u32, HashSet<u32>> = HashMap::new();
+    let mut edge = |from: u32, to: u32| {
+        preds.entry(to).or_default().insert(from);
+    };
+    for block in &function.blocks {
+        if let Some(last) = block.instructions.last() {
+            match last {
+                Instruction::Jump { target } => edge(block.id.0, target.0),
+                Instruction::Branch {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    edge(block.id.0, then_block.0);
+                    edge(block.id.0, else_block.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    for region in &function.exception_regions {
+        for protected in &region.protected_blocks {
+            for handler in [region.catch_block, region.finally_block]
+                .into_iter()
+                .flatten()
+            {
+                edge(protected.0, handler.0);
+            }
+        }
+    }
+    for point in &function.suspension_points {
+        edge(point.await_block.0, point.resume_block.0);
+        edge(point.await_block.0, point.reject_block.0);
+    }
+    for point in &function.generator_suspension_points {
+        edge(point.yield_block.0, point.resume_block.0);
+        edge(point.yield_block.0, point.throw_block.0);
+        edge(point.yield_block.0, point.return_block.0);
+    }
+    let all: HashSet<u32> = function.blocks.iter().map(|block| block.id.0).collect();
+    let entry = function.entry.0;
+    let mut doms: HashMap<u32, HashSet<u32>> = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let set = if block.id.0 == entry {
+                HashSet::from([entry])
+            } else {
+                all.clone()
+            };
+            (block.id.0, set)
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &function.blocks {
+            let id = block.id.0;
+            if id == entry {
+                continue;
+            }
+            let mut next: Option<HashSet<u32>> = None;
+            for pred in preds.get(&id).into_iter().flatten() {
+                let pred_doms = &doms[pred];
+                next = Some(match next {
+                    None => pred_doms.clone(),
+                    Some(acc) => acc.intersection(pred_doms).copied().collect(),
+                });
+            }
+            let mut next = next.unwrap_or_else(|| all.clone());
+            next.insert(id);
+            if next != doms[&id] {
+                doms.insert(id, next);
+                changed = true;
+            }
+        }
+    }
+    // Unreachable blocks keep the full set; nothing may be proven there.
+    let reachable = {
+        let mut seen = HashSet::from([entry]);
+        let mut stack = vec![entry];
+        let mut succs: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (to, froms) in &preds {
+            for from in froms {
+                succs.entry(*from).or_default().push(*to);
+            }
+        }
+        while let Some(block) = stack.pop() {
+            for next in succs.get(&block).into_iter().flatten() {
+                if seen.insert(*next) {
+                    stack.push(*next);
+                }
+            }
+        }
+        seen
+    };
+    doms.retain(|block, _| reachable.contains(block));
+    doms
+}
+
+/// Numeric bindings stored exactly once with a literal, plus the
+/// (function, binding) load sites that must check initialization first.
+/// A load not proven to follow the store keeps the constant only for
+/// lexical bindings (TDZ check); a `var` read there would see `undefined`.
+fn module_numeric_constants(functions: &[Function]) -> (HashMap<u32, f64>, HashSet<(u32, u32)>) {
+    let dominance = StoreDominance::new(functions);
+    let lexical: HashSet<u32> = functions
+        .iter()
+        .flat_map(|function| &function.bindings)
+        .filter(|binding| {
+            matches!(
+                binding.kind,
+                BindingKind::Let | BindingKind::Const | BindingKind::Class
+            )
+        })
+        .map(|binding| binding.id.0)
+        .collect();
+    let mut store_sites: HashMap<u32, Vec<Site>> = HashMap::new();
+    for function in functions {
+        for block in &function.blocks {
+            for (index, instruction) in block.instructions.iter().enumerate() {
+                if let Instruction::InitializeBinding { binding, .. }
+                | Instruction::StoreBinding { binding, .. } = instruction
+                {
+                    store_sites.entry(binding.0).or_default().push((
+                        function.id.0,
+                        block.id.0,
+                        index,
+                    ));
+                }
+            }
+        }
+    }
+    let single_store = |binding: u32| match store_sites.get(&binding).map(Vec::as_slice) {
+        Some([site]) => Some(*site),
+        _ => None,
+    };
     let mut known = HashMap::new();
     loop {
         let mut stores: HashMap<u32, Vec<Option<f64>>> = HashMap::new();
+        let mut unsafe_loads: HashSet<u32> = HashSet::new();
+        let mut guarded: HashSet<(u32, u32)> = HashSet::new();
         for function in functions {
             for block in &function.blocks {
                 let mut regs: HashMap<u32, f64> = HashMap::new();
-                for instruction in &block.instructions {
+                for (index, instruction) in block.instructions.iter().enumerate() {
+                    if let Instruction::LoadBinding { binding, .. } = instruction {
+                        let safe = single_store(binding.0).is_some_and(|store| {
+                            dominance.store_precedes(store, (function.id.0, block.id.0, index))
+                        });
+                        // A `var` read from another function (typically a
+                        // hoisted function reading a module-level `var` limit)
+                        // keeps the constant: only a call before the
+                        // initializer would observe `undefined`, and the hot
+                        // fused loops depend on the folded value.
+                        let foreign_var = !lexical.contains(&binding.0)
+                            && single_store(binding.0)
+                                .is_some_and(|store| store.0 != function.id.0);
+                        if !safe && !foreign_var {
+                            if lexical.contains(&binding.0) && single_store(binding.0).is_some() {
+                                guarded.insert((function.id.0, binding.0));
+                            } else {
+                                unsafe_loads.insert(binding.0);
+                            }
+                        }
+                    }
                     match instruction {
                         Instruction::LoadConstant {
                             dst,
@@ -972,6 +1241,7 @@ fn module_numeric_constants(functions: &[Function]) -> HashMap<u32, f64> {
         }
         let next = stores
             .into_iter()
+            .filter(|(id, _)| !unsafe_loads.contains(id))
             .filter_map(|(id, values)| {
                 if values.len() == 1 {
                     values[0].map(|value| (id, value))
@@ -981,7 +1251,8 @@ fn module_numeric_constants(functions: &[Function]) -> HashMap<u32, f64> {
             })
             .collect::<HashMap<_, _>>();
         if next == known {
-            return known;
+            guarded.retain(|(_, binding)| known.contains_key(binding));
+            return (known, guarded);
         }
         known = next;
     }
@@ -1469,6 +1740,11 @@ fn emit_unboxed_reg_storage(plan: &EscapePlan) -> (String, String) {
                 plan.n_num_bindings
             ));
         }
+    }
+    if !plan.tdz_cache.is_empty() {
+        let slots = plan.tdz_cache.len();
+        fields.push_str(&format!("    tdz_ready: [bool; {slots}],\n"));
+        inits.push_str(&format!("        tdz_ready: [false; {slots}],\n"));
     }
     (fields, inits)
 }
@@ -2440,8 +2716,9 @@ fn generate_function_tree(
         outermost
     });
     if install_constants {
-        NUMERIC_CONSTANTS
-            .with(|slot| *slot.borrow_mut() = module_numeric_constants(&module.functions));
+        let (constants, guarded) = module_numeric_constants(&module.functions);
+        NUMERIC_CONSTANTS.with(|slot| *slot.borrow_mut() = constants);
+        GUARDED_CONSTANTS.with(|slot| *slot.borrow_mut() = guarded);
         MODULE_FUNCTIONS.with(|slot| *slot.borrow_mut() = module.functions.clone());
         EVAL_BINDINGS.with(|cache| *cache.borrow_mut() = None);
     }
@@ -5926,7 +6203,11 @@ fn match_indexed_text_rewrite(
 }
 
 fn binding_number_expr(plan: &EscapePlan, binding: u32) -> String {
-    if let Some(number) = plan.constants.get(&binding) {
+    if let Some(number) = plan
+        .constants
+        .get(&binding)
+        .filter(|_| !plan.guarded.contains(&binding))
+    {
         return format!("{number:?}");
     }
     if let Some(slot) = num_binding_slot(plan, binding) {
@@ -7279,6 +7560,26 @@ fn emit_instruction(
             if num_binding_slot(plan, binding.0).is_some() =>
         {
             emit_numeric_binding_load(plan, dst.0, num_binding_slot(plan, binding.0).unwrap())
+        }
+        Instruction::LoadBinding { dst, binding }
+            if plan.constants.contains_key(&binding.0) && plan.guarded.contains(&binding.0) =>
+        {
+            let getter = emit_capture_get(storage, binding.0);
+            let cell = emit_binding_get(storage, binding.0);
+            let propagate = emit_exception_propagation(exception_target, mode, plan);
+            let check = format!(
+                "{{ let __w3cos_ready = if let Some(getter) = {getter} {{ w3cos_core::catch_js(|| getter.call_slice(w3cos_core::Value::Undefined, &[])).is_ok() }} else {{ matches!({cell}, Some(cell) if cell.borrow().1) }}; if !__w3cos_ready {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}"
+            );
+            let check = match plan.tdz_cache.get(&binding.0) {
+                Some(slot) => format!(
+                    "if !self.tdz_ready[{slot}] {{ {check} self.tdz_ready[{slot}] = true; }}"
+                ),
+                None => check,
+            };
+            format!(
+                "{check} {}",
+                emit_constant_binding_load(plan, dst.0, plan.constants[&binding.0])
+            )
         }
         Instruction::LoadBinding { dst, binding } if plan.constants.contains_key(&binding.0) => {
             emit_constant_binding_load(plan, dst.0, plan.constants[&binding.0])
@@ -9956,6 +10257,73 @@ fn main() {{
             );
         }
         assert!(generated.contains("let refreshed = binding.borrow().clone()"));
+    }
+
+    fn constants_for(source: &str) -> (Module, HashMap<u32, f64>, HashSet<(u32, u32)>) {
+        let module = crate::w3ir_lowering::lower_script(source, "app:///tdz.js").unwrap();
+        let (constants, guarded) = module_numeric_constants(&module.functions);
+        (module, constants, guarded)
+    }
+
+    fn binding_named(module: &Module, name: &str) -> u32 {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.bindings)
+            .find(|binding| binding.name == name)
+            .unwrap_or_else(|| panic!("binding {name}"))
+            .id
+            .0
+    }
+
+    #[test]
+    fn constant_bindings_respect_tdz_and_var_hoisting() {
+        // Read before the `let` initializer: constant kept, load checked.
+        let (module, constants, guarded) = constants_for(
+            "function f() { try { x; } catch (e) { return 'tdz'; } let x = 1; return 'no'; } f;",
+        );
+        let x = binding_named(&module, "x");
+        assert_eq!(constants.get(&x), Some(&1.0));
+        assert!(guarded.iter().any(|(_, binding)| *binding == x));
+
+        // A `var` read before its only store sees `undefined`: no constant.
+        let (module, constants, _) =
+            constants_for("function f() { var r = y; var y = 7; return r; } f;");
+        assert!(!constants.contains_key(&binding_named(&module, "y")));
+
+        // Hoisted closure created before the store: checked in the closure.
+        let (module, constants, guarded) = constants_for(
+            "function f() { const n = 5; return g(); function g() { return n + 1; } } f;",
+        );
+        let n = binding_named(&module, "n");
+        assert_eq!(constants.get(&n), Some(&5.0));
+        assert!(guarded.iter().any(|(_, binding)| *binding == n));
+
+        // Store dominates every load (same function and a later closure):
+        // forwarded with no check.
+        let (module, constants, guarded) = constants_for(
+            "function f() { const k = 3; var s = 0; for (var i = 0; i < 4; i++) { s += k; } var h = function () { return k; }; return s + h(); } f;",
+        );
+        let k = binding_named(&module, "k");
+        assert_eq!(constants.get(&k), Some(&3.0));
+        assert!(!guarded.iter().any(|(_, binding)| *binding == k));
+    }
+
+    #[test]
+    fn guarded_constant_loads_emit_a_tdz_check() {
+        let module = crate::w3ir_lowering::lower_script(
+            "function f() { const n = 5; return g(); function g() { return n + 1; } } f;",
+            "app:///tdz-guard.js",
+        )
+        .unwrap();
+        let entry = module
+            .functions
+            .iter()
+            .find(|f| f.id == module.entry)
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, entry, "tdz_guard").unwrap();
+        assert!(generated.contains("tdz_ready"), "{generated}");
+        assert!(generated.contains("binding is not initialized"));
     }
 
     fn assert_fused_after_gate(generated: &str, intrinsic: &str) {
