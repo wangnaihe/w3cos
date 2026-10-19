@@ -2780,7 +2780,9 @@ export function main() {{ bump(); return value + plugin.value; }}"#
 
         // Builtins: `node:` always; bare names only when no package exists.
         // w3cos-node provides some; the rest stay a coded resolution error.
-        let fs = resolver.resolve_with("fs", &src, Require).unwrap_err();
+        let fs = resolver
+            .resolve_with("child_process", &src, Require)
+            .unwrap_err();
         assert!(format!("{fs:#}").contains("Node builtin"), "{fs:#}");
         let events = resolver.resolve_with("node:events", &src, Require).unwrap();
         assert_eq!(events.package_name.as_deref(), Some("node:events"));

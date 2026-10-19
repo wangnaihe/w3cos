@@ -14,6 +14,8 @@ pub const MODULES: &[(&str, &str)] = &[
     ),
     ("buffer", include_str!("../js/buffer.js")),
     ("events", include_str!("../js/events.js")),
+    ("fs", include_str!("../js/fs.js")),
+    ("fs/promises", "module.exports = require('fs').promises;\n"),
     ("os", include_str!("../js/os.js")),
     ("path", include_str!("../js/path.js")),
     ("path/posix", "module.exports = require('path');\n"),
@@ -73,6 +75,6 @@ mod tests {
     fn node_prefix_is_accepted() {
         assert!(source("node:path").is_some());
         assert!(source("node:timers/promises").is_some());
-        assert!(source("fs").is_none());
+        assert!(source("fs").is_some());
     }
 }

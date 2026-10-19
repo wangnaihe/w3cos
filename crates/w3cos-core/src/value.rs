@@ -2210,6 +2210,15 @@ impl Value {
             }
             ValueUnpack::String(s) => s.as_str().to_string(),
             ValueUnpack::Array(arr) => {
+                // A typed array with an installed prototype (Buffer) uses
+                // that prototype's toString.
+                if let Some(to_string) =
+                    crate::binary::typed_array_prototype_property(self, "toString")
+                    && to_string.is_callable()
+                    && let Some(value) = to_string.call(self.clone(), vec![]).as_js_string()
+                {
+                    return value.as_str().to_string();
+                }
                 let elems: Vec<String> = arr
                     .borrow()
                     .iter()

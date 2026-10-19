@@ -4642,6 +4642,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         // CommonJS/Node artifacts that appear in UMD-wrapped sources.
         // `process` is one host-backed object per page (env, argv, cwd, exit).
         "process" => "w3cos_core::process_value()".to_string(),
+        // Native host functions for w3cos-node's fs/crypto glue.
+        "__w3cos_node_host" => "w3cos_core::node_host::node_host_value()".to_string(),
         "require" | "module" | "exports" | "global" | "Buffer" | "__dirname"
         | "__filename"
         // AMD (`define`/`define.amd`) and Worker (`importScripts`) globals:

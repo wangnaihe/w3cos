@@ -409,3 +409,124 @@ fn node_stream_matches_node() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+const FS_MAIN: &str = r##"const fs = require("fs");
+const fsp = require("node:fs/promises");
+const path = require("path");
+const os = require("os");
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "w3fs-"));
+const rel = (s) => String(s).split(tmp).join("<tmp>");
+const out = (...a) => console.log(...a.map(rel));
+const err = (fn) => { try { fn(); return "ok"; } catch (e) { return e.code + "/" + e.syscall + "/" + e.errno + "/" + rel(e.message); } };
+
+const f = path.join(tmp, "a.txt");
+fs.writeFileSync(f, "héllo\n");
+fs.appendFileSync(f, Buffer.from("world"));
+out("read", JSON.stringify(fs.readFileSync(f, "utf8")), fs.readFileSync(f).length, fs.readFileSync(f, { encoding: "hex" }).slice(0, 6), Buffer.isBuffer(fs.readFileSync(f)));
+const st = fs.statSync(f);
+out("stat", st.isFile(), st.isDirectory(), st.size, typeof st.mtimeMs, st.mtime instanceof Date, (st.mode & 0o170000) === fs.constants.S_IFREG);
+out("exists", fs.existsSync(f), fs.existsSync(path.join(tmp, "nope")), fs.statSync(path.join(tmp, "nope"), { throwIfNoEntry: false }));
+out("enoent", err(() => fs.readFileSync(path.join(tmp, "nope"))));
+out("mkdir", rel(fs.mkdirSync(path.join(tmp, "d1/d2/d3"), { recursive: true })), err(() => fs.mkdirSync(path.join(tmp, "d1"))));
+fs.writeFileSync(path.join(tmp, "d1/b.bin"), new Uint8Array([1, 2, 3]));
+out("readdir", fs.readdirSync(tmp).join(","), fs.readdirSync(path.join(tmp, "d1"), { withFileTypes: true }).map((d) => d.name + ":" + d.isDirectory()).join(","));
+out("recursive", fs.readdirSync(tmp, { recursive: true }).sort().join(","));
+fs.renameSync(f, path.join(tmp, "c.txt"));
+fs.copyFileSync(path.join(tmp, "c.txt"), path.join(tmp, "e.txt"));
+out("copy", err(() => fs.copyFileSync(path.join(tmp, "c.txt"), path.join(tmp, "e.txt"), fs.constants.COPYFILE_EXCL)), fs.readFileSync(path.join(tmp, "e.txt"), "utf8").length);
+out("rmdir-notempty", err(() => fs.rmdirSync(path.join(tmp, "d1"))).split("/")[0], err(() => fs.rmSync(path.join(tmp, "d1"))).split("/")[0]);
+fs.rmSync(path.join(tmp, "d1"), { recursive: true });
+out("rm", fs.existsSync(path.join(tmp, "d1")), err(() => fs.rmSync(path.join(tmp, "zz"), { force: true })), err(() => fs.unlinkSync(path.join(tmp, "zz"))));
+fs.symlinkSync(path.join(tmp, "c.txt"), path.join(tmp, "link"));
+out("symlink", fs.lstatSync(path.join(tmp, "link")).isSymbolicLink(), fs.statSync(path.join(tmp, "link")).isFile(), rel(fs.readlinkSync(path.join(tmp, "link"))), rel(fs.realpathSync(path.join(tmp, "link"))) === rel(fs.realpathSync(path.join(tmp, "c.txt"))));
+const fd = fs.openSync(path.join(tmp, "fd.txt"), "w+");
+out("fd-write", fs.writeSync(fd, "abcdef"), fs.writeSync(fd, Buffer.from("XY"), 0, 2, 1));
+const buf = Buffer.alloc(4);
+out("fd-read", fs.readSync(fd, buf, 0, 4, 0), buf.toString(), fs.fstatSync(fd).size);
+fs.ftruncateSync(fd, 3);
+fs.closeSync(fd);
+out("fd-closed", fs.readFileSync(path.join(tmp, "fd.txt"), "utf8"), err(() => fs.closeSync(fd)).split("/")[0]);
+fs.chmodSync(path.join(tmp, "c.txt"), 0o600);
+out("chmod", (fs.statSync(path.join(tmp, "c.txt")).mode & 0o777).toString(8), err(() => fs.accessSync(path.join(tmp, "c.txt"), fs.constants.R_OK)));
+fs.utimesSync(path.join(tmp, "c.txt"), 1000, 2000);
+out("utimes", fs.statSync(path.join(tmp, "c.txt")).mtimeMs);
+fs.truncateSync(path.join(tmp, "c.txt"), 2);
+out("truncate", fs.readFileSync(path.join(tmp, "c.txt"), "latin1").length);
+
+fs.readFile(path.join(tmp, "e.txt"), "utf8", (e, data) => {
+  out("cb readFile", e, data.length);
+  fs.stat(path.join(tmp, "missing"), (e2) => {
+    out("cb stat err", e2.code);
+    (async () => {
+      await fsp.writeFile(path.join(tmp, "p.txt"), "promised");
+      out("promises", await fsp.readFile(path.join(tmp, "p.txt"), "utf8"), (await fsp.stat(path.join(tmp, "p.txt"))).size);
+      const fh = await fsp.open(path.join(tmp, "p.txt"), "r");
+      const { bytesRead, buffer } = await fh.read(Buffer.alloc(3), 0, 3, 0);
+      out("filehandle", bytesRead, buffer.toString(), typeof fh.fd);
+      await fh.close();
+      try { await fsp.readFile(path.join(tmp, "missing")); } catch (e3) { out("promises err", e3.code, e3.syscall); }
+      const ws = fs.createWriteStream(path.join(tmp, "s.txt"));
+      ws.write("line1\n"); ws.end("line2\n");
+      ws.on("finish", () => {
+        const chunks = [];
+        fs.createReadStream(path.join(tmp, "s.txt"), { encoding: "utf8", highWaterMark: 4 })
+          .on("data", (c) => chunks.push(c))
+          .on("end", () => {
+            out("streams", chunks.length, JSON.stringify(chunks.join("")));
+            const rs = fs.createReadStream(path.join(tmp, "s.txt"), { start: 2, end: 4 });
+            let part = "";
+            rs.on("data", (c) => { part += c; }).on("close", () => {
+              out("range", part);
+              fs.rmSync(tmp, { recursive: true });
+              out("cleanup", fs.existsSync(tmp));
+            });
+          });
+      });
+    })();
+  });
+});
+"##;
+
+/// `node main.cjs` (v20.19.2).
+const FS_NODE_OUTPUT: &str = r##"read "héllo\nworld" 12 68c3a9 true
+stat true false 12 number true true
+exists true false undefined
+enoent ENOENT/open/-2/ENOENT: no such file or directory, open '<tmp>/nope'
+mkdir <tmp>/d1 EEXIST/mkdir/-17/EEXIST: file already exists, mkdir '<tmp>/d1'
+readdir a.txt,d1 b.bin:false,d2:true
+recursive a.txt,d1,d1/b.bin,d1/d2,d1/d2/d3
+copy EEXIST/copyfile/-17/EEXIST: file already exists, copyfile '<tmp>/c.txt' -> '<tmp>/e.txt' 11
+rmdir-notempty ENOTEMPTY ERR_FS_EISDIR
+rm false ok ENOENT/unlink/-2/ENOENT: no such file or directory, unlink '<tmp>/zz'
+symlink true true <tmp>/c.txt true
+fd-write 6 2
+fd-read 4 aXYd 6
+fd-closed aXY EBADF
+chmod 600 ok
+utimes 2000000
+truncate 2
+cb readFile null 11
+cb stat err ENOENT
+promises promised 8
+filehandle 3 pro number
+promises err ENOENT open
+streams 3 "line1\nline2\n"
+range ne1
+cleanup false
+"##;
+
+#[test]
+fn node_fs_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_fs_e2e",
+        &[
+            ("package.json", r#"{"name":"node-fs"}"#),
+            ("main.cjs", FS_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_fs_e2e");
+    let expected: Vec<&str> = FS_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
