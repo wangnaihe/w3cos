@@ -383,8 +383,10 @@ impl JsObject {
             }
         }
         let mut removed = self.properties.remove(key).is_some();
-        // Deleting an accessor property drops both of its halves.
-        if !key.starts_with("__w3cos_") && self.properties.may_have_marker_key() {
+        // Deleting an accessor property drops both of its halves. An own data
+        // slot shadowing a runtime accessor (authored override) is removed
+        // alone, re-exposing the accessor.
+        if !removed && !key.starts_with("__w3cos_") && self.properties.may_have_marker_key() {
             let getter = self
                 .properties
                 .remove(format!("__w3cos_getter_{key}").as_str())
