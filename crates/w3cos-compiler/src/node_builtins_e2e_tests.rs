@@ -41,10 +41,9 @@ console.log("removed", job.listenerCount("data"), EventEmitter.EventEmitter === 
 const util = require("util");
 console.log(util.format("%s=%d %i %f %j %%", "n", 42.5, 42.5, "1.5", { a: [1, 2] }), util.format("a", 1, "b", { c: 2 }));
 console.log(util.format("%O", { x: { y: { z: { w: 1 } } } }));
-const arrow = () => 1;
-console.log(util.inspect({ a: 1, b: "two", c: [1, 2, 3], d: { e: { f: { g: 1 } } }, fn: function named() {}, arrow }).split("\n").join("|"));
+console.log(util.inspect({ a: 1, b: "two", c: [1, 2, 3], d: { e: { f: { g: 1 } } }, fn: function named() {}, arrow: () => 1 }).split("\n").join("|"));
 console.log(util.inspect([1, "x", null, undefined, true, -0, [[[[1]]]]]), util.inspect("it's"), util.inspect(new Map([["k", 1]])), util.inspect(new Set([1, 2])));
-console.log(util.inspect({}), util.inspect([]), util.inspect(new Date(0)), util.inspect(/re/g));
+console.log(util.inspect(Object.create(null)), util.inspect({}), util.inspect([]), util.inspect(new Date(0)), util.inspect(/re/g));
 function Base() {}
 Base.prototype.hello = function () { return "hi"; };
 function Derived() { Base.call(this); }
@@ -56,7 +55,7 @@ const custom = { [util.inspect.custom]() { return "CUSTOM"; } };
 console.log("custom", util.inspect(custom), util.inspect.custom === Symbol.for("nodejs.util.inspect.custom"));
 
 const url = require("url");
-console.log("fileURLToPath", url.fileURLToPath("file:///tmp/a%20b.txt"), url.pathToFileURL("/tmp/x y#1.txt").pathname);
+console.log("fileURLToPath", url.fileURLToPath("file:///tmp/a%20b.txt"), url.pathToFileURL("/tmp/x y#1.txt").href);
 console.log("url format", url.format({ protocol: "https", hostname: "example.com", pathname: "/p", query: { q: "1 2" } }));
 console.log("URL", new url.URL("https://a.b/c?d=1").searchParams.get("d"), url.URL === URL);
 try { url.fileURLToPath("https://x/y"); } catch (e) { console.log("url err", e.code); }
@@ -80,6 +79,7 @@ timers.setTimeout((a, b) => {
     console.log("seq", seq.join(","));
   });
 }, 0, "x", "y");
+console.log("object model", ({}) instanceof Object, Object.getPrototypeOf({}) === Object.prototype, ({}).constructor === Object, new Date(0) instanceof Date, Object.prototype.toString.call(new Date(0)), Object.prototype.toString.call([]), typeof ({}).hasOwnProperty);
 "##;
 
 /// `node main.cjs` (v20.19.2).
@@ -105,17 +105,18 @@ n=42.5 42 1.5 {"a":[1,2]} % a 1 b { c: 2 }
 { x: { y: { z: [Object] } } }
 {|  a: 1,|  b: 'two',|  c: [ 1, 2, 3 ],|  d: { e: { f: [Object] } },|  fn: [Function: named],|  arrow: [Function: arrow]|}
 [ 1, 'x', null, undefined, true, -0, [ [ [Array] ] ] ] "it's" Map(1) { 'k' => 1 } Set(2) { 1, 2 }
-{} [] 1970-01-01T00:00:00.000Z /re/g
+[Object: null prototype] {} {} [] 1970-01-01T00:00:00.000Z /re/g
 inherits hi true
 deepEqual true false true
 types true true true true true
 custom CUSTOM true
-fileURLToPath /tmp/a b.txt /tmp/x%20y%231.txt
+fileURLToPath /tmp/a b.txt file:///tmp/x%20y%231.txt
 url format https://example.com/p?q=1%202
 URL 1 true
 url err ERR_INVALID_URL_SCHEME
 os "\n" linux Linux LE string string 15 2
 process linux function object 2 object true string
+object model true true true true [object Date] [object Array] function
 seq tick1,tick2,micro,timeout:xy,promise:val
 "##;
 
