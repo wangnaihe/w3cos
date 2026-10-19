@@ -622,6 +622,18 @@ fn optional_chain_member(expression: &Expr) -> Option<&MemberExpr> {
     }
 }
 
+/// `IsAnonymousFunctionDefinition`: an arrow or unnamed function
+/// expression (through parentheses), which takes its name from the
+/// property key or binding it initializes.
+fn is_anonymous_function_definition(expression: &Expr) -> bool {
+    match expression {
+        Expr::Paren(paren) => is_anonymous_function_definition(&paren.expr),
+        Expr::Arrow(_) => true,
+        Expr::Fn(function) => function.ident.is_none(),
+        _ => false,
+    }
+}
+
 fn object_property_name(name: &PropName) -> Option<String> {
     match name {
         PropName::Ident(identifier) => Some(identifier.sym.to_string()),
@@ -784,6 +796,9 @@ struct Builder {
     /// Return annotation of the function about to be lowered by
     /// `lower_nested_function`; consumed (taken) there.
     pending_return_hint: Option<TypeHint>,
+    /// Name an anonymous function/arrow takes from its object-literal key
+    /// (`{ f: () => 1 }.f.name === "f"`); consumed by the next one lowered.
+    pending_function_name: Option<String>,
 }
 
 impl Builder {
@@ -836,6 +851,7 @@ impl Builder {
             terminated: false,
             type_names: Default::default(),
             pending_return_hint: None,
+            pending_function_name: None,
         }
     }
 
@@ -892,6 +908,7 @@ impl Builder {
             terminated: false,
             type_names: Default::default(),
             pending_return_hint: None,
+            pending_function_name: None,
         }
     }
 
@@ -3664,10 +3681,16 @@ impl Builder {
                         }
                         PropOrSpread::Prop(property) => {
                             let (key, value) = match property.as_ref() {
-                                Prop::KeyValue(property) => (
-                                    self.lower_property_name(&property.key)?,
-                                    self.lower_expression(&property.value)?,
-                                ),
+                                Prop::KeyValue(property) => {
+                                    let key = self.lower_property_name(&property.key)?;
+                                    if is_anonymous_function_definition(&property.value) {
+                                        self.pending_function_name =
+                                            object_property_name(&property.key);
+                                    }
+                                    let value = self.lower_expression(&property.value);
+                                    self.pending_function_name = None;
+                                    (key, value?)
+                                }
                                 Prop::Shorthand(identifier) => (
                                     self.constant(Constant::String(identifier.sym.to_string())),
                                     self.lower_expression(&Expr::Ident(identifier.clone()))?,
@@ -3810,6 +3833,7 @@ impl Builder {
                     ));
                 }
                 let parameters = arrow.params.clone();
+                let inferred_name = self.pending_function_name.take();
                 self.pending_return_hint =
                     Some(return_hint(arrow.return_type.as_deref(), &self.type_names));
                 match arrow.body.as_ref() {
@@ -3817,7 +3841,7 @@ impl Builder {
                         parameters,
                         &body.stmts,
                         None,
-                        None,
+                        inferred_name,
                         arrow.is_async,
                         false,
                         false,
@@ -3827,7 +3851,7 @@ impl Builder {
                         parameters,
                         &[],
                         Some(expression.as_ref()),
-                        None,
+                        inferred_name,
                         arrow.is_async,
                         false,
                         false,
@@ -3851,10 +3875,12 @@ impl Builder {
                     function.function.return_type.as_deref(),
                     &self.type_names,
                 ));
+                let inferred_name = self.pending_function_name.take();
                 let name = function
                     .ident
                     .as_ref()
-                    .map(|identifier| identifier.sym.to_string());
+                    .map(|identifier| identifier.sym.to_string())
+                    .or(inferred_name);
                 let self_binding = function.ident.as_ref().filter(|identifier| {
                     function_references_name(&function.function, &identifier.sym)
                 });
