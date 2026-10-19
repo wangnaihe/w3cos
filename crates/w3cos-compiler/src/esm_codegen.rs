@@ -3932,12 +3932,12 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
             ),
             (
                 "instance_field",
-                "export class Broken { value = String.raw`unsupported`; }",
+                "export class Broken { value = new.target; }",
                 "class initialization lowering did not produce W3IR",
             ),
             (
                 "static_block",
-                "export class Broken { static { String.raw`unsupported`; } }",
+                "export class Broken { static { new.target; } }",
                 "class initialization lowering did not produce W3IR",
             ),
         ];
@@ -10339,7 +10339,7 @@ fn main() {{
         let root = fixture_root("w3cos_esm_codegen_module_init_failure");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let entry = root.join("src/app.js");
-        std::fs::write(&entry, "export const result = String.raw`not-yet-lowered`;").unwrap();
+        std::fs::write(&entry, "export const result = new.target;").unwrap();
 
         let resolver = EsmResolver::new(&root);
         let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
@@ -10357,7 +10357,7 @@ fn main() {{
             diagnostic.contains("W3IR module initialization failed")
                 && diagnostic.contains(&entry.display().to_string())
                 && diagnostic.contains("chunk 0..1")
-                && diagnostic.contains("TaggedTpl"),
+                && diagnostic.contains("new.target"),
             "the error must identify the module, W3IR phase, chunk and unsupported syntax: {diagnostic}"
         );
         std::fs::remove_dir_all(root).ok();

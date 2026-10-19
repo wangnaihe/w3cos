@@ -1967,7 +1967,7 @@ export function keymap() {}"#,
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         let entry = root.join("src/app.js");
-        std::fs::write(&entry, "export const result = String.raw`not-yet-lowered`;").unwrap();
+        std::fs::write(&entry, "export const result = new.target;").unwrap();
 
         let out = root.join("build");
         let error = compile_from_file(&entry, &out)
@@ -1976,7 +1976,7 @@ export function keymap() {}"#,
         assert!(
             diagnostic.contains("W3IR module initialization failed")
                 && diagnostic.contains(&entry.display().to_string())
-                && diagnostic.contains("TaggedTpl"),
+                && (diagnostic.contains("new.target") || diagnostic.contains("MetaProp")),
             "production diagnostic must preserve the module and W3IR cause: {diagnostic}"
         );
         assert!(

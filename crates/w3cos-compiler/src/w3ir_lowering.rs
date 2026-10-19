@@ -610,6 +610,14 @@ fn labeled_statement_targets_breakable(statement: &Stmt) -> bool {
     }
 }
 
+fn expression_ends_in_optional_chain(expression: &Expr) -> bool {
+    match expression {
+        Expr::OptChain(_) => true,
+        Expr::Paren(parenthesized) => expression_ends_in_optional_chain(&parenthesized.expr),
+        _ => false,
+    }
+}
+
 fn optional_chain_member(expression: &Expr) -> Option<&MemberExpr> {
     match expression {
         Expr::Member(member) => Some(member),
@@ -4231,6 +4239,12 @@ impl Builder {
     /// `tag\`a${b}c\`` → `tag(["a","c"], b)` (cooked strings only; enough
     /// for Code-OSS `inline` CSS helpers that never read `.raw`).
     fn lower_tagged_template(&mut self, tagged: &swc_ecma_ast::TaggedTpl) -> Result<Register> {
+        // Early Error: OptionalChain TemplateLiteral / ?.TemplateLiteral.
+        if expression_ends_in_optional_chain(&tagged.tag) {
+            return Err(anyhow!(
+                "SyntaxError: optional chain cannot be followed by a template literal"
+            ));
+        }
         let tag = self.lower_expression(&tagged.tag)?;
         let template = tagged.tpl.as_ref();
         if template.quasis.len() != template.exprs.len() + 1 {

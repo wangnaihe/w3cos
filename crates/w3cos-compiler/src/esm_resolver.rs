@@ -235,6 +235,9 @@ impl ParsedModuleGraph {
 
             // `import { X } from "./a.js"; export { X };` — the local name is
             // an import binding whose live cell lives in `./a.js`, not here.
+            // Namespace imports (`import * as ns` / `export * as ns`) stay local:
+            // their cell is the module's synthetic namespace object, not an
+            // export named `*` on the target.
             let local_name = export
                 .local
                 .clone()
@@ -242,7 +245,7 @@ impl ParsedModuleGraph {
             if let Some(binding) = module_info
                 .imports
                 .iter()
-                .find(|imp| imp.local == local_name)
+                .find(|imp| imp.local == local_name && imp.imported != "*")
             {
                 let from_dir = module_path.parent().unwrap_or_else(|| Path::new("."));
                 match resolver.resolve(&binding.source, from_dir) {
