@@ -122,6 +122,11 @@ mod node_sqlite;
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
+mod node_watcher;
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
 pub mod notification;
 pub mod notification_web;
 pub mod observable_web;

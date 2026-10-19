@@ -19483,8 +19483,14 @@ fn build_window_value() -> Value {
         tick_timers,
         next_timer_deadline,
     });
-    // Native-module replacements for Node glue (`@vscode/sqlite3`).
+    // Native-module replacements for Node glue (`@vscode/sqlite3`,
+    // `@parcel/watcher`).
     w3cos_core::node_host::register_extension(crate::node_sqlite::install);
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux", target_os = "windows"),
+        not(target_env = "ohos")
+    ))]
+    w3cos_core::node_host::register_extension(crate::node_watcher::install);
     let mut props: HashMap<String, Value> = HashMap::new();
 
     props.insert("document".to_string(), document_value());
