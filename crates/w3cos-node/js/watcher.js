@@ -179,7 +179,8 @@ function listTree(dir, ignored, out) {
       continue;
     }
     const isDirectory = stat.isDirectory();
-    out[file] = [stat.mtimeMs, stat.size, isDirectory ? 1 : 0];
+    // Round mtime to whole ms: JSON float round-trips can otherwise spuriously flag unchanged files as updates on some CI filesystems.
+    out[file] = [Math.round(stat.mtimeMs), stat.size, isDirectory ? 1 : 0];
     if (isDirectory) listTree(file, ignored, out);
   }
 }
