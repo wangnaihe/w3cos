@@ -2420,6 +2420,18 @@ pub fn named_function(
     function
 }
 
+/// [`named_function`] for a generator function: owns a fresh ordinary
+/// `prototype` (no `constructor`), distinct per function.
+pub fn named_generator_function(
+    name: &str,
+    length: u32,
+    f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+) -> Value {
+    let function = named_function(name, length, f);
+    function.set_property("prototype", Value::object(HashMap::new()));
+    function
+}
+
 /// [`named_function`] for an ordinary function declaration: also owns a
 /// `prototype` whose non-enumerable `constructor` points back at it.
 pub fn named_constructor_function(
