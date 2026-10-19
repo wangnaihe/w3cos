@@ -62,9 +62,22 @@ pub fn classify(
     source: &str,
     in_type_module_scope: bool,
 ) -> Result<Option<CjsAnalysis>> {
+    classify_as(path, source, in_type_module_scope, false)
+}
+
+/// [`classify`]; a `classic_script` (an Electron preload or page script,
+/// evaluated when a window loads it) is CommonJS unless it has module
+/// syntax, even without `require`/`module`/`exports`, so it gets a lazily
+/// evaluated record instead of running at startup like an ES module.
+pub fn classify_as(
+    path: &Path,
+    source: &str,
+    in_type_module_scope: bool,
+    classic_script: bool,
+) -> Result<Option<CjsAnalysis>> {
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let forced = extension == "cjs";
-    if !forced {
+    if !forced && !classic_script {
         if !matches!(extension, "js" | "jsx" | "") || in_type_module_scope {
             return Ok(None);
         }
@@ -124,7 +137,7 @@ pub fn classify(
     for statement in &statements {
         statement.visit_with(&mut scan);
     }
-    if !forced && !scan.uses_commonjs {
+    if !forced && !classic_script && !scan.uses_commonjs {
         return Ok(None);
     }
     let mut analysis = CjsAnalysis {

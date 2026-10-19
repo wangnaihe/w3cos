@@ -36,6 +36,12 @@ pub const MODULES: &[(&str, &str)] = &[
     ("zlib", include_str!("../js/zlib.js")),
 ];
 
+/// `electron` / `@w3cos/electron` (not a Node builtin): Electron's main- and
+/// renderer-process API over one AOT-compiled w3cos process. The compiler
+/// writes the app's pages and renderer scripts as `./electron_app.js` next
+/// to it.
+pub const ELECTRON: &str = include_str!("../js/electron.js");
+
 /// The builtin's name without a `node:` prefix.
 pub fn module_name(specifier: &str) -> &str {
     specifier.strip_prefix("node:").unwrap_or(specifier)
@@ -71,6 +77,22 @@ mod tests {
                 rest = &rest[end..];
             }
         }
+    }
+
+    #[test]
+    fn electron_glue_requires_builtins_and_its_app_module() {
+        let mut rest = ELECTRON;
+        while let Some(start) = rest.find("require('") {
+            rest = &rest[start + "require('".len()..];
+            let end = rest.find('\'').unwrap();
+            let dep = &rest[..end];
+            assert!(
+                dep == "./electron_app.js" || is_available(dep),
+                "electron requires unavailable {dep}"
+            );
+            rest = &rest[end..];
+        }
+        assert!(source("electron").is_none() && source("node:electron").is_none());
     }
 
     #[test]
