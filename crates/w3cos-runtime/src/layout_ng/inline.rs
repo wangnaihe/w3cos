@@ -204,11 +204,6 @@ fn is_soft_wrap_char(c: char) -> bool {
 
 /// Text style requirements shared by every S2a text leaf.
 fn text_style_reason(style: &Style) -> Option<&'static str> {
-    if style.break_spaces {
-        // BreakSpaceType::kAfterEverySpace is only modelled by the legacy
-        // wrapper (crate::line_break).
-        return Some("text:break-spaces");
-    }
     if style.position != Position::Static || style.float != Float::None {
         return Some("text:positioned");
     }
@@ -598,6 +593,11 @@ fn inline_text_reason(
             w3cos_std::style::WordBreak::Normal | w3cos_std::style::WordBreak::KeepAll
         ) {
             return Some("text:word-break");
+        }
+        // BreakSpaceType::kAfterEverySpace between items is not modelled
+        // (a paragraph leaf is wrapped by paint with crate::line_break).
+        if style.break_spaces {
+            return Some("text:break-spaces");
         }
         // Items may hold internal soft-wrap opportunities (the breaker falls
         // back when it would need one), but no forced break.
@@ -1025,10 +1025,6 @@ struct InlineItem {
     /// An atomic inline: its laid-out fragment and inline-start / block-
     /// start margins (the item's advance and metrics are its margin box).
     atomic: Option<(BoxFragment, f32, f32)>,
-    /// Outside Latin-1: opportunities between such items (ideographs,
-    /// dictionary breaks) are not modelled, so a line needing a break
-    /// next to one falls back.
-    non_latin: bool,
     /// Resolved bidi level and trailing-space level change (LeafLevel).
     bidi: LeafLevel,
     /// Baseline shift (down) from vertical-align: middle.
@@ -1037,6 +1033,45 @@ struct InlineItem {
     descent: f32,
     content_ascent: f32,
     font_height: f32,
+}
+
+/// A soft-wrap opportunity inside the item's non-space core: the engine's
+/// legacy set (spaces, hyphens, CJK) or any UAX #14 opportunity of
+/// crate::line_break.
+fn internal_opportunity(content: &str, style: &Style) -> bool {
+    let core = content.trim_matches(' ');
+    if core.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        // FillAscii: no opportunity between ASCII letters and digits.
+        return false;
+    }
+    core.chars().any(is_soft_wrap_char)
+        || crate::line_break::break_opportunities(core, crate::line_break::BreakMode::of(style))
+            .iter()
+            .any(|&o| o < core.len())
+}
+
+/// A UAX #14 break opportunity between two adjacent text items
+/// (crate::line_break over their concatenated text, with the first item's
+/// line-break / word-break).
+fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &InlineItem) -> bool {
+    if prev.atomic.is_some() || next.atomic.is_some() || prev.forced || next.forced {
+        return false;
+    }
+    let text = |item: &InlineItem| match &flat[item.index].kind {
+        ComponentKind::Text { content } => content.as_str(),
+        _ => "",
+    };
+    let (a, b) = (text(prev), text(next));
+    if a.is_empty() || b.is_empty() || a == FORCED_BREAK || b == FORCED_BREAK {
+        return false;
+    }
+    let joined = format!("{a}{b}");
+    crate::line_break::break_opportunities(
+        &joined,
+        crate::line_break::BreakMode::of(flat[prev.index].style),
+    )
+    .binary_search(&a.len())
+    .is_ok()
 }
 
 /// ShapeResult::SnappedWidth.
@@ -1581,7 +1616,6 @@ pub(super) fn layout_inline_beside(
                 aligned: aligned[k],
                 internal_break: false,
                 atomic: Some((result.fragment, margin[3], margin[0])),
-                non_latin: false,
                 bidi: levels[k],
                 shift,
                 ascent,
@@ -1672,11 +1706,10 @@ pub(super) fn layout_inline_beside(
                 aligned: aligned[k],
                 // Preserved leading spaces (pre-wrap) end in an opportunity
                 // inside the item too; collapsible ones vanish at a line start.
-                internal_break: content.trim_matches(' ').chars().any(is_soft_wrap_char)
+                internal_break: internal_opportunity(content, style)
                     || (hang_preserved
                         && content.starts_with(' ')
                         && !content.trim_start_matches(' ').is_empty()),
-                non_latin: !latin1(content),
                 bidi: levels[k],
                 shift,
                 atomic: None,
@@ -1744,11 +1777,6 @@ pub(super) fn layout_inline_beside(
             // NGLineBreaker would break inside this item.
             return super::bail("internal-break");
         }
-        if !fits && can_wrap && (item.non_latin || current.iter().any(|&k| items[k].non_latin)) {
-            // The break position may depend on UAX #14 classes S2 does not
-            // model (ideographic or dictionary opportunities).
-            return super::bail("non-latin-break");
-        }
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
             // Not even the first piece fits beside the floats: the line
             // moves down to where the band widens.
@@ -1775,8 +1803,14 @@ pub(super) fn layout_inline_beside(
             let next = current.get(j).copied().unwrap_or(i);
             let prev = current[j - 1];
             // Atomic inlines break before and after (UAX #14 CB, LB20).
-            (items[prev].ends_space || items[prev].atomic.is_some() || items[next].atomic.is_some())
-                && !items[next].starts_space
+            ((items[prev].ends_space || items[prev].atomic.is_some() || items[next].atomic.is_some())
+                && !items[next].starts_space)
+                // Between two text items: the UAX #14 opportunity of the
+                // IFC's text content at their boundary (NGLineBreaker reads
+                // the break iterator over the whole paragraph text).
+                || (!items[prev].ends_space
+                    && !items[next].starts_space
+                    && text_boundary_opportunity(flat, &items[prev], &items[next]))
         });
         match break_at {
             Some(j) if j == current.len() => lines.push(std::mem::take(&mut current)),
