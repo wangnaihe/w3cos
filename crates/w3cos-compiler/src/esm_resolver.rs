@@ -800,7 +800,7 @@ impl EsmResolver {
             return self.resolve_package_imports(specifier, from_dir, kind);
         }
         if specifier.starts_with("node:") {
-            if let Some(resolved) = node_builtin_module(specifier)? {
+            if let Some(resolved) = node_builtin_module(specifier, &self.project_root)? {
                 return Ok(resolved);
             }
             return Err(anyhow!(
@@ -810,7 +810,7 @@ impl EsmResolver {
         match self.resolve_package(specifier, from_dir, kind) {
             Ok(resolved) => Ok(resolved),
             Err(_) if is_node_builtin(specifier) && w3cos_node::is_available(specifier) => {
-                Ok(node_builtin_module(specifier)?.expect("available builtin"))
+                Ok(node_builtin_module(specifier, &self.project_root)?.expect("available builtin"))
             }
             // A bare builtin name only resolves to the builtin when no
             // package of that name is installed (`events`, `buffer`, ...
@@ -978,7 +978,13 @@ impl EsmResolver {
             crate::cjs::RUNTIME_SOURCE.to_string(),
             Vec::new(),
         );
-        let (record, imports) = crate::cjs::record_source(path, &source, &targets, &runtime);
+        let (record, imports) = crate::cjs::record_source_with_globals(
+            path,
+            &source,
+            &targets,
+            &runtime,
+            &analysis.implicit_globals,
+        );
         module_source::set_synthesized(crate::cjs::record_path(path), record, imports);
         self.write_commonjs_facade(path);
         Ok(true)
@@ -1718,15 +1724,20 @@ fn atom_to_string(atom: &impl std::fmt::Debug) -> String {
 }
 
 /// A `w3cos-node` builtin as an ordinary CommonJS file: the glue is written
-/// once per content hash under the temp dir and linked like package code.
-fn node_builtin_module(specifier: &str) -> Result<Option<ResolvedModule>> {
+/// once per content hash (and project) under the temp dir and linked like
+/// package code.
+fn node_builtin_module(specifier: &str, project_root: &Path) -> Result<Option<ResolvedModule>> {
     let Some(source) = w3cos_node::source(specifier) else {
         return Ok(None);
     };
     let name = w3cos_node::module_name(specifier);
-    let path = node_builtin_dir()?.join(format!("{}.js", name.replace('/', "__")));
+    let path = node_builtin_dir(project_root)?.join(format!("{}.js", name.replace('/', "__")));
     if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
-        let temp = path.with_extension(format!("js.{}", std::process::id()));
+        // Unique per writer: parallel resolutions in one process (tests,
+        // threaded builds) must not share a temp file.
+        static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let writer = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("js.{}.{writer}", std::process::id()));
         std::fs::write(&temp, source)
             .with_context(|| format!("writing Node builtin `{name}` to {}", temp.display()))?;
         std::fs::rename(&temp, &path)
@@ -1740,18 +1751,27 @@ fn node_builtin_module(specifier: &str) -> Result<Option<ResolvedModule>> {
     }))
 }
 
-fn node_builtin_dir() -> Result<PathBuf> {
+fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
     // FNV-1a over every builtin, so edits never reuse stale glue.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, source) in w3cos_node::MODULES {
-        for byte in name.bytes().chain(source.bytes()) {
+    let fnv = |bytes: &mut dyn Iterator<Item = u8>| {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
-    }
+        hash
+    };
+    let glue = fnv(&mut w3cos_node::MODULES
+        .iter()
+        .flat_map(|(name, source)| name.bytes().chain(source.bytes())));
+    // Per project too: a CommonJS file's synthesized record is keyed by its
+    // path process-wide and names the project's loader, so two projects
+    // compiled in one process must not share builtin paths.
+    let project = fnv(&mut project_root.to_string_lossy().bytes());
     let dir = std::env::temp_dir()
         .join("w3cos-node")
-        .join(format!("{hash:016x}"));
+        .join(format!("{glue:016x}"))
+        .join(format!("{project:016x}"));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating Node builtin dir {}", dir.display()))?;
     Ok(dir)
