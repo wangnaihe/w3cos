@@ -41,6 +41,18 @@ proc.exitCode = undefined;
 proc.config = { variables: {} };
 proc.features = {};
 
+// Node's permission model API over the host policy (`child`, `worker`,
+// `net`; file system access is not gated by this layer).
+proc.permission = {
+  has(scope, reference) {
+    const name = String(scope);
+    if (name === 'fs' || name.startsWith('fs.')) return true;
+    const host = typeof __w3cos_node_host === 'object' ? __w3cos_node_host : null;
+    if (host === null || typeof host.permissionHas !== 'function') return true;
+    return host.permissionHas(name, reference === undefined ? null : String(reference));
+  },
+};
+
 proc.cwd = function cwd() {
   if (typeof hostCwd === 'function') return hostCwd();
   return '/';
