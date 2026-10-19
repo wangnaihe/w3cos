@@ -10558,8 +10558,8 @@ fn main() {{
         assert!(
             fallback.contains("set_property_strict(")
                 && fallback.contains("\"textContent\"")
-                && fallback.contains(".call_method_slice(\"appendChild\""),
-            "a refused rewrite keeps the ordinary property path: {generated}"
+                && fallback.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "a refused rewrite keeps ordinary writes and a guarded observable append: {generated}"
         );
     }
 
@@ -10719,8 +10719,8 @@ fn main() {{
             generated.contains(".call_method_slice(\"createElement\"")
                 && generated.contains("set_property_strict(")
                 && generated.contains("\"textContent\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the text-append fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary fallback operations keep a guarded observable append: {generated}"
         );
     }
 
@@ -10838,8 +10838,8 @@ fn main() {{
             "createElement must stay an ordinary method call on the fallback: {generated}"
         );
         assert!(
-            generated.contains(".call_method_slice(\"appendChild\""),
-            "appendChild must stay an ordinary method call: {generated}"
+            generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "appendChild must use the guarded observable call: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"push\""),
@@ -10865,7 +10865,7 @@ fn main() {{
             !generated.contains("dom_build_appended")
                 && !generated.contains("dom_create_element")
                 && !generated.contains("dom_set_data")
-                && !generated.contains("dom_append_child")
+                && !generated.contains("w3cos_core::intrinsics::dom_append_child(&")
                 && !generated.contains("dom_set_style"),
             "observable DOM operations must not use unguarded intrinsics: {generated}"
         );
@@ -10903,8 +10903,8 @@ fn main() {{
                 && generated.contains("set_property_strict(")
                 && generated.contains("\"textContent\"")
                 && generated.contains("\"height\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary fallback operations keep a guarded observable append: {generated}"
         );
     }
 
@@ -10940,8 +10940,8 @@ fn main() {{
                 && generated.contains("set_property_strict(")
                 && generated.contains("\"textContent\"")
                 && generated.contains("\"height\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the module fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary module fallback operations keep a guarded observable append: {generated}"
         );
     }
 
@@ -10982,8 +10982,8 @@ fn main() {{
                 && generated.contains("\"textContent\"")
                 && generated.contains("\"height\"")
                 && generated.contains("\"flex\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the flex-list fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary flex-list fallback operations keep a guarded observable append: {generated}"
         );
         assert!(
             !generated.contains("dom_build_block_guarded"),
