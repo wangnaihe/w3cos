@@ -233,22 +233,56 @@ impl ParsedModuleGraph {
                 return self.resolve_export_from(&target_path, orig_name, resolver, visited);
             }
 
+            // `import { X } from "./a.js"; export { X };` — the local name is
+            // an import binding whose live cell lives in `./a.js`, not here.
+            let local_name = export
+                .local
+                .clone()
+                .unwrap_or_else(|| export_name.to_string());
+            if let Some(binding) = module_info
+                .imports
+                .iter()
+                .find(|imp| imp.local == local_name)
+            {
+                let from_dir = module_path.parent().unwrap_or_else(|| Path::new("."));
+                match resolver.resolve(&binding.source, from_dir) {
+                    Ok(resolved) => {
+                        return self.resolve_export_from(
+                            &resolved.path,
+                            &binding.imported,
+                            resolver,
+                            visited,
+                        );
+                    }
+                    Err(error) => {
+                        return SymbolResolution::Unresolved {
+                            name: export_name.to_string(),
+                            reason: format!(
+                                "export `{}` re-exports import from `{}`: {error}",
+                                local_name, binding.source
+                            ),
+                        };
+                    }
+                }
+            }
+
             return SymbolResolution::Resolved(ResolvedSymbol {
                 defining_module: module_path.to_path_buf(),
-                local_name: export
-                    .local
-                    .clone()
-                    .unwrap_or_else(|| export_name.to_string()),
+                local_name,
                 exported_name: export_name.to_string(),
-                kind: if module_info
-                    .top_level_classes
-                    .contains(&export.local.clone().unwrap_or_default())
-                {
+                kind: if module_info.top_level_classes.contains(
+                    &export
+                        .local
+                        .clone()
+                        .unwrap_or_else(|| export_name.to_string()),
+                ) {
                     SymbolKind::Class
-                } else if module_info
-                    .top_level_functions
-                    .contains(&export.local.clone().unwrap_or_default())
-                {
+                } else if module_info.top_level_functions.contains(
+                    &export
+                        .local
+                        .clone()
+                        .unwrap_or_else(|| export_name.to_string()),
+                ) {
                     SymbolKind::Function
                 } else {
                     SymbolKind::Variable
@@ -434,17 +468,63 @@ pub struct EsmBundle {
     pub symbols: Vec<BundledSymbol>,
     /// Imports that could not be bound to a definition.
     pub unresolved: Vec<String>,
+    /// Index of the first module that is only reachable through literal
+    /// `import()` calls (`None`: every module is evaluated at startup).
+    /// Modules from this index on are evaluated when first imported.
+    pub lazy_start: Option<usize>,
+    /// Literal `import()` edges, with the lazy modules each one evaluates.
+    pub dynamic_imports: Vec<BundledDynamicImport>,
+}
+
+/// A literal `import("specifier")` linked into the bundle.
+#[derive(Debug, Clone, Default)]
+pub struct BundledDynamicImport {
+    pub referrer: PathBuf,
+    pub specifier: String,
+    /// Bundle index of the imported module.
+    pub target: usize,
+    /// Lazy modules in the target's static closure, dependencies first
+    /// (bundle indices); evaluating the import runs their initializers.
+    pub evaluation_order: Vec<usize>,
 }
 
 impl EsmBundle {
     /// Flatten a parsed graph into a single bundle with collision-free names.
     pub fn build(parsed: &ParsedModuleGraph, resolver: &EsmResolver, entry: &Path) -> Self {
-        let order = topo_order(parsed, resolver, entry);
+        let (order, lazy_start) = topo_order(parsed, resolver, entry);
 
         let mut bundle = EsmBundle {
             entry: entry.to_path_buf(),
+            lazy_start,
             ..Default::default()
         };
+        if lazy_start.is_some() {
+            let index_of: HashMap<&Path, usize> = order
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
+            let lazy_from = lazy_start.unwrap_or(order.len());
+            for edge in resolver.dynamic_imports() {
+                let Some(&target) = index_of.get(edge.target.as_path()) else {
+                    continue;
+                };
+                let mut visited = HashSet::new();
+                let mut closure = Vec::new();
+                visit_module(&edge.target, parsed, resolver, &mut visited, &mut closure);
+                let evaluation_order = closure
+                    .iter()
+                    .filter_map(|path| index_of.get(path.as_path()).copied())
+                    .filter(|&index| index >= lazy_from)
+                    .collect();
+                bundle.dynamic_imports.push(BundledDynamicImport {
+                    referrer: edge.referrer,
+                    specifier: edge.specifier,
+                    target,
+                    evaluation_order,
+                });
+            }
+        }
 
         // Pass 1: assign namespaces and lift each module's own definitions.
         for (index, path) in order.iter().enumerate() {
@@ -646,17 +726,30 @@ fn host_import_path(source: &str, imported: &str) -> Option<&'static str> {
 }
 
 /// Depth-first topological order: each module appears after its dependencies.
-fn topo_order(parsed: &ParsedModuleGraph, resolver: &EsmResolver, entry: &Path) -> Vec<PathBuf> {
+fn topo_order(
+    parsed: &ParsedModuleGraph,
+    resolver: &EsmResolver,
+    entry: &Path,
+) -> (Vec<PathBuf>, Option<usize>) {
     let mut visited: HashSet<PathBuf> = HashSet::new();
     let mut order: Vec<PathBuf> = Vec::new();
     visit_module(entry, parsed, resolver, &mut visited, &mut order);
+    // Modules reachable only through literal `import()` are evaluated lazily;
+    // order each dynamic target's static closure dependencies-first.
+    let mut lazy: Vec<PathBuf> = Vec::new();
+    for edge in resolver.dynamic_imports() {
+        visit_module(&edge.target, parsed, resolver, &mut visited, &mut lazy);
+    }
     // Include any modules not reachable from entry (defensive), preserving graph order.
     for module in &parsed.modules {
-        if !order.contains(&module.path) {
+        if !visited.contains(&module.path) {
+            visited.insert(module.path.clone());
             order.push(module.path.clone());
         }
     }
-    order
+    let lazy_start = (!lazy.is_empty()).then_some(order.len());
+    order.extend(lazy);
+    (order, lazy_start)
 }
 
 fn visit_module(
@@ -711,6 +804,9 @@ pub struct EsmResolver {
     /// ES modules served as `createRequire`-rewritten text: still ES
     /// modules for facade-name collection.
     create_require_rewritten: RefCell<HashSet<PathBuf>>,
+    /// Literal `import("...")` edges found while building the graph, in
+    /// discovery order. Their targets are linked as lazily evaluated modules.
+    dynamic_imports: RefCell<Vec<DynamicImportEdge>>,
     /// Electron renderer-side scripts (preloads, `<script src>` files): classic
     /// scripts loaded on demand, so marker-free files become CommonJS records
     /// too (see [`crate::cjs::classify_as`]).
@@ -733,6 +829,7 @@ impl EsmResolver {
             commonjs_requested: RefCell::new(HashMap::new()),
             commonjs_diagnostics: RefCell::new(Vec::new()),
             create_require_rewritten: RefCell::new(HashSet::new()),
+            dynamic_imports: RefCell::new(Vec::new()),
             entry: RefCell::new(None),
             worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
@@ -799,12 +896,18 @@ impl EsmResolver {
             } else {
                 from_dir.join(specifier)
             };
-            let path = self.resolve_path_like(&candidate).with_context(|| {
-                format!(
-                    "Could not resolve relative import `{specifier}` from {}",
-                    from_dir.display()
-                )
-            })?;
+            let path = match self.resolve_path_like(&candidate) {
+                Ok(path) => self.prefer_transpiled_out(&path),
+                Err(error) => self
+                    .resolve_src_js_via_out(&candidate)
+                    .ok_or(error)
+                    .with_context(|| {
+                        format!(
+                            "Could not resolve relative import `{specifier}` from {}",
+                            from_dir.display()
+                        )
+                    })?,
+            };
             return Ok(ResolvedModule {
                 specifier: specifier.to_string(),
                 path,
@@ -853,6 +956,7 @@ impl EsmResolver {
     pub fn build_graph_from_entry(&self, entry: &Path) -> Result<ModuleGraph> {
         let entry = self.resolve_entry(entry)?;
         *self.entry.borrow_mut() = Some(entry.path.clone());
+        self.dynamic_imports.borrow_mut().clear();
         let mut graph = ModuleGraph::default();
         let mut visited = HashSet::new();
         self.visit_module(entry, &mut visited, &mut graph)?;
@@ -883,6 +987,9 @@ impl EsmResolver {
         if !visited.insert(module.path.clone()) {
             return Ok(());
         }
+        if self.should_skip_graph_path(&module.path) {
+            return Ok(());
+        }
 
         if !self.prepare_commonjs(&module.path)? {
             self.prepare_create_require(&module.path)?;
@@ -907,7 +1014,16 @@ impl EsmResolver {
             {
                 continue;
             }
-            let resolved = self.resolve(&import, from_dir)?;
+            let resolved = match self.resolve(&import, from_dir) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: import('{import}') does not resolve: {error:#}",
+                        module.path.display()
+                    ));
+                    continue;
+                }
+            };
             if (!module_source::is_synthesized(&module.path)
                 || self
                     .create_require_rewritten
@@ -955,7 +1071,70 @@ impl EsmResolver {
             self.visit_module(resolved, visited, graph)?;
         }
 
+        if !module_source::is_synthesized(&module.path)
+            || self
+                .create_require_rewritten
+                .borrow()
+                .contains(&module.path)
+        {
+            for specifier in collect_dynamic_import_literals(&source) {
+                self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Link the target of a literal `import("specifier")` as a lazily
+    /// evaluated module. A target that fails to resolve or link stays out of
+    /// the graph (the import rejects at runtime, as in Node when the file is
+    /// missing) and is reported through [`Self::commonjs_diagnostics`].
+    fn link_dynamic_import(
+        &self,
+        referrer: &Path,
+        specifier: &str,
+        from_dir: &Path,
+        visited: &mut HashSet<PathBuf>,
+        graph: &mut ModuleGraph,
+    ) {
+        if is_asset_import(specifier)
+            || is_host_module(specifier)
+            || self.is_runtime_module(specifier)
+        {
+            return;
+        }
+        let resolved = match self.resolve(specifier, from_dir) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.commonjs_diagnostics.borrow_mut().push(format!(
+                    "{}: import('{specifier}') does not resolve: {error}",
+                    referrer.display()
+                ));
+                return;
+            }
+        };
+        let target = resolved.path.clone();
+        let nodes_before = graph.nodes.len();
+        if let Err(error) = self.visit_module(resolved, visited, graph) {
+            for node in graph.nodes.drain(nodes_before..) {
+                visited.remove(&node.module.path);
+            }
+            self.commonjs_diagnostics.borrow_mut().push(format!(
+                "{}: import('{specifier}') does not link: {error:#}",
+                referrer.display()
+            ));
+            return;
+        }
+        self.dynamic_imports.borrow_mut().push(DynamicImportEdge {
+            referrer: referrer.to_path_buf(),
+            specifier: specifier.to_string(),
+            target,
+        });
+    }
+
+    /// Literal dynamic-import edges of the last built graph.
+    pub fn dynamic_imports(&self) -> Vec<DynamicImportEdge> {
+        self.dynamic_imports.borrow().clone()
     }
 
     /// Classify `path` and, for a CommonJS file, synthesize its module record
@@ -1403,7 +1582,96 @@ impl EsmResolver {
 
     /// LOAD_AS_FILE then LOAD_AS_DIRECTORY, with the extension set widened to
     /// the TypeScript and ESM sources the compiler accepts.
+    /// Prefer a TypeScript project's `out/` transpile over its `src/` when
+    /// both exist (Code-OSS: `npm run transpile-client` writes `out/vs/...js`
+    /// beside `src/vs/...ts`). Keeps Electron-main graphs out of the editor
+    /// sources that `build/vite` still imports by path.
+    /// `import '../../src/vs/foo.js'` from build tooling: the `.js` file lives
+    /// under `out/`, not `src/`.
+    /// Build/test tooling and TypeScript sources are not part of the Electron
+    /// `out/` runtime graph; following them pulls thousands of dead modules.
+    fn should_skip_graph_path(&self, path: &Path) -> bool {
+        let Some(entry) = self.entry.borrow().clone() else {
+            return false;
+        };
+        if !entry.starts_with(self.project_root.join("out")) {
+            return false;
+        }
+        let rel = match path.strip_prefix(&self.project_root) {
+            Ok(rel) => rel,
+            Err(_) => return false,
+        };
+        let first = rel
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .unwrap_or("");
+        if matches!(
+            first,
+            "build" | "test" | "src" | "extensions" | ".eslintplugin" | "scripts"
+        ) {
+            return true;
+        }
+        // Unit-test trees live under out/vs/**/test/** (and *.test.js). Following
+        // them pulls sinon (~1MB ESM) and OOMs codegen (~13GB).
+        if rel
+            .components()
+            .any(|c| c.as_os_str().to_str() == Some("test"))
+        {
+            return true;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.contains(".test.") {
+                return true;
+            }
+        }
+        // Belt-and-suspenders: known test-only packages under node_modules.
+        let rel_s = rel.to_string_lossy();
+        for pkg in [
+            "node_modules/sinon/",
+            "node_modules/mocha/",
+            "node_modules/nyc/",
+            "node_modules/@vscode/test-electron/",
+            "node_modules/@vscode/test-web/",
+        ] {
+            if rel_s.contains(pkg) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn resolve_src_js_via_out(&self, candidate: &Path) -> Option<PathBuf> {
+        let normalized = normalize_path(candidate);
+        let src_root = self.project_root.join("src");
+        let rel = normalized.strip_prefix(&src_root).ok()?;
+        let mut out = self.project_root.join("out").join(rel);
+        if out.extension().is_none_or(|ext| ext == "ts" || ext == "tsx") {
+            out.set_extension("js");
+        }
+        out.is_file().then_some(out)
+    }
+
+    fn prefer_transpiled_out(&self, path: &Path) -> PathBuf {
+
+        let Ok(src_root) = path.strip_prefix(self.project_root.join("src")) else {
+            return path.to_path_buf();
+        };
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        if !matches!(ext, Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts")) {
+            return path.to_path_buf();
+        }
+        let mut out = self.project_root.join("out").join(src_root);
+        out.set_extension("js");
+        if out.is_file() {
+            out
+        } else {
+            path.to_path_buf()
+        }
+    }
+
     fn resolve_path_like(&self, candidate: &Path) -> Result<PathBuf> {
+
         if let Some(path) = self.resolve_file(candidate) {
             return Ok(path);
         }
@@ -1508,6 +1776,95 @@ fn split_package_specifier(specifier: &str) -> Result<(String, Option<String>)> 
         let subpath = parts.next().map(|s| s.to_string());
         Ok((package_name, subpath))
     }
+}
+
+/// A literal `import("specifier")` in `referrer` that resolved to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicImportEdge {
+    pub referrer: PathBuf,
+    pub specifier: String,
+    pub target: PathBuf,
+}
+
+/// String-literal specifiers of `import("...")` calls, in source order and
+/// deduplicated. A light lexer skips comments, strings and template text so
+/// `import(` inside them is ignored; computed specifiers are not collected.
+pub fn collect_dynamic_import_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut found: Vec<String> = Vec::new();
+    let mut index = 0;
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'i' if bytes[index..].starts_with(b"import")
+                && (index == 0 || !(is_ident(bytes[index - 1]) || bytes[index - 1] == b'.'))
+                && !bytes.get(index + 6).copied().is_some_and(is_ident) =>
+            {
+                let mut cursor = index + 6;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                index += 6;
+                if bytes.get(cursor) != Some(&b'(') {
+                    continue;
+                }
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                let Some(&quote @ (b'\'' | b'"')) = bytes.get(cursor) else {
+                    continue;
+                };
+                let start = cursor + 1;
+                let Some(length) = bytes[start..]
+                    .iter()
+                    .position(|&byte| byte == quote || byte == b'\\' || byte == b'\n')
+                else {
+                    continue;
+                };
+                if bytes[start + length] != quote {
+                    continue;
+                }
+                let mut after = start + length + 1;
+                while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+                    after += 1;
+                }
+                if !matches!(bytes.get(after), Some(b')') | Some(b',')) {
+                    continue;
+                }
+                let specifier = source[start..start + length].to_string();
+                if !found.contains(&specifier) {
+                    found.push(specifier);
+                }
+                index = after;
+            }
+            _ => index += 1,
+        }
+    }
+    found
 }
 
 pub fn collect_static_imports(source: &str) -> Vec<String> {
@@ -2962,5 +3319,113 @@ export function main() {{ bump(); return value + plugin.value; }}"#
 
         assert!(!resolver.is_in_type_module_scope(&src.join("main.js")));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn collect_dynamic_import_literals_skips_comments_and_strings() {
+        let source = r#"
+import { x } from "./static.js";
+const a = import("./lazy.js");
+const b = import ( './lazy2.js' );
+const c = import("./lazy.js"); // dedupe
+const s = "import(\"./nope.js\")";
+const t = `import("./nope2.js")`;
+// import("./comment.js")
+/* import("./block.js") */
+foo.import("./method.js");
+importing("./ident.js");
+const d = import(computed);
+"#;
+        assert_eq!(
+            collect_dynamic_import_literals(source),
+            vec![
+                "./lazy.js".to_string(),
+                "./lazy2.js".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn literal_dynamic_import_is_lazy_in_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-dyn-import-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"type":"module"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("entry.js"),
+            "export async function main() { return import('./lazy.js'); }
+",
+        )
+        .unwrap();
+        std::fs::write(root.join("lazy.js"), "export const value = 42;
+").unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&root.join("entry.js")).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("entry.js"));
+        assert_eq!(bundle.modules.len(), 2);
+        assert_eq!(bundle.lazy_start, Some(1));
+        assert_eq!(bundle.dynamic_imports.len(), 1);
+        assert_eq!(bundle.dynamic_imports[0].specifier, "./lazy.js");
+        assert_eq!(bundle.dynamic_imports[0].evaluation_order, vec![1]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn export_imported_name_resolves_to_defining_module() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-reexport-import-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("facade")).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            root.join("lifecycle.js"),
+            "export class DisposableStore { constructor() { this.n = 1; } }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("facade/deps.js"),
+            "import { DisposableStore } from '../lifecycle.js';
+export { DisposableStore };
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("entry.js"),
+            "import { DisposableStore } from './facade/deps.js';
+export function main() { return new DisposableStore().n; }
+",
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&root.join("entry.js")).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("entry.js"));
+        assert!(
+            bundle.unresolved.is_empty(),
+            "unresolved: {:#?}",
+            bundle.unresolved
+        );
+        let entry = bundle.modules.iter().find(|m| m.path.ends_with("entry.js")).unwrap();
+        assert!(
+            entry.local_to_bundled.iter().any(|(local, _)| local == "DisposableStore"),
+            "entry bindings: {:#?}",
+            entry.local_to_bundled
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

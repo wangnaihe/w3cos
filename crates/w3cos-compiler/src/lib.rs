@@ -4,6 +4,10 @@ pub mod cjs;
 mod cjs_e2e_tests;
 #[cfg(test)]
 mod code_oss_boot_e2e_tests;
+#[cfg(test)]
+mod dynamic_import_e2e_tests;
+#[cfg(test)]
+mod ns_merge_e2e_tests;
 pub mod codegen;
 pub mod create_require;
 pub mod css_parser;

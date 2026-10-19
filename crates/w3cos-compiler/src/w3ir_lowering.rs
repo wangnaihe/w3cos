@@ -1540,7 +1540,9 @@ impl Builder {
         if self.classic_script_entry && self.scopes.len() == 1 {
             return Ok(self.declare_classic_lexical(name, BindingKind::Class));
         }
-        self.declare_current_binding(name, BindingKind::Class, false)
+        // Mutable so TypeScript `class C {} (C || (C = {}))` namespace-merge
+        // emit lowers; the assignment is behind `||` and never runs when C exists.
+        self.declare_current_binding(name, BindingKind::Class, true)
     }
 
     fn declare_current_binding(
@@ -3820,6 +3822,7 @@ impl Builder {
                 Ok(dst)
             }
             Expr::Tpl(template) => self.lower_template_literal(template),
+            Expr::TaggedTpl(tagged) => self.lower_tagged_template(tagged),
             Expr::TsTypeAssertion(assertion) => self.lower_expression(&assertion.expr),
             Expr::TsNonNull(non_null) => self.lower_expression(&non_null.expr),
             Expr::TsAs(as_expression) => self.lower_expression(&as_expression.expr),
@@ -4223,6 +4226,44 @@ impl Builder {
             }
         }
         Ok(value)
+    }
+
+    /// `tag\`a${b}c\`` → `tag(["a","c"], b)` (cooked strings only; enough
+    /// for Code-OSS `inline` CSS helpers that never read `.raw`).
+    fn lower_tagged_template(&mut self, tagged: &swc_ecma_ast::TaggedTpl) -> Result<Register> {
+        let tag = self.lower_expression(&tagged.tag)?;
+        let template = tagged.tpl.as_ref();
+        if template.quasis.len() != template.exprs.len() + 1 {
+            return Err(anyhow!(
+                "runtime W3IR tagged template has inconsistent quasi/expression counts"
+            ));
+        }
+        let mut elements = Vec::with_capacity(template.quasis.len());
+        for quasi in &template.quasis {
+            let cooked = quasi
+                .cooked
+                .as_ref()
+                .ok_or_else(|| anyhow!("runtime W3IR tagged template has an invalid escape"))?;
+            elements.push(self.constant(Constant::String(atom_to_string(cooked))));
+        }
+        let strings = self.register();
+        self.emit(Instruction::CreateArray {
+            dst: strings,
+            elements,
+        });
+        let mut arguments = vec![strings];
+        for expression in &template.exprs {
+            arguments.push(self.lower_expression(expression)?);
+        }
+        let dst = self.register();
+        let this_value = self.constant(Constant::Undefined);
+        self.emit_call(
+            dst,
+            tag,
+            this_value,
+            LoweredArguments::Registers(arguments),
+        );
+        Ok(dst)
     }
 
     fn lower_optional_chain(
