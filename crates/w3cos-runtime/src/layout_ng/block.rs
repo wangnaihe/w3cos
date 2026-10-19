@@ -752,28 +752,54 @@ pub(super) fn intrinsic_sizes(
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
     let info = &flat[index];
-    if flat[index + 1..info.subtree_end.max(index + 1)]
+    let subtree = &flat[index + 1..info.subtree_end.max(index + 1)];
+    let rendered = |node: &&FlatNodeInfo| node.style.display != Display::None;
+    if subtree
         .iter()
-        .any(|node| {
-            node.style.display != Display::None
-                && (percent_inline(node.style)
-                    || (node.style.float != Float::None && !oof::is_out_of_flow(node.style)))
-        })
+        .filter(rendered)
+        .any(|node| percent_inline(node.style))
     {
-        return None;
+        return super::bail("intrinsic-percent");
     }
     if let ComponentKind::Text { content } = info.kind {
         return Some(inline::text_min_max(content, info.style));
     }
     if inline::is_inline_container(flat, index) {
+        // Floats among inline content would take the float_left /
+        // float_right inline sizes into InlineNode::ComputeMinMaxSizes.
+        if subtree
+            .iter()
+            .filter(rendered)
+            .any(|node| node.style.float != Float::None && !oof::is_out_of_flow(node.style))
+        {
+            return super::bail("intrinsic-inline-float");
+        }
         return inline::inline_min_max(flat, index, space);
     }
+    // BlockLayoutAlgorithm::ComputeMinMaxSizes: floats and new formatting
+    // contexts sit on one conceptual "line" (the float inline sizes add up
+    // until clearance or an in-flow block starts a new one); the min-content
+    // contribution assumes every float on its own line.
     let mut sizes = MinMax::exact(0.0);
+    let (mut float_left, mut float_right) = (0.0f32, 0.0f32);
     for child in inline::rendered_children(flat, index) {
         let style = flat[child].style;
         // Out-of-flow children contribute nothing (CSS Sizing 3 5.1).
         if oof::is_out_of_flow(style) {
             continue;
+        }
+        let floating = style.float != Float::None;
+        let new_fc = !floating && is_bfc_root(style);
+        if floating || new_fc {
+            if style.clear != Clear::None {
+                sizes.max = sizes.max.max(float_left + float_right);
+            }
+            if matches!(style.clear, Clear::Both | Clear::Left) {
+                float_left = 0.0;
+            }
+            if matches!(style.clear, Clear::Both | Clear::Right) {
+                float_right = 0.0;
+            }
         }
         let side = |s: Spacing| match s {
             Spacing::Auto => 0.0,
@@ -781,7 +807,7 @@ pub(super) fn intrinsic_sizes(
         };
         let b = border(style);
         let edges = b[1] + b[3] + side(style.padding.left) + side(style.padding.right);
-        let margins = side(style.margin.left) + side(style.margin.right);
+        let (margin_left, margin_right) = (side(style.margin.left), side(style.margin.right));
         let content = match resolve_dim(style.width, None, style, space) {
             Some(w) => MinMax::exact(match style.box_sizing {
                 BoxSizing::BorderBox => (w - edges).max(0.0),
@@ -789,7 +815,40 @@ pub(super) fn intrinsic_sizes(
             }),
             None => intrinsic_sizes(flat, child, space).why("intrinsic")?,
         };
-        sizes.encompass(content.map(|w| clamp_inline(style, space, edges, w) + edges + margins));
+        let border_box = content.map(|w| clamp_inline(style, space, edges, w) + edges);
+        let max_contribution = if floating {
+            // A float outside the content area (negative margins) adds
+            // nothing.
+            let float_size = border_box.max + margin_left + margin_right;
+            if float_size > 0.0 {
+                if style.float == Float::Right {
+                    float_right += float_size;
+                } else {
+                    float_left += float_size;
+                }
+            }
+            float_left + float_right
+        } else if new_fc {
+            let inset = |floats: f32, margin: f32| {
+                if margin > 0.0 {
+                    floats.max(margin)
+                } else {
+                    floats + margin
+                }
+            };
+            border_box.max + inset(float_left, margin_left) + inset(float_right, margin_right)
+        } else {
+            border_box.max + margin_left + margin_right
+        };
+        sizes.max = sizes.max.max(max_contribution);
+        sizes.min = sizes
+            .min
+            .zip(border_box.min)
+            .map(|(a, b)| a.max(b + margin_left + margin_right));
+        if !floating {
+            float_left = 0.0;
+            float_right = 0.0;
+        }
     }
     Some(sizes)
 }
