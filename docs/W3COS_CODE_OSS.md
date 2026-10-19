@@ -111,3 +111,33 @@ missing, then `node:v8`.
    constructor lost its effect when the instance was built from a timer
    callback (seen in `readline`; the glue avoids the pattern). This needs a
    minimal repro and a fix.
+
+## Slice 2 (literal `import()` linking)
+
+- The resolver collects literal `import("...")` calls, links their targets as
+  lazily evaluated modules (`EsmBundle.lazy_start` / `dynamic_imports`), and
+  `run_entry` registers a `DYNAMIC_IMPORT_PATH` adapter that evaluates the
+  target's lazy closure then returns its namespace.
+- Soft-fail unresolved static imports (diagnostics instead of aborting the
+  graph) so one missing optional path does not drop a whole dynamic target.
+- Follow `import { X } from "./a"; export { X };` to `a`'s defining cell (Code-OSS `commonFacade/deps.js` pattern).
+- Prefer `out/` over `src/` when a TypeScript project has both, and skip
+  `build/` / `test/` / `src/` / `extensions/` when the entry lives under `out/`
+  (Code-OSS Electron main must not follow vite tooling into sources).
+
+### Sweep after slice 2 (Code-OSS e97039dd, box)
+
+| entry | modules | lazy_start | dynamic_imports | codegen |
+|-------|---------|------------|-----------------|---------|
+| main (before dyn-import) | 45 | — | 0 | ok |
+| main (after dyn-import + out remap + `import{X};export{X}` follow) | 2947 | 46 | 32 | codegen reaches `observableFromEvent.js` then fails: assignment to immutable runtime binding (3 leftover unresolved are electron_app→skipped build/test) |
+| preload | 1 | — | 0 | ok |
+| workbench | 2 | — | 0 | ok (still loads workbench.desktop.main via computed `import(url)`) |
+
+Next blockers: live-binding resolution for VS Code barrel/`export *` chains;
+computed `import(url)` for the workbench renderer; deeper network builtins at
+runtime.
+
+### Slice 2 progress (box)
+- Soft-skip `out/**/test/**`, `*.test.*`, and test-only `node_modules` (sinon/mocha) when entry is under `out/` — avoids OOM codegen of sinon-esm (~1MB → 13GB RSS).
+- Literal `import()` linking + live-binding follow + TS namespace merge mutability + TaggedTpl desugar.

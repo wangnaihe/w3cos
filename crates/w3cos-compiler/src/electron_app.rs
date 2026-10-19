@@ -31,7 +31,22 @@ pub fn is_electron_specifier(specifier: &str) -> bool {
 }
 
 /// Directories never scanned for pages or renderer scripts.
-const SKIPPED_DIRS: &[&str] = &["node_modules", "target", "bundle_run"];
+const SKIPPED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "bundle_run",
+    // Code-OSS / Electron app trees: unit-test and build sources are not
+    // renderer pages. Scanning them pulls test preloads (contextBridge) into
+    // electron_app and OOMs / breaks codegen of the main graph.
+    "test",
+    "build",
+    "src",
+    "extensions",
+    ".eslintplugin",
+    "scripts",
+    "out-build",
+    ".git",
+];
 const MAX_DEPTH: usize = 8;
 
 #[derive(Debug, Default, PartialEq)]
@@ -146,10 +161,17 @@ fn collect_files(dir: &Path, depth: usize, html: &mut Vec<PathBuf>, js: &mut Vec
 /// A preload is named `preload*` or talks to the main process from the
 /// renderer side (`contextBridge` / `ipcRenderer`) without creating windows.
 fn is_preload_candidate(file: &Path) -> bool {
+    // Never treat unit-test trees as app preloads (see SKIPPED_DIRS).
+    if file.components().any(|c| c.as_os_str() == "test") {
+        return false;
+    }
     let stem = file
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    if stem.contains(".test.") {
+        return false;
+    }
     if stem.starts_with("preload") {
         return true;
     }

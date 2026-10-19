@@ -47,12 +47,16 @@ fn sweep(root: &Path, name: &str, entry: &Path) -> serde_json::Value {
     } else {
         serde_json::json!({ "ok": false, "error": "skipped: unresolved bindings" })
     };
+    let diagnostics = resolver.commonjs_diagnostics();
     let report = serde_json::json!({
         "entry": name,
         "modules": modules,
         "imports": parsed.total_imports(),
         "exports": parsed.total_exports(),
         "symbols": bundle.symbol_count(),
+        "lazy_start": bundle.lazy_start,
+        "dynamic_imports": bundle.dynamic_imports.len(),
+        "diagnostics": diagnostics,
         "unresolved_count": unresolved.len(),
         "unresolved": unresolved,
         "codegen": codegen,

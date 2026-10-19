@@ -4329,7 +4329,6 @@ test/language/expressions/object/method-definition/use-strict-with-non-simple-pa
 test/language/expressions/object/method-definition/yield-as-function-expression-binding-identifier.js
 test/language/expressions/object/method-definition/yield-as-identifier-in-nested-function.js
 test/language/expressions/object/method-definition/yield-as-parameter.js
-test/language/expressions/optional-chaining/call-expression.js
 test/language/expressions/optional-chaining/eval-optional-call.js
 test/language/expressions/optional-chaining/iteration-statement-for-await-of.js
 test/language/expressions/optional-chaining/iteration-statement-for-of-type-error.js
@@ -4654,7 +4653,6 @@ test/language/statements/class/subclass/class-definition-null-proto-missing-retu
 test/language/statements/class/subclass/class-definition-null-proto-super.js
 test/language/statements/class/subclass/class-definition-null-proto-this.js
 test/language/statements/class/subclass/class-definition-null-proto.js
-test/language/statements/class/subclass/class-definition-parent-proto-null.js
 test/language/statements/class/subclass/default-constructor-2.js
 test/language/statements/class/subclass/default-constructor.js
 test/language/statements/class/subclass/derived-class-return-override-catch-super-arrow.js
