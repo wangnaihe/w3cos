@@ -56,7 +56,22 @@ pub(crate) fn compile_and_run(root: &Path, entry: &Path, crate_name: &str) -> Ve
             r#"#![allow(warnings)]
 {code}
 fn main() {{
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_entry));
+    // Like `node main.js`: run the entry, then the event loop (microtasks,
+    // nextTick-style jobs and timers) until no work is left (10 s cap).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{
+        run_entry();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {{
+            let ran = w3cos_runtime::jsdom::drain_microtasks() + w3cos_runtime::jsdom::tick_timers();
+            if ran > 0 {{
+                continue;
+            }}
+            match w3cos_runtime::jsdom::next_timer_deadline() {{
+                Some(at) => std::thread::sleep(at.saturating_duration_since(std::time::Instant::now())),
+                None => break,
+            }}
+        }}
+    }}));
     if let Err(payload) = outcome {{
         let message = payload
             .downcast_ref::<w3cos_core::PanicValue>()
@@ -312,7 +327,7 @@ const ADVANCED_FILES: &[(&str, &str)] = &[
         r##"const esm = require("./esm.mjs");
 console.log("require(esm)", esm.value, typeof esm.default, esm.default());
 try { require("fs"); } catch (e) { console.log("builtin", e.code); }
-try { require("node:path"); } catch (e) { console.log("node: builtin", e.code); }
+try { require("node:child_process"); } catch (e) { console.log("node: builtin", e.code); }
 console.log("#cfg", require("#cfg").which);
 console.log("w3cos condition", require("cond-pkg"));
 const reexp = require("./reexport-user.mjs");
@@ -379,7 +394,7 @@ export { hidden } from "./lib.js";
 ];
 
 /// CommonJS entry; `require(esm)` (Node 22 semantics: the namespace), Node
-/// builtins (not provided yet: they throw a coded error), `#imports` and
+/// builtins w3cos-node does not provide yet (they throw a coded error), `#imports` and
 /// package `exports` picking the `w3cos` condition first, `export *` from a
 /// CommonJS facade, and a name only the importer knows about.
 const ADVANCED_OUTPUT: &str = r##"require(esm) 42 function hello

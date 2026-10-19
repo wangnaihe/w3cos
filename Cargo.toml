@@ -6,6 +6,7 @@ members = [
     "tools/size-probes",
     "tools/wpt-runner",
     "crates/w3cos-ir",
+    "crates/w3cos-node",
     "crates/w3cos-cranelift",
     "crates/w3cos-vm",
     "crates/w3cos-core",
@@ -36,6 +37,7 @@ repository = "https://github.com/wangnaihe/w3cos"
 
 [workspace.dependencies]
 w3cos-ir = { path = "crates/w3cos-ir" }
+w3cos-node = { path = "crates/w3cos-node" }
 w3cos-vm = { path = "crates/w3cos-vm" }
 w3cos-core = { path = "crates/w3cos-core" }
 w3cos-runtime = { path = "crates/w3cos-runtime", default-features = false }

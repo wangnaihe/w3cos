@@ -3230,6 +3230,30 @@ impl Value {
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
+            (this, "lastIndexOf") if this.is_string() => {
+                // Same char-index convention as `indexOf` above.
+                let value = this.as_js_string().expect("string");
+                let needle = args.first().cloned().unwrap_or_default().to_js_string();
+                let chars: Vec<char> = value.chars().collect();
+                let needle: Vec<char> = needle.chars().collect();
+                let from = args.get(1).map(Value::to_number).unwrap_or(f64::NAN);
+                let from = if from.is_nan() {
+                    f64::INFINITY
+                } else {
+                    from.trunc()
+                };
+                if needle.len() > chars.len() {
+                    return Value::Number(-1.0);
+                }
+                let last = chars.len() - needle.len();
+                let start = from.clamp(0.0, last as f64) as usize;
+                let index = (0..=start)
+                    .rev()
+                    .find(|&index| chars[index..index + needle.len()] == needle[..])
+                    .map(|index| index as f64)
+                    .unwrap_or(-1.0);
+                return Value::Number(index);
+            }
             (this, "codePointAt") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
@@ -5166,6 +5190,12 @@ mod tests {
     #[test]
     fn string_methods_cover_token_parsing() {
         let token = Value::String("source.ts".into());
+        let path = Value::String("/a/b/c".into());
+        let last = |args: Vec<Value>| path.call_method("lastIndexOf", args).to_number();
+        assert_eq!(last(vec![Value::from("/")]), 4.0);
+        assert_eq!(last(vec![Value::from("/"), Value::Number(3.0)]), 2.0);
+        assert_eq!(last(vec![Value::from("x")]), -1.0);
+        assert_eq!(last(vec![Value::from("")]), 6.0);
         assert_eq!(
             token
                 .call_method("indexOf", vec![Value::from(".")])

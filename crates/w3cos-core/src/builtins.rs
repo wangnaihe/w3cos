@@ -1033,8 +1033,113 @@ fn build_math_value() -> Value {
     Value::object(properties)
 }
 
+/// The global `process` object: one shared object per page (like
+/// `math_value`), so `process.env.X = ...` writes persist and identity holds
+/// across references. `env`, `argv`, `cwd()`, `pid`, `execPath` and `exit()`
+/// come from the host process; `w3cos-node`'s `process` module layers
+/// EventEmitter, nextTick and hrtime on top of this object.
+pub fn process_value() -> Value {
+    let epoch = crate::page_arena::current_epoch();
+    let cached = PROCESS_VALUE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, _)| *cached_epoch == epoch)
+            .map(|(_, value)| value.clone())
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let value = build_process_value();
+    let retired = PROCESS_VALUE.with(|cell| cell.replace(Some((epoch, value.clone()))));
+    drop(retired);
+    value
+}
+
+fn build_process_value() -> Value {
+    let env: HashMap<String, Value> = std::env::vars()
+        .map(|(key, value)| (key, Value::from(value)))
+        .collect();
+    let argv: Vec<Value> = std::env::args().map(Value::from).collect();
+    let exec_path = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| std::env::args().next())
+        .unwrap_or_default();
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        other => other,
+    };
+    let mut properties = HashMap::new();
+    properties.insert("env".to_string(), Value::object(env));
+    properties.insert("argv".to_string(), Value::array(argv));
+    properties.insert("execPath".to_string(), Value::from(exec_path));
+    properties.insert(
+        "pid".to_string(),
+        Value::Number(f64::from(std::process::id())),
+    );
+    properties.insert("arch".to_string(), Value::string(arch));
+    let platform = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    };
+    properties.insert("platform".to_string(), Value::string(platform));
+    properties.insert(
+        "nextTick".to_string(),
+        Value::function(|_this, args| {
+            let mut args = args.into_iter();
+            let callback = args.next().unwrap_or(Value::Undefined);
+            if !callback.is_callable() {
+                crate::value::throw_value(error_instance(
+                    "TypeError",
+                    vec![Value::from(
+                        "The \"callback\" argument must be of type function",
+                    )],
+                ));
+            }
+            let rest: Vec<Value> = args.collect();
+            crate::promise::queue_microtask(Value::function(move |_this, _args| {
+                callback.call(Value::Undefined, rest.clone())
+            }));
+            Value::Undefined
+        }),
+    );
+    properties.insert(
+        "cwd".to_string(),
+        Value::function(|_this, _args| {
+            std::env::current_dir()
+                .map(|path| Value::from(path.to_string_lossy().into_owned()))
+                .unwrap_or_else(|_| Value::string("/"))
+        }),
+    );
+    properties.insert(
+        "chdir".to_string(),
+        Value::function(|_this, args| {
+            let directory = args.first().map(Value::to_js_string).unwrap_or_default();
+            if let Err(error) = std::env::set_current_dir(&directory) {
+                crate::value::throw_value(error_instance(
+                    "Error",
+                    vec![Value::from(format!("ENOENT: {error}, chdir '{directory}'"))],
+                ));
+            }
+            Value::Undefined
+        }),
+    );
+    properties.insert(
+        "exit".to_string(),
+        Value::function(|_this, args| {
+            let code = args.first().map(Value::to_number).unwrap_or(0.0);
+            std::process::exit(if code.is_finite() { code as i32 } else { 0 })
+        }),
+    );
+    Value::object(properties)
+}
+
 thread_local! {
     static MATH_VALUE: RefCell<Option<(u32, Value)>> = const { RefCell::new(None) };
+    static PROCESS_VALUE: RefCell<Option<(u32, Value)>> = const { RefCell::new(None) };
     static MATH_RANDOM_STATE: RefCell<u64> = const { RefCell::new(0x4d59_5df4_d0f3_3173) };
 }
 
@@ -1159,14 +1264,53 @@ fn dom_element() -> Value {
 
 pub fn parseInt(arguments: Vec<Value>) -> Value {
     let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-    let parsed = value
-        .to_js_string()
-        .trim()
-        .split(|character: char| !character.is_ascii_digit() && character != '-')
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(f64::NAN);
-    Value::Number(parsed)
+    let text = value.to_js_string();
+    let mut rest = text.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let mut sign = 1.0;
+    if let Some(stripped) = rest.strip_prefix('-') {
+        sign = -1.0;
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_prefix('+') {
+        rest = stripped;
+    }
+    let radix_arg = arguments.get(1).map(Value::to_number).unwrap_or(0.0);
+    let mut radix = if radix_arg.is_finite() {
+        (radix_arg.trunc() as i64 as i32) as u32
+    } else {
+        0
+    };
+    let mut strip_prefix = true;
+    if radix != 0 {
+        if !(2..=36).contains(&radix) {
+            return Value::Number(f64::NAN);
+        }
+        if radix != 16 {
+            strip_prefix = false;
+        }
+    } else {
+        radix = 10;
+    }
+    if strip_prefix && (rest.starts_with("0x") || rest.starts_with("0X")) {
+        rest = &rest[2..];
+        radix = 16;
+    }
+    let digits: Vec<u32> = rest.chars().map_while(|c| c.to_digit(radix)).collect();
+    if digits.is_empty() {
+        return Value::Number(f64::NAN);
+    }
+    let number = if radix == 10 {
+        // Decimal: let the float parser round the full digit string.
+        let text: String = digits
+            .iter()
+            .map(|d| char::from_digit(*d, 10).expect("digit"))
+            .collect();
+        text.parse::<f64>().unwrap_or(f64::NAN)
+    } else {
+        digits
+            .iter()
+            .fold(0.0, |acc, d| acc * f64::from(radix) + f64::from(*d))
+    };
+    Value::Number(sign * number)
 }
 
 pub fn parseFloat(arguments: Vec<Value>) -> Value {
@@ -2269,8 +2413,22 @@ pub fn named_function(
     f: impl Fn(Value, Vec<Value>) -> Value + 'static,
 ) -> Value {
     let function = Value::function(f);
+    // Built-in functions are not constructors: no own `prototype`.
+    function.delete_property("prototype");
     function.set_property("name", Value::string(name));
     function.set_property("length", Value::Number(length as f64));
+    function
+}
+
+/// [`named_function`] for a generator function: owns a fresh ordinary
+/// `prototype` (no `constructor`), distinct per function.
+pub fn named_generator_function(
+    name: &str,
+    length: u32,
+    f: impl Fn(Value, Vec<Value>) -> Value + 'static,
+) -> Value {
+    let function = named_function(name, length, f);
+    function.set_property("prototype", Value::object(HashMap::new()));
     function
 }
 

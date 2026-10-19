@@ -7444,6 +7444,11 @@ fn is_direct_control_flow(instruction: &Instruction, mode: EmissionMode) -> bool
 
 /// `inherited`: the pair came from this frame's own capture accessors (not a
 /// local cell), so it may be a weak back-edge getter.
+///
+/// The weak target is read when the closure is created. A binding still in
+/// its TDZ there (`const o = { f() { return o; } }`: the method is created
+/// before `o` is initialized) has no target yet, so the capture stays live
+/// instead of throwing a ReferenceError at creation.
 fn emit_capture_pair_store(capture_id: u32, weaken: bool, inherited: bool) -> String {
     let live = format!(
         "__w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(__w3cos_pair.0, __w3cos_pair.1));"
@@ -7461,7 +7466,7 @@ fn emit_capture_pair_store(capture_id: u32, weaken: bool, inherited: bool) -> St
         );
     }
     format!(
-        "let __w3cos_target = __w3cos_pair.0.call(w3cos_core::Value::Undefined, Vec::new()); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_getter = w3cos_core::weak::weak_capture_getter(__w3cos_target); __w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ {live} }}"
+        "let __w3cos_target = w3cos_core::catch_js(|| __w3cos_pair.0.call(w3cos_core::Value::Undefined, Vec::new())).unwrap_or(w3cos_core::Value::Undefined); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_getter = w3cos_core::weak::weak_capture_getter(__w3cos_target); __w3cos_nested_captures.insert({capture_id}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ {live} }}"
     )
 }
 

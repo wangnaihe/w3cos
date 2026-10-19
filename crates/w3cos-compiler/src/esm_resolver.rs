@@ -800,17 +800,23 @@ impl EsmResolver {
             return self.resolve_package_imports(specifier, from_dir, kind);
         }
         if specifier.starts_with("node:") {
+            if let Some(resolved) = node_builtin_module(specifier)? {
+                return Ok(resolved);
+            }
             return Err(anyhow!(
-                "`{specifier}` is a Node builtin module; builtins are provided by the runtime, not compiled from source"
+                "`{specifier}` is a Node builtin module that w3cos-node does not provide yet"
             ));
         }
         match self.resolve_package(specifier, from_dir, kind) {
             Ok(resolved) => Ok(resolved),
+            Err(_) if is_node_builtin(specifier) && w3cos_node::is_available(specifier) => {
+                Ok(node_builtin_module(specifier)?.expect("available builtin"))
+            }
             // A bare builtin name only resolves to the builtin when no
             // package of that name is installed (`events`, `buffer`, ...
             // polyfills are common in web dependency trees).
             Err(error) if is_node_builtin(specifier) => Err(error.context(format!(
-                "`{specifier}` is a Node builtin module; builtins are provided by the runtime, not compiled from source"
+                "`{specifier}` is a Node builtin module that w3cos-node does not provide yet"
             ))),
             Err(error) => Err(error),
         }
@@ -1709,6 +1715,46 @@ fn module_export_name(name: &ModuleExportName) -> String {
 
 fn atom_to_string(atom: &impl std::fmt::Debug) -> String {
     format!("{:?}", atom).trim_matches('"').to_string()
+}
+
+/// A `w3cos-node` builtin as an ordinary CommonJS file: the glue is written
+/// once per content hash under the temp dir and linked like package code.
+fn node_builtin_module(specifier: &str) -> Result<Option<ResolvedModule>> {
+    let Some(source) = w3cos_node::source(specifier) else {
+        return Ok(None);
+    };
+    let name = w3cos_node::module_name(specifier);
+    let path = node_builtin_dir()?.join(format!("{}.js", name.replace('/', "__")));
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
+        let temp = path.with_extension(format!("js.{}", std::process::id()));
+        std::fs::write(&temp, source)
+            .with_context(|| format!("writing Node builtin `{name}` to {}", temp.display()))?;
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("installing Node builtin `{name}` at {}", path.display()))?;
+    }
+    Ok(Some(ResolvedModule {
+        specifier: specifier.to_string(),
+        path,
+        kind: ModuleKind::Package,
+        package_name: Some(format!("node:{name}")),
+    }))
+}
+
+fn node_builtin_dir() -> Result<PathBuf> {
+    // FNV-1a over every builtin, so edits never reuse stale glue.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (name, source) in w3cos_node::MODULES {
+        for byte in name.bytes().chain(source.bytes()) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let dir = std::env::temp_dir()
+        .join("w3cos-node")
+        .join(format!("{hash:016x}"));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating Node builtin dir {}", dir.display()))?;
+    Ok(dir)
 }
 
 #[cfg(test)]
@@ -2713,9 +2759,14 @@ export function main() {{ bump(); return value + plugin.value; }}"#
         );
 
         // Builtins: `node:` always; bare names only when no package exists.
+        // w3cos-node provides some; the rest stay a coded resolution error.
         let fs = resolver.resolve_with("fs", &src, Require).unwrap_err();
         assert!(format!("{fs:#}").contains("Node builtin"), "{fs:#}");
-        assert!(resolver.resolve_with("node:events", &src, Require).is_err());
+        let events = resolver.resolve_with("node:events", &src, Require).unwrap();
+        assert_eq!(events.package_name.as_deref(), Some("node:events"));
+        assert!(events.path.ends_with("events.js"));
+        let bare_path = resolver.resolve_with("path", &src, Require).unwrap();
+        assert_eq!(bare_path.package_name.as_deref(), Some("node:path"));
         assert_eq!(
             path("events", &src, Require),
             "node_modules/events/events.js"
