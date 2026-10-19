@@ -151,39 +151,41 @@ function stringBytes(string, encoding) {
 // ── decoders: bytes [start, end) -> string ──
 
 function utf8Slice(buf, start, end) {
+  // WHATWG UTF-8 decode: one U+FFFD per maximal invalid subpart.
   let out = '';
   let i = start;
   while (i < end) {
-    const byte = buf[i];
-    let code = 0xfffd;
-    let size = 1;
-    if (byte < 0x80) {
-      code = byte;
-    } else if (byte >= 0xc2 && byte <= 0xdf && i + 1 < end && (buf[i + 1] & 0xc0) === 0x80) {
-      code = ((byte & 31) << 6) | (buf[i + 1] & 63);
-      size = 2;
-    } else if (byte >= 0xe0 && byte <= 0xef && i + 2 < end &&
-        (buf[i + 1] & 0xc0) === 0x80 && (buf[i + 2] & 0xc0) === 0x80) {
-      const value = ((byte & 15) << 12) | ((buf[i + 1] & 63) << 6) | (buf[i + 2] & 63);
-      if (value >= 0x800 && (value < 0xd800 || value > 0xdfff)) {
-        code = value;
-        size = 3;
-      }
-    } else if (byte >= 0xf0 && byte <= 0xf4 && i + 3 < end &&
-        (buf[i + 1] & 0xc0) === 0x80 && (buf[i + 2] & 0xc0) === 0x80 && (buf[i + 3] & 0xc0) === 0x80) {
-      const value = ((byte & 7) << 18) | ((buf[i + 1] & 63) << 12) | ((buf[i + 2] & 63) << 6) | (buf[i + 3] & 63);
-      if (value >= 0x10000 && value <= 0x10ffff) {
-        code = value;
-        size = 4;
-      }
+    const byte = buf[i++];
+    if (byte < 0x80) { out += String.fromCharCode(byte); continue; }
+    let need = 0;
+    let code = 0;
+    let lower = 0x80;
+    let upper = 0xbf;
+    if (byte >= 0xc2 && byte <= 0xdf) { need = 1; code = byte & 31; }
+    else if (byte >= 0xe0 && byte <= 0xef) {
+      need = 2; code = byte & 15;
+      if (byte === 0xe0) lower = 0xa0;
+      if (byte === 0xed) upper = 0x9f;
+    } else if (byte >= 0xf0 && byte <= 0xf4) {
+      need = 3; code = byte & 7;
+      if (byte === 0xf0) lower = 0x90;
+      if (byte === 0xf4) upper = 0x8f;
+    } else { out += '\ufffd'; continue; }
+    let ok = true;
+    for (let k = 0; k < need; k++) {
+      const next = buf[i];
+      if (i >= end || next < lower || next > upper) { ok = false; break; }
+      code = (code << 6) | (next & 63);
+      lower = 0x80; upper = 0xbf;
+      i++;
     }
+    if (!ok) { out += '\ufffd'; continue; }
     if (code > 0xffff) {
       code -= 0x10000;
       out += String.fromCharCode(0xd800 + (code >> 10), 0xdc00 + (code & 1023));
     } else {
       out += String.fromCharCode(code);
     }
-    i += size;
   }
   return out;
 }

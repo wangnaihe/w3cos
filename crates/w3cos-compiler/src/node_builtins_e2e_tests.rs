@@ -195,3 +195,217 @@ fn node_buffer_matches_node() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+const MODULES_MAIN: &str = r##"const { StringDecoder } = require("string_decoder");
+const qs = require("node:querystring");
+const assert = require("assert");
+const strict = require("assert/strict");
+
+const euro = Buffer.from("€");
+const d = new StringDecoder("utf8");
+console.log("sd", JSON.stringify(d.write(euro.subarray(0, 1))), JSON.stringify(d.write(euro.subarray(1))), JSON.stringify(d.end()), d.encoding);
+const d2 = new StringDecoder("utf8");
+console.log("sd-end", JSON.stringify(d2.write(Buffer.from([0x61, 0xe2, 0x82]))), JSON.stringify(d2.end()), new StringDecoder("hex").write(Buffer.from("hi")), new StringDecoder("utf16le").end(Buffer.from([0x68, 0, 0x69, 0])));
+try { new StringDecoder("nope"); } catch (e) { console.log("sd-err", e.code, e.name); }
+
+console.log("qs", qs.stringify({ a: 1, b: [2, "x y"], c: "é&=", d: true, e: null, f: undefined }), qs.escape("a b/ü"), qs.unescape("a%20b%zz+"));
+const parsed = qs.parse("a=1&b=2&a=3&c=x+y%21&d&=e&f=%E2%82%AC");
+console.log("qs-parse", JSON.stringify(parsed), Object.getPrototypeOf(parsed) === null, JSON.stringify(qs.parse("a:1;b:2", ";", ":")), qs.decode === qs.parse, JSON.stringify(qs.parse("a=1&b=2", null, null, { maxKeys: 1 })));
+
+function code(fn) { try { fn(); return "no-throw"; } catch (e) { return e.code + "/" + e.name + "/" + (e instanceof assert.AssertionError) + "/" + e.operator; } }
+console.log("assert-ok", code(() => assert(true)), code(() => assert.ok(0)), code(() => assert.equal(1, "1")), code(() => assert.equal(1, 2)), code(() => assert.notEqual(1, 2)));
+console.log("assert-strict", code(() => assert.strictEqual(1, "1")), code(() => assert.strictEqual(NaN, NaN)), code(() => strict.equal(1, "1")), strict.strict === strict, assert.strict === strict);
+console.log("assert-deep", code(() => assert.deepEqual({ a: [1, 2] }, { a: ["1", 2] })), code(() => assert.deepStrictEqual({ a: [1, 2] }, { a: ["1", 2] })), code(() => assert.deepStrictEqual({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] })), code(() => assert.notDeepStrictEqual([1], [1])));
+try { assert.strictEqual(1, 2); } catch (e) { console.log("msg1", JSON.stringify(e.message), e.actual, e.expected, e.generatedMessage); }
+try { assert.equal(1, 2, "custom"); } catch (e) { console.log("msg2", e.message, e.generatedMessage); }
+try { assert.fail("boom"); } catch (e) { console.log("msg3", e.message, e.code); }
+try { assert.notStrictEqual(1, 1); } catch (e) { console.log("msg4", JSON.stringify(e.message)); }
+console.log("throws", code(() => assert.throws(() => { throw new TypeError("bad"); }, TypeError)), code(() => assert.throws(() => { throw new Error("abc"); }, /abc/)), code(() => assert.throws(() => { throw new Error("abc"); }, { message: "abc" })), code(() => assert.throws(() => {})), code(() => assert.doesNotThrow(() => { throw new Error("x"); })));
+try { assert.throws(() => {}); } catch (e) { console.log("msg5", e.message); }
+try { assert.throws(() => {}, TypeError, "need it"); } catch (e) { console.log("msg6", e.message); }
+console.log("match", code(() => assert.match("abc", /b/)), code(() => assert.match("abc", /z/)), code(() => assert.ifError(null)), code(() => assert.ifError(new Error("e1"))));
+try { assert.ifError(new Error("e1")); } catch (e) { console.log("msg7", e.message); }
+// Chained: the AOT backend resumes `await` on an already-fulfilled promise
+// synchronously, so independent chains may interleave differently.
+assert.rejects(Promise.reject(new Error("r")), /r/)
+  .then(() => { console.log("rejects ok"); return assert.rejects(Promise.resolve(1)); })
+  .catch((e) => console.log("rejects missing", e.message, e.code));
+console.log("misc", Object.is(NaN, NaN), Object.is(0, -0), Object.keys(new Error("x")).length, new Error("x").hasOwnProperty("name"), JSON.stringify(new TypeError("t")), Promise.resolve(1) instanceof Promise, (async () => 1)() instanceof Promise);
+"##;
+
+/// `node main.cjs` (v20.19.2).
+const MODULES_NODE_OUTPUT: &str = r##"sd "" "€" "" utf8
+sd-end "a" "�" 6869 hi
+sd-err ERR_UNKNOWN_ENCODING TypeError
+qs a=1&b=2&b=x%20y&c=%C3%A9%26%3D&d=true&e=&f= a%20b%2F%C3%BC a b%zz+
+qs-parse {"a":["1","3"],"b":"2","c":"x y!","d":"","":"e","f":"€"} true {"a":"1","b":"2"} true {"a":"1"}
+assert-ok no-throw ERR_ASSERTION/AssertionError/true/== no-throw ERR_ASSERTION/AssertionError/true/== no-throw
+assert-strict ERR_ASSERTION/AssertionError/true/strictEqual no-throw ERR_ASSERTION/AssertionError/true/strictEqual true true
+assert-deep no-throw ERR_ASSERTION/AssertionError/true/deepStrictEqual no-throw ERR_ASSERTION/AssertionError/true/notDeepStrictEqual
+msg1 "Expected values to be strictly equal:\n\n1 !== 2\n" 1 2 true
+msg2 custom false
+msg3 boom ERR_ASSERTION
+msg4 "Expected \"actual\" to be strictly unequal to: 1"
+throws no-throw no-throw no-throw ERR_ASSERTION/AssertionError/true/throws ERR_ASSERTION/AssertionError/true/doesNotThrow
+msg5 Missing expected exception.
+msg6 Missing expected exception (TypeError): need it
+match no-throw ERR_ASSERTION/AssertionError/true/match no-throw ERR_ASSERTION/AssertionError/true/ifError
+msg7 ifError got unwanted exception: e1
+misc true false 0 false {} true true
+rejects ok
+rejects missing Missing expected rejection. ERR_ASSERTION
+"##;
+
+#[test]
+/// Also covers the implicit global `Buffer` (no `require("buffer")`).
+fn node_string_decoder_querystring_assert_match_node() {
+    let root = write_fixture(
+        "w3cos_node_modules_e2e",
+        &[
+            ("package.json", r#"{"name":"node-modules"}"#),
+            ("main.cjs", MODULES_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_modules_e2e");
+    let expected: Vec<&str> = MODULES_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+const STREAM_MAIN: &str = r##"const { Readable, Writable, Transform, PassThrough, Duplex, pipeline, finished } = require("stream");
+const streamPromises = require("stream/promises");
+const log = [];
+// Event interleaving across independent streams depends on tick
+// scheduling details; the lines are compared sorted.
+const out = (...a) => log.push(a.join(" "));
+
+// Readable push + data events
+const r1 = new Readable({ read() {} });
+const got1 = [];
+r1.on("data", (c) => got1.push(c.toString()));
+r1.on("end", () => out("r1 end", got1.join("|"), r1.readableEnded));
+r1.push("ab"); r1.push("cd"); r1.push(null);
+
+// Readable.from + objectMode + async iteration
+(async () => {
+  const items = [];
+  for await (const x of Readable.from([1, 2, 3])) items.push(x * 10);
+  out("from", items.join(","));
+})();
+
+// Writable with backpressure and drain
+const chunks = [];
+const w = new Writable({
+  highWaterMark: 4,
+  write(chunk, enc, cb) { chunks.push(chunk.toString()); setTimeout(cb, 1); },
+});
+const ok1 = w.write("abc");
+const ok2 = w.write("defg");
+out("write ret", ok1, ok2, w.writableLength, w.writableNeedDrain);
+w.on("drain", () => out("drain", chunks.join("")));
+w.end("!", () => out("w finished", chunks.join(""), w.writableFinished));
+
+// Transform upper + pipeline into collecting writable
+const upper = new Transform({ transform(chunk, enc, cb) { cb(null, chunk.toString().toUpperCase()); } });
+const sink = [];
+pipeline(
+  Readable.from(["x", "y", "z"]),
+  upper,
+  new Writable({ write(c, e, cb) { sink.push(c.toString()); cb(); } }),
+  (err) => out("pipeline", err === undefined || err === null ? "ok" : err.message, sink.join("")),
+);
+
+// pipe with PassThrough and setEncoding
+const pt = new PassThrough();
+pt.setEncoding("utf8");
+let ptOut = "";
+pt.on("data", (s) => { ptOut += typeof s + ":" + s + ";"; });
+pt.on("end", () => out("passthrough", ptOut));
+Readable.from([Buffer.from("he"), Buffer.from("llo")], { objectMode: false }).pipe(pt);
+
+// errors propagate through pipeline
+pipeline(
+  new Readable({ read() { this.destroy(new Error("boom")); } }),
+  new PassThrough(),
+  (err) => out("pipeline err", err && err.message),
+);
+
+// finished on writable
+const fw = new Writable({ write(c, e, cb) { cb(); } });
+finished(fw, (err) => out("finished", err === undefined ? "undefined" : String(err)));
+fw.end("x");
+
+// readable event / paused mode read()
+const r2 = new Readable({ read() {} });
+r2.push("hello"); r2.push(" world"); r2.push(null);
+r2.once("readable", () => {
+  const a = r2.read(5);
+  out("read5", a && a.toString(), r2.readableLength);
+  r2.resume();
+});
+
+// Duplex
+const d = new Duplex({
+  read() { this.push("pong"); this.push(null); },
+  write(c, e, cb) { out("duplex got", c.toString()); cb(); },
+});
+d.on("data", (c) => out("duplex data", c.toString()));
+d.write("ping"); d.end();
+
+// objectMode transform with flush
+const objs = [];
+const tx = new Transform({
+  objectMode: true,
+  transform(o, e, cb) { cb(null, { n: o.n * 2 }); },
+  flush(cb) { this.push({ n: -1 }); cb(); },
+});
+tx.on("data", (o) => objs.push(o.n));
+tx.on("end", () => out("objmode", objs.join(",")));
+tx.write({ n: 1 }); tx.write({ n: 2 }); tx.end();
+
+// write after end
+const we = new Writable({ write(c, e, cb) { cb(); } });
+we.on("error", (e) => out("write-after-end", e.code));
+we.end(); we.write("late");
+
+streamPromises.pipeline(Readable.from(["p", "q"]), new Writable({ objectMode: true, write(c, e, cb) { cb(); } }))
+  .then(() => out("promises.pipeline ok"));
+
+setTimeout(() => {
+  out("done", typeof require("stream").Stream, require("stream") === require("stream").Stream);
+  for (const line of log.sort()) console.log(line);
+}, 50);
+"##;
+
+/// `node main.cjs` (v20.19.2).
+const STREAM_NODE_OUTPUT: &str = r##"done function true
+duplex data pong
+duplex got ping
+finished undefined
+from 10,20,30
+objmode 2,4,-1
+passthrough string:he;string:llo;
+pipeline err boom
+pipeline ok XYZ
+promises.pipeline ok
+r1 end ab|cd true
+read5 hello 6
+w finished abcdefg! true
+write ret true false 7 true
+write-after-end ERR_STREAM_WRITE_AFTER_END
+"##;
+
+#[test]
+fn node_stream_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_stream_e2e",
+        &[
+            ("package.json", r#"{"name":"node-stream"}"#),
+            ("main.cjs", STREAM_MAIN),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_stream_e2e");
+    let expected: Vec<&str> = STREAM_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
