@@ -4627,15 +4627,15 @@ fn global_value_expr(name: &str) -> Option<String> {
                 "w3cos_core::intrinsics::get_property(&w3cos_runtime::jsdom::window_value(), &w3cos_core::Value::string({name:?}))"
             )
         }
-        // `Reflect` facade: `Reflect.construct(target, args)` routes through
-        // the class runtime (Monaco's InstantiationService._createInstance
-        // builds every service through it). The optional newTarget argument
-        // is ignored; all other Reflect members degrade to Undefined.
-        "Reflect" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"construct\".to_string(), w3cos_core::Value::function(|_this, __args| { let __target = __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined); let __ctor_args: Vec<w3cos_core::Value> = __args.get(1).map(|__a| __a.iter().collect()).unwrap_or_default(); w3cos_core::intrinsics::construct(&__target, __ctor_args) }))]))".to_string(),
+        // `Reflect` namespace (core `reflect_value`): `construct` routes
+        // through the class runtime (Monaco's InstantiationService builds
+        // every service through it; newTarget is ignored), `apply`/`get`/
+        // `ownKeys`/... delegate to the Object builtins and intrinsics.
+        "Reflect" => "w3cos_core::reflect_value()".to_string(),
         // Symbols use collision-resistant string sentinels in the compact
         // runtime. `Symbol.for(key)` must be stable because libraries use the
         // global registry for cross-module identity.
-        "Symbol" => "w3cos_core::Value::object(::std::collections::HashMap::from([(\"iterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_iterator\")), (\"asyncIterator\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_async_iterator\")), (\"unscopables\".to_string(), w3cos_core::Value::from(\"__w3cos_symbol_unscopables\")), (\"for\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::from(format!(\"__w3cos_symbol_for:{}\", __args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string()))))]))".to_string(),
+        "Symbol" => "w3cos_core::symbol_value()".to_string(),
         // Unimplemented builtin globals: harmless empty-object stubs keep
         // references total (`new X()` yields Undefined via construct on a
         // non-callable; `X.y` yields Undefined).
@@ -6453,14 +6453,15 @@ function f(window) { return window.x; }"#,
 
     #[test]
     fn lowers_reflect_construct_to_class_runtime() {
-        // Reflect.construct(target, args) → class::construct on the facade
-        // (Monaco's DI instantiates services through it).
+        // Reflect.construct(target, args) → core Reflect namespace, whose
+        // `construct` routes through the class runtime (Monaco's DI
+        // instantiates services through it; see core reflect tests).
         let stmts = parse_stmts("const o = Reflect.construct(Target, [1, 2]);");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
         assert!(
-            code.contains("w3cos_core::intrinsics::construct(&__target, __ctor_args)"),
-            "Reflect.construct → shared construct facade: {code}"
+            code.contains("w3cos_core::reflect_value()") && code.contains("\"construct\""),
+            "Reflect.construct → core Reflect namespace: {code}"
         );
     }
 
@@ -6470,8 +6471,9 @@ function f(window) { return window.x; }"#,
         let mut context = LowerCtx::new_dynamic(vec![]);
         let code = context.lower_stmts(&statements);
 
+        // The core Symbol facade maps `iterator` to `__w3cos_symbol_iterator`.
         assert!(
-            code.contains("__w3cos_symbol_iterator"),
+            code.contains("w3cos_core::symbol_value()") && code.contains("\"iterator\""),
             "well-known iterator symbol: {code}"
         );
     }
@@ -6483,7 +6485,7 @@ function f(window) { return window.x; }"#,
         let code = context.lower_stmts(&statements);
 
         assert!(
-            code.contains("__w3cos_symbol_for:{}")
+            code.contains("w3cos_core::symbol_value()")
                 && code.contains("w3cos_core::intrinsics::call_method(")
                 && code.contains("Value::string(\"for\")"),
             "Symbol.for registry facade: {code}"
@@ -6493,8 +6495,7 @@ function f(window) { return window.x; }"#,
     #[test]
     fn lowers_reflect_feature_detection_with_balanced_facade() {
         // DOMPurify destructures this expression at module scope. Keep the
-        // `&&` value semantics and, importantly, the inline Reflect facade's
-        // HashMap/array delimiters balanced so the generated Rust parses.
+        // `&&` value semantics and resolve the core Reflect namespace.
         let stmts =
             parse_stmts("let { apply, construct } = typeof Reflect !== 'undefined' && Reflect;");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
@@ -6504,12 +6505,8 @@ function f(window) { return window.x; }"#,
             "logical-and preserves the selected operand: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::construct(&__target, __ctor_args) }))]))"),
-            "Reflect facade closes function, tuple, array, HashMap, and object: {code}"
-        );
-        assert!(
-            !code.contains("w3cos_core::intrinsics::construct(&__target, __ctor_args) })))]))"),
-            "Reflect facade must not contain the old extra tuple delimiter: {code}"
+            code.contains("w3cos_core::reflect_value()"),
+            "Reflect resolves to the core namespace: {code}"
         );
     }
 

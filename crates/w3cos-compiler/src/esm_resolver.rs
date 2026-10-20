@@ -1314,7 +1314,18 @@ impl EsmResolver {
             return Ok(());
         };
         let calls = crate::create_require::find_calls(path, &source);
+        // Node implicit globals an ES module reads (`Buffer`) become static
+        // imports of their builtin, as CommonJS modules get via the prelude.
+        let implicit_imports = crate::cjs::esm_implicit_global_imports(path, &source);
         if calls.is_empty() {
+            if !implicit_imports.is_empty() {
+                let text = prepend_after_hashbang(&implicit_imports, &source);
+                let imports = collect_static_imports(&text);
+                module_source::set_synthesized(path.to_path_buf(), text, imports);
+                self.create_require_rewritten
+                    .borrow_mut()
+                    .insert(path.to_path_buf());
+            }
             return Ok(());
         }
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1341,7 +1352,10 @@ impl EsmResolver {
                 }
             });
         }
-        let text = crate::create_require::rewrite(&source, &calls, &targets);
+        let text = prepend_after_hashbang(
+            &implicit_imports,
+            &crate::create_require::rewrite(&source, &calls, &targets),
+        );
         let imports = collect_static_imports(&text);
         module_source::set_synthesized(path.to_path_buf(), text, imports);
         self.create_require_rewritten
@@ -1770,6 +1784,20 @@ impl EsmResolver {
             .find(|index| index.is_file())
             .map(|index| normalize_path(&index))
     }
+}
+
+/// `prefix` + `source`, keeping a leading `#!` line first.
+fn prepend_after_hashbang(prefix: &str, source: &str) -> String {
+    if prefix.is_empty() {
+        return source.to_string();
+    }
+    if source.starts_with("#!") {
+        let split = source.find('\n').map_or(source.len(), |index| index + 1);
+        let (hashbang, rest) = source.split_at(split);
+        let newline = if hashbang.ends_with('\n') { "" } else { "\n" };
+        return format!("{hashbang}{newline}{prefix}{rest}");
+    }
+    format!("{prefix}{source}")
 }
 
 fn is_host_module(specifier: &str) -> bool {

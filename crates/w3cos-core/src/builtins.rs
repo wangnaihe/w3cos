@@ -54,6 +54,182 @@ pub fn object_value() -> Value {
     })
 }
 
+/// The global `Reflect` namespace, one per thread. Members delegate to the
+/// `Object` builtins and the runtime's property/construct intrinsics.
+pub fn reflect_value() -> Value {
+    thread_local! {
+        static REFLECT: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    REFLECT.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let value = build_reflect_value();
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+fn build_reflect_value() -> Value {
+    fn arg(arguments: &[Value], index: usize) -> Value {
+        arguments.get(index).cloned().unwrap_or(Value::Undefined)
+    }
+    fn list(value: &Value) -> Vec<Value> {
+        if value.is_undefined() || value.is_null() {
+            return Vec::new();
+        }
+        let length = value.get_property("length").to_number();
+        let length = if length.is_finite() && length > 0.0 {
+            length as usize
+        } else {
+            0
+        };
+        (0..length)
+            .map(|index| value.get_property(&index.to_string()))
+            .collect()
+    }
+    fn object_method(name: &'static str) -> Value {
+        Value::function(move |_, arguments| object_value().call_method(name, arguments))
+    }
+    let mut properties = HashMap::new();
+    properties.insert(
+        "apply".to_string(),
+        Value::function(|_, arguments| {
+            let target = arg(&arguments, 0);
+            target.call(arg(&arguments, 1), list(&arg(&arguments, 2)))
+        }),
+    );
+    properties.insert(
+        "construct".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::construct(&arg(&arguments, 0), list(&arg(&arguments, 1)))
+        }),
+    );
+    properties.insert(
+        "get".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::get_property(&arg(&arguments, 0), &arg(&arguments, 1))
+        }),
+    );
+    properties.insert(
+        "set".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::set_property(
+                &arg(&arguments, 0),
+                &arg(&arguments, 1),
+                arg(&arguments, 2),
+            );
+            Value::Bool(true)
+        }),
+    );
+    properties.insert(
+        "has".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::in_operator(&arg(&arguments, 1), &arg(&arguments, 0))
+        }),
+    );
+    properties.insert(
+        "deleteProperty".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::delete_property(&arg(&arguments, 0), &arg(&arguments, 1))
+        }),
+    );
+    properties.insert(
+        "defineProperty".to_string(),
+        Value::function(|_, arguments| {
+            object_value().call_method("defineProperty", arguments);
+            Value::Bool(true)
+        }),
+    );
+    properties.insert(
+        "setPrototypeOf".to_string(),
+        Value::function(|_, arguments| {
+            object_value().call_method("setPrototypeOf", arguments);
+            Value::Bool(true)
+        }),
+    );
+    properties.insert(
+        "getPrototypeOf".to_string(),
+        object_method("getPrototypeOf"),
+    );
+    properties.insert(
+        "getOwnPropertyDescriptor".to_string(),
+        object_method("getOwnPropertyDescriptor"),
+    );
+    properties.insert("ownKeys".to_string(), object_method("getOwnPropertyNames"));
+    properties.insert(
+        "isExtensible".to_string(),
+        Value::function(|_, arguments| {
+            Value::Bool(arg(&arguments, 0).is_object() || arg(&arguments, 0).is_callable())
+        }),
+    );
+    properties.insert(
+        "preventExtensions".to_string(),
+        Value::function(|_, _| Value::Bool(true)),
+    );
+    Value::object(properties)
+}
+
+/// The global `Symbol` facade, one per thread. Symbols are collision-resistant
+/// string sentinels (`__w3cos_symbol_…`); `Symbol.for(key)` is stable for the
+/// global registry. `Symbol.prototype` exists so uncurried method captures
+/// (DOMPurify `unapply(Symbol.prototype.toString)`) resolve.
+pub fn symbol_value() -> Value {
+    thread_local! {
+        static SYMBOL: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    SYMBOL.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let prototype = Value::object(HashMap::from([
+            (
+                "toString".to_string(),
+                Value::function(|this, _| {
+                    let raw = this.to_js_string();
+                    let description = raw
+                        .strip_prefix("__w3cos_symbol_for:")
+                        .or_else(|| raw.strip_prefix("__w3cos_symbol_"))
+                        .unwrap_or(&raw)
+                        .to_string();
+                    Value::from(format!("Symbol({description})"))
+                }),
+            ),
+            ("valueOf".to_string(), Value::function(|this, _| this)),
+        ]));
+        let value = Value::object(HashMap::from([
+            (
+                "iterator".to_string(),
+                Value::from("__w3cos_symbol_iterator"),
+            ),
+            (
+                "asyncIterator".to_string(),
+                Value::from("__w3cos_symbol_async_iterator"),
+            ),
+            (
+                "unscopables".to_string(),
+                Value::from("__w3cos_symbol_unscopables"),
+            ),
+            (
+                "for".to_string(),
+                Value::function(|_, arguments| {
+                    Value::from(format!(
+                        "__w3cos_symbol_for:{}",
+                        arguments
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
+                            .to_js_string()
+                    ))
+                }),
+            ),
+            ("prototype".to_string(), prototype),
+        ]));
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
 fn build_object_value() -> Value {
     let mut properties = HashMap::new();
     let prototype = Value::object(HashMap::from([
@@ -2052,6 +2228,40 @@ pub fn dispatch_resize_observers_bounded(
 #[cfg(test)]
 mod monaco_tests {
     use super::*;
+
+    #[test]
+    fn reflect_and_symbol_facades_support_uncurried_captures() {
+        let reflect = reflect_value();
+        let to_lower = Value::function(|this, _| Value::from(this.to_js_string().to_lowercase()));
+        let lowered = reflect.call_method(
+            "apply",
+            vec![to_lower, Value::from("AB"), Value::array(Vec::new())],
+        );
+        assert_eq!(lowered.to_js_string(), "ab");
+        let object = Value::object(HashMap::from([("a".to_string(), Value::Number(1.0))]));
+        assert!(
+            reflect
+                .call_method("has", vec![object.clone(), Value::from("a")])
+                .to_bool()
+        );
+        assert_eq!(
+            reflect
+                .call_method("get", vec![object.clone(), Value::from("a")])
+                .to_number(),
+            1.0
+        );
+        let keys = reflect.call_method("ownKeys", vec![object]);
+        assert_eq!(keys.call_method("join", vec![]).to_js_string(), "a");
+        let symbol = symbol_value();
+        assert!(symbol.strict_eq(&symbol_value()));
+        let to_string = symbol.get_property("prototype").get_property("toString");
+        assert_eq!(
+            to_string
+                .call(symbol.get_property("iterator"), Vec::new())
+                .to_js_string(),
+            "Symbol(iterator)"
+        );
+    }
 
     #[test]
     fn math_floor_matches_javascript_number_semantics() {

@@ -217,6 +217,88 @@ struct RequireScan {
     globals_read: BTreeSet<String>,
 }
 
+/// Imports an ES module needs for Node implicit globals it reads without
+/// declaring (`typeof Buffer !== "undefined"` in Code-OSS `buffer.js`), as
+/// source text to prepend: `import { Buffer } from "node:buffer";`. Empty
+/// when the module declares, imports, or never reads them.
+pub fn esm_implicit_global_imports(path: &Path, source: &str) -> String {
+    if !IMPLICIT_GLOBALS
+        .iter()
+        .any(|(global, _, _)| source.contains(global))
+    {
+        return String::new();
+    }
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Real(path.to_path_buf())),
+        strip_hashbang(source).to_string(),
+    );
+    let jsx = path.extension().is_some_and(|ext| ext == "jsx");
+    let mut parser = Parser::new(
+        Syntax::Es(EsSyntax {
+            jsx,
+            ..Default::default()
+        }),
+        StringInput::from(&*fm),
+        None,
+    );
+    let Ok(module) = parser.parse_module() else {
+        return String::new();
+    };
+    let mut statements = Vec::new();
+    let mut imported = BTreeSet::new();
+    let mut scan = RequireScan::default();
+    for item in module.body {
+        match item {
+            ModuleItem::Stmt(statement) => statements.push(statement),
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                for specifier in &import.specifiers {
+                    let local = match specifier {
+                        ImportSpecifier::Named(named) => &named.local,
+                        ImportSpecifier::Default(default) => &default.local,
+                        ImportSpecifier::Namespace(namespace) => &namespace.local,
+                    };
+                    imported.insert(local.sym.to_string());
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                statements.push(Stmt::Decl(export.decl));
+            }
+            ModuleItem::ModuleDecl(declaration) => {
+                // `export default <expr>` and friends still read identifiers.
+                if let ModuleDecl::ExportDefaultDecl(default) = &declaration {
+                    let ident = match &default.decl {
+                        DefaultDecl::Class(class) => class.ident.as_ref(),
+                        DefaultDecl::Fn(function) => function.ident.as_ref(),
+                        _ => None,
+                    };
+                    if let Some(ident) = ident {
+                        imported.insert(ident.sym.to_string());
+                    }
+                }
+                declaration.visit_with(&mut scan);
+            }
+        }
+    }
+    for statement in &statements {
+        statement.visit_with(&mut scan);
+    }
+    IMPLICIT_GLOBALS
+        .iter()
+        .filter(|(global, _, _)| {
+            scan.globals_read.contains(*global)
+                && !imported.contains(*global)
+                && !declares_top_level(&statements, global)
+        })
+        .map(|(global, specifier, member)| {
+            format!(
+                "import {{ {member} as {global} }} from {};\n",
+                js_string(specifier)
+            )
+        })
+        .collect()
+}
+
 /// Does a top-level statement declare `name` (var/let/const/function/class)?
 fn declares_top_level(statements: &[Stmt], name: &str) -> bool {
     fn pat_binds(pat: &Pat, name: &str) -> bool {
@@ -911,6 +993,22 @@ pub fn facade_source<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn esm_modules_reading_buffer_import_it_from_node_buffer() {
+        let path = Path::new("/p/buffer.js");
+        let reads = "import { Lazy } from './lazy.js';\nconst hasBuffer = typeof Buffer !== 'undefined';\nexport class VSBuffer { static alloc(n) { return Buffer.allocUnsafe(n); } }\n";
+        assert_eq!(
+            esm_implicit_global_imports(path, reads),
+            "import { Buffer as Buffer } from \"node:buffer\";\n"
+        );
+        let imports = "import { Buffer } from 'node:buffer';\nexport const b = Buffer.from('x');\n";
+        assert_eq!(esm_implicit_global_imports(path, imports), "");
+        let declares = "export class Buffer {}\nexport const b = new Buffer();\n";
+        assert_eq!(esm_implicit_global_imports(path, declares), "");
+        let member_only = "export const size = view.Buffer;\n";
+        assert_eq!(esm_implicit_global_imports(path, member_only), "");
+    }
 
     fn analyze(path: &str, source: &str) -> Option<CjsAnalysis> {
         classify(Path::new(path), source, false).unwrap()
