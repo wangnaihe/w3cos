@@ -42,6 +42,37 @@ fn supported_spacing(s: Spacing, allow_auto: bool) -> bool {
 /// Internal custom properties that only carry computed values for the
 /// CSSOM, font selection or paint; they never mean a legacy layout
 /// projection owns the box.
+/// CSS Contain 2 size containment (the cascade keeps the `size` token;
+/// `Contain` folds tokens together).
+const SIZE_CONTAINMENT: &str = "--w3cos-internal-size-containment";
+/// `contain-intrinsic-size` per axis: "<w> <h>", px or `none`.
+const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
+/// `width: max-content | min-content | fit-content` (width is auto).
+const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
+
+fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(key))
+        .map(String::as_str)
+}
+
+pub(super) fn size_contained(style: &Style) -> bool {
+    marker(style, SIZE_CONTAINMENT).is_some()
+}
+
+/// The content-box size a size-contained box is laid out as if it had
+/// (Blink ComputeMinMaxSizes / ComputeIntrinsicBlockSize with
+/// ShouldApplySizeContainment: the contain-intrinsic size, else 0).
+fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
+    let mut axes = marker(style, CONTAIN_INTRINSIC_SIZE)
+        .unwrap_or("")
+        .split_ascii_whitespace()
+        .map(|v| v.parse::<f32>().unwrap_or(0.0));
+    (axes.next().unwrap_or(0.0), axes.next().unwrap_or(0.0))
+}
+
 fn is_value_carrier_marker(key: &str) -> bool {
     let name = key.trim_start_matches("--w3cos-internal-");
     matches!(
@@ -58,6 +89,8 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "text-source-run"
             | "text-fragment-ends"
             | "quirks-mode"
+            | "size-containment"
+            | "contain-intrinsic-size"
     ) || name.starts_with("decoration-owner")
 }
 
@@ -164,6 +197,9 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                 key.starts_with("--w3cos-internal")
                     && !is_value_carrier_marker(key)
                     && !allowed.contains(&key.as_str())
+                    // Intrinsic width keywords are only resolved where size
+                    // containment fixes the intrinsic sizes.
+                    && !(key == WIDTH_KEYWORD && size_contained(style))
             })
         })
         .then_some("internal-marker")
@@ -618,7 +654,13 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
         BoxSizing::BorderBox => (w - edges).max(0.0),
         BoxSizing::ContentBox => w,
     };
-    let specified = resolve_dim(style.width, Some(cb), style, space).map(to_content);
+    // An intrinsic keyword (only accepted under size containment) is the
+    // contain-intrinsic inline size: min-, max- and fit-content coincide.
+    let specified = if marker(style, WIDTH_KEYWORD).is_some() {
+        Some(contain_intrinsic_size(style).0)
+    } else {
+        resolve_dim(style.width, Some(cb), style, space).map(to_content)
+    };
     let mut content_width = specified
         .unwrap_or(cb - margin[1] - margin[3] - edges)
         .max(0.0);
@@ -763,6 +805,10 @@ pub(super) fn intrinsic_sizes(
     }
     if let ComponentKind::Text { content } = info.kind {
         return Some(inline::text_min_max(content, info.style));
+    }
+    if size_contained(info.style) {
+        // Size containment: intrinsic sizes ignore the contents.
+        return Some(MinMax::exact(contain_intrinsic_size(info.style).0));
     }
     if inline::is_inline_container(flat, index) {
         // Floats among inline content would take the float_left /
@@ -1533,7 +1579,8 @@ fn layout_block_in(
         && bb == 0.0
         && pb == 0.0
         && specified_height.is_none()
-        && !last_cleared_self_collapsing;
+        && !last_cleared_self_collapsing
+        && !size_contained(style);
 
     let mut end_strut = MarginStrut::default();
     let auto_content = if can_escape_bottom {
@@ -1550,6 +1597,12 @@ fn layout_block_in(
     let auto_content = match exclusions.max_bottom() {
         Some(bottom) if bfc_root => auto_content.max(bottom - bt - pt),
         _ => auto_content,
+    };
+    // Size containment: the auto block size is the contain-intrinsic one.
+    let auto_content = if size_contained(style) {
+        contain_intrinsic_size(style).1
+    } else {
+        auto_content
     };
     let content_height = clamp_h(specified_height.unwrap_or(auto_content));
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our

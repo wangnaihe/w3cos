@@ -1594,3 +1594,53 @@ fn clearance_past_adjoining_floats_matches_blink() {
         &[(1, [0.0, 0.0, 200.0, 201.0]), (3, [0.0, 101.0, 200.0, 0.0])],
     );
 }
+
+#[test]
+fn size_containment_uses_contain_intrinsic_size() {
+    // contain-intrinsic-size-014: `width: max-content; contain: size;
+    // contain-intrinsic-size: 111px 222px` lays out as a 111x222 content box
+    // whatever its children (Blink ShouldApplySizeContainment).
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let mut contained = block();
+    mark(
+        &mut contained,
+        &[
+            ("--w3cos-internal-size-containment", "1"),
+            ("--w3cos-internal-contain-intrinsic-size", "111 222"),
+            ("--w3cos-internal-width-keyword", "max-content"),
+        ],
+    );
+    let root = node(
+        block(),
+        vec![
+            node(contained, vec![node(sized(300.0), vec![])]),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 111.0, 222.0));
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 111.0, 300.0));
+    assert_eq!(rect(&ng, 3), (0.0, 222.0, 800.0, 10.0));
+    // No contain-intrinsic-size: the contents still do not size the box.
+    let mut empty = block();
+    mark(&mut empty, &[("--w3cos-internal-size-containment", "1")]);
+    let root = node(block(), vec![node(empty, vec![node(sized(50.0), vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
+    // A width keyword without size containment stays on legacy.
+    let mut keyword = block();
+    mark(
+        &mut keyword,
+        &[("--w3cos-internal-width-keyword", "max-content")],
+    );
+    let root = node(block(), vec![node(keyword, vec![])]);
+    assert!(block::unsupported_tree(&pre_flatten(&root)).is_some());
+}

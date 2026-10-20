@@ -8,6 +8,40 @@ use w3cos_std::style::{
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
+/// `contain` with a real `size` (or `strict`) token: size containment
+/// (CSS Contain 2 3.1; `inline-size` alone is not). `Contain` folds tokens.
+pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
+/// `contain-intrinsic-size`: "<width> <height>" in px, `none` per axis.
+pub const CONTAIN_INTRINSIC_SIZE_PROPERTY: &str = "--w3cos-internal-contain-intrinsic-size";
+/// `width: max-content | min-content | fit-content` (width stays auto).
+pub const WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-width-keyword";
+
+fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
+    match value {
+        Some(value) => {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(key.to_string(), value);
+        }
+        None => {
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove(key);
+            }
+        }
+    }
+}
+
+/// One `contain-intrinsic-*` axis value: `none`, `<length>` or
+/// `auto <length>` (no remembered sizes here, so the length is used).
+fn contain_intrinsic_axis(value: &str) -> Option<String> {
+    let v = value.trim().to_ascii_lowercase();
+    let v = v.strip_prefix("auto").map(str::trim).unwrap_or(&v);
+    if v == "none" {
+        return Some("none".into());
+    }
+    parse_px(v).filter(|px| *px >= 0.0).map(|px| px.to_string())
+}
 pub const TEXT_DECORATION_COLOR_PROPERTY: &str = w3cos_std::inline_text::DECORATION_COLOR;
 
 /// CSSStyleDeclaration — the `element.style` property.
@@ -461,13 +495,22 @@ impl CSSStyleDeclaration {
                 }
             }
             "width" => {
-                if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
+                let keyword = value.trim().to_ascii_lowercase();
+                if matches!(
+                    keyword.as_str(),
+                    "max-content" | "min-content" | "fit-content"
+                ) {
+                    self.inner.width = Dimension::Auto;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
                 } else if let Some(width) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.width = width;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "height" => {
@@ -842,6 +885,49 @@ impl CSSStyleDeclaration {
             }
             "contain" => {
                 self.inner.contain = Contain::from_css(value);
+                let size = value
+                    .split_ascii_whitespace()
+                    .any(|token| matches!(token.to_ascii_lowercase().as_str(), "size" | "strict"));
+                set_marker(
+                    &mut self.inner,
+                    SIZE_CONTAINMENT_PROPERTY,
+                    size.then(|| "1".to_string()),
+                );
+            }
+            "contain-intrinsic-size" | "containIntrinsicSize" => {
+                let v = value.trim().to_ascii_lowercase();
+                // Split "[auto] <a> [auto] <b>" into per-axis values.
+                let mut axes = Vec::new();
+                let mut auto = false;
+                for token in v.split_ascii_whitespace() {
+                    if token == "auto" {
+                        auto = true;
+                        continue;
+                    }
+                    axes.push(if auto {
+                        format!("auto {token}")
+                    } else {
+                        token.to_string()
+                    });
+                    auto = false;
+                }
+                let parsed: Option<Vec<String>> = axes
+                    .iter()
+                    .map(|axis| contain_intrinsic_axis(axis))
+                    .collect();
+                match parsed.as_deref() {
+                    Some([both]) => set_marker(
+                        &mut self.inner,
+                        CONTAIN_INTRINSIC_SIZE_PROPERTY,
+                        (both != "none").then(|| format!("{both} {both}")),
+                    ),
+                    Some([w, h]) => set_marker(
+                        &mut self.inner,
+                        CONTAIN_INTRINSIC_SIZE_PROPERTY,
+                        Some(format!("{w} {h}")),
+                    ),
+                    _ => {}
+                }
             }
             "filter" => {
                 let v = value.trim();
