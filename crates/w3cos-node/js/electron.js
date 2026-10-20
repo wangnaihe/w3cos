@@ -235,24 +235,42 @@ function runRendererScript(file, label) {
     console.error('Unable to load ' + label + ' ' + file + ': not compiled into this app');
     return;
   }
-  try {
-    assets.load(key);
-  } catch (error) {
+  const report = (error) => {
     console.error(label === 'preload'
       ? 'Unable to load preload script: ' + file
       : 'Uncaught ' + (error && error.stack ? error.stack : error));
     if (label === 'preload') console.error(error);
+  };
+  try {
+    // ES module scripts (`<script type="module">`, ESM preloads) are linked
+    // as lazily evaluated modules: `load` returns their `import()` promise.
+    const result = assets.load(key);
+    if (result && typeof result.then === 'function') return result.then(undefined, report);
+  } catch (error) {
+    report(error);
   }
+  return undefined;
 }
 
+// Returns a promise when an ES module script is still evaluating; classic
+// pages finish synchronously as before.
 function renderPage(contents, page) {
   document.head.innerHTML = page.head;
   document.body.innerHTML = page.body;
   document.title = page.title;
   const preload = contents._preferences.preload;
-  if (preload) runRendererScript(preload, 'preload');
-  for (const script of page.scripts) runRendererScript(script, 'script');
-  document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+  let pending = preload ? runRendererScript(preload, 'preload') : undefined;
+  for (const script of page.scripts) {
+    pending = pending
+      ? pending.then(() => runRendererScript(script, 'script'))
+      : runRendererScript(script, 'script');
+  }
+  const contentLoaded = () => {
+    document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+  };
+  if (pending) return pending.then(contentLoaded);
+  contentLoaded();
+  return undefined;
 }
 
 // --- webContents -------------------------------------------------------------
@@ -338,17 +356,21 @@ class WebContents extends EventEmitter {
         this._url = url;
         this._loading = true;
         this.emit('did-start-loading');
-        renderPage(this, page);
-        this.emit('dom-ready', makeEvent());
-        window.dispatchEvent(new Event('load'));
-        this._loading = false;
-        this.emit('did-frame-finish-load', makeEvent(), true, 1, 1);
-        this.emit('did-finish-load', makeEvent());
-        this.emit('did-stop-loading', makeEvent());
-        trace('page-loaded ' + JSON.stringify(document.title) + ' ' +
-          JSON.stringify(String(document.body.textContent).replace(/\s+/g, ' ').trim()));
-        resolve();
-        if (EXIT_AFTER_LOAD) task(() => { if (this._win && !this._win.isDestroyed()) this._win.close(); });
+        const finish = () => {
+          this.emit('dom-ready', makeEvent());
+          window.dispatchEvent(new Event('load'));
+          this._loading = false;
+          this.emit('did-frame-finish-load', makeEvent(), true, 1, 1);
+          this.emit('did-finish-load', makeEvent());
+          this.emit('did-stop-loading', makeEvent());
+          trace('page-loaded ' + JSON.stringify(document.title) + ' ' +
+            JSON.stringify(String(document.body.textContent).replace(/\s+/g, ' ').trim()));
+          resolve();
+          if (EXIT_AFTER_LOAD) task(() => { if (this._win && !this._win.isDestroyed()) this._win.close(); });
+        };
+        const rendering = renderPage(this, page);
+        if (rendering) rendering.then(finish);
+        else finish();
       });
     });
   }
