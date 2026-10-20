@@ -41,6 +41,10 @@ jobs:
           ref: aot-port
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The self-hosted runner keeps its own target/ between runs; saving
+          # a multi-GB cache from it hung the post step until the job timeout.
+          save-if: ${{ vars.LEAK_SOAK_RUNNER == '' }}
       - name: Resolve soak duration
         id: duration
         env:
