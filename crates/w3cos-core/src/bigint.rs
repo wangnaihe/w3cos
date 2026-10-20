@@ -60,6 +60,21 @@ pub fn get(value: &Value) -> Option<BigInt> {
     }
 }
 
+fn bigint_to_string(value: &BigInt, args: &[Value]) -> Value {
+    let radix = args
+        .first()
+        .filter(|value| !value.is_undefined())
+        .map(Value::to_number)
+        .unwrap_or(10.0);
+    if !radix.is_finite() || !(2.0..=36.0).contains(&radix) || radix.fract() != 0.0 {
+        crate::throw_value(error(
+            "RangeError",
+            "BigInt radix must be an integer between 2 and 36",
+        ));
+    }
+    Value::from(value.to_str_radix(radix as u32))
+}
+
 fn from_bigint(value: BigInt) -> Value {
     let encoded = value.to_string();
     let to_string_value = value.clone();
@@ -68,20 +83,7 @@ fn from_bigint(value: BigInt) -> Value {
         (VALUE.into(), Value::from(encoded)),
         (
             "toString".into(),
-            Value::function(move |_, args| {
-                let radix = args
-                    .first()
-                    .filter(|value| !value.is_undefined())
-                    .map(Value::to_number)
-                    .unwrap_or(10.0);
-                if !radix.is_finite() || !(2.0..=36.0).contains(&radix) || radix.fract() != 0.0 {
-                    crate::throw_value(error(
-                        "RangeError",
-                        "BigInt radix must be an integer between 2 and 36",
-                    ));
-                }
-                Value::from(to_string_value.to_str_radix(radix as u32))
-            }),
+            Value::function(move |_, args| bigint_to_string(&to_string_value, &args)),
         ),
         (
             "toLocaleString".into(),
@@ -97,26 +99,74 @@ fn from_bigint(value: BigInt) -> Value {
     ]))
 }
 
-pub fn bigint_class() -> Value {
-    Value::function(|_, args| {
-        let input = args.first().cloned().unwrap_or(Value::Undefined);
-        if let Some(value) = get(&input) {
-            return from_bigint(value);
-        }
-        match input.unpack() {
-            crate::value::ValueUnpack::Number(number)
-                if number.is_finite() && number.fract() == 0.0 =>
-            {
-                parse(&format!("{number:.0}"))
-            }
-            crate::value::ValueUnpack::Number(_) => crate::throw_value(error(
-                "RangeError",
-                "The number cannot be converted to a BigInt because it is not an integer",
-            )),
-            crate::value::ValueUnpack::Bool(value) => from_bigint(BigInt::from(u8::from(value))),
-            _ => parse(&input.to_js_string()),
-        }
+fn this_bigint(this: &Value, method: &str) -> BigInt {
+    get(this).unwrap_or_else(|| {
+        crate::throw_value(crate::error_instance(
+            "TypeError",
+            vec![Value::from(format!(
+                "BigInt.prototype.{method} requires that 'this' be a BigInt"
+            ))],
+        ))
     })
+}
+
+/// The global `BigInt` function, one per thread, with `BigInt.prototype`
+/// (`toString`/`valueOf`/`toLocaleString`) so uncurried captures (DOMPurify
+/// `unapply(BigInt.prototype.toString)`) resolve.
+pub fn bigint_class() -> Value {
+    thread_local! {
+        static BIGINT: std::cell::RefCell<Option<Value>> = const { std::cell::RefCell::new(None) };
+    }
+    BIGINT.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let prototype = Value::object(HashMap::from([
+            (
+                "toString".to_string(),
+                Value::function(|this, args| {
+                    bigint_to_string(&this_bigint(&this, "toString"), &args)
+                }),
+            ),
+            (
+                "toLocaleString".to_string(),
+                Value::function(|this, _| {
+                    Value::from(this_bigint(&this, "toLocaleString").to_string())
+                }),
+            ),
+            (
+                "valueOf".to_string(),
+                Value::function(|this, _| from_bigint(this_bigint(&this, "valueOf"))),
+            ),
+        ]));
+        let value = Value::callable(
+            HashMap::from([("prototype".to_string(), prototype.clone())]),
+            bigint_call,
+        );
+        prototype.set_property("constructor", value.clone());
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+fn bigint_call(_: Value, args: Vec<Value>) -> Value {
+    let input = args.first().cloned().unwrap_or(Value::Undefined);
+    if let Some(value) = get(&input) {
+        return from_bigint(value);
+    }
+    match input.unpack() {
+        crate::value::ValueUnpack::Number(number)
+            if number.is_finite() && number.fract() == 0.0 =>
+        {
+            parse(&format!("{number:.0}"))
+        }
+        crate::value::ValueUnpack::Number(_) => crate::throw_value(error(
+            "RangeError",
+            "The number cannot be converted to a BigInt because it is not an integer",
+        )),
+        crate::value::ValueUnpack::Bool(value) => from_bigint(BigInt::from(u8::from(value))),
+        _ => parse(&input.to_js_string()),
+    }
 }
 
 fn pair(left: &Value, right: &Value) -> Option<(BigInt, BigInt)> {
@@ -264,6 +314,26 @@ mod tests {
         );
         assert!(value.to_bool());
         assert!(!parse("0").to_bool());
+    }
+
+    #[test]
+    fn bigint_function_exposes_an_uncurryable_prototype() {
+        let class = bigint_class();
+        assert!(class.strict_eq(&bigint_class()));
+        let to_string = class.get_property("prototype").get_property("toString");
+        assert_eq!(
+            to_string
+                .call(parse("255"), vec![Value::Number(16.0)])
+                .to_js_string(),
+            "ff"
+        );
+        assert!(crate::value::catch_js(|| to_string.call(Value::Number(1.0), Vec::new())).is_err());
+        assert_eq!(
+            class
+                .call(Value::Undefined, vec![Value::Number(12.0)])
+                .to_js_string(),
+            "12"
+        );
     }
 
     #[test]

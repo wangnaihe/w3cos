@@ -271,6 +271,54 @@ pub fn number_value() -> Value {
     })
 }
 
+/// The global `Boolean` constructor, one per thread, with
+/// `Boolean.prototype.toString`/`valueOf` so uncurried captures
+/// (DOMPurify `unapply(Boolean.prototype.toString)`) resolve.
+pub fn boolean_value() -> Value {
+    thread_local! {
+        static BOOLEAN: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    BOOLEAN.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        fn this_boolean(this: &Value, method: &str) -> bool {
+            match this.unpack() {
+                crate::value::ValueUnpack::Bool(value) => value,
+                _ => crate::throw_value(error_instance(
+                    "TypeError",
+                    vec![Value::from(format!(
+                        "Boolean.prototype.{method} requires that 'this' be a Boolean"
+                    ))],
+                )),
+            }
+        }
+        let prototype = Value::object(HashMap::from([
+            (
+                "toString".to_string(),
+                Value::function(|this, _| {
+                    Value::from(if this_boolean(&this, "toString") {
+                        "true"
+                    } else {
+                        "false"
+                    })
+                }),
+            ),
+            (
+                "valueOf".to_string(),
+                Value::function(|this, _| Value::Bool(this_boolean(&this, "valueOf"))),
+            ),
+        ]));
+        let value = Value::callable(
+            HashMap::from([("prototype".to_string(), prototype.clone())]),
+            |_, arguments| Value::Bool(arguments.first().is_some_and(Value::to_bool)),
+        );
+        prototype.set_property("constructor", value.clone());
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
 /// The global `Symbol` facade, one per thread. Symbols are collision-resistant
 /// string sentinels (`__w3cos_symbol_…`); `Symbol.for(key)` is stable for the
 /// global registry. `Symbol.prototype` exists so uncurried method captures
@@ -2427,6 +2475,25 @@ mod monaco_tests {
                 .to_bool()
         );
         assert_eq!(number.call(Value::Undefined, Vec::new()).to_number(), 0.0);
+        // DOMPurify `unapply(Boolean.prototype.toString)`.
+        let boolean = boolean_value();
+        assert!(boolean.strict_eq(&boolean_value()));
+        let bool_to_string = boolean.get_property("prototype").get_property("toString");
+        assert_eq!(
+            bool_to_string
+                .call(Value::Bool(false), Vec::new())
+                .to_js_string(),
+            "false"
+        );
+        assert!(
+            crate::value::catch_js(|| bool_to_string.call(Value::Number(1.0), Vec::new())).is_err()
+        );
+        assert!(
+            boolean
+                .call(Value::Undefined, vec![Value::from("x")])
+                .to_bool()
+        );
+        assert!(!boolean.call(Value::Undefined, Vec::new()).to_bool());
         // `Symbol.toPrimitive[Symbol.toPrimitive]()` on the sentinel itself.
         let key = symbol.get_property("toPrimitive");
         assert!(

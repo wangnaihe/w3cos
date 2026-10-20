@@ -182,6 +182,20 @@ mod tests {
     }
 
     #[test]
+    fn electron_app_exposes_the_gpu_queries_code_oss_reads() {
+        // Code-OSS GPUProcessMainService reads
+        // `app.getGPUFeatureStatus().gpu_compositing` at construction.
+        for method in [
+            "getGPUFeatureStatus() {",
+            "getGPUInfo() {",
+            "getAppMetrics() {",
+        ] {
+            assert!(ELECTRON.contains(method), "electron app lacks {method}");
+        }
+        assert!(ELECTRON.contains("gpu_compositing: 'enabled'"));
+    }
+
+    #[test]
     fn node_prefix_is_accepted() {
         assert!(source("node:path").is_some());
         assert!(source("node:timers/promises").is_some());
