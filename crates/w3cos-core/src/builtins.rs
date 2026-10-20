@@ -271,6 +271,74 @@ pub fn number_value() -> Value {
     })
 }
 
+/// The global `Boolean` constructor, one per thread, with
+/// `Boolean.prototype.toString`/`valueOf` so uncurried captures
+/// (DOMPurify `unapply(Boolean.prototype.toString)`) resolve.
+pub fn boolean_value() -> Value {
+    /// [[BooleanData]] of `new Boolean(x)` wrappers (and of
+    /// `Boolean.prototype`, which is itself a Boolean object holding false).
+    const BOOLEAN_DATA: &str = "__w3cos_boolean_data";
+    thread_local! {
+        static BOOLEAN: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    BOOLEAN.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        fn this_boolean(this: &Value, method: &str) -> bool {
+            if let crate::value::ValueUnpack::Bool(value) = this.unpack() {
+                return value;
+            }
+            if let Some(object) = this.as_object() {
+                let data = object.borrow().get_direct(BOOLEAN_DATA);
+                if let crate::value::ValueUnpack::Bool(value) = data.unpack() {
+                    return value;
+                }
+            }
+            crate::throw_value(error_instance(
+                "TypeError",
+                vec![Value::from(format!(
+                    "Boolean.prototype.{method} requires that 'this' be a Boolean"
+                ))],
+            ))
+        }
+        let prototype = Value::object(HashMap::from([
+            (
+                "toString".to_string(),
+                Value::function(|this, _| {
+                    Value::from(if this_boolean(&this, "toString") {
+                        "true"
+                    } else {
+                        "false"
+                    })
+                }),
+            ),
+            (
+                "valueOf".to_string(),
+                Value::function(|this, _| Value::Bool(this_boolean(&this, "valueOf"))),
+            ),
+        ]));
+        crate::builtins::define_builtin(&prototype, BOOLEAN_DATA, Value::Bool(false));
+        // A plain function (not a host callable) so `new Boolean(x)` keeps
+        // producing an object, which is truthy (test262 relies on it). The
+        // constructor stamps [[BooleanData]] on the instance it receives.
+        let wrapper_prototype = prototype.clone();
+        let value = Value::function(move |this, arguments| {
+            let value = arguments.first().is_some_and(Value::to_bool);
+            if this.is_object()
+                && crate::class::get_prototype_of(&this).strict_eq(&wrapper_prototype)
+            {
+                crate::builtins::define_builtin(&this, BOOLEAN_DATA, Value::Bool(value));
+            }
+            Value::Bool(value)
+        });
+        value.set_property("prototype", prototype.clone());
+        prototype.set_property("constructor", value.clone());
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
 /// The global `Symbol` facade, one per thread. Symbols are collision-resistant
 /// string sentinels (`__w3cos_symbol_…`); `Symbol.for(key)` is stable for the
 /// global registry. `Symbol.prototype` exists so uncurried method captures
@@ -2427,6 +2495,44 @@ mod monaco_tests {
                 .to_bool()
         );
         assert_eq!(number.call(Value::Undefined, Vec::new()).to_number(), 0.0);
+        // DOMPurify `unapply(Boolean.prototype.toString)`.
+        let boolean = boolean_value();
+        assert!(boolean.strict_eq(&boolean_value()));
+        let bool_to_string = boolean.get_property("prototype").get_property("toString");
+        assert_eq!(
+            bool_to_string
+                .call(Value::Bool(false), Vec::new())
+                .to_js_string(),
+            "false"
+        );
+        assert!(
+            crate::value::catch_js(|| bool_to_string.call(Value::Number(1.0), Vec::new())).is_err()
+        );
+        assert!(
+            boolean
+                .call(Value::Undefined, vec![Value::from("x")])
+                .to_bool()
+        );
+        assert!(!boolean.call(Value::Undefined, Vec::new()).to_bool());
+        // `new Boolean(false)` is an object, so it is truthy, and it keeps
+        // its [[BooleanData]] for the prototype methods.
+        let wrapped = crate::class::construct(&boolean, vec![Value::Bool(false)]);
+        assert!(wrapped.to_bool());
+        assert_eq!(
+            wrapped.call_method("toString", Vec::new()).to_js_string(),
+            "false"
+        );
+        let wrapped = crate::class::construct(&boolean, vec![Value::Bool(true)]);
+        assert_eq!(
+            wrapped.call_method("valueOf", Vec::new()).to_js_string(),
+            "true"
+        );
+        assert_eq!(
+            bool_to_string
+                .call(boolean.get_property("prototype"), Vec::new())
+                .to_js_string(),
+            "false"
+        );
         // `Symbol.toPrimitive[Symbol.toPrimitive]()` on the sentinel itself.
         let key = symbol.get_property("toPrimitive");
         assert!(

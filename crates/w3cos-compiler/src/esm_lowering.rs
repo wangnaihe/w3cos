@@ -4472,7 +4472,7 @@ fn global_value_expr(name: &str) -> Option<String> {
         // prototype).
         "String" => "w3cos_core::string_value()".to_string(),
         "Number" => "w3cos_core::number_value()".to_string(),
-        "Boolean" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_bool()))".to_string(),
+        "Boolean" => "w3cos_core::boolean_value()".to_string(),
         // As values (`typeof parseFloat`, `[...].map(parseFloat)`, CommonJS
         // modules reading the global); direct calls stay static Rust calls.
         "parseFloat" => "w3cos_core::named_function(\"parseFloat\", 1, |_this, __args| w3cos_core::parseFloat(__args))".to_string(),

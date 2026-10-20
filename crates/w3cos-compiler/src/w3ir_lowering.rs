@@ -2203,8 +2203,7 @@ impl Builder {
                 let binding = self
                     .find_binding(&name)
                     .ok_or_else(|| anyhow!("missing predeclared class binding {name:?}"))?;
-                let value = self.lower_class_value(&declaration.class, Some(name))?;
-                self.emit(Instruction::InitializeBinding { binding, value });
+                self.lower_class_value(&declaration.class, Some(name), Some(binding))?;
                 Ok(())
             }
             Stmt::Return(statement) => {
@@ -4539,23 +4538,30 @@ impl Builder {
 
     fn lower_class_expression(&mut self, expression: &swc_ecma_ast::ClassExpr) -> Result<Register> {
         let Some(identifier) = &expression.ident else {
-            return self.lower_class_value(&expression.class, None);
+            return self.lower_class_value(&expression.class, None, None);
         };
         self.scopes.push(HashMap::new());
         let result = (|| {
             let name = identifier.sym.to_string();
             let binding = self.declare_class_binding(&name)?;
-            let value = self.lower_class_value(&expression.class, Some(name))?;
-            self.emit(Instruction::InitializeBinding { binding, value });
-            Ok(value)
+            self.lower_class_value(&expression.class, Some(name), Some(binding))
         })();
         self.scopes.pop();
         result
     }
 
-    fn lower_class_value(&mut self, class: &Class, name: Option<String>) -> Result<Register> {
+    /// `name_binding` is the class's own name binding. Per
+    /// ClassDefinitionEvaluation it is initialized once the class and its
+    /// methods exist, before static fields and static blocks run, so those
+    /// initializers can refer to the class by name.
+    fn lower_class_value(
+        &mut self,
+        class: &Class,
+        name: Option<String>,
+        name_binding: Option<BindingId>,
+    ) -> Result<Register> {
         self.scopes.push(HashMap::new());
-        let result = self.lower_class_value_in_scope(class, name);
+        let result = self.lower_class_value_in_scope(class, name, name_binding);
         self.scopes.pop();
         result
     }
@@ -4564,6 +4570,7 @@ impl Builder {
         &mut self,
         class: &Class,
         name: Option<String>,
+        name_binding: Option<BindingId>,
     ) -> Result<Register> {
         // Private-name operations capture this lexical cell. It is
         // initialized after CreateClass returns, before any static
@@ -4886,6 +4893,12 @@ impl Builder {
                     ));
                 }
             }
+        }
+        if let Some(binding) = name_binding {
+            self.emit(Instruction::InitializeBinding {
+                binding,
+                value: class_value,
+            });
         }
         for initializer in static_initializers {
             let dst = self.register();
@@ -8524,6 +8537,68 @@ mod tests {
                 "computed:6",
                 "after:7",
             ]
+        );
+    }
+
+    #[test]
+    fn static_initializers_see_the_initialized_class_name_binding() {
+        let module = lower_script(
+            r#"
+                const extractor = new class ColorExtractor {
+                    static {
+                        this.relaxed = "rgb";
+                    }
+                    static {
+                        this.strict = "^" + ColorExtractor.relaxed + "$";
+                    }
+                    read() {
+                        return ColorExtractor.strict;
+                    }
+                };
+                callback("expr:" + extractor.read());
+                class Declared {
+                    static x = 2;
+                    static y = Declared.x + 1;
+                    static {
+                        this.z = Declared.y + 1;
+                    }
+                }
+                callback("decl:" + Declared.y + "," + Declared.z);
+                const Named = class Inner {
+                    static self = Inner;
+                };
+                callback("named:" + (Named.self === Named));
+            "#,
+            "https://example.test/class-name-binding.js",
+        )
+        .unwrap();
+        let callback_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "callback")
+            .unwrap()
+            .local;
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let callback_observed = Rc::clone(&observed);
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_bindings(HashMap::from([(
+                callback_binding,
+                Value::function(move |_, arguments| {
+                    callback_observed.borrow_mut().push(
+                        arguments
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
+                            .to_js_string(),
+                    );
+                    Value::Undefined
+                }),
+            )]))
+            .unwrap();
+        assert_eq!(
+            *observed.borrow(),
+            vec!["expr:^rgb$", "decl:3,4", "named:true"]
         );
     }
 

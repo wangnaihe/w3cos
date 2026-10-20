@@ -141,6 +141,30 @@ class App extends EventEmitter {
   setAppUserModelId() {}
   setAboutPanelOptions() {}
   disableHardwareAcceleration() {}
+  // Chromium GPU feature map (`chrome://gpu`). w3cos composites natively, so
+  // every feature reports `enabled`; callers such as Code-OSS's
+  // GPUProcessMainService read `featureStatus.gpu_compositing`.
+  getGPUFeatureStatus() {
+    return {
+      '2d_canvas': 'enabled',
+      canvas_oop_rasterization: 'enabled',
+      direct_rendering_display_compositor: 'enabled',
+      gpu_compositing: 'enabled',
+      multiple_raster_threads: 'enabled',
+      opengl: 'enabled',
+      rasterization: 'enabled',
+      raw_draw: 'disabled_off',
+      skia_graphite: 'disabled_off',
+      video_decode: 'enabled',
+      video_encode: 'enabled',
+      vulkan: 'disabled_off',
+      webgl: 'enabled',
+      webgl2: 'enabled',
+      webgpu: 'disabled_off',
+    };
+  }
+  getGPUInfo() { return Promise.resolve({ auxAttributes: {}, gpuDevice: [] }); }
+  getAppMetrics() { return []; }
   focus() {}
   hide() {}
   show() {}
