@@ -617,6 +617,13 @@ pub struct DomFast {
     pub create_element: fn(&Value, &str) -> Value,
     pub create_text: fn(&Value, &str) -> Value,
     pub append_child: fn(&Value, &Value) -> Value,
+    /// Guarded builtin `appendChild` / `removeChild`. `remove == false`
+    /// selects append. `None` means an authored surface or non-DOM receiver
+    /// requires the ordinary method lookup.
+    pub mutate_child_guarded: fn(&Value, &Value, bool) -> Option<Value>,
+    /// Guarded builtin `Element.matches`. `None` means an authored surface,
+    /// forged wrapper, or non-DOM receiver requires ordinary method lookup.
+    pub matches_guarded: fn(&Value, &Value) -> Option<Value>,
     pub set_data: fn(&Value, &str, &Value) -> bool,
     /// `name` + raw text. The bytes are not a `Value`, so a `"prefix" + i`
     /// store can format into a stack buffer and skip the page-string intern.
@@ -664,6 +671,9 @@ thread_local! {
     /// Epoch after builtins are installed and before user script. Zero means
     /// the runtime has not sealed a baseline, so fusion stays off.
     static DOM_SHAPE_BASELINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Kept separate from DOM fusion/tree mutation so ordinary application
+    /// objects with a `matches` property cannot invalidate those hot paths.
+    static MATCHES_SHAPE_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
 /// Stamp sampled once per fused create loop. The fast path compares it on
@@ -674,6 +684,23 @@ pub fn dom_shape_epoch() -> u64 {
 
 pub fn bump_dom_shape() {
     DOM_SHAPE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
+
+pub fn matches_shape_epoch() -> u64 {
+    MATCHES_SHAPE_EPOCH.with(std::cell::Cell::get)
+}
+
+pub fn bump_matches_shape() {
+    MATCHES_SHAPE_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
+
+pub fn bump_matches_shape_for_key(key: &str) {
+    if matches!(
+        key,
+        "matches" | "__w3cos_getter_matches" | "__w3cos_setter_matches"
+    ) {
+        bump_matches_shape();
+    }
 }
 
 /// Record the epoch once builtins exist and before user script runs.
@@ -754,6 +781,32 @@ pub fn dom_append_child(parent: &Value, child: &Value) -> Value {
     } else {
         parent.call_method("appendChild", vec![child.clone()])
     }
+}
+
+/// Use the native tree mutation only while the runtime can prove that both
+/// builtin methods remain unshadowed on this exact parent. Otherwise perform
+/// the ordinary lookup, preserving getters, proxies, and authored methods.
+pub fn dom_append_child_guarded(parent: &Value, child: &Value) -> Value {
+    DOM_FAST
+        .get()
+        .and_then(|fast| (fast.mutate_child_guarded)(parent, child, false))
+        .unwrap_or_else(|| parent.call_method("appendChild", vec![child.clone()]))
+}
+
+pub fn dom_remove_child_guarded(parent: &Value, child: &Value) -> Value {
+    DOM_FAST
+        .get()
+        .and_then(|fast| (fast.mutate_child_guarded)(parent, child, true))
+        .unwrap_or_else(|| parent.call_method("removeChild", vec![child.clone()]))
+}
+
+/// Skip generic method construction and dispatch only while the runtime can
+/// prove that builtin `Element.matches` is still visible on this receiver.
+pub fn dom_matches_guarded(element: &Value, selector: &Value) -> Value {
+    DOM_FAST
+        .get()
+        .and_then(|fast| (fast.matches_guarded)(element, selector))
+        .unwrap_or_else(|| element.call_method("matches", vec![selector.clone()]))
 }
 
 pub fn dom_set_data(object: &Value, name: &str, value: &Value) -> bool {

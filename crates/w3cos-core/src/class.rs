@@ -527,6 +527,7 @@ fn set_with_receiver(target: &Value, receiver: &Value, name: &str, value: Value)
 /// Used for class field initializers and private-brand installation, which
 /// in JS semantics use `[[Define]]` rather than `[[Set]]`.
 pub fn define_field(this: &Value, key: &str, value: Value) {
+    crate::intrinsics::bump_matches_shape_for_key(key);
     let dom_node = crate::intrinsics::dom_node_id(this);
     if dom_node.is_some() {
         crate::intrinsics::bump_dom_shape();
@@ -548,6 +549,7 @@ pub fn set_prototype_of(obj: &Value, proto: &Value) {
         return;
     }
     crate::intrinsics::bump_dom_shape();
+    crate::intrinsics::bump_matches_shape();
     if let Some(object) = obj.as_object() {
         object.borrow_mut().set_prototype_of(proto);
         if let Some(node) = crate::intrinsics::dom_node_id(obj) {
@@ -581,6 +583,7 @@ pub fn get_own_property_descriptor(obj: &Value, key: &str) -> Value {
 /// `{value}`/`{get}`/`{set}` descriptor (best-effort), returning `obj`.
 pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
     crate::intrinsics::bump_dom_shape();
+    crate::intrinsics::bump_matches_shape_for_key(key);
     if let Some(object) = obj.as_object() {
         let proxy_define = {
             let object = object.borrow();

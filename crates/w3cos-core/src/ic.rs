@@ -155,6 +155,9 @@ pub(crate) fn generic_only_key(key: &str) -> bool {
             | "createElement"
             | "createElementNS"
             | "createTextNode"
+            | "matches"
+            | "__w3cos_getter_matches"
+            | "__w3cos_setter_matches"
             | "push"
     ) || key.as_bytes().first().is_some_and(u8::is_ascii_digit)
         || key.starts_with(crate::property_map::MARKER_PREFIX)
@@ -397,6 +400,21 @@ mod tests {
         assert_eq!(array.get_property_ic("1", &ic).to_number(), 2.0);
         let object = obj(&[("length", 3.0)]);
         assert_eq!(object.get_property_ic("length", &ic).to_number(), 3.0);
+        assert!(ic.load().is_none());
+        object.set_property_ic("matches", Value::Number(4.0), &ic);
+        assert_eq!(object.get_property("matches").to_number(), 4.0);
+        assert!(ic.load().is_none());
+        object.set_property_ic("__w3cos_getter_matches", Value::Number(5.0), &ic);
+        assert_eq!(
+            object.get_property("__w3cos_getter_matches").to_number(),
+            5.0
+        );
+        assert!(ic.load().is_none());
+        object.set_property_ic("__w3cos_setter_matches", Value::Number(6.0), &ic);
+        assert_eq!(
+            object.get_property("__w3cos_setter_matches").to_number(),
+            6.0
+        );
         assert!(ic.load().is_none());
         assert!(Value::Undefined.get_property_ic("x", &ic).is_undefined());
         assert!(Value::Number(1.0).get_property_ic("x", &ic).is_undefined());

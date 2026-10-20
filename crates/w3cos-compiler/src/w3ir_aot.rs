@@ -8209,11 +8209,28 @@ fn emit_instruction(
                 let mut reads = vec![object.0];
                 reads.extend(arguments.iter().map(|argument| argument.0));
                 let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
-                let expr = format!(
-                    "{}.call_method_slice({literal:?}, &[{}])",
-                    uses.emit(object.0),
-                    emit_arguments_from(&mut uses, arguments)
-                );
+                let expr = if matches!(mode, EmissionMode::Sync)
+                    && arguments.len() == 1
+                    && matches!(literal.as_str(), "appendChild" | "removeChild" | "matches")
+                {
+                    let intrinsic = match literal.as_str() {
+                        "appendChild" => "dom_append_child_guarded",
+                        "removeChild" => "dom_remove_child_guarded",
+                        "matches" => "dom_matches_guarded",
+                        _ => unreachable!("guarded DOM literal filtered above"),
+                    };
+                    format!(
+                        "w3cos_core::intrinsics::{intrinsic}(&{}, &{})",
+                        uses.emit(object.0),
+                        uses.emit(arguments[0].0)
+                    )
+                } else {
+                    format!(
+                        "{}.call_method_slice({literal:?}, &[{}])",
+                        uses.emit(object.0),
+                        emit_arguments_from(&mut uses, arguments)
+                    )
+                };
                 if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
                     return Ok(format!("self.registers[{}] = {expr};", register(*dst)));
                 }
@@ -8839,7 +8856,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -8847,11 +8864,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -8982,7 +8994,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -8990,11 +9002,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9098,7 +9105,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9106,11 +9113,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9229,7 +9231,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9237,11 +9239,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9479,7 +9476,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9487,11 +9484,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9658,7 +9650,7 @@ fn main() {{
             ),
         )
         .unwrap();
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        let output = Command::new("cargo")
             .args([
                 "run",
                 "--quiet",
@@ -9666,11 +9658,6 @@ fn main() {{
                 "--manifest-path",
                 fixture.path().join("Cargo.toml").to_str().unwrap(),
             ])
-            .env(
-                "CARGO_TARGET_DIR",
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../target/w3ir-aot-fixtures"),
-            )
             .output()
             .unwrap();
         assert!(
@@ -9942,6 +9929,152 @@ fn main() {{
         assert!(
             !generated.contains("w3cos_core::intrinsics::get_property_checked(&self.registers"),
             "proven string keys must not go through the Value-key intrinsic: {generated}"
+        );
+    }
+
+    #[test]
+    fn emits_guarded_builtin_dom_tree_mutations_for_literal_calls() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function cycle(parent, child) {
+                    parent.appendChild(child);
+                    if (child.parentNode !== parent) throw new Error("append");
+                    parent.removeChild(child);
+                    if (child.parentNode !== null) throw new Error("remove");
+                    return child;
+                }
+                cycle;
+            "#,
+            "app:///guarded-tree-mutation-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("cycle"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "cycle_aot").unwrap();
+        assert!(
+            generated.contains("dom_append_child_guarded")
+                && generated.contains("dom_remove_child_guarded"),
+            "literal tree mutations must use the guarded intrinsic: {generated}"
+        );
+        assert!(
+            !generated.contains("call_method_slice(\"appendChild\"")
+                && !generated.contains("call_method_slice(\"removeChild\""),
+            "the hot literal calls must skip ordinary method dispatch: {generated}"
+        );
+        assert!(
+            generated.contains("get_property_checked_ic(\"parentNode\""),
+            "parentNode observations must stay ordinary property reads: {generated}"
+        );
+    }
+
+    #[test]
+    fn emits_guarded_builtin_matches_for_literal_call() {
+        let module = crate::w3ir_lowering::lower_script(
+            r#"
+                function check(element, selector) {
+                    return element.matches(selector);
+                }
+                check;
+            "#,
+            "app:///guarded-matches-aot.js",
+        )
+        .unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("check"))
+            .unwrap();
+        let generated = generate_sync_function_from_module(&module, function, "check_aot").unwrap();
+        assert!(
+            generated.contains("dom_matches_guarded"),
+            "literal matches must use the guarded intrinsic: {generated}"
+        );
+        assert!(
+            !generated.contains("call_method_slice(\"matches\""),
+            "the hot literal call must skip ordinary method dispatch: {generated}"
+        );
+
+        for (name, source) in [
+            (
+                "zero",
+                "function zero(element) { return element.matches(); } zero;",
+            ),
+            (
+                "two",
+                "function two(element, selector, scope) { return element.matches(selector, scope); } two;",
+            ),
+        ] {
+            let fallback_module = crate::w3ir_lowering::lower_script(
+                source,
+                &format!("app:///guarded-matches-{name}-fallback.js"),
+            )
+            .unwrap();
+            let fallback_function = fallback_module
+                .functions
+                .iter()
+                .find(|function| function.name.as_deref() == Some(name))
+                .unwrap();
+            let fallback = generate_sync_function_from_module(
+                &fallback_module,
+                fallback_function,
+                &format!("{name}_aot"),
+            )
+            .unwrap();
+            assert!(
+                fallback.contains("call_method_slice(\"matches\""),
+                "{name}-argument matches must retain ordinary dispatch: {fallback}"
+            );
+            assert!(
+                !fallback.contains("dom_matches_guarded"),
+                "{name}-argument matches must not use the guarded intrinsic: {fallback}"
+            );
+        }
+
+        let computed_module = crate::w3ir_lowering::lower_script(
+            "function computed(element, name, selector) { return element[name](selector); } computed;",
+            "app:///guarded-matches-computed-fallback.js",
+        )
+        .unwrap();
+        let computed_function = computed_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("computed"))
+            .unwrap();
+        let computed =
+            generate_sync_function_from_module(&computed_module, computed_function, "computed_aot")
+                .unwrap();
+        assert!(
+            computed.contains("call_method_completion"),
+            "nonliteral matches must retain computed ordinary dispatch: {computed}"
+        );
+        assert!(
+            !computed.contains("dom_matches_guarded"),
+            "nonliteral matches must not use the guarded intrinsic: {computed}"
+        );
+
+        let async_module = crate::w3ir_lowering::lower_script(
+            "async function async_check(element, selector) { return element.matches(selector); } async_check;",
+            "app:///guarded-matches-async-fallback.js",
+        )
+        .unwrap();
+        let async_function = async_module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("async_check"))
+            .unwrap();
+        let async_generated =
+            generate_async_function_from_module(&async_module, async_function, "async_check_aot")
+                .unwrap();
+        assert!(
+            async_generated.contains("call_method_slice(\"matches\""),
+            "async matches must retain ordinary dispatch: {async_generated}"
+        );
+        assert!(
+            !async_generated.contains("dom_matches_guarded"),
+            "async matches must not use the guarded intrinsic: {async_generated}"
         );
     }
 
@@ -10557,8 +10690,8 @@ fn main() {{
         assert!(
             fallback.contains("set_property_strict(")
                 && fallback.contains("\"textContent\"")
-                && fallback.contains(".call_method_slice(\"appendChild\""),
-            "a refused rewrite keeps the ordinary property path: {generated}"
+                && fallback.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "a refused rewrite keeps ordinary writes and a guarded observable append: {generated}"
         );
     }
 
@@ -10718,8 +10851,8 @@ fn main() {{
             generated.contains(".call_method_slice(\"createElement\"")
                 && generated.contains("set_property_strict(")
                 && generated.contains("\"textContent\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the text-append fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary fallback operations keep a guarded observable append: {generated}"
         );
     }
 
@@ -10837,8 +10970,8 @@ fn main() {{
             "createElement must stay an ordinary method call on the fallback: {generated}"
         );
         assert!(
-            generated.contains(".call_method_slice(\"appendChild\""),
-            "appendChild must stay an ordinary method call: {generated}"
+            generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "appendChild must use the guarded observable call: {generated}"
         );
         assert!(
             generated.contains(".call_method_slice(\"push\""),
@@ -10864,7 +10997,7 @@ fn main() {{
             !generated.contains("dom_build_appended")
                 && !generated.contains("dom_create_element")
                 && !generated.contains("dom_set_data")
-                && !generated.contains("dom_append_child")
+                && !generated.contains("w3cos_core::intrinsics::dom_append_child(&")
                 && !generated.contains("dom_set_style"),
             "observable DOM operations must not use unguarded intrinsics: {generated}"
         );
@@ -10902,8 +11035,8 @@ fn main() {{
                 && generated.contains("set_property_strict(")
                 && generated.contains("\"textContent\"")
                 && generated.contains("\"height\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary fallback operations keep a guarded observable append: {generated}"
         );
     }
 
@@ -10939,8 +11072,8 @@ fn main() {{
                 && generated.contains("set_property_strict(")
                 && generated.contains("\"textContent\"")
                 && generated.contains("\"height\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the module fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary module fallback operations keep a guarded observable append: {generated}"
         );
     }
 
@@ -10981,8 +11114,8 @@ fn main() {{
                 && generated.contains("\"textContent\"")
                 && generated.contains("\"height\"")
                 && generated.contains("\"flex\"")
-                && generated.contains(".call_method_slice(\"appendChild\""),
-            "ordinary lookup stays on the flex-list fallback: {generated}"
+                && generated.contains("w3cos_core::intrinsics::dom_append_child_guarded"),
+            "ordinary flex-list fallback operations keep a guarded observable append: {generated}"
         );
         assert!(
             !generated.contains("dom_build_block_guarded"),
