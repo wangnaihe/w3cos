@@ -285,3 +285,79 @@ fn electron_renderer_dom_gaps_match_electron() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A `<script type="module">` page and its imports evaluate when the window
+/// loads the page (after the preload, before `DOMContentLoaded` and
+/// `did-finish-load`), never when the main process requires `electron`.
+const ESM_PAGE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-esm-page", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain } = require('electron')
+const path = require('node:path')
+console.log('main start', typeof globalThis.pageEvaluated)
+let win
+ipcMain.on('line', (_event, line) => console.log(line))
+app.whenReady().then(() => {
+  console.log('ready', typeof globalThis.pageEvaluated)
+  win = new BrowserWindow({ show: false, webPreferences: { preload: path.join(__dirname, 'preload.js') } })
+  win.webContents.on('did-finish-load', () => { console.log('did-finish-load', typeof globalThis.pageEvaluated); setTimeout(() => win.close(), 0) })
+  win.loadFile('index.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "preload.js",
+        r#"const { ipcRenderer, contextBridge } = require('electron')
+contextBridge.exposeInMainWorld('bridge', { line: (text) => ipcRenderer.send('line', text) })
+window.addEventListener('DOMContentLoaded', () => window.bridge.line('DOMContentLoaded'))
+"#,
+    ),
+    (
+        "page.js",
+        r#"import { label } from './lib/label.js'
+globalThis.pageEvaluated = true
+window.bridge.line('page ' + label() + ' ' + document.querySelector('h1').textContent)
+"#,
+    ),
+    (
+        "lib/label.js",
+        r#"export function label() { return typeof window.bridge.line + ':ipcRenderer-free' }
+"#,
+    ),
+    (
+        "index.html",
+        r#"<!DOCTYPE html><html><head><title>ESM page</title></head><body><h1>Hello</h1><script type="module" src="./page.js"></script></body></html>"#,
+    ),
+];
+
+#[test]
+fn electron_module_page_script_evaluates_when_the_page_loads() {
+    let root = write_fixture("w3cos_electron_esm_page", ESM_PAGE);
+    let lines =
+        compile_and_run_with_env(&root, &root.join("main.js"), "w3cos_electron_esm_page", &[]);
+    // Startup never evaluates the page; `did-finish-load` fires after the
+    // module ran. Renderer→main IPC lines arrive asynchronously, so only
+    // their presence is checked.
+    assert_eq!(
+        lines[..2],
+        ["main start undefined", "ready undefined"],
+        "{lines:#?}"
+    );
+    let mut rest: Vec<&str> = lines[2..].iter().map(String::as_str).collect();
+    rest.sort_unstable();
+    assert_eq!(
+        rest,
+        [
+            "DOMContentLoaded",
+            "did-finish-load boolean",
+            "page function:ipcRenderer-free Hello",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

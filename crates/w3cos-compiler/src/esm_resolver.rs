@@ -1090,6 +1090,7 @@ impl EsmResolver {
                 .create_require_rewritten
                 .borrow()
                 .contains(&module.path)
+            || is_electron_app_record(&module.path)
         {
             for specifier in collect_dynamic_import_literals(&source) {
                 self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
@@ -2434,6 +2435,13 @@ fn node_builtin_module(specifier: &str, project_root: &Path) -> Result<Option<Re
         kind: ModuleKind::Package,
         package_name: Some(format!("node:{name}")),
     }))
+}
+
+/// The CommonJS record of the generated `electron_app.js`: its `load()`
+/// switch `import()`s ES module page scripts, which must link lazily.
+fn is_electron_app_record(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "electron_app.js.w3cos-cjs.js")
 }
 
 /// Write `source` at `path` unless it is already there.

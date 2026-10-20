@@ -119,10 +119,20 @@ pub fn app_module(root: &Path) -> (String, Vec<PathBuf>) {
     );
     out.push_str("];\nexports.load = function load(file) {\n  switch (file) {\n");
     for module in &modules {
+        let file = root.join(module);
+        // A classic script is a lazily evaluated CommonJS record. An ES
+        // module goes through a literal `import()` so it is linked as a lazy
+        // module too: `require()` of an ES module would make it (and its
+        // whole graph) a static dependency evaluated with the main process.
+        let load = if is_es_module(&file) {
+            "import"
+        } else {
+            "require"
+        };
         out.push_str(&format!(
-            "    case {}: return require({});\n",
+            "    case {}: return {load}({});\n",
             json(module),
-            json(&root.join(module).to_string_lossy())
+            json(&file.to_string_lossy())
         ));
     }
     out.push_str("    default: return undefined;\n  }\n};\n");
@@ -178,8 +188,30 @@ fn is_preload_candidate(file: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(file) else {
         return false;
     };
+    // Only classic scripts: ES modules that mention `ipcRenderer` are
+    // renderer-side library code (Code-OSS `electron-browser/*`), which
+    // pages reach through their own imports.
     (text.contains("contextBridge") || text.contains("ipcRenderer"))
         && !text.contains("BrowserWindow")
+        && !has_module_syntax(file, &text)
+}
+
+/// The file parses with `import`/`export` declarations (an ES module).
+fn is_es_module(file: &Path) -> bool {
+    std::fs::read_to_string(file).is_ok_and(|text| has_module_syntax(file, &text))
+}
+
+fn has_module_syntax(file: &Path, text: &str) -> bool {
+    if file.extension().is_some_and(|ext| ext == "cjs") {
+        return false;
+    }
+    if file.extension().is_some_and(|ext| ext == "mjs") {
+        return true;
+    }
+    // Cheap pre-filter, then the CommonJS classifier: a classic script
+    // without module declarations is a record (`Some`).
+    (text.contains("import") || text.contains("export"))
+        && matches!(crate::cjs::classify_as(file, text, false, true), Ok(None))
 }
 
 fn package_info(root: &Path) -> (String, String) {
@@ -228,6 +260,11 @@ pub fn parse_page(text: &str, dir: &Path, root: &Path) -> Page {
     let mut page = Page::default();
     let head = take_scripts(head_src, dir, root, &mut page.scripts);
     page.body = take_scripts(body_src, dir, root, &mut page.scripts);
+    // Content after `</body>` is parsed into the body by browsers; Code-OSS's
+    // workbench.html puts its `<script type="module">` there.
+    if let Some((_, end)) = body_range {
+        let _ = take_scripts(&text[end..], dir, root, &mut page.scripts);
+    }
     let (head, title) = take_title(&head);
     page.title = title;
     page.head = inline_stylesheets(&head, dir).trim().to_string();
@@ -413,7 +450,8 @@ mod tests {
         std::fs::write(root.join("main.js"), "require('electron').BrowserWindow").unwrap();
         let html = r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><title> A &amp; B </title>
 <link href="./styles.css" rel="stylesheet"><link rel="icon" href="x.png"><script src="js/app.js"></script></head>
-<body><h1>Hi</h1><script src="https://cdn/x.js"></script><SCRIPT src='./js/app.js?v=1' type="module"></SCRIPT></body></html>"#;
+<body><h1>Hi</h1><script src="https://cdn/x.js"></script><SCRIPT src='./js/app.js?v=1' type="module"></SCRIPT></body>
+<!-- after body --><script src="./preload.js"></script></html>"#;
         std::fs::write(root.join("index.html"), html).unwrap();
         let root = root.canonicalize().unwrap();
         let page = parse_page(html, &root, &root);
@@ -423,7 +461,7 @@ mod tests {
             "<meta charset=\"UTF-8\">\n<style>h1 { color: red; }</style><link rel=\"icon\" href=\"x.png\">"
         );
         assert_eq!(page.body, "<h1>Hi</h1>");
-        assert_eq!(page.scripts, ["js/app.js", "js/app.js"]);
+        assert_eq!(page.scripts, ["js/app.js", "js/app.js", "preload.js"]);
         let source = app_module_source(&root);
         assert!(
             source.contains("case \"preload.js\": return require("),
@@ -431,6 +469,52 @@ mod tests {
         );
         assert!(source.contains("case \"js/app.js\""), "{source}");
         assert!(!source.contains("case \"main.js\""), "{source}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn es_module_page_scripts_load_lazily_and_are_not_preloads() {
+        let root = std::env::temp_dir().join("w3cos_electron_app_esm");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(
+            root.join("preload.js"),
+            "const { contextBridge } = require('electron');",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("page.js"),
+            "import { boot } from './lib/boot.js';\nboot();",
+        )
+        .unwrap();
+        // Renderer-side ES library code mentioning ipcRenderer is not a preload.
+        std::fs::write(
+            root.join("lib/boot.js"),
+            "export function boot() { return globalThis.vscode.ipcRenderer; }",
+        )
+        .unwrap();
+        std::fs::write(root.join("lib/bridge.js"), "window.ipcRenderer = 1;").unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<html><body><script type=\"module\" src=\"./page.js\"></script></body></html>",
+        )
+        .unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = app_module_source(&root);
+        let page = root.join("page.js").to_string_lossy().into_owned();
+        assert!(
+            source.contains(&format!("case \"page.js\": return import({page:?});")),
+            "{source}"
+        );
+        assert!(
+            source.contains("case \"preload.js\": return require("),
+            "{source}"
+        );
+        assert!(
+            source.contains("case \"lib/bridge.js\": return require("),
+            "{source}"
+        );
+        assert!(!source.contains("lib/boot.js"), "{source}");
         std::fs::remove_dir_all(root).ok();
     }
 }
