@@ -139,10 +139,8 @@ pub fn bigint_class() -> Value {
                 Value::function(|this, _| from_bigint(this_bigint(&this, "valueOf"))),
             ),
         ]));
-        let value = Value::callable(
-            HashMap::from([("prototype".to_string(), prototype.clone())]),
-            bigint_call,
-        );
+        let value = Value::function(bigint_call);
+        value.set_property("prototype", prototype.clone());
         prototype.set_property("constructor", value.clone());
         *slot.borrow_mut() = Some(value.clone());
         value
