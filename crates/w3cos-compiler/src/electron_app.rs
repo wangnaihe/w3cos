@@ -260,6 +260,11 @@ pub fn parse_page(text: &str, dir: &Path, root: &Path) -> Page {
     let mut page = Page::default();
     let head = take_scripts(head_src, dir, root, &mut page.scripts);
     page.body = take_scripts(body_src, dir, root, &mut page.scripts);
+    // Content after `</body>` is parsed into the body by browsers; Code-OSS's
+    // workbench.html puts its `<script type="module">` there.
+    if let Some((_, end)) = body_range {
+        let _ = take_scripts(&text[end..], dir, root, &mut page.scripts);
+    }
     let (head, title) = take_title(&head);
     page.title = title;
     page.head = inline_stylesheets(&head, dir).trim().to_string();
@@ -445,7 +450,8 @@ mod tests {
         std::fs::write(root.join("main.js"), "require('electron').BrowserWindow").unwrap();
         let html = r#"<!DOCTYPE html><html><head><meta charset="UTF-8"><title> A &amp; B </title>
 <link href="./styles.css" rel="stylesheet"><link rel="icon" href="x.png"><script src="js/app.js"></script></head>
-<body><h1>Hi</h1><script src="https://cdn/x.js"></script><SCRIPT src='./js/app.js?v=1' type="module"></SCRIPT></body></html>"#;
+<body><h1>Hi</h1><script src="https://cdn/x.js"></script><SCRIPT src='./js/app.js?v=1' type="module"></SCRIPT></body>
+<!-- after body --><script src="./preload.js"></script></html>"#;
         std::fs::write(root.join("index.html"), html).unwrap();
         let root = root.canonicalize().unwrap();
         let page = parse_page(html, &root, &root);
@@ -455,7 +461,7 @@ mod tests {
             "<meta charset=\"UTF-8\">\n<style>h1 { color: red; }</style><link rel=\"icon\" href=\"x.png\">"
         );
         assert_eq!(page.body, "<h1>Hi</h1>");
-        assert_eq!(page.scripts, ["js/app.js", "js/app.js"]);
+        assert_eq!(page.scripts, ["js/app.js", "js/app.js", "preload.js"]);
         let source = app_module_source(&root);
         assert!(
             source.contains("case \"preload.js\": return require("),
