@@ -13,7 +13,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::Value;
-use crate::value::js_error;
 
 /// `JSON.parse(text[, reviver])`.
 pub fn parse(args: Vec<Value>) -> Value {
@@ -24,7 +23,12 @@ pub fn parse(args: Vec<Value>) -> Value {
         .to_js_string();
     let parsed: serde_json::Value = match serde_json::from_str(&text) {
         Ok(parsed) => parsed,
-        Err(error) => crate::throw_value(js_error(&format!("SyntaxError: {error}"))),
+        // A real SyntaxError instance: `${error}` reads "SyntaxError: …" and
+        // `error instanceof SyntaxError` holds (Code-OSS jsonc fallback).
+        Err(error) => crate::throw_value(crate::error_instance(
+            "SyntaxError",
+            vec![Value::string(&format!("{error} in JSON"))],
+        )),
     };
     let value = from_json(&parsed);
     let reviver = args.get(1).cloned().unwrap_or(Value::Undefined);
@@ -135,7 +139,10 @@ impl SerializeContext {
     /// Enter a container; panics with a JS error value on a cycle.
     fn enter(&mut self, pointer: usize) {
         if !self.stack.insert(pointer) {
-            crate::throw_value(js_error("TypeError: Converting circular structure to JSON"));
+            crate::throw_value(crate::error_instance(
+                "TypeError",
+                vec![Value::string("Converting circular structure to JSON")],
+            ));
         }
     }
 
@@ -366,12 +373,12 @@ mod tests {
         let payload = outcome.expect_err("invalid JSON must panic");
         let error = payload_value(payload);
         assert!(error.is_object());
-        assert!(
-            error
-                .get_property("message")
-                .to_js_string()
-                .starts_with("SyntaxError:")
-        );
+        assert_eq!(error.get_property("name").to_js_string(), "SyntaxError");
+        assert!(crate::class::instance_of(
+            &error,
+            &crate::error_class("SyntaxError")
+        ));
+        assert!(error.to_js_string().starts_with("SyntaxError: "));
     }
 
     #[test]
