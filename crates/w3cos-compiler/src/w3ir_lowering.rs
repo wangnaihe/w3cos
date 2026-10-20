@@ -481,45 +481,21 @@ fn module_export_name(name: &ModuleExportName) -> String {
     }
 }
 
-fn atom_to_string(atom: &impl serde::Serialize) -> String {
-    let serialized = serde_json::to_value(atom).expect("SWC string atom must serialize");
-    let value = serialized
-        .as_str()
-        .expect("SWC string atom must serialize as a JSON string")
-        .to_string();
-    decode_serialized_wtf8_surrogates(&value)
-}
-
-fn decode_serialized_wtf8_surrogates(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            output.push(character);
-            continue;
-        }
-        if characters.peek() == Some(&'\\') {
-            characters.next();
-            output.push('\\');
-            continue;
-        }
-        if characters.peek() != Some(&'u') {
-            output.push('\\');
-            continue;
-        }
-        characters.next();
-        let digits = characters.by_ref().take(4).collect::<String>();
-        if digits.len() == 4
-            && let Ok(surrogate @ 0xd800..=0xdfff) = u32::from_str_radix(&digits, 16)
-        {
-            output.push(
-                char::from_u32(0xe000 + surrogate - 0xd800)
-                    .expect("surrogate sentinel must be a valid scalar value"),
-            );
-        } else {
-            output.push_str("\\u");
-            output.push_str(&digits);
-        }
+/// Decode an SWC string atom (WTF-8) into the compiler's string form.
+///
+/// Read the code points directly: the atom's serde form only doubles a
+/// backslash when it precedes `uXXXX`, so decoding that text collapsed real
+/// `\\` pairs (`"\\\\"` lowered to a single backslash). Unpaired
+/// surrogates map to the internal single-unit sentinel range.
+fn atom_to_string(atom: &swc_atoms::Wtf8Atom) -> String {
+    let mut output = String::with_capacity(atom.len());
+    for code_point in atom.code_points() {
+        let value = code_point.to_u32();
+        let character = match value {
+            0xd800..=0xdfff => char::from_u32(0xe000 + value - 0xd800),
+            _ => char::from_u32(value),
+        };
+        output.push(character.expect("WTF-8 code point maps to a scalar value"));
     }
     output
 }
@@ -5560,10 +5536,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serialized_wtf8_surrogates_keep_single_utf16_units() {
-        let decoded = decode_serialized_wtf8_surrogates("left\\uD83Cright\\uDF20");
+    fn string_atoms_keep_backslashes_and_single_utf16_surrogates() {
+        let module = parse(
+            r#"x("left\uD83Cright\uDF20", "\\\\", "literal\\uD83C", `(\\\\)?`);"#,
+            "atoms.js",
+        )
+        .unwrap();
+        let swc_ecma_ast::ModuleItem::Stmt(swc_ecma_ast::Stmt::Expr(statement)) = &module.body[0]
+        else {
+            panic!("expression statement");
+        };
+        let swc_ecma_ast::Expr::Call(call) = statement.expr.as_ref() else {
+            panic!("call");
+        };
+        let texts = call
+            .args
+            .iter()
+            .map(|argument| match argument.expr.as_ref() {
+                swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(value)) => {
+                    atom_to_string(&value.value)
+                }
+                swc_ecma_ast::Expr::Tpl(template) => {
+                    atom_to_string(template.quasis[0].cooked.as_ref().unwrap())
+                }
+                _ => panic!("string argument"),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            w3cos_core::js_string_utf16_units(&decoded),
+            w3cos_core::js_string_utf16_units(&texts[0]),
             [
                 b'l' as u16,
                 b'e' as u16,
@@ -5578,10 +5578,9 @@ mod tests {
                 0xdf20,
             ]
         );
-        assert_eq!(
-            decode_serialized_wtf8_surrogates("literal\\\\uD83C"),
-            "literal\\uD83C"
-        );
+        assert_eq!(texts[1], "\\\\");
+        assert_eq!(texts[2], "literal\\uD83C");
+        assert_eq!(texts[3], "(\\\\)?");
     }
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;

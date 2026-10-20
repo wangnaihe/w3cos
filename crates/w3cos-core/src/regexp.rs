@@ -578,6 +578,18 @@ fn translate_javascript_escapes(source: &str) -> String {
                 .expect("index always starts on a character boundary");
             match character {
                 '[' if in_character_class => output.push_str(r"\["),
+                // `[^]` matches any code unit and `[]` matches nothing in
+                // JS; Rust would read the `]` as a class member.
+                '[' if source[index..].starts_with("[^]") => {
+                    output.push_str(r"[\s\S]");
+                    index += 3;
+                    continue;
+                }
+                '[' if source[index..].starts_with("[]") => {
+                    output.push_str(r"[^\s\S]");
+                    index += 2;
+                    continue;
+                }
                 '[' => {
                     in_character_class = true;
                     output.push('[');
@@ -628,8 +640,24 @@ fn translate_javascript_escapes(source: &str) -> String {
             index += 6;
             continue;
         }
-        output.push('\\');
-        index += 1;
+        // Remaining escapes. Letters/digits keep their regex meaning
+        // (`\d`, `\b`, `\p{..}`, backreferences); any other escaped
+        // character is a literal (JS identity escape). Consume both
+        // characters so an escaped `[`/`]` never toggles class state, and
+        // drop the backslash where Rust's syntax rejects the escape (`\<`,
+        // `\>`, non-ASCII).
+        let Some(escaped) = source[index + 1..].chars().next() else {
+            output.push_str(r"\\");
+            index += 1;
+            continue;
+        };
+        if escaped.is_ascii() && !matches!(escaped, '<' | '>') {
+            output.push('\\');
+            output.push(escaped);
+        } else {
+            output.push_str(&regex::escape(&escaped.to_string()));
+        }
+        index += 1 + escaped.len_utf8();
     }
     output
 }
@@ -1014,6 +1042,28 @@ mod tests {
                 .to_number(),
             3.0
         );
+    }
+
+    #[test]
+    fn identity_escapes_and_empty_classes_follow_javascript() {
+        let test = |source: &str, flags: &str, input: &str| {
+            create(source, flags)
+                .call_method("test", vec![Value::from(input)])
+                .to_bool()
+        };
+        // Escaped brackets inside a class must not open/close it.
+        assert!(test(r"[\{\}\[\]\<\>\(\)]", "g", "<"));
+        assert!(test(r"[\{\}\[\]\<\>\(\)]", "", "]"));
+        assert!(test(r"(^|[^\[])\^", "", "a^"));
+        assert!(!test(r"(^|[^\[])\^", "", "[^"));
+        // `\<` / `\>` / backtick are identity escapes, not word boundaries.
+        assert!(test(r"\<b\>", "", "<b>"));
+        assert!(test(r"[^\`\~\!]+", "", "abc"));
+        // `[^]` is "any code unit"; `[]` never matches.
+        assert!(test(r"^a[^]b$", "", "a\nb"));
+        assert!(!test(r"a[]", "", "a"));
+        assert!(test(r"(\\)?\$\(x\)", "", "\\$(x)"));
+        assert!(test(r"^(?!.*\\).*\S.*$", "", "abc"));
     }
 
     #[test]

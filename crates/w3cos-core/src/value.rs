@@ -3596,21 +3596,24 @@ impl Value {
             _ if self.as_array().is_some() && key == "filter" => {
                 let values = self.as_array().expect("array");
                 let predicate = args.first().cloned().unwrap_or(Value::Undefined);
-                let filtered = values
-                    .borrow()
-                    .iter()
+                let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                // Snapshot so a callback may mutate the array without a
+                // RefCell re-borrow panic.
+                let snapshot: Vec<Value> = values.borrow().iter().cloned().collect();
+                let filtered = snapshot
+                    .into_iter()
                     .enumerate()
                     .filter_map(|(index, value)| {
-                        if is_array_hole(value) {
+                        if is_array_hole(&value) {
                             return None;
                         }
                         predicate
                             .call(
-                                Value::Undefined,
-                                vec![value.clone(), Value::Number(index as f64)],
+                                this_arg.clone(),
+                                vec![value.clone(), Value::Number(index as f64), self.clone()],
                             )
                             .to_bool()
-                            .then(|| value.clone())
+                            .then_some(value)
                     })
                     .collect();
                 return Value::array(filtered);
@@ -3647,12 +3650,14 @@ impl Value {
             _ if self.as_array().is_some() && key == "forEach" => {
                 let values = self.as_array().expect("array");
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
-                for (index, value) in values.borrow().iter().cloned().enumerate() {
+                let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let snapshot: Vec<Value> = values.borrow().iter().cloned().collect();
+                for (index, value) in snapshot.into_iter().enumerate() {
                     if is_array_hole(&value) {
                         continue;
                     }
                     callback.call(
-                        Value::Undefined,
+                        this_arg.clone(),
                         vec![value, Value::Number(index as f64), self.clone()],
                     );
                 }
@@ -3992,6 +3997,11 @@ fn array_call_method(
     let callback_args = |value: &Value, index: usize| {
         vec![value.clone(), Value::Number(index as f64), this.clone()]
     };
+    // Callback `thisArg` (`arr.forEach(this.fn, this)`) and a snapshot of the
+    // elements, so a callback that mutates the array cannot hit a RefCell
+    // re-borrow panic.
+    let this_arg = || arg(1);
+    let snapshot = || values.borrow().iter().cloned().collect::<Vec<Value>>();
     Some(match key {
         "filter" | "push" | "forEach" | "set" => return None, // handled by dedicated arms
         "pop" => values
@@ -4036,15 +4046,15 @@ fn array_call_method(
         }
         "map" => {
             let f = arg(0);
-            let mapped = values
-                .borrow()
+            let receiver = this_arg();
+            let mapped = snapshot()
                 .iter()
                 .enumerate()
                 .map(|(index, value)| {
                     if is_array_hole(value) {
                         array_hole()
                     } else {
-                        f.call(Value::Undefined, callback_args(value, index))
+                        f.call(receiver.clone(), callback_args(value, index))
                     }
                 })
                 .collect();
@@ -4052,13 +4062,13 @@ fn array_call_method(
         }
         "find" => {
             let f = arg(0);
-            values
-                .borrow()
+            let receiver = this_arg();
+            snapshot()
                 .iter()
                 .enumerate()
                 .find(|(index, value)| {
                     let value = array_slot_value((*value).clone());
-                    f.call(Value::Undefined, callback_args(&value, *index))
+                    f.call(receiver.clone(), callback_args(&value, *index))
                         .to_bool()
                 })
                 .map(|(_, value)| array_slot_value(value.clone()))
@@ -4066,13 +4076,13 @@ fn array_call_method(
         }
         "findIndex" => {
             let f = arg(0);
-            let index = values
-                .borrow()
+            let receiver = this_arg();
+            let index = snapshot()
                 .iter()
                 .enumerate()
                 .find(|(index, value)| {
                     let value = array_slot_value((*value).clone());
-                    f.call(Value::Undefined, callback_args(&value, *index))
+                    f.call(receiver.clone(), callback_args(&value, *index))
                         .to_bool()
                 })
                 .map(|(index, _)| index as f64)
@@ -4081,26 +4091,26 @@ fn array_call_method(
         }
         "some" => {
             let f = arg(0);
-            let hit = values
-                .borrow()
+            let receiver = this_arg();
+            let hit = snapshot()
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !is_array_hole(value))
                 .any(|(index, value)| {
-                    f.call(Value::Undefined, callback_args(value, index))
+                    f.call(receiver.clone(), callback_args(value, index))
                         .to_bool()
                 });
             Value::Bool(hit)
         }
         "every" => {
             let f = arg(0);
-            let all = values
-                .borrow()
+            let receiver = this_arg();
+            let all = snapshot()
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !is_array_hole(value))
                 .all(|(index, value)| {
-                    f.call(Value::Undefined, callback_args(value, index))
+                    f.call(receiver.clone(), callback_args(value, index))
                         .to_bool()
                 });
             Value::Bool(all)
@@ -4289,12 +4299,13 @@ fn array_call_method(
         }
         "flatMap" => {
             let f = arg(0);
+            let receiver = this_arg();
             let mut out = Vec::new();
-            for (index, value) in values.borrow().iter().enumerate() {
+            for (index, value) in snapshot().iter().enumerate() {
                 if is_array_hole(value) {
                     continue;
                 }
-                let mapped = f.call(Value::Undefined, callback_args(value, index));
+                let mapped = f.call(receiver.clone(), callback_args(value, index));
                 if let Some(inner) = mapped.as_array() {
                     out.extend(inner.borrow().iter().cloned());
                 } else {
@@ -4893,6 +4904,56 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_callbacks_honor_this_arg_and_tolerate_mutation() {
+        let receiver = Value::object(HashMap::new());
+        receiver.set_property("k", Value::Number(2.0));
+        let array = Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+            Value::Number(3.0),
+        ]);
+        let times_k = Value::function(|this, args| {
+            Value::Number(args[0].to_number() * this.get_property("k").to_number())
+        });
+        let above_k = Value::function(|this, args| {
+            Value::Bool(args[0].to_number() > this.get_property("k").to_number())
+        });
+        let mapped = array.call_method("map", vec![times_k, receiver.clone()]);
+        assert_eq!(mapped.call_method("join", vec![]).to_js_string(), "2,4,6");
+        let filtered = array.call_method("filter", vec![above_k.clone(), receiver.clone()]);
+        assert_eq!(filtered.call_method("join", vec![]).to_js_string(), "3");
+        assert!(
+            array
+                .call_method("some", vec![above_k.clone(), receiver.clone()])
+                .to_bool()
+        );
+        assert_eq!(
+            array
+                .call_method("find", vec![above_k.clone(), receiver.clone()])
+                .to_number(),
+            3.0
+        );
+        assert_eq!(
+            array
+                .call_method("findIndex", vec![above_k, receiver.clone()])
+                .to_number(),
+            2.0
+        );
+        // forEach with a receiver that pushes onto the iterated array.
+        let target = array.clone();
+        let seen = Rc::new(std::cell::Cell::new(0.0));
+        let sum = seen.clone();
+        let push_and_sum = Value::function(move |this, args| {
+            sum.set(sum.get() + args[0].to_number() * this.get_property("k").to_number());
+            target.call_method("push", vec![Value::Number(0.0)]);
+            Value::Undefined
+        });
+        array.call_method("forEach", vec![push_and_sum, receiver]);
+        assert_eq!(seen.get(), 12.0);
+        assert_eq!(array.get_property("length").to_number(), 6.0);
+    }
 
     #[test]
     fn explicit_receiver_lookup_preserves_undefined_and_proxy_exception() {
