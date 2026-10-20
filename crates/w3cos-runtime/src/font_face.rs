@@ -442,10 +442,22 @@ pub(crate) fn parsed_fallback(character: char) -> Option<Arc<fontdue::Font>> {
 }
 
 /// Fontconfig-backed manager. Tests pin bundled faces before the first init.
+///
+/// `FontMgr::default()` builds a fresh platform manager on every call; on
+/// macOS `SkFontMgr_Mac` copies the full family-name list over XPC in its
+/// constructor (`CTFontManagerCopyAvailableFontFamilyNames`), which made
+/// per-glyph fallback lookups dominate CJK pages (30-55 s). Skia expects
+/// one long-lived manager (Blink keeps a single `FontCache`), so cache it
+/// per thread.
 #[cfg(feature = "skia")]
 pub(crate) fn pinned_font_mgr() -> skia_safe::FontMgr {
-    system_fonts::pin_test_fontconfig();
-    skia_safe::FontMgr::default()
+    thread_local! {
+        static MGR: skia_safe::FontMgr = {
+            system_fonts::pin_test_fontconfig();
+            skia_safe::FontMgr::default()
+        };
+    }
+    MGR.with(|m| m.clone())
 }
 
 pub(crate) fn host_ui_font() -> &'static HostUiFont {
