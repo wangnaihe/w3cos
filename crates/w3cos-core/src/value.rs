@@ -3544,6 +3544,15 @@ impl Value {
                 if let Some(result) = crate::regexp::string_match(&value, &pattern) {
                     return result;
                 }
+                // `str.match("\\w+")`: a non-RegExp argument is compiled as a
+                // pattern (undefined matches the empty string).
+                let source = if pattern.is_undefined() {
+                    "(?:)".to_string()
+                } else {
+                    pattern.to_js_string()
+                };
+                let compiled = crate::regexp::create(&source, "");
+                return crate::regexp::string_match(&value, &compiled).unwrap_or(Value::Null);
             }
             (this, "matchAll") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -3561,12 +3570,15 @@ impl Value {
                 if let Some(result) = crate::regexp::string_search(&value, &pattern) {
                     return result;
                 }
-                return Value::Number(
-                    value
-                        .find(&pattern.to_js_string())
-                        .map(|byte| value[..byte].encode_utf16().count() as f64)
-                        .unwrap_or(-1.0),
-                );
+                // Like `match`, a non-RegExp argument is a pattern source.
+                let source = if pattern.is_undefined() {
+                    "(?:)".to_string()
+                } else {
+                    pattern.to_js_string()
+                };
+                let compiled = crate::regexp::create(&source, "");
+                return crate::regexp::string_search(&value, &compiled)
+                    .unwrap_or(Value::Number(-1.0));
             }
             (this, "replace") if this.is_string() => {
                 let value = this.as_js_string().expect("string");

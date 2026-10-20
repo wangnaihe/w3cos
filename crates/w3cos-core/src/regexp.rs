@@ -1045,6 +1045,29 @@ mod tests {
     }
 
     #[test]
+    fn string_match_and_search_compile_string_patterns() {
+        // Code-OSS tokenClassificationRegistry: `id.match("^\\w+[-_\\w+]*$")`.
+        let id = Value::from("typeParameter");
+        let matched = id.call_method("match", vec![Value::from("^\\w+[-_\\w+]*$")]);
+        assert!(
+            !matched.is_null() && !matched.is_undefined(),
+            "string pattern match"
+        );
+        assert_eq!(matched.get_property("0").to_js_string(), "typeParameter");
+        assert!(
+            Value::from("a b")
+                .call_method("match", vec![Value::from("^\\w+$")])
+                .is_null()
+        );
+        assert_eq!(
+            Value::from("abc")
+                .call_method("search", vec![Value::from("c|b")])
+                .to_number(),
+            1.0
+        );
+    }
+
+    #[test]
     fn identity_escapes_and_empty_classes_follow_javascript() {
         let test = |source: &str, flags: &str, input: &str| {
             create(source, flags)

@@ -1042,11 +1042,22 @@ impl EsmResolver {
                         .map(|parsed| collect_module_info(&module.path, &parsed));
                 }
                 if let Some(info) = &importer_info {
+                    // `import * as fs from "original-fs"`: the facade
+                    // snapshots named exports, so request every `fs.member`
+                    // the importer reads (members assigned dynamically, like
+                    // w3cos-node's `fs[name + 'Sync']`, escape the lexer).
+                    let namespace_members: Vec<String> = info
+                        .imports
+                        .iter()
+                        .filter(|binding| binding.source == import && binding.imported == "*")
+                        .flat_map(|binding| namespace_member_names(&source, &binding.local))
+                        .collect();
                     let imported = info
                         .imports
                         .iter()
                         .filter(|binding| binding.source == import)
-                        .map(|binding| binding.imported.clone());
+                        .map(|binding| binding.imported.clone())
+                        .chain(namespace_members);
                     let reexported = info
                         .exports
                         .iter()
@@ -1786,6 +1797,35 @@ impl EsmResolver {
     }
 }
 
+/// Identifiers read as `local.<name>` in `source` (namespace member reads).
+/// Lexical scan: occurrences inside strings or comments only add names the
+/// CommonJS facade then exports as `undefined`, which is harmless.
+fn namespace_member_names(source: &str, local: &str) -> Vec<String> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let needle = format!("{local}.");
+    let mut names = BTreeSet::new();
+    let mut from = 0;
+    while let Some(offset) = source[from..].find(&needle) {
+        let start = from + offset;
+        from = start + needle.len();
+        let preceded = source[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| is_ident(c) || c == '.');
+        if preceded {
+            continue;
+        }
+        let name: String = source[from..]
+            .chars()
+            .take_while(|c| is_ident(*c))
+            .collect();
+        if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
+            names.insert(name);
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// `prefix` + `source`, keeping a leading `#!` line first.
 fn prepend_after_hashbang(prefix: &str, source: &str) -> String {
     if prefix.is_empty() {
@@ -2490,6 +2530,15 @@ export function main() { return 42; }"#,
         assert_eq!(bundle.symbols[0].kind, SymbolKind::Function);
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn namespace_member_names_collects_reads_on_the_local() {
+        let source = "import * as fs from 'original-fs';\nconst a = fs.readFileSync(p);\nif (fs.existsSync(d)) x.fs.ignored(); myfs.no(); fs.promises.readFile;";
+        assert_eq!(
+            namespace_member_names(source, "fs"),
+            ["existsSync", "promises", "readFileSync"]
+        );
     }
 
     #[test]
