@@ -182,11 +182,27 @@ pub fn symbol_value() -> Value {
         if let Some(value) = slot.borrow().clone() {
             return value;
         }
+        fn this_symbol(this: &Value, method: &str) -> String {
+            let raw = if this.is_string() {
+                this.to_js_string()
+            } else {
+                String::new()
+            };
+            if !raw.starts_with("__w3cos_symbol_") {
+                crate::throw_value(error_instance(
+                    "TypeError",
+                    vec![Value::from(format!(
+                        "Symbol.prototype.{method} requires that 'this' be a Symbol"
+                    ))],
+                ));
+            }
+            raw
+        }
         let prototype = Value::object(HashMap::from([
             (
                 "toString".to_string(),
                 Value::function(|this, _| {
-                    let raw = this.to_js_string();
+                    let raw = this_symbol(&this, "toString");
                     let description = raw
                         .strip_prefix("__w3cos_symbol_for:")
                         .or_else(|| raw.strip_prefix("__w3cos_symbol_"))
@@ -195,7 +211,14 @@ pub fn symbol_value() -> Value {
                     Value::from(format!("Symbol({description})"))
                 }),
             ),
-            ("valueOf".to_string(), Value::function(|this, _| this)),
+            (
+                "valueOf".to_string(),
+                Value::function(|this, _| Value::from(this_symbol(&this, "valueOf"))),
+            ),
+            (
+                "__w3cos_symbol_to_primitive".to_string(),
+                Value::function(|this, _| Value::from(this_symbol(&this, "[Symbol.toPrimitive]"))),
+            ),
         ]));
         let value = Value::object(HashMap::from([
             (
@@ -209,6 +232,10 @@ pub fn symbol_value() -> Value {
             (
                 "unscopables".to_string(),
                 Value::from("__w3cos_symbol_unscopables"),
+            ),
+            (
+                "toPrimitive".to_string(),
+                Value::from("__w3cos_symbol_to_primitive"),
             ),
             (
                 "for".to_string(),
@@ -2261,6 +2288,19 @@ mod monaco_tests {
                 .to_js_string(),
             "Symbol(iterator)"
         );
+        // test262 Symbol.prototype[Symbol.toPrimitive].call({}) → TypeError.
+        let to_primitive = symbol
+            .get_property("prototype")
+            .get_property(&symbol.get_property("toPrimitive").to_js_string());
+        let iterator = symbol.get_property("iterator");
+        assert!(
+            to_primitive
+                .call(iterator.clone(), Vec::new())
+                .strict_eq(&iterator)
+        );
+        let thrown =
+            crate::value::catch_js(|| to_primitive.call(Value::object(HashMap::new()), Vec::new()));
+        assert!(thrown.is_err(), "non-symbol receiver must throw");
     }
 
     #[test]
