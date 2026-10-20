@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 swc_common = "19.0.0"
 swc_ecma_parser = "36.0.0"
 swc_ecma_ast = "21.0.0"
+swc_atoms = "9.0.3"
 swc_ecma_visit = "21.0.0"
 grass = { version = "0.13", optional = true }
 

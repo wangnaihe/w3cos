@@ -7480,8 +7480,91 @@ fn function_compat_class() -> Value {
     class.set_property("name", Value::string("Function"));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
+    install_function_prototype_methods(&prototype);
     class.set_property("prototype", prototype);
     class
+}
+
+fn incompatible_function_receiver(method: &str, this: &Value) -> Value {
+    w3cos_core::throw_value(w3cos_core::error_instance(
+        "TypeError",
+        vec![Value::string(&format!(
+            "Function.prototype.{method} called on incompatible {}",
+            this.to_js_string()
+        ))],
+    ))
+}
+
+/// `Function.prototype.{call,apply,bind,toString}` as first-class values,
+/// so polyfills that capture them (`var $call = Function.prototype.call;
+/// bind.call($call, $apply)`) see real functions. Each dispatches on its
+/// receiver directly instead of re-entering the method lookup.
+fn install_function_prototype_methods(prototype: &Value) {
+    prototype.set_property(
+        "call",
+        Value::function(|this, args| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("call", &this);
+            }
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            this.call(this_arg, args.into_iter().skip(1).collect())
+        }),
+    );
+    prototype.set_property(
+        "apply",
+        Value::function(|this, args| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("apply", &this);
+            }
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let list = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let applied = if list.is_undefined() || list.is_null() {
+                Vec::new()
+            } else {
+                let length = list.get_property("length").to_number();
+                let length = if length.is_finite() && length > 0.0 {
+                    length as usize
+                } else {
+                    0
+                };
+                (0..length)
+                    .map(|index| list.get_property(&index.to_string()))
+                    .collect()
+            };
+            this.call(this_arg, applied)
+        }),
+    );
+    prototype.set_property(
+        "bind",
+        Value::function(|this, args| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("bind", &this);
+            }
+            let target = this.clone();
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
+            Value::function(move |_, call_args| {
+                let mut combined = bound_args.clone();
+                combined.extend(call_args);
+                target.call(this_arg.clone(), combined)
+            })
+        }),
+    );
+    prototype.set_property(
+        "toString",
+        Value::function(|this, _| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("toString", &this);
+            }
+            let name = this.get_property("name");
+            let name = if name.is_string() {
+                name.to_js_string()
+            } else {
+                String::new()
+            };
+            Value::string(&format!("function {name}() {{ [native code] }}"))
+        }),
+    );
 }
 
 fn frame_function_compat_class(global: Value, document: Value) -> Value {
@@ -22788,6 +22871,34 @@ mod tests {
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn function_prototype_methods_are_first_class_values() {
+        let prototype = function_compat_class().get_property("prototype");
+        let call = prototype.get_property("call");
+        let apply = prototype.get_property("apply");
+        let bind = prototype.get_property("bind");
+        assert!(call.is_callable() && apply.is_callable() && bind.is_callable());
+        let max = Value::function(|_, args| {
+            Value::Number(args.iter().map(Value::to_number).fold(f64::MIN, f64::max))
+        });
+        // function-bind polyfill: `bind.call($call, $apply)(fn, this, list)`.
+        let apply_via_call = bind.call(call.clone(), vec![apply.clone()]);
+        let list = Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(5.0),
+            Value::Number(3.0),
+        ]);
+        let result = apply_via_call.call(Value::Undefined, vec![max.clone(), Value::Null, list]);
+        assert_eq!(result.to_number(), 5.0);
+        let receiver = Value::function(|this, _| this);
+        let marker = Value::string("marker");
+        assert_eq!(
+            call.call(receiver, vec![marker.clone()]).to_js_string(),
+            "marker"
+        );
+        assert!(prototype.get_property("toString").is_callable());
     }
 
     #[test]

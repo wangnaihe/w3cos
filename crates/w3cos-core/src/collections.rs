@@ -275,6 +275,7 @@ fn map_proto_for_each(this: Value, args: Vec<Value>) -> Value {
         return Value::Undefined;
     };
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut index = 0;
     loop {
         let next = {
@@ -288,7 +289,7 @@ fn map_proto_for_each(this: Value, args: Vec<Value>) -> Value {
             })
         };
         let Some((key, value)) = next else { break };
-        callback.call(Value::Undefined, vec![value, key, this.clone()]);
+        callback.call(this_arg.clone(), vec![value, key, this.clone()]);
     }
     Value::Undefined
 }
@@ -433,6 +434,7 @@ fn set_proto_for_each(this: Value, args: Vec<Value>) -> Value {
         return Value::Undefined;
     };
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut index = 0;
     loop {
         let next = {
@@ -446,7 +448,7 @@ fn set_proto_for_each(this: Value, args: Vec<Value>) -> Value {
             })
         };
         let Some(value) = next else { break };
-        callback.call(Value::Undefined, vec![value.clone(), value, this.clone()]);
+        callback.call(this_arg.clone(), vec![value.clone(), value, this.clone()]);
     }
     Value::Undefined
 }
