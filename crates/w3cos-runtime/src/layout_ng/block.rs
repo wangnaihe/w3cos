@@ -1209,6 +1209,7 @@ fn layout_block_in(
                     y0,
                     BoxFragment {
                         index: child,
+                        text_range: None,
                         width,
                         height: (bottom - y0).max(0.0),
                         children: placed
@@ -1613,6 +1614,7 @@ fn layout_block_in(
         last_baseline,
         fragment: BoxFragment {
             index,
+            text_range: None,
             width,
             height,
             children,

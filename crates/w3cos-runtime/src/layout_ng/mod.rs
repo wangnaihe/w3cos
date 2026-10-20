@@ -125,6 +125,9 @@ pub(crate) struct BoxFragment {
     pub index: usize,
     pub width: f32,
     pub height: f32,
+    /// A text fragment covering part of its leaf's text: the byte range
+    /// (NGPhysicalTextFragment start/end offsets).  `None` is a whole node.
+    pub text_range: Option<(usize, usize)>,
     /// Children with their border-box offset from this border box.
     pub children: Vec<(f32, f32, BoxFragment)>,
 }
@@ -281,9 +284,24 @@ pub(crate) fn layout_tree(
         }
         return None;
     };
+    if has_partial_text(&fragment) {
+        // Paint keys text by node (one rect per leaf); text ranges are not
+        // painted yet.
+        if trace() {
+            eprintln!(
+                "[layout-ng] fallback runtime:internal-break-paint ({} boxes)",
+                flat.len()
+            );
+        }
+        return None;
+    }
     let mut out = Vec::with_capacity(flat.len());
     flatten(&fragment, x, y, &mut out);
     Some(out)
+}
+
+fn has_partial_text(fragment: &BoxFragment) -> bool {
+    fragment.text_range.is_some() || fragment.children.iter().any(|c| has_partial_text(&c.2))
 }
 
 fn flatten(fragment: &BoxFragment, x: f32, y: f32, out: &mut Vec<(LayoutRect, usize)>) {

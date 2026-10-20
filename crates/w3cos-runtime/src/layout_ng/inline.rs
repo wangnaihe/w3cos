@@ -994,9 +994,15 @@ fn strut(style: &Style) -> (f32, f32) {
     (ascent, height - ascent)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct InlineItem {
     index: usize,
+    /// Position of the item's leaf among the IFC children (box edges,
+    /// bidi levels); split pieces of one leaf share it.
+    pos: usize,
+    /// Byte range of the leaf's text this item covers (NGInlineItem
+    /// start/end offsets); `None` is the whole text.
+    range: Option<(usize, usize)>,
     /// Raw advance in its run's shaping context (unsnapped).
     raw: f32,
     /// Raw advance without trailing collapsible spaces (they hang).
@@ -1057,11 +1063,7 @@ fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &In
     if prev.atomic.is_some() || next.atomic.is_some() || prev.forced || next.forced {
         return false;
     }
-    let text = |item: &InlineItem| match &flat[item.index].kind {
-        ComponentKind::Text { content } => content.as_str(),
-        _ => "",
-    };
-    let (a, b) = (text(prev), text(next));
+    let (a, b) = (item_text(flat, prev), item_text(flat, next));
     if a.is_empty() || b.is_empty() || a == FORCED_BREAK || b == FORCED_BREAK {
         return false;
     }
@@ -1143,21 +1145,99 @@ fn hang_advance(content: &str, raw: f32, style: &Style) -> f32 {
     (raw - parts[1]).max(0.0)
 }
 
+/// The text an item covers (its leaf's text, or a split piece of it).
+fn item_text<'a>(flat: &'a [FlatNodeInfo], item: &InlineItem) -> &'a str {
+    let full = match &flat[item.index].kind {
+        ComponentKind::Text { content } => content.as_str(),
+        _ => "",
+    };
+    match item.range {
+        Some((start, end)) => &full[start..end],
+        None => full,
+    }
+}
+
+/// NGLineBreaker breaking inside a text item: split `item` at the latest
+/// UAX #14 opportunity (crate::line_break over the item's text) for which
+/// `fits(prefix)` holds, or, with `overflow`, at its first opportunity.
+/// The prefix keeps the opening box edges, the rest the closing ones; both
+/// are measured as one shaping run (NGShapeResult::SubRange).
+fn split_text_item(
+    flat: &[FlatNodeInfo],
+    item: &InlineItem,
+    overflow: bool,
+    mut fits: impl FnMut(&InlineItem) -> bool,
+) -> Option<(InlineItem, InlineItem)> {
+    let style = flat[item.index].style;
+    if item.atomic.is_some() || item.forced || !zero_edges(style) {
+        return None;
+    }
+    let text = item_text(flat, item);
+    let base = item.range.map_or(0, |r| r.0);
+    let mode = crate::line_break::BreakMode::of(style);
+    let candidates: Vec<usize> = crate::line_break::break_opportunities(text, mode)
+        .into_iter()
+        .filter(|&o| o > 0 && o < text.len() && !text[..o].trim_end_matches(' ').is_empty())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let piece = |o: usize| {
+        let (head, tail) = text.split_at(o);
+        let adv = run_advances(&[head, tail], style);
+        let mut a = item.clone();
+        a.range = Some((base, base + o));
+        a.raw = adv[0] + item.box_start;
+        a.raw_hang = hang_advance(head, adv[0], style) + item.box_start;
+        a.ends_space = head.ends_with(' ');
+        a.whitespace_only = head.trim_end_matches(' ').is_empty();
+        a.internal_break = internal_opportunity(head, style);
+        a.box_end = 0.0;
+        let mut b = item.clone();
+        b.range = Some((base + o, base + text.len()));
+        b.raw = adv[1] + item.box_end;
+        b.raw_hang = hang_advance(tail, adv[1], style) + item.box_end;
+        b.starts_space = tail.starts_with(' ');
+        b.whitespace_only = tail.trim_end_matches(' ').is_empty();
+        b.internal_break = internal_opportunity(tail, style);
+        b.box_start = 0.0;
+        (a, b)
+    };
+    // Prefix advances grow with the offset: the latest fitting one by
+    // binary search.
+    let (mut lo, mut hi) = (0usize, candidates.len());
+    let mut best = None;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let pieces = piece(candidates[mid]);
+        if fits(&pieces.0) {
+            best = Some(pieces);
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    best.or_else(|| overflow.then(|| piece(candidates[0])))
+}
+
 /// LayoutUnit width of a line holding `line` (item indices in order) for
 /// fitting and alignment: trailing spaces hang (removed when collapsible,
 /// CSS Text 3 4.1.2; hanging when preserved by pre-wrap, 4.1.3), so the
 /// trailing whitespace-only items and the last other item's trailing spaces
 /// do not count.
 fn line_width(items: &[InlineItem], line: &[usize]) -> f32 {
+    line_width_of(&line.iter().map(|&k| &items[k]).collect::<Vec<_>>())
+}
+
+fn line_width_of(line: &[&InlineItem]) -> f32 {
     let end = line
         .iter()
-        .rposition(|&k| !items[k].whitespace_only && !items[k].forced)
+        .rposition(|item| !item.whitespace_only && !item.forced)
         .map_or(0, |p| p + 1);
     let mut width = 0.0f32;
     let mut slice = 0.0f32;
     let mut run = usize::MAX;
-    for (position, &k) in line[..end].iter().enumerate() {
-        let item = &items[k];
+    for (position, &item) in line[..end].iter().enumerate() {
         if item.run != run {
             width += snap(slice);
             slice = 0.0;
@@ -1477,6 +1557,7 @@ pub(super) fn layout_inline_beside(
                 y,
                 BoxFragment {
                     index: child,
+                    text_range: None,
                     width: available,
                     height: rect_height,
                     children: Vec::new(),
@@ -1527,6 +1608,7 @@ pub(super) fn layout_inline_beside(
                 ascent - inline_font_content_ascent(style),
                 BoxFragment {
                     index: child,
+                    text_range: None,
                     width,
                     height: inline_font_height(style),
                     children: Vec::new(),
@@ -1603,6 +1685,8 @@ pub(super) fn layout_inline_beside(
                 .why("vertical-align")?;
             items.push(InlineItem {
                 index: child,
+                pos: k,
+                range: None,
                 raw,
                 raw_hang: raw,
                 run,
@@ -1688,6 +1772,8 @@ pub(super) fn layout_inline_beside(
                 .why("vertical-align")?;
             items.push(InlineItem {
                 index: child,
+                pos: k,
+                range: None,
                 raw,
                 // Preserved spaces (pre) do not hang (CSS Text 3 4.1.3).
                 raw_hang: if container.white_space == WhiteSpace::Pre {
@@ -1774,7 +1860,26 @@ pub(super) fn layout_inline_beside(
         let fits = line_width(&items, &current) <= available + EPSILON;
         current.pop();
         if !fits && can_wrap && item.internal_break {
-            // NGLineBreaker would break inside this item.
+            // NGLineBreaker breaks inside the item at its latest opportunity
+            // that fits; on an otherwise empty line, at its first one.
+            // (An earlier item's internal opportunity, or preserved spaces,
+            // stay on legacy.)
+            if preserve {
+                return super::bail("internal-break");
+            }
+            let split = split_text_item(flat, item, current.is_empty(), |a| {
+                let mut probe: Vec<&InlineItem> = current.iter().map(|&k| &items[k]).collect();
+                probe.push(a);
+                line_width_of(&probe) <= available + EPSILON
+            });
+            if let Some((a, b)) = split {
+                items[i] = a;
+                items.insert(i + 1, b);
+                current.push(i);
+                lines.push(std::mem::take(&mut current));
+                i += 1;
+                continue;
+            }
             return super::bail("internal-break");
         }
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
@@ -2028,7 +2133,10 @@ pub(super) fn layout_inline_beside(
     let mut last_line_baseline = None;
     let mut out = Vec::with_capacity(items.len() + entries.len() - children.len());
     // (line, inline offset, width, baseline) of each placed item.
-    let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; items.len()];
+    // Keyed by leaf position: the first piece of a split leaf opens its
+    // boxes, the last one closes them.
+    let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
+    let mut placed_last: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
     for (line_index, line) in built.into_iter().enumerate() {
         if floats.is_some() {
             top = line.top;
@@ -2062,6 +2170,7 @@ pub(super) fn layout_inline_beside(
                     top + line.ascent + line.descent,
                     BoxFragment {
                         index: item.index,
+                        text_range: None,
                         width: available,
                         height: 0.0,
                         children: Vec::new(),
@@ -2069,7 +2178,9 @@ pub(super) fn layout_inline_beside(
                 ));
                 continue;
             }
-            placed[k] = Some((line_index, offset + x, width, baseline));
+            let at = Some((line_index, offset + x, width, baseline));
+            placed[item.pos] = placed[item.pos].or(at);
+            placed_last[item.pos] = at;
             // The item's own baseline after its vertical-align shift (the
             // enclosing boxes stay on the unshifted one).
             let baseline = baseline + item.shift;
@@ -2089,6 +2200,7 @@ pub(super) fn layout_inline_beside(
                 baseline - item.content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
+                    text_range: item.range,
                     width: width - item.box_start - item.box_end - e.margin_start - e.margin_end,
                     height: item.font_height + e.top + e.bottom,
                     children: Vec::new(),
@@ -2114,7 +2226,7 @@ pub(super) fn layout_inline_beside(
         }
         for (k, boxes) in closes.iter().enumerate() {
             for (pos, &b) in boxes.iter().enumerate() {
-                let (line, x, width, _) = placed[k].why("inline-box-placement")?;
+                let (line, x, width, _) = placed_last[k].why("inline-box-placement")?;
                 let (start_line, start, baseline) =
                     starts.get(&b).copied().why("inline-box-placement")?;
                 if start_line != line {
@@ -2128,6 +2240,7 @@ pub(super) fn layout_inline_beside(
                     baseline - inline_font_content_ascent(style) - e.top,
                     BoxFragment {
                         index: b,
+                        text_range: None,
                         width: end - start,
                         height: inline_font_height(style) + e.top + e.bottom,
                         children: Vec::new(),

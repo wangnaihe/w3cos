@@ -2499,3 +2499,68 @@ fn lines_avoid_floats() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// NGLineBreaker breaks inside a text item at its latest UAX #14
+/// opportunity that fits: one leaf yields text fragments on two lines,
+/// each with its byte range (NGPhysicalTextFragment start/end offsets).
+#[test]
+fn text_items_break_inside_at_uax14_opportunities() {
+    let _ahem = AhemGuard::new();
+    let mut container = Style {
+        display: Display::Block,
+        width: Dimension::Px(120.0),
+        ..Style::default()
+    };
+    font(&mut container, 20.0, LineHeight::Number(1.0));
+    container
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(inline::IFC_MARKER.into(), "1".into());
+    let text = |content: &str| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        Component::text(content, style)
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            container,
+            vec![text("XX"), text("XXX-XXX")],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let (_, _, fragment) = block::layout_root(&flat, 800.0, 600.0).expect("ng");
+    fn leaves(
+        f: &BoxFragment,
+        x: f32,
+        y: f32,
+        out: &mut Vec<(usize, Option<(usize, usize)>, [f32; 4])>,
+    ) {
+        if f.children.is_empty() {
+            out.push((f.index, f.text_range, [x, y, f.width, f.height]));
+        }
+        for (dx, dy, c) in &f.children {
+            leaves(c, x + dx, y + dy, out);
+        }
+    }
+    let mut got = Vec::new();
+    leaves(&fragment, 0.0, 0.0, &mut got);
+    got.retain(|(i, _, _)| *i >= 2);
+    assert_eq!(
+        got,
+        vec![
+            (2, None, [0.0, 0.0, 40.0, 20.0]),
+            (3, Some((0, 4)), [40.0, 0.0, 80.0, 20.0]),
+            (3, Some((4, 7)), [0.0, 20.0, 60.0, 20.0]),
+        ]
+    );
+    // Paint cannot draw text ranges yet: the page stays on legacy.
+    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+}
