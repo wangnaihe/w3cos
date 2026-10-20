@@ -4468,9 +4468,10 @@ fn global_value_expr(name: &str) -> Option<String> {
         "arguments" => "w3cos_core::Value::array(__args.clone())".to_string(),
         // Conversion globals as function values: `String(x)`/`Number(x)`/
         // `Boolean(x)`/`isNaN(x)`/`isFinite(x)` work through the normal call
-        // path; `String` is Core's realm constructor (statics + prototype).
+        // path; `String`/`Number` are Core's realm constructors (statics +
+        // prototype).
         "String" => "w3cos_core::string_value()".to_string(),
-        "Number" => "w3cos_core::Value::callable(::std::collections::HashMap::from([(\"MAX_SAFE_INTEGER\".to_string(), w3cos_core::Value::Number(9007199254740991.0)), (\"MIN_SAFE_INTEGER\".to_string(), w3cos_core::Value::Number(-9007199254740991.0)), (\"EPSILON\".to_string(), w3cos_core::Value::Number(f64::EPSILON)), (\"MAX_VALUE\".to_string(), w3cos_core::Value::Number(f64::MAX)), (\"MIN_VALUE\".to_string(), w3cos_core::Value::Number(5e-324)), (\"POSITIVE_INFINITY\".to_string(), w3cos_core::Value::Number(f64::INFINITY)), (\"NEGATIVE_INFINITY\".to_string(), w3cos_core::Value::Number(f64::NEG_INFINITY)), (\"NaN\".to_string(), w3cos_core::Value::Number(f64::NAN)), (\"isFinite\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_finite())))), (\"isInteger\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_finite() && value.fract() == 0.0)))), (\"isNaN\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_nan())))), (\"isSafeInteger\".to_string(), w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().and_then(|value| value.as_number()).is_some_and(|value| value.is_finite() && value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0))))]), |_this, __args| w3cos_core::Value::Number(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_number()))".to_string(),
+        "Number" => "w3cos_core::number_value()".to_string(),
         "Boolean" => "w3cos_core::Value::function(|_this, __args| w3cos_core::Value::Bool(__args.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_bool()))".to_string(),
         // As values (`typeof parseFloat`, `[...].map(parseFloat)`, CommonJS
         // modules reading the global); direct calls stay static Rust calls.
@@ -5941,16 +5942,16 @@ const params = new URLSearchParams("a=1");"#,
             parse_stmts("const safe = Number.isSafeInteger(1); const finite = Number.isFinite(1);");
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&stmts);
+        // Statics live on Core's realm `Number` (see core number tests).
         assert!(
             code.contains("isSafeInteger"),
             "Number.isSafeInteger: {code}"
         );
-        assert!(
-            code.contains("9_007_199_254_740_991.0"),
-            "safe integer bound: {code}"
-        );
         assert!(code.contains("isFinite"), "Number.isFinite: {code}");
-        assert!(code.contains("Value::callable"), "Number facade: {code}");
+        assert!(
+            code.contains("w3cos_core::number_value()"),
+            "Number constructor: {code}"
+        );
     }
 
     #[test]

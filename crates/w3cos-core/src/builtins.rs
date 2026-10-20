@@ -170,6 +170,107 @@ fn build_reflect_value() -> Value {
     Value::object(properties)
 }
 
+/// The global `Number` constructor, one per thread: the static constants and
+/// predicates plus `Number.prototype` (`valueOf`, `toString`, `toFixed`, ...)
+/// so uncurried captures (`uncurryThis(Number.prototype.valueOf)` in the
+/// `util` polyfill) resolve and `Number.prototype` keeps one identity.
+pub fn number_value() -> Value {
+    thread_local! {
+        static NUMBER: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    NUMBER.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        fn this_number(this: &Value, method: &str) -> f64 {
+            match this.as_number() {
+                Some(number) => number,
+                None => crate::throw_value(error_instance(
+                    "TypeError",
+                    vec![Value::from(format!(
+                        "Number.prototype.{method} requires that 'this' be a Number"
+                    ))],
+                )),
+            }
+        }
+        fn number_predicate(test: fn(f64) -> bool) -> Value {
+            Value::function(move |_, arguments| {
+                Value::Bool(
+                    arguments
+                        .first()
+                        .and_then(Value::as_number)
+                        .is_some_and(test),
+                )
+            })
+        }
+        let mut prototype = HashMap::new();
+        prototype.insert(
+            "valueOf".to_string(),
+            Value::function(|this, _| Value::Number(this_number(&this, "valueOf"))),
+        );
+        for method in [
+            "toString",
+            "toFixed",
+            "toPrecision",
+            "toExponential",
+            "toLocaleString",
+        ] {
+            prototype.insert(
+                method.to_string(),
+                Value::function(move |this, arguments| {
+                    let number = this_number(&this, method);
+                    crate::number_proto::number_method(number, method, &arguments)
+                        .unwrap_or_else(|| Value::from(Value::Number(number).to_js_string()))
+                }),
+            );
+        }
+        let prototype = Value::object(prototype);
+        let value = Value::callable(
+            HashMap::from([
+                (
+                    "MAX_SAFE_INTEGER".to_string(),
+                    Value::Number(9007199254740991.0),
+                ),
+                (
+                    "MIN_SAFE_INTEGER".to_string(),
+                    Value::Number(-9007199254740991.0),
+                ),
+                ("EPSILON".to_string(), Value::Number(f64::EPSILON)),
+                ("MAX_VALUE".to_string(), Value::Number(f64::MAX)),
+                ("MIN_VALUE".to_string(), Value::Number(5e-324)),
+                (
+                    "POSITIVE_INFINITY".to_string(),
+                    Value::Number(f64::INFINITY),
+                ),
+                (
+                    "NEGATIVE_INFINITY".to_string(),
+                    Value::Number(f64::NEG_INFINITY),
+                ),
+                ("NaN".to_string(), Value::Number(f64::NAN)),
+                ("isFinite".to_string(), number_predicate(f64::is_finite)),
+                (
+                    "isInteger".to_string(),
+                    number_predicate(|value| value.is_finite() && value.fract() == 0.0),
+                ),
+                ("isNaN".to_string(), number_predicate(f64::is_nan)),
+                (
+                    "isSafeInteger".to_string(),
+                    number_predicate(|value| {
+                        value.is_finite()
+                            && value.fract() == 0.0
+                            && value.abs() <= 9_007_199_254_740_991.0
+                    }),
+                ),
+                ("prototype".to_string(), prototype.clone()),
+            ]),
+            |_, arguments| Value::Number(arguments.first().map_or(0.0, Value::to_number)),
+        );
+        prototype.set_property("constructor", value.clone());
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
 /// The global `Symbol` facade, one per thread. Symbols are collision-resistant
 /// string sentinels (`__w3cos_symbol_…`); `Symbol.for(key)` is stable for the
 /// global registry. `Symbol.prototype` exists so uncurried method captures
@@ -2301,6 +2402,37 @@ mod monaco_tests {
         let thrown =
             crate::value::catch_js(|| to_primitive.call(Value::object(HashMap::new()), Vec::new()));
         assert!(thrown.is_err(), "non-symbol receiver must throw");
+        let number = number_value();
+        assert!(number.strict_eq(&number_value()));
+        let value_of = number.get_property("prototype").get_property("valueOf");
+        assert_eq!(
+            value_of.call(Value::Number(5.0), Vec::new()).to_number(),
+            5.0
+        );
+        let to_fixed = number.get_property("prototype").get_property("toFixed");
+        assert_eq!(
+            to_fixed
+                .call(Value::Number(1.5), vec![Value::Number(2.0)])
+                .to_js_string(),
+            "1.50"
+        );
+        assert!(crate::value::catch_js(|| value_of.call(Value::from("x"), Vec::new())).is_err());
+        assert!(
+            number
+                .get_property("isSafeInteger")
+                .call(
+                    Value::Undefined,
+                    vec![Value::Number(9_007_199_254_740_991.0)]
+                )
+                .to_bool()
+        );
+        assert_eq!(number.call(Value::Undefined, Vec::new()).to_number(), 0.0);
+        // `Symbol.toPrimitive[Symbol.toPrimitive]()` on the sentinel itself.
+        let key = symbol.get_property("toPrimitive");
+        assert!(
+            key.call_method(&key.to_js_string(), Vec::new())
+                .strict_eq(&key)
+        );
     }
 
     #[test]
