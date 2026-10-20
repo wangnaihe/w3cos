@@ -197,9 +197,11 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                 key.starts_with("--w3cos-internal")
                     && !is_value_carrier_marker(key)
                     && !allowed.contains(&key.as_str())
-                    // Intrinsic width keywords are only resolved where size
-                    // containment fixes the intrinsic sizes.
-                    && !(key == WIDTH_KEYWORD && size_contained(style))
+                    // Intrinsic width keywords are resolved under size
+                    // containment; elsewhere width stays auto, as before
+                    // the cascade kept the keyword (legacy does the same).
+                    // TODO: Blink ComputeInlineSizeForFragment keywords.
+                    && key != WIDTH_KEYWORD
             })
         })
         .then_some("internal-marker")
@@ -656,7 +658,7 @@ fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     };
     // An intrinsic keyword (only accepted under size containment) is the
     // contain-intrinsic inline size: min-, max- and fit-content coincide.
-    let specified = if marker(style, WIDTH_KEYWORD).is_some() {
+    let specified = if marker(style, WIDTH_KEYWORD).is_some() && size_contained(style) {
         Some(contain_intrinsic_size(style).0)
     } else {
         resolve_dim(style.width, Some(cb), style, space).map(to_content)

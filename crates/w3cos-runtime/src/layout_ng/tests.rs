@@ -1635,12 +1635,15 @@ fn size_containment_uses_contain_intrinsic_size() {
     let flat = pre_flatten(&root);
     let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
-    // A width keyword without size containment stays on legacy.
+    // Without size containment a width keyword is not resolved yet: the
+    // width stays auto (as on legacy).
     let mut keyword = block();
     mark(
         &mut keyword,
         &[("--w3cos-internal-width-keyword", "max-content")],
     );
     let root = node(block(), vec![node(keyword, vec![])]);
-    assert!(block::unsupported_tree(&pre_flatten(&root)).is_some());
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
 }
