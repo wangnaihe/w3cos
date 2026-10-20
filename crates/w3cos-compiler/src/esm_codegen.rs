@@ -23,8 +23,9 @@ fn json_value_expr(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "w3cos_core::Value::Null".to_string(),
         serde_json::Value::Bool(value) => format!("w3cos_core::Value::Bool({value})"),
+        // `{:?}` keeps the float literal form (`1.0`, `1e300`).
         serde_json::Value::Number(value) => format!(
-            "w3cos_core::Value::Number({})",
+            "w3cos_core::Value::Number({:?})",
             value.as_f64().unwrap_or_default()
         ),
         serde_json::Value::String(value) => {
@@ -57,8 +58,10 @@ fn emit_literal_imports(module: &BundledModule) -> String {
             let value = serde_json::from_str(source)
                 .map(|value| json_value_expr(&value))
                 .unwrap_or_else(|_| "w3cos_core::Value::Undefined".to_string());
+            // One value per module instance: every import of the JSON file
+            // (and every `require` of it) sees the same object.
             format!(
-                "    pub fn {}_get() -> w3cos_core::Value {{ {value} }}\n",
+                "    pub fn {}_get() -> w3cos_core::Value {{ thread_local! {{ static VALUE: ::std::cell::OnceCell<w3cos_core::Value> = const {{ ::std::cell::OnceCell::new() }}; }} VALUE.with(|cell| cell.get_or_init(|| {value}).clone()) }}\n",
                 sanitize_ident(local)
             )
         })
@@ -242,6 +245,28 @@ pub fn try_generate_with_bodies_and_css(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
 ) -> Result<String, EsmCodegenError> {
+    let parts = generate_parts(bundle, css_rules)?;
+    let mut out = parts.header;
+    for (_, code) in &parts.modules {
+        out.push_str(code);
+        out.push('\n');
+    }
+    out.push_str(&parts.tail);
+    Ok(out)
+}
+
+/// Generated bundle pieces: a header, one `mod mN { … }` per ESM module (in
+/// bundle order, keyed by namespace) and the entry/registration tail.
+struct GeneratedParts {
+    header: String,
+    modules: Vec<(String, String)>,
+    tail: String,
+}
+
+fn generate_parts(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+) -> Result<GeneratedParts, EsmCodegenError> {
     let mut out = String::new();
     // Generated bundles intentionally use source-shaped JS identifiers and
     // mutable temporaries; suppressing those mechanical Rust warnings keeps
@@ -254,15 +279,16 @@ pub fn try_generate_with_bodies_and_css(
         bundle.symbols.len()
     ));
 
+    let header = std::mem::take(&mut out);
     let mut parse_cache = ModuleParseCache::default();
     let mut async_init_namespaces = HashSet::new();
+    let mut modules = Vec::with_capacity(bundle.modules.len());
     for module in &bundle.modules {
         let generated = generate_module_with_bodies(bundle, module, &mut parse_cache)?;
         if generated.has_async_init {
             async_init_namespaces.insert(module.namespace.clone());
         }
-        out.push_str(&generated.code);
-        out.push('\n');
+        modules.push((module.namespace.clone(), generated.code));
     }
     let has_async_init = !async_init_namespaces.is_empty();
 
@@ -292,22 +318,27 @@ pub fn try_generate_with_bodies_and_css(
         }
     }
 
-    // ESM evaluation order: every synchronous module's top-level statements
-    // run once in bundle (topological) order before the entry's main. Bundles
-    // containing top-level await use the Promise chain emitted below.
-    let init_calls = if bundle.modules.is_empty() {
+    // ESM evaluation order: every synchronous *eager* module's top-level
+    // statements run once in bundle (topological) order before the entry's
+    // main. Modules only reachable through literal `import()` stay unevaluated
+    // until the dynamic-import adapter calls `module_registry::evaluate`.
+    let eager_modules: Vec<&crate::esm_resolver::BundledModule> = match bundle.lazy_start {
+        Some(start) => bundle.modules.iter().take(start).collect(),
+        None => bundle.modules.iter().collect(),
+    };
+    let init_calls = if eager_modules.is_empty() {
         String::new()
     } else {
         format!(
             " {}",
-            bundle
-                .modules
+            eager_modules
                 .iter()
                 .map(|module| format!("{}::{}__init();", module.namespace, module.namespace))
                 .collect::<Vec<_>>()
                 .join(" ")
         )
     };
+    let dynamic_import_adapter = emit_dynamic_import_adapter(bundle);
 
     let entry_call = if let Some(symbol) = bundle
         .symbols
@@ -322,15 +353,29 @@ pub fn try_generate_with_bodies_and_css(
     } else {
         "w3cos_core::Value::Undefined".to_string()
     };
+    // `worker_threads`: a worker thread re-runs this entry in a fresh realm
+    // (`w3cos_core::node_workers`), so bundles with the worker glue hand the
+    // entry to the host.
+    let register_entry = if bundle.modules.iter().any(|module| {
+        module
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("internal__w3cos_worker.js"))
+    }) {
+        " w3cos_core::node_workers::register_entry(run_entry);"
+    } else {
+        ""
+    };
     if has_async_init {
         out.push_str(&format!(
             "fn __w3cos_run_entry_body() -> w3cos_core::Value {{ {entry_call} }}\n\
-             pub fn run_entry() -> w3cos_core::Value {{ run_entry_async() }}\n"
+             pub fn run_entry() -> w3cos_core::Value {{{register_entry} run_entry_async() }}\n"
         ));
     } else {
         out.push_str(&format!(
             "fn __w3cos_run_entry_body() -> w3cos_core::Value {{{init_calls} {entry_call} }}\n\
-             pub fn run_entry() -> w3cos_core::Value {{ register_styles();{register_calls} __w3cos_run_entry_body() }}\n"
+             pub fn run_entry() -> w3cos_core::Value {{{register_entry} register_styles();{register_calls}{dynamic_import_adapter} __w3cos_run_entry_body() }}\n"
         ));
     }
 
@@ -346,8 +391,7 @@ pub fn try_generate_with_bodies_and_css(
                 "w3cos_core::intrinsics::promise_all(vec![w3cos_core::Value::array(vec![{evaluations}])])"
             )
         };
-        let module_steps = bundle
-            .modules
+        let module_steps = eager_modules
             .iter()
             .map(|module| {
                 let init = if async_init_namespaces.contains(&module.namespace) {
@@ -364,23 +408,236 @@ pub fn try_generate_with_bodies_and_css(
             })
             .collect::<String>();
         out.push_str(&format!(
-            "pub fn run_entry_async() -> w3cos_core::Value {{\n    register_styles();{register_calls}\n    let mut __evaluation = {initial_evaluation};\n{module_steps}    w3cos_core::intrinsics::call_method(&__evaluation, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| __w3cos_run_entry_body())])\n}}\n"
+            "pub fn run_entry_async() -> w3cos_core::Value {{\n    register_styles();{register_calls}{dynamic_import_adapter}\n    let mut __evaluation = {initial_evaluation};\n{module_steps}    w3cos_core::intrinsics::call_method(&__evaluation, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| __w3cos_run_entry_body())])\n}}\n"
         ));
     } else if runtime_dependencies.is_empty() {
         // Preserve synchronous startup for ordinary AOT bundles while giving
         // launchers one stable API for both distribution modes.
         out.push_str(&format!(
-            "pub fn run_entry_async() -> w3cos_core::Value {{ register_styles();{register_calls} w3cos_core::intrinsics::promise_resolve(vec![__w3cos_run_entry_body()]) }}\n"
+            "pub fn run_entry_async() -> w3cos_core::Value {{ register_styles();{register_calls}{dynamic_import_adapter} w3cos_core::intrinsics::promise_resolve(vec![__w3cos_run_entry_body()]) }}\n"
         ));
     } else {
         let entry_referrer = entry_referrer(bundle);
         let evaluations = runtime_dependency_evaluations(&runtime_dependencies, &entry_referrer);
         out.push_str(&format!(
-            "pub fn run_entry_async() -> w3cos_core::Value {{\n    register_styles();{register_calls}\n    let __dependencies = w3cos_core::intrinsics::promise_all(vec![w3cos_core::Value::array(vec![{evaluations}])]);\n    w3cos_core::intrinsics::call_method(&__dependencies, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| __w3cos_run_entry_body())])\n}}\n"
+            "pub fn run_entry_async() -> w3cos_core::Value {{\n    register_styles();{register_calls}{dynamic_import_adapter}\n    let __dependencies = w3cos_core::intrinsics::promise_all(vec![w3cos_core::Value::array(vec![{evaluations}])]);\n    w3cos_core::intrinsics::call_method(&__dependencies, &w3cos_core::Value::string(\"then\"), vec![w3cos_core::Value::function(move |_, _| __w3cos_run_entry_body())])\n}}\n"
         ));
     }
 
-    Ok(out)
+    Ok(GeneratedParts {
+        header,
+        modules,
+        tail: out,
+    })
+}
+
+/// One generated library crate holding a contiguous run of ESM modules.
+#[derive(Debug, Clone)]
+pub struct SplitSegment {
+    /// Crate name, e.g. `w3cos_seg_3`.
+    pub name: String,
+    /// Names of earlier segment crates this one references.
+    pub deps: Vec<String>,
+    /// `lib.rs` source.
+    pub code: String,
+    /// Module namespaces (`mN`) it defines.
+    pub modules: Vec<String>,
+}
+
+/// A bundle split across several crates so Code-OSS scale graphs stay
+/// buildable: rustc's front end is largely serial per crate, and one
+/// multi-GB crate does not fit in memory. Segments are contiguous runs of
+/// the module reference graph's strongly connected components in
+/// dependency-first order, so crate dependencies are acyclic; references
+/// keep their `super::mN::` spelling because each segment root imports
+/// every foreign module it uses.
+#[derive(Debug, Clone)]
+pub struct SplitBundle {
+    pub segments: Vec<SplitSegment>,
+    /// Source of the root module (`esm_bundle.rs`): re-exports every
+    /// module and holds `run_entry` / registration / dynamic import glue.
+    pub root: String,
+}
+
+fn module_references(code: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let bytes = code.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = code[from..].find("super::m") {
+        let start = from + offset + "super::".len();
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start + 1 && code[end..].starts_with("::") {
+            found.push(&code[start..end]);
+        }
+        from = end;
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Tarjan SCCs over `edges` (index lists), emitted dependencies-first.
+fn strongly_connected_components(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let count = edges.len();
+    let mut index = vec![usize::MAX; count];
+    let mut low = vec![0usize; count];
+    let mut on_stack = vec![false; count];
+    let mut stack = Vec::new();
+    let mut components = Vec::new();
+    let mut next = 0usize;
+    for root in 0..count {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(top) = work.last_mut() {
+            let node = top.0;
+            if top.1 < edges[node].len() {
+                let target = edges[node][top.1];
+                top.1 += 1;
+                if index[target] == usize::MAX {
+                    index[target] = next;
+                    low[target] = next;
+                    next += 1;
+                    stack.push(target);
+                    on_stack[target] = true;
+                    work.push((target, 0));
+                } else if on_stack[target] {
+                    low[node] = low[node].min(index[target]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[node]);
+            }
+            if low[node] == index[node] {
+                let mut component = Vec::new();
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component.push(member);
+                    if member == node {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                components.push(component);
+            }
+        }
+    }
+    components
+}
+
+/// Generate a bundle split into library crates of roughly `segment_bytes`
+/// of Rust source each (a module or reference cycle is never divided).
+pub fn try_generate_split_with_bodies_and_css(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+    segment_bytes: usize,
+) -> Result<SplitBundle, EsmCodegenError> {
+    let parts = generate_parts(bundle, css_rules)?;
+    Ok(split_parts(parts, segment_bytes))
+}
+
+fn split_parts(parts: GeneratedParts, segment_bytes: usize) -> SplitBundle {
+    let position: HashMap<&str, usize> = parts
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, (namespace, _))| (namespace.as_str(), index))
+        .collect();
+    let edges: Vec<Vec<usize>> = parts
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(index, (_, code))| {
+            module_references(code)
+                .into_iter()
+                .filter_map(|namespace| position.get(namespace).copied())
+                .filter(|target| *target != index)
+                .collect()
+        })
+        .collect();
+    let mut segment_of = vec![0usize; parts.modules.len()];
+    let mut members: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut size = 0usize;
+    for component in strongly_connected_components(&edges) {
+        let bytes: usize = component.iter().map(|&m| parts.modules[m].1.len()).sum();
+        if size > 0 && size + bytes > segment_bytes.max(1) {
+            members.push(Vec::new());
+            size = 0;
+        }
+        size += bytes;
+        let segment = members.len() - 1;
+        for module in component {
+            segment_of[module] = segment;
+            members.last_mut().expect("segment").push(module);
+        }
+    }
+    let segment_name = |segment: usize| format!("w3cos_seg_{segment}");
+    let mut segments = Vec::with_capacity(members.len());
+    for (segment, modules) in members.iter().enumerate() {
+        let mut imports = std::collections::BTreeSet::new();
+        let mut deps = std::collections::BTreeSet::new();
+        for &module in modules {
+            for &target in &edges[module] {
+                let target_segment = segment_of[target];
+                if target_segment != segment {
+                    debug_assert!(
+                        target_segment < segment,
+                        "segment order is dependency-first"
+                    );
+                    deps.insert(target_segment);
+                    imports.insert((target_segment, target));
+                }
+            }
+        }
+        let mut code = String::from(
+            "#![allow(warnings)]\n// Generated by w3cos esm_codegen (split segment)\n",
+        );
+        for (target_segment, target) in &imports {
+            code.push_str(&format!(
+                "use {}::{};\n",
+                segment_name(*target_segment),
+                parts.modules[*target].0
+            ));
+        }
+        for &module in modules {
+            let (namespace, module_code) = &parts.modules[module];
+            code.push_str(&module_code.replacen(
+                &format!("\nmod {namespace} {{"),
+                &format!("\npub mod {namespace} {{"),
+                1,
+            ));
+            code.push('\n');
+        }
+        segments.push(SplitSegment {
+            name: segment_name(segment),
+            deps: deps.into_iter().map(segment_name).collect(),
+            code,
+            modules: modules
+                .iter()
+                .map(|&m| parts.modules[m].0.clone())
+                .collect(),
+        });
+    }
+    let mut root = parts.header;
+    for (index, (namespace, _)) in parts.modules.iter().enumerate() {
+        root.push_str(&format!(
+            "pub use {}::{namespace};\n",
+            segment_name(segment_of[index])
+        ));
+    }
+    root.push_str(&parts.tail);
+    SplitBundle { segments, root }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +695,43 @@ impl fmt::Display for EsmCodegenError {
 }
 
 impl std::error::Error for EsmCodegenError {}
+
+fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
+    if bundle.dynamic_imports.is_empty() {
+        return String::new();
+    }
+    let mut arms = String::new();
+    let mut fallback = String::from("{ let __s = __specifier.as_str(); ");
+    for edge in &bundle.dynamic_imports {
+        let referrer = edge.referrer.to_string_lossy();
+        let specifier = &edge.specifier;
+        let target = bundle.modules[edge.target].path.to_string_lossy();
+        let mut evals = String::new();
+        for &index in &edge.evaluation_order {
+            let path = bundle.modules[index].path.to_string_lossy();
+            evals.push_str(&format!(
+                "let _ = w3cos_core::module_registry::evaluate({path:?}); "
+            ));
+        }
+        let load = format!(
+            "{evals}w3cos_core::module_registry::namespace({target:?}).unwrap_or(w3cos_core::Value::Undefined)"
+        );
+        arms.push_str(&format!("({referrer:?}, {specifier:?}) => {{ {load} }}, "));
+        // Computed vscode-file / file URL: match by absolute target or by /<specifier> suffix.
+        let spec_len = specifier.len();
+        fallback.push_str(&format!(
+            "if __s == {target:?} || __s.ends_with({specifier:?}) && (__s.len() == {spec_len} || __s.as_bytes().get(__s.len().saturating_sub({spec_len} + 1)) == Some(&b'/')) {{ {load} }} else ",
+            spec_len = spec_len,
+            specifier = specifier,
+            target = target,
+            load = load,
+        ));
+    }
+    fallback.push_str("{ w3cos_core::Value::Undefined } }");
+    format!(
+        " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}_ => {fallback}, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
+    )
+}
 
 fn entry_referrer(bundle: &EsmBundle) -> String {
     let entry = bundle.entry.to_string_lossy();
@@ -567,7 +861,10 @@ fn generate_module_with_bodies(
                         owner.namespace, bundled, local
                     ));
                 }
-            } else if sym.kind == SymbolKind::Function {
+            } else if sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Variable {
+                // Function declarations and function-shaped variables
+                // (`const f = () => …`, lowered as native functions) both
+                // expose `{bundled}_value`; captures read it by local name.
                 let local = sanitize_ident(local);
                 if emitted_uses.insert(local.clone()) {
                     out.push_str(&format!(
@@ -846,8 +1143,25 @@ fn generate_module_with_bodies(
                         // every referencing module sees one uniform shape
                         // (the target may be a fn, class accessor, or a
                         // variable accessor — resolve the final form).
-                        let (target_module, target_bundled, shape) =
+                        let (mut target_module, mut target_bundled, mut shape) =
                             resolve_namespace_symbol(bundle, &module.path, target, parse_cache, 0);
+                        if matches!(shape, NamespacePropShape::Missing)
+                            && let Some(imported) = module.lookup(target)
+                            && let Some(imported_sym) =
+                                bundle.symbols.iter().find(|s| s.bundled_name == imported)
+                            && imported_sym.module != module.path
+                        {
+                            // `const y = x` where `x` is an import binding
+                            // (e.g. a CommonJS facade's default export):
+                            // resolve the binding in its defining module.
+                            (target_module, target_bundled, shape) = resolve_namespace_symbol(
+                                bundle,
+                                &imported_sym.module.clone(),
+                                &imported_sym.original_name.clone(),
+                                parse_cache,
+                                1,
+                            );
+                        }
                         let owner_ns = bundle
                             .modules
                             .iter()
@@ -1281,7 +1595,10 @@ fn emit_w3ir_module_init_statements(
     namespace_names: &HashSet<String>,
 ) -> Result<W3irModuleInitStatement, String> {
     let specifier = format!("{}#module-init-{chunk_index}", module.path.display());
-    let external_bindings = module_init_external_bindings(module, value_bindings);
+    let function_names = module_function_names(bundle, module);
+    let class_locals = module_class_names(bundle, module);
+    let external_bindings =
+        module_init_external_bindings(module, value_bindings, &function_names, &class_locals);
     let w3ir_module =
         crate::w3ir_lowering::lower_module_statements(statements, &specifier, &external_bindings)
             .map_err(|error| error.to_string())?;
@@ -1319,12 +1636,21 @@ fn emit_w3ir_module_init_statements(
 fn module_init_external_bindings(
     module: &BundledModule,
     value_bindings: &HashSet<String>,
+    function_names: &HashSet<String>,
+    class_names: &HashSet<String>,
 ) -> Vec<(String, bool)> {
     let mut bindings = HashMap::<String, bool>::new();
     let mut insert = |name: &str| {
+        let sanitized = sanitize_ident(name);
+        // Function/class locals are marked mutable so TypeScript namespace-merge
+        // emit (`X || (X = {})`) lowers; the assign is behind `||` and does not
+        // run when X already exists. Import/const cells stay immutable unless
+        // they are value bindings.
         bindings.insert(
             name.to_string(),
-            value_bindings.contains(&sanitize_ident(name)),
+            value_bindings.contains(&sanitized)
+                || function_names.contains(&sanitized)
+                || class_names.contains(&sanitized),
         );
     };
     for (name, _) in &module.local_to_bundled {
@@ -1675,18 +2001,26 @@ fn resolve_namespace_symbol(
             .iter()
             .any(|namespace| namespace.local == local_name)
     {
-        return (
-            defining_module.to_path_buf(),
-            bundle
-                .symbols
-                .iter()
-                .find(|symbol| {
-                    symbol.module == defining_module && symbol.original_name == local_name
-                })
-                .map(|symbol| symbol.bundled_name.clone())
-                .unwrap_or_else(|| sanitize_ident(local_name)),
-            NamespacePropShape::NamespaceValue,
-        );
+        // A re-exported `import * as ns` binding is backed by an export cell
+        // (`{bundled}_get`) when the bundler recorded a symbol for it;
+        // otherwise only the lazy namespace accessor `{m}_ns_{local}()`
+        // exists, which has the zero-arg call shape of a class value.
+        return match bundle
+            .symbols
+            .iter()
+            .find(|symbol| symbol.module == defining_module && symbol.original_name == local_name)
+        {
+            Some(symbol) => (
+                defining_module.to_path_buf(),
+                symbol.bundled_name.clone(),
+                NamespacePropShape::NamespaceValue,
+            ),
+            None => (
+                defining_module.to_path_buf(),
+                namespace_fn_name(module, local_name),
+                NamespacePropShape::ClassValue,
+            ),
+        };
     }
     let Some(sym) = bundle
         .symbols
@@ -2685,6 +3019,21 @@ fn module_class_names(bundle: &EsmBundle, module: &BundledModule) -> HashSet<Str
         .collect()
 }
 
+fn module_function_names(bundle: &EsmBundle, module: &BundledModule) -> HashSet<String> {
+    let function_symbols: HashSet<&str> = bundle
+        .symbols
+        .iter()
+        .filter(|sym| sym.kind == SymbolKind::Function)
+        .map(|sym| sym.bundled_name.as_str())
+        .collect();
+    module
+        .local_to_bundled
+        .iter()
+        .filter(|(_, bundled)| function_symbols.contains(bundled.as_str()))
+        .map(|(local, _)| sanitize_ident(local))
+        .collect()
+}
+
 /// A method/getter/setter extracted from a class body, ready for emission.
 struct ClassMethodDef {
     /// Unique Rust fn name within the module, e.g. `m1_Point__m_move`.
@@ -3319,6 +3668,66 @@ fn emit_class(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_parts_keeps_cycles_together_and_orders_dependencies_first() {
+        let module = |namespace: &str, refs: &[&str]| {
+            let body = refs
+                .iter()
+                .map(|r| format!("    pub use super::{r}::{r}_x;\n"))
+                .collect::<String>();
+            (
+                namespace.to_string(),
+                format!(
+                    "/// ESM module: /{namespace}.js\nmod {namespace} {{\n{body}    pub fn {namespace}_x() {{}}\n}}\n"
+                ),
+            )
+        };
+        let parts = GeneratedParts {
+            header: "#![allow(warnings)]\n".into(),
+            // m0 -> m1 <-> m2 -> m3
+            modules: vec![
+                module("m0", &["m1"]),
+                module("m1", &["m2"]),
+                module("m2", &["m1", "m3"]),
+                module("m3", &[]),
+            ],
+            tail: "pub fn run_entry() {}\n".into(),
+        };
+        let split = split_parts(parts, 1);
+        let segment_of = |namespace: &str| {
+            split
+                .segments
+                .iter()
+                .position(|segment| segment.modules.iter().any(|m| m == namespace))
+                .unwrap()
+        };
+        assert_eq!(
+            segment_of("m1"),
+            segment_of("m2"),
+            "a cycle is never divided"
+        );
+        assert!(segment_of("m3") < segment_of("m2"));
+        assert!(segment_of("m2") < segment_of("m0"));
+        for segment in &split.segments {
+            for dep in &segment.deps {
+                let index: usize = dep.trim_start_matches("w3cos_seg_").parse().unwrap();
+                assert!(index < segment_of(&segment.modules[0]));
+            }
+            assert!(segment.code.contains("\npub mod "));
+        }
+        let m0 = &split.segments[segment_of("m0")];
+        assert!(
+            m0.code
+                .contains(&format!("use w3cos_seg_{}::m1;", segment_of("m1")))
+        );
+        assert!(
+            split
+                .root
+                .contains(&format!("pub use w3cos_seg_{}::m3;", segment_of("m3")))
+        );
+        assert!(split.root.ends_with("pub fn run_entry() {}\n"));
+    }
+
     use super::*;
     use crate::esm_resolver::EsmResolver;
     use std::path::PathBuf;
@@ -3842,12 +4251,12 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
             ),
             (
                 "instance_field",
-                "export class Broken { value = String.raw`unsupported`; }",
+                "export class Broken { value = new.target; }",
                 "class initialization lowering did not produce W3IR",
             ),
             (
                 "static_block",
-                "export class Broken { static { String.raw`unsupported`; } }",
+                "export class Broken { static { new.target; } }",
                 "class initialization lowering did not produce W3IR",
             ),
         ];
@@ -4640,6 +5049,36 @@ fn main() {{
     }
 
     #[test]
+    fn reexported_namespace_import_registers_through_namespace_accessor() {
+        let root = fixture_root("w3cos_esm_codegen_reexported_namespace_import");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let entry = root.join("src/app.js");
+        std::fs::write(
+            root.join("src/icons.js"),
+            "export const a = 1;\nexport const b = 2;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &entry,
+            "import * as icons from \"./icons.js\";\nexport const n = icons.a;\nexport { icons };\n",
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        let code = generate_with_bodies(&bundle);
+        let line = code
+            .lines()
+            .find(|line| line.contains("exports.insert(\"icons\""))
+            .unwrap_or_else(|| panic!("icons export registration: {code}"));
+        assert!(
+            line.contains("_ns_icons()"),
+            "namespace accessor getter: {line}"
+        );
+        assert!(!line.contains(" icons_get()"), "dangling icons_get: {line}");
+    }
+
+    #[test]
     fn generated_esm_registers_live_exports_in_the_shared_module_abi() {
         let root = fixture_root("w3cos_esm_codegen_shared_module_registry");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -5148,7 +5587,7 @@ export function makePoint(v: number) {
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("w3cos_core::Value::local_object("),
+            code.contains("w3cos_core::Value::local_object_literal("),
             "non-escaping literal should be a refcounted local:\n{code}"
         );
 
@@ -5503,7 +5942,8 @@ export function makeCycles(n: number): number {
         let bundle = EsmBundle::build(&parsed, &resolver, &root.join("src/app.ts"));
         let code = generate_with_bodies(&bundle);
         assert!(
-            code.contains("w3cos_core::weak::weak_capture_getter"),
+            code.contains("w3cos_core::weak::weak_capture_getter")
+                || code.contains("w3cos_core::aot_frame::nest_capture_weak("),
             "holder.run is a unique back-edge:\n{code}"
         );
 
@@ -5524,6 +5964,9 @@ export function makeCycles(n: number): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     let base = live();
     for _ in 0..5 {
@@ -5699,6 +6142,9 @@ export function clearStash(): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     let base = live();
     let n = |v: Value| v.to_number();
@@ -5827,6 +6273,9 @@ export function pipeline(n: number): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     macro_rules! steady {
         ($name:expr, $f:expr, $arg:expr, $expect:expr) => {{
@@ -6102,6 +6551,9 @@ export function getAsync(): number {
 fn main() {
     use w3cos_core::{page_arena, Value};
     let _ = run_entry();
+    // `Object` / `Object.prototype` are page-lifetime intrinsics, built on
+    // the first object literal; count only what the work allocates.
+    let _ = w3cos_core::object_value();
     let live = || page_arena::live_objects() + page_arena::live_arrays() + page_arena::live_functions();
     let n = |v: Value| v.to_number();
     let check = || {
@@ -10237,7 +10689,7 @@ fn main() {{
         let root = fixture_root("w3cos_esm_codegen_module_init_failure");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let entry = root.join("src/app.js");
-        std::fs::write(&entry, "export const result = String.raw`not-yet-lowered`;").unwrap();
+        std::fs::write(&entry, "export const result = new.target;").unwrap();
 
         let resolver = EsmResolver::new(&root);
         let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
@@ -10255,7 +10707,7 @@ fn main() {{
             diagnostic.contains("W3IR module initialization failed")
                 && diagnostic.contains(&entry.display().to_string())
                 && diagnostic.contains("chunk 0..1")
-                && diagnostic.contains("TaggedTpl"),
+                && diagnostic.contains("new.target"),
             "the error must identify the module, W3IR phase, chunk and unsupported syntax: {diagnostic}"
         );
         std::fs::remove_dir_all(root).ok();
@@ -10287,7 +10739,8 @@ export function main() { return total; }"#,
         assert!(
             code.contains("__init_w3ir_0(")
                 && !code.contains("__init_w3ir_1(")
-                && code.contains("capture_getters.get")
+                && (code.contains("capture_getters.get")
+                    || code.contains("aot_frame::load(&self.capture_getters"))
                 && !code.contains("W3IR module-init chunk"),
             "module-init closure must compile through W3IR: {code}"
         );
@@ -10422,14 +10875,14 @@ export function main() {
         );
         let code = generate_with_bodies(&bundle);
         assert_eq!(
-            code.matches("struct M0InitW3ir0Frame").count(),
+            code.matches("struct M0U2InitW3ir0Frame").count(),
             1,
             "the first bounded segment should produce one W3IR AOT frame"
         );
         assert!(
-            code.matches("struct M0InitW3ir32Frame").count() == 1
-                && code.matches("struct M0InitW3ir64Frame").count() == 1
-                && !code.contains("struct M0InitW3ir65Frame")
+            code.matches("struct M0U2InitW3ir32Frame").count() == 1
+                && code.matches("struct M0U2InitW3ir64Frame").count() == 1
+                && !code.contains("struct M0U2InitW3ir65Frame")
                 && code.matches("m0__init_w3ir_0(").count() == 2
                 && code.matches("m0__init_w3ir_32(").count() == 2
                 && code.matches("m0__init_w3ir_64(").count() == 2

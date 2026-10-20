@@ -1562,6 +1562,9 @@ pub struct FunctionData {
     /// Own string-keyed data properties. Ordinary functions keep ≤4 inline
     /// (prototype, and often length/name) without a HashMap spill.
     props: RefCell<PropertyMap>,
+    /// `Object.defineProperty(fn, key, { get, set })` accessors (rare: boxed
+    /// so ordinary functions pay one pointer).
+    accessors: RefCell<Option<Box<HashMap<String, (Value, Value)>>>>,
     allocation: HeapAllocation,
 }
 
@@ -1635,7 +1638,7 @@ impl FunctionData {
         // compiler uses these Values for function declarations/constructors;
         // Libraries install methods on constructor prototypes before
         // constructing instances.
-        props.insert(JsString::intern("prototype"), Value::object(HashMap::new()));
+        props.insert(JsString::intern("prototype"), Value::function_prototype());
         let allocation = HeapAllocation::new(
             HeapKind::Function,
             function_heap_bytes(&props, captures_ref),
@@ -1643,8 +1646,43 @@ impl FunctionData {
         Self {
             body,
             props: RefCell::new(props),
+            accessors: RefCell::new(None),
             allocation,
         }
+    }
+
+    /// The `(getter, setter)` pair of an accessor property (each may be
+    /// `Undefined`).
+    pub fn accessor(&self, key: &str) -> Option<(Value, Value)> {
+        self.accessors
+            .borrow()
+            .as_ref()
+            .and_then(|accessors| accessors.get(key).cloned())
+    }
+
+    /// Install (or update one side of) an accessor property, replacing a
+    /// data property of the same name.
+    pub fn define_accessor(&self, key: &str, getter: Option<Value>, setter: Option<Value>) {
+        self.delete_property(key);
+        let mut accessors = self.accessors.borrow_mut();
+        let accessors = accessors.get_or_insert_with(Default::default);
+        let entry = accessors
+            .entry(key.to_string())
+            .or_insert((Value::Undefined, Value::Undefined));
+        if let Some(getter) = getter {
+            entry.0 = getter;
+        }
+        if let Some(setter) = setter {
+            entry.1 = setter;
+        }
+    }
+
+    /// Drop an accessor property (a data definition replaces it).
+    pub fn remove_accessor(&self, key: &str) -> bool {
+        self.accessors
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|accessors| accessors.remove(key).is_some())
     }
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
@@ -1691,8 +1729,24 @@ impl FunctionData {
 
     pub fn has_own_property(&self, key: &str) -> bool {
         self.props.borrow().contains_key(key)
+            || self.accessor(key).is_some()
             || (matches!(key, "name" | "length")
                 && matches!(&self.body, FunctionBody::Aot { factory, .. } if aot_function_meta(*factory).is_some()))
+    }
+
+    /// Ordinary `function` (not arrow / method / host): `super(...)` from a
+    /// derived class runs its body on the instance.
+    pub(crate) fn is_ordinary_constructor(&self) -> bool {
+        match &self.body {
+            FunctionBody::Aot { factory, .. } => {
+                aot_function_meta(*factory).is_some_and(|(_, _, constructor)| constructor)
+            }
+            _ => self
+                .props
+                .borrow()
+                .get(crate::class::FUNCTION_CONSTRUCTOR_MARKER)
+                .is_some_and(Value::to_bool),
+        }
     }
 
     pub fn keys(&self) -> Vec<String> {
@@ -1700,7 +1754,12 @@ impl FunctionData {
         self.props
             .borrow()
             .keys()
-            .filter(|key| !matches!(key.as_str(), "name" | "length"))
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "name" | "length" | crate::class::FUNCTION_CONSTRUCTOR_MARKER
+                )
+            })
             .map(|key| key.as_str().to_string())
             .collect()
     }
@@ -1858,6 +1917,18 @@ impl JsFunction {
 
     pub fn has_own_property(&self, key: &str) -> bool {
         self.data().has_own_property(key)
+    }
+
+    pub fn accessor(&self, key: &str) -> Option<(Value, Value)> {
+        self.data().accessor(key)
+    }
+
+    pub fn define_accessor(&self, key: &str, getter: Option<Value>, setter: Option<Value>) {
+        self.data().define_accessor(key, getter, setter)
+    }
+
+    pub fn remove_accessor(&self, key: &str) -> bool {
+        self.data().remove_accessor(key)
     }
 
     /// Own property names installed on this function object.
@@ -2159,6 +2230,15 @@ impl Value {
             }
             ValueUnpack::String(s) => s.as_str().to_string(),
             ValueUnpack::Array(arr) => {
+                // A typed array with an installed prototype (Buffer) uses
+                // that prototype's toString.
+                if let Some(to_string) =
+                    crate::binary::typed_array_prototype_property(self, "toString")
+                    && to_string.is_callable()
+                    && let Some(value) = to_string.call(self.clone(), vec![]).as_js_string()
+                {
+                    return value.as_str().to_string();
+                }
                 let elems: Vec<String> = arr
                     .borrow()
                     .iter()
@@ -2329,14 +2409,17 @@ impl Value {
             return if !value.is_undefined() || !o.borrow().may_have_getter_properties() {
                 value
             } else {
-                let getter = o
-                    .borrow()
-                    .get(&format!("__w3cos_getter_{key}"), receiver)
-                    .clone();
-                getter.call(receiver.clone(), vec![])
+                let getter = o.borrow().chain_getter(key);
+                match getter {
+                    Some(getter) if getter.is_callable() => getter.call(receiver.clone(), vec![]),
+                    _ => Value::Undefined,
+                }
             };
         }
         if let Some(arr) = self.as_array() {
+            if let Some(value) = crate::binary::typed_array_prototype_property(self, key) {
+                return value;
+            }
             if let Some(value) = crate::binary::typed_array_property(self, key) {
                 return value;
             }
@@ -2369,14 +2452,37 @@ impl Value {
                     Value::Undefined
                 }
             }
+            _ if self.as_number().is_some() || self.as_bool().is_some() => {
+                let methods: &[&'static str] = if self.as_bool().is_some() {
+                    &["toString", "toLocaleString", "valueOf"]
+                } else {
+                    crate::number_proto::NUMBER_METHODS
+                };
+                methods
+                    .iter()
+                    .find(|name| **name == key)
+                    .map(|name| crate::number_proto::primitive_method_value(name))
+                    .unwrap_or_else(|| {
+                        crate::object_value()
+                            .get_property("prototype")
+                            .get_property(key)
+                    })
+            }
             // JS functions are objects: read attached properties.
             _ if self.as_function().is_some() => {
                 let function = self.as_function().expect("function");
                 if key == "prototype" && function.data().wants_lazy_prototype() {
-                    let prototype = Value::object(HashMap::new());
+                    let prototype = Value::function_prototype();
                     crate::builtins::define_builtin(&prototype, "constructor", self.clone());
                     function.set_property("prototype", prototype.clone());
                     return prototype;
+                }
+                if let Some((getter, _)) = function.accessor(key) {
+                    return if getter.is_callable() {
+                        getter.call(self.clone(), Vec::new())
+                    } else {
+                        Value::Undefined
+                    };
                 }
                 function.get_property(key)
             }
@@ -2523,9 +2629,14 @@ impl Value {
             // JS functions are objects: properties attach to the function
             // value (decorator ids, constructor statics).
             _ if self.as_function().is_some() => {
-                self.as_function()
-                    .expect("function")
-                    .set_property(key, value);
+                let function = self.as_function().expect("function");
+                if let Some((_, setter)) = function.accessor(key) {
+                    if setter.is_callable() {
+                        setter.call(self.clone(), vec![value]);
+                    }
+                    return true;
+                }
+                function.set_property(key, value);
                 true
             }
             _ => false,
@@ -2796,6 +2907,39 @@ impl Value {
         Self::arena_object(crate::JsObject::from_map(props))
     }
 
+    /// An object literal / `new Object()`: like [`Self::object`], with
+    /// `Object.prototype` as its prototype (`{} instanceof Object`,
+    /// `({}).hasOwnProperty`, `({}).constructor === Object`).
+    pub fn object_literal(props: HashMap<String, Value>) -> Self {
+        let mut object = crate::JsObject::from_map(props);
+        object.prototype = crate::builtins::object_prototype_ref();
+        Self::arena_object(object)
+    }
+
+    /// Arena object whose prototype is `prototype` (when it is an object),
+    /// set at creation: unlike `Object.setPrototypeOf` this does not
+    /// invalidate inline caches.
+    pub fn object_with_prototype(prototype: &Value, props: HashMap<String, Value>) -> Self {
+        let mut object = crate::JsObject::from_map(props);
+        object.prototype = prototype.as_object();
+        Self::arena_object(object)
+    }
+
+    /// A fresh function's `prototype` object: inherits `Object.prototype`
+    /// once the page's `Object` exists (see `object_prototype_ref_if_built`).
+    pub(crate) fn function_prototype() -> Self {
+        let mut object = crate::JsObject::from_map(HashMap::new());
+        object.prototype = crate::builtins::object_prototype_ref_if_built();
+        Self::arena_object(object)
+    }
+
+    /// Non-escaping object literal; see [`Self::local_object`].
+    pub fn local_object_literal(props: HashMap<String, Value>) -> Self {
+        let mut object = crate::JsObject::from_map(props);
+        object.prototype = crate::builtins::object_prototype_ref();
+        Value::Object(Rc::new(RefCell::new(object)))
+    }
+
     /// Arena object with a shared proxy. Own properties are written directly
     /// so the trap can read them without re-entering.
     pub fn proxied_object(entries: &[(&str, Value)], handler: crate::proxy::ProxyHandler) -> Self {
@@ -2867,6 +3011,13 @@ impl Value {
         Self::arena_function(FunctionData::from_aot(factory, captures))
     }
 
+    /// True for an ordinary JS `function` value (see
+    /// `FunctionData::is_ordinary_constructor`).
+    pub(crate) fn is_ordinary_constructor_function(&self) -> bool {
+        self.as_function()
+            .is_some_and(|function| function.data().is_ordinary_constructor())
+    }
+
     /// Intern a captured numeric increment. Calling it adds `addend` to `cell`.
     pub fn number_bump(cell: Rc<Cell<Option<f64>>>, addend: f64) -> Self {
         Self::arena_function(FunctionData::from_bump(cell, addend))
@@ -2928,6 +3079,14 @@ impl Value {
     pub fn call_method(&self, key: &str, args: Vec<Value>) -> Value {
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
+        }
+        if key == "__w3cos_symbol_to_primitive" && self.type_of() == "symbol" {
+            // Symbols are string sentinels: `sym[Symbol.toPrimitive]()` (and
+            // on `Object(sym)`) resolves through Symbol.prototype.
+            return crate::builtins::symbol_value()
+                .get_property("prototype")
+                .get_property(key)
+                .call(self.clone(), args);
         }
         if key == "__w3cos_symbol_iterator" {
             if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", args) {
@@ -3078,6 +3237,11 @@ impl Value {
                     .has_own_property(&property),
                 _ => false,
             });
+        }
+        if let Some(method) = crate::binary::typed_array_prototype_property(self, key)
+            && method.is_callable()
+        {
+            return method.call(self.clone(), args);
         }
         if crate::binary::is_typed_array(self)
             && let Some(result) = crate::binary::typed_array_call_method(self, key, args.clone())
@@ -3382,6 +3546,15 @@ impl Value {
                 if let Some(result) = crate::regexp::string_match(&value, &pattern) {
                     return result;
                 }
+                // `str.match("\\w+")`: a non-RegExp argument is compiled as a
+                // pattern (undefined matches the empty string).
+                let source = if pattern.is_undefined() {
+                    "(?:)".to_string()
+                } else {
+                    pattern.to_js_string()
+                };
+                let compiled = crate::regexp::create(&source, "");
+                return crate::regexp::string_match(&value, &compiled).unwrap_or(Value::Null);
             }
             (this, "matchAll") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -3399,12 +3572,15 @@ impl Value {
                 if let Some(result) = crate::regexp::string_search(&value, &pattern) {
                     return result;
                 }
-                return Value::Number(
-                    value
-                        .find(&pattern.to_js_string())
-                        .map(|byte| value[..byte].encode_utf16().count() as f64)
-                        .unwrap_or(-1.0),
-                );
+                // Like `match`, a non-RegExp argument is a pattern source.
+                let source = if pattern.is_undefined() {
+                    "(?:)".to_string()
+                } else {
+                    pattern.to_js_string()
+                };
+                let compiled = crate::regexp::create(&source, "");
+                return crate::regexp::string_search(&value, &compiled)
+                    .unwrap_or(Value::Number(-1.0));
             }
             (this, "replace") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
@@ -3442,21 +3618,24 @@ impl Value {
             _ if self.as_array().is_some() && key == "filter" => {
                 let values = self.as_array().expect("array");
                 let predicate = args.first().cloned().unwrap_or(Value::Undefined);
-                let filtered = values
-                    .borrow()
-                    .iter()
+                let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                // Snapshot so a callback may mutate the array without a
+                // RefCell re-borrow panic.
+                let snapshot: Vec<Value> = values.borrow().iter().cloned().collect();
+                let filtered = snapshot
+                    .into_iter()
                     .enumerate()
                     .filter_map(|(index, value)| {
-                        if is_array_hole(value) {
+                        if is_array_hole(&value) {
                             return None;
                         }
                         predicate
                             .call(
-                                Value::Undefined,
-                                vec![value.clone(), Value::Number(index as f64)],
+                                this_arg.clone(),
+                                vec![value.clone(), Value::Number(index as f64), self.clone()],
                             )
                             .to_bool()
-                            .then(|| value.clone())
+                            .then_some(value)
                     })
                     .collect();
                 return Value::array(filtered);
@@ -3493,18 +3672,29 @@ impl Value {
             _ if self.as_array().is_some() && key == "forEach" => {
                 let values = self.as_array().expect("array");
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
-                for (index, value) in values.borrow().iter().cloned().enumerate() {
+                let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let snapshot: Vec<Value> = values.borrow().iter().cloned().collect();
+                for (index, value) in snapshot.into_iter().enumerate() {
                     if is_array_hole(&value) {
                         continue;
                     }
                     callback.call(
-                        Value::Undefined,
+                        this_arg.clone(),
                         vec![value, Value::Number(index as f64), self.clone()],
                     );
                 }
                 return Value::Undefined;
             }
             _ => {}
+        }
+        if let Some(number) = self.as_number() {
+            if let Some(result) = crate::number_proto::number_method(number, key, &args) {
+                return result;
+            }
+        } else if let Some(flag) = self.as_bool() {
+            if let Some(result) = crate::number_proto::boolean_method(flag, key) {
+                return result;
+            }
         }
         self.get_property(key).call(self.clone(), args)
     }
@@ -3829,6 +4019,11 @@ fn array_call_method(
     let callback_args = |value: &Value, index: usize| {
         vec![value.clone(), Value::Number(index as f64), this.clone()]
     };
+    // Callback `thisArg` (`arr.forEach(this.fn, this)`) and a snapshot of the
+    // elements, so a callback that mutates the array cannot hit a RefCell
+    // re-borrow panic.
+    let this_arg = || arg(1);
+    let snapshot = || values.borrow().iter().cloned().collect::<Vec<Value>>();
     Some(match key {
         "filter" | "push" | "forEach" | "set" => return None, // handled by dedicated arms
         "pop" => values
@@ -3873,15 +4068,15 @@ fn array_call_method(
         }
         "map" => {
             let f = arg(0);
-            let mapped = values
-                .borrow()
+            let receiver = this_arg();
+            let mapped = snapshot()
                 .iter()
                 .enumerate()
                 .map(|(index, value)| {
                     if is_array_hole(value) {
                         array_hole()
                     } else {
-                        f.call(Value::Undefined, callback_args(value, index))
+                        f.call(receiver.clone(), callback_args(value, index))
                     }
                 })
                 .collect();
@@ -3889,13 +4084,13 @@ fn array_call_method(
         }
         "find" => {
             let f = arg(0);
-            values
-                .borrow()
+            let receiver = this_arg();
+            snapshot()
                 .iter()
                 .enumerate()
                 .find(|(index, value)| {
                     let value = array_slot_value((*value).clone());
-                    f.call(Value::Undefined, callback_args(&value, *index))
+                    f.call(receiver.clone(), callback_args(&value, *index))
                         .to_bool()
                 })
                 .map(|(_, value)| array_slot_value(value.clone()))
@@ -3903,13 +4098,13 @@ fn array_call_method(
         }
         "findIndex" => {
             let f = arg(0);
-            let index = values
-                .borrow()
+            let receiver = this_arg();
+            let index = snapshot()
                 .iter()
                 .enumerate()
                 .find(|(index, value)| {
                     let value = array_slot_value((*value).clone());
-                    f.call(Value::Undefined, callback_args(&value, *index))
+                    f.call(receiver.clone(), callback_args(&value, *index))
                         .to_bool()
                 })
                 .map(|(index, _)| index as f64)
@@ -3918,26 +4113,26 @@ fn array_call_method(
         }
         "some" => {
             let f = arg(0);
-            let hit = values
-                .borrow()
+            let receiver = this_arg();
+            let hit = snapshot()
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !is_array_hole(value))
                 .any(|(index, value)| {
-                    f.call(Value::Undefined, callback_args(value, index))
+                    f.call(receiver.clone(), callback_args(value, index))
                         .to_bool()
                 });
             Value::Bool(hit)
         }
         "every" => {
             let f = arg(0);
-            let all = values
-                .borrow()
+            let receiver = this_arg();
+            let all = snapshot()
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !is_array_hole(value))
                 .all(|(index, value)| {
-                    f.call(Value::Undefined, callback_args(value, index))
+                    f.call(receiver.clone(), callback_args(value, index))
                         .to_bool()
                 });
             Value::Bool(all)
@@ -4126,12 +4321,13 @@ fn array_call_method(
         }
         "flatMap" => {
             let f = arg(0);
+            let receiver = this_arg();
             let mut out = Vec::new();
-            for (index, value) in values.borrow().iter().enumerate() {
+            for (index, value) in snapshot().iter().enumerate() {
                 if is_array_hole(value) {
                     continue;
                 }
-                let mapped = f.call(Value::Undefined, callback_args(value, index));
+                let mapped = f.call(receiver.clone(), callback_args(value, index));
                 if let Some(inner) = mapped.as_array() {
                     out.extend(inner.borrow().iter().cloned());
                 } else {
@@ -4214,7 +4410,7 @@ macro_rules! js_object {
     ($($key:expr => $value:expr),* $(,)?) => {{
         let mut properties = ::std::collections::HashMap::new();
         $(properties.insert(($key).to_string(), $crate::Value::from($value));)*
-        $crate::Value::object(properties)
+        $crate::Value::object_literal(properties)
     }};
 }
 
@@ -4730,6 +4926,56 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_callbacks_honor_this_arg_and_tolerate_mutation() {
+        let receiver = Value::object(HashMap::new());
+        receiver.set_property("k", Value::Number(2.0));
+        let array = Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+            Value::Number(3.0),
+        ]);
+        let times_k = Value::function(|this, args| {
+            Value::Number(args[0].to_number() * this.get_property("k").to_number())
+        });
+        let above_k = Value::function(|this, args| {
+            Value::Bool(args[0].to_number() > this.get_property("k").to_number())
+        });
+        let mapped = array.call_method("map", vec![times_k, receiver.clone()]);
+        assert_eq!(mapped.call_method("join", vec![]).to_js_string(), "2,4,6");
+        let filtered = array.call_method("filter", vec![above_k.clone(), receiver.clone()]);
+        assert_eq!(filtered.call_method("join", vec![]).to_js_string(), "3");
+        assert!(
+            array
+                .call_method("some", vec![above_k.clone(), receiver.clone()])
+                .to_bool()
+        );
+        assert_eq!(
+            array
+                .call_method("find", vec![above_k.clone(), receiver.clone()])
+                .to_number(),
+            3.0
+        );
+        assert_eq!(
+            array
+                .call_method("findIndex", vec![above_k, receiver.clone()])
+                .to_number(),
+            2.0
+        );
+        // forEach with a receiver that pushes onto the iterated array.
+        let target = array.clone();
+        let seen = Rc::new(std::cell::Cell::new(0.0));
+        let sum = seen.clone();
+        let push_and_sum = Value::function(move |this, args| {
+            sum.set(sum.get() + args[0].to_number() * this.get_property("k").to_number());
+            target.call_method("push", vec![Value::Number(0.0)]);
+            Value::Undefined
+        });
+        array.call_method("forEach", vec![push_and_sum, receiver]);
+        assert_eq!(seen.get(), 12.0);
+        assert_eq!(array.get_property("length").to_number(), 6.0);
+    }
 
     #[test]
     fn explicit_receiver_lookup_preserves_undefined_and_proxy_exception() {

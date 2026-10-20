@@ -233,22 +233,59 @@ impl ParsedModuleGraph {
                 return self.resolve_export_from(&target_path, orig_name, resolver, visited);
             }
 
+            // `import { X } from "./a.js"; export { X };` — the local name is
+            // an import binding whose live cell lives in `./a.js`, not here.
+            // Namespace imports (`import * as ns` / `export * as ns`) stay local:
+            // their cell is the module's synthetic namespace object, not an
+            // export named `*` on the target.
+            let local_name = export
+                .local
+                .clone()
+                .unwrap_or_else(|| export_name.to_string());
+            if let Some(binding) = module_info
+                .imports
+                .iter()
+                .find(|imp| imp.local == local_name && imp.imported != "*")
+            {
+                let from_dir = module_path.parent().unwrap_or_else(|| Path::new("."));
+                match resolver.resolve(&binding.source, from_dir) {
+                    Ok(resolved) => {
+                        return self.resolve_export_from(
+                            &resolved.path,
+                            &binding.imported,
+                            resolver,
+                            visited,
+                        );
+                    }
+                    Err(error) => {
+                        return SymbolResolution::Unresolved {
+                            name: export_name.to_string(),
+                            reason: format!(
+                                "export `{}` re-exports import from `{}`: {error}",
+                                local_name, binding.source
+                            ),
+                        };
+                    }
+                }
+            }
+
             return SymbolResolution::Resolved(ResolvedSymbol {
                 defining_module: module_path.to_path_buf(),
-                local_name: export
-                    .local
-                    .clone()
-                    .unwrap_or_else(|| export_name.to_string()),
+                local_name,
                 exported_name: export_name.to_string(),
-                kind: if module_info
-                    .top_level_classes
-                    .contains(&export.local.clone().unwrap_or_default())
-                {
+                kind: if module_info.top_level_classes.contains(
+                    &export
+                        .local
+                        .clone()
+                        .unwrap_or_else(|| export_name.to_string()),
+                ) {
                     SymbolKind::Class
-                } else if module_info
-                    .top_level_functions
-                    .contains(&export.local.clone().unwrap_or_default())
-                {
+                } else if module_info.top_level_functions.contains(
+                    &export
+                        .local
+                        .clone()
+                        .unwrap_or_else(|| export_name.to_string()),
+                ) {
                     SymbolKind::Function
                 } else {
                     SymbolKind::Variable
@@ -434,17 +471,63 @@ pub struct EsmBundle {
     pub symbols: Vec<BundledSymbol>,
     /// Imports that could not be bound to a definition.
     pub unresolved: Vec<String>,
+    /// Index of the first module that is only reachable through literal
+    /// `import()` calls (`None`: every module is evaluated at startup).
+    /// Modules from this index on are evaluated when first imported.
+    pub lazy_start: Option<usize>,
+    /// Literal `import()` edges, with the lazy modules each one evaluates.
+    pub dynamic_imports: Vec<BundledDynamicImport>,
+}
+
+/// A literal `import("specifier")` linked into the bundle.
+#[derive(Debug, Clone, Default)]
+pub struct BundledDynamicImport {
+    pub referrer: PathBuf,
+    pub specifier: String,
+    /// Bundle index of the imported module.
+    pub target: usize,
+    /// Lazy modules in the target's static closure, dependencies first
+    /// (bundle indices); evaluating the import runs their initializers.
+    pub evaluation_order: Vec<usize>,
 }
 
 impl EsmBundle {
     /// Flatten a parsed graph into a single bundle with collision-free names.
     pub fn build(parsed: &ParsedModuleGraph, resolver: &EsmResolver, entry: &Path) -> Self {
-        let order = topo_order(parsed, resolver, entry);
+        let (order, lazy_start) = topo_order(parsed, resolver, entry);
 
         let mut bundle = EsmBundle {
             entry: entry.to_path_buf(),
+            lazy_start,
             ..Default::default()
         };
+        if lazy_start.is_some() {
+            let index_of: HashMap<&Path, usize> = order
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
+            let lazy_from = lazy_start.unwrap_or(order.len());
+            for edge in resolver.dynamic_imports() {
+                let Some(&target) = index_of.get(edge.target.as_path()) else {
+                    continue;
+                };
+                let mut visited = HashSet::new();
+                let mut closure = Vec::new();
+                visit_module(&edge.target, parsed, resolver, &mut visited, &mut closure);
+                let evaluation_order = closure
+                    .iter()
+                    .filter_map(|path| index_of.get(path.as_path()).copied())
+                    .filter(|&index| index >= lazy_from)
+                    .collect();
+                bundle.dynamic_imports.push(BundledDynamicImport {
+                    referrer: edge.referrer,
+                    specifier: edge.specifier,
+                    target,
+                    evaluation_order,
+                });
+            }
+        }
 
         // Pass 1: assign namespaces and lift each module's own definitions.
         for (index, path) in order.iter().enumerate() {
@@ -646,17 +729,30 @@ fn host_import_path(source: &str, imported: &str) -> Option<&'static str> {
 }
 
 /// Depth-first topological order: each module appears after its dependencies.
-fn topo_order(parsed: &ParsedModuleGraph, resolver: &EsmResolver, entry: &Path) -> Vec<PathBuf> {
+fn topo_order(
+    parsed: &ParsedModuleGraph,
+    resolver: &EsmResolver,
+    entry: &Path,
+) -> (Vec<PathBuf>, Option<usize>) {
     let mut visited: HashSet<PathBuf> = HashSet::new();
     let mut order: Vec<PathBuf> = Vec::new();
     visit_module(entry, parsed, resolver, &mut visited, &mut order);
+    // Modules reachable only through literal `import()` are evaluated lazily;
+    // order each dynamic target's static closure dependencies-first.
+    let mut lazy: Vec<PathBuf> = Vec::new();
+    for edge in resolver.dynamic_imports() {
+        visit_module(&edge.target, parsed, resolver, &mut visited, &mut lazy);
+    }
     // Include any modules not reachable from entry (defensive), preserving graph order.
     for module in &parsed.modules {
-        if !order.contains(&module.path) {
+        if !visited.contains(&module.path) {
+            visited.insert(module.path.clone());
             order.push(module.path.clone());
         }
     }
-    order
+    let lazy_start = (!lazy.is_empty()).then_some(order.len());
+    order.extend(lazy);
+    (order, lazy_start)
 }
 
 fn visit_module(
@@ -708,6 +804,21 @@ pub struct EsmResolver {
     commonjs_requested: RefCell<HashMap<PathBuf, BTreeSet<String>>>,
     /// Literal `require()`s that did not resolve (they throw when called).
     commonjs_diagnostics: RefCell<Vec<String>>,
+    /// ES modules served as `createRequire`-rewritten text: still ES
+    /// modules for facade-name collection.
+    create_require_rewritten: RefCell<HashSet<PathBuf>>,
+    /// Literal `import("...")` edges found while building the graph, in
+    /// discovery order. Their targets are linked as lazily evaluated modules.
+    dynamic_imports: RefCell<Vec<DynamicImportEdge>>,
+    /// Electron renderer-side scripts (preloads, `<script src>` files): classic
+    /// scripts loaded on demand, so marker-free files become CommonJS records
+    /// too (see [`crate::cjs::classify_as`]).
+    classic_scripts: RefCell<HashSet<PathBuf>>,
+    /// The graph entry: its CommonJS record links every worker module (see
+    /// [`crate::cjs::worker_boot_prelude`]).
+    entry: RefCell<Option<PathBuf>>,
+    /// Statically named worker modules found so far, in discovery order.
+    worker_entries: RefCell<Vec<PathBuf>>,
 }
 
 impl EsmResolver {
@@ -720,6 +831,11 @@ impl EsmResolver {
             commonjs: RefCell::new(HashMap::new()),
             commonjs_requested: RefCell::new(HashMap::new()),
             commonjs_diagnostics: RefCell::new(Vec::new()),
+            create_require_rewritten: RefCell::new(HashSet::new()),
+            dynamic_imports: RefCell::new(Vec::new()),
+            entry: RefCell::new(None),
+            worker_entries: RefCell::new(Vec::new()),
+            classic_scripts: RefCell::new(HashSet::new()),
         }
     }
 
@@ -783,12 +899,18 @@ impl EsmResolver {
             } else {
                 from_dir.join(specifier)
             };
-            let path = self.resolve_path_like(&candidate).with_context(|| {
-                format!(
-                    "Could not resolve relative import `{specifier}` from {}",
-                    from_dir.display()
-                )
-            })?;
+            let path = match self.resolve_path_like(&candidate) {
+                Ok(path) => self.prefer_transpiled_out(&path),
+                Err(error) => self
+                    .resolve_src_js_via_out(&candidate)
+                    .ok_or(error)
+                    .with_context(|| {
+                        format!(
+                            "Could not resolve relative import `{specifier}` from {}",
+                            from_dir.display()
+                        )
+                    })?,
+            };
             return Ok(ResolvedModule {
                 specifier: specifier.to_string(),
                 path,
@@ -799,8 +921,20 @@ impl EsmResolver {
         if specifier.starts_with('#') {
             return self.resolve_package_imports(specifier, from_dir, kind);
         }
+        if let Some(module) = w3cos_node::native_replacement(specifier) {
+            let mut resolved = node_builtin_module(module, &self.project_root)?
+                .expect("native replacement glue is a w3cos-node module");
+            resolved.specifier = specifier.to_string();
+            resolved.package_name = Some(specifier.to_string());
+            return Ok(resolved);
+        }
+        if crate::electron_app::is_electron_specifier(specifier) {
+            let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
+            self.classic_scripts.borrow_mut().extend(scripts);
+            return Ok(resolved);
+        }
         if specifier.starts_with("node:") {
-            if let Some(resolved) = node_builtin_module(specifier)? {
+            if let Some(resolved) = node_builtin_module(specifier, &self.project_root)? {
                 return Ok(resolved);
             }
             return Err(anyhow!(
@@ -810,7 +944,7 @@ impl EsmResolver {
         match self.resolve_package(specifier, from_dir, kind) {
             Ok(resolved) => Ok(resolved),
             Err(_) if is_node_builtin(specifier) && w3cos_node::is_available(specifier) => {
-                Ok(node_builtin_module(specifier)?.expect("available builtin"))
+                Ok(node_builtin_module(specifier, &self.project_root)?.expect("available builtin"))
             }
             // A bare builtin name only resolves to the builtin when no
             // package of that name is installed (`events`, `buffer`, ...
@@ -824,6 +958,8 @@ impl EsmResolver {
 
     pub fn build_graph_from_entry(&self, entry: &Path) -> Result<ModuleGraph> {
         let entry = self.resolve_entry(entry)?;
+        *self.entry.borrow_mut() = Some(entry.path.clone());
+        self.dynamic_imports.borrow_mut().clear();
         let mut graph = ModuleGraph::default();
         let mut visited = HashSet::new();
         self.visit_module(entry, &mut visited, &mut graph)?;
@@ -854,8 +990,13 @@ impl EsmResolver {
         if !visited.insert(module.path.clone()) {
             return Ok(());
         }
+        if self.should_skip_graph_path(&module.path) {
+            return Ok(());
+        }
 
-        self.prepare_commonjs(&module.path)?;
+        if !self.prepare_commonjs(&module.path)? {
+            self.prepare_create_require(&module.path)?;
+        }
         let source = module_source::read(&module.path)
             .with_context(|| format!("Could not read ESM module {}", module.path.display()))?;
         let imports = module_source::synthesized_imports(&module.path)
@@ -876,8 +1017,21 @@ impl EsmResolver {
             {
                 continue;
             }
-            let resolved = self.resolve(&import, from_dir)?;
-            if !module_source::is_synthesized(&module.path)
+            let resolved = match self.resolve(&import, from_dir) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: import('{import}') does not resolve: {error:#}",
+                        module.path.display()
+                    ));
+                    continue;
+                }
+            };
+            if (!module_source::is_synthesized(&module.path)
+                || self
+                    .create_require_rewritten
+                    .borrow()
+                    .contains(&module.path))
                 && self.prepare_commonjs(&resolved.path)?
             {
                 // ESM → CommonJS: the facade also exports the names this
@@ -888,11 +1042,22 @@ impl EsmResolver {
                         .map(|parsed| collect_module_info(&module.path, &parsed));
                 }
                 if let Some(info) = &importer_info {
+                    // `import * as fs from "original-fs"`: the facade
+                    // snapshots named exports, so request every `fs.member`
+                    // the importer reads (members assigned dynamically, like
+                    // w3cos-node's `fs[name + 'Sync']`, escape the lexer).
+                    let namespace_members: Vec<String> = info
+                        .imports
+                        .iter()
+                        .filter(|binding| binding.source == import && binding.imported == "*")
+                        .flat_map(|binding| namespace_member_names(&source, &binding.local))
+                        .collect();
                     let imported = info
                         .imports
                         .iter()
                         .filter(|binding| binding.source == import)
-                        .map(|binding| binding.imported.clone());
+                        .map(|binding| binding.imported.clone())
+                        .chain(namespace_members);
                     let reexported = info
                         .exports
                         .iter()
@@ -920,7 +1085,105 @@ impl EsmResolver {
             self.visit_module(resolved, visited, graph)?;
         }
 
+        if !module_source::is_synthesized(&module.path)
+            || self
+                .create_require_rewritten
+                .borrow()
+                .contains(&module.path)
+        {
+            for specifier in collect_dynamic_import_literals(&source) {
+                self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
+            }
+            // Code-OSS workbench: `new URL(\`vs/workbench/....js\`, baseUrl)` then
+            // `import(workbenchUrl)` — seed the URL's JS path as a lazy module.
+            for specifier in collect_new_url_js_literals(&source) {
+                self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Link the target of a literal `import("specifier")` as a lazily
+    /// evaluated module. A target that fails to resolve or link stays out of
+    /// the graph (the import rejects at runtime, as in Node when the file is
+    /// missing) and is reported through [`Self::commonjs_diagnostics`].
+    fn link_dynamic_import(
+        &self,
+        referrer: &Path,
+        specifier: &str,
+        from_dir: &Path,
+        visited: &mut HashSet<PathBuf>,
+        graph: &mut ModuleGraph,
+    ) {
+        if is_asset_import(specifier)
+            || is_host_module(specifier)
+            || self.is_runtime_module(specifier)
+        {
+            return;
+        }
+        let resolved = match self.resolve(specifier, from_dir) {
+            Ok(resolved) => resolved,
+            Err(error) => match self.resolve_out_rooted_url(specifier, referrer) {
+                Some(resolved) => resolved,
+                None => {
+                    self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: import('{specifier}') does not resolve: {error}",
+                        referrer.display()
+                    ));
+                    return;
+                }
+            },
+        };
+        let target = resolved.path.clone();
+        let nodes_before = graph.nodes.len();
+        if let Err(error) = self.visit_module(resolved, visited, graph) {
+            for node in graph.nodes.drain(nodes_before..) {
+                visited.remove(&node.module.path);
+            }
+            self.commonjs_diagnostics.borrow_mut().push(format!(
+                "{}: import('{specifier}') does not link: {error:#}",
+                referrer.display()
+            ));
+            return;
+        }
+        self.dynamic_imports.borrow_mut().push(DynamicImportEdge {
+            referrer: referrer.to_path_buf(),
+            specifier: specifier.to_string(),
+            target,
+        });
+    }
+
+    /// Resolve a path-like specifier (e.g. `vs/workbench/workbench.desktop.main.js`)
+    /// against `<project>/out/` when the referrer lives under that tree. Used for
+    /// Code-OSS `new URL(path, vscode-file://…/out/)` seeds.
+    fn resolve_out_rooted_url(&self, specifier: &str, referrer: &Path) -> Option<ResolvedModule> {
+        if specifier.starts_with('.')
+            || specifier.starts_with('/')
+            || specifier.starts_with("node:")
+            || specifier.contains("://")
+            || !specifier.contains('/')
+        {
+            return None;
+        }
+        let out_root = self.project_root.join("out");
+        if !referrer.starts_with(&out_root) {
+            return None;
+        }
+        let candidate = out_root.join(specifier);
+        let path = self.resolve_path_like(&candidate).ok()?;
+        let path = self.prefer_transpiled_out(&path);
+        Some(ResolvedModule {
+            specifier: specifier.to_string(),
+            path,
+            kind: ModuleKind::Relative,
+            package_name: None,
+        })
+    }
+
+    /// Literal dynamic-import edges of the last built graph.
+    pub fn dynamic_imports(&self) -> Vec<DynamicImportEdge> {
+        self.dynamic_imports.borrow().clone()
     }
 
     /// Classify `path` and, for a CommonJS file, synthesize its module record
@@ -939,7 +1202,12 @@ impl EsmResolver {
         let Ok(source) = std::fs::read_to_string(path) else {
             return Ok(false);
         };
-        let analysis = crate::cjs::classify(path, &source, self.is_in_type_module_scope(path))?;
+        let analysis = crate::cjs::classify_as(
+            path,
+            &source,
+            self.is_in_type_module_scope(path),
+            self.classic_scripts.borrow().contains(path),
+        )?;
         let Some(analysis) = analysis.map(Rc::new) else {
             self.commonjs.borrow_mut().insert(path.to_path_buf(), None);
             module_source::clear(path);
@@ -972,16 +1240,139 @@ impl EsmResolver {
                 )),
             }
         }
+        for specifier in &analysis.worker_entries {
+            match self.resolve_with(specifier, dir, ResolveKind::Require) {
+                Ok(resolved) => {
+                    let known = self.worker_entries.borrow().contains(&resolved.path);
+                    if !known {
+                        // Node runs a worker file as a script: a marker-free
+                        // file is CommonJS too (not an eagerly evaluated ESM
+                        // module of the main program).
+                        self.classic_scripts
+                            .borrow_mut()
+                            .insert(resolved.path.clone());
+                        if self.prepare_commonjs(&resolved.path)? {
+                            self.worker_entries.borrow_mut().push(resolved.path.clone());
+                        } else {
+                            self.commonjs_diagnostics.borrow_mut().push(format!(
+                                "{}: worker module `{specifier}` is an ES module; w3cos runs CommonJS worker files only",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                Err(error) => self.commonjs_diagnostics.borrow_mut().push(format!(
+                    "{}: worker module `{specifier}` is unresolved: {error:#}",
+                    path.display()
+                )),
+            }
+        }
+        let mut prelude = String::new();
+        let is_entry = self.entry.borrow().as_deref() == Some(path);
+        if is_entry && !self.worker_entries.borrow().is_empty() {
+            // The entry's require closure has been classified by now, so
+            // every CommonJS-reachable worker module is known.
+            let workers = self.worker_entries.borrow().clone();
+            if let Ok(boot) =
+                self.resolve_with("node:internal/w3cos_worker", dir, ResolveKind::Require)
+            {
+                targets.push((
+                    "node:internal/w3cos_worker".to_string(),
+                    RequireTarget::CommonJs(boot.path.clone()),
+                ));
+                self.prepare_commonjs(&boot.path)?;
+                for worker in workers.iter().filter(|worker| worker.as_path() != path) {
+                    let target = RequireTarget::CommonJs(worker.clone());
+                    targets.push((
+                        format!(
+                            "{}{}",
+                            crate::cjs::WORKER_TARGET_PREFIX,
+                            worker.to_string_lossy()
+                        ),
+                        target,
+                    ));
+                }
+                prelude = crate::cjs::worker_boot_prelude(path, &workers);
+            }
+        }
         let runtime = crate::cjs::runtime_path(&self.project_root);
         module_source::set_synthesized(
             runtime.clone(),
             crate::cjs::RUNTIME_SOURCE.to_string(),
             Vec::new(),
         );
-        let (record, imports) = crate::cjs::record_source(path, &source, &targets, &runtime);
+        let (record, imports) = crate::cjs::record_source_with_prelude(
+            path,
+            &source,
+            &targets,
+            &runtime,
+            &analysis.implicit_globals,
+            &prelude,
+        );
         module_source::set_synthesized(crate::cjs::record_path(path), record, imports);
         self.write_commonjs_facade(path);
         Ok(true)
+    }
+
+    /// Serve an ES module that requires through `createRequire` as text
+    /// whose literal `require` calls are static imports (see
+    /// [`crate::create_require`]).
+    fn prepare_create_require(&self, path: &Path) -> Result<()> {
+        if crate::cjs::is_virtual(path) || self.create_require_rewritten.borrow().contains(path) {
+            return Ok(());
+        }
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return Ok(());
+        };
+        let calls = crate::create_require::find_calls(path, &source);
+        // Node implicit globals an ES module reads (`Buffer`) become static
+        // imports of their builtin, as CommonJS modules get via the prelude.
+        let implicit_imports = crate::cjs::esm_implicit_global_imports(path, &source);
+        if calls.is_empty() {
+            if !implicit_imports.is_empty() {
+                let text = prepend_after_hashbang(&implicit_imports, &source);
+                let imports = collect_static_imports(&text);
+                module_source::set_synthesized(path.to_path_buf(), text, imports);
+                self.create_require_rewritten
+                    .borrow_mut()
+                    .insert(path.to_path_buf());
+            }
+            return Ok(());
+        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut targets = Vec::with_capacity(calls.len());
+        for call in &calls {
+            use crate::create_require::Target;
+            targets.push(match self.resolve_with(&call.specifier, dir, ResolveKind::Require) {
+                Ok(resolved) => {
+                    if resolved.path.extension().is_some_and(|ext| ext == "json")
+                        || self.prepare_commonjs(&resolved.path)?
+                    {
+                        Target::Default
+                    } else {
+                        Target::Namespace
+                    }
+                }
+                Err(error) => {
+                    self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: require(`{}`) via createRequire is unresolved and throws when called: {error:#}",
+                        path.display(),
+                        call.specifier
+                    ));
+                    Target::Missing
+                }
+            });
+        }
+        let text = prepend_after_hashbang(
+            &implicit_imports,
+            &crate::create_require::rewrite(&source, &calls, &targets),
+        );
+        let imports = collect_static_imports(&text);
+        module_source::set_synthesized(path.to_path_buf(), text, imports);
+        self.create_require_rewritten
+            .borrow_mut()
+            .insert(path.to_path_buf());
+        Ok(())
     }
 
     fn write_commonjs_facade(&self, path: &Path) {
@@ -1254,6 +1645,96 @@ impl EsmResolver {
 
     /// LOAD_AS_FILE then LOAD_AS_DIRECTORY, with the extension set widened to
     /// the TypeScript and ESM sources the compiler accepts.
+    /// Prefer a TypeScript project's `out/` transpile over its `src/` when
+    /// both exist (Code-OSS: `npm run transpile-client` writes `out/vs/...js`
+    /// beside `src/vs/...ts`). Keeps Electron-main graphs out of the editor
+    /// sources that `build/vite` still imports by path.
+    /// `import '../../src/vs/foo.js'` from build tooling: the `.js` file lives
+    /// under `out/`, not `src/`.
+    /// Build/test tooling and TypeScript sources are not part of the Electron
+    /// `out/` runtime graph; following them pulls thousands of dead modules.
+    fn should_skip_graph_path(&self, path: &Path) -> bool {
+        let Some(entry) = self.entry.borrow().clone() else {
+            return false;
+        };
+        if !entry.starts_with(self.project_root.join("out")) {
+            return false;
+        }
+        let rel = match path.strip_prefix(&self.project_root) {
+            Ok(rel) => rel,
+            Err(_) => return false,
+        };
+        let first = rel
+            .components()
+            .next()
+            .and_then(|c| c.as_os_str().to_str())
+            .unwrap_or("");
+        if matches!(
+            first,
+            "build" | "test" | "src" | "extensions" | ".eslintplugin" | "scripts"
+        ) {
+            return true;
+        }
+        // Unit-test trees live under out/vs/**/test/** (and *.test.js). Following
+        // them pulls sinon (~1MB ESM) and OOMs codegen (~13GB).
+        if rel
+            .components()
+            .any(|c| c.as_os_str().to_str() == Some("test"))
+        {
+            return true;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.contains(".test.") {
+                return true;
+            }
+        }
+        // Belt-and-suspenders: known test-only packages under node_modules.
+        let rel_s = rel.to_string_lossy();
+        for pkg in [
+            "node_modules/sinon/",
+            "node_modules/mocha/",
+            "node_modules/nyc/",
+            "node_modules/@vscode/test-electron/",
+            "node_modules/@vscode/test-web/",
+        ] {
+            if rel_s.contains(pkg) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn resolve_src_js_via_out(&self, candidate: &Path) -> Option<PathBuf> {
+        let normalized = normalize_path(candidate);
+        let src_root = self.project_root.join("src");
+        let rel = normalized.strip_prefix(&src_root).ok()?;
+        let mut out = self.project_root.join("out").join(rel);
+        if out
+            .extension()
+            .is_none_or(|ext| ext == "ts" || ext == "tsx")
+        {
+            out.set_extension("js");
+        }
+        out.is_file().then_some(out)
+    }
+
+    fn prefer_transpiled_out(&self, path: &Path) -> PathBuf {
+        let Ok(src_root) = path.strip_prefix(self.project_root.join("src")) else {
+            return path.to_path_buf();
+        };
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        if !matches!(ext, Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts")) {
+            return path.to_path_buf();
+        }
+        let mut out = self.project_root.join("out").join(src_root);
+        out.set_extension("js");
+        if out.is_file() {
+            out
+        } else {
+            path.to_path_buf()
+        }
+    }
+
     fn resolve_path_like(&self, candidate: &Path) -> Result<PathBuf> {
         if let Some(path) = self.resolve_file(candidate) {
             return Ok(path);
@@ -1316,6 +1797,49 @@ impl EsmResolver {
     }
 }
 
+/// Identifiers read as `local.<name>` in `source` (namespace member reads).
+/// Lexical scan: occurrences inside strings or comments only add names the
+/// CommonJS facade then exports as `undefined`, which is harmless.
+fn namespace_member_names(source: &str, local: &str) -> Vec<String> {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let needle = format!("{local}.");
+    let mut names = BTreeSet::new();
+    let mut from = 0;
+    while let Some(offset) = source[from..].find(&needle) {
+        let start = from + offset;
+        from = start + needle.len();
+        let preceded = source[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| is_ident(c) || c == '.');
+        if preceded {
+            continue;
+        }
+        let name: String = source[from..]
+            .chars()
+            .take_while(|c| is_ident(*c))
+            .collect();
+        if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
+            names.insert(name);
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// `prefix` + `source`, keeping a leading `#!` line first.
+fn prepend_after_hashbang(prefix: &str, source: &str) -> String {
+    if prefix.is_empty() {
+        return source.to_string();
+    }
+    if source.starts_with("#!") {
+        let split = source.find('\n').map_or(source.len(), |index| index + 1);
+        let (hashbang, rest) = source.split_at(split);
+        let newline = if hashbang.ends_with('\n') { "" } else { "\n" };
+        return format!("{hashbang}{newline}{prefix}{rest}");
+    }
+    format!("{prefix}{source}")
+}
+
 fn is_host_module(specifier: &str) -> bool {
     matches!(specifier, "w3cos/native")
 }
@@ -1359,6 +1883,183 @@ fn split_package_specifier(specifier: &str) -> Result<(String, Option<String>)> 
         let subpath = parts.next().map(|s| s.to_string());
         Ok((package_name, subpath))
     }
+}
+
+/// A literal `import("specifier")` in `referrer` that resolved to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicImportEdge {
+    pub referrer: PathBuf,
+    pub specifier: String,
+    pub target: PathBuf,
+}
+
+/// String-literal specifiers of `import("...")` calls, in source order and
+/// deduplicated. A light lexer skips comments, strings and template text so
+/// `import(` inside them is ignored; computed specifiers are not collected.
+pub fn collect_dynamic_import_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut found: Vec<String> = Vec::new();
+    let mut index = 0;
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'i' if bytes[index..].starts_with(b"import")
+                && (index == 0 || !(is_ident(bytes[index - 1]) || bytes[index - 1] == b'.'))
+                && !bytes.get(index + 6).copied().is_some_and(is_ident) =>
+            {
+                let mut cursor = index + 6;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                index += 6;
+                if bytes.get(cursor) != Some(&b'(') {
+                    continue;
+                }
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                let Some(&quote @ (b'\'' | b'"')) = bytes.get(cursor) else {
+                    continue;
+                };
+                let start = cursor + 1;
+                let Some(length) = bytes[start..]
+                    .iter()
+                    .position(|&byte| byte == quote || byte == b'\\' || byte == b'\n')
+                else {
+                    continue;
+                };
+                if bytes[start + length] != quote {
+                    continue;
+                }
+                let mut after = start + length + 1;
+                while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+                    after += 1;
+                }
+                if !matches!(bytes.get(after), Some(b')') | Some(b',')) {
+                    continue;
+                }
+                let specifier = source[start..start + length].to_string();
+                if !found.contains(&specifier) {
+                    found.push(specifier);
+                }
+                index = after;
+            }
+            _ => index += 1,
+        }
+    }
+    found
+}
+
+/// Collect JS module paths from `new URL("….js", base)` / `new URL('….js', base)` /
+/// `` new URL(`….js`, base) `` (no `${…}` interpolations). Code-OSS builds the
+/// workbench entry as `new URL(\`vs/workbench/workbench.desktop.main.js\`, baseUrl)`
+/// then `import(workbenchUrl)`; seeding those paths links the renderer graph.
+pub fn collect_new_url_js_literals(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut found: Vec<String> = Vec::new();
+    let mut index = 0;
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'n' if bytes[index..].starts_with(b"new")
+                && (index == 0 || !is_ident(bytes[index - 1]))
+                && !bytes.get(index + 3).copied().is_some_and(is_ident) =>
+            {
+                let mut cursor = index + 3;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if !bytes[cursor..].starts_with(b"URL")
+                    || bytes.get(cursor + 3).copied().is_some_and(is_ident)
+                {
+                    index += 1;
+                    continue;
+                }
+                cursor += 3;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) != Some(&b'(') {
+                    index += 1;
+                    continue;
+                }
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                let Some(&quote @ (b'\'' | b'"' | b'`')) = bytes.get(cursor) else {
+                    index += 1;
+                    continue;
+                };
+                let start = cursor + 1;
+                let end_rel = match bytes[start..].iter().position(|&b| b == quote) {
+                    Some(n) => n,
+                    None => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                let lit = &source[start..start + end_rel];
+                // Skip template interpolations and non-JS assets (css, etc.).
+                if !lit.contains("${")
+                    && (lit.ends_with(".js") || lit.ends_with(".mjs") || lit.ends_with(".cjs"))
+                    && !found.contains(&lit.to_string())
+                {
+                    found.push(lit.to_string());
+                }
+                index = start + end_rel + 1;
+            }
+            _ => index += 1,
+        }
+    }
+    found
 }
 
 pub fn collect_static_imports(source: &str) -> Vec<String> {
@@ -1718,20 +2419,15 @@ fn atom_to_string(atom: &impl std::fmt::Debug) -> String {
 }
 
 /// A `w3cos-node` builtin as an ordinary CommonJS file: the glue is written
-/// once per content hash under the temp dir and linked like package code.
-fn node_builtin_module(specifier: &str) -> Result<Option<ResolvedModule>> {
+/// once per content hash (and project) under the temp dir and linked like
+/// package code.
+fn node_builtin_module(specifier: &str, project_root: &Path) -> Result<Option<ResolvedModule>> {
     let Some(source) = w3cos_node::source(specifier) else {
         return Ok(None);
     };
     let name = w3cos_node::module_name(specifier);
-    let path = node_builtin_dir()?.join(format!("{}.js", name.replace('/', "__")));
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
-        let temp = path.with_extension(format!("js.{}", std::process::id()));
-        std::fs::write(&temp, source)
-            .with_context(|| format!("writing Node builtin `{name}` to {}", temp.display()))?;
-        std::fs::rename(&temp, &path)
-            .with_context(|| format!("installing Node builtin `{name}` at {}", path.display()))?;
-    }
+    let path = node_builtin_dir(project_root)?.join(format!("{}.js", name.replace('/', "__")));
+    install_glue_file(&path, source)?;
     Ok(Some(ResolvedModule {
         specifier: specifier.to_string(),
         path,
@@ -1740,18 +2436,62 @@ fn node_builtin_module(specifier: &str) -> Result<Option<ResolvedModule>> {
     }))
 }
 
-fn node_builtin_dir() -> Result<PathBuf> {
+/// Write `source` at `path` unless it is already there.
+fn install_glue_file(path: &Path, source: &str) -> Result<()> {
+    if std::fs::read_to_string(path).ok().as_deref() != Some(source) {
+        // Unique per writer: parallel resolutions in one process (tests,
+        // threaded builds) must not share a temp file.
+        static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let writer = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = path.with_extension(format!("js.{}.{writer}", std::process::id()));
+        std::fs::write(&temp, source)
+            .with_context(|| format!("writing glue module {}", temp.display()))?;
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("installing glue module {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `electron` / `@w3cos/electron`: the Electron glue from `w3cos-node`, next
+/// to this project's generated `electron_app.js` (pages and renderer-side
+/// scripts, see `electron_app.rs`), which the glue requires.
+fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModule, Vec<PathBuf>)> {
+    let dir = node_builtin_dir(project_root)?;
+    let (source, scripts) = crate::electron_app::app_module(project_root);
+    install_glue_file(&dir.join("electron_app.js"), &source)?;
+    let path = dir.join("electron.js");
+    install_glue_file(&path, w3cos_node::ELECTRON)?;
+    let resolved = ResolvedModule {
+        specifier: specifier.to_string(),
+        path,
+        kind: ModuleKind::Package,
+        package_name: Some("electron".to_string()),
+    };
+    Ok((resolved, scripts))
+}
+
+fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
     // FNV-1a over every builtin, so edits never reuse stale glue.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for (name, source) in w3cos_node::MODULES {
-        for byte in name.bytes().chain(source.bytes()) {
+    let fnv = |bytes: &mut dyn Iterator<Item = u8>| {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
-    }
+        hash
+    };
+    let glue = fnv(&mut w3cos_node::MODULES
+        .iter()
+        .flat_map(|(name, source)| name.bytes().chain(source.bytes()))
+        .chain(w3cos_node::ELECTRON.bytes()));
+    // Per project too: a CommonJS file's synthesized record is keyed by its
+    // path process-wide and names the project's loader, so two projects
+    // compiled in one process must not share builtin paths.
+    let project = fnv(&mut project_root.to_string_lossy().bytes());
     let dir = std::env::temp_dir()
         .join("w3cos-node")
-        .join(format!("{hash:016x}"));
+        .join(format!("{glue:016x}"))
+        .join(format!("{project:016x}"));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating Node builtin dir {}", dir.display()))?;
     Ok(dir)
@@ -1790,6 +2530,15 @@ export function main() { return 42; }"#,
         assert_eq!(bundle.symbols[0].kind, SymbolKind::Function);
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn namespace_member_names_collects_reads_on_the_local() {
+        let source = "import * as fs from 'original-fs';\nconst a = fs.readFileSync(p);\nif (fs.existsSync(d)) x.fs.ignored(); myfs.no(); fs.promises.readFile;";
+        assert_eq!(
+            namespace_member_names(source, "fs"),
+            ["existsSync", "promises", "readFileSync"]
+        );
     }
 
     #[test]
@@ -2760,7 +3509,7 @@ export function main() {{ bump(); return value + plugin.value; }}"#
 
         // Builtins: `node:` always; bare names only when no package exists.
         // w3cos-node provides some; the rest stay a coded resolution error.
-        let fs = resolver.resolve_with("fs", &src, Require).unwrap_err();
+        let fs = resolver.resolve_with("dgram", &src, Require).unwrap_err();
         assert!(format!("{fs:#}").contains("Node builtin"), "{fs:#}");
         let events = resolver.resolve_with("node:events", &src, Require).unwrap();
         assert_eq!(events.package_name.as_deref(), Some("node:events"));
@@ -2774,5 +3523,140 @@ export function main() {{ bump(); return value + plugin.value; }}"#
 
         assert!(!resolver.is_in_type_module_scope(&src.join("main.js")));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn collect_new_url_js_literals_picks_js_paths() {
+        let source = r#"
+const baseUrl = new URL(`${root}/out/`);
+const workbenchUrl = new URL(`vs/workbench/workbench.desktop.main.js`, baseUrl).href;
+const cssUrl = new URL("skin.css", baseUrl).href;
+const other = new URL("./lazy.js", import.meta.url);
+const skip = new URL(`vs/${name}.js`, baseUrl);
+import("./literal.js");
+"#;
+        assert_eq!(
+            collect_new_url_js_literals(source),
+            vec![
+                "vs/workbench/workbench.desktop.main.js".to_string(),
+                "./lazy.js".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_dynamic_import_literals_skips_comments_and_strings() {
+        let source = r#"
+import { x } from "./static.js";
+const a = import("./lazy.js");
+const b = import ( './lazy2.js' );
+const c = import("./lazy.js"); // dedupe
+const s = "import(\"./nope.js\")";
+const t = `import("./nope2.js")`;
+// import("./comment.js")
+/* import("./block.js") */
+foo.import("./method.js");
+importing("./ident.js");
+const d = import(computed);
+"#;
+        assert_eq!(
+            collect_dynamic_import_literals(source),
+            vec!["./lazy.js".to_string(), "./lazy2.js".to_string(),]
+        );
+    }
+
+    #[test]
+    fn literal_dynamic_import_is_lazy_in_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-dyn-import-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            root.join("entry.js"),
+            "export async function main() { return import('./lazy.js'); }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lazy.js"),
+            "export const value = 42;
+",
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("entry.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("entry.js"));
+        assert_eq!(bundle.modules.len(), 2);
+        assert_eq!(bundle.lazy_start, Some(1));
+        assert_eq!(bundle.dynamic_imports.len(), 1);
+        assert_eq!(bundle.dynamic_imports[0].specifier, "./lazy.js");
+        assert_eq!(bundle.dynamic_imports[0].evaluation_order, vec![1]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn export_imported_name_resolves_to_defining_module() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-reexport-import-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("facade")).unwrap();
+        std::fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+        std::fs::write(
+            root.join("lifecycle.js"),
+            "export class DisposableStore { constructor() { this.n = 1; } }
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("facade/deps.js"),
+            "import { DisposableStore } from '../lifecycle.js';
+export { DisposableStore };
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("entry.js"),
+            "import { DisposableStore } from './facade/deps.js';
+export function main() { return new DisposableStore().n; }
+",
+        )
+        .unwrap();
+        let resolver = EsmResolver::new(&root);
+        let parsed = resolver
+            .parse_graph_from_entry(&root.join("entry.js"))
+            .unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &root.join("entry.js"));
+        assert!(
+            bundle.unresolved.is_empty(),
+            "unresolved: {:#?}",
+            bundle.unresolved
+        );
+        let entry = bundle
+            .modules
+            .iter()
+            .find(|m| m.path.ends_with("entry.js"))
+            .unwrap();
+        assert!(
+            entry
+                .local_to_bundled
+                .iter()
+                .any(|(local, _)| local == "DisposableStore"),
+            "entry bindings: {:#?}",
+            entry.local_to_bundled
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

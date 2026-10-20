@@ -651,11 +651,67 @@ fn utf8_incomplete_suffix_len(bytes: &[u8]) -> usize {
     (available < expected).then_some(available).unwrap_or(0)
 }
 
+thread_local! {
+    static DATE_CLASS: std::cell::RefCell<Option<(u32, Value)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Compact `Date` constructor used by the native JavaScript runtime. Date
 /// instances keep their epoch milliseconds in a non-standard internal slot;
 /// Web APIs such as IndexedDB recognize the slot while applications interact
 /// through standard Date methods.
+///
+/// The realm's `Date` constructor: one per page, so `Date` keeps its
+/// identity and `new Date() instanceof Date` / `.constructor === Date` hold.
 pub fn date_class() -> Value {
+    let epoch = crate::page_arena::current_epoch();
+    let cached = DATE_CLASS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, _)| *cached_epoch == epoch)
+            .map(|(_, value)| value.clone())
+    });
+    if let Some(value) = cached {
+        return value;
+    }
+    let value = build_date_class();
+    let prototype = Value::object_literal(HashMap::new());
+    crate::class::define_property(
+        &prototype,
+        "constructor",
+        &Value::object(HashMap::from([
+            ("value".into(), value.clone()),
+            ("writable".into(), Value::Bool(true)),
+            ("enumerable".into(), Value::Bool(false)),
+            ("configurable".into(), Value::Bool(true)),
+        ])),
+    );
+    crate::builtins::define_builtin(
+        &prototype,
+        "toJSON",
+        crate::named_function("toJSON", 1, |this, _| {
+            if this
+                .get_property("__w3cos_date_milliseconds")
+                .to_number()
+                .is_finite()
+            {
+                this.call_method("toISOString", Vec::new())
+            } else {
+                Value::Null
+            }
+        }),
+    );
+    value.set_property("prototype", prototype);
+    let retired = DATE_CLASS.with(|slot| slot.replace(Some((epoch, value.clone()))));
+    drop(retired);
+    value
+}
+
+fn date_prototype() -> Value {
+    date_class().get_property("prototype")
+}
+
+fn build_date_class() -> Value {
     Value::callable(
         HashMap::from([
             (
@@ -686,8 +742,64 @@ pub fn date_class() -> Value {
     )
 }
 
+/// Calendar field getters (`getFullYear` ... `getUTCMilliseconds`,
+/// `getTimezoneOffset`) for a Date at `milliseconds`; NaN when invalid.
+fn date_field_getters(milliseconds: f64) -> Vec<(String, Value)> {
+    use chrono::{Datelike, Timelike};
+    fn field<Tz: chrono::TimeZone>(
+        zone: Tz,
+        milliseconds: f64,
+        pick: fn(&chrono::DateTime<Tz>) -> f64,
+    ) -> f64 {
+        if !milliseconds.is_finite() {
+            return f64::NAN;
+        }
+        zone.timestamp_millis_opt(milliseconds.floor() as i64)
+            .single()
+            .map_or(f64::NAN, |instant| pick(&instant))
+    }
+    macro_rules! getters {
+        ($($local:literal, $utc:literal => $pick:expr;)*) => {
+            vec![$(
+                (
+                    $local.to_string(),
+                    Value::function(move |_, _| {
+                        Value::Number(field(chrono::Local, milliseconds, $pick))
+                    }),
+                ),
+                (
+                    $utc.to_string(),
+                    Value::function(move |_, _| {
+                        Value::Number(field(chrono::Utc, milliseconds, $pick))
+                    }),
+                ),
+            )*]
+        };
+    }
+    let mut getters = getters! {
+        "getFullYear", "getUTCFullYear" => |d| f64::from(d.year());
+        "getMonth", "getUTCMonth" => |d| f64::from(d.month0());
+        "getDate", "getUTCDate" => |d| f64::from(d.day());
+        "getDay", "getUTCDay" => |d| f64::from(d.weekday().num_days_from_sunday());
+        "getHours", "getUTCHours" => |d| f64::from(d.hour());
+        "getMinutes", "getUTCMinutes" => |d| f64::from(d.minute());
+        "getSeconds", "getUTCSeconds" => |d| f64::from(d.second());
+        "getMilliseconds", "getUTCMilliseconds" => |d| f64::from(d.timestamp_subsec_millis());
+    };
+    getters.push((
+        "getTimezoneOffset".to_string(),
+        Value::function(move |_, _| {
+            Value::Number(field(chrono::Local, milliseconds, |d| {
+                -f64::from(d.offset().local_minus_utc()) / 60.0
+            }))
+        }),
+    ));
+    getters
+}
+
 pub fn date_value(milliseconds: f64) -> Value {
-    Value::object(HashMap::from([
+    let mut fields: HashMap<String, Value> = date_field_getters(milliseconds).into_iter().collect();
+    fields.extend([
         (
             "__w3cos_date_milliseconds".into(),
             Value::Number(milliseconds),
@@ -711,7 +823,8 @@ pub fn date_value(milliseconds: f64) -> Value {
                 Value::from(text)
             }),
         ),
-    ]))
+    ]);
+    Value::object_with_prototype(&date_prototype(), fields)
 }
 
 fn now_milliseconds() -> f64 {
@@ -2491,8 +2604,10 @@ struct UrlParts {
 }
 
 impl UrlParts {
+    /// Serialized with `//`: a host, or a `file:` URL (whose host may be
+    /// empty: `file:///tmp/x`).
     fn has_authority(&self) -> bool {
-        !self.hostname.is_empty()
+        !self.hostname.is_empty() || self.protocol == "file:"
     }
 
     fn host(&self) -> String {
@@ -2504,7 +2619,7 @@ impl UrlParts {
     }
 
     fn origin(&self) -> String {
-        if self.has_authority() {
+        if !self.hostname.is_empty() && self.protocol != "file:" {
             format!("{}//{}", self.protocol, self.host())
         } else {
             "null".to_string()
@@ -2563,17 +2678,71 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
+/// WHATWG percent-encode sets (beyond C0 controls and non-ASCII, which
+/// are always encoded). An existing `%XX` is kept as is.
+const FRAGMENT_ENCODE_SET: &[u8] = b" \"<>`";
+const QUERY_ENCODE_SET: &[u8] = b" \"#<>";
+const PATH_ENCODE_SET: &[u8] = b" \"#<>?`{}";
+
+fn percent_encode_with(input: &str, set: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        if byte < 0x20 || byte >= 0x7f || set.contains(&byte) {
+            out.push_str(&format!("%{byte:02X}"));
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
 /// Minimal RFC 3986 parse + relative resolution against `base`.
 fn parse_url(input: &str, base: Option<&UrlParts>) -> Result<UrlParts, String> {
     let input = input.trim();
     // Split off fragment and query first — they never contain the scheme.
     let (before_hash, hash) = match input.split_once('#') {
-        Some((rest, fragment)) => (rest, format!("#{fragment}")),
+        Some((rest, fragment)) => (
+            rest,
+            format!("#{}", percent_encode_with(fragment, FRAGMENT_ENCODE_SET)),
+        ),
         None => (input, String::new()),
     };
     let (before_query, search) = match before_hash.split_once('?') {
-        Some((rest, query)) => (rest, format!("?{query}")),
+        Some((rest, query)) => (
+            rest,
+            format!("?{}", percent_encode_with(query, QUERY_ENCODE_SET)),
+        ),
         None => (before_hash, String::new()),
+    };
+    let encoded_path;
+    let before_query = if before_query
+        .bytes()
+        .any(|byte| byte <= 0x20 || byte >= 0x7f || PATH_ENCODE_SET.contains(&byte))
+    {
+        // Hierarchical paths only: an opaque path (`mailto:a b`) keeps its
+        // spaces. The path starts after `scheme:` and any `//authority`.
+        let scheme_len = before_query.find(':').filter(|&end| {
+            let candidate = &before_query[..end];
+            candidate.starts_with(|c: char| c.is_ascii_alphabetic())
+                && candidate
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        });
+        let rest_start = scheme_len.map(|end| end + 1).unwrap_or(0);
+        let rest = &before_query[rest_start..];
+        if scheme_len.is_some() && !rest.starts_with('/') {
+            before_query
+        } else {
+            let path_start = match rest.strip_prefix("//") {
+                Some(after) => rest_start + 2 + after.find('/').unwrap_or(after.len()),
+                None => rest_start,
+            };
+            let (head, path) = before_query.split_at(path_start);
+            encoded_path = format!("{head}{}", percent_encode_with(path, PATH_ENCODE_SET));
+            encoded_path.as_str()
+        }
+    } else {
+        before_query
     };
 
     let scheme_end = before_query.find(':').filter(|&end| {
@@ -2916,6 +3085,48 @@ mod tests {
     /// Test helper: unwrap a caught JS-exception payload into its Value.
     fn payload_value(payload: Box<dyn std::any::Any + Send>) -> Value {
         crate::promise::payload_to_value(payload)
+    }
+
+    #[test]
+    fn date_has_calendar_field_getters() {
+        let get = |date: &Value, key: &str| date.call_method(key, vec![]).to_number();
+        // 2001-02-03T04:05:06.007Z, a Saturday.
+        let date = date_value(981_173_106_007.0);
+        assert_eq!(get(&date, "getUTCFullYear"), 2001.0);
+        assert_eq!(get(&date, "getUTCMonth"), 1.0);
+        assert_eq!(get(&date, "getUTCDate"), 3.0);
+        assert_eq!(get(&date, "getUTCDay"), 6.0);
+        assert_eq!(get(&date, "getUTCHours"), 4.0);
+        assert_eq!(get(&date, "getUTCMinutes"), 5.0);
+        assert_eq!(get(&date, "getUTCSeconds"), 6.0);
+        assert_eq!(get(&date, "getUTCMilliseconds"), 7.0);
+        // Local fields agree with the zone offset.
+        let offset = get(&date, "getTimezoneOffset");
+        let local_minutes = get(&date, "getHours") * 60.0 + get(&date, "getMinutes");
+        assert_eq!(
+            (4.0 * 60.0 + 5.0 - offset - local_minutes).rem_euclid(1440.0),
+            0.0
+        );
+        assert!(get(&date_value(f64::NAN), "getFullYear").is_nan());
+    }
+
+    #[test]
+    fn url_serializes_file_authority_and_percent_encodes() {
+        let href = |input: &str| parse_url(input, None).unwrap().href();
+        assert_eq!(href("file:///tmp/x y#1"), "file:///tmp/x%20y#1");
+        assert_eq!(href("https://e.com/p?q=1 2"), "https://e.com/p?q=1%202");
+        assert_eq!(
+            href("https://e.com/a%20b/{c}"),
+            "https://e.com/a%20b/%7Bc%7D"
+        );
+        assert_eq!(href("https://e.com/#a b"), "https://e.com/#a%20b");
+        assert_eq!(href("mailto:a b"), "mailto:a b");
+        assert_eq!(parse_url("file:///tmp", None).unwrap().origin(), "null");
+        let base = parse_url("file:///tmp/dir/", None).unwrap();
+        assert_eq!(
+            parse_url("x y.txt", Some(&base)).unwrap().href(),
+            "file:///tmp/dir/x y.txt".replace(' ', "%20")
+        );
     }
 
     // ── atob / btoa ──

@@ -20,6 +20,16 @@ pub(crate) fn write_fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
 /// Compile `entry` under `root`, run it, and return the `console.*` lines
 /// (and an `UNCAUGHT ...` line if evaluation threw).
 pub(crate) fn compile_and_run(root: &Path, entry: &Path, crate_name: &str) -> Vec<String> {
+    compile_and_run_with_env(root, entry, crate_name, &[])
+}
+
+/// [`compile_and_run`] with extra environment variables for the app.
+pub(crate) fn compile_and_run_with_env(
+    root: &Path,
+    entry: &Path,
+    crate_name: &str,
+    env: &[(&str, &str)],
+) -> Vec<String> {
     let resolver = EsmResolver::new(root);
     let parsed = resolver
         .parse_graph_from_entry(entry)
@@ -102,6 +112,7 @@ fn main() {{
         .current_dir(&crate_dir)
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("W3COS_JS_CONSOLE", "1")
+        .envs(env.iter().copied())
         .output()
         .expect("cargo should be available");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -326,8 +337,8 @@ const ADVANCED_FILES: &[(&str, &str)] = &[
         "src/main.cjs",
         r##"const esm = require("./esm.mjs");
 console.log("require(esm)", esm.value, typeof esm.default, esm.default());
-try { require("fs"); } catch (e) { console.log("builtin", e.code); }
-try { require("node:child_process"); } catch (e) { console.log("node: builtin", e.code); }
+try { require("dgram"); } catch (e) { console.log("builtin", e.code); }
+try { require("node:repl"); } catch (e) { console.log("node: builtin", e.code); }
 console.log("#cfg", require("#cfg").which);
 console.log("w3cos condition", require("cond-pkg"));
 const reexp = require("./reexport-user.mjs");

@@ -498,6 +498,76 @@ pub(crate) fn file_list_from_files(files: Vec<Value>) -> Value {
     file_list(Rc::new(RefCell::new(entries)))
 }
 
+/// HTML drag data formats: ASCII-lowercased, `text` / `url` aliases.
+fn normalize_format(format: &str) -> String {
+    let format = format.to_ascii_lowercase();
+    match format.as_str() {
+        "text" => "text/plain".to_string(),
+        "url" => "text/uri-list".to_string(),
+        _ => format,
+    }
+}
+
+/// `dropEffect` / `effectAllowed`. A script-constructed DataTransfer is not
+/// in a drag data store's read/write mode, so (as in Chromium) both stay
+/// `none`; a native drag source switches the mode on through
+/// `__w3cos_setDragMode(true)`, after which valid values are kept.
+fn install_drag_effects(value: &Value) {
+    let writable = Rc::new(std::cell::Cell::new(false));
+    let drop_effect = Rc::new(RefCell::new("none".to_string()));
+    let effect_allowed = Rc::new(RefCell::new("none".to_string()));
+    for (name, slot, valid) in [
+        (
+            "dropEffect",
+            Rc::clone(&drop_effect),
+            &["none", "copy", "link", "move"][..],
+        ),
+        (
+            "effectAllowed",
+            Rc::clone(&effect_allowed),
+            &[
+                "none",
+                "copy",
+                "copyLink",
+                "copyMove",
+                "link",
+                "linkMove",
+                "move",
+                "all",
+                "uninitialized",
+            ][..],
+        ),
+    ] {
+        let read = Rc::clone(&slot);
+        value.set_property(
+            &format!("__w3cos_getter_{name}"),
+            Value::function(move |_, _| Value::string(&read.borrow())),
+        );
+        let writable = Rc::clone(&writable);
+        value.set_property(
+            &format!("__w3cos_setter_{name}"),
+            Value::function(move |_, args| {
+                let next = args.first().cloned().unwrap_or_default().to_js_string();
+                if writable.get() && valid.contains(&next.as_str()) {
+                    *slot.borrow_mut() = next;
+                }
+                Value::Undefined
+            }),
+        );
+    }
+    value.set_property(
+        "__w3cos_setDragMode",
+        Value::function(move |_, args| {
+            let on = args.first().is_some_and(Value::to_bool);
+            writable.set(on);
+            if on && effect_allowed.borrow().as_str() == "none" {
+                *effect_allowed.borrow_mut() = "uninitialized".to_string();
+            }
+            Value::Undefined
+        }),
+    );
+}
+
 pub fn data_transfer_class() -> Value {
     DATA_TRANSFER_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
@@ -506,10 +576,8 @@ pub fn data_transfer_class() -> Value {
         let generation = crate::jsdom::realm_generation();
         let class = realm_function(generation, |_, _| {
             let entries = Rc::new(RefCell::new(Vec::<Value>::new()));
-            let value = Value::object(HashMap::from([
-                ("dropEffect".to_string(), Value::string("none")),
-                ("effectAllowed".to_string(), Value::string("uninitialized")),
-            ]));
+            let value = Value::object(HashMap::new());
+            install_drag_effects(&value);
             let getter_entries = Rc::clone(&entries);
             value.set_property(
                 "__w3cos_getter_types",
@@ -534,7 +602,8 @@ pub fn data_transfer_class() -> Value {
             value.set_property(
                 "setData",
                 Value::function(move |_, args| {
-                    let type_name = args.first().cloned().unwrap_or_default().to_js_string();
+                    let type_name =
+                        normalize_format(&args.first().cloned().unwrap_or_default().to_js_string());
                     let data = args.get(1).cloned().unwrap_or_default();
                     let mut entries = set_entries.borrow_mut();
                     entries.retain(|item| {
@@ -553,7 +622,8 @@ pub fn data_transfer_class() -> Value {
             value.set_property(
                 "getData",
                 Value::function(move |_, args| {
-                    let kind = args.first().cloned().unwrap_or_default().to_js_string();
+                    let kind =
+                        normalize_format(&args.first().cloned().unwrap_or_default().to_js_string());
                     get_entries
                         .borrow()
                         .iter()
@@ -575,7 +645,7 @@ pub fn data_transfer_class() -> Value {
                             .borrow_mut()
                             .retain(|item| item.get_property("kind").to_js_string() != "string");
                     } else {
-                        let kind = kind.to_js_string();
+                        let kind = normalize_format(&kind.to_js_string());
                         clear_entries.borrow_mut().retain(|item| {
                             item.get_property("kind").to_js_string() != "string"
                                 || item.get_property("type").to_js_string() != kind

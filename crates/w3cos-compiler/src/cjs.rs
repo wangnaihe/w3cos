@@ -42,7 +42,20 @@ pub struct CjsAnalysis {
     /// Specifiers whose exports are re-exported wholesale
     /// (`module.exports = require(x)`, `__exportStar(require(x), exports)`).
     pub reexports: Vec<String>,
+    /// Node globals the file reads without declaring (`Buffer`): the record
+    /// binds them from their builtin module, as Node's globals would.
+    pub implicit_globals: Vec<String>,
+    /// Statically named worker modules (`new Worker(path.join(__dirname,
+    /// 'w.js'))`, `utilityProcess.fork(...)`), as specifiers relative to the
+    /// file: each runs as a worker entry (see [`WORKER_TARGET_PREFIX`]).
+    pub worker_entries: Vec<String>,
 }
+
+/// `require()` key under which the program entry links a worker module.
+pub const WORKER_TARGET_PREFIX: &str = "w3cos-worker:";
+
+/// Free Node globals backed by a builtin: (global, specifier, member).
+pub const IMPLICIT_GLOBALS: &[(&str, &str, &str)] = &[("Buffer", "node:buffer", "Buffer")];
 
 /// Classify `source` at `path`. Returns `Some` for CommonJS:
 /// - `.cjs` files;
@@ -56,9 +69,22 @@ pub fn classify(
     source: &str,
     in_type_module_scope: bool,
 ) -> Result<Option<CjsAnalysis>> {
+    classify_as(path, source, in_type_module_scope, false)
+}
+
+/// [`classify`]; a `classic_script` (an Electron preload or page script,
+/// evaluated when a window loads it) is CommonJS unless it has module
+/// syntax, even without `require`/`module`/`exports`, so it gets a lazily
+/// evaluated record instead of running at startup like an ES module.
+pub fn classify_as(
+    path: &Path,
+    source: &str,
+    in_type_module_scope: bool,
+    classic_script: bool,
+) -> Result<Option<CjsAnalysis>> {
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let forced = extension == "cjs";
-    if !forced {
+    if !forced && !classic_script {
         if !matches!(extension, "js" | "jsx" | "") || in_type_module_scope {
             return Ok(None);
         }
@@ -118,13 +144,47 @@ pub fn classify(
     for statement in &statements {
         statement.visit_with(&mut scan);
     }
-    if !forced && !scan.uses_commonjs {
+    if !forced && !classic_script && !scan.uses_commonjs {
         return Ok(None);
+    }
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut worker_entries: Vec<String> = Vec::new();
+    let named = scan.worker_idents.iter().filter_map(|name| {
+        scan.path_consts
+            .iter()
+            .find(|(binding, _)| binding == name)
+            .map(|(_, path)| path)
+    });
+    for entry in scan
+        .worker_args
+        .iter()
+        .chain(named)
+        .filter_map(|arg| arg.relative_specifier(&file_name))
+    {
+        if !worker_entries.contains(&entry) {
+            worker_entries.push(entry);
+        }
     }
     let mut analysis = CjsAnalysis {
         requires: scan.requires,
+        worker_entries,
         ..Default::default()
     };
+    for (global, specifier, _) in IMPLICIT_GLOBALS {
+        if scan.globals_read.contains(*global) && !declares_top_level(&statements, global) {
+            analysis.implicit_globals.push((*global).to_string());
+            if !analysis
+                .requires
+                .iter()
+                .any(|existing| existing == specifier)
+            {
+                analysis.requires.push((*specifier).to_string());
+            }
+        }
+    }
     let mut lexer = ExportLexer::default();
     for statement in &statements {
         lexer.statement(statement);
@@ -146,7 +206,125 @@ pub fn strip_hashbang(source: &str) -> &str {
 #[derive(Default)]
 struct RequireScan {
     requires: Vec<String>,
+    /// First arguments of worker constructors, when statically known.
+    worker_args: Vec<WorkerPath>,
+    /// Worker constructor arguments that name a binding (`new Worker(file)`).
+    worker_idents: Vec<String>,
+    /// `const file = path.join(__dirname, 'w.js')` bindings.
+    path_consts: Vec<(String, WorkerPath)>,
     uses_commonjs: bool,
+    /// Implicit-global names that appear as identifiers.
+    globals_read: BTreeSet<String>,
+}
+
+/// Imports an ES module needs for Node implicit globals it reads without
+/// declaring (`typeof Buffer !== "undefined"` in Code-OSS `buffer.js`), as
+/// source text to prepend: `import { Buffer } from "node:buffer";`. Empty
+/// when the module declares, imports, or never reads them.
+pub fn esm_implicit_global_imports(path: &Path, source: &str) -> String {
+    if !IMPLICIT_GLOBALS
+        .iter()
+        .any(|(global, _, _)| source.contains(global))
+    {
+        return String::new();
+    }
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Real(path.to_path_buf())),
+        strip_hashbang(source).to_string(),
+    );
+    let jsx = path.extension().is_some_and(|ext| ext == "jsx");
+    let mut parser = Parser::new(
+        Syntax::Es(EsSyntax {
+            jsx,
+            ..Default::default()
+        }),
+        StringInput::from(&*fm),
+        None,
+    );
+    let Ok(module) = parser.parse_module() else {
+        return String::new();
+    };
+    let mut statements = Vec::new();
+    let mut imported = BTreeSet::new();
+    let mut scan = RequireScan::default();
+    for item in module.body {
+        match item {
+            ModuleItem::Stmt(statement) => statements.push(statement),
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
+                for specifier in &import.specifiers {
+                    let local = match specifier {
+                        ImportSpecifier::Named(named) => &named.local,
+                        ImportSpecifier::Default(default) => &default.local,
+                        ImportSpecifier::Namespace(namespace) => &namespace.local,
+                    };
+                    imported.insert(local.sym.to_string());
+                }
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                statements.push(Stmt::Decl(export.decl));
+            }
+            ModuleItem::ModuleDecl(declaration) => {
+                // `export default <expr>` and friends still read identifiers.
+                if let ModuleDecl::ExportDefaultDecl(default) = &declaration {
+                    let ident = match &default.decl {
+                        DefaultDecl::Class(class) => class.ident.as_ref(),
+                        DefaultDecl::Fn(function) => function.ident.as_ref(),
+                        _ => None,
+                    };
+                    if let Some(ident) = ident {
+                        imported.insert(ident.sym.to_string());
+                    }
+                }
+                declaration.visit_with(&mut scan);
+            }
+        }
+    }
+    for statement in &statements {
+        statement.visit_with(&mut scan);
+    }
+    IMPLICIT_GLOBALS
+        .iter()
+        .filter(|(global, _, _)| {
+            scan.globals_read.contains(*global)
+                && !imported.contains(*global)
+                && !declares_top_level(&statements, global)
+        })
+        .map(|(global, specifier, member)| {
+            format!(
+                "import {{ {member} as {global} }} from {};\n",
+                js_string(specifier)
+            )
+        })
+        .collect()
+}
+
+/// Does a top-level statement declare `name` (var/let/const/function/class)?
+fn declares_top_level(statements: &[Stmt], name: &str) -> bool {
+    fn pat_binds(pat: &Pat, name: &str) -> bool {
+        match pat {
+            Pat::Ident(ident) => ident.id.sym == *name,
+            Pat::Array(array) => array
+                .elems
+                .iter()
+                .flatten()
+                .any(|elem| pat_binds(elem, name)),
+            Pat::Object(object) => object.props.iter().any(|prop| match prop {
+                ObjectPatProp::KeyValue(kv) => pat_binds(&kv.value, name),
+                ObjectPatProp::Assign(assign) => assign.key.id.sym == *name,
+                ObjectPatProp::Rest(rest) => pat_binds(&rest.arg, name),
+            }),
+            Pat::Rest(rest) => pat_binds(&rest.arg, name),
+            Pat::Assign(assign) => pat_binds(&assign.left, name),
+            _ => false,
+        }
+    }
+    statements.iter().any(|statement| match statement {
+        Stmt::Decl(Decl::Var(var)) => var.decls.iter().any(|decl| pat_binds(&decl.name, name)),
+        Stmt::Decl(Decl::Fn(function)) => function.ident.sym == *name,
+        Stmt::Decl(Decl::Class(class)) => class.ident.sym == *name,
+        _ => false,
+    })
 }
 
 fn literal_string(expr: &Expr) -> Option<String> {
@@ -185,8 +363,144 @@ fn member_prop_name(prop: &MemberProp) -> Option<String> {
     }
 }
 
+/// A worker module path the compiler can name: `__filename`, or segments
+/// below `__dirname`.
+#[derive(Clone)]
+enum WorkerPath {
+    SelfFile,
+    BelowDir(Vec<String>),
+}
+
+impl WorkerPath {
+    fn relative_specifier(&self, file_name: &str) -> Option<String> {
+        match self {
+            WorkerPath::SelfFile => Some(format!("./{file_name}")),
+            WorkerPath::BelowDir(segments) => {
+                let joined = segments
+                    .iter()
+                    .flat_map(|segment| segment.split('/'))
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .collect::<Vec<_>>()
+                    .join("/");
+                (!joined.is_empty()).then(|| format!("./{joined}"))
+            }
+        }
+    }
+}
+
+/// `__filename`, `path.join(__dirname, 'a', 'b')` / `path.resolve(...)`,
+/// `__dirname + '/w.js'` and `` `${__dirname}/w.js` ``.
+fn worker_path(expr: &Expr) -> Option<WorkerPath> {
+    match expr {
+        Expr::Paren(paren) => worker_path(&paren.expr),
+        Expr::Ident(ident) if ident.sym == *"__filename" => Some(WorkerPath::SelfFile),
+        Expr::Call(call) => {
+            let Callee::Expr(callee) = &call.callee else {
+                return None;
+            };
+            let name = match &**callee {
+                Expr::Ident(ident) => ident.sym.to_string(),
+                Expr::Member(member) => member_prop_name(&member.prop)?,
+                _ => return None,
+            };
+            if !matches!(name.as_str(), "join" | "resolve") || call.args.len() < 2 {
+                return None;
+            }
+            if call.args.iter().any(|arg| arg.spread.is_some())
+                || !is_ident(&call.args[0].expr, "__dirname")
+            {
+                return None;
+            }
+            let segments = call.args[1..]
+                .iter()
+                .map(|arg| literal_string(&arg.expr))
+                .collect::<Option<Vec<_>>>()?;
+            if segments.iter().any(|segment| segment.starts_with('/')) {
+                return None;
+            }
+            Some(WorkerPath::BelowDir(segments))
+        }
+        Expr::Bin(bin) if bin.op == BinaryOp::Add && is_ident(&bin.left, "__dirname") => {
+            let rest = literal_string(&bin.right)?;
+            rest.starts_with('/')
+                .then(|| WorkerPath::BelowDir(vec![rest]))
+        }
+        Expr::Tpl(tpl)
+            if tpl.exprs.len() == 1
+                && is_ident(&tpl.exprs[0], "__dirname")
+                && tpl.quasis.len() == 2
+                && tpl.quasis[0].raw.is_empty() =>
+        {
+            let rest = tpl.quasis[1]
+                .cooked
+                .as_ref()?
+                .to_string_lossy()
+                .into_owned();
+            rest.starts_with('/')
+                .then(|| WorkerPath::BelowDir(vec![rest]))
+        }
+        _ => None,
+    }
+}
+
+/// A worker constructor's first argument: a path expression, or a binding
+/// to resolve against `const` path declarations.
+fn note_worker_arg(scan: &mut RequireScan, expr: &Expr) {
+    if let Some(path) = worker_path(expr) {
+        scan.worker_args.push(path);
+    } else if let Expr::Ident(ident) = expr {
+        scan.worker_idents.push(ident.sym.to_string());
+    }
+}
+
 impl Visit for RequireScan {
+    fn visit_var_decl(&mut self, decl: &VarDecl) {
+        if decl.kind == VarDeclKind::Const {
+            for declarator in &decl.decls {
+                if let Pat::Ident(binding) = &declarator.name
+                    && let Some(init) = &declarator.init
+                    && let Some(path) = worker_path(init)
+                {
+                    self.path_consts.push((binding.id.sym.to_string(), path));
+                }
+            }
+        }
+        decl.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, new: &NewExpr) {
+        let is_worker = match &*new.callee {
+            Expr::Ident(ident) => ident.sym == *"Worker",
+            Expr::Member(member) => member_prop_name(&member.prop).as_deref() == Some("Worker"),
+            _ => false,
+        };
+        if is_worker
+            && let Some(args) = &new.args
+            && let Some(first) = args.first()
+            && first.spread.is_none()
+        {
+            note_worker_arg(self, &first.expr);
+        }
+        new.visit_children_with(self);
+    }
+
     fn visit_call_expr(&mut self, call: &CallExpr) {
+        // Electron's `utilityProcess.fork(modulePath)` runs a worker entry too.
+        if let Callee::Expr(callee) = &call.callee
+            && let Expr::Member(member) = &**callee
+            && member_prop_name(&member.prop).as_deref() == Some("fork")
+            && match &*member.obj {
+                Expr::Ident(ident) => ident.sym == *"utilityProcess",
+                Expr::Member(inner) => {
+                    member_prop_name(&inner.prop).as_deref() == Some("utilityProcess")
+                }
+                _ => false,
+            }
+            && let Some(first) = call.args.first()
+            && first.spread.is_none()
+        {
+            note_worker_arg(self, &first.expr);
+        }
         if let Callee::Expr(callee) = &call.callee {
             let is_require = is_ident(callee, "require")
                 || matches!(&**callee, Expr::Member(member)
@@ -206,6 +520,12 @@ impl Visit for RequireScan {
     fn visit_ident(&mut self, ident: &Ident) {
         if matches!(&*ident.sym, "require" | "module" | "exports") {
             self.uses_commonjs = true;
+        }
+        if IMPLICIT_GLOBALS
+            .iter()
+            .any(|(global, _, _)| ident.sym == **global)
+        {
+            self.globals_read.insert(ident.sym.to_string());
         }
     }
 }
@@ -444,6 +764,86 @@ pub fn record_source(
     targets: &[(String, RequireTarget)],
     runtime: &Path,
 ) -> (String, Vec<String>) {
+    record_source_with_globals(file, body, targets, runtime, &[])
+}
+
+/// [`record_source`] plus bindings for `implicit_globals` (see
+/// [`CjsAnalysis::implicit_globals`]) at the top of the module body.
+pub fn record_source_with_globals(
+    file: &Path,
+    body: &str,
+    targets: &[(String, RequireTarget)],
+    runtime: &Path,
+    implicit_globals: &[String],
+) -> (String, Vec<String>) {
+    record_source_with_prelude(file, body, targets, runtime, implicit_globals, "")
+}
+
+/// Statements the program entry runs first on a worker thread: hand over to
+/// the worker module the thread was started for (linked under
+/// [`WORKER_TARGET_PREFIX`]); a worker started on the entry file itself
+/// (`new Worker(__filename)`) keeps running the entry.
+pub fn worker_boot_prelude(entry: &Path, workers: &[PathBuf]) -> String {
+    if workers.is_empty() {
+        return String::new();
+    }
+    let paths = workers
+        .iter()
+        .map(|path| js_string(&path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases = workers
+        .iter()
+        .filter(|path| path.as_path() != entry)
+        .map(|path| {
+            let path = path.to_string_lossy();
+            format!(
+                "    case {}: require({}); break;\n",
+                js_string(&path),
+                js_string(&format!("{WORKER_TARGET_PREFIX}{path}"))
+            )
+        })
+        .collect::<String>();
+    format!(
+        "var __w3cos_worker_boot = require(\"node:internal/w3cos_worker\");\n\
+__w3cos_worker_boot.compiled([{paths}]);\n\
+var __w3cos_worker_entry = __w3cos_worker_boot.entry();\n\
+if (__w3cos_worker_entry !== undefined && __w3cos_worker_entry !== __filename) {{\n\
+  switch (__w3cos_worker_entry) {{\n{cases}    default: __w3cos_worker_boot.missing(__w3cos_worker_entry);\n  }}\n\
+  return;\n}}\n"
+    )
+}
+
+/// [`record_source_with_globals`] plus `extra_prelude` statements before the
+/// module body (see [`worker_boot_prelude`]).
+pub fn record_source_with_prelude(
+    file: &Path,
+    body: &str,
+    targets: &[(String, RequireTarget)],
+    runtime: &Path,
+    implicit_globals: &[String],
+    extra_prelude: &str,
+) -> (String, Vec<String>) {
+    let prelude: String = IMPLICIT_GLOBALS
+        .iter()
+        .filter(|(global, _, _)| implicit_globals.iter().any(|name| name == global))
+        .map(|(global, specifier, member)| {
+            format!(
+                "var {global} = require({}).{member};\n",
+                js_string(specifier)
+            )
+        })
+        .collect::<String>()
+        + extra_prelude;
+    // Keep a leading "use strict" directive first in the function body.
+    let leading = strip_hashbang(body).trim_start();
+    let prelude = if !prelude.is_empty()
+        && (leading.starts_with("'use strict'") || leading.starts_with("\"use strict\""))
+    {
+        format!("\"use strict\";\n{prelude}")
+    } else {
+        prelude
+    };
     let filename = file.to_string_lossy();
     let dirname = file
         .parent()
@@ -497,7 +897,7 @@ pub fn record_source(
         "function __w3cos_cjs_require(specifier) {{\n  switch (specifier) {{\n{require_cases}  }}\n  return __w3cos_cjs_missing(specifier, {file});\n}}\n\
 function __w3cos_cjs_resolve(specifier) {{\n  switch (specifier) {{\n{resolve_cases}  }}\n  return undefined;\n}}\n\
 export default function __w3cos_cjs_record() {{\n  return __w3cos_cjs_load({file}, {dir}, __w3cos_cjs_factory, __w3cos_cjs_require, __w3cos_cjs_resolve);\n}}\n\
-function __w3cos_cjs_factory(exports, require, module, __filename, __dirname) {{\n{body}\n}}\n",
+function __w3cos_cjs_factory(exports, require, module, __filename, __dirname) {{\n{prelude}{body}\n}}\n",
         file = js_string(&filename),
         dir = js_string(&dirname),
         body = strip_hashbang(body),
@@ -594,6 +994,22 @@ pub fn facade_source<'a>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn esm_modules_reading_buffer_import_it_from_node_buffer() {
+        let path = Path::new("/p/buffer.js");
+        let reads = "import { Lazy } from './lazy.js';\nconst hasBuffer = typeof Buffer !== 'undefined';\nexport class VSBuffer { static alloc(n) { return Buffer.allocUnsafe(n); } }\n";
+        assert_eq!(
+            esm_implicit_global_imports(path, reads),
+            "import { Buffer as Buffer } from \"node:buffer\";\n"
+        );
+        let imports = "import { Buffer } from 'node:buffer';\nexport const b = Buffer.from('x');\n";
+        assert_eq!(esm_implicit_global_imports(path, imports), "");
+        let declares = "export class Buffer {}\nexport const b = new Buffer();\n";
+        assert_eq!(esm_implicit_global_imports(path, declares), "");
+        let member_only = "export const size = view.Buffer;\n";
+        assert_eq!(esm_implicit_global_imports(path, member_only), "");
+    }
+
     fn analyze(path: &str, source: &str) -> Option<CjsAnalysis> {
         classify(Path::new(path), source, false).unwrap()
     }
@@ -615,6 +1031,52 @@ mod tests {
         );
         // Property names are not references.
         assert!(analyze("/a.js", "var o = {}; o.module = o.exports; o.require();").is_none());
+    }
+
+    #[test]
+    fn names_statically_known_worker_modules() {
+        let analysis = analyze(
+            "/app/main.js",
+            r#"const path = require('path');
+const { Worker } = require('worker_threads');
+const file = path.join(__dirname, 'workers', 'a.js');
+new Worker(file);
+new Worker(path.resolve(__dirname, './b.js'));
+new threads.Worker(__dirname + '/c.js');
+new Worker(`${__dirname}/d.js`, { workerData: 1 });
+new Worker(__filename);
+utilityProcess.fork(path.join(__dirname, 'child.js'), []);
+electron.utilityProcess.fork(file);
+new Worker(someRuntimePath);
+new Worker('./relative-to-cwd.js');
+new Worker(path.join(__dirname, '/abs.js'));
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            analysis.worker_entries,
+            [
+                "./b.js",
+                "./c.js",
+                "./d.js",
+                "./main.js",
+                "./child.js",
+                "./workers/a.js"
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_boot_prelude_dispatches_to_linked_workers() {
+        let entry = Path::new("/app/main.js");
+        let prelude =
+            worker_boot_prelude(entry, &[PathBuf::from("/app/w.js"), entry.to_path_buf()]);
+        assert!(
+            prelude.contains(r#"__w3cos_worker_boot.compiled(["/app/w.js", "/app/main.js"]);"#)
+        );
+        assert!(prelude.contains(r#"case "/app/w.js": require("w3cos-worker:/app/w.js"); break;"#));
+        assert!(!prelude.contains(r#"case "/app/main.js""#));
+        assert!(worker_boot_prelude(entry, &[]).is_empty());
     }
 
     #[test]
@@ -668,6 +1130,31 @@ tslib_1.__exportStar(require("./star2"), exports);
         assert!(source.contains("export const a = __w3cos_cjs_exports.a;"));
         assert_eq!(source.matches("export const").count(), 1);
         assert_eq!(imports, ["/p/x.js.w3cos-cjs.js"]);
+    }
+
+    #[test]
+    fn free_buffer_reads_bind_the_builtin() {
+        let free = analyze("/p/a.js", "module.exports = Buffer.from('x');").unwrap();
+        assert_eq!(free.implicit_globals, ["Buffer"]);
+        assert!(free.requires.contains(&"node:buffer".to_string()));
+        for declared in [
+            "const { Buffer } = require('buffer'); module.exports = Buffer;",
+            "const Buffer = require('safe-buffer').Buffer; module.exports = Buffer;",
+            "function Buffer() {} module.exports = Buffer;",
+        ] {
+            let analysis = analyze("/p/b.js", declared).unwrap();
+            assert!(analysis.implicit_globals.is_empty(), "{declared}");
+        }
+        let (source, _) = record_source_with_globals(
+            Path::new("/p/a.js"),
+            "'use strict';\nmodule.exports = Buffer;",
+            &[],
+            Path::new("/p/__w3cos_cjs_runtime__.js"),
+            &["Buffer".to_string()],
+        );
+        assert!(source.contains(
+            "__dirname) {\n\"use strict\";\nvar Buffer = require(\"node:buffer\").Buffer;\n'use strict';"
+        ));
     }
 
     #[test]

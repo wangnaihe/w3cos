@@ -481,45 +481,21 @@ fn module_export_name(name: &ModuleExportName) -> String {
     }
 }
 
-fn atom_to_string(atom: &impl serde::Serialize) -> String {
-    let serialized = serde_json::to_value(atom).expect("SWC string atom must serialize");
-    let value = serialized
-        .as_str()
-        .expect("SWC string atom must serialize as a JSON string")
-        .to_string();
-    decode_serialized_wtf8_surrogates(&value)
-}
-
-fn decode_serialized_wtf8_surrogates(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            output.push(character);
-            continue;
-        }
-        if characters.peek() == Some(&'\\') {
-            characters.next();
-            output.push('\\');
-            continue;
-        }
-        if characters.peek() != Some(&'u') {
-            output.push('\\');
-            continue;
-        }
-        characters.next();
-        let digits = characters.by_ref().take(4).collect::<String>();
-        if digits.len() == 4
-            && let Ok(surrogate @ 0xd800..=0xdfff) = u32::from_str_radix(&digits, 16)
-        {
-            output.push(
-                char::from_u32(0xe000 + surrogate - 0xd800)
-                    .expect("surrogate sentinel must be a valid scalar value"),
-            );
-        } else {
-            output.push_str("\\u");
-            output.push_str(&digits);
-        }
+/// Decode an SWC string atom (WTF-8) into the compiler's string form.
+///
+/// Read the code points directly: the atom's serde form only doubles a
+/// backslash when it precedes `uXXXX`, so decoding that text collapsed real
+/// `\\` pairs (`"\\\\"` lowered to a single backslash). Unpaired
+/// surrogates map to the internal single-unit sentinel range.
+fn atom_to_string(atom: &swc_atoms::Wtf8Atom) -> String {
+    let mut output = String::with_capacity(atom.len());
+    for code_point in atom.code_points() {
+        let value = code_point.to_u32();
+        let character = match value {
+            0xd800..=0xdfff => char::from_u32(0xe000 + value - 0xd800),
+            _ => char::from_u32(value),
+        };
+        output.push(character.expect("WTF-8 code point maps to a scalar value"));
     }
     output
 }
@@ -610,6 +586,14 @@ fn labeled_statement_targets_breakable(statement: &Stmt) -> bool {
     }
 }
 
+fn expression_ends_in_optional_chain(expression: &Expr) -> bool {
+    match expression {
+        Expr::OptChain(_) => true,
+        Expr::Paren(parenthesized) => expression_ends_in_optional_chain(&parenthesized.expr),
+        _ => false,
+    }
+}
+
 fn optional_chain_member(expression: &Expr) -> Option<&MemberExpr> {
     match expression {
         Expr::Member(member) => Some(member),
@@ -619,6 +603,18 @@ fn optional_chain_member(expression: &Expr) -> Option<&MemberExpr> {
         },
         Expr::Paren(parenthesized) => optional_chain_member(&parenthesized.expr),
         _ => None,
+    }
+}
+
+/// `IsAnonymousFunctionDefinition`: an arrow or unnamed function
+/// expression (through parentheses), which takes its name from the
+/// property key or binding it initializes.
+fn is_anonymous_function_definition(expression: &Expr) -> bool {
+    match expression {
+        Expr::Paren(paren) => is_anonymous_function_definition(&paren.expr),
+        Expr::Arrow(_) => true,
+        Expr::Fn(function) => function.ident.is_none(),
+        _ => false,
     }
 }
 
@@ -784,6 +780,9 @@ struct Builder {
     /// Return annotation of the function about to be lowered by
     /// `lower_nested_function`; consumed (taken) there.
     pending_return_hint: Option<TypeHint>,
+    /// Name an anonymous function/arrow takes from its object-literal key
+    /// (`{ f: () => 1 }.f.name === "f"`); consumed by the next one lowered.
+    pending_function_name: Option<String>,
 }
 
 impl Builder {
@@ -836,6 +835,7 @@ impl Builder {
             terminated: false,
             type_names: Default::default(),
             pending_return_hint: None,
+            pending_function_name: None,
         }
     }
 
@@ -892,6 +892,7 @@ impl Builder {
             terminated: false,
             type_names: Default::default(),
             pending_return_hint: None,
+            pending_function_name: None,
         }
     }
 
@@ -1523,7 +1524,9 @@ impl Builder {
         if self.classic_script_entry && self.scopes.len() == 1 {
             return Ok(self.declare_classic_lexical(name, BindingKind::Class));
         }
-        self.declare_current_binding(name, BindingKind::Class, false)
+        // Mutable so TypeScript `class C {} (C || (C = {}))` namespace-merge
+        // emit lowers; the assignment is behind `||` and never runs when C exists.
+        self.declare_current_binding(name, BindingKind::Class, true)
     }
 
     fn declare_current_binding(
@@ -2200,8 +2203,7 @@ impl Builder {
                 let binding = self
                     .find_binding(&name)
                     .ok_or_else(|| anyhow!("missing predeclared class binding {name:?}"))?;
-                let value = self.lower_class_value(&declaration.class, Some(name))?;
-                self.emit(Instruction::InitializeBinding { binding, value });
+                self.lower_class_value(&declaration.class, Some(name), Some(binding))?;
                 Ok(())
             }
             Stmt::Return(statement) => {
@@ -3664,10 +3666,16 @@ impl Builder {
                         }
                         PropOrSpread::Prop(property) => {
                             let (key, value) = match property.as_ref() {
-                                Prop::KeyValue(property) => (
-                                    self.lower_property_name(&property.key)?,
-                                    self.lower_expression(&property.value)?,
-                                ),
+                                Prop::KeyValue(property) => {
+                                    let key = self.lower_property_name(&property.key)?;
+                                    if is_anonymous_function_definition(&property.value) {
+                                        self.pending_function_name =
+                                            object_property_name(&property.key);
+                                    }
+                                    let value = self.lower_expression(&property.value);
+                                    self.pending_function_name = None;
+                                    (key, value?)
+                                }
                                 Prop::Shorthand(identifier) => (
                                     self.constant(Constant::String(identifier.sym.to_string())),
                                     self.lower_expression(&Expr::Ident(identifier.clone()))?,
@@ -3797,6 +3805,7 @@ impl Builder {
                 Ok(dst)
             }
             Expr::Tpl(template) => self.lower_template_literal(template),
+            Expr::TaggedTpl(tagged) => self.lower_tagged_template(tagged),
             Expr::TsTypeAssertion(assertion) => self.lower_expression(&assertion.expr),
             Expr::TsNonNull(non_null) => self.lower_expression(&non_null.expr),
             Expr::TsAs(as_expression) => self.lower_expression(&as_expression.expr),
@@ -3810,6 +3819,7 @@ impl Builder {
                     ));
                 }
                 let parameters = arrow.params.clone();
+                let inferred_name = self.pending_function_name.take();
                 self.pending_return_hint =
                     Some(return_hint(arrow.return_type.as_deref(), &self.type_names));
                 match arrow.body.as_ref() {
@@ -3817,7 +3827,7 @@ impl Builder {
                         parameters,
                         &body.stmts,
                         None,
-                        None,
+                        inferred_name,
                         arrow.is_async,
                         false,
                         false,
@@ -3827,7 +3837,7 @@ impl Builder {
                         parameters,
                         &[],
                         Some(expression.as_ref()),
-                        None,
+                        inferred_name,
                         arrow.is_async,
                         false,
                         false,
@@ -3851,10 +3861,12 @@ impl Builder {
                     function.function.return_type.as_deref(),
                     &self.type_names,
                 ));
+                let inferred_name = self.pending_function_name.take();
                 let name = function
                     .ident
                     .as_ref()
-                    .map(|identifier| identifier.sym.to_string());
+                    .map(|identifier| identifier.sym.to_string())
+                    .or(inferred_name);
                 let self_binding = function.ident.as_ref().filter(|identifier| {
                     function_references_name(&function.function, &identifier.sym)
                 });
@@ -4199,6 +4211,45 @@ impl Builder {
         Ok(value)
     }
 
+    /// `tag\`a${b}c\`` → `tag(["a","c"], b)` (cooked strings only; enough
+    /// for Code-OSS `inline` CSS helpers that never read `.raw`).
+    fn lower_tagged_template(&mut self, tagged: &swc_ecma_ast::TaggedTpl) -> Result<Register> {
+        // Early Error: OptionalChain TemplateLiteral / ?.TemplateLiteral.
+        if expression_ends_in_optional_chain(&tagged.tag) {
+            return Err(anyhow!(
+                "SyntaxError: optional chain cannot be followed by a template literal"
+            ));
+        }
+        let tag = self.lower_expression(&tagged.tag)?;
+        let template = tagged.tpl.as_ref();
+        if template.quasis.len() != template.exprs.len() + 1 {
+            return Err(anyhow!(
+                "runtime W3IR tagged template has inconsistent quasi/expression counts"
+            ));
+        }
+        let mut elements = Vec::with_capacity(template.quasis.len());
+        for quasi in &template.quasis {
+            let cooked = quasi
+                .cooked
+                .as_ref()
+                .ok_or_else(|| anyhow!("runtime W3IR tagged template has an invalid escape"))?;
+            elements.push(self.constant(Constant::String(atom_to_string(cooked))));
+        }
+        let strings = self.register();
+        self.emit(Instruction::CreateArray {
+            dst: strings,
+            elements,
+        });
+        let mut arguments = vec![strings];
+        for expression in &template.exprs {
+            arguments.push(self.lower_expression(expression)?);
+        }
+        let dst = self.register();
+        let this_value = self.constant(Constant::Undefined);
+        self.emit_call(dst, tag, this_value, LoweredArguments::Registers(arguments));
+        Ok(dst)
+    }
+
     fn lower_optional_chain(
         &mut self,
         expression: &swc_ecma_ast::OptChainExpr,
@@ -4487,23 +4538,30 @@ impl Builder {
 
     fn lower_class_expression(&mut self, expression: &swc_ecma_ast::ClassExpr) -> Result<Register> {
         let Some(identifier) = &expression.ident else {
-            return self.lower_class_value(&expression.class, None);
+            return self.lower_class_value(&expression.class, None, None);
         };
         self.scopes.push(HashMap::new());
         let result = (|| {
             let name = identifier.sym.to_string();
             let binding = self.declare_class_binding(&name)?;
-            let value = self.lower_class_value(&expression.class, Some(name))?;
-            self.emit(Instruction::InitializeBinding { binding, value });
-            Ok(value)
+            self.lower_class_value(&expression.class, Some(name), Some(binding))
         })();
         self.scopes.pop();
         result
     }
 
-    fn lower_class_value(&mut self, class: &Class, name: Option<String>) -> Result<Register> {
+    /// `name_binding` is the class's own name binding. Per
+    /// ClassDefinitionEvaluation it is initialized once the class and its
+    /// methods exist, before static fields and static blocks run, so those
+    /// initializers can refer to the class by name.
+    fn lower_class_value(
+        &mut self,
+        class: &Class,
+        name: Option<String>,
+        name_binding: Option<BindingId>,
+    ) -> Result<Register> {
         self.scopes.push(HashMap::new());
-        let result = self.lower_class_value_in_scope(class, name);
+        let result = self.lower_class_value_in_scope(class, name, name_binding);
         self.scopes.pop();
         result
     }
@@ -4512,6 +4570,7 @@ impl Builder {
         &mut self,
         class: &Class,
         name: Option<String>,
+        name_binding: Option<BindingId>,
     ) -> Result<Register> {
         // Private-name operations capture this lexical cell. It is
         // initialized after CreateClass returns, before any static
@@ -4834,6 +4893,12 @@ impl Builder {
                     ));
                 }
             }
+        }
+        if let Some(binding) = name_binding {
+            self.emit(Instruction::InitializeBinding {
+                binding,
+                value: class_value,
+            });
         }
         for initializer in static_initializers {
             let dst = self.register();
@@ -5484,10 +5549,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serialized_wtf8_surrogates_keep_single_utf16_units() {
-        let decoded = decode_serialized_wtf8_surrogates("left\\uD83Cright\\uDF20");
+    fn string_atoms_keep_backslashes_and_single_utf16_surrogates() {
+        let module = parse(
+            r#"x("left\uD83Cright\uDF20", "\\\\", "literal\\uD83C", `(\\\\)?`);"#,
+            "atoms.js",
+        )
+        .unwrap();
+        let swc_ecma_ast::ModuleItem::Stmt(swc_ecma_ast::Stmt::Expr(statement)) = &module.body[0]
+        else {
+            panic!("expression statement");
+        };
+        let swc_ecma_ast::Expr::Call(call) = statement.expr.as_ref() else {
+            panic!("call");
+        };
+        let texts = call
+            .args
+            .iter()
+            .map(|argument| match argument.expr.as_ref() {
+                swc_ecma_ast::Expr::Lit(swc_ecma_ast::Lit::Str(value)) => {
+                    atom_to_string(&value.value)
+                }
+                swc_ecma_ast::Expr::Tpl(template) => {
+                    atom_to_string(template.quasis[0].cooked.as_ref().unwrap())
+                }
+                _ => panic!("string argument"),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            w3cos_core::js_string_utf16_units(&decoded),
+            w3cos_core::js_string_utf16_units(&texts[0]),
             [
                 b'l' as u16,
                 b'e' as u16,
@@ -5502,10 +5591,9 @@ mod tests {
                 0xdf20,
             ]
         );
-        assert_eq!(
-            decode_serialized_wtf8_surrogates("literal\\\\uD83C"),
-            "literal\\uD83C"
-        );
+        assert_eq!(texts[1], "\\\\");
+        assert_eq!(texts[2], "literal\\uD83C");
+        assert_eq!(texts[3], "(\\\\)?");
     }
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
@@ -8449,6 +8537,68 @@ mod tests {
                 "computed:6",
                 "after:7",
             ]
+        );
+    }
+
+    #[test]
+    fn static_initializers_see_the_initialized_class_name_binding() {
+        let module = lower_script(
+            r#"
+                const extractor = new class ColorExtractor {
+                    static {
+                        this.relaxed = "rgb";
+                    }
+                    static {
+                        this.strict = "^" + ColorExtractor.relaxed + "$";
+                    }
+                    read() {
+                        return ColorExtractor.strict;
+                    }
+                };
+                callback("expr:" + extractor.read());
+                class Declared {
+                    static x = 2;
+                    static y = Declared.x + 1;
+                    static {
+                        this.z = Declared.y + 1;
+                    }
+                }
+                callback("decl:" + Declared.y + "," + Declared.z);
+                const Named = class Inner {
+                    static self = Inner;
+                };
+                callback("named:" + (Named.self === Named));
+            "#,
+            "https://example.test/class-name-binding.js",
+        )
+        .unwrap();
+        let callback_binding = module
+            .imports
+            .iter()
+            .find(|import| import.imported == "callback")
+            .unwrap()
+            .local;
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let callback_observed = Rc::clone(&observed);
+        Vm::new(module, Limits::default())
+            .unwrap()
+            .run_with_bindings(HashMap::from([(
+                callback_binding,
+                Value::function(move |_, arguments| {
+                    callback_observed.borrow_mut().push(
+                        arguments
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
+                            .to_js_string(),
+                    );
+                    Value::Undefined
+                }),
+            )]))
+            .unwrap();
+        assert_eq!(
+            *observed.borrow(),
+            vec!["expr:^rgb$", "decl:3,4", "named:true"]
         );
     }
 

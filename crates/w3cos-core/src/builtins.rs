@@ -18,6 +18,8 @@ thread_local! {
 /// `page_arena::reset` makes the next realm observe empty keys.
 pub fn reset_constructors() {
     OBJECT_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    let retired = OBJECT_PROTOTYPE.with(|slot| slot.borrow_mut().take());
+    drop(retired);
     ARRAY_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     STRING_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     ERROR_CLASSES.with(|slot| slot.borrow_mut().take());
@@ -52,6 +54,378 @@ pub fn object_value() -> Value {
     })
 }
 
+/// The global `Reflect` namespace, one per thread. Members delegate to the
+/// `Object` builtins and the runtime's property/construct intrinsics.
+pub fn reflect_value() -> Value {
+    thread_local! {
+        static REFLECT: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    REFLECT.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        let value = build_reflect_value();
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+fn build_reflect_value() -> Value {
+    fn arg(arguments: &[Value], index: usize) -> Value {
+        arguments.get(index).cloned().unwrap_or(Value::Undefined)
+    }
+    fn list(value: &Value) -> Vec<Value> {
+        if value.is_undefined() || value.is_null() {
+            return Vec::new();
+        }
+        let length = value.get_property("length").to_number();
+        let length = if length.is_finite() && length > 0.0 {
+            length as usize
+        } else {
+            0
+        };
+        (0..length)
+            .map(|index| value.get_property(&index.to_string()))
+            .collect()
+    }
+    fn object_method(name: &'static str) -> Value {
+        Value::function(move |_, arguments| object_value().call_method(name, arguments))
+    }
+    let mut properties = HashMap::new();
+    properties.insert(
+        "apply".to_string(),
+        Value::function(|_, arguments| {
+            let target = arg(&arguments, 0);
+            target.call(arg(&arguments, 1), list(&arg(&arguments, 2)))
+        }),
+    );
+    properties.insert(
+        "construct".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::construct(&arg(&arguments, 0), list(&arg(&arguments, 1)))
+        }),
+    );
+    properties.insert(
+        "get".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::get_property(&arg(&arguments, 0), &arg(&arguments, 1))
+        }),
+    );
+    properties.insert(
+        "set".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::set_property(
+                &arg(&arguments, 0),
+                &arg(&arguments, 1),
+                arg(&arguments, 2),
+            );
+            Value::Bool(true)
+        }),
+    );
+    properties.insert(
+        "has".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::in_operator(&arg(&arguments, 1), &arg(&arguments, 0))
+        }),
+    );
+    properties.insert(
+        "deleteProperty".to_string(),
+        Value::function(|_, arguments| {
+            crate::intrinsics::delete_property(&arg(&arguments, 0), &arg(&arguments, 1))
+        }),
+    );
+    properties.insert(
+        "defineProperty".to_string(),
+        Value::function(|_, arguments| {
+            object_value().call_method("defineProperty", arguments);
+            Value::Bool(true)
+        }),
+    );
+    properties.insert(
+        "setPrototypeOf".to_string(),
+        Value::function(|_, arguments| {
+            object_value().call_method("setPrototypeOf", arguments);
+            Value::Bool(true)
+        }),
+    );
+    properties.insert(
+        "getPrototypeOf".to_string(),
+        object_method("getPrototypeOf"),
+    );
+    properties.insert(
+        "getOwnPropertyDescriptor".to_string(),
+        object_method("getOwnPropertyDescriptor"),
+    );
+    properties.insert("ownKeys".to_string(), object_method("getOwnPropertyNames"));
+    properties.insert(
+        "isExtensible".to_string(),
+        Value::function(|_, arguments| {
+            Value::Bool(arg(&arguments, 0).is_object() || arg(&arguments, 0).is_callable())
+        }),
+    );
+    properties.insert(
+        "preventExtensions".to_string(),
+        Value::function(|_, _| Value::Bool(true)),
+    );
+    Value::object(properties)
+}
+
+/// The global `Number` constructor, one per thread: the static constants and
+/// predicates plus `Number.prototype` (`valueOf`, `toString`, `toFixed`, ...)
+/// so uncurried captures (`uncurryThis(Number.prototype.valueOf)` in the
+/// `util` polyfill) resolve and `Number.prototype` keeps one identity.
+pub fn number_value() -> Value {
+    thread_local! {
+        static NUMBER: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    NUMBER.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        fn this_number(this: &Value, method: &str) -> f64 {
+            match this.as_number() {
+                Some(number) => number,
+                None => crate::throw_value(error_instance(
+                    "TypeError",
+                    vec![Value::from(format!(
+                        "Number.prototype.{method} requires that 'this' be a Number"
+                    ))],
+                )),
+            }
+        }
+        fn number_predicate(test: fn(f64) -> bool) -> Value {
+            Value::function(move |_, arguments| {
+                Value::Bool(
+                    arguments
+                        .first()
+                        .and_then(Value::as_number)
+                        .is_some_and(test),
+                )
+            })
+        }
+        let mut prototype = HashMap::new();
+        prototype.insert(
+            "valueOf".to_string(),
+            Value::function(|this, _| Value::Number(this_number(&this, "valueOf"))),
+        );
+        for method in [
+            "toString",
+            "toFixed",
+            "toPrecision",
+            "toExponential",
+            "toLocaleString",
+        ] {
+            prototype.insert(
+                method.to_string(),
+                Value::function(move |this, arguments| {
+                    let number = this_number(&this, method);
+                    crate::number_proto::number_method(number, method, &arguments)
+                        .unwrap_or_else(|| Value::from(Value::Number(number).to_js_string()))
+                }),
+            );
+        }
+        let prototype = Value::object(prototype);
+        let value = Value::callable(
+            HashMap::from([
+                (
+                    "MAX_SAFE_INTEGER".to_string(),
+                    Value::Number(9007199254740991.0),
+                ),
+                (
+                    "MIN_SAFE_INTEGER".to_string(),
+                    Value::Number(-9007199254740991.0),
+                ),
+                ("EPSILON".to_string(), Value::Number(f64::EPSILON)),
+                ("MAX_VALUE".to_string(), Value::Number(f64::MAX)),
+                ("MIN_VALUE".to_string(), Value::Number(5e-324)),
+                (
+                    "POSITIVE_INFINITY".to_string(),
+                    Value::Number(f64::INFINITY),
+                ),
+                (
+                    "NEGATIVE_INFINITY".to_string(),
+                    Value::Number(f64::NEG_INFINITY),
+                ),
+                ("NaN".to_string(), Value::Number(f64::NAN)),
+                ("isFinite".to_string(), number_predicate(f64::is_finite)),
+                (
+                    "isInteger".to_string(),
+                    number_predicate(|value| value.is_finite() && value.fract() == 0.0),
+                ),
+                ("isNaN".to_string(), number_predicate(f64::is_nan)),
+                (
+                    "isSafeInteger".to_string(),
+                    number_predicate(|value| {
+                        value.is_finite()
+                            && value.fract() == 0.0
+                            && value.abs() <= 9_007_199_254_740_991.0
+                    }),
+                ),
+                ("prototype".to_string(), prototype.clone()),
+            ]),
+            |_, arguments| Value::Number(arguments.first().map_or(0.0, Value::to_number)),
+        );
+        prototype.set_property("constructor", value.clone());
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+/// The global `Boolean` constructor, one per thread, with
+/// `Boolean.prototype.toString`/`valueOf` so uncurried captures
+/// (DOMPurify `unapply(Boolean.prototype.toString)`) resolve.
+pub fn boolean_value() -> Value {
+    /// [[BooleanData]] of `new Boolean(x)` wrappers (and of
+    /// `Boolean.prototype`, which is itself a Boolean object holding false).
+    const BOOLEAN_DATA: &str = "__w3cos_boolean_data";
+    thread_local! {
+        static BOOLEAN: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    BOOLEAN.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        fn this_boolean(this: &Value, method: &str) -> bool {
+            if let crate::value::ValueUnpack::Bool(value) = this.unpack() {
+                return value;
+            }
+            if let Some(object) = this.as_object() {
+                let data = object.borrow().get_direct(BOOLEAN_DATA);
+                if let crate::value::ValueUnpack::Bool(value) = data.unpack() {
+                    return value;
+                }
+            }
+            crate::throw_value(error_instance(
+                "TypeError",
+                vec![Value::from(format!(
+                    "Boolean.prototype.{method} requires that 'this' be a Boolean"
+                ))],
+            ))
+        }
+        let prototype = Value::object(HashMap::from([
+            (
+                "toString".to_string(),
+                Value::function(|this, _| {
+                    Value::from(if this_boolean(&this, "toString") {
+                        "true"
+                    } else {
+                        "false"
+                    })
+                }),
+            ),
+            (
+                "valueOf".to_string(),
+                Value::function(|this, _| Value::Bool(this_boolean(&this, "valueOf"))),
+            ),
+        ]));
+        crate::builtins::define_builtin(&prototype, BOOLEAN_DATA, Value::Bool(false));
+        // A plain function (not a host callable) so `new Boolean(x)` keeps
+        // producing an object, which is truthy (test262 relies on it). The
+        // constructor stamps [[BooleanData]] on the instance it receives.
+        let wrapper_prototype = prototype.clone();
+        let value = Value::function(move |this, arguments| {
+            let value = arguments.first().is_some_and(Value::to_bool);
+            if this.is_object()
+                && crate::class::get_prototype_of(&this).strict_eq(&wrapper_prototype)
+            {
+                crate::builtins::define_builtin(&this, BOOLEAN_DATA, Value::Bool(value));
+            }
+            Value::Bool(value)
+        });
+        value.set_property("prototype", prototype.clone());
+        prototype.set_property("constructor", value.clone());
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
+/// The global `Symbol` facade, one per thread. Symbols are collision-resistant
+/// string sentinels (`__w3cos_symbol_…`); `Symbol.for(key)` is stable for the
+/// global registry. `Symbol.prototype` exists so uncurried method captures
+/// (DOMPurify `unapply(Symbol.prototype.toString)`) resolve.
+pub fn symbol_value() -> Value {
+    thread_local! {
+        static SYMBOL: RefCell<Option<Value>> = const { RefCell::new(None) };
+    }
+    SYMBOL.with(|slot| {
+        if let Some(value) = slot.borrow().clone() {
+            return value;
+        }
+        fn this_symbol(this: &Value, method: &str) -> String {
+            let raw = if this.is_string() {
+                this.to_js_string()
+            } else {
+                String::new()
+            };
+            if !raw.starts_with("__w3cos_symbol_") {
+                crate::throw_value(error_instance(
+                    "TypeError",
+                    vec![Value::from(format!(
+                        "Symbol.prototype.{method} requires that 'this' be a Symbol"
+                    ))],
+                ));
+            }
+            raw
+        }
+        let prototype = Value::object(HashMap::from([
+            (
+                "toString".to_string(),
+                Value::function(|this, _| {
+                    let raw = this_symbol(&this, "toString");
+                    let description = raw
+                        .strip_prefix("__w3cos_symbol_for:")
+                        .or_else(|| raw.strip_prefix("__w3cos_symbol_"))
+                        .unwrap_or(&raw)
+                        .to_string();
+                    Value::from(format!("Symbol({description})"))
+                }),
+            ),
+            (
+                "valueOf".to_string(),
+                Value::function(|this, _| Value::from(this_symbol(&this, "valueOf"))),
+            ),
+            (
+                "__w3cos_symbol_to_primitive".to_string(),
+                Value::function(|this, _| Value::from(this_symbol(&this, "[Symbol.toPrimitive]"))),
+            ),
+        ]));
+        let value = Value::object(HashMap::from([
+            (
+                "iterator".to_string(),
+                Value::from("__w3cos_symbol_iterator"),
+            ),
+            (
+                "asyncIterator".to_string(),
+                Value::from("__w3cos_symbol_async_iterator"),
+            ),
+            (
+                "unscopables".to_string(),
+                Value::from("__w3cos_symbol_unscopables"),
+            ),
+            (
+                "toPrimitive".to_string(),
+                Value::from("__w3cos_symbol_to_primitive"),
+            ),
+            (
+                "for".to_string(),
+                Value::function(|_, arguments| {
+                    Value::from(format!(
+                        "__w3cos_symbol_for:{}",
+                        arguments
+                            .first()
+                            .cloned()
+                            .unwrap_or(Value::Undefined)
+                            .to_js_string()
+                    ))
+                }),
+            ),
+            ("prototype".to_string(), prototype),
+        ]));
+        *slot.borrow_mut() = Some(value.clone());
+        value
+    })
+}
+
 fn build_object_value() -> Value {
     let mut properties = HashMap::new();
     let prototype = Value::object(HashMap::from([
@@ -79,7 +453,36 @@ fn build_object_value() -> Value {
             }),
         ),
     ]));
-    for method in ["hasOwnProperty", "isPrototypeOf"] {
+    prototype.set_property(
+        "toString",
+        Value::function(|this, _| Value::from(object_to_string(&this))),
+    );
+    prototype.set_property(
+        "toLocaleString",
+        Value::function(|this, _| this.call_method("toString", Vec::new())),
+    );
+    prototype.set_property("valueOf", Value::function(|this, _| this));
+    prototype.set_property(
+        "propertyIsEnumerable",
+        Value::function(|this, arguments| {
+            let key = arguments
+                .first()
+                .map(Value::to_js_string)
+                .unwrap_or_default();
+            let descriptor = crate::class::get_own_property_descriptor(&this, &key);
+            Value::Bool(
+                !descriptor.is_undefined() && descriptor.get_property("enumerable").to_bool(),
+            )
+        }),
+    );
+    for method in [
+        "hasOwnProperty",
+        "isPrototypeOf",
+        "toString",
+        "toLocaleString",
+        "valueOf",
+        "propertyIsEnumerable",
+    ] {
         crate::class::define_property(
             &prototype,
             method,
@@ -201,12 +604,110 @@ fn build_object_value() -> Value {
             object
         }),
     );
-    Value::callable(properties, |_, arguments| {
-        arguments
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Value::object(HashMap::new()))
+    let prototype = properties.get("prototype").cloned();
+    let constructor = Value::callable(properties, |_, arguments| match arguments.first() {
+        Some(value) if !value.is_undefined() && !value.is_null() => value.clone(),
+        _ => Value::object_literal(HashMap::new()),
+    });
+    if let Some(prototype) = prototype {
+        crate::class::define_property(
+            &prototype,
+            "constructor",
+            &Value::object(HashMap::from([
+                ("value".into(), constructor.clone()),
+                ("writable".into(), Value::Bool(true)),
+                ("enumerable".into(), Value::Bool(false)),
+                ("configurable".into(), Value::Bool(true)),
+            ])),
+        );
+    }
+    constructor
+}
+
+/// `Object.prototype.toString`: `[object <Tag>]` from the value's kind and
+/// the runtime's brand markers (Date, RegExp, Error, Map, Set).
+pub fn object_to_string(value: &Value) -> String {
+    let tag = if value.is_undefined() {
+        "Undefined"
+    } else if value.is_null() {
+        "Null"
+    } else if let Some(name) = crate::binary::typed_array_name(value) {
+        name
+    } else if value.is_array() {
+        "Array"
+    } else if value.is_string() {
+        "String"
+    } else if value.is_number() {
+        "Number"
+    } else if value.is_bool() {
+        "Boolean"
+    } else if value.is_function() {
+        "Function"
+    } else if has_own(value, "__w3cos_date_milliseconds") {
+        "Date"
+    } else if has_own(value, "__w3cos_regexp_source") {
+        "RegExp"
+    } else if crate::class::instance_of(value, &error_class("Error")) {
+        "Error"
+    } else if crate::class::instance_of(value, &crate::collections::map_class()) {
+        "Map"
+    } else if crate::class::instance_of(value, &crate::collections::set_class()) {
+        "Set"
+    } else if value.is_callable() {
+        "Function"
+    } else {
+        "Object"
+    };
+    format!("[object {tag}]")
+}
+
+fn has_own(value: &Value, key: &str) -> bool {
+    !crate::class::get_own_property_descriptor(value, key).is_undefined()
+}
+
+thread_local! {
+    static OBJECT_PROTOTYPE: RefCell<Option<(u32, crate::value::JsObjectRef)>> =
+        const { RefCell::new(None) };
+    static BUILDING_OBJECT_PROTOTYPE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `Object.prototype` if this page's `Object` already exists, without
+/// building it. Function `prototype` objects use this: creating a function
+/// must not allocate the whole `Object` realm.
+pub(crate) fn object_prototype_ref_if_built() -> Option<crate::value::JsObjectRef> {
+    let epoch = crate::page_arena::current_epoch();
+    OBJECT_PROTOTYPE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, proto)| *cached_epoch == epoch && proto.is_live())
+            .map(|(_, proto)| proto.clone())
     })
+}
+
+/// `Object.prototype` as a prototype link for new object literals, cached
+/// per page epoch (the realm's `Object` is rebuilt after a page reset).
+pub(crate) fn object_prototype_ref() -> Option<crate::value::JsObjectRef> {
+    let epoch = crate::page_arena::current_epoch();
+    let cached = OBJECT_PROTOTYPE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, proto)| *cached_epoch == epoch && proto.is_live())
+            .map(|(_, proto)| proto.clone())
+    });
+    if cached.is_some() {
+        return cached;
+    }
+    // Building `Object` creates functions, whose `prototype` objects ask
+    // for `Object.prototype` again: those few stay prototype-less.
+    if BUILDING_OBJECT_PROTOTYPE.with(|flag| flag.replace(true)) {
+        return None;
+    }
+    let proto = object_value().get_property("prototype").as_object();
+    BUILDING_OBJECT_PROTOTYPE.with(|flag| flag.set(false));
+    let proto = proto?;
+    let retired = OBJECT_PROTOTYPE.with(|slot| slot.replace(Some((epoch, proto.clone()))));
+    drop(retired);
+    Some(proto)
 }
 
 /// Define a non-enumerable data property (`writable`/`configurable` true),
@@ -778,8 +1279,17 @@ fn array_like_snapshot(value: &Value) -> Vec<Value> {
     if !length.is_finite() || length <= 0.0 {
         return Vec::new();
     }
+    // Missing indices stay holes (HasProperty before each Get, in order),
+    // so callbacks skip them like the spec's array-like iteration.
     (0..length.floor() as usize)
-        .map(|index| value.get_property(&index.to_string()))
+        .map(|index| {
+            let key = index.to_string();
+            if Value::string(&key).js_in(value).to_bool() {
+                value.get_property(&key)
+            } else {
+                crate::value::array_hole()
+            }
+        })
         .collect()
 }
 
@@ -834,6 +1344,7 @@ fn array_from(arguments: &[Value]) -> Value {
         .is_undefined()
         || source.is_array()
         || source.is_string()
+        || crate::collections::iter_collection(&source).is_some()
         || !source
             .get_property("__w3cosIterableSnapshot")
             .is_undefined()
@@ -922,12 +1433,18 @@ impl BuiltinObject {
                     .cast_unsigned()
                     .leading_zeros() as f64,
             ),
-            (BuiltinKind::Object, "is") => Value::Bool(
-                arguments
-                    .first()
-                    .zip(arguments.get(1))
-                    .is_some_and(|(left, right)| left.strict_eq(right)),
-            ),
+            (BuiltinKind::Object, "is") => {
+                // SameValue: NaN equals NaN, +0 and -0 differ.
+                let left = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let right = arguments.get(1).cloned().unwrap_or(Value::Undefined);
+                Value::Bool(match (left.as_number(), right.as_number()) {
+                    (Some(a), Some(b)) => {
+                        (a.is_nan() && b.is_nan())
+                            || (a == b && a.is_sign_negative() == b.is_sign_negative())
+                    }
+                    _ => left.strict_eq(&right),
+                })
+            }
             (BuiltinKind::Object, "keys") => arguments
                 .first()
                 .map(object_keys)
@@ -1436,28 +1953,31 @@ pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
     } else {
         message_value.to_js_string()
     };
-    let value = Value::object(HashMap::from([
-        ("name".to_string(), Value::string(name)),
-        ("message".to_string(), Value::string(&message)),
-        (
-            "stack".to_string(),
-            Value::from(if message.is_empty() {
-                name.to_string()
-            } else {
-                format!("{name}: {message}")
-            }),
-        ),
-    ]));
+    // `message` / `stack` are own non-enumerable data properties; `name`
+    // comes from the prototype (so Object.keys(new Error("x")) is empty).
+    let value = Value::object(HashMap::new());
+    if !message_value.is_undefined() {
+        define_builtin(&value, "message", Value::string(&message));
+    }
+    define_builtin(
+        &value,
+        "stack",
+        Value::from(if message.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}: {message}")
+        }),
+    );
     if name == "AggregateError" {
         let errors = arguments.first().cloned().unwrap_or(Value::Undefined);
-        value.set_property("errors", Value::array(errors.iter().collect()));
+        define_builtin(&value, "errors", Value::array(errors.iter().collect()));
     }
     let cause = arguments
         .get(options_index)
         .map(|options| options.get_property("cause"))
         .unwrap_or(Value::Undefined);
     if !cause.is_undefined() {
-        value.set_property("cause", cause);
+        define_builtin(&value, "cause", cause);
     }
     crate::class::set_prototype_of(&value, &error_class(name).get_property("prototype"));
     value
@@ -1906,6 +2426,122 @@ mod monaco_tests {
     use super::*;
 
     #[test]
+    fn reflect_and_symbol_facades_support_uncurried_captures() {
+        let reflect = reflect_value();
+        let to_lower = Value::function(|this, _| Value::from(this.to_js_string().to_lowercase()));
+        let lowered = reflect.call_method(
+            "apply",
+            vec![to_lower, Value::from("AB"), Value::array(Vec::new())],
+        );
+        assert_eq!(lowered.to_js_string(), "ab");
+        let object = Value::object(HashMap::from([("a".to_string(), Value::Number(1.0))]));
+        assert!(
+            reflect
+                .call_method("has", vec![object.clone(), Value::from("a")])
+                .to_bool()
+        );
+        assert_eq!(
+            reflect
+                .call_method("get", vec![object.clone(), Value::from("a")])
+                .to_number(),
+            1.0
+        );
+        let keys = reflect.call_method("ownKeys", vec![object]);
+        assert_eq!(keys.call_method("join", vec![]).to_js_string(), "a");
+        let symbol = symbol_value();
+        assert!(symbol.strict_eq(&symbol_value()));
+        let to_string = symbol.get_property("prototype").get_property("toString");
+        assert_eq!(
+            to_string
+                .call(symbol.get_property("iterator"), Vec::new())
+                .to_js_string(),
+            "Symbol(iterator)"
+        );
+        // test262 Symbol.prototype[Symbol.toPrimitive].call({}) → TypeError.
+        let to_primitive = symbol
+            .get_property("prototype")
+            .get_property(&symbol.get_property("toPrimitive").to_js_string());
+        let iterator = symbol.get_property("iterator");
+        assert!(
+            to_primitive
+                .call(iterator.clone(), Vec::new())
+                .strict_eq(&iterator)
+        );
+        let thrown =
+            crate::value::catch_js(|| to_primitive.call(Value::object(HashMap::new()), Vec::new()));
+        assert!(thrown.is_err(), "non-symbol receiver must throw");
+        let number = number_value();
+        assert!(number.strict_eq(&number_value()));
+        let value_of = number.get_property("prototype").get_property("valueOf");
+        assert_eq!(
+            value_of.call(Value::Number(5.0), Vec::new()).to_number(),
+            5.0
+        );
+        let to_fixed = number.get_property("prototype").get_property("toFixed");
+        assert_eq!(
+            to_fixed
+                .call(Value::Number(1.5), vec![Value::Number(2.0)])
+                .to_js_string(),
+            "1.50"
+        );
+        assert!(crate::value::catch_js(|| value_of.call(Value::from("x"), Vec::new())).is_err());
+        assert!(
+            number
+                .get_property("isSafeInteger")
+                .call(
+                    Value::Undefined,
+                    vec![Value::Number(9_007_199_254_740_991.0)]
+                )
+                .to_bool()
+        );
+        assert_eq!(number.call(Value::Undefined, Vec::new()).to_number(), 0.0);
+        // DOMPurify `unapply(Boolean.prototype.toString)`.
+        let boolean = boolean_value();
+        assert!(boolean.strict_eq(&boolean_value()));
+        let bool_to_string = boolean.get_property("prototype").get_property("toString");
+        assert_eq!(
+            bool_to_string
+                .call(Value::Bool(false), Vec::new())
+                .to_js_string(),
+            "false"
+        );
+        assert!(
+            crate::value::catch_js(|| bool_to_string.call(Value::Number(1.0), Vec::new())).is_err()
+        );
+        assert!(
+            boolean
+                .call(Value::Undefined, vec![Value::from("x")])
+                .to_bool()
+        );
+        assert!(!boolean.call(Value::Undefined, Vec::new()).to_bool());
+        // `new Boolean(false)` is an object, so it is truthy, and it keeps
+        // its [[BooleanData]] for the prototype methods.
+        let wrapped = crate::class::construct(&boolean, vec![Value::Bool(false)]);
+        assert!(wrapped.to_bool());
+        assert_eq!(
+            wrapped.call_method("toString", Vec::new()).to_js_string(),
+            "false"
+        );
+        let wrapped = crate::class::construct(&boolean, vec![Value::Bool(true)]);
+        assert_eq!(
+            wrapped.call_method("valueOf", Vec::new()).to_js_string(),
+            "true"
+        );
+        assert_eq!(
+            bool_to_string
+                .call(boolean.get_property("prototype"), Vec::new())
+                .to_js_string(),
+            "false"
+        );
+        // `Symbol.toPrimitive[Symbol.toPrimitive]()` on the sentinel itself.
+        let key = symbol.get_property("toPrimitive");
+        assert!(
+            key.call_method(&key.to_js_string(), Vec::new())
+                .strict_eq(&key)
+        );
+    }
+
+    #[test]
     fn math_floor_matches_javascript_number_semantics() {
         assert_eq!(
             Math.call_method("floor", vec![Value::Number(2.75)])
@@ -2218,6 +2854,21 @@ mod tests {
     }
 
     #[test]
+    fn array_from_snapshots_native_set_and_map() {
+        let set = crate::class::construct(&crate::collections::set_class(), vec![]);
+        set.call_method("add", vec![Value::Number(1.0)]);
+        set.call_method("add", vec![Value::string("two")]);
+        let values = array_value().call_method("from", vec![set]);
+        assert_eq!(values.get_property("length").to_number(), 2.0);
+        assert_eq!(values.get_property("1").to_js_string(), "two");
+        let map = crate::class::construct(&crate::collections::map_class(), vec![]);
+        map.call_method("set", vec![Value::string("k"), Value::Number(3.0)]);
+        let entries = array_value().call_method("from", vec![map]);
+        assert_eq!(entries.get_property("length").to_number(), 1.0);
+        assert_eq!(entries.get_property("0").get_property("1").to_number(), 3.0);
+    }
+
+    #[test]
     fn array_from_applies_mapping_function_with_index_and_this_argument() {
         let this_argument = Value::object(HashMap::from([(
             "prefix".to_string(),
@@ -2443,5 +3094,8 @@ pub fn named_constructor_function(
     let prototype = Value::object(HashMap::new());
     define_builtin(&prototype, "constructor", function.clone());
     function.set_property("prototype", prototype);
+    // Marks a compiled `function` declaration: `class X extends F` runs F's
+    // body on the new instance (`super(...)`), which host constructors skip.
+    function.set_property(crate::class::FUNCTION_CONSTRUCTOR_MARKER, Value::Bool(true));
     function
 }

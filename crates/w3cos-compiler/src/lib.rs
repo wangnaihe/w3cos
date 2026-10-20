@@ -2,9 +2,17 @@ pub mod alloc_escape;
 pub mod cjs;
 #[cfg(test)]
 mod cjs_e2e_tests;
+#[cfg(test)]
+mod code_oss_boot_e2e_tests;
 pub mod codegen;
+pub mod create_require;
 pub mod css_parser;
 pub mod css_values;
+#[cfg(test)]
+mod dynamic_import_e2e_tests;
+pub mod electron_app;
+#[cfg(test)]
+mod electron_e2e_tests;
 pub mod esm_codegen;
 pub mod esm_css;
 pub mod esm_lowering;
@@ -15,8 +23,14 @@ pub mod mobile_codegen;
 pub mod module_source;
 #[cfg(test)]
 mod node_builtins_e2e_tests;
+#[cfg(test)]
+mod node_io_e2e_tests;
+#[cfg(test)]
+mod node_native_e2e_tests;
 pub mod node_resolution;
 pub mod npm_bridge;
+#[cfg(test)]
+mod ns_merge_e2e_tests;
 pub mod parser;
 pub mod scope_analysis;
 pub mod style_matcher;
@@ -1953,7 +1967,7 @@ export function keymap() {}"#,
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         let entry = root.join("src/app.js");
-        std::fs::write(&entry, "export const result = String.raw`not-yet-lowered`;").unwrap();
+        std::fs::write(&entry, "export const result = new.target;").unwrap();
 
         let out = root.join("build");
         let error = compile_from_file(&entry, &out)
@@ -1962,7 +1976,7 @@ export function keymap() {}"#,
         assert!(
             diagnostic.contains("W3IR module initialization failed")
                 && diagnostic.contains(&entry.display().to_string())
-                && diagnostic.contains("TaggedTpl"),
+                && (diagnostic.contains("new.target") || diagnostic.contains("MetaProp")),
             "production diagnostic must preserve the module and W3IR cause: {diagnostic}"
         );
         assert!(

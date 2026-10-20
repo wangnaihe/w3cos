@@ -2703,15 +2703,30 @@ impl Document {
                         "inherit" | "unset"
                     )
                 });
+            let declared_custom_properties = if author_declarations
+                .iter()
+                .any(|(_, value, _)| value.contains("var("))
+            {
+                style.custom_properties.clone().unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
             let declares = |property: &str| {
-                let winning_author_value = author_declarations
+                // `var()` is substituted before validation, as in the
+                // declaration pass above.
+                let resolved_author_values = author_declarations
                     .iter()
-                    .filter(|(name, value, _)| {
-                        css_property_eq(name, property)
-                            && declaration_value_is_valid(property, value)
+                    .filter(|(name, _, _)| css_property_eq(name, property))
+                    .map(|(_, value, _)| {
+                        if value.contains("var(") {
+                            resolve_css_variables(value, &declared_custom_properties)
+                        } else {
+                            value.clone()
+                        }
                     })
-                    .map(|(_, value, _)| value.as_str())
-                    .last();
+                    .filter(|value| declaration_value_is_valid(property, value))
+                    .collect::<Vec<_>>();
+                let winning_author_value = resolved_author_values.last().map(String::as_str);
                 // A UA declaration wins over inherited values when no author
                 // declaration exists. Explicit author inherit/unset still
                 // requests inheritance rather than keeping the UA default.

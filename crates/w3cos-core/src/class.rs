@@ -174,6 +174,13 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
     if crate::binary::typed_array_instance_of(obj, class_value) {
         return true;
     }
+    // Runtime promises carry no prototype object: recognise the `Promise`
+    // global by its marker.
+    if crate::promise::status(obj).is_some()
+        && class_value.get_property("__w3cos_promise_class").to_bool()
+    {
+        return true;
+    }
     // Ordinary JavaScript closures are represented by `Value::Function`, not
     // `JsObject`, so they do not participate in the object prototype walk
     // below.  They are nevertheless Function instances in JavaScript.  Keep
@@ -207,9 +214,21 @@ pub fn instance_of(obj: &Value, class_value: &Value) -> bool {
 /// `super(...)` inside a derived constructor: run the parent class's raw
 /// constructor (stored under `"__w3cos_ctor"`) on the already-allocated
 /// `this`. Returns `this` so the call is usable in expression position.
+/// Hidden marker on compiled `function` declarations (see
+/// `builtins::named_constructor_function`).
+pub const FUNCTION_CONSTRUCTOR_MARKER: &str = "__w3cos_function_ctor";
+
 pub fn super_ctor(this: &Value, parent_class: &Value, args: Vec<Value>) -> Value {
     let ctor = parent_class.get_property("__w3cos_ctor");
-    ctor.call(this.clone(), args);
+    if ctor.is_callable() {
+        ctor.call(this.clone(), args);
+    } else if parent_class.is_ordinary_constructor_function() {
+        // `class X extends F` with an ES5 constructor `function F() {...}`:
+        // F's body initializes the already-allocated instance (its
+        // prototype chain includes F.prototype, so `this instanceof F`
+        // guards hold).
+        parent_class.call(this.clone(), args);
+    }
     run_pending_class_initializer(this);
     this.clone()
 }
@@ -526,6 +545,9 @@ pub fn define_field(this: &Value, key: &str, value: Value) {
 
 /// Set `obj`'s prototype link from generated code (`obj` must be an object).
 pub fn set_prototype_of(obj: &Value, proto: &Value) {
+    if crate::binary::set_typed_array_prototype(obj, proto) {
+        return;
+    }
     crate::intrinsics::bump_dom_shape();
     crate::intrinsics::bump_matches_shape();
     if let Some(object) = obj.as_object() {
@@ -539,6 +561,11 @@ pub fn set_prototype_of(obj: &Value, proto: &Value) {
 /// `Object.getPrototypeOf(obj)`: the object's prototype link, or `Null`
 /// (matching JS for non-objects, which throw — kept total here).
 pub fn get_prototype_of(obj: &Value) -> Value {
+    if obj.as_array().is_some()
+        && let Some(prototype) = crate::binary::typed_array_prototype(obj)
+    {
+        return prototype;
+    }
     obj.as_object()
         .map(|object| object.borrow().get_prototype_of())
         .unwrap_or(Value::Null)
@@ -579,6 +606,24 @@ pub fn define_property(obj: &Value, key: &str, descriptor: &Value) -> Value {
         }
         if let Some(node) = crate::intrinsics::dom_node_id(obj) {
             crate::intrinsics::pin_dom(node);
+        }
+    } else if let Some(function) = obj.as_function() {
+        // Function objects (constructor statics such as
+        // `EventEmitter.defaultMaxListeners`) take data and accessor
+        // definitions too.
+        let field = |name: &str| {
+            descriptor
+                .as_object()
+                .filter(|desc| desc.borrow().properties.contains_key(name))
+                .map(|_| descriptor.get_property(name))
+        };
+        let getter = field("get");
+        let setter = field("set");
+        if getter.is_some() || setter.is_some() {
+            function.define_accessor(key, getter, setter);
+        } else if let Some(value) = field("value") {
+            function.remove_accessor(key);
+            function.set_property(key, value);
         }
     }
     obj.clone()
@@ -761,6 +806,27 @@ mod tests {
         });
         let instance = construct(&ctor, vec![Value::Number(9.0)]);
         assert_eq!(instance.get_property("v").to_number(), 9.0);
+    }
+
+    #[test]
+    fn super_ctor_runs_a_compiled_es5_parent_function() {
+        let parent = crate::named_constructor_function("Base", 1, |this, args| {
+            this.set_property("base", args.first().cloned().unwrap_or(Value::Undefined));
+            Value::Undefined
+        });
+        let instance = Value::object(HashMap::new());
+        super_ctor(&instance, &parent, vec![Value::Number(7.0)]);
+        assert_eq!(instance.get_property("base").to_number(), 7.0);
+        // The marker stays out of the function's own keys.
+        let keys = parent.as_function().expect("function").keys();
+        assert!(!keys.iter().any(|key| key == FUNCTION_CONSTRUCTOR_MARKER));
+        // Host constructors keep running only through `__w3cos_ctor`.
+        let host = Value::function(|this, _| {
+            this.set_property("host", Value::Bool(true));
+            Value::Undefined
+        });
+        super_ctor(&instance, &host, vec![]);
+        assert!(instance.get_property("host").is_undefined());
     }
 
     #[test]

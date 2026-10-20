@@ -117,6 +117,13 @@ pub mod multi_window;
 pub mod navigation_web;
 pub mod navigator_web;
 pub mod network_information_web;
+mod node_safe_storage;
+mod node_sqlite;
+#[cfg(all(
+    any(target_os = "macos", target_os = "linux", target_os = "windows"),
+    not(target_env = "ohos")
+))]
+mod node_watcher;
 #[cfg(all(
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")

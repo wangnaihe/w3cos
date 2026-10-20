@@ -562,6 +562,15 @@ thread_local! {
     static STYLE_SHEET_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static STYLE_SHEET_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static AUTHOR_STYLE_SHEETS: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(Vec::new()));
+    /// Inline declarations set with priority `important`.
+    static INLINE_IMPORTANT: RefCell<HashSet<(u32, String)>> = RefCell::new(HashSet::new());
+    /// Every constructed / author sheet's rule list, by sheet id (for the
+    /// adopted-sheet cascade).
+    static SHEET_RULES: RefCell<HashMap<u64, std::rc::Weak<RefCell<Vec<String>>>>> =
+        RefCell::new(HashMap::new());
+    static NEXT_SHEET_ID: Cell<u64> = const { Cell::new(1) };
+    /// `document.adoptedStyleSheets`: the array value and its sheet ids.
+    static ADOPTED_SHEETS: RefCell<(Option<Value>, Vec<u64>)> = const { RefCell::new((None, Vec::new())) };
     static MEDIA_LIST_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DOM_COLLECTION_CLASSES: RefCell<Option<HashMap<String, Value>>> =
         const { RefCell::new(None) };
@@ -4990,6 +4999,11 @@ fn replace_all_children(node: u32, replacement: impl FnOnce()) {
         replacement();
     });
     let added = dom::children(node);
+    if dom::is_connected(node) {
+        for child in removed.iter().chain(added.iter()) {
+            sync_style_tree(*child);
+        }
+    }
     if !added.is_empty() || !removed.is_empty() {
         crate::observers_web::notify_child_list(node, &added, &removed, None, None);
     }
@@ -7544,8 +7558,91 @@ fn function_compat_class() -> Value {
     class.set_property("name", Value::string("Function"));
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
+    install_function_prototype_methods(&prototype);
     class.set_property("prototype", prototype);
     class
+}
+
+fn incompatible_function_receiver(method: &str, this: &Value) -> Value {
+    w3cos_core::throw_value(w3cos_core::error_instance(
+        "TypeError",
+        vec![Value::string(&format!(
+            "Function.prototype.{method} called on incompatible {}",
+            this.to_js_string()
+        ))],
+    ))
+}
+
+/// `Function.prototype.{call,apply,bind,toString}` as first-class values,
+/// so polyfills that capture them (`var $call = Function.prototype.call;
+/// bind.call($call, $apply)`) see real functions. Each dispatches on its
+/// receiver directly instead of re-entering the method lookup.
+fn install_function_prototype_methods(prototype: &Value) {
+    prototype.set_property(
+        "call",
+        Value::function(|this, args| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("call", &this);
+            }
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            this.call(this_arg, args.into_iter().skip(1).collect())
+        }),
+    );
+    prototype.set_property(
+        "apply",
+        Value::function(|this, args| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("apply", &this);
+            }
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let list = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let applied = if list.is_undefined() || list.is_null() {
+                Vec::new()
+            } else {
+                let length = list.get_property("length").to_number();
+                let length = if length.is_finite() && length > 0.0 {
+                    length as usize
+                } else {
+                    0
+                };
+                (0..length)
+                    .map(|index| list.get_property(&index.to_string()))
+                    .collect()
+            };
+            this.call(this_arg, applied)
+        }),
+    );
+    prototype.set_property(
+        "bind",
+        Value::function(|this, args| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("bind", &this);
+            }
+            let target = this.clone();
+            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
+            Value::function(move |_, call_args| {
+                let mut combined = bound_args.clone();
+                combined.extend(call_args);
+                target.call(this_arg.clone(), combined)
+            })
+        }),
+    );
+    prototype.set_property(
+        "toString",
+        Value::function(|this, _| {
+            if !this.is_callable() {
+                return incompatible_function_receiver("toString", &this);
+            }
+            let name = this.get_property("name");
+            let name = if name.is_string() {
+                name.to_js_string()
+            } else {
+                String::new()
+            };
+            Value::string(&format!("function {name}() {{ [native code] }}"))
+        }),
+    );
 }
 
 fn frame_function_compat_class(global: Value, document: Value) -> Value {
@@ -7627,6 +7724,78 @@ fn boolean_compat_class() -> Value {
     class
 }
 
+/// Keyword-valued properties `CSS.supports(property, value)` validates.
+fn css_keyword_value_supported(property: &str, value: &str) -> Option<bool> {
+    let keywords: &[&str] = match property {
+        "display" => &[
+            "block",
+            "inline",
+            "inline-block",
+            "flex",
+            "inline-flex",
+            "grid",
+            "inline-grid",
+            "flow-root",
+            "none",
+            "contents",
+            "list-item",
+            "table",
+            "inline-table",
+            "table-row-group",
+            "table-header-group",
+            "table-footer-group",
+            "table-row",
+            "table-column-group",
+            "table-column",
+            "table-cell",
+            "table-caption",
+            "ruby",
+            "ruby-text",
+        ],
+        "position" => &["static", "relative", "absolute", "fixed", "sticky"],
+        "overflow" | "overflow-x" | "overflow-y" => {
+            &["visible", "hidden", "clip", "scroll", "auto", "overlay"]
+        }
+        "visibility" => &["visible", "hidden", "collapse"],
+        "box-sizing" => &["content-box", "border-box"],
+        "float" => &["none", "left", "right", "inline-start", "inline-end"],
+        "white-space" => &[
+            "normal",
+            "nowrap",
+            "pre",
+            "pre-wrap",
+            "pre-line",
+            "break-spaces",
+        ],
+        "flex-direction" => &["row", "row-reverse", "column", "column-reverse"],
+        "flex-wrap" => &["nowrap", "wrap", "wrap-reverse"],
+        "pointer-events" => &[
+            "auto",
+            "none",
+            "visiblepainted",
+            "visiblefill",
+            "visiblestroke",
+            "visible",
+            "painted",
+            "fill",
+            "stroke",
+            "all",
+            "bounding-box",
+        ],
+        "user-select" => &["auto", "none", "text", "all", "contain"],
+        _ => return None,
+    };
+    let value = value.trim().to_ascii_lowercase();
+    Some(
+        keywords.contains(&value.as_str())
+            || matches!(
+                value.as_str(),
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+            )
+            || value.starts_with("var("),
+    )
+}
+
 fn css_property_supported(property: &str, value: &str) -> bool {
     let property = camel_to_kebab(property.trim());
     if property.starts_with("--") {
@@ -7634,6 +7803,9 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     }
     if value.trim().is_empty() {
         return false;
+    }
+    if let Some(supported) = css_keyword_value_supported(&property, value) {
+        return supported;
     }
     if matches!(
         property.as_str(),
@@ -8113,6 +8285,16 @@ fn parse_stylesheet_rules(text: &str) -> Vec<String> {
 
 fn stylesheet_value() -> Value {
     let rules = Rc::new(RefCell::new(Vec::<String>::new()));
+    let sheet_id = NEXT_SHEET_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    });
+    SHEET_RULES.with(|sheets| {
+        let mut sheets = sheets.borrow_mut();
+        sheets.retain(|_, rules| rules.strong_count() > 0);
+        sheets.insert(sheet_id, Rc::downgrade(&rules));
+    });
     let value = Value::object(HashMap::from([
         ("disabled".to_string(), Value::Bool(false)),
         ("href".to_string(), Value::Null),
@@ -8121,6 +8303,10 @@ fn stylesheet_value() -> Value {
         ("title".to_string(), Value::Null),
         ("type".to_string(), Value::string("text/css")),
         ("media".to_string(), media_list_value("")),
+        (
+            "__w3cos_sheet_id".to_string(),
+            Value::Number(sheet_id as f64),
+        ),
     ]));
     for name in ["cssRules", "rules"] {
         let rules = rules.clone();
@@ -8148,6 +8334,8 @@ fn stylesheet_value() -> Value {
                     )])));
                 }
                 rules.insert(index, rule);
+                drop(rules);
+                adopted_sheet_changed(sheet_id);
                 Value::Number(index as f64)
             }),
         );
@@ -8161,6 +8349,7 @@ fn stylesheet_value() -> Value {
                 if index < rules.borrow().len() {
                     rules.borrow_mut().remove(index);
                 }
+                adopted_sheet_changed(sheet_id);
                 Value::Undefined
             }),
         );
@@ -8171,6 +8360,7 @@ fn stylesheet_value() -> Value {
             "replaceSync",
             func(move |_, args| {
                 *rules.borrow_mut() = parse_stylesheet_rules(&arg(&args, 0).to_js_string());
+                adopted_sheet_changed(sheet_id);
                 Value::Undefined
             }),
         );
@@ -8182,6 +8372,7 @@ fn stylesheet_value() -> Value {
             "replace",
             func(move |_, args| {
                 *rules.borrow_mut() = parse_stylesheet_rules(&arg(&args, 0).to_js_string());
+                adopted_sheet_changed(sheet_id);
                 resolved_thenable(sheet.clone())
             }),
         );
@@ -8214,6 +8405,84 @@ fn processing_instruction_sheet(node: u32) -> Value {
     sheet.set_property("ownerNode", element_value(node));
     set_expando(node, "sheet", sheet.clone());
     sheet
+}
+
+/// Cascade owner of an adopted sheet (`<style>` owners are node ids, < 2^32).
+fn adopted_sheet_owner(id: u64) -> u64 {
+    (1 << 40) + id
+}
+
+/// Re-register the adopted sheets in the cascade, in array order (after the
+/// document's own sheets, like the CSSOM).
+fn register_adopted_sheets(ids: &[u64]) {
+    for id in ids {
+        w3cos_dom::stylesheet::clear_owner(adopted_sheet_owner(*id));
+    }
+    for id in ids {
+        let css = SHEET_RULES.with(|sheets| {
+            sheets
+                .borrow()
+                .get(id)
+                .and_then(std::rc::Weak::upgrade)
+                .map(|rules| rules.borrow().join("\n"))
+        });
+        if let Some(css) = css {
+            register_author_sheet(adopted_sheet_owner(*id), &css);
+        }
+    }
+    dom::mark_dom_dirty();
+}
+
+/// A constructed sheet changed: refresh the cascade if it is adopted.
+fn adopted_sheet_changed(id: u64) {
+    let ids = ADOPTED_SHEETS.with(|adopted| adopted.borrow().1.clone());
+    if ids.contains(&id) {
+        register_adopted_sheets(&ids);
+    }
+}
+
+/// `document.adoptedStyleSheets` as an accessor whose sheets join the cascade.
+fn install_adopted_style_sheets(document: &Value) {
+    document.delete_property("adoptedStyleSheets");
+    document.set_property(
+        "__w3cos_getter_adoptedStyleSheets",
+        func(|_, _| {
+            ADOPTED_SHEETS.with(|adopted| {
+                let mut adopted = adopted.borrow_mut();
+                adopted.0.get_or_insert_with(|| js_array(vec![])).clone()
+            })
+        }),
+    );
+    document.set_property(
+        "__w3cos_setter_adoptedStyleSheets",
+        func(|_, args| {
+            let list = arg(&args, 0);
+            let length = list.get_property("length").to_u32();
+            let mut sheets = Vec::with_capacity(length as usize);
+            let mut ids = Vec::with_capacity(length as usize);
+            for index in 0..length {
+                let sheet = list.get_property(&index.to_string());
+                let id = sheet.get_property("__w3cos_sheet_id");
+                if id.as_number().is_none() {
+                    type_error(
+                        "Failed to set the 'adoptedStyleSheets' property on 'Document': Failed to convert value to 'CSSStyleSheet'.",
+                    );
+                }
+                ids.push(id.to_number() as u64);
+                sheets.push(sheet);
+            }
+            let previous = ADOPTED_SHEETS.with(|adopted| {
+                let mut adopted = adopted.borrow_mut();
+                adopted.0 = Some(js_array(sheets));
+                std::mem::replace(&mut adopted.1, ids.clone())
+            });
+            for id in previous {
+                w3cos_dom::stylesheet::clear_owner(adopted_sheet_owner(id));
+            }
+            register_adopted_sheets(&ids);
+            Value::Undefined
+        }),
+    );
 }
 
 pub(crate) fn install_author_stylesheet(node: u32, href: Option<&str>, source: &str) -> Value {
@@ -10429,13 +10698,25 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "hidden" => Value::Bool(dom::has_attribute(node, "hidden")),
         "tabIndex" => Value::Number(
             dom::get_attribute(node, "tabindex")
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(-1.0),
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .map_or_else(|| default_tab_index(node), f64::from),
         ),
         "lang" => Value::string(&dom::get_attribute(node, "lang").unwrap_or_default()),
-        "draggable" => {
-            Value::Bool(dom::get_attribute(node, "draggable").as_deref() == Some("true"))
-        }
+        "draggable" => Value::Bool(
+            match dom::get_attribute(node, "draggable")
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("true") => true,
+                Some("false") => false,
+                // HTML: images and links with an href are draggable by default.
+                _ => match dom::tag_name(node).as_str() {
+                    "img" => true,
+                    "a" => dom::has_attribute(node, "href"),
+                    _ => false,
+                },
+            },
+        ),
         "slot" => Value::string(&dom::get_attribute(node, "slot").unwrap_or_default()),
 
         // ── Style ──
@@ -10986,40 +11267,65 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "getClientRects" => func(move |_, _| {
             crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
         }),
-        "offsetWidth" | "clientWidth" => Value::Number(forced_bounding_rect(node).width as f64),
-        "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
+        "offsetWidth" => Value::Number(forced_bounding_rect(node).width as f64),
+        "offsetHeight" => Value::Number(forced_bounding_rect(node).height as f64),
+        // The padding box: the border box without its borders.
+        "clientWidth" => {
+            let width = forced_bounding_rect(node).width as f64;
+            let borders = border_width_px(node, "left") + border_width_px(node, "right");
+            Value::Number((width - borders).max(0.0))
+        }
+        "clientHeight" => {
+            let height = forced_bounding_rect(node).height as f64;
+            let borders = border_width_px(node, "top") + border_width_px(node, "bottom");
+            Value::Number((height - borders).max(0.0))
+        }
         "scrollWidth" => Value::Number(forced_scroll_size(node).0),
         "scrollHeight" => Value::Number(forced_scroll_size(node).1),
         "offsetTop" => Value::Number(offset_position(node).1 as f64),
         "offsetLeft" => Value::Number(offset_position(node).0 as f64),
         "offsetParent" => element_or_null(offset_parent_node(node)),
-        "clientTop" | "clientLeft" => Value::Number(0.0),
+        "clientTop" => Value::Number(border_width_px(node, "top")),
+        "clientLeft" => Value::Number(border_width_px(node, "left")),
         "scrollTop" => Value::Number(dom::get_scroll_offset(node).1 as f64),
         "scrollLeft" => Value::Number(dom::get_scroll_offset(node).0 as f64),
         "scrollIntoView" => func(move |_, args| {
             scroll_element_into_view(node, arg(&args, 0));
             Value::Undefined
         }),
-        "scrollTo" | "scrollBy" | "scroll" => func(move |_, args| {
-            // Accepts (x, y) or an options object {left, top}.
-            let (mut left, mut top) = dom::get_scroll_offset(node);
-            let first = arg(&args, 0);
-            if first.is_object() {
-                let l = first.get_property("left");
-                let t = first.get_property("top");
-                if !l.is_undefined() {
-                    left = l.to_number() as f32;
+        "scrollTo" | "scrollBy" | "scroll" => {
+            let relative = key == "scrollBy";
+            func(move |_, args| {
+                // Accepts (x, y) or an options object {left, top}; scrollBy
+                // is relative to the current offset.
+                let (current_left, current_top) = dom::get_scroll_offset(node);
+                let (mut left, mut top) = if relative {
+                    (0.0, 0.0)
+                } else {
+                    (current_left, current_top)
+                };
+                let first = arg(&args, 0);
+                if first.is_object() {
+                    let l = first.get_property("left");
+                    let t = first.get_property("top");
+                    if !l.is_undefined() {
+                        left = l.to_number() as f32;
+                    }
+                    if !t.is_undefined() {
+                        top = t.to_number() as f32;
+                    }
+                } else {
+                    left = first.to_number() as f32;
+                    top = arg(&args, 1).to_number() as f32;
                 }
-                if !t.is_undefined() {
-                    top = t.to_number() as f32;
+                if relative {
+                    left += current_left;
+                    top += current_top;
                 }
-            } else {
-                left = first.to_number() as f32;
-                top = arg(&args, 1).to_number() as f32;
-            }
-            set_element_scroll_offset(node, Some(left), Some(top));
-            Value::Undefined
-        }),
+                set_element_scroll_offset(node, Some(left), Some(top));
+                Value::Undefined
+            })
+        }
 
         // ── Focus (bridge-side tracking; no real input focus yet) ──
         "focus" => func(move |_, _| {
@@ -11480,10 +11786,43 @@ pub(crate) fn sync_style_element(node: u32) {
     let owner = node as u64;
     w3cos_dom::stylesheet::clear_owner(owner);
     if !dom::is_connected(node) {
+        if get_expando(node, "sheet").is_some_and(|sheet| !sheet.is_null()) {
+            remove_author_stylesheet(node);
+        }
         return;
     }
     let css = dom::get_descendant_text_content(node);
     register_author_sheet(owner, &css);
+    // `document.styleSheets` / `style.sheet`, in tree order.
+    install_author_stylesheet(node, None, &css);
+    let mut owners = AUTHOR_STYLE_SHEETS.with(|sheets| {
+        sheets
+            .borrow()
+            .iter()
+            .map(|sheet| sheet.get_property("__w3cos_owner_node_id").to_u32())
+            .collect::<Vec<_>>()
+    });
+    if owners.len() > 1 {
+        owners.sort_by(|a, b| dom::tree_order(*a, *b));
+        order_author_stylesheets(&owners);
+    }
+}
+
+/// Re-sync the `<style>` elements in `root`'s inclusive subtree after it was
+/// inserted into, or removed from, a document.
+pub(crate) fn sync_style_tree(root: u32) {
+    if dom::node_type(root) != 1 {
+        return;
+    }
+    sync_style_element(root);
+    let style = style_atom();
+    for node in descendant_elements(root) {
+        let is_style =
+            dom::with_document(|doc| doc.get_node(w3cos_dom::NodeId::from_u32(node)).tag == style);
+        if is_style {
+            sync_style_element(node);
+        }
+    }
 }
 
 fn register_author_sheet(owner: u64, css: &str) {
@@ -11589,6 +11928,16 @@ fn element_computed_set(node: u32, key: &str, value: Value) -> bool {
             dom::set_text_content(node, &text);
         }
         "nodeValue" => {}
+        // HTML: the setter replaces the children with one Text node, like
+        // `textContent` (line breaks stay text; `<br>` insertion is a gap).
+        "innerText" if matches!(dom::node_type(node), 1 | 11) => {
+            let text = if value.is_null() {
+                String::new()
+            } else {
+                value.to_js_string()
+            };
+            apply_text_content(node, &text);
+        }
         "innerText" => {
             clear_children(node);
             dom::set_text_content(node, &value.to_js_string());
@@ -13366,17 +13715,39 @@ fn normalize_inline_style_property(property: &str, value: &str) -> Option<String
     w3cos_std::color::Color::from_css(&lower).map(serialize_css_color)
 }
 
+/// CSSOM serialization: `a: b; c: d !important;`.
 fn style_css_text(node: u32) -> String {
     STYLE_CACHE.with(|c| {
         let mut out = String::new();
         for (k, v) in c.borrow().nonempty_pairs(node) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
             out.push_str(&k);
             out.push_str(": ");
             out.push_str(&v);
-            out.push_str("; ");
+            if inline_important(node, &k) {
+                out.push_str(" !important");
+            }
+            out.push(';');
         }
         out
     })
+}
+
+fn inline_important(node: u32, property: &str) -> bool {
+    INLINE_IMPORTANT.with(|set| set.borrow().contains(&(node, property.to_string())))
+}
+
+fn set_inline_important(node: u32, property: &str, important: bool) {
+    INLINE_IMPORTANT.with(|set| {
+        let mut set = set.borrow_mut();
+        if important {
+            set.insert((node, property.to_string()));
+        } else {
+            set.remove(&(node, property.to_string()));
+        }
+    });
 }
 
 fn style_property_names(node: u32) -> Vec<String> {
@@ -13580,13 +13951,27 @@ fn typed_style_map_value(node: u32, readonly: bool) -> Value {
 }
 
 fn parse_css_text(node: u32, css: &str) {
+    // Setting cssText replaces every inline declaration.
+    for name in style_property_names(node) {
+        set_inline_important(node, &name, false);
+        style_apply(node, &name, "");
+    }
     for decl in css.split(';') {
         let decl = decl.trim();
         if decl.is_empty() {
             continue;
         }
         if let Some((prop, value)) = decl.split_once(':') {
-            style_apply(node, &camel_to_kebab(prop.trim()), value.trim());
+            let prop = camel_to_kebab(prop.trim());
+            let value = value.trim();
+            let (value, important) = match value.rsplit_once('!') {
+                Some((head, tail)) if tail.trim().eq_ignore_ascii_case("important") => {
+                    (head.trim(), true)
+                }
+                _ => (value, false),
+            };
+            style_apply(node, &prop, value);
+            set_inline_important(node, &prop, important);
         }
     }
 }
@@ -13613,8 +13998,23 @@ fn style_value(node: u32) -> Value {
                 "setProperty" => func(move |_, args| {
                     let prop = camel_to_kebab(&arg(&args, 0).to_js_string());
                     let value = arg(&args, 1).to_js_string();
+                    let priority = arg(&args, 2);
+                    let important = !priority.is_undefined()
+                        && priority.to_js_string().eq_ignore_ascii_case("important");
+                    if !priority.is_undefined() && !important && !priority.to_js_string().is_empty()
+                    {
+                        // An invalid priority makes the call a no-op.
+                        return Value::Undefined;
+                    }
                     style_apply(node, &prop, &value);
+                    set_inline_important(node, &prop, important && !value.is_empty());
                     Value::Undefined
+                }),
+                "getPropertyPriority" => func(move |_, args| {
+                    let prop = camel_to_kebab(&arg(&args, 0).to_js_string());
+                    let important =
+                        inline_important(node, &prop) && !style_read(node, &prop).is_empty();
+                    Value::string(if important { "important" } else { "" })
                 }),
                 "getPropertyValue" => func(move |_, args| {
                     let prop = camel_to_kebab(&arg(&args, 0).to_js_string());
@@ -13622,6 +14022,7 @@ fn style_value(node: u32) -> Value {
                 }),
                 "removeProperty" => func(move |_, args| {
                     let prop = camel_to_kebab(&arg(&args, 0).to_js_string());
+                    set_inline_important(node, &prop, false);
                     let old = style_read(node, &prop);
                     style_apply(node, &prop, "");
                     Value::string(&old)
@@ -13699,6 +14100,30 @@ fn serialize_css_color(color: w3cos_std::color::Color) -> String {
         alpha.pop();
     }
     format!("rgba({}, {}, {}, {alpha})", color.r, color.g, color.b)
+}
+
+/// Used border width of one side, in px (0 for inline / unstyled boxes).
+fn border_width_px(node: u32, side: &str) -> f64 {
+    if dom::node_type(node) != 1 {
+        return 0.0;
+    }
+    dom::computed_style_property(node, &format!("border-{side}-width"))
+        .trim_end_matches("px")
+        .parse::<f64>()
+        .unwrap_or(0.0)
+}
+
+/// HTML's default `tabIndex`: 0 for focusable controls and links, -1 otherwise.
+fn default_tab_index(node: u32) -> f64 {
+    let focusable = match dom::tag_name(node).as_str() {
+        "a" | "area" => dom::has_attribute(node, "href"),
+        "button" | "select" | "textarea" | "iframe" | "summary" => true,
+        "input" => !dom::get_attribute(node, "type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")),
+        _ => dom::get_attribute(node, "contenteditable")
+            .is_some_and(|value| !value.eq_ignore_ascii_case("false")),
+    };
+    if focusable { 0.0 } else { -1.0 }
 }
 
 fn computed_style_property_value(node: u32, pseudo: Option<&str>, property: &str) -> String {
@@ -17836,7 +18261,6 @@ fn build_document_value() -> Value {
         "styleSheets".to_string(),
         AUTHOR_STYLE_SHEETS.with(|sheets| style_sheet_list_value(Rc::clone(sheets))),
     );
-    props.insert("adoptedStyleSheets".to_string(), js_array(vec![]));
     props.insert("doctype".to_string(), Value::Null);
     props.insert("implementation".to_string(), implementation.clone());
     props.insert(
@@ -18150,6 +18574,35 @@ fn build_document_value() -> Value {
         }),
     );
     props.insert("hasFocus".to_string(), func(|_, _| Value::Bool(true)));
+    // Editing commands Chromium reports as supported (execCommand itself still
+    // only reaches the Clipboard API through the app).
+    for name in ["queryCommandSupported"] {
+        props.insert(
+            name.to_string(),
+            func(|_, args| {
+                let command = arg(&args, 0).to_js_string().to_ascii_lowercase();
+                Value::Bool(matches!(
+                    command.as_str(),
+                    "copy"
+                        | "cut"
+                        | "paste"
+                        | "delete"
+                        | "forwarddelete"
+                        | "inserttext"
+                        | "inserthtml"
+                        | "insertparagraph"
+                        | "insertlinebreak"
+                        | "selectall"
+                        | "undo"
+                        | "redo"
+                        | "bold"
+                        | "italic"
+                        | "underline"
+                        | "strikethrough"
+                ))
+            }),
+        );
+    }
     props.insert(
         "adoptNode".to_string(),
         func(|document, args| adopt_node_into(&document, arg(&args, 0))),
@@ -18315,6 +18768,7 @@ fn build_document_value() -> Value {
     );
 
     let document = document_node_value(props);
+    install_adopted_style_sheets(&document);
     implementation.set_property("__w3cos_owner_document", document.clone());
     w3cos_core::class::set_prototype_of(
         &document,
@@ -19545,6 +19999,23 @@ pub fn window_value() -> Value {
 }
 
 fn build_window_value() -> Value {
+    // `worker_threads` workers run this runtime's event loop on their own
+    // thread (see `w3cos_core::node_workers`).
+    w3cos_core::node_workers::register_event_loop(w3cos_core::node_workers::EventLoopHooks {
+        drain_microtasks,
+        tick_timers,
+        next_timer_deadline,
+    });
+    // Native-module replacements for Node glue (`@vscode/sqlite3`,
+    // `@parcel/watcher`).
+    w3cos_core::node_host::register_extension(crate::node_sqlite::install);
+    // Electron `safeStorage` on the local keyring.
+    w3cos_core::node_host::register_extension(crate::node_safe_storage::install);
+    #[cfg(all(
+        any(target_os = "macos", target_os = "linux", target_os = "windows"),
+        not(target_env = "ohos")
+    ))]
+    w3cos_core::node_host::register_extension(crate::node_watcher::install);
     let mut props: HashMap<String, Value> = HashMap::new();
 
     props.insert("document".to_string(), document_value());
@@ -22339,6 +22810,14 @@ pub fn reset_bridge() {
     EVENT_COUNTS.with(|counts| *counts.borrow_mut() = initial_event_counts());
     MEDIA_QUERY_LISTS.with(|lists| lists.borrow_mut().clear());
     AUTHOR_STYLE_SHEETS.with(|sheets| sheets.borrow_mut().clear());
+    INLINE_IMPORTANT.with(|set| set.borrow_mut().clear());
+    ADOPTED_SHEETS.with(|adopted| {
+        let mut adopted = adopted.borrow_mut();
+        for id in adopted.1.drain(..) {
+            w3cos_dom::stylesheet::clear_owner(adopted_sheet_owner(id));
+        }
+        adopted.0 = None;
+    });
     LIVE_RANGES.with(|ranges| ranges.borrow_mut().clear());
     ACTIVE_ELEMENT.with(|a| *a.borrow_mut() = None);
     KEYBOARD_FOCUS_MODALITY.with(|modality| modality.set(true));
@@ -22698,11 +23177,8 @@ mod tests {
             Value::function(|_, _| Value::Undefined),
         );
         assert!(
-            w3cos_core::intrinsics::dom_matches_guarded(
-                &prototype_host,
-                &Value::string("div"),
-            )
-            .is_undefined(),
+            w3cos_core::intrinsics::dom_matches_guarded(&prototype_host, &Value::string("div"),)
+                .is_undefined(),
             "a setter-only matches descriptor must shadow the builtin"
         );
         prototype.delete_property("__w3cos_setter_matches");
@@ -22760,6 +23236,34 @@ mod tests {
                 .to_js_string(),
             "fake"
         );
+    }
+
+    #[test]
+    fn function_prototype_methods_are_first_class_values() {
+        let prototype = function_compat_class().get_property("prototype");
+        let call = prototype.get_property("call");
+        let apply = prototype.get_property("apply");
+        let bind = prototype.get_property("bind");
+        assert!(call.is_callable() && apply.is_callable() && bind.is_callable());
+        let max = Value::function(|_, args| {
+            Value::Number(args.iter().map(Value::to_number).fold(f64::MIN, f64::max))
+        });
+        // function-bind polyfill: `bind.call($call, $apply)(fn, this, list)`.
+        let apply_via_call = bind.call(call.clone(), vec![apply.clone()]);
+        let list = Value::array(vec![
+            Value::Number(1.0),
+            Value::Number(5.0),
+            Value::Number(3.0),
+        ]);
+        let result = apply_via_call.call(Value::Undefined, vec![max.clone(), Value::Null, list]);
+        assert_eq!(result.to_number(), 5.0);
+        let receiver = Value::function(|this, _| this);
+        let marker = Value::string("marker");
+        assert_eq!(
+            call.call(receiver, vec![marker.clone()]).to_js_string(),
+            "marker"
+        );
+        assert!(prototype.get_property("toString").is_callable());
     }
 
     #[test]

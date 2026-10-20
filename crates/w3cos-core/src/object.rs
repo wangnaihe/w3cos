@@ -238,7 +238,7 @@ impl JsObject {
         // An own getter shadows prototype data even before it is invoked by
         // Value::get_property. In particular, a Document method accessor must
         // not resolve its prototype's forwarding method and recurse forever.
-        if self.own_getter(key).is_some() {
+        if self.own_getter(key).is_some() || self.own_setter_only(key) {
             return Value::Undefined;
         }
         if let Some(ref proto) = self.prototype {
@@ -247,6 +247,34 @@ impl JsObject {
             }
         }
         Value::Undefined
+    }
+
+    /// An own accessor with a setter and no getter: `[[Get]]` yields
+    /// `undefined` and must not consult the prototype.
+    fn own_setter_only(&self, key: &str) -> bool {
+        self.properties.may_have_marker_key()
+            && self
+                .properties
+                .contains_key(format!("__w3cos_setter_{key}").as_str())
+            && !self
+                .properties
+                .contains_key(format!("__w3cos_getter_{key}").as_str())
+    }
+
+    /// The getter `[[Get]]` of `key` runs: the first object on the chain
+    /// owning `key` decides (data or a setter-only accessor yield `None`; a
+    /// runtime accessor may also keep a placeholder data slot of its name).
+    pub(crate) fn chain_getter(&self, key: &str) -> Option<Value> {
+        if let Some(getter) = self.own_getter(key) {
+            return Some(getter);
+        }
+        if self.properties.contains_key(key) || self.own_setter_only(key) {
+            return None;
+        }
+        match &self.prototype {
+            Some(proto) if proto.is_live() => proto.borrow().chain_getter(key),
+            _ => None,
+        }
     }
 
     /// `[[Set]]` — routes through `handler.set` if present.
@@ -324,6 +352,10 @@ impl JsObject {
         if self.properties.contains_key(key) {
             return true;
         }
+        // Accessor halves are stored under marker keys.
+        if self.properties.may_have_marker_key() && self.has_own_property(key) {
+            return true;
+        }
         if let Some(ref proto) = self.prototype {
             if proto.is_live() {
                 return proto.borrow().has_direct(key);
@@ -350,7 +382,26 @@ impl JsObject {
                 return trap(&target, key);
             }
         }
-        let removed = self.properties.remove(key).is_some();
+        let mut removed = self.properties.remove(key).is_some();
+        // Deleting an accessor property drops both of its halves. An own data
+        // slot shadowing a runtime accessor (authored override) is removed
+        // alone, re-exposing the accessor.
+        if !removed && !key.starts_with("__w3cos_") && self.properties.may_have_marker_key() {
+            let getter = self
+                .properties
+                .remove(format!("__w3cos_getter_{key}").as_str())
+                .is_some();
+            let setter = self
+                .properties
+                .remove(format!("__w3cos_setter_{key}").as_str())
+                .is_some();
+            if getter {
+                self.has_getter_properties = self
+                    .properties
+                    .any_key(|key| key.as_str().starts_with("__w3cos_getter_"));
+            }
+            removed |= getter || setter;
+        }
         if removed {
             if let Some(rare) = self.rare.as_mut() {
                 rare.non_enumerable.remove(key);

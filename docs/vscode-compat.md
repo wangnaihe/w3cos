@@ -53,8 +53,8 @@ These are capabilities the **platform** must implement. They are not VS Code-spe
 | DOM Events | MouseEvent, KeyboardEvent, FocusEvent, InputEvent, WheelEvent, PointerEvent | Done | P0 | |
 | DOM Events | CompositionEvent (IME input) | Done (winit IME) | P1 | CJK input support |
 | DOM Events | CustomEvent | Done | P1 | Event::custom with detail |
-| CSSOM | element.style read/write, getComputedStyle() | Partial | P0 | getComputedStyle echoes inline style only; no cascade |
-| CSSOM | CSSStyleSheet, adoptedStyleSheets | None | P2 | Theme system |
+| CSSOM | element.style read/write, getComputedStyle() | Done (runtime) | P0 | Runtime cascade over `<style>`, adopted sheets and inline style; `setProperty` priority, `getPropertyPriority`, CSSOM `cssText` serialization; box/text longhands and `--custom` read back from getComputedStyle (M3 item 22, `examples/electron-dom-gaps`) |
+| CSSOM | CSSStyleSheet, adoptedStyleSheets | Done (runtime) | P2 | Constructable sheets (`replaceSync`/`replace`/`insertRule`/`deleteRule`) join the cascade when adopted and restyle on edit; `document.styleSheets` follows tree order. Shadow-root `adoptedStyleSheets` not yet |
 | CSS Flexbox | Full spec | Have (Taffy) | Done | |
 | CSS Grid | Full spec | Have (Taffy) | Done | |
 | CSS Position | relative, absolute, fixed, sticky | Have | Done | |
@@ -66,7 +66,7 @@ These are capabilities the **platform** must implement. They are not VS Code-spe
 | CSS Transitions | transition property | Have | Done | |
 | CSS Animations | @keyframes, animation property | Parsed only | P2 | KeyframeAnimation parsed, never executed |
 | CSS calc() | calc(100% - 20px) | Partial | P2 | px-only evaluator |
-| CSS Custom Props | var(--color), :root definitions | Partial | P1 | Same-block compile-time resolution; no :root runtime cascade |
+| CSS Custom Props | var(--color), :root definitions | Done (runtime) | P1 | Runtime cascade inherits `:root` / ancestor values; inline `setProperty('--x')` / `removeProperty` re-resolve |
 | CSS z-index | Stacking context | Have | Done | |
 | CSS box-shadow | Multi-layer | Have | Done | |
 | CSS border | border-width, border-style, border-color (per-side) | Partial | P1 | Uniform border only; sides collapsed |
@@ -74,13 +74,13 @@ These are capabilities the **platform** must implement. They are not VS Code-spe
 | Canvas 2D | CanvasRenderingContext2D (fillRect, strokeRect, drawImage, fillText, measureText) | Done | P1 | Full path API, ImageData, line styles, transforms |
 | Selection API | window.getSelection(), Range, Selection | Done | P0 | 564-line selection.rs |
 | Clipboard API | navigator.clipboard.readText/writeText | Done | P1 | + ClipboardItem MIME roundtrip |
-| Drag and Drop | dragstart, dragover, drop, DataTransfer | None | P2 | File drag, tab reorder |
+| Drag and Drop | dragstart, dragover, drop, DataTransfer | Partial | P2 | `DataTransfer`/`DragEvent` match Chromium (format aliases, `effectAllowed`/`dropEffect` modes, default `draggable`); no native OS drag source/target yet |
 | ResizeObserver | Element resize monitoring | Done | P1 | observers.rs |
 | MutationObserver | DOM change monitoring | Done | P2 | observers.rs |
 | IntersectionObserver | Visibility detection | Done | P2 | observers.rs |
 | requestAnimationFrame | Frame-synced callbacks | Done | P1 | timers.rs + frame loop |
 | matchMedia | Media query matching | Done | P3 | min/max-width, prefers-color-scheme |
-| window.scrollTo | Programmatic scrolling | None | P1 | Element scrollTop/scrollLeft exist |
+| window.scrollTo | Programmatic scrolling | Done | P1 | window/element `scrollTo`/`scrollBy` (relative), `scrollWidth`/`clientHeight` net of borders |
 
 ### 2.2 JavaScript / TypeScript Runtime (replacing V8)
 
@@ -214,7 +214,7 @@ Platform work:
 - [ ] ESM module system (static import/export)
 
 VS Code work:
-- [ ] Create @electron/shim stub (window creation, basic lifecycle)
+- [x] Create @electron/shim stub (window creation, basic lifecycle) — `@w3cos/electron`, see `docs/W3COS_ELECTRON.md`
 - [ ] Identify and stub Node.js fs calls for initial render
 
 ### Phase B — Code Editing Works (+6 months)

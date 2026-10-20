@@ -406,17 +406,13 @@ mod tests {
         assert!(ic.load().is_none());
         object.set_property_ic("__w3cos_getter_matches", Value::Number(5.0), &ic);
         assert_eq!(
-            object
-                .get_property("__w3cos_getter_matches")
-                .to_number(),
+            object.get_property("__w3cos_getter_matches").to_number(),
             5.0
         );
         assert!(ic.load().is_none());
         object.set_property_ic("__w3cos_setter_matches", Value::Number(6.0), &ic);
         assert_eq!(
-            object
-                .get_property("__w3cos_setter_matches")
-                .to_number(),
+            object.get_property("__w3cos_setter_matches").to_number(),
             6.0
         );
         assert!(ic.load().is_none());

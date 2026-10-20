@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>DOM gaps</title>
+    <style>
+      :root { --fg: rgb(1, 2, 3); --pad: 6px; }
+      body { margin: 0; }
+      .themed { color: var(--fg); padding-left: var(--pad); }
+      #list > li:nth-child(2n+1) { font-weight: 700; }
+      #list li.skip:not(.keep) { display: none; }
+      .scroller { width: 100px; height: 50px; overflow: hidden; }
+      .tall { height: 500px; width: 300px; }
+      .box { width: 120px; height: 40px; border: 2px solid black; padding: 3px; margin: 5px; box-sizing: content-box; }
+      .inherit-parent { color: rgb(9, 8, 7); font-size: 20px; }
+    </style>
+  </head>
+  <body>
+    <div id="themed" class="themed">themed</div>
+    <ul id="list">
+      <li>one</li><li class="skip">two</li><li class="skip keep">three</li><li data-x="abc">four</li>
+    </ul>
+    <div class="scroller" id="scroller"><div class="tall"></div></div>
+    <div class="box" id="box">box</div>
+    <div class="inherit-parent"><span id="child">child</span></div>
+    <div id="dnd" draggable="true">drag me</div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

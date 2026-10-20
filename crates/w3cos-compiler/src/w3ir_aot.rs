@@ -1917,6 +1917,29 @@ fn emit_owned_operand(
     }
 }
 
+/// Inline a single hoisted move (`let __w3cos_owned_R = EXPR; `) back into
+/// its only use, for out-of-line helper calls that take the value by move.
+fn inline_owned(hoisted: &str, value_expr: &str) -> String {
+    if let Some(rest) = hoisted.strip_prefix("let ")
+        && let Some((name, expr)) = rest.split_once(" = ")
+        && name == value_expr
+        && let Some(expr) = expr.strip_suffix("; ")
+        && !expr.contains("; ")
+    {
+        return expr.to_string();
+    }
+    if hoisted.is_empty() {
+        value_expr.to_string()
+    } else {
+        format!("{{ {hoisted}{value_expr} }}")
+    }
+}
+
+/// `propagate` is plain `return Err(e)`: a helper's `Result` can use `?`.
+fn propagates_with_question_mark(propagate: &str) -> bool {
+    propagate == "{ return Err(__w3cos_exception); }"
+}
+
 /// Wrap `statement` in a block after its hoisted moves, if any.
 fn with_hoisted(hoisted: &str, statement: String) -> String {
     if hoisted.is_empty() {
@@ -2137,7 +2160,7 @@ fn emit_registers_field(n: u32) -> String {
 
 fn emit_registers_init(n: u32) -> String {
     if (n as usize) <= INLINE_FRAME {
-        "        registers: std::array::from_fn(|_| w3cos_core::Value::Undefined),\n".to_string()
+        format!("        registers: [const {{ w3cos_core::Value::Undefined }}; {n}],\n")
     } else {
         format!("        registers: vec![w3cos_core::Value::Undefined; {n}],\n")
     }
@@ -2175,15 +2198,19 @@ fn emit_bindings_new(storage: SlotStorage) -> String {
         SlotStorage::Packed(_, len) if len as usize <= INLINE_FRAME => {
             inline_bindings_new(len as usize)
         }
-        SlotStorage::Packed(_, len) => format!("    let mut bindings = vec![None; {len}];\n"),
-        SlotStorage::Dense(len) => format!("    let mut bindings = vec![None; {len}];\n"),
-        SlotStorage::Map => "    let mut bindings = std::collections::HashMap::new();\n".into(),
+        SlotStorage::Packed(_, len) => format!(
+            "    let mut bindings: Vec<Option<w3cos_core::aot_frame::BindingCell>> = vec![None; {len}];\n"
+        ),
+        SlotStorage::Dense(len) => format!(
+            "    let mut bindings: Vec<Option<w3cos_core::aot_frame::BindingCell>> = vec![None; {len}];\n"
+        ),
+        SlotStorage::Map => "    let mut bindings: std::collections::HashMap<u32, w3cos_core::aot_frame::BindingCell> = std::collections::HashMap::new();\n".into(),
     }
 }
 
 fn inline_bindings_new(len: usize) -> String {
     format!(
-        "    let mut bindings: [Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>; {len}] = std::array::from_fn(|_| None);\n"
+        "    let mut bindings: [Option<std::rc::Rc<std::cell::RefCell<(w3cos_core::Value, bool)>>>; {len}] = [const {{ None }}; {len}];\n"
     )
 }
 
@@ -2201,43 +2228,38 @@ fn emit_capture_match_body(index: &str) -> String {
 }
 
 fn emit_capture_init(storage: SlotStorage) -> String {
+    const BIND: &str = "    w3cos_core::aot_frame::bind_captures(__captures, {ids}, &mut capture_getters, &mut capture_setters, &mut bindings);\n";
     match storage {
-        SlotStorage::Dense(len) if len <= INLINE_FRAME => {
-            let body = emit_capture_match_body("index");
-            format!(
-                "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    for (binding, capture) in __captures.iter() {{\n        let index = *binding as usize;\n        {body}\n    }}\n"
-            )
-        }
+        SlotStorage::Dense(len) if len <= INLINE_FRAME => format!(
+            "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n{}",
+            BIND.replace("{ids}", "&[]")
+        ),
         SlotStorage::Packed(ids, len) => {
             let len = len as usize;
-            let mut arms = String::new();
-            for (index, id) in ids.iter().take(len).enumerate() {
-                arms.push_str(&format!("{id} => {index}usize,\n"));
-            }
-            let body = emit_capture_match_body("index");
             let slots = if len <= INLINE_FRAME {
                 format!(
-                    "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = std::array::from_fn(|_| None);\n"
+                    "    let mut capture_getters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n    let mut capture_setters: [Option<w3cos_core::Value>; {len}] = [const {{ None }}; {len}];\n"
                 )
             } else {
                 format!(
                     "    let mut capture_getters: Vec<Option<w3cos_core::Value>> = vec![None; {len}];\n    let mut capture_setters: Vec<Option<w3cos_core::Value>> = vec![None; {len}];\n"
                 )
             };
-            format!(
-                "{slots}    for (binding, capture) in __captures.iter() {{\n        let index = match *binding {{\n            {arms}            _ => continue,\n        }};\n        {body}\n    }}\n"
-            )
+            let ids = ids[..len]
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{slots}{}", BIND.replace("{ids}", &format!("&[{ids}]")))
         }
-        SlotStorage::Dense(_) => {
-            let number = emit_number_capture_slots("index");
-            format!(
-                "    let mut capture_getters = vec![None; bindings.len()];\n    let mut capture_setters = vec![None; bindings.len()];\n    for (binding, capture) in __captures.iter() {{\n        let index = *binding as usize;\n        match capture {{\n            w3cos_core::AotCapture::Accessors(getter, setter) => {{\n                if let Some(slot) = capture_getters.get_mut(index) {{ *slot = Some(getter.clone()); }}\n                if let Some(slot) = capture_setters.get_mut(index) {{ *slot = Some(setter.clone()); }}\n            }}\n            w3cos_core::AotCapture::Cell(cell) => {{\n                if let Some(slot) = bindings.get_mut(index) {{ *slot = Some(std::rc::Rc::clone(cell)); }}\n            }}\n            {number}\n        }}\n    }}\n"
-            )
-        }
-        SlotStorage::Map => (
-            "    let mut capture_getters = std::collections::HashMap::new();\n    let mut capture_setters = std::collections::HashMap::new();\n    for (binding, capture) in __captures.iter() {\n        match capture {\n            w3cos_core::AotCapture::Accessors(getter, setter) => {\n                capture_getters.insert(*binding, getter.clone());\n                capture_setters.insert(*binding, setter.clone());\n            }\n            w3cos_core::AotCapture::Cell(cell) => {\n                bindings.insert(*binding, std::rc::Rc::clone(cell));\n            }\n            w3cos_core::AotCapture::Number(cell) => {\n                let __w3cos_number = std::rc::Rc::clone(cell);\n                let __w3cos_number_set = std::rc::Rc::clone(cell);\n                capture_getters.insert(*binding, w3cos_core::Value::function(move |_, _| match __w3cos_number.get() { Some(n) => w3cos_core::Value::Number(n), None => w3cos_core::Value::Undefined }));\n                capture_setters.insert(*binding, w3cos_core::Value::function(move |_, arguments| { let next = arguments.first().map(|value| value.to_number()).unwrap_or(f64::NAN); __w3cos_number_set.set(Some(next)); w3cos_core::Value::Undefined }));\n            }\n        }\n    }\n"
-        )
-            .into(),
+        SlotStorage::Dense(_) => format!(
+            "    let mut capture_getters: Vec<Option<w3cos_core::Value>> = vec![None; bindings.len()];\n    let mut capture_setters: Vec<Option<w3cos_core::Value>> = vec![None; bindings.len()];\n{}",
+            BIND.replace("{ids}", "&[]")
+        ),
+        SlotStorage::Map => format!(
+            "    let mut capture_getters: std::collections::HashMap<u32, w3cos_core::Value> = std::collections::HashMap::new();\n    let mut capture_setters: std::collections::HashMap<u32, w3cos_core::Value> = std::collections::HashMap::new();\n{}",
+            BIND.replace("{ids}", "&[]")
+        ),
     }
 }
 
@@ -4767,7 +4789,7 @@ fn fuse_private_binding_loads(
         if remaining.contains(&format!("self.registers[{register}]")) {
             continue;
         }
-        let cell = emit_binding_get(storage, binding.0);
+        let key = slot_index(storage, binding.0);
         let propagate = emit_exception_propagation(exception_target, mode, plan);
         // The cell borrow and TDZ check stay outside any catch wrapper, so the
         // TDZ error takes the same path the standalone load's would.
@@ -4779,7 +4801,7 @@ fn fuse_private_binding_loads(
             prewrapped.insert(next);
         }
         emitted[next] = format!(
-            "match {cell} {{ Some(__w3cos_cell) => {{ let {local} = __w3cos_cell.borrow(); if !{local}.1 {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} {replaced} }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}"
+            "match w3cos_core::aot_frame::ready_cell(&self.bindings, {key}) {{ Ok(__w3cos_cell) => {{ let {local} = __w3cos_cell.borrow(); {replaced} }} Err(__w3cos_exception) => {propagate} }}"
         );
         fused.insert(current);
         index = next + 1;
@@ -7594,17 +7616,21 @@ fn emit_instruction(
             let getter = emit_capture_get(storage, binding.0);
             let cell = emit_binding_get(storage, binding.0);
             let propagate = emit_exception_propagation(exception_target, mode, plan);
-            let dst_store = format!("self.registers[{dst_reg}] = __w3cos_value;");
-            let local = format!(
-                "match {cell} {{ Some(cell) => {{ let binding = cell.borrow(); if binding.1 {{ self.registers[{dst_reg}] = binding.0.clone(); }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }} None => {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} }}"
-            );
-            if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
+            let _ = (getter, cell);
+            let key = slot_index(storage, binding.0);
+            // Out-of-line capture/TDZ protocol (w3cos_core::aot_frame).
+            let helper = if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
+                "load"
+            } else {
+                "load_catch"
+            };
+            if propagates_with_question_mark(&propagate) {
                 format!(
-                    "if let Some(getter) = {getter} {{ let __w3cos_value = getter.call_slice(w3cos_core::Value::Undefined, &[]); {dst_store} }} else {{ {local} }}"
+                    "self.registers[{dst_reg}] = w3cos_core::aot_frame::{helper}(&self.capture_getters, &self.bindings, {key})?;"
                 )
             } else {
                 format!(
-                    "if let Some(getter) = {getter} {{ match w3cos_core::catch_js(|| getter.call_slice(w3cos_core::Value::Undefined, &[])) {{ Ok(__w3cos_value) => {{ {dst_store} }} Err(__w3cos_exception) => {propagate} }} }} else {{ {local} }}"
+                    "match w3cos_core::aot_frame::{helper}(&self.capture_getters, &self.bindings, {key}) {{ Ok(__w3cos_value) => {{ self.registers[{dst_reg}] = __w3cos_value; }} Err(__w3cos_exception) => {propagate} }}"
                 )
             }
         }
@@ -7619,14 +7645,18 @@ fn emit_instruction(
         Instruction::InitializeBinding { binding, value } => {
             // Both branches are alternatives, so one hoisted move serves both.
             let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &[value.0], value.0);
-            with_hoisted(
-                &hoisted,
+            let value_expr = inline_owned(&hoisted, &value_expr);
+            if value_expr.contains("self.bindings") {
                 format!(
-                    "if let Some(binding) = {} {{ *binding.borrow_mut() = ({value_expr}, true); }} else {{ {} }}",
-                    emit_binding_get(storage, binding.0),
-                    emit_binding_store_value(storage, binding.0, &format!("({value_expr}, true)")),
-                ),
-            )
+                    "{{ let __w3cos_init = {value_expr}; w3cos_core::aot_frame::initialize(&mut self.bindings, {}, __w3cos_init); }}",
+                    slot_index(storage, binding.0),
+                )
+            } else {
+                format!(
+                    "w3cos_core::aot_frame::initialize(&mut self.bindings, {}, {value_expr});",
+                    slot_index(storage, binding.0),
+                )
+            }
         }
         Instruction::StoreBinding { binding, value } if is_shared_number(binding.0) => {
             emit_shared_number_store(plan, binding.0, value.0)
@@ -7643,19 +7673,22 @@ fn emit_instruction(
             // move serves both.
             let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &[value.0], value.0);
             let propagate = emit_exception_propagation(exception_target, mode, plan);
-            let local = format!(
-                "if let Some(binding) = {cell} {{ let mut binding = binding.borrow_mut(); if !binding.1 {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"binding is not initialized\"); {propagate} }} binding.0 = {value_expr}; }} else {{ let __w3cos_exception = w3cos_core::intrinsics::reference_error(\"missing binding\"); {propagate} }}"
-            );
-            let statement = if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
-                format!(
-                    "if let Some(setter) = {setter} {{ if !setter.is_callable() {{ let __w3cos_exception = w3cos_core::intrinsics::type_error(\"captured binding is immutable\"); {propagate} }} let __w3cos_stored = {value_expr}; setter.call_slice(w3cos_core::Value::Undefined, std::slice::from_ref(&__w3cos_stored)); }} else {{ {local} }}"
-                )
+            let _ = (setter, cell);
+            let key = slot_index(storage, binding.0);
+            let helper = if exception_target.is_none() && matches!(mode, EmissionMode::Sync) {
+                "store"
             } else {
-                format!(
-                    "if let Some(setter) = {setter} {{ if !setter.is_callable() {{ let __w3cos_exception = w3cos_core::intrinsics::type_error(\"captured binding is immutable\"); {propagate} }} let __w3cos_stored = {value_expr}; match w3cos_core::catch_js(|| setter.call_slice(w3cos_core::Value::Undefined, std::slice::from_ref(&__w3cos_stored))) {{ Ok(_) => {{}} Err(__w3cos_exception) => {propagate} }} }} else {{ {local} }}"
-                )
+                "store_catch"
             };
-            with_hoisted(&hoisted, statement)
+            let value_expr = inline_owned(&hoisted, &value_expr);
+            let call = format!(
+                "w3cos_core::aot_frame::{helper}(&self.capture_setters, &self.bindings, {key}, {value_expr})"
+            );
+            if propagates_with_question_mark(&propagate) {
+                format!("{call}?;")
+            } else {
+                format!("match {call} {{ Ok(()) => {{}} Err(__w3cos_exception) => {propagate} }}")
+            }
         }
         Instruction::RefreshBinding { binding } if num_binding_slot(plan, binding.0).is_some() => {
             String::new()
@@ -7967,9 +8000,9 @@ fn emit_instruction(
         ),
         Instruction::CreateObject { dst, properties } => {
             let constructor = if plan.local_allocs.contains(&dst.0) {
-                "local_object"
+                "local_object_literal"
             } else {
-                "object"
+                "object_literal"
             };
             let reads: Vec<u32> = properties
                 .iter()
@@ -8020,31 +8053,16 @@ fn emit_instruction(
             for capture in &ordered_captures {
                 let mutable = binding_is_mutable(function, capture.0);
                 let weaken = back_edges.weak_captures.contains(&(*nested, *capture));
-                let const_getter = "let getter = { let cell = std::rc::Rc::clone(&cell); w3cos_core::Value::function(move |_, _| { let binding = cell.borrow(); if binding.1 { binding.0.clone() } else { w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"binding is not initialized\")) } }) }; let __w3cos_pair = (getter, w3cos_core::Value::Undefined);";
-                let cell_store = if mutable {
-                    if weaken {
-                        format!(
-                            "let __w3cos_target = cell.borrow().0.clone(); if __w3cos_target.is_object() || __w3cos_target.is_array() || __w3cos_target.is_function() {{ let __w3cos_getter = w3cos_core::weak::weak_capture_getter(__w3cos_target); __w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Accessors(__w3cos_getter, w3cos_core::Value::Undefined)); }} else {{ __w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Cell(cell)); }}",
-                            capture.0, capture.0
-                        )
-                    } else {
-                        format!(
-                            "__w3cos_nested_captures.insert({}, w3cos_core::AotCapture::Cell(cell));",
-                            capture.0
-                        )
-                    }
-                } else {
-                    format!(
-                        "{const_getter} {}",
-                        emit_capture_pair_store(capture.0, weaken, false)
-                    )
-                };
+                // Out-of-line adapter (w3cos_core::aot_frame::nest_capture).
                 let adapter = format!(
-                    "if let Some(getter) = {} {{ let __w3cos_pair = (getter, {}.unwrap_or(w3cos_core::Value::Undefined)); {} }} else if let Some(cell) = {} {{ {cell_store} }} else {{ return w3cos_core::throw_value(w3cos_core::intrinsics::reference_error(\"missing nested generator capture\")); }}; ",
-                    emit_capture_get_cloned(storage, capture.0),
-                    emit_capture_setter_get_cloned(storage, capture.0),
-                    emit_capture_pair_store(capture.0, weaken, true),
-                    emit_binding_get_cloned(storage, capture.0),
+                    "w3cos_core::aot_frame::{}(&mut __w3cos_nested_captures, {}, &self.capture_getters, &self.capture_setters, &self.bindings, {}, {mutable}); ",
+                    if weaken {
+                        "nest_capture_weak"
+                    } else {
+                        "nest_capture"
+                    },
+                    capture.0,
+                    slot_index(storage, capture.0),
                 );
                 if is_shared_number(capture.0) {
                     adapters.push_str(&format!(
@@ -8328,7 +8346,7 @@ fn emit_instruction(
             let specifier = module_specifier
                 .ok_or_else(|| anyhow!("import.meta AOT emission requires its W3IR module"))?;
             format!(
-                "self.registers[{}] = w3cos_core::Value::object(std::collections::HashMap::from([(\"url\".to_string(), w3cos_core::Value::string({specifier:?}))]));",
+                "self.registers[{}] = w3cos_core::module_registry::import_meta({specifier:?});",
                 register(*dst)
             )
         }
@@ -8667,18 +8685,33 @@ fn sanitize_identifier(name: &str) -> String {
     }
 }
 
+/// Frame type name for a generated resumable function. Must be injective:
+/// `m5_NKeyMap__m_values` and `m5_NKeyMap__m__values` are distinct JS
+/// methods (`values` / `_values`) and need distinct frame types, so each
+/// underscore run is kept as a count-tagged separator instead of dropped.
 fn upper_camel(name: &str) -> String {
     let mut output = String::new();
     let mut uppercase = true;
+    let mut underscores = 0usize;
     for character in name.chars() {
         if character == '_' {
+            underscores += 1;
             uppercase = true;
-        } else if uppercase {
+            continue;
+        }
+        if underscores > 1 && !output.is_empty() {
+            output.push_str(&format!("U{underscores}"));
+        }
+        underscores = 0;
+        if uppercase {
             output.push(character.to_ascii_uppercase());
             uppercase = false;
         } else {
             output.push(character);
         }
+    }
+    if underscores > 0 {
+        output.push_str(&format!("U{underscores}"));
     }
     output
 }
@@ -9322,6 +9355,7 @@ fn main() {{
         );
         assert!(
             generated.contains("return Err(")
+                || generated.contains("w3cos_core::aot_frame::load(")
                 || generated
                     .contains("let __w3cos_exception = w3cos_core::intrinsics::reference_error"),
             "local TDZ should propagate a Completion Err: {generated}"
@@ -9770,8 +9804,9 @@ fn main() {{
             "object/array literals must not emit Value::Object/Array(Rc::new(...)): {generated}"
         );
         assert!(
-            generated.contains("w3cos_core::Value::object(std::collections::HashMap::new())"),
-            "empty object literals must intern via Value::object(HashMap::new()): {generated}"
+            generated
+                .contains("w3cos_core::Value::object_literal(std::collections::HashMap::new())"),
+            "empty object literals must intern via Value::object_literal(HashMap::new()): {generated}"
         );
         assert!(
             generated.contains("w3cos_core::Value::array(vec!["),
@@ -10008,12 +10043,9 @@ fn main() {{
             .iter()
             .find(|function| function.name.as_deref() == Some("computed"))
             .unwrap();
-        let computed = generate_sync_function_from_module(
-            &computed_module,
-            computed_function,
-            "computed_aot",
-        )
-        .unwrap();
+        let computed =
+            generate_sync_function_from_module(&computed_module, computed_function, "computed_aot")
+                .unwrap();
         assert!(
             computed.contains("call_method_completion"),
             "nonliteral matches must retain computed ordinary dispatch: {computed}"
@@ -10033,12 +10065,9 @@ fn main() {{
             .iter()
             .find(|function| function.name.as_deref() == Some("async_check"))
             .unwrap();
-        let async_generated = generate_async_function_from_module(
-            &async_module,
-            async_function,
-            "async_check_aot",
-        )
-        .unwrap();
+        let async_generated =
+            generate_async_function_from_module(&async_module, async_function, "async_check_aot")
+                .unwrap();
         assert!(
             async_generated.contains("call_method_slice(\"matches\""),
             "async matches must retain ordinary dispatch: {async_generated}"
@@ -10119,7 +10148,7 @@ fn main() {{
             SlotStorage::Dense(_) => {
                 assert!(
                     add_generated.contains("vec![None;")
-                        || add_generated.contains("std::array::from_fn"),
+                        || add_generated.contains("[const { None };"),
                     "dense 0..n BindingIds should index a compact slot array: {add_generated}"
                 );
             }
@@ -10131,7 +10160,7 @@ fn main() {{
             }
             SlotStorage::Packed(_, _) => {
                 assert!(
-                    add_generated.contains("std::array::from_fn")
+                    add_generated.contains("[const { None };")
                         || add_generated.contains("vec![None;"),
                     "sparse add should pack slots: {add_generated}"
                 );
@@ -10141,7 +10170,7 @@ fn main() {{
             SlotStorage::Dense(_) => {
                 assert!(
                     inner_generated.contains("vec![None;")
-                        || inner_generated.contains("std::array::from_fn"),
+                        || inner_generated.contains("[const { None };"),
                     "unexpected dense inner captures: {inner_generated}"
                 );
             }
@@ -10157,9 +10186,10 @@ fn main() {{
             }
             SlotStorage::Packed(_, _) => {
                 assert!(
-                    (inner_generated.contains("std::array::from_fn")
+                    (inner_generated.contains("[const { None };")
                         || inner_generated.contains("vec![None;"))
-                        && inner_generated.contains("AotCapture::Cell"),
+                        && (inner_generated.contains("AotCapture::Cell")
+                            || inner_generated.contains("w3cos_core::aot_frame::bind_captures(")),
                     "a small captured binding should share the parent cell: {inner_generated}"
                 );
                 assert!(
@@ -10195,8 +10225,16 @@ fn main() {{
             .find(|function| function.name.as_deref() == Some("outer"))
             .unwrap();
         let generated = generate_sync_function_from_module(&module, outer, "outer_aot").unwrap();
+        // Mutable captures forward the cell itself (`nest_capture(…, true)`).
         assert!(
-            generated.contains("AotCapture::Cell(cell)"),
+            generated.contains("AotCapture::Cell(cell)")
+                || generated
+                    .split("w3cos_core::aot_frame::nest_capture(")
+                    .skip(1)
+                    .any(|rest| rest
+                        .split(';')
+                        .next()
+                        .is_some_and(|call| call.ends_with(", true)"))),
             "outer let must be shared as a cell: {generated}"
         );
         assert!(
@@ -10451,6 +10489,15 @@ fn main() {{
         let k = binding_named(&module, "k");
         assert_eq!(constants.get(&k), Some(&3.0));
         assert!(!guarded.iter().any(|(_, binding)| *binding == k));
+    }
+
+    #[test]
+    fn frame_type_names_keep_underscore_runs_distinct() {
+        assert_ne!(
+            upper_camel("m5_NKeyMap__m_values__w3ir_generator_factory"),
+            upper_camel("m5_NKeyMap__m__values__w3ir_generator_factory")
+        );
+        assert_eq!(upper_camel("values_aot"), "ValuesAot");
     }
 
     #[test]
