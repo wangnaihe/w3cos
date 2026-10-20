@@ -8329,7 +8329,7 @@ fn emit_instruction(
             let specifier = module_specifier
                 .ok_or_else(|| anyhow!("import.meta AOT emission requires its W3IR module"))?;
             format!(
-                "self.registers[{}] = w3cos_core::Value::object(std::collections::HashMap::from([(\"url\".to_string(), w3cos_core::Value::string({specifier:?}))]));",
+                "self.registers[{}] = w3cos_core::module_registry::import_meta({specifier:?});",
                 register(*dst)
             )
         }
