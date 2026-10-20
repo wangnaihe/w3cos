@@ -3078,6 +3078,14 @@ impl Value {
         if let Some(value) = fast_dom_dispatch(self, key, args.first()) {
             return value;
         }
+        if key == "__w3cos_symbol_to_primitive" && self.type_of() == "symbol" {
+            // Symbols are string sentinels: `sym[Symbol.toPrimitive]()` (and
+            // on `Object(sym)`) resolves through Symbol.prototype.
+            return crate::builtins::symbol_value()
+                .get_property("prototype")
+                .get_property(key)
+                .call(self.clone(), args);
+        }
         if key == "__w3cos_symbol_iterator" {
             if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", args) {
                 return iterator;
