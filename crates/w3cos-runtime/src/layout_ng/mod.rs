@@ -216,14 +216,42 @@ fn note(reason: &'static str) {
     });
 }
 
-/// Entry point used by `LayoutEngine::compute`.  Returns `None` when the tree
-/// is outside the supported stage, so the legacy engine runs.
+/// One line-box piece of a text node broken inside its content, like
+/// Blink's NGPhysicalTextFragment: the node, its [start, end) byte offsets
+/// into the node's text (NGInlineItem start/end offsets) and the piece's
+/// physical rect. `text` is that slice, captured at layout time so later
+/// paint-side whitespace trimming cannot shift the offsets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextFragment {
+    pub index: usize,
+    pub start: usize,
+    pub end: usize,
+    pub rect: LayoutRect,
+    pub text: String,
+}
+
+/// Entry point used by tests: the per-node rects only.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn layout_tree(
     root: &Component,
     flat: &[FlatNodeInfo],
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<Vec<(LayoutRect, usize)>> {
+    layout_tree_with_text(root, flat, viewport_w, viewport_h).map(|(rects, _)| rects)
+}
+
+/// Entry point used by `LayoutEngine::compute`.  Returns `None` when the tree
+/// is outside the supported stage, so the legacy engine runs.  A text node
+/// broken across lines gets one rect per node (the union of its pieces, like
+/// LayoutText's bounding box) plus one `TextFragment` per piece, in fragment
+/// order, which paint draws in place of the node.
+pub(crate) fn layout_tree_with_text(
+    root: &Component,
+    flat: &[FlatNodeInfo],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
     let _ = root;
     let reason = if flat.is_empty() {
         Some("empty")
@@ -284,38 +312,96 @@ pub(crate) fn layout_tree(
         }
         return None;
     };
-    if has_partial_text(&fragment) {
-        // Paint keys text by node (one rect per leaf); text ranges are not
-        // painted yet.
-        if trace() {
-            eprintln!(
-                "[layout-ng] fallback runtime:internal-break-paint ({} boxes)",
-                flat.len()
-            );
-        }
-        return None;
-    }
     let mut out = Vec::with_capacity(flat.len());
-    flatten(&fragment, x, y, &mut out);
-    Some(out)
+    let mut texts = Vec::new();
+    flatten(&fragment, x, y, flat, &mut out, &mut texts);
+    if !texts.is_empty() {
+        // Paint draws pieces as inline text runs; a block-level text leaf
+        // also paints box decorations from its single node rect.
+        // Bidi paint reorders whole text clients; keep that on legacy too.
+        if texts.iter().any(|t| {
+            let style = flat[t.index].style;
+            style.display != w3cos_std::style::Display::Inline
+                || style
+                    .custom_properties
+                    .as_ref()
+                    .is_some_and(|p| p.contains_key("--w3cos-internal-bidi-logical-order"))
+        }) {
+            if trace() {
+                eprintln!(
+                    "[layout-ng] fallback runtime:internal-break-paint ({} boxes)",
+                    flat.len()
+                );
+            }
+            return None;
+        }
+        out = union_text_pieces(out, &texts);
+    }
+    Some((out, texts))
 }
 
-fn has_partial_text(fragment: &BoxFragment) -> bool {
-    fragment.text_range.is_some() || fragment.children.iter().any(|c| has_partial_text(&c.2))
+/// Collapse the pieces of each broken text node into one entry (at the first
+/// piece's position) holding their union.
+fn union_text_pieces(
+    out: Vec<(LayoutRect, usize)>,
+    texts: &[TextFragment],
+) -> Vec<(LayoutRect, usize)> {
+    let broken: std::collections::HashSet<usize> = texts.iter().map(|t| t.index).collect();
+    let mut slot: std::collections::HashMap<usize, usize> = Default::default();
+    let mut merged: Vec<(LayoutRect, usize)> = Vec::with_capacity(out.len());
+    for (rect, index) in out {
+        if broken.contains(&index) {
+            if let Some(&at) = slot.get(&index) {
+                let u = &mut merged[at].0;
+                let x0 = u.x.min(rect.x);
+                let y0 = u.y.min(rect.y);
+                let x1 = (u.x + u.width).max(rect.x + rect.width);
+                let y1 = (u.y + u.height).max(rect.y + rect.height);
+                *u = LayoutRect {
+                    x: x0,
+                    y: y0,
+                    width: x1 - x0,
+                    height: y1 - y0,
+                };
+                continue;
+            }
+            slot.insert(index, merged.len());
+        }
+        merged.push((rect, index));
+    }
+    merged
 }
 
-fn flatten(fragment: &BoxFragment, x: f32, y: f32, out: &mut Vec<(LayoutRect, usize)>) {
-    out.push((
-        LayoutRect {
-            x,
-            y,
-            width: fragment.width,
-            height: fragment.height,
-        },
-        fragment.index,
-    ));
+fn flatten(
+    fragment: &BoxFragment,
+    x: f32,
+    y: f32,
+    flat: &[FlatNodeInfo],
+    out: &mut Vec<(LayoutRect, usize)>,
+    texts: &mut Vec<TextFragment>,
+) {
+    let rect = LayoutRect {
+        x,
+        y,
+        width: fragment.width,
+        height: fragment.height,
+    };
+    if let Some((start, end)) = fragment.text_range {
+        let text = match flat[fragment.index].kind {
+            w3cos_std::ComponentKind::Text { content } => content[start..end].to_string(),
+            _ => String::new(),
+        };
+        texts.push(TextFragment {
+            index: fragment.index,
+            start,
+            end,
+            rect,
+            text,
+        });
+    }
+    out.push((rect, fragment.index));
     for (dx, dy, child) in &fragment.children {
-        flatten(child, x + dx, y + dy, out);
+        flatten(child, x + dx, y + dy, flat, out, texts);
     }
 }
 

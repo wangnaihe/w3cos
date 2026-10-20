@@ -148,6 +148,7 @@ fn finish_headless_frame(
     let structure = crate::dom::with_document(|document| document.structure_generation());
     let reuse = crate::incremental_layout::take_paint_reuse();
     if reuse != crate::incremental_layout::PaintReuse::None
+        && layout_results.text_fragments.is_empty()
         && let Some(frame) = reuse_retained_paint(
             structure,
             reuse,
@@ -218,6 +219,7 @@ fn finish_headless_frame(
         body_index,
         Some((width as f32, height as f32)),
     );
+    artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
     let mut nodes = artifact
         .rect_by_index
@@ -335,7 +337,7 @@ fn reuse_retained_paint(
         let Some(retained) = slot.as_mut() else {
             return Ok(None);
         };
-        if retained.structure != structure {
+        if retained.structure != structure || !retained.artifact.text_fragments.is_empty() {
             return Ok(None);
         }
         retained.artifact.viewport_scroll = crate::jsdom::window_scroll_offset();

@@ -380,11 +380,17 @@ fn ext_trees_match_chrome(level: u8, seed: u64, golden: &str) {
     for case in 0..EXT_CASES {
         let root = random_case_with(&mut rng, level);
         let flat = pre_flatten(&root);
-        let ng = layout_tree(&root, &flat, 800.0, 600.0);
+        let ng = layout_tree_with_text(&root, &flat, 800.0, 600.0);
         let Some(expected) = golden.get(&case.to_string()) else {
-            assert!(ng.is_none(), "case {case} has no Chrome golden");
+            // Goldens predate breaking inside items: only such cases (with
+            // text pieces) may be newly laid out without one.
+            assert!(
+                ng.as_ref().is_none_or(|(_, texts)| !texts.is_empty()),
+                "case {case} has no Chrome golden"
+            );
             continue;
         };
+        let ng = ng.map(|(rects, _)| rects);
         let ng = ng.unwrap_or_else(|| panic!("case {case} fell back"));
         for (key, want) in expected {
             let index: usize = key.parse().expect("index");
@@ -2561,6 +2567,29 @@ fn text_items_break_inside_at_uax14_opportunities() {
             (3, Some((4, 7)), [0.0, 20.0, 60.0, 20.0]),
         ]
     );
-    // Paint cannot draw text ranges yet: the page stays on legacy.
-    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    // The node keeps one union rect; paint gets the pieces in order.
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    let text_rects: Vec<_> = rects.iter().filter(|(_, i)| *i == 3).collect();
+    assert_eq!(text_rects.len(), 1);
+    let r = text_rects[0].0;
+    assert_eq!([r.x, r.y, r.width, r.height], [0.0, 0.0, 120.0, 40.0]);
+    let pieces: Vec<_> = texts
+        .iter()
+        .map(|t| {
+            (
+                t.index,
+                t.start,
+                t.end,
+                t.text.as_str(),
+                [t.rect.x, t.rect.y, t.rect.width],
+            )
+        })
+        .collect();
+    assert_eq!(
+        pieces,
+        vec![
+            (3, 0, 4, "XXX-", [40.0, 0.0, 80.0]),
+            (3, 4, 7, "XXX", [0.0, 20.0, 60.0]),
+        ]
+    );
 }

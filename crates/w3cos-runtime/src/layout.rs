@@ -4559,6 +4559,10 @@ pub struct LayoutResults {
     pub scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     pub clip_only_nodes: Vec<(usize, LayoutRect)>,
     pub scroll_ancestor: Vec<Option<usize>>,
+    /// LayoutNG text nodes broken inside their content: one piece per line
+    /// (NGPhysicalTextFragment), in fragment order. `layout_cache` holds the
+    /// union rect for such a node; paint draws the pieces instead.
+    pub text_fragments: Vec<crate::layout_ng::TextFragment>,
 }
 
 impl LayoutResults {
@@ -4568,6 +4572,7 @@ impl LayoutResults {
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_ancestor: Vec::new(),
+            text_fragments: Vec::new(),
         }
     }
 }
@@ -4644,8 +4649,8 @@ impl LayoutEngine {
         match crate::layout_ng::mode() {
             crate::layout_ng::Mode::Off => self.compute_legacy(root, flat, viewport_w, viewport_h),
             crate::layout_ng::Mode::On => {
-                match crate::layout_ng::layout_tree(root, flat, viewport_w, viewport_h) {
-                    Some(layout_cache) => {
+                match crate::layout_ng::layout_tree_with_text(root, flat, viewport_w, viewport_h) {
+                    Some((layout_cache, text_fragments)) => {
                         // The legacy Taffy tree no longer matches this output.
                         self.tree_valid = false;
                         Ok(LayoutResults {
@@ -4653,6 +4658,7 @@ impl LayoutEngine {
                             scrollable_nodes: Vec::new(),
                             clip_only_nodes: Vec::new(),
                             scroll_ancestor: vec![None; flat.len()],
+                            text_fragments,
                         })
                     }
                     None => self.compute_legacy(root, flat, viewport_w, viewport_h),
@@ -4660,7 +4666,8 @@ impl LayoutEngine {
             }
             crate::layout_ng::Mode::Verify => {
                 let legacy = self.compute_legacy(root, flat, viewport_w, viewport_h)?;
-                if let Some(ng) = crate::layout_ng::layout_tree(root, flat, viewport_w, viewport_h)
+                if let Some((ng, _)) =
+                    crate::layout_ng::layout_tree_with_text(root, flat, viewport_w, viewport_h)
                 {
                     crate::layout_ng::verify(flat, &legacy.layout_cache, &ng);
                 }
@@ -4802,6 +4809,7 @@ impl LayoutEngine {
                 scrollable_nodes: scrollable,
                 clip_only_nodes: clip_only,
                 scroll_ancestor,
+                text_fragments: Vec::new(),
             });
         }
 
@@ -5074,6 +5082,7 @@ impl LayoutEngine {
             scrollable_nodes: scrollable,
             clip_only_nodes: clip_only,
             scroll_ancestor,
+            text_fragments: Vec::new(),
         })
     }
 }
@@ -5365,6 +5374,7 @@ pub fn compute_with_scroll_details(
         scrollable_nodes: scrollable,
         clip_only_nodes: clip_only,
         scroll_ancestor,
+        text_fragments: Vec::new(),
     })
 }
 
