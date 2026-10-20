@@ -1291,8 +1291,7 @@ fn first_children_beside_floats_match_chrome() {
     assert_eq!(rect(4), [0.0, 151.0, 800.0, 18.0]);
 
     // adjoining-float-before-clearance: the float sits at the unresolved
-    // position the cleared box's margin would collapse through; that needs
-    // the BFC offset resolved before clearance, so it stays on legacy.
+    // position the cleared box's margin would collapse through.
     let mut cleared = Style {
         display: Display::Block,
         height: px(50.0),
@@ -1329,8 +1328,17 @@ fn first_children_beside_floats_match_chrome() {
             ],
         )],
     );
+    // Blink HasClearancePastAdjoiningFloats: the parent resolves without
+    // the 400px margin and the cleared box sits right below the float.
     let flat = pre_flatten(&root);
-    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let rect = |i: usize| {
+        let r = ng.iter().find(|(_, j)| *j == i).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    assert_eq!(rect(1), [0.0, 0.0, 100.0, 100.0]);
+    assert_eq!(rect(3), [0.0, 0.0, 100.0, 50.0]);
+    assert_eq!(rect(4), [0.0, 50.0, 100.0, 50.0]);
 
     // margin-collapse-039 shape: past clearance (ForcedBfcBlockOffset) the
     // first child's margin no longer collapses through the cleared box, so
@@ -1435,4 +1443,154 @@ fn first_children_beside_floats_match_chrome() {
     assert_eq!(rect(2), [0.0, 150.0, 800.0, 10.0]);
     assert_eq!(rect(4), [790.0, 150.0, 10.0, 200.0]);
     assert_eq!(rect(6), [0.0, 150.0, 800.0, 10.0]);
+}
+
+/// Blink HasClearancePastAdjoiningFloats: a cleared box whose margin
+/// would otherwise drag adjoining floats down resolves the parent's BFC
+/// offset without that margin and sits exactly at the clearance offset
+/// (adjoining-float-before-clearance, clear-on-parent-with-margins).
+#[test]
+fn clearance_past_adjoining_floats_matches_blink() {
+    use w3cos_std::style::{Clear, Dimension as D, Display, Edges, Float, Spacing as S, Style};
+    let px = D::Px;
+    let z = S::Px(0.0);
+    let block = |w: D, h: D, float: Float, clear: Clear, mt: f32| Style {
+        display: Display::Block,
+        width: w,
+        height: h,
+        float,
+        clear,
+        margin: Edges {
+            top: S::Px(mt),
+            right: z,
+            bottom: z,
+            left: z,
+        },
+        ..Style::default()
+    };
+    let leaf = |style: Style| Component::boxed(style, vec![]);
+    let (n, l, auto) = (Float::None, Float::Left, D::Auto);
+    let check = |root: &Component, expected: &[(usize, [f32; 4])]| {
+        let flat = pre_flatten(root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(root, &flat, 800.0, 600.0).expect("ng");
+        let mut bad = Vec::new();
+        for &(index, want) in expected {
+            let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+            if [r.x, r.y, r.width, r.height] != want {
+                bad.push(format!(
+                    "#{index}: {:?} want {want:?}",
+                    [r.x, r.y, r.width, r.height]
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    };
+    // Through a non-BFC wrapper with its own top margin: the wrapper (and
+    // the float) resolve at that margin; the cleared child goes below.
+    let outer = Component::boxed(
+        Style {
+            display: Display::FlowRoot,
+            width: px(200.0),
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            block(auto, auto, n, Clear::None, 10.0),
+            vec![
+                leaf(block(px(40.0), px(30.0), l, Clear::None, 0.0)),
+                leaf(block(auto, px(20.0), n, Clear::Left, 25.0)),
+            ],
+        )],
+    );
+    check(
+        &outer,
+        &[
+            (0, [0.0, 0.0, 200.0, 60.0]),
+            (1, [0.0, 10.0, 200.0, 50.0]),
+            (2, [0.0, 10.0, 40.0, 30.0]),
+            (3, [0.0, 40.0, 200.0, 20.0]),
+        ],
+    );
+    // negative-clearance-after-adjoining-float: a cleared self-collapsing
+    // box sits at the clearance offset and its margin is kept inside the
+    // parent (Blink ComputeInflowPosition / FinishLayout).
+    let negative = Component::boxed(
+        Style {
+            display: Display::FlowRoot,
+            width: px(100.0),
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(
+                block(auto, auto, n, Clear::None, 0.0),
+                vec![
+                    leaf(block(px(100.0), px(50.0), l, Clear::None, 0.0)),
+                    leaf(block(auto, auto, n, Clear::Left, 200.0)),
+                ],
+            ),
+            leaf(block(auto, px(50.0), n, Clear::None, 0.0)),
+        ],
+    );
+    check(
+        &negative,
+        &[
+            (0, [0.0, 0.0, 100.0, 100.0]),
+            (1, [0.0, 0.0, 100.0, 50.0]),
+            (2, [0.0, 0.0, 100.0, 50.0]),
+            (3, [0.0, 50.0, 100.0, 0.0]),
+            (4, [0.0, 50.0, 100.0, 50.0]),
+        ],
+    );
+    // margin-collapse-033: the flag survives a following self-collapsing
+    // sibling, whose margin then stays inside the parent (1 + 99).
+    let sibling = Component::boxed(
+        Style {
+            display: Display::FlowRoot,
+            width: px(100.0),
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            block(auto, auto, n, Clear::None, 0.0),
+            vec![
+                leaf(block(px(10.0), px(1.0), l, Clear::None, 0.0)),
+                leaf(block(auto, auto, n, Clear::Left, 0.0)),
+                leaf(block(auto, auto, n, Clear::None, 99.0)),
+            ],
+        )],
+    );
+    check(
+        &sibling,
+        &[
+            (0, [0.0, 0.0, 100.0, 100.0]),
+            (1, [0.0, 0.0, 100.0, 100.0]),
+            (3, [0.0, 1.0, 100.0, 0.0]),
+        ],
+    );
+    // margin-collapse-clear-012: clearance = 100 - 40 (margin-top only);
+    // the 80px bottom margin and the sibling's 140px collapse after it.
+    let mut cleared = block(auto, auto, n, Clear::Left, 40.0);
+    cleared.margin.bottom = S::Px(80.0);
+    let mut sib = block(auto, auto, n, Clear::None, 0.0);
+    sib.margin.bottom = S::Px(140.0);
+    let mut parent = block(px(200.0), auto, n, Clear::None, 0.0);
+    parent.border_top_width = Some(1.0);
+    let clear012 = Component::boxed(
+        Style {
+            display: Display::FlowRoot,
+            width: px(400.0),
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            parent,
+            vec![
+                leaf(block(px(100.0), px(100.0), l, Clear::None, 0.0)),
+                leaf(cleared),
+                leaf(sib),
+            ],
+        )],
+    );
+    check(
+        &clear012,
+        &[(1, [0.0, 0.0, 200.0, 201.0]), (3, [0.0, 101.0, 200.0, 0.0])],
+    );
 }

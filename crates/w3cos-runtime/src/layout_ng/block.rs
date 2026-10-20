@@ -1074,6 +1074,8 @@ fn layout_block_in(
     let mut pending = MarginStrut::default();
     let mut cursor = 0.0f32;
     let mut at_top = true; // no in-flow content placed yet
+    // PreviousInflowPosition::self_collapsing_child_had_clearance.
+    let mut last_cleared_self_collapsing = false;
     let mut children = Vec::new();
     // Offset of the content box from the border box.
     let content_top = bt + pt;
@@ -1227,22 +1229,32 @@ fn layout_block_in(
         // when the hypothetical position is above it; the cleared box's
         // top margin then no longer collapses with what precedes it.
         let clear = clearance_offset(child_info.style, exclusions);
-        if clear.is_some() && at_top && can_escape_top && !forced {
-            // Floats on the cleared side at our still-unresolved position
-            // are adjoining: the cleared box's margin must not drag them
-            // down (Blink HasClearancePastAdjoiningFloats resolves the BFC
-            // block offset without the child's margin first, then applies
-            // clearance).  Not implemented: stay on legacy.
+        // Blink NGBlockLayoutAlgorithm::HandleInflow: with clearance past
+        // adjoining floats (HasClearancePastAdjoiningFloats) our BFC block
+        // offset resolves first, at the margin strut so far and without
+        // the child's margin (ResolveBfcBlockOffset(previous_inflow_
+        // position)), which is where those floats already sit; the child
+        // then goes exactly to the clearance offset (forced BFC block
+        // offset, is_pushed_by_floats): its margins have no effect.
+        let mut forced_clearance = None;
+        if let Some(c) = clear.filter(|_| at_top && can_escape_top && !forced) {
             let (left, right) = match child_info.style.clear {
                 Clear::Left => (true, false),
                 Clear::Right => (false, true),
                 _ => (true, true),
             };
             if exclusions.has_float_since(adjoining_from, left, right) {
-                return super::bail("adjoining-clearance");
+                start_strut.merge(pending);
+                pending = MarginStrut::default();
+                cursor = 0.0;
+                at_top = false;
+                forced_clearance = Some(c);
             }
         }
         let place = |start: MarginStrut| {
+            if let Some(c) = forced_clearance {
+                return Some((c - content_bfc_y, true));
+            }
             if at_top && can_escape_top {
                 // The margins still collapse through us: the hypothetical
                 // position is past all of them.
@@ -1442,11 +1454,29 @@ fn layout_block_in(
             float_overlap = true;
         }
         let y;
-        if cleared {
-            if result.self_collapsing {
-                // (Clearance on a box that collapses through.)
-                return super::bail("clearance-self-collapsing");
+        // Blink self_or_sibling_self_collapsing_child_had_clearance: the flag
+        // survives later self-collapsing siblings.
+        let sibling_had_clearance = last_cleared_self_collapsing;
+        last_cleared_self_collapsing = false;
+        if cleared && result.self_collapsing {
+            // Blink FinishInflow/ComputeInflowPosition: a self-collapsing
+            // child pushed down by clearance sits at the clearance offset;
+            // its margins are separated from the preceding strut (relayout
+            // with only its own margin) and the inflow position becomes
+            // that offset minus its end margin strut, so the margins after
+            // it collapse with its own (CSS2 9.5.2 negative clearance).
+            if at_top && can_escape_top {
+                start_strut.merge(pending);
+                at_top = false;
             }
+            // Clearance uses the child's end margin strut before its own
+            // block-end margin is appended (that is our start strut).
+            y = resolved;
+            cursor = y - result.start_strut.sum();
+            pending = result.start_strut;
+            pending.merge(result.end_strut);
+            last_cleared_self_collapsing = true;
+        } else if cleared {
             if at_top && can_escape_top {
                 start_strut.merge(pending);
             }
@@ -1455,6 +1485,7 @@ fn layout_block_in(
             pending = result.end_strut;
             at_top = false;
         } else if result.self_collapsing {
+            last_cleared_self_collapsing = sibling_had_clearance;
             let mut combined = pending;
             combined.merge(result.start_strut);
             if at_top && can_escape_top {
@@ -1495,7 +1526,13 @@ fn layout_block_in(
 
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
     // height is auto (min-height only matters for collapsing through).
-    let can_escape_bottom = !bfc_root && bb == 0.0 && pb == 0.0 && specified_height.is_none();
+    // Blink FinishLayout: after a self-collapsing child affected by
+    // clearance the end strut is part of our size and does not escape.
+    let can_escape_bottom = !bfc_root
+        && bb == 0.0
+        && pb == 0.0
+        && specified_height.is_none()
+        && !last_cleared_self_collapsing;
 
     let mut end_strut = MarginStrut::default();
     let auto_content = if can_escape_bottom {
