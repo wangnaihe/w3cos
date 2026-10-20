@@ -1865,7 +1865,10 @@ pub(super) fn layout_inline_beside(
             // (An earlier item's internal opportunity, or preserved spaces,
             // stay on legacy.)
             if preserve {
-                return super::bail("internal-break");
+                return super::bail("internal-break-preserve");
+            }
+            if item.atomic.is_some() || !zero_edges(flat[item.index].style) {
+                return super::bail("internal-break-edges");
             }
             let split = split_text_item(flat, item, current.is_empty(), |a| {
                 let mut probe: Vec<&InlineItem> = current.iter().map(|&k| &items[k]).collect();
@@ -1880,7 +1883,14 @@ pub(super) fn layout_inline_beside(
                 i += 1;
                 continue;
             }
-            return super::bail("internal-break");
+            if current.is_empty() {
+                return super::bail("internal-break");
+            }
+            // No prefix fits after the line's content: NGLineBreaker
+            // rewinds to the last opportunity before this item and retries
+            // it on the next line (the soft-wrap path below). An overflow
+            // that would need an earlier item's internal opportunity still
+            // falls back after line building ("internal-break-earlier").
         }
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
             // Not even the first piece fits beside the floats: the line
@@ -1917,6 +1927,13 @@ pub(super) fn layout_inline_beside(
                     && !items[next].starts_space
                     && text_boundary_opportunity(flat, &items[prev], &items[next]))
         });
+        // NGLineBreaker rewinds to the latest opportunity: one inside an
+        // item after `break_at` would come later (not modelled yet).
+        if let Some(j) = break_at
+            && current[j..].iter().any(|&k| items[k].internal_break)
+        {
+            return super::bail("internal-break-earlier");
+        }
         match break_at {
             Some(j) if j == current.len() => lines.push(std::mem::take(&mut current)),
             Some(j) => {
@@ -2083,7 +2100,7 @@ pub(super) fn layout_inline_beside(
             && content_width > available + EPSILON
             && line.iter().any(|&k| items[k].internal_break)
         {
-            return super::bail("internal-break");
+            return super::bail("internal-break-earlier");
         }
         max_line_width = max_line_width.max(content_width);
         // CSS Text 3 4.1.3: before a forced break or the end of the block,

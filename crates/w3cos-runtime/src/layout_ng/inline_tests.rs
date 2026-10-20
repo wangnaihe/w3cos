@@ -382,12 +382,7 @@ fn ext_trees_match_chrome(level: u8, seed: u64, golden: &str) {
         let flat = pre_flatten(&root);
         let ng = layout_tree_with_text(&root, &flat, 800.0, 600.0);
         let Some(expected) = golden.get(&case.to_string()) else {
-            // Goldens predate breaking inside items: only such cases (with
-            // text pieces) may be newly laid out without one.
-            assert!(
-                ng.as_ref().is_none_or(|(_, texts)| !texts.is_empty()),
-                "case {case} has no Chrome golden"
-            );
+            assert!(ng.is_none(), "case {case} has no Chrome golden");
             continue;
         };
         let ng = ng.map(|(rects, _)| rects);
