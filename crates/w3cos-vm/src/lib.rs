@@ -2086,11 +2086,8 @@ impl Vm {
                 registers[dst.0 as usize] = handler(read(*specifier).to_js_string());
             }
             Instruction::ImportMeta { dst } => {
-                let value = Value::object(HashMap::from([(
-                    "url".into(),
-                    Value::string(&self.0.module.specifier),
-                )]));
-                registers[dst.0 as usize] = value;
+                registers[dst.0 as usize] =
+                    w3cos_core::module_registry::import_meta(&self.0.module.specifier);
             }
             Instruction::Await { .. } => return Err(VmError::Unsupported("Await")),
             Instruction::Yield { .. } => return Err(VmError::Unsupported("Yield")),

@@ -412,6 +412,78 @@ pub fn clear() {
     let _ = ALIASES.try_with(|aliases| aliases.borrow_mut().clear());
 }
 
+thread_local! {
+    static IMPORT_META: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+}
+
+/// `file:` URL for an absolute filesystem path (RFC 8089), percent-encoding
+/// bytes outside the unreserved/path-safe set like Node's `pathToFileURL`.
+pub fn path_to_file_url(path: &str) -> String {
+    let mut out = String::from("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'/'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The per-module `import.meta` object (one identity per module record).
+///
+/// A module identified by an absolute filesystem path gets Node's shape:
+/// `url` is its `file:` URL plus `filename` / `dirname`. Any other specifier
+/// (already a URL, or a bare build id) is exposed unchanged as `url`.
+pub fn import_meta(specifier: &str) -> Value {
+    if let Ok(Some(existing)) = IMPORT_META.try_with(|metas| metas.borrow().get(specifier).cloned())
+    {
+        return existing;
+    }
+    let mut props = HashMap::new();
+    if specifier.starts_with('/') {
+        props.insert(
+            "url".to_string(),
+            Value::string(&path_to_file_url(specifier)),
+        );
+        props.insert("filename".to_string(), Value::string(specifier));
+        let dirname = match specifier.rfind('/') {
+            Some(0) => "/",
+            Some(index) => &specifier[..index],
+            None => specifier,
+        };
+        props.insert("dirname".to_string(), Value::string(dirname));
+    } else {
+        props.insert("url".to_string(), Value::string(specifier));
+    }
+    let meta = Value::object(props);
+    let _ = IMPORT_META.try_with(|metas| {
+        metas
+            .borrow_mut()
+            .insert(specifier.to_string(), meta.clone())
+    });
+    meta
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +699,31 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
         clear();
+    }
+
+    #[test]
+    fn import_meta_exposes_node_file_identity_once_per_module() {
+        let meta = super::import_meta("/srv/app dir/out/main.js");
+        assert_eq!(
+            meta.get_property("url").to_js_string(),
+            "file:///srv/app%20dir/out/main.js"
+        );
+        assert_eq!(
+            meta.get_property("filename").to_js_string(),
+            "/srv/app dir/out/main.js"
+        );
+        assert_eq!(
+            meta.get_property("dirname").to_js_string(),
+            "/srv/app dir/out"
+        );
+        meta.set_property("hot", Value::Bool(true));
+        let again = super::import_meta("/srv/app dir/out/main.js");
+        assert!(again.get_property("hot").to_js_string() == "true");
+        let url = super::import_meta("https://example.test/a.js");
+        assert_eq!(
+            url.get_property("url").to_js_string(),
+            "https://example.test/a.js"
+        );
+        assert!(url.get_property("dirname").is_undefined());
     }
 }
