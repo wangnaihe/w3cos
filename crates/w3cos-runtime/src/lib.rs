@@ -160,6 +160,7 @@ pub mod sensors_web;
 pub mod service_worker_web;
 pub mod tray_host;
 
+pub(crate) mod keyring_store;
 pub mod plugin_abi;
 pub mod shared_abi;
 #[cfg(feature = "skia")]

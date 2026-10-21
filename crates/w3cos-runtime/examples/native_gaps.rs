@@ -1,9 +1,11 @@
 //! Headless demo for the native-gap adapters.
 //!
 //! Exercises permission denial, a real process, window-management displays,
-//! battery (or an honest `NotSupportedError`), an application shortcut, a
-//! system-tray adapter (or an honest `NotSupportedError` when the session
-//! has no status watcher), display capture, a TCP echo, and a WebNN add.
+//! battery (or an honest `NotSupportedError`), an application shortcut, the
+//! origin-scoped keyring (or `NotSupportedError` when no secret store is
+//! open), a system-tray adapter (or an honest `NotSupportedError` when the
+//! session has no status watcher), display capture, a TCP echo, and a WebNN
+//! add.
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
@@ -189,6 +191,7 @@ fn main() {
         "display-capture",
         "direct-sockets",
         "webnn",
+        "w3cos-keyring",
     ] {
         capability_gate::grant(name);
     }
@@ -222,6 +225,25 @@ fn main() {
     if shortcut.is_ok() {
         dispatch_accelerator("Control+Shift+K");
     }
+    let keyring = await_value(namespace.get_property("keyring").call_method(
+        "set",
+        vec![Value::string("native-gaps"), Value::string("probe")],
+    ));
+    let keyring_read = if keyring.is_ok() {
+        let read = await_value(
+            namespace
+                .get_property("keyring")
+                .call_method("get", vec![Value::string("native-gaps")]),
+        );
+        let _ = await_value(
+            namespace
+                .get_property("keyring")
+                .call_method("delete", vec![Value::string("native-gaps")]),
+        );
+        read
+    } else {
+        keyring.clone()
+    };
     let tray = await_value(namespace.get_property("tray").call_method(
         "show",
         vec![Value::object(HashMap::from([(
@@ -303,6 +325,16 @@ fn main() {
         ),
         Err(err) => err.clone(),
     };
+    let keyring_text = match &keyring_read {
+        Ok(value) if value.to_js_string() == "probe" => "stored".to_string(),
+        Ok(_) => "mismatch".to_string(),
+        Err(err) => err.clone(),
+    };
+    row(
+        "keyring",
+        &keyring_text,
+        keyring_text == "stored" || keyring_text == "NotSupportedError",
+    );
     let tray_ok = match &tray {
         Ok(_) => true,
         Err(err) => err == "NotSupportedError",
