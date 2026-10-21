@@ -253,6 +253,17 @@ suite is red.
   AudioWorklet ports and deterministic OfflineAudioContext silent rendering.
   Real-time output, compressed decoding, sink selection and worklet processor
   execution remain explicit warning-backed native-adapter boundaries.
+- [x] Render connected Web Audio graphs: oscillator (built-in and
+  `PeriodicWave`), buffer-source (rate, detune, offset, duration, loop),
+  constant-source, gain and stereo-panner nodes with speaker up/down-mixing,
+  shared by `OfflineAudioContext.startRendering()` and real-time
+  `AudioContext` output on the default device through cpal (macOS, Windows,
+  Linux desktop).
+- [ ] Render AudioParam automation timelines and AudioParam inputs, and the
+  remaining processing nodes (biquad/IIR, delay, convolver, compressor,
+  wave shaper, panner, analyser data, channel splitter/merger).
+- [ ] Add Android (AAudio) and iOS (AVAudioEngine) output adapters, output
+  device selection (`setSinkId`) and `decodeAudioData`.
 - [x] Implement `ImageDecoder`, `ImageTrack` and `ImageTrackList` over the
   existing native image codecs, including MIME capability queries, static
   PNG/JPEG-family decode, GIF/WebP/APNG frame extraction, repetition/frame
@@ -861,6 +872,12 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Add `Crypto`/`SubtleCrypto` identities around secure random generation;
   preserve every SubtleCrypto Promise method with explicit warning and
   `NotSupportedError` rejection until a native cryptographic provider lands.
+- [x] Back SubtleCrypto with `ring` for SHA digests, HMAC, AES-GCM (raw/JWK
+  import/export, encrypt/decrypt, wrap/unwrap) and HKDF/PBKDF2 derivation,
+  with WebCrypto error semantics and published test vectors.
+- [ ] Add asymmetric WebCrypto (ECDSA/ECDH P-256/P-384, Ed25519/X25519,
+  RSA-PSS/OAEP) with `spki`/`pkcs8`/JWK formats, AES-CBC/CTR/KW and
+  `CryptoKey` structured cloning.
 - [x] Add the `DOMStringList` identity and list methods used by
   `Location.ancestorOrigins`.
 - [x] Add the read-only maplike `EventCounts` identity with Chromium's 36

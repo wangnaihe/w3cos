@@ -7254,11 +7254,16 @@ export function cryptoIdentityShape() {
   let subtleError = "";
   try { new Crypto(); } catch (error) { cryptoError = error.name; }
   try { new SubtleCrypto(); } catch (error) { subtleError = error.name; }
-  // SHA-256 digest is implemented via ring; an unimplemented SubtleCrypto
-  // method still rejects with NotSupportedError.
-  crypto.subtle.sign("HMAC", {}, new Uint8Array()).catch((error) => {
+  // A non-CryptoKey rejects TypeError; a real HMAC key signs and verifies.
+  const message = new Uint8Array([1, 2, 3]);
+  crypto.subtle.sign("HMAC", {}, message).catch((error) => {
     subtleCryptoLog = error.name;
-  });
+    return crypto.subtle.importKey("raw", new Uint8Array([74, 101, 102, 101]),
+      { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  }).then((key) => crypto.subtle.sign("HMAC", key, message).then((mac) =>
+    crypto.subtle.verify("HMAC", key, mac, message).then((ok) => {
+      subtleCryptoLog += ":" + mac.byteLength + ":" + ok;
+    })));
   return typeof Crypto + ":" + typeof SubtleCrypto + ":" +
     (crypto instanceof Crypto) + ":" + (crypto.subtle instanceof SubtleCrypto) + ":" +
     typeof crypto.subtle.digest + ":" + cryptoError + ":" + subtleError;
@@ -8738,8 +8743,8 @@ fn main() {
     w3cos_runtime::jsdom::drain_microtasks();
     let r = m0::m0_getSubtleCryptoLog(vec![]);
     assert!(
-        matches_js_string!(&r, s, s == "NotSupportedError"),
-        "SubtleCrypto unavailable provider rejects explicitly: {r:?}"
+        matches_js_string!(&r, s, s == "TypeError:32:true"),
+        "SubtleCrypto rejects non-keys and signs/verifies with HMAC: {r:?}"
     );
     let r = m0::m0_domParserShape(vec![]);
     assert!(

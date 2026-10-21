@@ -1,13 +1,19 @@
-//! Web Audio graph, buffer and lifecycle compatibility layer.
+//! Web Audio graph, buffer and lifecycle layer.
 //!
-//! The graph and offline zero-signal rendering are implemented locally. A
-//! host audio device/decoder/worklet adapter is still required for audible
-//! real-time output, compressed decoding and processor module execution.
+//! Connected graphs render through [`crate::audio_render`]: oscillator,
+//! buffer-source, constant-source, gain and stereo-panner nodes produce real
+//! samples in `OfflineAudioContext.startRendering()` and, after
+//! `AudioContext.resume()`, on the default output device via
+//! [`crate::audio_device`] (cpal). Other processing nodes render silence with
+//! a warning. Compressed decoding, AudioParam automation timelines, sink
+//! selection and AudioWorklet processor execution remain pending.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::{Arc, Once};
+
+use crate::audio_render::{GraphSnapshot, NodeKind, NodeSnapshot, Schedule, Waveform};
 
 use w3cos_core::Value;
 
@@ -18,6 +24,376 @@ thread_local! {
     static CONTEXTS: RefCell<Vec<(Value, Rc<RefCell<ContextClock>>)>> =
         const { RefCell::new(Vec::new()) };
     static CALLBACK_TARGETS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
+    static NEXT_AUDIO_ID: Cell<u64> = const { Cell::new(1) };
+    /// Nodes with at least one outgoing connection, kept alive like a
+    /// browser keeps connected nodes alive, keyed by node id.
+    static GRAPH_NODES: RefCell<HashMap<u64, GraphEntry>> = RefCell::new(HashMap::new());
+    /// AudioBufferSourceNode content acquired at `start()`.
+    static ACQUIRED_BUFFERS: RefCell<HashMap<u64, (Arc<Vec<Vec<f32>>>, f64)>> =
+        RefCell::new(HashMap::new());
+    static LIVE_OUTPUTS: RefCell<HashMap<u64, LiveContext>> = RefCell::new(HashMap::new());
+    static LAST_LIVE_POLL: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
+}
+
+struct GraphEntry {
+    node: Value,
+    context_id: u64,
+    kind: &'static str,
+    connections: Rc<RefCell<Vec<Value>>>,
+}
+
+struct LiveContext {
+    output: crate::audio_device::LiveOutput,
+    destination: u64,
+}
+
+fn next_audio_id() -> u64 {
+    NEXT_AUDIO_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    })
+}
+
+fn audio_id(value: &Value) -> Option<u64> {
+    let id = value.get_property("__w3cos_audio_id");
+    id.is_number().then(|| id.to_number() as u64)
+}
+
+fn param_number(node: &Value, name: &str, fallback: f64) -> f64 {
+    let param = node.get_property(name);
+    if param.is_undefined() || param.is_null() {
+        return fallback;
+    }
+    let value = param.get_property("value").to_number();
+    if value.is_finite() { value } else { fallback }
+}
+
+fn optional_time(node: &Value, name: &str) -> Option<f64> {
+    let value = node.get_property(name);
+    value.is_number().then(|| value.to_number())
+}
+
+fn schedule_of(node: &Value) -> Schedule {
+    Schedule {
+        start: optional_time(node, "__w3cos_start_time"),
+        stop: optional_time(node, "__w3cos_stop_time"),
+    }
+}
+
+fn numbers(value: &Value) -> Vec<f64> {
+    if value.is_undefined() || value.is_null() {
+        return Vec::new();
+    }
+    value.iter().map(|item| item.to_number()).collect()
+}
+
+/// Copies an AudioBuffer's channel data out of its Float32Arrays.
+fn buffer_channels(buffer: &Value) -> Option<(Arc<Vec<Vec<f32>>>, f64)> {
+    if !w3cos_core::class::instance_of(buffer, &class_for("AudioBuffer")) {
+        return None;
+    }
+    let count = buffer.get_property("numberOfChannels").to_u32() as usize;
+    let rate = buffer.get_property("sampleRate").to_number();
+    let channels = (0..count)
+        .map(|channel| {
+            let data = buffer.call_method("getChannelData", vec![Value::Number(channel as f64)]);
+            w3cos_core::binary::bytes_of(&data)
+                .unwrap_or_default()
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect()
+        })
+        .collect();
+    Some((Arc::new(channels), rate))
+}
+
+fn acquire_buffer(node: &Value, id: u64) {
+    if let Some(content) = buffer_channels(&node.get_property("buffer")) {
+        ACQUIRED_BUFFERS.with(|buffers| buffers.borrow_mut().insert(id, content));
+    }
+}
+
+fn node_kind(id: u64, node: &Value, kind: &'static str, unsupported: &mut Vec<String>) -> NodeKind {
+    match kind {
+        "GainNode" => NodeKind::Gain {
+            gain: param_number(node, "gain", 1.0) as f32,
+        },
+        "StereoPannerNode" => NodeKind::StereoPanner {
+            pan: param_number(node, "pan", 0.0) as f32,
+        },
+        "ConstantSourceNode" => NodeKind::ConstantSource {
+            offset: param_number(node, "offset", 1.0) as f32,
+            schedule: schedule_of(node),
+        },
+        "OscillatorNode" => {
+            let waveform = match node.get_property("type").to_js_string().as_str() {
+                "square" => Some(Waveform::Square),
+                "sawtooth" => Some(Waveform::Sawtooth),
+                "triangle" => Some(Waveform::Triangle),
+                "custom" => None,
+                _ => Some(Waveform::Sine),
+            };
+            let table = waveform.is_none().then(|| {
+                let wave = node.get_property("__w3cos_periodic_wave");
+                Arc::new(crate::audio_render::periodic_wave_table(
+                    &numbers(&wave.get_property("__w3cos_real")),
+                    &numbers(&wave.get_property("__w3cos_imag")),
+                    !wave.get_property("__w3cos_disable_normalization").to_bool(),
+                ))
+            });
+            NodeKind::Oscillator {
+                waveform,
+                table,
+                frequency: param_number(node, "frequency", 440.0),
+                detune: param_number(node, "detune", 0.0),
+                schedule: schedule_of(node),
+            }
+        }
+        "AudioBufferSourceNode" => {
+            if ACQUIRED_BUFFERS.with(|buffers| !buffers.borrow().contains_key(&id)) {
+                acquire_buffer(node, id);
+            }
+            let Some((channels, buffer_rate)) =
+                ACQUIRED_BUFFERS.with(|buffers| buffers.borrow().get(&id).cloned())
+            else {
+                return NodeKind::Silent;
+            };
+            NodeKind::BufferSource {
+                channels,
+                buffer_rate,
+                playback_rate: param_number(node, "playbackRate", 1.0),
+                detune: param_number(node, "detune", 0.0),
+                looping: node.get_property("loop").to_bool(),
+                loop_start: node.get_property("loopStart").to_number().max(0.0),
+                loop_end: node.get_property("loopEnd").to_number().max(0.0),
+                offset: optional_time(node, "__w3cos_start_offset").unwrap_or(0.0),
+                duration: optional_time(node, "__w3cos_start_duration"),
+                schedule: schedule_of(node),
+            }
+        }
+        other => {
+            if !unsupported.iter().any(|name| name == other) {
+                unsupported.push(other.to_string());
+            }
+            NodeKind::Silent
+        }
+    }
+}
+
+/// Builds a renderable snapshot of every connected node in a context.
+fn graph_snapshot(context_id: u64, destination: u64) -> GraphSnapshot {
+    let entries: Vec<(u64, Value, &'static str, Vec<Value>)> = GRAPH_NODES.with(|nodes| {
+        nodes
+            .borrow()
+            .iter()
+            .filter(|(_, entry)| entry.context_id == context_id)
+            .map(|(id, entry)| {
+                (
+                    *id,
+                    entry.node.clone(),
+                    entry.kind,
+                    entry.connections.borrow().clone(),
+                )
+            })
+            .collect()
+    });
+    let mut snapshot = GraphSnapshot {
+        destination,
+        ..GraphSnapshot::empty()
+    };
+    snapshot.nodes.insert(
+        destination,
+        NodeSnapshot {
+            kind: NodeKind::Destination,
+            inputs: Vec::new(),
+        },
+    );
+    for (id, node, kind, _) in &entries {
+        let kind = node_kind(*id, node, kind, &mut snapshot.unsupported);
+        snapshot.nodes.insert(
+            *id,
+            NodeSnapshot {
+                kind,
+                inputs: Vec::new(),
+            },
+        );
+    }
+    for (id, _, _, connections) in &entries {
+        for target in connections {
+            match audio_id(target) {
+                Some(target_id) => {
+                    if let Some(node) = snapshot.nodes.get_mut(&target_id) {
+                        node.inputs.push(*id);
+                    }
+                }
+                None => {
+                    let name = "AudioParam input".to_string();
+                    if !snapshot.unsupported.contains(&name) {
+                        snapshot.unsupported.push(name);
+                    }
+                }
+            }
+        }
+    }
+    for node in snapshot.nodes.values_mut() {
+        node.inputs.sort_unstable();
+    }
+    if !snapshot.unsupported.is_empty() {
+        static WARNING: Once = Once::new();
+        let names = snapshot.unsupported.join(", ");
+        WARNING.call_once(|| {
+            eprintln!(
+                "[w3cos] warning: Web Audio renders oscillator, buffer-source, constant-source, \
+                 gain and stereo-panner nodes; {names} render silence until their DSP lands"
+            );
+        });
+    }
+    snapshot
+}
+
+fn context_ids(node: &Value) -> Option<(u64, u64)> {
+    let context = node.get_property("context");
+    let context_id = audio_id(&context)?;
+    let destination = context.get_property("__w3cos_audio_destination_id");
+    destination
+        .is_number()
+        .then(|| (context_id, destination.to_number() as u64))
+}
+
+/// Publishes the current graph to a running device output, if any.
+fn refresh_live(context_id: u64) {
+    let destination = LIVE_OUTPUTS.with(|outputs| {
+        outputs
+            .borrow()
+            .get(&context_id)
+            .map(|live| live.destination)
+    });
+    if let Some(destination) = destination {
+        let snapshot = graph_snapshot(context_id, destination);
+        LIVE_OUTPUTS.with(|outputs| {
+            if let Some(live) = outputs.borrow().get(&context_id) {
+                live.output.update(snapshot);
+            }
+        });
+    }
+}
+
+fn refresh_node_context(node: &Value) {
+    if let Some((context_id, _)) = context_ids(node) {
+        refresh_live(context_id);
+    }
+}
+
+/// Whether `AudioContext.resume()` may open the host output device. Unit
+/// tests never open a device unless `W3COS_AUDIO_DEVICE_TESTS` is set, and
+/// `W3COS_AUDIO_OUTPUT=0` disables device output at runtime.
+fn device_output_enabled() -> bool {
+    if std::env::var_os("W3COS_AUDIO_OUTPUT").is_some_and(|value| value == "0") {
+        return false;
+    }
+    !cfg!(test) || std::env::var_os("W3COS_AUDIO_DEVICE_TESTS").is_some()
+}
+
+fn open_live_output(context: &Value, sample_rate: f64, start_time: f64) -> bool {
+    let (Some(context_id), destination) = (
+        audio_id(context),
+        context.get_property("__w3cos_audio_destination_id"),
+    ) else {
+        return false;
+    };
+    let destination = destination.to_number() as u64;
+    let exists = LIVE_OUTPUTS.with(|outputs| {
+        let outputs = outputs.borrow();
+        if let Some(live) = outputs.get(&context_id) {
+            live.output.set_paused(false);
+            true
+        } else {
+            false
+        }
+    });
+    if exists {
+        refresh_live(context_id);
+        return true;
+    }
+    if !device_output_enabled() {
+        return false;
+    }
+    match crate::audio_device::LiveOutput::open(sample_rate, start_time) {
+        Ok(output) => {
+            LIVE_OUTPUTS.with(|outputs| {
+                outputs.borrow_mut().insert(
+                    context_id,
+                    LiveContext {
+                        output,
+                        destination,
+                    },
+                )
+            });
+            refresh_live(context_id);
+            true
+        }
+        Err(error) => {
+            static WARNING: Once = Once::new();
+            WARNING.call_once(|| {
+                eprintln!(
+                    "[w3cos] warning: AudioContext has no audio output device ({error}); \
+                     the graph clock runs silently"
+                );
+            });
+            false
+        }
+    }
+}
+
+/// Republishes live graphs (AudioParam values are sampled, not observed) and
+/// delivers `ended` for buffer sources that played to their natural end.
+/// Called from the runtime's event pump; returns the number of events run.
+pub fn poll_live_outputs() -> usize {
+    if LIVE_OUTPUTS.with(|outputs| outputs.borrow().is_empty()) {
+        return 0;
+    }
+    let now = crate::jsdom::performance_now();
+    if now - LAST_LIVE_POLL.with(Cell::get) < 20.0 {
+        return 0;
+    }
+    LAST_LIVE_POLL.with(|last| last.set(now));
+    let contexts: Vec<u64> =
+        LIVE_OUTPUTS.with(|outputs| outputs.borrow().keys().copied().collect());
+    let mut ran = 0;
+    for context_id in contexts {
+        refresh_live(context_id);
+        let finished = LIVE_OUTPUTS.with(|outputs| {
+            outputs
+                .borrow()
+                .get(&context_id)
+                .map(|live| live.output.take_finished())
+                .unwrap_or_default()
+        });
+        for id in finished {
+            let node =
+                GRAPH_NODES.with(|nodes| nodes.borrow().get(&id).map(|entry| entry.node.clone()));
+            if let Some(node) = node {
+                if !node.get_property("__w3cos_ended").to_bool() {
+                    node.set_property("__w3cos_ended", Value::Bool(true));
+                    dispatch(&node, "ended");
+                    ran += 1;
+                }
+            }
+        }
+    }
+    ran
+}
+
+/// Number of frames the device has rendered for a running AudioContext.
+pub fn live_output_frames(context: &Value) -> Option<u64> {
+    let context_id = audio_id(context)?;
+    LIVE_OUTPUTS.with(|outputs| {
+        outputs
+            .borrow()
+            .get(&context_id)
+            .map(|live| live.output.frames())
+    })
 }
 
 fn realm_audio_function(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Value {
@@ -329,8 +705,11 @@ fn require_context(context: &Value) {
 
 fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outputs: u32) -> Value {
     require_context(&context);
+    let node_id = next_audio_id();
+    let context_id = audio_id(&context).unwrap_or(0);
     let connections = Rc::new(RefCell::new(Vec::<Value>::new()));
     let value = w3cos_core::class::construct(&crate::web_events::event_target_class(), Vec::new());
+    value.set_property("__w3cos_audio_id", Value::Number(node_id as f64));
     for (name, property) in [
         ("channelCount", Value::Number(2.0)),
         ("channelCountMode", Value::string("max")),
@@ -344,7 +723,7 @@ fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outpu
     let connect_connections = Rc::clone(&connections);
     value.set_property(
         "connect",
-        realm_audio_function(move |_, args| {
+        realm_audio_function(move |this, args| {
             let destination = args.first().cloned().unwrap_or(Value::Undefined);
             let is_node = w3cos_core::class::instance_of(&destination, &class_for("AudioNode"));
             let is_param = w3cos_core::class::instance_of(&destination, &class_for("AudioParam"));
@@ -361,6 +740,18 @@ fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outpu
             {
                 connect_connections.borrow_mut().push(destination.clone());
             }
+            GRAPH_NODES.with(|nodes| {
+                nodes
+                    .borrow_mut()
+                    .entry(node_id)
+                    .or_insert_with(|| GraphEntry {
+                        node: this.clone(),
+                        context_id,
+                        kind: class_name,
+                        connections: Rc::clone(&connect_connections),
+                    });
+            });
+            refresh_live(context_id);
             if is_node {
                 destination
             } else {
@@ -379,6 +770,10 @@ fn audio_node_value(class_name: &'static str, context: Value, inputs: u32, outpu
             } else {
                 disconnect_connections.borrow_mut().clear();
             }
+            if disconnect_connections.borrow().is_empty() {
+                GRAPH_NODES.with(|nodes| nodes.borrow_mut().remove(&node_id));
+            }
+            refresh_live(context_id);
             Value::Undefined
         }),
     );
@@ -396,34 +791,62 @@ fn scheduled_source_value(class_name: &'static str, context: Value) -> Value {
     value.set_property("__w3cos_started", Value::Bool(false));
     value.set_property(
         "start",
-        realm_audio_function(|this, _| {
+        realm_audio_function(|this, args| {
             if this.get_property("__w3cos_started").to_bool() {
                 throw(
                     "InvalidStateError",
                     "AudioScheduledSourceNode already started",
                 );
             }
+            let when = args.first().map(Value::to_number).unwrap_or(0.0);
+            let when = if when.is_nan() { 0.0 } else { when };
+            if when < 0.0 {
+                throw("RangeError", "start time must not be negative");
+            }
+            for (index, name) in ["__w3cos_start_offset", "__w3cos_start_duration"]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(value) = args.get(index + 1).filter(|value| !value.is_undefined()) {
+                    let number = value.to_number();
+                    if !number.is_finite() || number < 0.0 {
+                        throw(
+                            "RangeError",
+                            "start offset and duration must not be negative",
+                        );
+                    }
+                    this.set_property(name, Value::Number(number));
+                }
+            }
             this.set_property("__w3cos_started", Value::Bool(true));
-            static WARNING: Once = Once::new();
-            WARNING.call_once(|| {
-                eprintln!(
-                    "[w3cos] warning: Web Audio source scheduling and graph state are active, \
-                     but audible real-time output requires a native audio device adapter"
-                );
-            });
+            this.set_property("__w3cos_start_time", Value::Number(when));
+            if let Some(id) = audio_id(&this) {
+                acquire_buffer(&this, id);
+            }
+            refresh_node_context(&this);
             Value::Undefined
         }),
     );
     value.set_property(
         "stop",
-        realm_audio_function(|this, _| {
+        realm_audio_function(|this, args| {
             if !this.get_property("__w3cos_started").to_bool() {
                 throw(
                     "InvalidStateError",
                     "AudioScheduledSourceNode must start before stop",
                 );
             }
-            dispatch(&this, "ended");
+            let when = args.first().map(Value::to_number).unwrap_or(0.0);
+            let when = if when.is_nan() { 0.0 } else { when };
+            if when < 0.0 {
+                throw("RangeError", "stop time must not be negative");
+            }
+            this.set_property("__w3cos_stop_time", Value::Number(when));
+            refresh_node_context(&this);
+            if !this.get_property("__w3cos_ended").to_bool() {
+                this.set_property("__w3cos_ended", Value::Bool(true));
+                dispatch(&this, "ended");
+            }
             Value::Undefined
         }),
     );
@@ -761,6 +1184,10 @@ fn periodic_wave_value(context: Value, options: Value) -> Value {
     let value = Value::object(HashMap::new());
     value.set_property("__w3cos_real", options.get_property("real"));
     value.set_property("__w3cos_imag", options.get_property("imag"));
+    value.set_property(
+        "__w3cos_disable_normalization",
+        Value::Bool(options.get_property("disableNormalization").to_bool()),
+    );
     w3cos_core::class::set_prototype_of(
         &value,
         &class_for("PeriodicWave").get_property("prototype"),
@@ -855,6 +1282,8 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
     let context =
         w3cos_core::class::construct(&crate::web_events::event_target_class(), Vec::new());
     w3cos_core::class::set_prototype_of(&context, &class_for(class_name).get_property("prototype"));
+    let context_id = next_audio_id();
+    context.set_property("__w3cos_audio_id", Value::Number(context_id as f64));
     let clock = Rc::new(RefCell::new(ContextClock {
         state: "suspended",
         accumulated: 0.0,
@@ -874,10 +1303,13 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
     context.set_property("onstatechange", Value::Null);
     context.set_property("listener", audio_listener_value());
     context.set_property("audioWorklet", worklet_value());
+    let destination = node_value("AudioDestinationNode", context.clone(), Value::Undefined);
+    let destination_id = audio_id(&destination).unwrap_or(0);
     context.set_property(
-        "destination",
-        node_value("AudioDestinationNode", context.clone(), Value::Undefined),
+        "__w3cos_audio_destination_id",
+        Value::Number(destination_id as f64),
     );
+    context.set_property("destination", destination);
     install_context_factories(&context);
 
     if class_name == "AudioContext" {
@@ -904,14 +1336,9 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
                         "Cannot resume a closed AudioContext",
                     )]);
                 }
+                let start_time = clock_time(&resume_clock.borrow());
                 transition_context(&this, &resume_clock, "running");
-                static WARNING: Once = Once::new();
-                WARNING.call_once(|| {
-                    eprintln!(
-                        "[w3cos] warning: AudioContext graph time can run, but audible output \
-                         requires a native audio device adapter"
-                    );
-                });
+                open_live_output(&this, sample_rate, start_time);
                 w3cos_core::promise::resolve(vec![Value::Undefined])
             }),
         );
@@ -926,6 +1353,13 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
                     )]);
                 }
                 transition_context(&this, &suspend_clock, "suspended");
+                if let Some(id) = audio_id(&this) {
+                    LIVE_OUTPUTS.with(|outputs| {
+                        if let Some(live) = outputs.borrow().get(&id) {
+                            live.output.set_paused(true);
+                        }
+                    });
+                }
                 w3cos_core::promise::resolve(vec![Value::Undefined])
             }),
         );
@@ -934,6 +1368,10 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
             "close",
             realm_audio_function(move |this, _| {
                 transition_context(&this, &close_clock, "closed");
+                if let Some(id) = audio_id(&this) {
+                    let live = LIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().remove(&id));
+                    drop(live);
+                }
                 w3cos_core::promise::resolve(vec![Value::Undefined])
             }),
         );
@@ -988,6 +1426,13 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
                     ("length".into(), Value::Number(offline_length as f64)),
                     ("sampleRate".into(), Value::Number(sample_rate)),
                 ])));
+                render_offline(
+                    &this,
+                    &buffer,
+                    sample_rate,
+                    offline_channels,
+                    offline_length,
+                );
                 render_clock.borrow_mut().accumulated = offline_length as f64 / sample_rate;
                 transition_context(&this, &render_clock, "closed");
                 let completion = w3cos_core::class::construct(
@@ -1010,6 +1455,44 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
     }
     register_context(&context, &clock);
     context
+}
+
+/// Renders the connected graph into the OfflineAudioContext result buffer and
+/// fires `ended` for buffer sources that reached their natural end.
+fn render_offline(
+    context: &Value,
+    buffer: &Value,
+    sample_rate: f64,
+    channels: usize,
+    length: usize,
+) {
+    let (Some(context_id), destination) = (
+        audio_id(context),
+        context.get_property("__w3cos_audio_destination_id"),
+    ) else {
+        return;
+    };
+    let snapshot = graph_snapshot(context_id, destination.to_number() as u64);
+    let mut renderer = crate::audio_render::Renderer::new(sample_rate, channels, 0.0);
+    let rendered = renderer.render_planar(&snapshot, length);
+    for (channel, samples) in rendered.iter().enumerate() {
+        let data = buffer.call_method("getChannelData", vec![Value::Number(channel as f64)]);
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        w3cos_core::binary::fill_array_buffer_view(&data, &bytes);
+    }
+    for id in renderer.finished_sources() {
+        let node =
+            GRAPH_NODES.with(|nodes| nodes.borrow().get(&id).map(|entry| entry.node.clone()));
+        if let Some(node) = node {
+            if !node.get_property("__w3cos_ended").to_bool() {
+                node.set_property("__w3cos_ended", Value::Bool(true));
+                dispatch(&node, "ended");
+            }
+        }
+    }
 }
 
 fn install_context_factories(context: &Value) {
@@ -1494,6 +1977,10 @@ pub fn class_for(name: &'static str) -> Value {
 }
 
 pub fn reset() {
+    LIVE_OUTPUTS.with(|outputs| outputs.borrow_mut().clear());
+    GRAPH_NODES.with(|nodes| nodes.borrow_mut().clear());
+    ACQUIRED_BUFFERS.with(|buffers| buffers.borrow_mut().clear());
+    LAST_LIVE_POLL.with(|last| last.set(f64::NEG_INFINITY));
     let callback_targets =
         CALLBACK_TARGETS.with(|targets| std::mem::take(&mut *targets.borrow_mut()));
     for target in callback_targets {
@@ -1629,6 +2116,149 @@ mod tests {
         assert!(completed.get());
         assert_eq!(rendered.borrow().get_property("duration").to_number(), 1.0);
         assert_eq!(context.get_property("state").to_js_string(), "closed");
+    }
+
+    fn offline_context(channels: f64, length: f64, rate: f64) -> Value {
+        context_value(
+            "OfflineAudioContext",
+            Value::object(HashMap::from([
+                ("numberOfChannels".into(), Value::Number(channels)),
+                ("length".into(), Value::Number(length)),
+                ("sampleRate".into(), Value::Number(rate)),
+            ])),
+        )
+    }
+
+    fn render(context: &Value) -> Value {
+        let rendered = Rc::new(RefCell::new(Value::Undefined));
+        let slot = Rc::clone(&rendered);
+        context
+            .call_method("startRendering", Vec::new())
+            .call_method(
+                "then",
+                vec![Value::function(move |_, args| {
+                    *slot.borrow_mut() = args.first().cloned().unwrap_or(Value::Undefined);
+                    Value::Undefined
+                })],
+            );
+        crate::jsdom::drain_microtasks();
+        let buffer = rendered.borrow().clone();
+        assert!(!buffer.is_undefined(), "startRendering did not resolve");
+        buffer
+    }
+
+    fn channel(buffer: &Value, index: usize) -> Vec<f32> {
+        let data = buffer.call_method("getChannelData", vec![Value::Number(index as f64)]);
+        w3cos_core::binary::bytes_of(&data)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect()
+    }
+
+    #[test]
+    fn offline_render_plays_oscillator_through_gain_into_destination() {
+        let context = offline_context(1.0, 256.0, 8_000.0);
+        {
+            // The graph stays alive through its connections, like a browser.
+            let oscillator = context.call_method("createOscillator", Vec::new());
+            let gain = context.call_method("createGain", Vec::new());
+            oscillator
+                .get_property("frequency")
+                .set_property("value", Value::Number(1_000.0));
+            gain.get_property("gain")
+                .set_property("value", Value::Number(0.5));
+            oscillator.call_method("connect", vec![gain.clone()]);
+            gain.call_method("connect", vec![context.get_property("destination")]);
+            oscillator.call_method("start", vec![Value::Number(0.0)]);
+        }
+        let samples = channel(&render(&context), 0);
+        assert_eq!(samples.len(), 256);
+        for (index, sample) in samples.iter().enumerate() {
+            let expected =
+                0.5 * (2.0 * std::f64::consts::PI * 1_000.0 * index as f64 / 8_000.0).sin();
+            assert!(
+                (*sample as f64 - expected).abs() < 1e-4,
+                "frame {index}: {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_render_schedules_buffer_sources_and_fires_natural_ended() {
+        let context = offline_context(2.0, 8.0, 8.0);
+        let buffer = context.call_method(
+            "createBuffer",
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(8.0)],
+        );
+        let data = buffer.call_method("getChannelData", vec![Value::Number(0.0)]);
+        data.set_property("0", Value::Number(0.25));
+        data.set_property("1", Value::Number(-0.5));
+        let source = context.call_method("createBufferSource", Vec::new());
+        source.set_property("buffer", buffer);
+        source.call_method("connect", vec![context.get_property("destination")]);
+        let ended = Rc::new(Cell::new(0));
+        let ended_count = Rc::clone(&ended);
+        source.call_method(
+            "addEventListener",
+            vec![
+                Value::string("ended"),
+                Value::function(move |_, _| {
+                    ended_count.set(ended_count.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        source.call_method("start", vec![Value::Number(0.5)]);
+        let rendered = render(&context);
+        let expected = vec![0.0, 0.0, 0.0, 0.0, 0.25, -0.5, 0.0, 0.0];
+        // Mono buffer up-mixes to both destination channels.
+        assert_eq!(channel(&rendered, 0), expected);
+        assert_eq!(channel(&rendered, 1), expected);
+        assert_eq!(ended.get(), 1);
+    }
+
+    #[test]
+    fn offline_render_pans_and_leaves_unconnected_or_unstarted_sources_silent() {
+        let context = offline_context(2.0, 4.0, 8_000.0);
+        let constant = context.call_method("createConstantSource", Vec::new());
+        let panner = context.call_method("createStereoPanner", Vec::new());
+        panner
+            .get_property("pan")
+            .set_property("value", Value::Number(1.0));
+        constant.call_method("connect", vec![panner.clone()]);
+        panner.call_method("connect", vec![context.get_property("destination")]);
+        constant.call_method("start", Vec::new());
+        let idle = context.call_method("createOscillator", Vec::new());
+        idle.call_method("start", Vec::new());
+        let unstarted = context.call_method("createOscillator", Vec::new());
+        unstarted.call_method("connect", vec![context.get_property("destination")]);
+        let rendered = render(&context);
+        assert!(
+            channel(&rendered, 0)
+                .iter()
+                .all(|sample| sample.abs() < 1e-6)
+        );
+        assert!(
+            channel(&rendered, 1)
+                .iter()
+                .all(|sample| (sample - 1.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn source_start_and_stop_validate_times_and_disconnect_detaches_nodes() {
+        let context = offline_context(1.0, 4.0, 4.0);
+        let source = context.call_method("createConstantSource", Vec::new());
+        let negative =
+            w3cos_core::catch_js(|| source.call_method("start", vec![Value::Number(-1.0)]))
+                .expect_err("negative start must throw");
+        assert_eq!(negative.get_property("name").to_js_string(), "RangeError");
+        source.call_method("connect", vec![context.get_property("destination")]);
+        source.call_method("start", vec![Value::Number(0.25)]);
+        source.call_method("disconnect", Vec::new());
+        let rendered = render(&context);
+        assert_eq!(channel(&rendered, 0), vec![0.0; 4]);
     }
 
     #[test]
