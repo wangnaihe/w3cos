@@ -1224,6 +1224,27 @@ mod tests {
     }
 
     #[test]
+    fn class_name_replacement_keeps_shared_index_entries_without_duplicates() {
+        let mut doc = Document::new();
+        let el = doc.create_element("div");
+        doc.body().append_child(&mut doc, el);
+
+        el.set_class_name(&mut doc, "bench active");
+        assert_eq!(doc.get_elements_by_class_name("bench").len(), 1);
+        assert_eq!(doc.get_elements_by_class_name("active").len(), 1);
+
+        el.set_class_name(&mut doc, "bench inactive");
+        assert_eq!(doc.get_elements_by_class_name("bench").len(), 1);
+        assert!(doc.get_elements_by_class_name("active").is_empty());
+        assert_eq!(doc.get_elements_by_class_name("inactive").len(), 1);
+
+        el.set_class_name(&mut doc, "bench bench inactive");
+        assert_eq!(el.class_name(&doc), "bench inactive");
+        assert_eq!(doc.get_elements_by_class_name("bench").len(), 1);
+        assert_eq!(doc.get_elements_by_class_name("inactive").len(), 1);
+    }
+
+    #[test]
     fn test_element_class_list_add() {
         let mut doc = Document::new();
         let el = doc.create_element("div");
