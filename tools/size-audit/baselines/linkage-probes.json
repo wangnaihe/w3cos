@@ -10,11 +10,11 @@
       "features": [],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 11905440,
-          "text_bytes": 7737496,
-          "data_bytes": 3352409,
-          "readonly_data_bytes": 2713001,
-          "gzip_bytes": 5110163,
+          "total_bytes": 11932232,
+          "text_bytes": 7758936,
+          "data_bytes": 3355625,
+          "readonly_data_bytes": 2717457,
+          "gzip_bytes": 5124056,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -31,7 +31,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "x86_64-unknown-linux-gnu release-size rows after host-tray and host-keyring left these probes. Desktop web-bluetooth is off; btleplug symbol bytes are 0. Rust 1.99.1."
+          "note": "x86_64-unknown-linux-gnu release-size rows after host-tray and host-keyring left these probes. web-bluetooth and web-geolocation are off; btleplug is absent. Rust 1.99.1."
         }
       }
     },
@@ -42,11 +42,11 @@
       ],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 15718704,
-          "text_bytes": 10217736,
-          "data_bytes": 4472109,
-          "readonly_data_bytes": 3638553,
-          "gzip_bytes": 6842849,
+          "total_bytes": 15750744,
+          "text_bytes": 10236680,
+          "data_bytes": 4481901,
+          "readonly_data_bytes": 3646897,
+          "gzip_bytes": 6854785,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -63,7 +63,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "x86_64-unknown-linux-gnu release-size rows after host-tray and host-keyring left these probes. Desktop web-bluetooth is off; btleplug symbol bytes are 0. Rust 1.99.1."
+          "note": "x86_64-unknown-linux-gnu release-size rows after host-tray and host-keyring left these probes. web-bluetooth and web-geolocation are off; btleplug is absent. Rust 1.99.1."
         }
       }
     }

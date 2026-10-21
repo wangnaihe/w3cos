@@ -151,11 +151,11 @@ checked-in rows are:
 
 | Probe | Stripped bytes | text | data | gzip -9 | Embedded |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ordinary AOT | 11,905,440 | 7,737,496 | 3,352,409 | 5,110,163 | 0 |
-| dynamic browser | 15,718,704 | 10,217,736 | 4,472,109 | 6,842,849 | 0 |
+| ordinary AOT | 11,932,232 | 7,758,936 | 3,355,625 | 5,124,056 | 0 |
+| dynamic browser | 15,750,744 | 10,236,680 | 4,481,901 | 6,854,785 | 0 |
 
-Data includes read-only data (2,713,001 bytes AOT, 3,638,553 bytes browser).
-The same-runner dynamic increment is 3,813,264 bytes (32.03% of the AOT
+Data includes read-only data (2,717,457 bytes AOT, 3,646,897 bytes browser).
+The same-runner dynamic increment is 3,818,512 bytes (32.00% of the AOT
 probe). Symbol attribution assigns 686,785 of the browser symbol bytes to
 `dynamic-js` crates and 435,725 to image-codec crates. Those codec bytes are
 reported only; codec selection is a separate change. `web-bluetooth` is off
@@ -174,8 +174,10 @@ bluetooth code was in the tree, ordinary AOT fell from 12,814,744 to
 (927,096 bytes, 5.58%). Calls without the feature reject `NotSupportedError`
 and do not install an icon or store a secret. Desktop `web-bluetooth` landing
 with the feature still off, and with no `btleplug` symbols, then added 21,376
-bytes to ordinary AOT and 23,808 bytes to the browser probe. Those post-merge
-sizes are the checked-in rows above.
+bytes to ordinary AOT and 23,808 bytes to the browser probe. Desktop
+`web-geolocation` landing the same way, still off, added another 26,792 bytes
+to ordinary AOT and 32,040 bytes to the browser probe. Those post-merge sizes
+are the checked-in rows above.
 
 On the current arm64 macOS measurement, the stripped probes are 6,083,264 bytes
 for ordinary AOT and 7,148,896 bytes for dynamic Browser linkage: a 1,065,632-byte
