@@ -48,6 +48,7 @@ const FEATURE_CRATES: &[(&str, &[&str])] = &[
     ("web-gamepad", &["gilrs"]),
     ("web-device-access", &["hidapi", "nusb"]),
     ("web-serial", &["serialport"]),
+    ("web-bluetooth", &["btleplug"]),
     ("host-tray", &["ksni", "tray_icon"]),
     (
         "host-keyring",

@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "host-tray", "host-keyring"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-bluetooth", "host-tray", "host-keyring"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -32,6 +32,11 @@ web-device-access = ["dep:hidapi", "dep:nusb"]
 # NotReadableError instead of inventing samples. Host injection still works
 # when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
 web-sensors = []
+# Desktop Web Bluetooth over btleplug (CoreBluetooth / WinRT / BlueZ).
+# Android keeps the host-module adapter and does not link this crate.
+# Linux links libdbus (BlueZ); CI installs libdbus-1-dev. Unit tests use the
+# in-memory radio unless W3COS_BLUETOOTH_DEVICE_TESTS=1.
+web-bluetooth = ["dep:btleplug", "dep:tokio", "dep:uuid", "dep:futures"]
 # System tray (`navigator.w3cos.tray`) and the OS secret store
 # (`navigator.w3cos.keyring`). Ordinary AOT linkage leaves both off. The
 # default feature set and the desktop shell turn them back on.
@@ -170,6 +175,12 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 keyring = { version = "4.2", optional = true }
 # Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
+# Web Bluetooth (CoreBluetooth / WinRT / BlueZ). Optional so Android, iOS, and
+# OHOS builds that disable `web-bluetooth` do not link a desktop radio stack.
+btleplug = { version = "0.13", optional = true }
+tokio = { version = "1", optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+uuid = { version = "1", optional = true, default-features = false, features = ["std"] }
+futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 # Web Serial. The serialport crate leaves libudev off; USB
 # vendor and product ids still come from sysfs on Linux.
 serialport = { version = "4.10", default-features = false, optional = true }
