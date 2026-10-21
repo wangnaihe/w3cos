@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access", "web-sensors"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access", "web-sensors", "web-serial"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -15,6 +15,9 @@ web-graphics-advanced = ["dep:naga"]
 # Includes real-time Web Audio output and microphone capture through cpal
 # on desktop targets.
 web-media-advanced = ["dep:cpal"]
+# Host serial ports for navigator.serial on macOS, Windows, and Linux desktop.
+# libudev stays off so CI does not need libudev-dev; Linux USB ids come from sysfs.
+web-serial = ["dep:serialport"]
 # Desktop WebHID (hidapi hidraw) and WebUSB (nusb). The crates are desktop-only,
 # so Android, iOS, and OHOS keep the truthful rejection path.
 web-device-access = ["dep:hidapi", "dep:nusb"]
@@ -145,6 +148,9 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 keyring = "4.2"
 # Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
+# Web Serial. libudev is off so Linux CI does not need libudev-dev; USB
+# vendor and product ids still come from sysfs on Linux.
+serialport = { version = "4.10", default-features = false, optional = true }
 # Pure Rust USB. No libusb.
 nusb = { version = "0.2.8", optional = true }
 # System tray. `ksni` is the Linux StatusNotifierItem backend (the protocol
