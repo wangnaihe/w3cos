@@ -76,6 +76,9 @@ tempfile = { workspace = true }
 glob = { workspace = true }
 w3cos-ffi = { path = "../w3cos-ffi" }
 w3cos-a11y = { workspace = true }
+# In-memory mock used by tests. The desktop `keyring` crate (below) opens the
+# real Secret Service / Keychain / Credential Manager store.
+keyring-core = "1.0"
 
 # GPU rendering (default)
 vello = { workspace = true, optional = true }
@@ -131,10 +134,18 @@ tungstenite = { workspace = true }
 # rfd 0.15.4+ enables xdg-portal by default on Linux; that backend's build.rs
 # requires an async runtime feature even when we only call the sync FileDialog API.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# Default `v1` feature: macOS Keychain, Windows Credential Manager, and the
+# Secret Service over D-Bus (the service libsecret talks to) on Linux.
+keyring = "4.2"
 # Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
 # Pure Rust USB. No libusb.
 nusb = { version = "0.2.8", optional = true }
+# System tray. `ksni` is the Linux StatusNotifierItem backend (the protocol
+# Ayatana AppIndicator implements) and does not need GTK. macOS uses
+# NSStatusItem and Windows uses Shell_NotifyIcon inside the same crate.
+# The default `libappindicator` feature links GTK and is intentionally off.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 
 # hidraw without libusb. On Linux, `linux-native-basic-udev` talks to hidraw
 # through sysfs (basic-udev) and does not link libudev or libusb. macOS uses

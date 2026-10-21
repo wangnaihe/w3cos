@@ -153,6 +153,55 @@ interface W3cosShortcutHandle {
   undefined unregister();
 };
 
+dictionary W3cosTrayMenuItem {
+  USVString id;
+  USVString label;
+  USVString type; // "separator" marks a separator; id and label are then omitted
+  boolean enabled = true;
+  boolean checked = false;
+  boolean separator = false;
+};
+
+dictionary W3cosTrayIcon {
+  required unsigned long width;
+  required unsigned long height;
+  required sequence<octet> rgba;
+};
+
+dictionary W3cosTrayOptions {
+  USVString tooltip;
+  USVString title;
+  sequence<W3cosTrayMenuItem> menu;
+  W3cosTrayIcon icon;
+};
+
+[Exposed=Window]
+interface W3cosTray {
+  Promise<W3cosTrayHandle> show(optional W3cosTrayOptions options = {});
+  Promise<undefined> setMenu(sequence<W3cosTrayMenuItem> menu);
+};
+
+[Exposed=Window]
+interface W3cosTrayHandle {
+  readonly attribute unsigned long long id;
+  readonly attribute USVString tooltip;
+  readonly attribute USVString title;
+  readonly attribute boolean removed;
+  Promise<undefined> update(optional W3cosTrayOptions options = {});
+  Promise<undefined> setMenu(sequence<W3cosTrayMenuItem> menu);
+  Promise<undefined> onClick(EventHandler callback);
+  Promise<undefined> onMenu(EventHandler callback);
+  Promise<undefined> remove();
+};
+
+[Exposed=Window]
+interface W3cosKeyring {
+  Promise<USVString?> get(USVString name);
+  Promise<undefined> set(USVString name, USVString secret);
+  Promise<undefined> delete(USVString name);
+  Promise<sequence<USVString>> list();
+};
+
 dictionary W3cosAgentOptions {
   USVString scope = "app"; // "system" | "cross-app" | "background" are refused
 };
@@ -164,10 +213,10 @@ interface W3cosAgent {
 };
 ```
 
-`tray`, `windows`, `daemon`, `system`, and `keyring` expose their method
-names (`show`, `setMenu`, `list`, `focus`, `setAlwaysOnTop`, `install`,
-`start`, `enableAutostart`, `get`, `set`, `power`, `delete`) so callers
-can feature-detect them. Each one rejects.
+`windows`, `daemon`, and `system` expose their method names
+(`list`, `focus`, `setAlwaysOnTop`, `install`, `start`, `enableAutostart`,
+`get`, `set`, `power`) so callers can feature-detect them. Each one
+rejects. `tray.show`, `tray.setMenu`, and the `keyring` methods are real.
 
 ### Implemented slice
 
@@ -184,14 +233,48 @@ can feature-detect them. Each one rejects.
   when a shortcut is registered, so an empty registry does not touch the
   input hot path. The OS thread queues accelerator strings;
   `flush_global_shortcuts()` delivers them on the JavaScript thread.
+- `tray.show({ tooltip, title, menu, icon })` installs a status item and
+  returns a handle. `update` changes that item. `setMenu` replaces its
+  menu; the namespace method updates the most recently shown icon that is
+  still installed. `onClick` and `onMenu` register callbacks. `remove`
+  drops the item. Tooltip, title, ids, and labels are limited to 128
+  characters. Menus are a flat list of at most 40 items; a `submenu`
+  rejects `TypeError`. Icon pixels are RGBA, at most 128×128; omitted
+  pixels use a built-in 16×16 icon. The shell calls
+  `flush_tray_events()` on the JavaScript thread. A missing permission is
+  `NotAllowedError`. A missing session, or a target with no adapter,
+  rejects `NotSupportedError` and does not report success.
+- Linux calls the StatusNotifierItem D-Bus interface through `ksni` (the
+  protocol Ayatana AppIndicator implements). This build does not link GTK
+  or `libappindicator`. A panel that watches StatusNotifierItem, including
+  KDE and GNOME's AppIndicator extension, can display the item. No session
+  bus is an adapter failure.
+- macOS calls `NSStatusItem`. The icon is created on the thread that calls
+  `show`, which has to be the main thread, and the shell event loop has to
+  be running. `title` is the status-item title. Left click is the click
+  callback; the menu is the context menu.
+- Windows calls `Shell_NotifyIcon`. The creating thread has to pump Win32
+  messages; the shell loop does. `title` is ignored by the shell. Left
+  click is the click callback; right click opens the menu. Tooltip text
+  follows the 128-character limit above.
+- `keyring.get` / `keyring.set` / `keyring.delete` / `keyring.list` read
+  and write the current document origin's secrets. The service name is
+  derived from that origin. `list` returns names only, and only for items
+  whose stored service matches this origin exactly, so a prefix of another
+  origin is not enough. `get` resolves `null` when the name is absent.
+  `delete` of a missing name resolves. The desktop adapter is the `keyring`
+  crate: Linux talks to the Secret Service over D-Bus (the same service
+  libsecret uses), macOS uses Keychain Services, and Windows uses
+  Credential Manager. Android, iOS, and HarmonyOS have no adapter yet.
+  A missing session bus, a locked store, or any other failure to open the
+  backend rejects `NotSupportedError`. Nothing is written to a file
+  instead. Exception text does not include the secret.
 
 ### Refused until an adapter exists
 
-- `tray.show` / `tray.setMenu`
 - `windows.list` / `windows.focus` / `windows.setAlwaysOnTop`
 - `daemon.install` / `daemon.start` / `daemon.enableAutostart`
 - `system.get` / `system.set` / `system.power`
-- `keyring.get` / `keyring.set` / `keyring.delete`
 - `agent.accessibilityTree({ scope: "cross-app" })` and
   `agent.captureScreen({ scope: "background" })`
 
@@ -210,11 +293,21 @@ display capture as `getDisplayMedia`.
 - A global shortcut grabs a key combination for every application. The
   prompt must name the accelerator. Failed grabs do not fall back to a
   silent in-app registration.
+- A tray icon is visible in the session status area and can open a menu.
+  The prompt must name the app. The adapter does not read other apps'
+  status items. Menu labels are plain text. Realm reset removes every icon
+  this realm created. Callbacks run only after `flush_tray_events()` on
+  the JavaScript thread; a failed adapter does not invent a click.
 - The accessibility tree and the capture blob describe the current app
   only. Cross-app and unprompted background capture stay refused so this
   namespace cannot bypass the bridge's screenshot and DOM-read bits.
-- The keyring stub stores nothing. A later adapter must require the
-  `w3cos-keyring` grant per origin and must not echo secrets into logs.
+- The keyring requires `w3cos-keyring` before it touches the store. Items
+  are scoped to the document origin (`w3cos://files` and `w3cos://editor`
+  do not see each other). Hosts that leave every app on the default
+  `w3cos://app` origin share that one namespace. Secrets are not written
+  to logs or exception messages. There is no in-memory fallback when the
+  system store cannot be opened; headless CI without a Secret Service
+  session gets `NotSupportedError`.
 - System power and settings are refused. A later `power("shutdown")` needs
   its own confirmation, not only the capability bit.
 

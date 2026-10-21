@@ -159,8 +159,10 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+pub mod tray_host;
 mod usb_adapter;
 
+pub(crate) mod keyring_store;
 pub mod plugin_abi;
 pub mod shared_abi;
 #[cfg(feature = "skia")]
