@@ -4451,8 +4451,10 @@ fn fs() -> @location(0) vec4<f32> {
         linked: &LinkedGpu,
     ) -> Result<Vec<SamplerBind>, u32> {
         let program = draw.current_program().ok_or(INVALID_OPERATION)?;
-        let wgsl = draw.gpu.modules[&program].fragment_wgsl.clone()
-            + &draw.gpu.modules[&program].vertex_wgsl;
+        let module = &draw.gpu.modules[&program];
+        // `String + &String` fails to resolve once smartstring is in the
+        // crate graph (default features). Build the scan buffer explicitly.
+        let wgsl = format!("{}{}", module.fragment_wgsl, module.vertex_wgsl);
         let mut entries = Vec::new();
         for (index, uniform) in linked.uniforms.iter().enumerate() {
             if uniform.gl_type != SAMPLER_2D {
