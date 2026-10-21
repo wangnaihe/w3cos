@@ -151,15 +151,16 @@ checked-in rows are:
 
 | Probe | Stripped bytes | text | data | gzip -9 | Embedded |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ordinary AOT | 11,932,232 | 7,758,936 | 3,355,625 | 5,124,056 | 0 |
-| dynamic browser | 15,750,744 | 10,236,680 | 4,481,901 | 6,854,785 | 0 |
+| ordinary AOT | 11,877,576 | 7,726,552 | 3,338,845 | 5,095,951 | 0 |
+| dynamic browser | 15,372,632 | 9,963,144 | 4,399,109 | 6,693,042 | 0 |
 
-Data includes read-only data (2,717,457 bytes AOT, 3,646,897 bytes browser).
-The same-runner dynamic increment is 3,818,512 bytes (32.00% of the AOT
+Data includes read-only data (2,703,813 bytes AOT, 3,586,561 bytes browser).
+The same-runner dynamic increment is 3,495,056 bytes (29.43% of the AOT
 probe). Symbol attribution assigns 686,785 of the browser symbol bytes to
-`dynamic-js` crates and 435,725 to image-codec crates. Those codec bytes are
-reported only; codec selection is a separate change. `web-bluetooth` is off
-in both probes, and its `btleplug` symbol bucket is 0.
+`dynamic-js` crates and 192,080 to image-codec crates. Ordinary AOT's
+image-codec bucket is 0. Those codec bytes are reported only; codec
+selection is a separate change. `web-bluetooth` is off in both probes, and
+its `btleplug` symbol bucket is 0.
 
 Moving `navigator.w3cos.tray` and `navigator.w3cos.keyring` behind `host-tray`
 and `host-keyring` removed them from both probes. The runtime `default`
@@ -176,8 +177,10 @@ and do not install an icon or store a secret. Desktop `web-bluetooth` landing
 with the feature still off, and with no `btleplug` symbols, then added 21,376
 bytes to ordinary AOT and 23,808 bytes to the browser probe. Desktop
 `web-geolocation` landing the same way, still off, added another 26,792 bytes
-to ordinary AOT and 32,040 bytes to the browser probe. Those post-merge sizes
-are the checked-in rows above.
+to ordinary AOT and 32,040 bytes to the browser probe. Merging explicit image
+codecs and the SVG GPU path, with the codecs still off in these two probes,
+then moved the checked-in rows from 11,932,232 / 15,750,744 to 11,877,576 /
+15,372,632 (−54,656 and −378,112). Those last sizes are the rows above.
 
 On the current arm64 macOS measurement, the stripped probes are 6,083,264 bytes
 for ordinary AOT and 7,148,896 bytes for dynamic Browser linkage: a 1,065,632-byte

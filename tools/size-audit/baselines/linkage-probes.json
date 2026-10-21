@@ -10,11 +10,11 @@
       "features": [],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 11932232,
-          "text_bytes": 7758936,
-          "data_bytes": 3355625,
-          "readonly_data_bytes": 2717457,
-          "gzip_bytes": 5124056,
+          "total_bytes": 11877576,
+          "text_bytes": 7726552,
+          "data_bytes": 3338845,
+          "readonly_data_bytes": 2703813,
+          "gzip_bytes": 5095951,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -22,7 +22,7 @@
             "gpu": 0,
             "host-keyring": 0,
             "host-tray": 0,
-            "image-codecs": 17072,
+            "image-codecs": 0,
             "skia": 0,
             "web-bluetooth": 0,
             "web-device-access": 0,
@@ -31,7 +31,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "x86_64-unknown-linux-gnu release-size rows after host-tray and host-keyring left these probes. web-bluetooth and web-geolocation are off; btleplug is absent. Rust 1.99.1."
+          "note": "x86_64-unknown-linux-gnu release-size rows after merging explicit image codecs and the SVG GPU path. Ordinary AOT and dynamic-browser probes leave image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring off. Rust 1.99.1."
         }
       }
     },
@@ -42,11 +42,11 @@
       ],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 15750744,
-          "text_bytes": 10236680,
-          "data_bytes": 4481901,
-          "readonly_data_bytes": 3646897,
-          "gzip_bytes": 6854785,
+          "total_bytes": 15372632,
+          "text_bytes": 9963144,
+          "data_bytes": 4399109,
+          "readonly_data_bytes": 3586561,
+          "gzip_bytes": 6693042,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -54,7 +54,7 @@
             "gpu": 0,
             "host-keyring": 0,
             "host-tray": 0,
-            "image-codecs": 435725,
+            "image-codecs": 192080,
             "skia": 0,
             "web-bluetooth": 0,
             "web-device-access": 0,
@@ -63,7 +63,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "x86_64-unknown-linux-gnu release-size rows after host-tray and host-keyring left these probes. web-bluetooth and web-geolocation are off; btleplug is absent. Rust 1.99.1."
+          "note": "x86_64-unknown-linux-gnu release-size rows after merging explicit image codecs and the SVG GPU path. Ordinary AOT and dynamic-browser probes leave image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring off. Rust 1.99.1."
         }
       }
     }
