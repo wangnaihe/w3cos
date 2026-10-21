@@ -48,9 +48,9 @@ jobs:
           cargo test -p w3cos-runtime --lib --tests
       - name: Test optional dynamic JavaScript path
         run: |
-          cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
-          cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_realm::
-          cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_web::tests
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico dynamic_script::tests --lib
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --lib worker_realm::
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --lib worker_web::tests
       - name: Checkout pinned Web Platform Tests subset
         run: |
           wpt_dir="$RUNNER_TEMP/wpt"
@@ -80,15 +80,25 @@ jobs:
             target/wpt-smoke
             target/wpt-baseline
       - name: Test map-style dynamic SDK loading
-        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js --test map_sdk_compat
+        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --test map_sdk_compat
       - name: Verify ordinary AOT dependency boundary
         run: scripts/check-aot-dependency-boundary.sh
       - name: Verify dynamic JavaScript execution boundary
         run: scripts/check-dynamic-js-boundary.sh
+      - name: Verify mobile renderer dependency boundary
+        run: scripts/check-mobile-renderer-boundary.sh
       - name: Test size audit policy
         run: cargo test -p w3cos-size-audit
       - name: Audit linkage-probe size, attribution, and baselines
         run: scripts/audit-linkage-sizes.sh
+      - name: Build and budget the mobile Skia linkage probe
+        run: |
+          cargo build -p w3cos-size-probes --features mobile-skia --bin w3cos-mobile-skia-size-probe --profile release-size
+          test "$(target/release-size/w3cos-mobile-skia-size-probe)" = "mobile-skia"
+          target/release-size/w3cos-size-audit \
+            --profile runtime \
+            --component executable=target/release-size/w3cos-mobile-skia-size-probe \
+            --output target/size-audit-mobile-skia.json
       - name: Upload linkage-probe size reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -99,3 +109,4 @@ jobs:
             target/size-audit-aot.md
             target/size-audit-browser.json
             target/size-audit-browser.md
+            target/size-audit-mobile-skia.json

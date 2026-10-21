@@ -236,7 +236,7 @@ rejects. `tray.show`, `tray.setMenu`, and the `keyring` methods are real.
 - `navigator.w3cos.tray` and `navigator.w3cos.keyring` stay available as
   explicit `w3cos-runtime` features. `host-tray` and `host-keyring` are in
   the crate `default` set and in `w3cos-shell`
-  (`features = ["web-sensors", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring"]`).
+  (`features = ["web-sensors", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]`).
   Ordinary AOT, the size probes, and generated apps use
   `default-features = false` and leave both off, so the call rejects
   `NotSupportedError` and does not link `ksni`, `tray-icon`, or `keyring`.

@@ -1085,7 +1085,15 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     copy clean tiles and rerasterize only dirty bounding boxes. Topology or
     geometry changes still take a full tiled raster. SMIL and Web Animations
     still do not write computed values into this raster path.
-  - [ ] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+  - [x] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+    When the wgpu/Vello backend is active, each SVG element is encoded as GPU
+    vector geometry (paths, solid and gradient fills and strokes, transforms,
+    clip paths, opacity, blend modes, and text glyph outlines) or, for a mask,
+    filter, pattern paint, miter-clip join, or non-outline glyphs, as a CPU
+    pixmap of that element only. The choice and the reason are logged per
+    element. `W3COS_SVG_CPU_TILES=1` keeps the full 32px tile upload. CPU and
+    Skia backends keep the tiled resvg raster. SMIL and Web Animations still
+    do not write computed values into this paint path.
 - [x] Define cookie behavior: real per-origin session store instead of inert
   assignment.
 
@@ -2988,9 +2996,17 @@ W3COS.
 
 ### Standalone iOS/Android model
 - [ ] Produce capability-driven runtime feature sets; applications link only the APIs and subsystems reachable from their manifest/build graph
-- [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
-- [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
-- [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+- [x] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
+  - Generated iOS, Android, and Harmony manifests enable `skia`, or `gpu` plus `web-graphics-advanced` when the application references WebGPU/WebGL/WebXR. `cpu-render` (tiny-skia and softbuffer) is not combined with that primary backend.
+  - `scripts/check-mobile-renderer-boundary.sh` rejects a Skia closure containing softbuffer, vello, wgpu, ravif, or rav1e, and a GPU closure containing skia-safe or softbuffer. resvg's transitive tiny-skia crate is not a second presenter.
+  - Linux x86_64 host linkage, rustc 1.99.1, `release-size`, stripped, same DOM/jsdom touch: 12,796,192 bytes with no renderer, and 16,057,800 bytes with Skia plus PNG/JPEG/WebP (+3,261,608 bytes). The Skia probe links libstdc++ and Skia objects and has no vello, wgpu, or softbuffer strings. This is not an Android ABI split or an iOS device slice.
+- [x] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
+  - `assets/CJK-Subset.ttf` is 10,028,840 bytes and is `include_bytes!` only for tests and the explicit `embed-cjk-font` feature. Web codegen copies it only when `CompileOptions.embed_cjk_font` or `W3COS_EMBED_CJK_FONT` opts in.
+  - Production fallback uses fontconfig, then Android `AFontMatcher`, Apple Core Text, or the Windows `NONCLIENTMETRICS` UI face, then named families and a directory scan. A missing CJK face warns once and is not drawn. With no system font at all, `host_ui_font` still panics unless a non-test build enabled `embed-cjk-font`.
+  - The probes above do not enable `embed-cjk-font`, and neither binary contains that subset.
+- [x] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+  - The workspace `image` crate is `default-features = false`. Raster formats are explicit `w3cos-runtime` features. Generated iOS, Android, and Harmony manifests enable `image-png`, `image-jpeg`, and `image-webp` only.
+  - The runtime crate default, desktop generated apps, shell, demo, rn-compat, and the WPT runner still enable `image-gif`, `image-bmp`, and `image-ico` so existing desktop decode paths keep working.
   - [x] Remove the unused AVIF encoder (`ravif`/`rav1e`) from the ordinary
     raster closure and retain it as explicit `image-avif-encode` capability.
     AVIF decoding is a separate native-decoder boundary.
@@ -3022,17 +3038,21 @@ W3COS.
     1,065,632-byte (17.52%) dynamic increment.
   - [x] Linkage-probe reports now record executable text, file-backed data,
     read-only data, bss, gzip level 9 of the stripped bytes, and an embedded
-    font/image scan. On `x86_64-unknown-linux-gnu` with Rust 1.99.1 the
-    checked-in stripped probes are 11,932,232 bytes (text 7,758,936, data
-    3,355,625, gzip 5,124,056, embedded 0) for ordinary AOT and 15,750,744
-    bytes (text 10,236,680, data 4,481,901, gzip 6,854,785, embedded 0) for
-    the dynamic browser probe. The same-runner dynamic increment is 3,818,512
-    bytes (32.00%). `web-bluetooth` and `web-geolocation` are off in both probes.
+    font/image scan. The checked-in `x86_64-unknown-linux-gnu` rows are in
+    `tools/size-audit/baselines/linkage-probes.json` and
+    `docs/distribution-size.md`. `web-bluetooth`, `web-geolocation`, and the
+    explicit image codecs are off in the ordinary AOT and dynamic-browser probes.
+  - [x] The 2026-10-21 Linux x86_64 `release-size` probes (rustc 1.99.1,
+    stripped) measure 12,839,200 bytes for ordinary DOM/jsdom AOT at
+    `ff70045` and 12,796,192 bytes after moving raster codecs onto explicit
+    features (-43,008 bytes; LTO had already dropped unreferenced decoders).
+    The same DOM touch plus Skia and PNG/JPEG/WebP is 16,057,800 bytes.
+    CI builds that Skia probe and audits it with `--profile runtime`.
   - Product gates still need native-library rows, Android ABI-split, and iOS App Store device-slice artifacts
 - [x] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
   - `w3cos-size-audit` reads the unstripped symbol table and records crate totals, the largest symbols, and feature buckets in the uploaded JSON and markdown reports.
   - CI fails when a probe's stripped size grows by more than 3% or more than 200 KiB versus the checked-in row for the same rustc host triple in `tools/size-audit/baselines/linkage-probes.json`. Other architectures are not compared. Update that row with `scripts/audit-linkage-sizes.sh --update-baseline --baseline-note "..."` and review the diff.
-  - `host-tray` and `host-keyring` are explicit features, on for the runtime default set and the desktop shell, off for ordinary AOT. On the same `x86_64-unknown-linux-gnu` toolchain, ordinary AOT fell from 12,814,744 to 11,884,064 bytes (930,680 bytes, 7.26%) and the browser probe from 16,621,992 to 15,694,896 bytes (927,096 bytes, 5.58%).
+  - `host-tray` and `host-keyring` are explicit features, on for the runtime default set and the desktop shell, off for ordinary AOT. On the same `x86_64-unknown-linux-gnu` toolchain, before the later codec split, ordinary AOT fell from 12,814,744 to 11,884,064 bytes (930,680 bytes, 7.26%) and the browser probe from 16,621,992 to 15,694,896 bytes (927,096 bytes, 5.58%).
 - [ ] Track the current full-runtime Monaco artifact as a baseline (about 172 MB unstripped / 120 MB fully stripped on arm64 macOS); replace it with reproducible per-feature baselines
   - [x] The single arm64 macOS 172 MB / 120 MB figure is retired as a CI gate. It mixed application modules with every default feature and is not reproducible on the Linux runner.
   - [x] The two checked-in linkage closures, plus per-feature symbol-byte buckets, are the reproducible baselines. A full default-feature Monaco product artifact (renderers, embedded fonts, application JS) is still not rebuilt here.

@@ -3657,7 +3657,7 @@ mod tests {
         extra_dependencies: &str,
     ) -> String {
         format!(
-            "[package]\nname = {package:?}\nversion = \"0.1.0\"\nedition = {edition:?}\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false, features = [\"web-graphics-advanced\", \"web-media-advanced\"] }}\n{extra_dependencies}\n[workspace]\n"
+            "[package]\nname = {package:?}\nversion = \"0.1.0\"\nedition = {edition:?}\n\n[dependencies]\nw3cos-core = {{ path = {core_path:?} }}\nw3cos-runtime = {{ path = {runtime_path:?}, default-features = false, features = [\"web-graphics-advanced\", \"web-media-advanced\", \"image-png\", \"image-jpeg\", \"image-webp\", \"image-gif\", \"image-bmp\", \"image-ico\"] }}\n{extra_dependencies}\n[workspace]\n"
         )
     }
 
