@@ -3,7 +3,9 @@
 //! Exercises permission denial, a real process, window-management displays,
 //! battery (or an honest `NotSupportedError`), an application shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
-//! open), a refused tray stub, display capture, a TCP echo, and a WebNN add.
+//! open), a system-tray adapter (or an honest `NotSupportedError` when the
+//! session has no status watcher), display capture, a TCP echo, and a WebNN
+//! add.
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
@@ -242,7 +244,16 @@ fn main() {
     } else {
         keyring.clone()
     };
-    let tray = await_value(namespace.get_property("tray").call_method("show", vec![]));
+    let tray = await_value(namespace.get_property("tray").call_method(
+        "show",
+        vec![Value::object(HashMap::from([(
+            "tooltip".into(),
+            Value::string("w3cos native gaps"),
+        )]))],
+    ));
+    if let Ok(handle) = &tray {
+        let _ = await_value(handle.call_method("remove", vec![]));
+    }
     let capture = await_value(
         namespace
             .get_property("agent")
@@ -307,7 +318,11 @@ fn main() {
     let shortcut_text = format!("hits {}", hits.borrow());
     row("shortcut", &shortcut_text, *hits.borrow() == 1);
     let tray_text = match &tray {
-        Ok(_) => "unexpected success".to_string(),
+        Ok(handle) => format!(
+            "id {} {}",
+            handle.get_property("id").to_number(),
+            handle.get_property("tooltip").to_js_string()
+        ),
         Err(err) => err.clone(),
     };
     let keyring_text = match &keyring_read {
@@ -320,7 +335,11 @@ fn main() {
         &keyring_text,
         keyring_text == "stored" || keyring_text == "NotSupportedError",
     );
-    row("tray stub", &tray_text, tray_text == "NotSupportedError");
+    let tray_ok = match &tray {
+        Ok(_) => true,
+        Err(err) => err == "NotSupportedError",
+    };
+    row("tray adapter", &tray_text, tray_ok);
     let capture_text = match &capture {
         Ok(image) => format!(
             "{}x{}",
