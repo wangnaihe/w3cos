@@ -3038,10 +3038,13 @@ W3COS.
     1,065,632-byte (17.52%) dynamic increment.
   - [x] Linkage-probe reports now record executable text, file-backed data,
     read-only data, bss, gzip level 9 of the stripped bytes, and an embedded
-    font/image scan. The checked-in `x86_64-unknown-linux-gnu` rows are in
-    `tools/size-audit/baselines/linkage-probes.json` and
-    `docs/distribution-size.md`. `web-bluetooth`, `web-geolocation`, and the
-    explicit image codecs are off in the ordinary AOT and dynamic-browser probes.
+    font/image scan. On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after
+    explicit image codecs and the SVG GPU path landed and with those codecs
+    off in these probes, the checked-in stripped sizes are 11,877,576 bytes
+    for ordinary AOT and 15,372,632 bytes for the dynamic browser probe
+    (gzip 5,095,951 and 6,693,042; embedded 0). The same-runner dynamic
+    increment is 3,495,056 bytes (29.43%). `web-bluetooth` and
+    `web-geolocation` are off in both probes.
   - [x] The 2026-10-21 Linux x86_64 `release-size` probes (rustc 1.99.1,
     stripped) measure 12,839,200 bytes for ordinary DOM/jsdom AOT at
     `ff70045` and 12,796,192 bytes after moving raster codecs onto explicit
