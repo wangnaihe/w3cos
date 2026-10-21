@@ -61,6 +61,8 @@ pub struct CompiledShader {
     pub success: bool,
     pub info_log: String,
     pub interface: Interface,
+    /// Line-preserving GLSL 450 that `naga` validated, empty when compilation failed.
+    pub glsl: String,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +71,20 @@ pub struct LinkedProgram {
     pub info_log: String,
     /// Attributes with their assigned locations.
     pub attributes: Vec<(Variable, u32)>,
+    pub uniforms: Vec<Variable>,
+    /// Vertex/fragment GLSL 450 with link-time attribute locations, shared
+    /// varying locations and uniform bindings. Empty when linking failed.
+    pub vertex_glsl: String,
+    pub fragment_glsl: String,
+}
+
+/// Linked program lowered for the wgpu pipeline cache.
+#[derive(Clone, Debug)]
+pub struct LinkedGpu {
+    pub generation: u64,
+    pub vertex_glsl: String,
+    pub fragment_glsl: String,
+    pub attributes: Vec<(String, u32, String)>,
     pub uniforms: Vec<Variable>,
 }
 
@@ -181,6 +197,28 @@ fn is_ident_byte(byte: u8) -> bool {
 }
 
 /// Replaces whole-identifier occurrences of `from` with `to`.
+fn replace_call(text: &str, from: &str, to: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while let Some(found) = text[index..].find(from) {
+        let start = index + found;
+        let end = start + from.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        let call = text[end..].trim_start().starts_with('(');
+        out.push_str(&text[index..start]);
+        if before_ok && after_ok && call {
+            out.push_str(to);
+        } else {
+            out.push_str(from);
+        }
+        index = end;
+    }
+    out.push_str(&text[index..]);
+    out
+}
+
 fn replace_ident(text: &str, from: &str, to: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -583,12 +621,15 @@ fn translate(source: &str, stage: Stage, webgl2: bool) -> Result<Translation, St
             ("texture2DProjLod", "textureProjLod"),
             ("texture2DLod", "textureLod"),
             ("texture2DProj", "textureProj"),
-            ("texture2D", "texture"),
             ("textureCubeLodEXT", "textureLod"),
             ("textureCubeLod", "textureLod"),
-            ("textureCube", "texture"),
         ] {
             text = replace_ident(&text, from, to);
+        }
+        // `texture2D` / `textureCube` are also the split sampler types.
+        // Only function calls become the GLSL 450 overloads.
+        for (from, to) in [("texture2D", "texture"), ("textureCube", "texture")] {
+            text = replace_call(&text, from, to);
         }
         if stage == Stage::Fragment {
             text = text.replace("gl_FragData[0]", "_w3cos_FragColor");
@@ -661,6 +702,7 @@ pub fn compile(stage: Stage, source: &str, webgl2: bool) -> CompiledShader {
                 success: false,
                 info_log: log + "\n",
                 interface: Interface::default(),
+                glsl: String::new(),
             };
         }
     };
@@ -670,6 +712,11 @@ pub fn compile(stage: Stage, source: &str, webgl2: bool) -> CompiledShader {
         success,
         info_log,
         interface: translation.interface,
+        glsl: if success {
+            translation.source
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -748,6 +795,279 @@ fn check(_stage: Stage, _translation: &Translation) -> (bool, String) {
     )
 }
 
+// ── Link-time GLSL for the GPU path ──────────────────────────────────────
+
+struct LayoutDecl {
+    num_start: usize,
+    num_end: usize,
+    storage: String,
+    name: String,
+}
+
+fn next_idents(source: &str, cursor: &mut usize) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut idents = Vec::new();
+    while *cursor < bytes.len() && idents.len() < 6 {
+        while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
+            *cursor += 1;
+        }
+        if *cursor >= bytes.len() || !is_ident_byte(bytes[*cursor]) {
+            break;
+        }
+        let start = *cursor;
+        while *cursor < bytes.len() && is_ident_byte(bytes[*cursor]) {
+            *cursor += 1;
+        }
+        idents.push(source[start..*cursor].to_string());
+    }
+    idents
+}
+
+fn layout_decls(source: &str) -> Vec<LayoutDecl> {
+    let mut decls = Vec::new();
+    let mut from = 0;
+    while let Some(found) = source[from..].find("layout(location=") {
+        let num_start = from + found + "layout(location=".len();
+        let num_len = source[num_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let num_end = num_start + num_len;
+        let Some(close) = source[num_end..].find(')') else {
+            break;
+        };
+        let mut cursor = num_end + close + 1;
+        let tokens = next_idents(source, &mut cursor);
+        let storage_at = tokens
+            .iter()
+            .position(|token| matches!(token.as_str(), "in" | "out" | "uniform"));
+        if let Some(storage_at) = storage_at
+            && tokens.len() >= storage_at + 3
+        {
+            decls.push(LayoutDecl {
+                num_start,
+                num_end,
+                storage: tokens[storage_at].clone(),
+                name: tokens[storage_at + 2].clone(),
+            });
+        }
+        from = num_end;
+    }
+    decls
+}
+
+fn apply_number_rewrites(source: &str, mut spans: Vec<(usize, usize, u32)>) -> String {
+    spans.sort_by_key(|(start, _, _)| *start);
+    spans.dedup_by_key(|(start, _, _)| *start);
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for (start, end, value) in spans {
+        if start < cursor || end > source.len() || start > end {
+            continue;
+        }
+        out.push_str(&source[cursor..start]);
+        out.push_str(&value.to_string());
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
+    out
+}
+
+fn attribute_location(attributes: &[(Variable, u32)], name: &str) -> Option<u32> {
+    if let Some((base, column)) = name.rsplit_once("_w3cos_c")
+        && let Ok(column) = column.parse::<u32>()
+    {
+        return attributes
+            .iter()
+            .find(|(variable, _)| variable.name == base)
+            .map(|(_, location)| location + column);
+    }
+    let base = name.split('[').next().unwrap_or(name);
+    attributes
+        .iter()
+        .find(|(variable, _)| variable.name == base)
+        .map(|(_, location)| *location)
+}
+
+fn rewrite_attribute_locations(source: &str, attributes: &[(Variable, u32)]) -> String {
+    let spans = layout_decls(source)
+        .into_iter()
+        .filter(|decl| decl.storage == "in")
+        .filter_map(|decl| {
+            attribute_location(attributes, &decl.name)
+                .map(|location| (decl.num_start, decl.num_end, location))
+        })
+        .collect();
+    apply_number_rewrites(source, spans)
+}
+
+fn varying_locations(vertex: &str, fragment: &str) -> HashMap<String, u32> {
+    let mut names = Vec::new();
+    for decl in layout_decls(vertex) {
+        if decl.storage == "out" && !decl.name.starts_with("_w3cos_") && !names.contains(&decl.name)
+        {
+            names.push(decl.name);
+        }
+    }
+    for decl in layout_decls(fragment) {
+        if decl.storage == "in" && !names.contains(&decl.name) {
+            names.push(decl.name);
+        }
+    }
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| (name, index as u32))
+        .collect()
+}
+
+fn rewrite_varying_locations(
+    source: &str,
+    storage: &str,
+    locations: &HashMap<String, u32>,
+) -> String {
+    let spans = layout_decls(source)
+        .into_iter()
+        .filter(|decl| decl.storage == storage)
+        .filter_map(|decl| {
+            locations
+                .get(&decl.name)
+                .copied()
+                .map(|location| (decl.num_start, decl.num_end, location))
+        })
+        .collect();
+    apply_number_rewrites(source, spans)
+}
+
+fn binding_digits_before(source: &str, marker_at: usize) -> Option<(usize, usize)> {
+    let head = &source[..marker_at];
+    let binding = head.rfind("binding=")?;
+    let num_start = binding + "binding=".len();
+    let num_end = num_start
+        + source[num_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+    if source[num_end..marker_at].contains(';') {
+        return None;
+    }
+    Some((num_start, num_end))
+}
+
+fn first_ident(source: &str, name: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(found) = source[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
+}
+
+fn block_field_at(source: &str, name: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(found) = source[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            let brace = source[..start].rfind('{');
+            let semi = source[..start].rfind(';');
+            if brace.is_some_and(|brace| semi.is_none_or(|semi| semi < brace)) {
+                return Some(start);
+            }
+        }
+        from = end.max(from + 1);
+    }
+    None
+}
+
+fn rewrite_uniform_bindings(source: &str, uniforms: &[Variable]) -> String {
+    let mut spans = Vec::new();
+    for (index, uniform) in uniforms.iter().enumerate() {
+        let index = index as u32;
+        if split_sampler(&uniform.glsl_type).is_some() {
+            if let Some(marker) = first_ident(source, &format!("{}_w3cos_t", uniform.name))
+                && let Some((start, end)) = binding_digits_before(source, marker)
+            {
+                spans.push((start, end, index * 2));
+            }
+            if let Some(marker) = first_ident(source, &format!("{}_w3cos_s", uniform.name))
+                && let Some((start, end)) = binding_digits_before(source, marker)
+            {
+                spans.push((start, end, index * 2 + 1));
+            }
+        } else if let Some(marker) = block_field_at(source, &uniform.name)
+            && let Some((start, end)) = binding_digits_before(source, marker)
+        {
+            spans.push((start, end, index));
+        }
+    }
+    apply_number_rewrites(source, spans)
+}
+
+/// Patches compiled GLSL so both stages agree on attribute locations,
+/// varying locations and uniform bindings.
+pub fn linked_glsl(
+    vertex: &CompiledShader,
+    fragment: &CompiledShader,
+    attributes: &[(Variable, u32)],
+    uniforms: &[Variable],
+) -> (String, String) {
+    let vertex_glsl = rewrite_attribute_locations(&vertex.glsl, attributes);
+    let locations = varying_locations(&vertex_glsl, &fragment.glsl);
+    let vertex_glsl = rewrite_varying_locations(&vertex_glsl, "out", &locations);
+    let fragment_glsl = rewrite_varying_locations(&fragment.glsl, "in", &locations);
+    (
+        rewrite_uniform_bindings(&vertex_glsl, uniforms),
+        rewrite_uniform_bindings(&fragment_glsl, uniforms),
+    )
+}
+
+/// Lowers linked GLSL 450 to WGSL with `naga`, the translator wgpu uses.
+#[cfg(feature = "web-graphics-advanced")]
+pub fn glsl_to_wgsl(stage: Stage, glsl: &str) -> Result<String, String> {
+    use naga::front::glsl::{Frontend, Options};
+
+    let naga_stage = match stage {
+        Stage::Vertex => naga::ShaderStage::Vertex,
+        Stage::Fragment => naga::ShaderStage::Fragment,
+    };
+    let mut frontend = Frontend::default();
+    let module = frontend
+        .parse(&Options::from(naga_stage), glsl)
+        .map_err(|errors| {
+            errors
+                .errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    let info = validator
+        .validate(&module)
+        .map_err(|error| error.to_string())?;
+    naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "web-graphics-advanced"))]
+pub fn glsl_to_wgsl(_stage: Stage, _glsl: &str) -> Result<String, String> {
+    Err("WGSL lowering requires the web-graphics-advanced feature".into())
+}
+
 // ── Linking ───────────────────────────────────────────────────────────────
 
 /// Links a vertex and fragment shader. `bound` holds `bindAttribLocation`
@@ -763,6 +1083,8 @@ pub fn link(
         info_log: log,
         attributes: Vec::new(),
         uniforms: Vec::new(),
+        vertex_glsl: String::new(),
+        fragment_glsl: String::new(),
     };
     let (Some(vertex), Some(fragment)) = (vertex, fragment) else {
         return fail("ERROR: Program must have a vertex and a fragment shader attached\n".into());
@@ -848,11 +1170,14 @@ pub fn link(
         return fail(log);
     }
     attributes.sort_by_key(|(_, location)| *location);
+    let (vertex_glsl, fragment_glsl) = linked_glsl(vertex, fragment, &attributes, &uniforms);
     LinkedProgram {
         success: true,
         info_log: String::new(),
         attributes,
         uniforms,
+        vertex_glsl,
+        fragment_glsl,
     }
 }
 
@@ -1039,5 +1364,72 @@ mod tests {
             "T texture tex2 (T)"
         );
         assert_eq!(count_ident("v_uv v_uv2 v_uv", "v_uv"), 2);
+    }
+
+    #[test]
+    fn link_retargets_attribute_locations_and_shared_uniform_bindings() {
+        let vs = compile(
+            Stage::Vertex,
+            "attribute vec2 a_position;\nattribute vec2 a_uv;\nuniform mat4 u_mvp;\n\
+             varying vec2 v_uv;\nvoid main(){ v_uv = a_uv; gl_Position = u_mvp * vec4(a_position, 0.0, 1.0); }\n",
+            false,
+        );
+        let fs = compile(
+            Stage::Fragment,
+            "precision mediump float;\nuniform mat4 u_mvp;\nuniform vec4 u_color;\n\
+             varying vec2 v_uv;\nvoid main(){ gl_FragColor = u_color; }\n",
+            false,
+        );
+        assert!(vs.success && fs.success, "{}{}", vs.info_log, fs.info_log);
+        let bound = HashMap::from([("a_uv".into(), 3)]);
+        let linked = link(Some(&vs), Some(&fs), &bound, 16);
+        assert!(linked.success, "{}", linked.info_log);
+        assert!(
+            linked.vertex_glsl.contains("layout(location=3)"),
+            "{}",
+            linked.vertex_glsl
+        );
+        assert!(
+            linked.vertex_glsl.contains("binding=0"),
+            "{}",
+            linked.vertex_glsl
+        );
+        assert!(
+            linked.fragment_glsl.contains("vec4 u_color")
+                && linked.fragment_glsl.contains("binding=1"),
+            "{}",
+            linked.fragment_glsl
+        );
+        assert!(
+            !linked
+                .fragment_glsl
+                .contains("layout(std140,set=0,binding=0) uniform _w3cos_u0 { vec4 u_color"),
+            "shared u_mvp must keep binding 0 in the fragment shader\n{}",
+            linked.fragment_glsl
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "web-graphics-advanced")]
+    fn linked_glsl_lowers_to_wgsl() {
+        let vs = compile(
+            Stage::Vertex,
+            "attribute vec2 a_position;\nvarying vec2 v_uv;\nvoid main(){ v_uv = a_position; gl_Position = vec4(a_position, 0.0, 1.0); }\n",
+            false,
+        );
+        let fs = compile(
+            Stage::Fragment,
+            "precision mediump float;\nuniform vec4 u_color;\nvarying vec2 v_uv;\nvoid main(){ gl_FragColor = u_color; }\n",
+            false,
+        );
+        let linked = link(Some(&vs), Some(&fs), &HashMap::new(), 16);
+        assert!(linked.success, "{}", linked.info_log);
+        let vertex = glsl_to_wgsl(Stage::Vertex, &linked.vertex_glsl).expect("vertex wgsl");
+        let fragment = glsl_to_wgsl(Stage::Fragment, &linked.fragment_glsl).expect("fragment wgsl");
+        assert!(vertex.contains("fn main"), "{vertex}");
+        assert!(
+            fragment.contains("@group(0)") && fragment.contains("fn main"),
+            "{fragment}"
+        );
     }
 }
