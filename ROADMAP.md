@@ -282,9 +282,16 @@ suite is red.
   command encoder/submission, while retaining explicit warnings for pending
   bind-group/pipeline/pass/canvas descriptor translation.
 - [x] Add WebGL 1/2 contexts, resource identities, shader/program lifecycle,
-  state queries and current Chrome method/constant surfaces. GLSL-to-wgpu
-  translation and draw/upload execution remain a warning-backed renderer
-  boundary.
+  state queries and current Chrome method/constant surfaces.
+- [x] Compile WebGL GLSL ES 1.00/3.00 against the native shader stack: the
+  dialect is rewritten line-preservingly to GLSL 450 and parsed/validated by
+  `naga` (same version as wgpu), so `COMPILE_STATUS`, info logs with original
+  line numbers, `linkProgram` varying/uniform checks, attribute locations,
+  active attribute/uniform introspection, uniform locations, `useProgram`
+  and `getError` are real (`webgl_shader.rs`, `webgl_program.rs`).
+- [ ] WebGL draw/upload execution on the wgpu compositor (buffers, textures,
+  uniform upload, pipelines, `drawArrays`/`drawElements`, `readPixels`),
+  uniform-block introspection, unused-uniform elimination, extensions.
 - [x] Brand the host-backed Web Bluetooth device/GATT server/service/
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`
