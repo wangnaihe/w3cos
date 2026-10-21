@@ -19663,6 +19663,7 @@ pub fn set_document_visibility(state: &str) -> bool {
         return true;
     }
     crate::observers_web::record_visibility_state(state, performance_now());
+    crate::gamepad_web::on_document_visibility(state);
     let event = w3cos_core::class::construct(
         &crate::web_events::event_class(),
         vec![Value::string("visibilitychange")],
@@ -22694,6 +22695,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
+        ran += crate::gamepad_web::poll();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));

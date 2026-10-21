@@ -4,8 +4,9 @@
 //! battery (or an honest `NotSupportedError`), an application shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
-//! session has no status watcher), display capture, a TCP echo, and a WebNN
-//! add.
+//! session has no status watcher), display capture, a TCP echo, a WebNN add,
+//! and Gamepad enumeration through the desktop adapter (or the host snapshot
+//! path).
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
@@ -60,6 +61,29 @@ fn await_value(promise: Value) -> Result<Value, String> {
         return Err(error);
     }
     ok.borrow().clone().ok_or_else(|| "unresolved".into())
+}
+
+fn gamepad_probe() -> (String, bool) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w3cos_runtime::gamepad_web::get_gamepads_value().call(Value::Undefined, vec![])
+    }));
+    match result {
+        Ok(list) => {
+            let backend = w3cos_runtime::gamepad_web::platform_backend_name();
+            let length = list.get_property("length").to_u32();
+            let mut connected = 0u32;
+            for index in 0..length {
+                if !list.get_property(&index.to_string()).is_null() {
+                    connected += 1;
+                }
+            }
+            (
+                format!("{backend} connected {connected}"),
+                backend != "gilrs-unavailable",
+            )
+        }
+        Err(_) => ("call failed".into(), false),
+    }
 }
 
 fn row(label: &str, detail: &str, ok: bool) {
@@ -359,8 +383,10 @@ fn main() {
         &webnn.clone().unwrap_or_else(|err| err),
         webnn.as_deref() == Ok("4,6"),
     );
+    let (gamepad_text, gamepad_ok) = gamepad_probe();
+    row("gamepad", &gamepad_text, gamepad_ok);
 
-    let frame = render_document_rgba_cpu(960, 560).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 780).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -15,6 +15,10 @@ web-graphics-advanced = ["dep:naga"]
 # Includes real-time Web Audio output and microphone capture through cpal
 # on desktop targets.
 web-media-advanced = ["dep:cpal"]
+# Gamepad discovery and dual-rumble through gilrs on macOS, Windows and Linux
+# desktop. Linux links libudev; CI images install libudev-dev. Android, iOS
+# and OHOS do not enable the adapter.
+web-gamepad = ["dep:gilrs"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
@@ -141,6 +145,8 @@ cpal = { version = "0.15", optional = true }
 # NSStatusItem and Windows uses Shell_NotifyIcon inside the same crate.
 # The default `libappindicator` feature links GTK and is intentionally off.
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+# Gamepad input and rumble (evdev / XInput / IOKit). Linux needs libudev.
+gilrs = { version = "0.11", optional = true }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
