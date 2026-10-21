@@ -1140,6 +1140,14 @@ pub fn selector_matches_node_with_target(
     // selector list still preserves its parsing and short-circuit semantics.
     if !selector.contains(',') {
         let parsed = parse_selector_chain_cached(selector).ok_or(())?;
+        if let Some(class) = single_class_selector(&parsed.chain, &parsed.combinators) {
+            let node = document.get_node(node);
+            return Ok(node.node_type == NodeType::Element
+                && node
+                    .class_list
+                    .iter()
+                    .any(|candidate| candidate.as_str() == class));
+        }
         return Ok(matches_chain_node(
             document,
             node,
@@ -2004,6 +2012,25 @@ fn parse_selector_chain_cached(
     selector_parse_cache::get_or_parse(selector, parse_selector_chain)
 }
 
+fn single_class_selector<'a>(
+    chain: &'a [CompoundSelector],
+    combinators: &[Combinator],
+) -> Option<&'a str> {
+    let [compound] = chain else {
+        return None;
+    };
+    (!compound.unsupported
+        && !compound.universal
+        && !compound.any_namespace
+        && compound.tag.is_none()
+        && compound.id.is_none()
+        && compound.classes.len() == 1
+        && compound.attributes.is_empty()
+        && compound.pseudo_classes.is_empty()
+        && combinators.is_empty())
+    .then(|| compound.classes[0].as_str())
+}
+
 /// Parse one compound selector starting at `pos`. Returns the compound and
 /// the index just past it.
 fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, usize)> {
@@ -2481,6 +2508,56 @@ mod tests {
         assert_eq!(selector_matches_context("[data-x=", &target, &[]), Err(()));
 
         assert_eq!(selector_parse_cache::parse_count_for_test(), 2);
+    }
+
+    #[test]
+    fn node_matches_single_class_fast_path_preserves_parser_and_fallback_semantics() {
+        selector_parse_cache::clear_for_test();
+        let mut document = Document::new();
+        let element = document.create_element("div");
+        element.set_attribute(&mut document, "class", "active other");
+        document.append_child(document.body().id, element.id);
+
+        assert_eq!(
+            selector_matches_node(".active", &document, element.id),
+            Ok(true)
+        );
+        assert_eq!(
+            selector_matches_node(r".act\69 ve", &document, element.id),
+            Ok(true),
+            "the fast path must use the parser's decoded class token"
+        );
+        assert_eq!(
+            selector_matches_node(".inactive", &document, element.id),
+            Ok(false)
+        );
+        assert_eq!(
+            selector_matches_node(".active.other", &document, element.id),
+            Ok(true),
+            "multi-class compounds must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("div.active", &document, element.id),
+            Ok(true),
+            "tag/class compounds must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("[class~=active]", &document, element.id),
+            Ok(true),
+            "attribute selectors must retain the general matcher"
+        );
+        assert_eq!(selector_matches_node(".", &document, element.id), Err(()));
+
+        let parsed = parse_selector_chain_cached(".active").unwrap();
+        assert_eq!(
+            single_class_selector(&parsed.chain, &parsed.combinators),
+            Some("active")
+        );
+        let compound = parse_selector_chain_cached(".active.other").unwrap();
+        assert_eq!(
+            single_class_selector(&compound.chain, &compound.combinators),
+            None
+        );
     }
 
     #[test]
