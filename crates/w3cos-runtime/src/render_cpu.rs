@@ -721,6 +721,7 @@ fn paint_nodes(
             continue;
         }
         let clip_mask = effective_clip.and_then(|rect| clip_masks.get_or_create(pixmap, rect));
+        crate::canvas2d::set_paint_client(idx);
         let text_value = match kind {
             ComponentKind::TextInput { value, .. } => Some(
                 text_input_values
@@ -1293,6 +1294,23 @@ fn render_node(
                     raster.width,
                     raster.height,
                     raster.data.as_slice(),
+                    opacity,
+                    clip_mask,
+                    None,
+                    crate::background_image::BackgroundBlendMode::Normal,
+                );
+            }
+        }
+        ComponentKind::Canvas { .. } => {
+            if let Some(snapshot) =
+                crate::canvas2d::surface_snapshot(crate::canvas2d::paint_client())
+            {
+                draw_image_pixels(
+                    pixmap,
+                    rect,
+                    snapshot.width,
+                    snapshot.height,
+                    snapshot.pixels.as_slice(),
                     opacity,
                     clip_mask,
                     None,

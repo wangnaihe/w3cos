@@ -301,9 +301,19 @@ suite is red.
   line numbers, `linkProgram` varying/uniform checks, attribute locations,
   active attribute/uniform introspection, uniform locations, `useProgram`
   and `getError` are real (`webgl_shader.rs`, `webgl_program.rs`).
-- [ ] WebGL draw/upload execution on the wgpu compositor (buffers, textures,
-  uniform upload, pipelines, `drawArrays`/`drawElements`, `readPixels`),
-  uniform-block introspection, unused-uniform elimination, extensions.
+- [x] Execute WebGL 1/2 draws on the wgpu compositor (`webgl_draw.rs`):
+  buffer upload, vertex attributes and VAOs, `uniform*`/`uniformMatrix*`
+  in std140, 2D `texImage2D`/`texSubImage2D`, framebuffer/renderbuffer
+  basics, viewport/scissor, clear, depth/blend/cull, `drawArrays`/
+  `drawElements` (including instanced draws), `readPixels` of real GPU
+  pixels, and publishing the drawing buffer into the canvas compositor.
+  Linked GLSL 450 is lowered to WGSL with naga. Pipelines are cached by
+  program generation and draw state. With no adapter, draw and
+  `readPixels` return `INVALID_OPERATION` and leave the destination
+  untouched. Transform feedback, uniform blocks, queries, sync, 3D and
+  compressed textures, and non-`sampler2D` samplers are rejected.
+- [ ] WebGL uniform-block introspection, unused-uniform elimination,
+  mipmap generation, `copyTexImage2D`, and extension objects.
 - [x] Brand the host-backed Web Bluetooth device/GATT server/service/
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`

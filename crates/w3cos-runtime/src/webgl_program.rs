@@ -5,13 +5,13 @@
 //! hidden `__w3cos_gl_id`; an object from another context is rejected with
 //! `INVALID_OPERATION` as in browsers.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use w3cos_core::Value;
 
-use crate::webgl_shader::{self, CompiledShader, LinkedProgram, Stage, Variable};
+use crate::webgl_shader::{self, CompiledShader, LinkedGpu, LinkedProgram, Stage, Variable};
 use crate::webgl_web::{class_for, object_value};
 
 const NO_ERROR: u32 = 0;
@@ -55,18 +55,19 @@ struct ProgramEntry {
     deleted: bool,
 }
 
-#[derive(Default)]
 struct Table {
     next_id: u64,
+    next_generation: u64,
     shaders: HashMap<u64, ShaderEntry>,
     programs: HashMap<u64, ProgramEntry>,
-    error: u32,
+    error: Rc<Cell<u32>>,
+    gpu: Rc<RefCell<HashMap<u64, LinkedGpu>>>,
 }
 
 impl Table {
-    fn record(&mut self, error: u32) {
-        if self.error == NO_ERROR {
-            self.error = error;
+    fn record(&self, error: u32) {
+        if self.error.get() == NO_ERROR {
+            self.error.set(error);
         }
     }
 }
@@ -144,8 +145,21 @@ fn find_uniform<'a>(uniforms: &'a [Variable], query: &str) -> Option<&'a Variabl
 }
 
 /// Installs the shader/program methods on a WebGL context object.
-pub fn install(context: &Value, webgl2: bool, state: Rc<RefCell<HashMap<String, Value>>>) {
-    let table: Shared = Rc::new(RefCell::new(Table::default()));
+pub fn install(
+    context: &Value,
+    webgl2: bool,
+    state: Rc<RefCell<HashMap<String, Value>>>,
+    error: Rc<Cell<u32>>,
+    gpu: Rc<RefCell<HashMap<u64, LinkedGpu>>>,
+) {
+    let table: Shared = Rc::new(RefCell::new(Table {
+        next_id: 0,
+        next_generation: 0,
+        shaders: HashMap::new(),
+        programs: HashMap::new(),
+        error,
+        gpu,
+    }));
 
     method(context, "createShader", &table, |table, args| {
         let stage = match arg_u32(args, 0) {
@@ -345,6 +359,25 @@ pub fn install(context: &Value, webgl2: bool, state: Rc<RefCell<HashMap<String, 
             &program.bound,
             MAX_VERTEX_ATTRIBS,
         );
+        if linked.success {
+            table.next_generation += 1;
+            let info = LinkedGpu {
+                generation: table.next_generation,
+                vertex_glsl: linked.vertex_glsl.clone(),
+                fragment_glsl: linked.fragment_glsl.clone(),
+                attributes: linked
+                    .attributes
+                    .iter()
+                    .map(|(variable, location)| {
+                        (variable.name.clone(), *location, variable.glsl_type.clone())
+                    })
+                    .collect(),
+                uniforms: linked.uniforms.clone(),
+            };
+            table.gpu.borrow_mut().insert(program_id, info);
+        } else {
+            table.gpu.borrow_mut().remove(&program_id);
+        }
         let program = table.programs.get_mut(&program_id).expect("checked above");
         program.linked = Some(linked);
         program.validated = false;
@@ -415,8 +448,11 @@ pub fn install(context: &Value, webgl2: bool, state: Rc<RefCell<HashMap<String, 
         if let Some(program) = args.first() {
             program.set_property("__w3cos_deleted", Value::Bool(true));
         }
-        if let Some(entry) = id_of(args.first()).and_then(|id| table.programs.get_mut(&id)) {
-            entry.deleted = true;
+        if let Some(id) = id_of(args.first()) {
+            table.gpu.borrow_mut().remove(&id);
+            if let Some(entry) = table.programs.get_mut(&id) {
+                entry.deleted = true;
+            }
         }
         Value::Undefined
     });
@@ -513,7 +549,7 @@ pub fn install(context: &Value, webgl2: bool, state: Rc<RefCell<HashMap<String, 
         Value::Undefined
     });
     method(context, "getError", &table, |table, _| {
-        Value::Number(std::mem::replace(&mut table.error, NO_ERROR) as f64)
+        Value::Number(table.error.replace(NO_ERROR) as f64)
     });
 }
 
