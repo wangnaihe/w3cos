@@ -392,22 +392,31 @@ thread_local! {
     /// backend for one module at a time.
     static DIRECT_TYPED_CALLEES: std::cell::RefCell<HashMap<u32, (String, usize)>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Same proof as `DIRECT_TYPED_CALLEES`, but for a boxed slice entry.
+    /// This handles immutable same-module functions whose arguments cannot
+    /// use the numeric ABI while still avoiding a function-value lookup, an
+    /// argument `Vec`, and dynamic `call_completion` dispatch.
+    static DIRECT_BOXED_CALLEES: std::cell::RefCell<HashMap<u32, (String, usize)>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
-pub(crate) struct DirectTypedCalleeGuard;
+pub(crate) struct DirectCalleeGuard;
 
-impl Drop for DirectTypedCalleeGuard {
+impl Drop for DirectCalleeGuard {
     fn drop(&mut self) {
         DIRECT_TYPED_CALLEES.with(|callees| callees.borrow_mut().clear());
+        DIRECT_BOXED_CALLEES.with(|callees| callees.borrow_mut().clear());
     }
 }
 
-/// Installs the direct typed callees of the module being emitted.
-pub(crate) fn install_direct_typed_callees(
-    callees: HashMap<u32, (String, usize)>,
-) -> DirectTypedCalleeGuard {
-    DIRECT_TYPED_CALLEES.with(|installed| *installed.borrow_mut() = callees);
-    DirectTypedCalleeGuard
+/// Installs the proven immutable direct callees of the module being emitted.
+pub(crate) fn install_direct_callees(
+    typed: HashMap<u32, (String, usize)>,
+    boxed: HashMap<u32, (String, usize)>,
+) -> DirectCalleeGuard {
+    DIRECT_TYPED_CALLEES.with(|installed| *installed.borrow_mut() = typed);
+    DIRECT_BOXED_CALLEES.with(|installed| *installed.borrow_mut() = boxed);
+    DirectCalleeGuard
 }
 
 /// Arity of an installed direct entry, by its Rust name.
@@ -423,6 +432,14 @@ pub(crate) fn direct_typed_arity_for(target: &str) -> Option<usize> {
 
 fn direct_typed_callee(binding: u32) -> Option<(String, usize)> {
     DIRECT_TYPED_CALLEES.with(|callees| callees.borrow().get(&binding).cloned())
+}
+
+pub(crate) fn direct_boxed_entry_for(target: &str) -> bool {
+    DIRECT_BOXED_CALLEES.with(|callees| callees.borrow().values().any(|(name, _)| name == target))
+}
+
+fn direct_boxed_callee(binding: u32) -> Option<(String, usize)> {
+    DIRECT_BOXED_CALLEES.with(|callees| callees.borrow().get(&binding).cloned())
 }
 
 /// Arity of a function's native typed entry (`{factory}__typed_direct`):
@@ -465,36 +482,42 @@ fn single_definition(function: &Function, register: u32) -> Option<&Instruction>
 /// `callee(args)` where `callee` is a same-module function with a direct
 /// typed entry, `this` is `undefined`, and every argument is an unboxed
 /// number: returns the entry to call.
+#[derive(Debug, Clone)]
+enum DirectCallTarget {
+    Typed(String),
+    Boxed(String),
+}
+
 fn direct_call_target(
     function: &Function,
     plan: &EscapePlan,
     callee: Register,
     this_value: Register,
     arguments: &[Register],
-) -> Option<String> {
-    if DIRECT_TYPED_CALLEES.with(|callees| callees.borrow().is_empty()) {
-        return None;
-    }
+) -> Option<DirectCallTarget> {
     let Some(Instruction::LoadBinding { binding, .. }) = single_definition(function, callee.0)
     else {
         return None;
     };
-    let (target, arity) = direct_typed_callee(binding.0)?;
-    if arity != arguments.len()
-        || !arguments
-            .iter()
-            .all(|argument| num_slot(plan, argument.0).is_some())
-        || !matches!(
-            single_definition(function, this_value.0),
-            Some(Instruction::LoadConstant {
-                value: Constant::Undefined,
-                ..
-            })
-        )
-    {
+    if !matches!(
+        single_definition(function, this_value.0),
+        Some(Instruction::LoadConstant {
+            value: Constant::Undefined,
+            ..
+        })
+    ) {
         return None;
     }
-    Some(target)
+    if let Some((target, arity)) = direct_typed_callee(binding.0)
+        && arity == arguments.len()
+        && arguments
+            .iter()
+            .all(|argument| num_slot(plan, argument.0).is_some())
+    {
+        return Some(DirectCallTarget::Typed(target));
+    }
+    let (target, arity) = direct_boxed_callee(binding.0)?;
+    (arity == arguments.len()).then_some(DirectCallTarget::Boxed(target))
 }
 
 /// A `LoadBinding` of a direct callee whose register only feeds direct
@@ -7508,7 +7531,7 @@ fn emit_instruction(
 ) -> Result<String> {
     let register = |register: w3cos_ir::Register| val_index(plan, register.0);
     if let Instruction::LoadBinding { dst, binding } = instruction
-        && direct_typed_callee(binding.0).is_some()
+        && (direct_typed_callee(binding.0).is_some() || direct_boxed_callee(binding.0).is_some())
         && load_only_feeds_direct_calls(function, plan, *dst)
     {
         return Ok(String::new());
@@ -8137,17 +8160,31 @@ fn emit_instruction(
             this_value,
             arguments,
         } if direct_call_target(function, plan, *callee, *this_value, arguments).is_some() => {
-            // Direct native call into a same-module typed entry: no argument
-            // `Vec`, no boxing of the numbers, no `call_completion` dispatch.
+            // Direct native call into a proven immutable same-module entry:
+            // no function-value lookup, argument `Vec`, or dynamic dispatch.
             let target = direct_call_target(function, plan, *callee, *this_value, arguments)
                 .expect("checked by the guard");
-            let args = arguments
-                .iter()
-                .map(|argument| format!("self.num_regs[{}]", num_index(plan, argument.0)))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let expr = match target {
+                DirectCallTarget::Typed(target) => {
+                    let args = arguments
+                        .iter()
+                        .map(|argument| format!("self.num_regs[{}]", num_index(plan, argument.0)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{target}({args})")
+                }
+                DirectCallTarget::Boxed(target) => {
+                    let reads = arguments
+                        .iter()
+                        .map(|argument| argument.0)
+                        .collect::<Vec<_>>();
+                    let mut uses = ValueUseEmitter::new(plan, last_uses, reads);
+                    let args = emit_arguments_from(&mut uses, arguments);
+                    format!("{target}(&[{args}])")
+                }
+            };
             emit_completion_match(
-                &format!("{target}({args})"),
+                &expr,
                 &format!("self.registers[{}] = __w3cos_value;", register(*dst)),
                 exception_target,
                 mode,
