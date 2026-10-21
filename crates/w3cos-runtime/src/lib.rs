@@ -199,6 +199,8 @@ pub mod web_share;
 pub mod web_transport_web;
 pub mod webcodecs_web;
 mod webgl_constants_generated;
+pub mod webgl_program;
+pub mod webgl_shader;
 pub mod webgl_web;
 pub mod webgpu_web;
 pub mod webnn_web;

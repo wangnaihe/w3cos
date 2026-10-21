@@ -1,8 +1,10 @@
 //! Stateful WebGL 1/2 compatibility contexts.
 //!
-//! Resource identity, shader/program lifecycle, state queries and standard
-//! constants are available. Draw/upload calls preserve state and warn because
-//! GLSL-to-wgpu translation is not yet connected to the compositor.
+//! Resource identity, state queries and standard constants are available.
+//! Shader compilation and program linking run through [`crate::webgl_program`]
+//! (GLSL ES → naga, the shader translator used by wgpu). Draw/upload calls
+//! preserve state and warn because execution is not yet connected to the
+//! compositor.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -191,9 +193,9 @@ fn warn_once() {
     WARNING_EMITTED.with(|warned| {
         if !warned.replace(true) {
             eprintln!(
-                "[w3cos] warning: WebGL preserves resources, shader/program state, queries and \
-                 constants; GLSL translation and draw/upload execution on the native wgpu \
-                 compositor are pending"
+                "[w3cos] warning: WebGL compiles and links GLSL against the native naga \
+                 shader stack and preserves resources, state and queries; draw/upload \
+                 execution on the native wgpu compositor is pending"
             );
         }
     });
@@ -210,7 +212,7 @@ fn constant(name: &str) -> f64 {
     crate::webgl_constants_generated::value(name).unwrap_or(0.0)
 }
 
-fn object_value(name: &'static str) -> Value {
+pub(crate) fn object_value(name: &'static str) -> Value {
     let value = Value::object(HashMap::from([(
         "__w3cos_deleted".into(),
         Value::Bool(false),
@@ -312,16 +314,13 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     for (method, class_name) in [
         ("createBuffer", "WebGLBuffer"),
         ("createFramebuffer", "WebGLFramebuffer"),
-        ("createProgram", "WebGLProgram"),
         ("createQuery", "WebGLQuery"),
         ("createRenderbuffer", "WebGLRenderbuffer"),
         ("createSampler", "WebGLSampler"),
-        ("createShader", "WebGLShader"),
         ("createTexture", "WebGLTexture"),
         ("createTransformFeedback", "WebGLTransformFeedback"),
         ("createVertexArray", "WebGLVertexArrayObject"),
         ("fenceSync", "WebGLSync"),
-        ("getUniformLocation", "WebGLUniformLocation"),
     ] {
         value.set_property(
             method,
@@ -412,6 +411,11 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
             move |_, args| match args.first().map(Value::to_u32).unwrap_or(0) {
                 3106 => state_for_parameter.borrow()["clearColor"].clone(),
                 2978 => state_for_parameter.borrow()["viewport"].clone(),
+                35725 => state_for_parameter
+                    .borrow()
+                    .get("currentProgram")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 7936 => Value::string("w3cos"),
                 7937 => Value::string("w3cos wgpu compatibility renderer"),
                 7938 => Value::string(if webgl2 { "WebGL 2.0" } else { "WebGL 1.0" }),
@@ -424,7 +428,6 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
             },
         ),
     );
-    value.set_property("getError", realm_webgl_function(|_, _| Value::Number(0.0)));
     value.set_property(
         "isContextLost",
         realm_webgl_function(|_, _| Value::Bool(false)),
@@ -451,18 +454,6 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     value.set_property(
         "checkFramebufferStatus",
         realm_webgl_function(|_, _| Value::Number(36053.0)),
-    );
-    value.set_property(
-        "getAttribLocation",
-        realm_webgl_function(|_, _| Value::Number(0.0)),
-    );
-    value.set_property(
-        "getProgramInfoLog",
-        realm_webgl_function(|_, _| Value::string("")),
-    );
-    value.set_property(
-        "getShaderInfoLog",
-        realm_webgl_function(|_, _| Value::string("")),
     );
     value.set_property(
         "getShaderPrecisionFormat",
@@ -501,20 +492,13 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
         }),
     );
     value.set_property(
-        "getShaderParameter",
-        realm_webgl_function(|_, _| Value::Bool(true)),
-    );
-    value.set_property(
-        "getProgramParameter",
-        realm_webgl_function(|_, _| Value::Bool(true)),
-    );
-    value.set_property(
         "makeXRCompatible",
         realm_webgl_function(|_, _| {
             warn_once();
             w3cos_core::promise::resolve(vec![Value::Undefined])
         }),
     );
+    crate::webgl_program::install(&value, webgl2, state.clone());
     let all_methods = if webgl2 {
         WEBGL2_METHODS
     } else {

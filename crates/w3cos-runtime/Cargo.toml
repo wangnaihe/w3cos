@@ -11,7 +11,7 @@ default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-adva
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
-web-graphics-advanced = []
+web-graphics-advanced = ["dep:naga"]
 # Includes real-time Web Audio output through cpal on desktop targets.
 web-media-advanced = ["dep:cpal"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
@@ -44,6 +44,8 @@ w3cos-vm = { workspace = true, optional = true }
 url = { workspace = true }
 base64 = { version = "0.22", optional = true }
 ring = "0.17"
+# WebGL GLSL validation uses the same naga as wgpu (web-graphics-advanced).
+naga = { version = "28", features = ["glsl-in"], optional = true }
 psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
