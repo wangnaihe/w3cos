@@ -8837,6 +8837,7 @@ fn main() {
         matches_js_string!(&r, s, s == "service-not-allowed:end"),
         "unsupported desktop SpeechRecognition error lifecycle: {r:?}"
     );
+    w3cos_runtime::capability_gate::grant("geolocation");
     w3cos_runtime::geolocation_web::update_position(
         w3cos_runtime::geolocation_web::GeoPosition::new(31.23, 121.47, 8.0),
     );
