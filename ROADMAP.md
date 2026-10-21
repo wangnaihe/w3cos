@@ -253,6 +253,17 @@ suite is red.
   AudioWorklet ports and deterministic OfflineAudioContext silent rendering.
   Real-time output, compressed decoding, sink selection and worklet processor
   execution remain explicit warning-backed native-adapter boundaries.
+- [x] Render connected Web Audio graphs: oscillator (built-in and
+  `PeriodicWave`), buffer-source (rate, detune, offset, duration, loop),
+  constant-source, gain and stereo-panner nodes with speaker up/down-mixing,
+  shared by `OfflineAudioContext.startRendering()` and real-time
+  `AudioContext` output on the default device through cpal (macOS, Windows,
+  Linux desktop).
+- [ ] Render AudioParam automation timelines and AudioParam inputs, and the
+  remaining processing nodes (biquad/IIR, delay, convolver, compressor,
+  wave shaper, panner, analyser data, channel splitter/merger).
+- [ ] Add Android (AAudio) and iOS (AVAudioEngine) output adapters, output
+  device selection (`setSinkId`) and `decodeAudioData`.
 - [x] Implement `ImageDecoder`, `ImageTrack` and `ImageTrackList` over the
   existing native image codecs, including MIME capability queries, static
   PNG/JPEG-family decode, GIF/WebP/APNG frame extraction, repetition/frame
