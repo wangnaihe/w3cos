@@ -188,6 +188,8 @@ pub mod storage_manager_web;
 pub mod streams;
 pub mod streams_web;
 pub mod subtle_crypto_web;
+#[cfg(feature = "gpu")]
+pub mod svg_gpu;
 #[cfg(feature = "skia")]
 mod svg_image_document;
 pub mod svg_renderer;
