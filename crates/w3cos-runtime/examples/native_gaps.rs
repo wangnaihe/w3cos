@@ -4,9 +4,9 @@
 //! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
 //! honest `NotReadableError` when this host has no live sensor), a geolocation
 //! fix (or an honest position error when this host has no location service),
-//! a camera frame (or an honest `NotFoundError` / `NotAllowedError` /
-//! `NotReadableError` when this host has no usable camera), an application
-//! shortcut, the
+//! Bluetooth availability (or `NotSupportedError` / `NotFoundError`), a camera
+//! frame (or an honest `NotFoundError` / `NotAllowedError` / `NotReadableError`
+//! when this host has no usable camera), an application shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
 //! session has no status watcher), display capture, Web Serial (permission
@@ -17,7 +17,7 @@
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render,web-sensors,web-serial,web-geolocation,web-gamepad,web-media-advanced,web-device-access
+//!   --no-default-features --features cpu-render,web-sensors,web-serial,web-geolocation,web-bluetooth,web-gamepad,web-media-advanced,web-device-access
 //! ```
 //!
 //! The HID and USB probes do not grant `hid` or `usb`, so `requestDevice`
@@ -378,6 +378,42 @@ fn geolocation_probe() -> (String, bool) {
     report
 }
 
+fn bluetooth_probe() -> (String, bool) {
+    let bluetooth = w3cos_runtime::bluetooth_web::bluetooth_value();
+    let request = Value::object(HashMap::from([(
+        "acceptAllDevices".into(),
+        Value::Bool(true),
+    )]));
+    let denied = await_value(bluetooth.call_method("requestDevice", vec![request.clone()]));
+    if matches!(denied.as_ref(), Err(name) if name == "NotSupportedError") {
+        return ("NotSupportedError".to_string(), true);
+    }
+    let denied_ok = matches!(denied.as_ref(), Err(name) if name == "NotAllowedError");
+    capability_gate::grant("bluetooth");
+    let available = await_value(bluetooth.call_method("getAvailability", vec![]));
+    let available_text = match &available {
+        Ok(value) => format!("available {}", value.to_bool()),
+        Err(err) => err.clone(),
+    };
+    let found = await_value(bluetooth.call_method("requestDevice", vec![request]));
+    let detail = match &found {
+        Ok(device) => format!(
+            "{available_text}; {}",
+            device.get_property("id").to_js_string()
+        ),
+        Err(err) => format!("{available_text}; {err}"),
+    };
+    let ok = denied_ok
+        && available
+            .as_ref()
+            .is_ok_and(|value| value.as_bool().is_some())
+        && match &found {
+            Ok(device) => device.get_property("id").to_js_string().starts_with("ble:"),
+            Err(err) => err == "NotFoundError",
+        };
+    (detail, ok)
+}
+
 fn camera_probe() -> (String, bool) {
     capability_gate::grant("camera");
     let media = w3cos_runtime::media_devices_web::media_devices_value();
@@ -653,10 +689,12 @@ fn main() {
     row("accelerometer", &sensor_text, sensor_ok);
     let (geo_text, geo_ok) = geolocation_probe();
     row("geolocation", &geo_text, geo_ok);
+    let (bluetooth_text, bluetooth_ok) = bluetooth_probe();
+    row("bluetooth", &bluetooth_text, bluetooth_ok);
     let (camera_text, camera_ok) = camera_probe();
     row("camera", &camera_text, camera_ok);
 
-    let frame = render_document_rgba_cpu(960, 1200).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 1260).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

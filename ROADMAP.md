@@ -318,6 +318,14 @@ suite is red.
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`
   canonicalization. Host-unsupported enumeration/I/O rejects explicitly.
+- [x] Desktop `navigator.bluetooth` (`web-bluetooth`) uses `btleplug`
+  (CoreBluetooth, WinRT, BlueZ over D-Bus) for real adapter availability,
+  filtered `requestDevice` (explicit `bluetooth` grant or a chooser; no silent
+  grant), `getDevices`, GATT connect/disconnect, services, characteristics,
+  descriptors, reads, writes, and notifications. The Web Bluetooth GATT
+  blocklist applies. Linux CI installs `libdbus-1-dev`. macOS bundles need
+  `NSBluetoothAlwaysUsageDescription`. The Android host-module adapter is
+  unchanged.
 - [ ] Separate test labels for:
   - direct Rust engine API;
   - ESM/JavaScript Web surface;
