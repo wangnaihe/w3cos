@@ -15522,7 +15522,12 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         for _ in 0..5000 {
             loader.poll();
             poll_script_fetches();
-            if crate::image_loader::dimensions(&source) == Some((3, 2)) {
+            // Image bytes can land in the fetch poll that follows `loader.poll`.
+            // That poll queues the document `load` microtask; the next
+            // `loader.poll` is what marks the navigation complete.
+            if crate::image_loader::dimensions(&source) == Some((3, 2))
+                && matches!(loader.progress(), DocumentLoadProgress::Complete)
+            {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(1));

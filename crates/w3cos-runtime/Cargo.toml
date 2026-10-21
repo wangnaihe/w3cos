@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-bluetooth", "host-tray", "host-keyring"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -32,6 +32,18 @@ web-device-access = ["dep:hidapi", "dep:nusb"]
 # NotReadableError instead of inventing samples. Host injection still works
 # when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
 web-sensors = []
+# Desktop `navigator.geolocation` on a dedicated thread. Linux uses GeoClue2
+# through zbus (no extra system libraries). macOS uses CoreLocation and Windows
+# uses Windows.Devices.Geolocation. iOS, Android, and OHOS stay unavailable.
+# Host `update_position` still works when the feature is off. Unit tests do not
+# open a real provider unless W3COS_GEOLOCATION_DEVICE_TESTS=1.
+web-geolocation = [
+    "dep:zbus",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-core-location",
+    "dep:windows",
+]
 # Desktop Web Bluetooth over btleplug (CoreBluetooth / WinRT / BlueZ).
 # Android keeps the host-module adapter and does not link this crate.
 # Linux links libdbus (BlueZ); CI installs libdbus-1-dev. Unit tests use the
@@ -127,17 +139,17 @@ winit = { workspace = true }
 skia-safe = { version = "=0.93.1", optional = true, features = ["metal"] }
 security-framework = "3.7"
 
-# macOS camera. `nokhwa` captures through AVFoundation. The bindings crate
-# exposes AVAuthorizationStatus, which nokhwa's boolean check does not.
-# Both are target-gated, so Linux CI does not compile them or link new libraries.
+# macOS location and camera. Core Location is objc2. `nokhwa` captures through
+# AVFoundation; the bindings crate exposes AVAuthorizationStatus. Camera crates
+# are target-gated, so Linux CI does not compile them or link new libraries.
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.3", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSObject"] }
+objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-avfoundation", "decoding"] }
 nokhwa-bindings-macos = { version = "0.2.4", optional = true }
+# hidraw IOKit backend. No libusb.
 hidapi = { version = "2.6.7", optional = true, default-features = false }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-msmf", "decoding"] }
-hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.5.2"
@@ -194,11 +206,17 @@ tray-icon = { version = "0.26", optional = true, default-features = false, featu
 # Gamepad input and rumble (evdev / XInput / IOKit). Linux needs libudev.
 gilrs = { version = "0.11", optional = true }
 
-# hidraw without libusb. On Linux, `linux-native-basic-udev` talks to hidraw
-# through sysfs (basic-udev) and does not link libudev or libusb. macOS uses
-# the hidapi IOKit backend; Windows uses hid.dll directly.
+# GeoClue2 over the system bus. Pure Rust; Linux CI does not need libdbus.
+# hidraw without libusb: `linux-native-basic-udev` talks to hidraw through
+# sysfs and does not link libudev or libusb.
 [target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+zbus = { version = "5", optional = true, default-features = false, features = ["blocking-api"] }
 hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["linux-native-basic-udev"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", optional = true, features = ["Devices_Geolocation", "Foundation"] }
+nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-msmf", "decoding"] }
+hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }

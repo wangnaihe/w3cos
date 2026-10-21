@@ -164,7 +164,7 @@ in both probes, and its `btleplug` symbol bucket is 0.
 Moving `navigator.w3cos.tray` and `navigator.w3cos.keyring` behind `host-tray`
 and `host-keyring` removed them from both probes. The runtime `default`
 feature set and `w3cos-shell` still enable both, and the shell also enables
-`web-bluetooth`. A generated app uses `default-features = false`, so it
+`web-geolocation` and `web-bluetooth`. A generated app uses `default-features = false`, so it
 enables them with `W3COS_RUNTIME_FEATURES=host-tray,host-keyring` or by
 listing those Cargo features. Without the feature the call rejects
 `NotSupportedError`. Measured on this same toolchain and strip, before that

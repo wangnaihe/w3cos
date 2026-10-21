@@ -1392,7 +1392,7 @@ mod tests {
     fn mock_device() -> CameraDevice {
         CameraDevice {
             label: "Front Camera".into(),
-            device_key: "mock:front".into(),
+            device_key: "mock:lifecycle".into(),
             group_key: "mock:group".into(),
             path: PathBuf::new(),
             facing: Facing::User,
@@ -1428,7 +1428,7 @@ mod tests {
             width_exact: true,
             ..VideoPrefs::default()
         };
-        push_frame("mock:front", 640, 480, rgba(640, 480, [1, 2, 3, 255]));
+        push_frame("mock:lifecycle", 640, 480, rgba(640, 480, [1, 2, 3, 255]));
         let opened = open_camera(&device, &prefs).unwrap();
         assert_eq!((opened.settings.width, opened.settings.height), (640, 480));
         assert_eq!(opened.settings.frame_rate, Some(30.0));
@@ -1442,7 +1442,7 @@ mod tests {
         assert_eq!(first[0].rgba[0], 1);
         assert!(drain_frames("track-1").is_empty());
 
-        push_frame("mock:front", 640, 480, rgba(640, 480, [9, 9, 9, 255]));
+        push_frame("mock:lifecycle", 640, 480, rgba(640, 480, [9, 9, 9, 255]));
         let second = drain_frames("track-1");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].rgba[0], 9);
@@ -1452,7 +1452,7 @@ mod tests {
         assert_eq!(live_track_count(), 2);
         release_track("track-1");
         assert!(latest_png("track-2").is_some());
-        push_frame("mock:front", 640, 480, rgba(640, 480, [4, 4, 4, 255]));
+        push_frame("mock:lifecycle", 640, 480, rgba(640, 480, [4, 4, 4, 255]));
         assert_eq!(drain_frames("track-2")[0].rgba[0], 4);
         release_track("track-2");
         assert_eq!(live_track_count(), 0);
