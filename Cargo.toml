@@ -137,6 +137,15 @@ inherits = "release"
 opt-level = "z"
 lto = "fat"
 
+# Wall-clock harness profile. opt-level 3 without fat/thin LTO so the
+# report-only CI job stays within a GitHub runner and repeated local runs
+# share one codegen setting. Absolute times are not a merge gate.
+[profile.runtime-bench]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = "none"
+
 # libp2p-quic 0.14 disables QUIC connection migration. The patched copy enables it.
 [patch.crates-io]
 libp2p-quic = { path = "third_party/libp2p-quic" }

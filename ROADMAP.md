@@ -72,6 +72,33 @@ These are source and focused-test milestones. They do not close the physical
 Android/iOS device, full gesture, lifecycle, signing, or downstream-product
 gates in R3.
 
+## Performance
+
+Measured with `w3cos-runtime-bench` (`runtime-bench` profile, CPU raster).
+See `docs/performance.md`.
+
+Done:
+
+- Report-only CI job uploads a JSON timing report. It fails only when the
+  harness crashes or a one-node edit costs more than four times a full
+  style-plus-layout pass on that same run.
+- Matched-properties sharing no longer keys on the `id` attribute. On an
+  8201-node flex/grid tree, style recalc median dropped from 76.3 ms to
+  29.6 ms. Layout checksums stayed the same.
+- A one-node width edit still relayouts. A background edit patches the
+  retained tree. Inherited `color` still restyles descendants. `dir` still
+  changes computed direction when `id` differs.
+
+Pending:
+
+- Layout of that tree is still about 55 ms and is dominated by text
+  measurement and Taffy, which this pass does not rewrite.
+- Scroll-list paint and JS-to-DOM host-call medians did not move outside
+  run noise.
+- Cold startup is still dominated by the first fontconfig load.
+- Escape analysis and JIT stay deferred until correctness and Web API
+  conformance land.
+
 ---
 
 ## R0 — Restore a Trustworthy Main Branch
