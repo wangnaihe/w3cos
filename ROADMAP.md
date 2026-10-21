@@ -510,8 +510,13 @@ precede ecosystem breadth or migration tooling.
 - [x] Expose Web Serial, WebHID and WebUSB compatibility bases with navigator
   manager identity, EventTarget behavior, standard device/event constructors,
   truthful empty enumeration and Promise chooser rejection. Native discovery,
-  permission prompts and device I/O remain host-adapter work and emit one-time
-  warnings instead of reporting false success.
+  permission prompts and device I/O remain host-adapter work for WebHID and
+  WebUSB and emit one-time warnings instead of reporting false success.
+- [x] Wire `navigator.serial` on macOS, Windows and Linux desktop through the
+  `serialport` crate (`web-serial`): an explicit `serial` grant plus one
+  filter match or a host chooser, granted-port `getPorts`, open options, byte
+  streams on an I/O thread, signals, USB ids, `close`/`forget` and polled
+  hot-plug. Mobile and OHOS keep the unavailable rejection.
 - [x] Expose the Web NFC base with constructible `NDEFReader`, `NDEFMessage`,
   `NDEFRecord` and `NDEFReadingEvent`, usable message/record data, AbortSignal
   pre-abort handling and explicit Promise failures. Scanning, permissions and

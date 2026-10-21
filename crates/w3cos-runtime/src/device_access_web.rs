@@ -1,4 +1,5 @@
-//! Compatibility entry points for Web Serial, WebHID and WebUSB.
+//! Compatibility entry points for WebHID and WebUSB.
+//! `navigator.serial` is implemented in `serial_web` and re-exported here.
 //!
 //! Enumeration is truthful (empty until a host adapter is installed), while
 //! chooser operations reject explicitly instead of pretending that access was
@@ -157,7 +158,6 @@ fn manager_value(
     ]));
     crate::web_events::event_target_class().call(manager.clone(), vec![]);
     let warning = match api {
-        "Web Serial" => &SERIAL_WARNING,
         "WebHID" => &HID_WARNING,
         _ => &USB_WARNING,
     };
@@ -181,42 +181,19 @@ fn manager_value(
     manager
 }
 
-static SERIAL_WARNING: Once = Once::new();
 static HID_WARNING: Once = Once::new();
 static USB_WARNING: Once = Once::new();
 
 pub fn serial_class() -> Value {
-    manager_class("Serial")
+    crate::serial_web::serial_class()
 }
 
 pub fn serial_port_class() -> Value {
-    let class = illegal_class(
-        "SerialPort",
-        &[
-            "open",
-            "close",
-            "forget",
-            "getInfo",
-            "getSignals",
-            "setSignals",
-        ],
-    );
-    for property in [
-        "connected",
-        "onconnect",
-        "ondisconnect",
-        "readable",
-        "writable",
-    ] {
-        class
-            .get_property("prototype")
-            .set_property(property, Value::Undefined);
-    }
-    class
+    crate::serial_web::serial_port_class()
 }
 
 pub fn serial_value() -> Value {
-    manager_value(serial_class(), "getPorts", "requestPort", "Web Serial")
+    crate::serial_web::serial_value()
 }
 
 pub fn hid_class() -> Value {
@@ -420,7 +397,6 @@ mod tests {
     #[test]
     fn device_managers_enumerate_truthfully_and_reject_unavailable_choosers() {
         for (manager, list, request, needs_filters) in [
-            (serial_value(), "getPorts", "requestPort", false),
             (hid_value(), "getDevices", "requestDevice", true),
             (usb_value(), "getDevices", "requestDevice", true),
         ] {

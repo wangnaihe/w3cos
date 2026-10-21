@@ -22694,6 +22694,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
+        ran += crate::serial_web::poll_serial_io();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22933,6 +22934,7 @@ pub fn reset_bridge() {
     crate::observers_web::reset_intersection_observers();
     crate::observers_web::reset_performance_timeline();
     crate::fetch::reset_realm();
+    crate::serial_web::reset_realm();
     crate::streams_web::reset_realm();
     crate::web_events::reset_realm();
     reset_realm_class_caches();

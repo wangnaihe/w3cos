@@ -157,6 +157,7 @@ pub mod sanitizer_web;
 pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
+pub mod serial_web;
 pub mod service_worker_web;
 pub mod tray_host;
 
