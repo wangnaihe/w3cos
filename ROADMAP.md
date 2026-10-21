@@ -540,12 +540,16 @@ precede ecosystem breadth or migration tooling.
   `DeviceMotionEvent`, acceleration and rotation-rate value identities) with
   standard fields/identity, permission-gated trusted window events, Permissions
   API synchronization and host sensor injection.
-  Platform sensor-consent and telemetry adapters remain pending with warning.
 - [x] Expose the Generic Sensor core (`Sensor`, `SensorErrorEvent`,
-  `Accelerometer`, `Gyroscope`, `Magnetometer`) with asynchronous
-  start/error/activate lifecycle, permission integration, reading events and
-  host vector injection. Live telemetry requires platform adapters and emits a
-  warning.
+  `Accelerometer`, `Gyroscope`, `Magnetometer`, plus gravity, linear
+  acceleration, absolute/relative orientation, and `AmbientLightSensor`) with
+  asynchronous start/error/activate lifecycle, permission integration, reading
+  events and host vector injection.
+- [x] Read Linux desktop Generic Sensor and device motion from Industrial I/O
+  (`/sys/bus/iio/devices`, optional `iio-sensor-proxy`) on a `web-sensors`
+  sampler thread. Missing hardware is `NotReadableError` or, for window
+  events, silence. macOS, Windows, and mobile do not invent samples. Host
+  injection still feeds unit tests unless `W3COS_SENSOR_DEVICE_TESTS=1`.
 - [x] Expose Media Capabilities (`navigator.mediaCapabilities`,
   `MediaCapabilities`) with validated decode/encode Promise queries backed by
   a host-registerable MIME codec table. Unknown formats report unsupported;
@@ -1226,6 +1230,8 @@ generic JavaScript/Web-platform coverage.
 - [x] Bootable ISO release workflow.
 - [x] AI Bridge DOM/a11y/query/click/type/screenshot foundation.
 - [x] File system, process, PTY, IPC, menu, and dialog engine modules.
+- [x] Linux desktop motion and ambient-light telemetry through Industrial I/O
+  (`web-sensors`). macOS, Windows, and mobile report the sensor as unavailable.
 
 ### Remaining
 
