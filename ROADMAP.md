@@ -3063,15 +3063,29 @@ W3COS.
     parses HTML and executes SWC → W3IR → W3VM while retaining the network
     loader, WOFF/WOFF2 decoder and configurable persistent-cache/retry path, a
     1,065,632-byte (17.52%) dynamic increment.
+  - [x] Linkage-probe reports now record executable text, file-backed data,
+    read-only data, bss, gzip level 9 of the stripped bytes, and an embedded
+    font/image scan. On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after
+    explicit image codecs and the SVG GPU path landed and with those codecs
+    off in these probes, the checked-in stripped sizes are 11,877,576 bytes
+    for ordinary AOT and 15,372,632 bytes for the dynamic browser probe
+    (gzip 5,095,951 and 6,693,042; embedded 0). The same-runner dynamic
+    increment is 3,495,056 bytes (29.43%). `web-bluetooth` and
+    `web-geolocation` are off in both probes.
   - [x] The 2026-10-21 Linux x86_64 `release-size` probes (rustc 1.99.1,
     stripped) measure 12,839,200 bytes for ordinary DOM/jsdom AOT at
     `ff70045` and 12,796,192 bytes after moving raster codecs onto explicit
     features (-43,008 bytes; LTO had already dropped unreferenced decoders).
     The same DOM touch plus Skia and PNG/JPEG/WebP is 16,057,800 bytes.
     CI builds that Skia probe and audits it with `--profile runtime`.
-  - Product gates still need Android ABI-split and iOS App Store device-slice artifacts
-- [ ] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+  - Product gates still need native-library rows, Android ABI-split, and iOS App Store device-slice artifacts
+- [x] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+  - `w3cos-size-audit` reads the unstripped symbol table and records crate totals, the largest symbols, and feature buckets in the uploaded JSON and markdown reports.
+  - CI fails when a probe's stripped size grows by more than 3% or more than 200 KiB versus the checked-in row for the same rustc host triple in `tools/size-audit/baselines/linkage-probes.json`. Other architectures are not compared. Update that row with `scripts/audit-linkage-sizes.sh --update-baseline --baseline-note "..."` and review the diff.
+  - `host-tray` and `host-keyring` are explicit features, on for the runtime default set and the desktop shell, off for ordinary AOT. On the same `x86_64-unknown-linux-gnu` toolchain, before the later codec split, ordinary AOT fell from 12,814,744 to 11,884,064 bytes (930,680 bytes, 7.26%) and the browser probe from 16,621,992 to 15,694,896 bytes (927,096 bytes, 5.58%).
 - [ ] Track the current full-runtime Monaco artifact as a baseline (about 172 MB unstripped / 120 MB fully stripped on arm64 macOS); replace it with reproducible per-feature baselines
+  - [x] The single arm64 macOS 172 MB / 120 MB figure is retired as a CI gate. It mixed application modules with every default feature and is not reproducible on the Linux runner.
+  - [x] The two checked-in linkage closures, plus per-feature symbol-byte buckets, are the reproducible baselines. A full default-feature Monaco product artifact (renderers, embedded fonts, application JS) is still not rebuilt here.
 - [ ] Verify that standalone W3COS applications remain materially smaller than shipping a complete Chromium stack; treat a regression toward Chromium-class size as an architecture issue, not something `strip` alone will fix
 
 ## Phase 4 — Operating System ✅ (core done)
