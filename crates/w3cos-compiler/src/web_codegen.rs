@@ -9,18 +9,34 @@ use std::path::Path;
 use w3cos_std::style::{SafeAreaEdge, Spacing};
 
 pub fn write_web_project(tree: &AppTree, stylesheet: &Stylesheet, output_dir: &Path) -> Result<()> {
+    write_web_project_with_font(
+        tree,
+        stylesheet,
+        output_dir,
+        crate::codegen::embed_cjk_font_enabled(&crate::codegen::CompileOptions::default()),
+    )
+}
+
+pub fn write_web_project_with_font(
+    tree: &AppTree,
+    stylesheet: &Stylesheet,
+    output_dir: &Path,
+    embed_cjk: bool,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
-    if let Ok(root) = find_workspace_root() {
-        let font_src = root.join("crates/w3cos-runtime/assets/CJK-Subset.ttf");
-        if font_src.exists() {
-            let fonts_dir = output_dir.join("fonts");
-            std::fs::create_dir_all(&fonts_dir)?;
-            std::fs::copy(&font_src, fonts_dir.join("CJK-Subset.ttf"))?;
+    if embed_cjk {
+        if let Ok(root) = find_workspace_root() {
+            let font_src = root.join("crates/w3cos-runtime/assets/CJK-Subset.ttf");
+            if font_src.exists() {
+                let fonts_dir = output_dir.join("fonts");
+                std::fs::create_dir_all(&fonts_dir)?;
+                std::fs::copy(&font_src, fonts_dir.join("CJK-Subset.ttf"))?;
+            }
         }
     }
     let signal_names: Vec<&str> = tree.signals.iter().map(|s| s.name.as_str()).collect();
     let body = gen_html_node(&tree.root, 0, &signal_names, stylesheet);
-    let css = emit_stylesheet(stylesheet);
+    let css = emit_stylesheet(stylesheet, embed_cjk);
     let js = gen_runtime(&tree.signals, &signal_names);
 
     std::fs::write(
@@ -292,22 +308,30 @@ fn escape_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn emit_stylesheet(_sheet: &Stylesheet) -> String {
-    String::from(
-        r#"/* w3cos web emit — mobile shell + inline node styles */
-@font-face{font-family:'W3cosUI';src:url('fonts/CJK-Subset.ttf') format('truetype');font-display:swap}
-*,*::before,*::after{box-sizing:border-box}
-html,body{margin:0;padding:0;height:100%;background:#0b1220;font-family:'W3cosUI',-apple-system,BlinkMacSystemFont,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
-body{display:flex;justify-content:center;align-items:flex-start}
-#root{width:402px;height:874px;max-height:100vh;display:flex;flex-direction:column;overflow:hidden;background:#f7f9fc}
-.screen{flex:1;min-height:0;display:flex;flex-direction:column}
-.feed{flex:1 1 0;min-height:0!important;height:auto!important;overflow:auto!important;-webkit-overflow-scrolling:touch}
-.feed-content{flex-shrink:0}
-button{border:none;cursor:pointer;font-family:inherit;background:transparent;line-height:1.2;min-height:0;padding:0;margin:0}
-input{font-family:inherit;outline:none;width:100%;border:none}
-img{display:block;max-width:100%}
-[data-action]{cursor:pointer}
-"#,
+fn emit_stylesheet(_sheet: &Stylesheet, embed_cjk: bool) -> String {
+    let family = if embed_cjk {
+        "'W3cosUI',-apple-system,BlinkMacSystemFont,system-ui,sans-serif"
+    } else {
+        "-apple-system,BlinkMacSystemFont,system-ui,sans-serif"
+    };
+    let font_face = if embed_cjk {
+        "@font-face{font-family:'W3cosUI';src:url('fonts/CJK-Subset.ttf') format('truetype');font-display:swap}\n"
+    } else {
+        ""
+    };
+    format!(
+        "/* w3cos web emit — mobile shell + inline node styles */\n\
+{font_face}*,*::before,*::after{{box-sizing:border-box}}\n\
+html,body{{margin:0;padding:0;height:100%;background:#0b1220;font-family:{family};-webkit-font-smoothing:antialiased}}\n\
+body{{display:flex;justify-content:center;align-items:flex-start}}\n\
+#root{{width:402px;height:874px;max-height:100vh;display:flex;flex-direction:column;overflow:hidden;background:#f7f9fc}}\n\
+.screen{{flex:1;min-height:0;display:flex;flex-direction:column}}\n\
+.feed{{flex:1 1 0;min-height:0!important;height:auto!important;overflow:auto!important;-webkit-overflow-scrolling:touch}}\n\
+.feed-content{{flex-shrink:0}}\n\
+button{{border:none;cursor:pointer;font-family:inherit;background:transparent;line-height:1.2;min-height:0;padding:0;margin:0}}\n\
+input{{font-family:inherit;outline:none;width:100%;border:none}}\n\
+img{{display:block;max-width:100%}}\n\
+[data-action]{{cursor:pointer}}\n"
     )
 }
 
@@ -731,5 +755,8 @@ export default
         let html = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
         assert!(html.contains("data-bind=\"count\""));
         assert!(html.contains("data-action=\"increment:count\""));
+        assert!(!dir.path().join("fonts/CJK-Subset.ttf").exists());
+        let css = std::fs::read_to_string(dir.path().join("styles.css")).unwrap();
+        assert!(!css.contains("CJK-Subset.ttf"));
     }
 }

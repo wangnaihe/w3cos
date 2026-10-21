@@ -125,35 +125,65 @@ fn decode_image(
 ) -> Result<(Vec<DecodedFrame>, f64), String> {
     match format {
         ImageFormat::Gif => {
-            let decoder =
-                image::codecs::gif::GifDecoder::new(BufReader::new(Cursor::new(bytes.to_vec())))
-                    .map_err(|error| error.to_string())?;
-            let repeats = repetition_count(decoder.loop_count(), false);
-            let frames =
-                frames_from_animation(decoder.into_frames(), desired_width, desired_height)?;
-            Ok((frames, repeats))
+            #[cfg(feature = "image-gif")]
+            {
+                let decoder = image::codecs::gif::GifDecoder::new(BufReader::new(Cursor::new(
+                    bytes.to_vec(),
+                )))
+                .map_err(|error| error.to_string())?;
+                let repeats = repetition_count(decoder.loop_count(), false);
+                let frames =
+                    frames_from_animation(decoder.into_frames(), desired_width, desired_height)?;
+                Ok((frames, repeats))
+            }
+            #[cfg(not(feature = "image-gif"))]
+            {
+                let _ = (bytes, desired_width, desired_height);
+                Err("GIF decoding requires the image-gif feature".into())
+            }
         }
         ImageFormat::WebP => {
-            let decoder =
-                image::codecs::webp::WebPDecoder::new(BufReader::new(Cursor::new(bytes.to_vec())))
-                    .map_err(|error| error.to_string())?;
-            let repeats = repetition_count(decoder.loop_count(), true);
-            let frames =
-                frames_from_animation(decoder.into_frames(), desired_width, desired_height)?;
-            Ok((frames, repeats))
-        }
-        ImageFormat::Png => {
-            let decoder =
-                image::codecs::png::PngDecoder::new(BufReader::new(Cursor::new(bytes.to_vec())))
-                    .map_err(|error| error.to_string())?;
-            if decoder.is_apng().map_err(|error| error.to_string())? {
-                let decoder = decoder.apng().map_err(|error| error.to_string())?;
+            #[cfg(feature = "image-webp")]
+            {
+                let decoder = image::codecs::webp::WebPDecoder::new(BufReader::new(Cursor::new(
+                    bytes.to_vec(),
+                )))
+                .map_err(|error| error.to_string())?;
                 let repeats = repetition_count(decoder.loop_count(), true);
                 let frames =
                     frames_from_animation(decoder.into_frames(), desired_width, desired_height)?;
-                return Ok((frames, repeats));
+                Ok((frames, repeats))
             }
-            decode_static(bytes, format, desired_width, desired_height)
+            #[cfg(not(feature = "image-webp"))]
+            {
+                let _ = (bytes, desired_width, desired_height);
+                Err("WebP decoding requires the image-webp feature".into())
+            }
+        }
+        ImageFormat::Png => {
+            #[cfg(feature = "image-png")]
+            {
+                let decoder = image::codecs::png::PngDecoder::new(BufReader::new(Cursor::new(
+                    bytes.to_vec(),
+                )))
+                .map_err(|error| error.to_string())?;
+                if decoder.is_apng().map_err(|error| error.to_string())? {
+                    let decoder = decoder.apng().map_err(|error| error.to_string())?;
+                    let repeats = repetition_count(decoder.loop_count(), true);
+                    let frames = frames_from_animation(
+                        decoder.into_frames(),
+                        desired_width,
+                        desired_height,
+                    )?;
+                    return Ok((frames, repeats));
+                }
+                decode_static(bytes, format, desired_width, desired_height)
+            }
+            #[cfg(not(feature = "image-png"))]
+            {
+                let _ = (bytes, format, desired_width, desired_height);
+                Err("PNG decoding requires the image-png feature".into())
+            }
         }
         _ => decode_static(bytes, format, desired_width, desired_height),
     }
