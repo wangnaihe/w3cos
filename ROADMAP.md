@@ -255,7 +255,8 @@ suite is red.
   execution remain explicit warning-backed native-adapter boundaries.
 - [x] Render connected Web Audio graphs: oscillator (built-in and
   `PeriodicWave`), buffer-source (rate, detune, offset, duration, loop),
-  constant-source, gain and stereo-panner nodes with speaker up/down-mixing,
+  constant-source, gain, stereo-panner and `MediaStreamAudioSourceNode`
+  (live microphone PCM, linear resampling) nodes with speaker up/down-mixing,
   shared by `OfflineAudioContext.startRendering()` and real-time
   `AudioContext` output on the default device through cpal (macOS, Windows,
   Linux desktop).
@@ -612,10 +613,24 @@ precede ecosystem breadth or migration tooling.
 - [ ] Continuous camera frame delivery into `MediaStreamTrackProcessor`,
   `<video>` preview and `MediaRecorder` (the Linux adapter currently captures a
   frame when `getUserMedia` resolves); `devicechange` hot-plug events.
-- [ ] Platform microphone adapter, plus macOS (AVFoundation), Windows (Media
-  Foundation), Android (Camera2) and iOS camera adapters.
-- [ ] Connect host media payloads to preview and capture sinks; the current
-  adapter boundary exposes device/track lifecycle but not frame/audio data.
+- [x] Desktop microphone adapter (cpal, `audio_input.rs`, macOS / Windows /
+  Linux desktop, gated by `web-media-advanced`): `enumerateDevices()` lists
+  input devices (one anonymous `audioinput` until the `microphone` capability
+  is granted, then labels and opaque stable SHA-256 `deviceId`/`groupId`);
+  `getUserMedia({audio})` requires that grant, honours `deviceId`,
+  `sampleRate` and `channelCount`, and opens a live cpal input stream.
+  `MediaStreamAudioSourceNode` pulls those samples into an `AudioContext` or
+  `OfflineAudioContext` (linear resampling when the rates differ).
+  `echoCancellation`, `noiseSuppression` and `autoGainControl` with
+  `exact: true` reject `OverconstrainedError` because the adapter does not
+  apply them. Host-registered `audioinput` devices still take precedence and
+  carry no PCM. Android, iOS and OHOS have no input adapter. Physical capture
+  is verified only by the opt-in `W3COS_AUDIO_DEVICE_TESTS=1` test.
+- [ ] macOS (AVFoundation), Windows (Media Foundation), Android (Camera2) and
+  iOS camera adapters.
+- [ ] Connect camera frames to preview and `MediaRecorder`. Microphone PCM
+  reaches `MediaStreamAudioSourceNode` but not `MediaStreamTrackProcessor` or
+  an `<audio>` element.
 - [ ] Add photo/evidence capture without product-specific native modules.
 - [ ] Validate camera/microphone denial and interruption on physical devices.
 

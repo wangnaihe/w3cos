@@ -1,12 +1,13 @@
 //! Web Audio graph, buffer and lifecycle layer.
 //!
 //! Connected graphs render through [`crate::audio_render`]: oscillator,
-//! buffer-source, constant-source, gain and stereo-panner nodes produce real
-//! samples in `OfflineAudioContext.startRendering()` and, after
-//! `AudioContext.resume()`, on the default output device via
-//! [`crate::audio_device`] (cpal). Other processing nodes render silence with
-//! a warning. Compressed decoding, AudioParam automation timelines, sink
-//! selection and AudioWorklet processor execution remain pending.
+//! buffer-source, constant-source, gain, stereo-panner and
+//! `MediaStreamAudioSourceNode` (live microphone PCM) produce real samples in
+//! `OfflineAudioContext.startRendering()` and, after `AudioContext.resume()`,
+//! on the default output device via [`crate::audio_device`] (cpal). Other
+//! processing nodes render silence with a warning. Compressed decoding,
+//! AudioParam automation timelines, sink selection and AudioWorklet processor
+//! execution remain pending.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -172,6 +173,23 @@ fn node_kind(id: u64, node: &Value, kind: &'static str, unsupported: &mut Vec<St
                 schedule: schedule_of(node),
             }
         }
+        "MediaStreamAudioSourceNode" => {
+            if let Some(source) = media_stream_source(node) {
+                return NodeKind::MediaStream {
+                    queue: source.queue,
+                    audibility: source.audibility,
+                    channels: source.channels,
+                    sample_rate: source.sample_rate,
+                };
+            }
+            if !unsupported
+                .iter()
+                .any(|name| name == "MediaStreamAudioSourceNode")
+            {
+                unsupported.push("MediaStreamAudioSourceNode".to_string());
+            }
+            NodeKind::Silent
+        }
         other => {
             if !unsupported.iter().any(|name| name == other) {
                 unsupported.push(other.to_string());
@@ -245,11 +263,28 @@ fn graph_snapshot(context_id: u64, destination: u64) -> GraphSnapshot {
         WARNING.call_once(|| {
             eprintln!(
                 "[w3cos] warning: Web Audio renders oscillator, buffer-source, constant-source, \
-                 gain and stereo-panner nodes; {names} render silence until their DSP lands"
+                 gain, stereo-panner and media-stream source nodes; {names} render silence until \
+                 their DSP lands"
             );
         });
     }
     snapshot
+}
+
+/// The first audio track of a `MediaStreamAudioSourceNode`, when that track
+/// is backed by a live capture queue.
+fn media_stream_source(node: &Value) -> Option<crate::audio_input::RenderSource> {
+    let stream = node.get_property("mediaStream");
+    if !w3cos_core::class::instance_of(&stream, &crate::media_devices_web::media_stream_class()) {
+        return None;
+    }
+    let track = stream
+        .call_method("getAudioTracks", vec![])
+        .get_property("0");
+    if track.is_undefined() || track.is_null() {
+        return None;
+    }
+    crate::audio_input::source_for_track(&track.get_property("id").to_js_string())
 }
 
 fn context_ids(node: &Value) -> Option<(u64, u64)> {
@@ -859,7 +894,10 @@ fn set_param(value: &Value, name: &str, default: f64, min: f64, max: f64) {
 
 fn node_value(class_name: &'static str, context: Value, options: Value) -> Value {
     let (inputs, outputs) = match class_name {
-        "AudioBufferSourceNode" | "ConstantSourceNode" | "OscillatorNode" => (0, 1),
+        "AudioBufferSourceNode"
+        | "ConstantSourceNode"
+        | "OscillatorNode"
+        | "MediaStreamAudioSourceNode" => (0, 1),
         "AudioDestinationNode" => (1, 0),
         "ChannelMergerNode" => (
             option(&options, "numberOfInputs", Value::Number(6.0)).to_u32(),
@@ -1005,7 +1043,40 @@ fn node_value(class_name: &'static str, context: Value, options: Value) -> Value
             );
         }
         "MediaStreamAudioSourceNode" => {
-            value.set_property("mediaStream", options.get_property("mediaStream"));
+            let stream = options.get_property("mediaStream");
+            if !w3cos_core::class::instance_of(
+                &stream,
+                &crate::media_devices_web::media_stream_class(),
+            ) {
+                throw(
+                    "TypeError",
+                    "MediaStreamAudioSourceNode requires a MediaStream",
+                );
+            }
+            if stream
+                .call_method("getAudioTracks", vec![])
+                .get_property("length")
+                .to_number()
+                < 1.0
+            {
+                throw(
+                    "InvalidStateError",
+                    "MediaStreamAudioSourceNode requires a MediaStream with an audio track",
+                );
+            }
+            value.set_property("mediaStream", stream.clone());
+            let track_id = stream
+                .call_method("getAudioTracks", vec![])
+                .get_property("0")
+                .get_property("id")
+                .to_js_string();
+            if let Some(source) = crate::audio_input::source_for_track(&track_id) {
+                value.set_property(
+                    "channelCount",
+                    Value::Number(f64::from(source.channels.max(1))),
+                );
+                value.set_property("channelCountMode", Value::string("explicit"));
+            }
         }
         "OscillatorNode" => {
             set_param(&value, "detune", 0.0, -153_600.0, 153_600.0);
@@ -1403,7 +1474,6 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
                 ]))
             }),
         );
-        install_media_factories(&context);
     } else {
         context.set_property("length", Value::Number(offline_length as f64));
         context.set_property("oncomplete", Value::Null);
@@ -1453,6 +1523,8 @@ fn context_value(class_name: &'static str, options: Value) -> Value {
             realm_audio_function(|_, _| w3cos_core::promise::resolve(vec![Value::Undefined])),
         );
     }
+    // BaseAudioContext: both live and offline contexts can pull a microphone.
+    install_media_factories(&context);
     register_context(&context, &clock);
     context
 }
@@ -2318,5 +2390,93 @@ mod tests {
         );
         assert!(state_marker_weak.upgrade().is_none());
         assert!(ended_marker_weak.upgrade().is_none());
+    }
+
+    fn promise_value(promise: Value) -> Result<Value, Value> {
+        let result = Rc::new(RefCell::new(None));
+        let fulfilled = Rc::clone(&result);
+        let rejected = Rc::clone(&result);
+        promise.call_method(
+            "then",
+            vec![
+                Value::function(move |_, args| {
+                    *fulfilled.borrow_mut() = Some(Ok(args.first().cloned().unwrap_or_default()));
+                    Value::Undefined
+                }),
+                Value::function(move |_, args| {
+                    *rejected.borrow_mut() = Some(Err(args.first().cloned().unwrap_or_default()));
+                    Value::Undefined
+                }),
+            ],
+        );
+        crate::jsdom::drain_microtasks();
+        result.borrow().clone().unwrap_or(Err(Value::Undefined))
+    }
+
+    #[test]
+    fn microphone_pcm_reaches_an_offline_audio_context_through_gain() {
+        crate::media_devices_web::reset();
+        crate::capability_gate::reset();
+        let mic = crate::audio_input::MicrophoneInfo {
+            label: "Graph Microphone".into(),
+            device_key: "audio-web:mic".into(),
+            group_key: "audio-web:group".into(),
+            sample_rate: 8_000,
+            channels: 1,
+            is_default: true,
+        };
+        crate::audio_input::set_microphone_override(Some(vec![mic.clone()]));
+        crate::audio_input::push_microphone_samples(&mic.device_key, &[0.25, -0.5, 0.125, -0.125]);
+        crate::capability_gate::grant("microphone");
+        let stream = promise_value(crate::media_devices_web::media_devices_value().call_method(
+            "getUserMedia",
+            vec![Value::object(HashMap::from([(
+                "audio".into(),
+                Value::Bool(true),
+            )]))],
+        ))
+        .expect("getUserMedia");
+        let context = offline_context(1.0, 4.0, 8_000.0);
+        let source = context.call_method("createMediaStreamSource", vec![stream.clone()]);
+        assert_eq!(source.get_property("channelCount").to_number(), 1.0);
+        assert_eq!(source.get_property("numberOfInputs").to_number(), 0.0);
+        let gain = context.call_method("createGain", Vec::new());
+        gain.get_property("gain")
+            .set_property("value", Value::Number(0.5));
+        source.call_method("connect", vec![gain.clone()]);
+        gain.call_method("connect", vec![context.get_property("destination")]);
+        assert_eq!(
+            channel(&render(&context), 0),
+            vec![0.125, -0.25, 0.0625, -0.0625]
+        );
+
+        let track = stream
+            .call_method("getAudioTracks", vec![])
+            .get_property("0");
+        track.set_property("enabled", Value::Bool(false));
+        let muted = offline_context(1.0, 4.0, 8_000.0);
+        let muted_source = muted.call_method("createMediaStreamSource", vec![stream.clone()]);
+        muted_source.call_method("connect", vec![muted.get_property("destination")]);
+        assert!(
+            channel(&render(&muted), 0)
+                .iter()
+                .all(|sample| sample.abs() < 1e-6)
+        );
+
+        let video =
+            crate::media_devices_web::stream_value(vec![crate::media_devices_web::track_value(
+                "video", "camera",
+            )]);
+        let fresh = offline_context(1.0, 4.0, 8_000.0);
+        let error =
+            w3cos_core::catch_js(|| fresh.call_method("createMediaStreamSource", vec![video]))
+                .expect_err("a video-only stream is not a media-stream source");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "InvalidStateError"
+        );
+
+        crate::capability_gate::reset();
+        crate::media_devices_web::reset();
     }
 }
