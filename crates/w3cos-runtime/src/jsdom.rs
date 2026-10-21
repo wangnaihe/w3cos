@@ -22769,6 +22769,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::eventsource::poll_js_events();
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
+        ran += crate::audio_web::poll_live_outputs();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
