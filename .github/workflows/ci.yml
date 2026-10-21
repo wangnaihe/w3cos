@@ -89,37 +89,24 @@ jobs:
         run: scripts/check-mobile-renderer-boundary.sh
       - name: Test size audit policy
         run: cargo test -p w3cos-size-audit
-      - name: Build stripped AOT and dynamic-browser linkage probes
+      - name: Audit linkage-probe size, attribution, and baselines
+        run: scripts/audit-linkage-sizes.sh
+      - name: Build and budget the mobile Skia linkage probe
         run: |
-          cargo build -p w3cos-size-audit --profile release-size
-          cargo build -p w3cos-size-probes --bin w3cos-aot-size-probe --profile release-size
-          cargo build -p w3cos-size-probes --features browser --bin w3cos-browser-size-probe --profile release-size
           cargo build -p w3cos-size-probes --features mobile-skia --bin w3cos-mobile-skia-size-probe --profile release-size
-          test "$(target/release-size/w3cos-aot-size-probe)" = "ordinary-aot"
-          test "$(target/release-size/w3cos-browser-size-probe)" = "dynamic-w3vm"
           test "$(target/release-size/w3cos-mobile-skia-size-probe)" = "mobile-skia"
-      - name: Enforce linkage-probe size budgets
-        run: |
-          target/release-size/w3cos-size-audit \
-            --profile aot \
-            --component executable=target/release-size/w3cos-aot-size-probe \
-            --output target/size-audit-aot.json
-          aot_bytes="$(stat -c%s target/release-size/w3cos-aot-size-probe)"
-          target/release-size/w3cos-size-audit \
-            --profile browser \
-            --component executable=target/release-size/w3cos-browser-size-probe \
-            --baseline-bytes "$aot_bytes" \
-            --max-regression-percent 50 \
-            --output target/size-audit-browser.json
           target/release-size/w3cos-size-audit \
             --profile runtime \
             --component executable=target/release-size/w3cos-mobile-skia-size-probe \
             --output target/size-audit-mobile-skia.json
       - name: Upload linkage-probe size reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: size-audit-linkage-probes
           path: |
             target/size-audit-aot.json
+            target/size-audit-aot.md
             target/size-audit-browser.json
+            target/size-audit-browser.md
             target/size-audit-mobile-skia.json
