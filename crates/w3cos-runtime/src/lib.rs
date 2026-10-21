@@ -77,7 +77,18 @@ pub mod fs_watch;
 ))]
 mod gamepad_gilrs;
 pub mod gamepad_web;
+#[cfg(all(
+    feature = "web-geolocation",
+    target_os = "linux",
+    not(target_env = "ohos")
+))]
+mod geolocation_linux;
+#[cfg(all(feature = "web-geolocation", target_os = "macos"))]
+mod geolocation_macos;
+mod geolocation_provider;
 pub mod geolocation_web;
+#[cfg(all(feature = "web-geolocation", target_os = "windows"))]
+mod geolocation_windows;
 pub mod geometry_web;
 #[cfg(feature = "gpu")]
 pub mod gpu_filter;

@@ -654,6 +654,15 @@ precede ecosystem breadth or migration tooling.
 - [x] Support `getCurrentPosition`, `watchPosition`, and `clearWatch`.
 - [x] Implement timeout, maximum age, accuracy fields, permission denial, and
   platform-disabled errors.
+- [x] Desktop providers behind `web-geolocation`: Linux GeoClue2 on the system
+  bus (zbus, desktop id `w3cos`, city vs exact accuracy; allow `[w3cos]` in
+  `geoclue.conf` when no agent is running), macOS Core Location when-in-use
+  (`NSLocationWhenInUseUsageDescription`, `NSLocationUsageDescription`, and
+  entitlement `com.apple.security.personal-information.location`), and Windows
+  `Windows.Devices.Geolocation` (honors the location privacy setting).
+  Acquisition runs on a dedicated thread and is delivered on the event loop.
+  Host `update_position` remains for tests. `W3COS_GEOLOCATION_DEVICE_TESTS=1`
+  opts into a hardware run. Coordinates are never synthesized.
 - [ ] Add iOS Core Location and Android location adapters with manifest/plist
   generation.
 
