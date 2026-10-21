@@ -1,7 +1,9 @@
 //! Headless demo for the native-gap adapters.
 //!
 //! Exercises permission denial, a real process, window-management displays,
-//! battery (or an honest `NotSupportedError`), an application shortcut, the
+//! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
+//! honest `NotReadableError` when this host has no live sensor), an application
+//! shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
 //! session has no status watcher), display capture, a TCP echo, a WebNN add,
@@ -11,7 +13,7 @@
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render
+//!   --no-default-features --features cpu-render,web-sensors,web-gamepad
 //! ```
 
 use std::cell::RefCell;
@@ -186,6 +188,64 @@ fn webnn_add() -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(",");
     Ok(values)
+}
+
+fn sensor_probe() -> (String, bool) {
+    w3cos_runtime::orientation_web::set_permission_granted(true);
+    capability_gate::grant("accelerometer");
+    let sensor = w3cos_core::class::construct(
+        &w3cos_runtime::sensors_web::accelerometer_class(),
+        vec![Value::object(HashMap::from([(
+            "frequency".into(),
+            Value::Number(10.0),
+        )]))],
+    );
+    let error = Rc::new(RefCell::new(String::new()));
+    let error_slot = Rc::clone(&error);
+    sensor.call_method(
+        "addEventListener",
+        vec![
+            Value::string("error"),
+            Value::function(move |_, args| {
+                *error_slot.borrow_mut() = args
+                    .first()
+                    .map(|event| {
+                        event
+                            .get_property("error")
+                            .get_property("name")
+                            .to_js_string()
+                    })
+                    .unwrap_or_default();
+                Value::Undefined
+            }),
+        ],
+    );
+    sensor.call_method("start", vec![]);
+    for _ in 0..30 {
+        jsdom::drain_microtasks();
+        if sensor.get_property("hasReading").to_bool() || !error.borrow().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    let has_reading = sensor.get_property("hasReading").to_bool();
+    let text = if has_reading {
+        format!(
+            "x {} y {} z {}",
+            sensor.get_property("x").to_number(),
+            sensor.get_property("y").to_number(),
+            sensor.get_property("z").to_number()
+        )
+    } else if error.borrow().is_empty() {
+        "no live sample".to_string()
+    } else {
+        error.borrow().clone()
+    };
+    let ok = has_reading || error.borrow().as_str() == "NotReadableError";
+    sensor.call_method("stop", vec![]);
+    w3cos_runtime::orientation_web::reset();
+    w3cos_runtime::sensors_web::reset();
+    (text, ok)
 }
 
 fn main() {
@@ -385,8 +445,10 @@ fn main() {
     );
     let (gamepad_text, gamepad_ok) = gamepad_probe();
     row("gamepad", &gamepad_text, gamepad_ok);
+    let (sensor_text, sensor_ok) = sensor_probe();
+    row("accelerometer", &sensor_text, sensor_ok);
 
-    let frame = render_document_rgba_cpu(960, 780).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 840).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
