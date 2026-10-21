@@ -2,8 +2,9 @@
 //!
 //! Exercises permission denial, a real process, window-management displays,
 //! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
-//! honest `NotReadableError` when this host has no live sensor), an application
-//! shortcut, the
+//! honest `NotReadableError` when this host has no live sensor), a camera
+//! frame (or an honest `NotFoundError` / `NotAllowedError` / `NotReadableError`
+//! when this host has no usable camera), an application shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
 //! session has no status watcher), display capture, Web Serial (permission
@@ -286,6 +287,43 @@ fn sensor_probe() -> (String, bool) {
     (text, ok)
 }
 
+fn camera_probe() -> (String, bool) {
+    capability_gate::grant("camera");
+    let media = w3cos_runtime::media_devices_web::media_devices_value();
+    let opened = await_value(media.call_method(
+        "getUserMedia",
+        vec![Value::object(HashMap::from([(
+            "video".into(),
+            Value::Bool(true),
+        )]))],
+    ));
+    let result = match opened {
+        Ok(stream) => {
+            let track = stream
+                .call_method("getVideoTracks", vec![])
+                .get_property("0");
+            let settings = track.call_method("getSettings", vec![]);
+            let width = settings.get_property("width").to_number();
+            let height = settings.get_property("height").to_number();
+            let label = track.get_property("label").to_js_string();
+            track.call_method("stop", vec![]);
+            (
+                format!("{label} {width}x{height}"),
+                width > 0.0 && height > 0.0,
+            )
+        }
+        Err(err) => {
+            let honest = matches!(
+                err.as_str(),
+                "NotFoundError" | "NotAllowedError" | "NotReadableError" | "OverconstrainedError"
+            );
+            (err, honest)
+        }
+    };
+    w3cos_runtime::media_devices_web::reset();
+    result
+}
+
 fn main() {
     dom::reset_document();
     jsdom::reset_bridge();
@@ -522,6 +560,8 @@ fn main() {
     row("usb", &usb.0, usb.1);
     let (sensor_text, sensor_ok) = sensor_probe();
     row("accelerometer", &sensor_text, sensor_ok);
+    let (camera_text, camera_ok) = camera_probe();
+    row("camera", &camera_text, camera_ok);
 
     let frame = render_document_rgba_cpu(960, 1080).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");

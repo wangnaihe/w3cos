@@ -634,17 +634,21 @@ precede ecosystem breadth or migration tooling.
 - [x] Provide browser-shaped `MediaStream` and `MediaStreamTrack` lifecycle:
   track enumeration/filtering, add/remove events, clone, stop/ended, live
   `active`, constraints facades, and permission/not-found failures.
-- [x] Linux camera platform adapter (V4L2, `platform_host` → `camera_v4l2.rs`):
+- [x] Linux camera platform adapter (V4L2 ioctl, `camera_v4l2.rs`, no libv4l):
   `enumerateDevices()` lists `/dev/video*` capture nodes (one anonymous entry
   until the `camera` capability is granted, then labels and opaque stable
-  SHA-256 `deviceId`/`groupId`); `getUserMedia({video})` honours
-  `deviceId.exact`/`width`/`height`, requires the `camera` grant, and captures a
-  YUYV/MJPEG frame (mmap streaming) that feeds `getSettings()` and
-  `ImageCapture`. Host-registered devices still take precedence. Physical
-  capture is verified only by the opt-in `W3COS_CAMERA_TESTS=1` test.
-- [ ] Continuous camera frame delivery into `MediaStreamTrackProcessor`,
-  `<video>` preview and `MediaRecorder` (the Linux adapter currently captures a
-  frame when `getUserMedia` resolves); `devicechange` hot-plug events.
+  SHA-256 `deviceId`/`groupId`); `getUserMedia({video})` requires that grant,
+  opens a live track on a capture thread, and honours `deviceId`, `width`,
+  `height`, `frameRate`, and `facingMode` (`exact` that the device cannot meet
+  is `OverconstrainedError`). YUYV/MJPEG frames stream into `getSettings()`,
+  `getCapabilities()`, `ImageCapture`, and `MediaStreamTrackProcessor` /
+  `VideoFrame`. The last `stop()` releases the device. Host-registered devices
+  still take precedence. Physical capture is opt-in:
+  `W3COS_CAMERA_TESTS=1` (one-shot) and `W3COS_CAMERA_DEVICE_TESTS=1` (live).
+- [x] Continuous camera frames reach `MediaStreamTrackProcessor` / `VideoFrame`
+  on Linux, macOS, and Windows desktop.
+- [ ] `<video>` preview, camera `MediaRecorder` encoding, and `devicechange`
+  hot-plug events.
 - [x] Desktop microphone adapter (cpal, `audio_input.rs`, macOS / Windows /
   Linux desktop, gated by `web-media-advanced`): `enumerateDevices()` lists
   input devices (one anonymous `audioinput` until the `microphone` capability
@@ -658,11 +662,16 @@ precede ecosystem breadth or migration tooling.
   apply them. Host-registered `audioinput` devices still take precedence and
   carry no PCM. Android, iOS and OHOS have no input adapter. Physical capture
   is verified only by the opt-in `W3COS_AUDIO_DEVICE_TESTS=1` test.
-- [ ] macOS (AVFoundation), Windows (Media Foundation), Android (Camera2) and
-  iOS camera adapters.
-- [ ] Connect camera frames to preview and `MediaRecorder`. Microphone PCM
-  reaches `MediaStreamAudioSourceNode` but not `MediaStreamTrackProcessor` or
-  an `<audio>` element.
+- [x] macOS (AVFoundation) and Windows (Media Foundation) camera adapters,
+  gated by `web-media-advanced` through `nokhwa` (`input-avfoundation`,
+  `input-msmf`). macOS reads `AVAuthorizationStatus` and rejects
+  `NotAllowedError` when access is denied or restricted; the host `Info.plist`
+  must include `NSCameraUsageDescription` or the system will not grant the
+  camera. Linux keeps the ioctl adapter and does not compile or link nokhwa.
+- [ ] Android (Camera2) and iOS camera adapters.
+- [ ] Connect camera frames to `<video>` preview and `MediaRecorder`. Microphone
+  PCM reaches `MediaStreamAudioSourceNode` but not `MediaStreamTrackProcessor`
+  or an `<audio>` element.
 - [ ] Add photo/evidence capture without product-specific native modules.
 - [ ] Validate camera/microphone denial and interruption on physical devices.
 
