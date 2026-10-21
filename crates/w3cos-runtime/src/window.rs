@@ -2834,6 +2834,19 @@ impl App {
         self.ensure_layout_pass(0);
     }
 
+    fn publish_webgl_canvases(&self) {
+        if !crate::webgl_draw::has_live_contexts() {
+            return;
+        }
+        let flat = layout::pre_flatten(&self.root);
+        crate::webgl_draw::publish_drawing_buffers(flat.iter().enumerate().filter_map(
+            |(index, node)| match &node.on_click {
+                EventAction::NativeHost { id, .. } => u32::try_from(*id).ok().map(|id| (index, id)),
+                _ => None,
+            },
+        ));
+    }
+
     fn ensure_layout_pass(&mut self, measurement_pass: u8) {
         let window = match self.get_window() {
             Some(w) => w,
@@ -3664,6 +3677,7 @@ impl App {
         self.sync_gpu_surface_to_window();
         let layout_started = Instant::now();
         self.ensure_layout();
+        self.publish_webgl_canvases();
         crate::perf::record_layout(layout_started.elapsed());
         let paint_started = Instant::now();
 
@@ -4078,6 +4092,7 @@ impl App {
     fn paint_cpu(&mut self) {
         let layout_started = Instant::now();
         self.ensure_layout();
+        self.publish_webgl_canvases();
         self.paint_artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
         crate::perf::record_layout(layout_started.elapsed());
         let paint_started = Instant::now();

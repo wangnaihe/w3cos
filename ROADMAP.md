@@ -301,9 +301,19 @@ suite is red.
   line numbers, `linkProgram` varying/uniform checks, attribute locations,
   active attribute/uniform introspection, uniform locations, `useProgram`
   and `getError` are real (`webgl_shader.rs`, `webgl_program.rs`).
-- [ ] WebGL draw/upload execution on the wgpu compositor (buffers, textures,
-  uniform upload, pipelines, `drawArrays`/`drawElements`, `readPixels`),
-  uniform-block introspection, unused-uniform elimination, extensions.
+- [x] Execute WebGL 1/2 draws on the wgpu compositor (`webgl_draw.rs`):
+  buffer upload, vertex attributes and VAOs, `uniform*`/`uniformMatrix*`
+  in std140, 2D `texImage2D`/`texSubImage2D`, framebuffer/renderbuffer
+  basics, viewport/scissor, clear, depth/blend/cull, `drawArrays`/
+  `drawElements` (including instanced draws), `readPixels` of real GPU
+  pixels, and publishing the drawing buffer into the canvas compositor.
+  Linked GLSL 450 is lowered to WGSL with naga. Pipelines are cached by
+  program generation and draw state. With no adapter, draw and
+  `readPixels` return `INVALID_OPERATION` and leave the destination
+  untouched. Transform feedback, uniform blocks, queries, sync, 3D and
+  compressed textures, and non-`sampler2D` samplers are rejected.
+- [ ] WebGL uniform-block introspection, unused-uniform elimination,
+  mipmap generation, `copyTexImage2D`, and extension objects.
 - [x] Brand the host-backed Web Bluetooth device/GATT server/service/
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`
@@ -509,9 +519,12 @@ precede ecosystem breadth or migration tooling.
   milestone and emit a compatibility warning.
 - [x] Expose Web Serial, WebHID and WebUSB compatibility bases with navigator
   manager identity, EventTarget behavior, standard device/event constructors,
-  truthful empty enumeration and Promise chooser rejection. Native discovery,
-  permission prompts and device I/O remain host-adapter work and emit one-time
-  warnings instead of reporting false success.
+  truthful empty enumeration and Promise chooser rejection.
+- [x] Wire `navigator.serial` on macOS, Windows and Linux desktop through the
+  `serialport` crate (`web-serial`): an explicit `serial` grant plus one
+  filter match or a host chooser, granted-port `getPorts`, open options, byte
+  streams on an I/O thread, signals, USB ids, `close`/`forget` and polled
+  hot-plug. Mobile and OHOS keep the unavailable rejection.
 - [x] Wire desktop WebHID and WebUSB to real devices. `navigator.hid` uses
   hidapi (Linux hidraw via `linux-native-basic-udev`, macOS IOKit, Windows
   hid.dll) for `getDevices`, filtered `requestDevice`, open/close, output and
@@ -521,8 +534,7 @@ precede ecosystem breadth or migration tooling.
   with `USBInTransferResult`/`USBOutTransferResult`, protected-interface
   `SecurityError`, and isochronous `NotSupportedError`. `requestDevice` requires
   an explicit `hid`/`usb` grant or a host chooser and never grants silently.
-  Android, iOS, and OHOS keep the truthful rejection path. Web Serial stays on
-  the compatibility base until its own adapter lands.
+  Android, iOS, and OHOS keep the truthful rejection path.
 - [x] Expose the Web NFC base with constructible `NDEFReader`, `NDEFMessage`,
   `NDEFRecord` and `NDEFReadingEvent`, usable message/record data, AbortSignal
   pre-abort handling and explicit Promise failures. Scanning, permissions and

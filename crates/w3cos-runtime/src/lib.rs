@@ -171,6 +171,7 @@ pub mod screen_details_web;
 #[cfg(feature = "web-sensors")]
 pub mod sensor_iio;
 pub mod sensors_web;
+pub mod serial_web;
 pub mod service_worker_web;
 pub mod tray_host;
 mod usb_adapter;
@@ -217,6 +218,7 @@ pub mod web_share;
 pub mod web_transport_web;
 pub mod webcodecs_web;
 mod webgl_constants_generated;
+pub mod webgl_draw;
 pub mod webgl_program;
 pub mod webgl_shader;
 pub mod webgl_web;
