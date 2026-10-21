@@ -1,7 +1,9 @@
 //! Headless demo for the native-gap adapters.
 //!
 //! Exercises permission denial, a real process, window-management displays,
-//! battery (or an honest `NotSupportedError`), an application shortcut, the
+//! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
+//! honest `NotReadableError` when this host has no live sensor), an application
+//! shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
 //! session has no status watcher), display capture, Web Serial (permission
@@ -11,7 +13,9 @@
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render
+//!   --no-default-features --features cpu-render,web-sensors
+//! # Optional: add web-device-access to print live hidapi/nusb summaries.
+//! # The probe does not grant hid/usb, so requestDevice must not succeed.
 //! ```
 
 use std::cell::RefCell;
@@ -22,6 +26,7 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 use w3cos_runtime::capability_gate;
+use w3cos_runtime::device_access_web;
 use w3cos_runtime::direct_sockets_web::{self, tcp_socket_class};
 use w3cos_runtime::dom;
 use w3cos_runtime::headless::{self, render_document_rgba_cpu};
@@ -165,6 +170,99 @@ fn webnn_add() -> Result<String, String> {
     Ok(values)
 }
 
+fn device_probe(kind: &str) -> (String, bool) {
+    let manager = if kind == "hid" {
+        device_access_web::hid_value()
+    } else {
+        device_access_web::usb_value()
+    };
+    let summary = if kind == "hid" {
+        device_access_web::hid_backend_summary()
+    } else {
+        device_access_web::usb_backend_summary()
+    };
+    let listed = await_value(manager.call_method("getDevices", vec![]));
+    let requested = await_value(manager.call_method(
+        "requestDevice",
+        vec![Value::object(HashMap::from([(
+            "filters".into(),
+            Value::array(vec![]),
+        )]))],
+    ));
+    let list_len = listed
+        .as_ref()
+        .map(|devices| devices.get_property("length").to_number())
+        .unwrap_or(-1.0);
+    let request_error = match &requested {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    let ok =
+        list_len == 0.0 && matches!(request_error.as_str(), "NotFoundError" | "NotAllowedError");
+    (
+        format!("{summary} devices {list_len} request {request_error}"),
+        ok,
+    )
+}
+
+fn sensor_probe() -> (String, bool) {
+    w3cos_runtime::orientation_web::set_permission_granted(true);
+    capability_gate::grant("accelerometer");
+    let sensor = w3cos_core::class::construct(
+        &w3cos_runtime::sensors_web::accelerometer_class(),
+        vec![Value::object(HashMap::from([(
+            "frequency".into(),
+            Value::Number(10.0),
+        )]))],
+    );
+    let error = Rc::new(RefCell::new(String::new()));
+    let error_slot = Rc::clone(&error);
+    sensor.call_method(
+        "addEventListener",
+        vec![
+            Value::string("error"),
+            Value::function(move |_, args| {
+                *error_slot.borrow_mut() = args
+                    .first()
+                    .map(|event| {
+                        event
+                            .get_property("error")
+                            .get_property("name")
+                            .to_js_string()
+                    })
+                    .unwrap_or_default();
+                Value::Undefined
+            }),
+        ],
+    );
+    sensor.call_method("start", vec![]);
+    for _ in 0..30 {
+        jsdom::drain_microtasks();
+        if sensor.get_property("hasReading").to_bool() || !error.borrow().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    let has_reading = sensor.get_property("hasReading").to_bool();
+    let text = if has_reading {
+        format!(
+            "x {} y {} z {}",
+            sensor.get_property("x").to_number(),
+            sensor.get_property("y").to_number(),
+            sensor.get_property("z").to_number()
+        )
+    } else if error.borrow().is_empty() {
+        "no live sample".to_string()
+    } else {
+        error.borrow().clone()
+    };
+    let ok = has_reading || error.borrow().as_str() == "NotReadableError";
+    sensor.call_method("stop", vec![]);
+    w3cos_runtime::orientation_web::reset();
+    w3cos_runtime::sensors_web::reset();
+    (text, ok)
+}
+
 fn main() {
     dom::reset_document();
     jsdom::reset_bridge();
@@ -279,6 +377,8 @@ fn main() {
     );
     let tcp = tcp_echo();
     let webnn = webnn_add();
+    let hid = device_probe("hid");
+    let usb = device_probe("usb");
 
     dom::set_style_property(dom::body_id(), "margin", "0");
     dom::set_style_property(dom::body_id(), "background", "#101418");
@@ -393,8 +493,12 @@ fn main() {
         &webnn.clone().unwrap_or_else(|err| err),
         webnn.as_deref() == Ok("4,6"),
     );
+    row("hid", &hid.0, hid.1);
+    row("usb", &usb.0, usb.1);
+    let (sensor_text, sensor_ok) = sensor_probe();
+    row("accelerometer", &sensor_text, sensor_ok);
 
-    let frame = render_document_rgba_cpu(960, 560).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 960).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

@@ -104,6 +104,8 @@ fn state_for(name: &str) -> Option<String> {
         | "battery"
         | "display-capture"
         | "serial"
+        | "hid"
+        | "usb"
         | "w3cos-process"
         | "w3cos-global-shortcuts"
         | "w3cos-tray"

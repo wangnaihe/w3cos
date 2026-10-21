@@ -14415,7 +14415,15 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
     });
     if added {
         ensure_native_registration(node, et);
+        note_window_motion_listener(node, type_name, true);
     }
+}
+
+fn note_window_motion_listener(node: u32, type_name: &str, added: bool) {
+    if node != 0 {
+        return;
+    }
+    crate::orientation_web::adjust_motion_listener(type_name, if added { 1 } else { -1 });
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -14472,9 +14480,10 @@ fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options:
         false
     };
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().remove_one(node, et, &handler, capture);
-    });
+    let removed = LISTENERS.with(|l| l.borrow_mut().remove_one(node, et, &handler, capture));
+    if removed {
+        note_window_motion_listener(node, type_name, false);
+    }
 }
 
 fn key_code_for(key: &str, code: &str) -> u32 {
@@ -20553,6 +20562,10 @@ fn build_window_value() -> Value {
         "HIDInputReportEvent".to_string(),
         crate::device_access_web::hid_input_report_event_class(),
     );
+    props.insert(
+        "HIDConnectionEvent".to_string(),
+        crate::device_access_web::hid_connection_event_class(),
+    );
     props.insert("USB".to_string(), crate::device_access_web::usb_class());
     props.insert(
         "USBDevice".to_string(),
@@ -20861,6 +20874,10 @@ fn build_window_value() -> Value {
     props.insert(
         "RelativeOrientationSensor".to_string(),
         crate::sensors_web::relative_orientation_sensor_class(),
+    );
+    props.insert(
+        "AmbientLightSensor".to_string(),
+        crate::sensors_web::ambient_light_sensor_class(),
     );
     props.insert(
         "ReadableStream".to_string(),
@@ -22695,6 +22712,8 @@ pub fn drain_microtasks() -> usize {
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
         ran += crate::serial_web::poll_serial_io();
+        ran += crate::device_access_web::poll_device_events();
+        ran += crate::sensors_web::poll_platform_samples();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22752,7 +22771,8 @@ pub fn has_pending_work() -> bool {
                 false
             }
         };
-    timers || raf || micro || events || native_io
+    let device_io = crate::device_access_web::has_pending_device_events();
+    timers || raf || micro || events || native_io || device_io
 }
 
 /// Earliest non-rendering deadline the bridge needs to be woken at: the
@@ -22778,6 +22798,8 @@ pub fn next_timer_deadline() -> Option<Instant> {
         socket_deadline,
         script_deadline,
         crate::speech::next_deadline(),
+        crate::device_access_web::next_device_deadline(),
+        crate::sensors_web::next_sample_deadline(),
     ]
     .into_iter()
     .flatten()
@@ -22870,6 +22892,7 @@ pub fn reset_bridge() {
     crate::xpath_web::reset_realm();
     crate::sanitizer_web::reset_realm();
     crate::bluetooth_web::reset_realm();
+    crate::device_access_web::reset_realm();
     crate::speech_web::reset();
     crate::speech_synthesis_web::reset();
     crate::geolocation_web::reset();

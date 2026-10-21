@@ -509,14 +509,22 @@ precede ecosystem breadth or migration tooling.
   milestone and emit a compatibility warning.
 - [x] Expose Web Serial, WebHID and WebUSB compatibility bases with navigator
   manager identity, EventTarget behavior, standard device/event constructors,
-  truthful empty enumeration and Promise chooser rejection. Native discovery,
-  permission prompts and device I/O remain host-adapter work for WebHID and
-  WebUSB and emit one-time warnings instead of reporting false success.
+  truthful empty enumeration and Promise chooser rejection.
 - [x] Wire `navigator.serial` on macOS, Windows and Linux desktop through the
   `serialport` crate (`web-serial`): an explicit `serial` grant plus one
   filter match or a host chooser, granted-port `getPorts`, open options, byte
   streams on an I/O thread, signals, USB ids, `close`/`forget` and polled
   hot-plug. Mobile and OHOS keep the unavailable rejection.
+- [x] Wire desktop WebHID and WebUSB to real devices. `navigator.hid` uses
+  hidapi (Linux hidraw via `linux-native-basic-udev`, macOS IOKit, Windows
+  hid.dll) for `getDevices`, filtered `requestDevice`, open/close, output and
+  feature reports, `inputreport` events from a reader thread, report-descriptor
+  collections, and connect/disconnect. `navigator.usb` uses nusb for
+  configuration and interface lifecycle, control and bulk/interrupt transfers
+  with `USBInTransferResult`/`USBOutTransferResult`, protected-interface
+  `SecurityError`, and isochronous `NotSupportedError`. `requestDevice` requires
+  an explicit `hid`/`usb` grant or a host chooser and never grants silently.
+  Android, iOS, and OHOS keep the truthful rejection path.
 - [x] Expose the Web NFC base with constructible `NDEFReader`, `NDEFMessage`,
   `NDEFRecord` and `NDEFReadingEvent`, usable message/record data, AbortSignal
   pre-abort handling and explicit Promise failures. Scanning, permissions and
@@ -545,12 +553,16 @@ precede ecosystem breadth or migration tooling.
   `DeviceMotionEvent`, acceleration and rotation-rate value identities) with
   standard fields/identity, permission-gated trusted window events, Permissions
   API synchronization and host sensor injection.
-  Platform sensor-consent and telemetry adapters remain pending with warning.
 - [x] Expose the Generic Sensor core (`Sensor`, `SensorErrorEvent`,
-  `Accelerometer`, `Gyroscope`, `Magnetometer`) with asynchronous
-  start/error/activate lifecycle, permission integration, reading events and
-  host vector injection. Live telemetry requires platform adapters and emits a
-  warning.
+  `Accelerometer`, `Gyroscope`, `Magnetometer`, plus gravity, linear
+  acceleration, absolute/relative orientation, and `AmbientLightSensor`) with
+  asynchronous start/error/activate lifecycle, permission integration, reading
+  events and host vector injection.
+- [x] Read Linux desktop Generic Sensor and device motion from Industrial I/O
+  (`/sys/bus/iio/devices`, optional `iio-sensor-proxy`) on a `web-sensors`
+  sampler thread. Missing hardware is `NotReadableError` or, for window
+  events, silence. macOS, Windows, and mobile do not invent samples. Host
+  injection still feeds unit tests unless `W3COS_SENSOR_DEVICE_TESTS=1`.
 - [x] Expose Media Capabilities (`navigator.mediaCapabilities`,
   `MediaCapabilities`) with validated decode/encode Promise queries backed by
   a host-registerable MIME codec table. Unknown formats report unsupported;
@@ -1231,6 +1243,11 @@ generic JavaScript/Web-platform coverage.
 - [x] Bootable ISO release workflow.
 - [x] AI Bridge DOM/a11y/query/click/type/screenshot foundation.
 - [x] File system, process, PTY, IPC, menu, and dialog engine modules.
+- [x] Desktop WebHID (hidapi) and WebUSB (nusb) device I/O, with explicit
+  permission, protected USB interface classes, and truthful mobile/OHOS
+  rejection.
+- [x] Linux desktop motion and ambient-light telemetry through Industrial I/O
+  (`web-sensors`). macOS, Windows, and mobile report the sensor as unavailable.
 
 ### Remaining
 
