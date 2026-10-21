@@ -8178,6 +8178,14 @@ impl ApplicationHandler for App {
             self.request_repaint();
         }
 
+        // Tray click and menu callbacks are queued by the status-item thread.
+        // Deliver them on this turn, before timers, so a handler can schedule
+        // work that the microtask checkpoint below will flush.
+        if crate::w3cos_extensions::flush_tray_events() > 0 {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
+
         // A due JS timer is eligible at every native task boundary. Limiting
         // this to ResumeTimeReached starves setTimeout(0) while redraw, touch,
         // or IME polling keeps the loop in Poll/WaitCancelled turns.

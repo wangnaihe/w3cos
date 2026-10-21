@@ -158,6 +158,7 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+pub mod tray_host;
 
 pub mod plugin_abi;
 pub mod shared_abi;

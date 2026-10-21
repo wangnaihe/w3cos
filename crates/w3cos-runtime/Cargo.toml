@@ -130,6 +130,11 @@ tungstenite = { workspace = true }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 # Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
+# System tray. `ksni` is the Linux StatusNotifierItem backend (the protocol
+# Ayatana AppIndicator implements) and does not need GTK. macOS uses
+# NSStatusItem and Windows uses Shell_NotifyIcon inside the same crate.
+# The default `libappindicator` feature links GTK and is intentionally off.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
