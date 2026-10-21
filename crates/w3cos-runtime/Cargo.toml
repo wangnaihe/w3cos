@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access", "web-sensors", "web-bluetooth"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access", "web-sensors", "web-serial", "web-bluetooth"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -15,6 +15,9 @@ web-graphics-advanced = ["dep:naga"]
 # Includes real-time Web Audio output and microphone capture through cpal
 # on desktop targets.
 web-media-advanced = ["dep:cpal"]
+# Host serial ports for navigator.serial on macOS, Windows, and Linux desktop.
+# libudev stays off so CI does not need libudev-dev; Linux USB ids come from sysfs.
+web-serial = ["dep:serialport"]
 # Desktop WebHID (hidapi hidraw) and WebUSB (nusb). The crates are desktop-only,
 # so Android, iOS, and OHOS keep the truthful rejection path.
 web-device-access = ["dep:hidapi", "dep:nusb"]
@@ -156,6 +159,9 @@ btleplug = { version = "0.13", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "net", "rt", "sync", "time"] }
 uuid = { version = "1", optional = true, default-features = false, features = ["std"] }
 futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+# Web Serial. libudev is off so Linux CI does not need libudev-dev; USB
+# vendor and product ids still come from sysfs on Linux.
+serialport = { version = "4.10", default-features = false, optional = true }
 # Pure Rust USB. No libusb.
 nusb = { version = "0.2.8", optional = true }
 # System tray. `ksni` is the Linux StatusNotifierItem backend (the protocol

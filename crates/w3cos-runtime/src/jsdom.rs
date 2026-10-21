@@ -22711,6 +22711,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
+        ran += crate::serial_web::poll_serial_io();
         ran += crate::device_access_web::poll_device_events();
         ran += crate::sensors_web::poll_platform_samples();
         ran += crate::bluetooth_web::poll_platform_events();
@@ -22957,6 +22958,7 @@ pub fn reset_bridge() {
     crate::observers_web::reset_intersection_observers();
     crate::observers_web::reset_performance_timeline();
     crate::fetch::reset_realm();
+    crate::serial_web::reset_realm();
     crate::streams_web::reset_realm();
     crate::web_events::reset_realm();
     reset_realm_class_caches();
