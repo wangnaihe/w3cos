@@ -2,9 +2,9 @@
 //! no W3C or WICG draft.
 //!
 //! The namespace is deliberately not a root `Navigator` member. See
-//! `docs/W3COS_EXTENSIONS.md`. Process spawn and global shortcuts run against
-//! the host. Every other surface in this namespace rejects with
-//! `NotSupportedError` after its permission check.
+//! `docs/W3COS_EXTENSIONS.md`. Process spawn, global shortcuts, and the
+//! origin-scoped keyring run against the host. Every other surface in this
+//! namespace rejects with `NotSupportedError` after its permission check.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -643,6 +643,81 @@ fn stub_namespace(
     value
 }
 
+fn keyring_rejected(err: crate::keyring_store::KeyringError) -> Value {
+    rejected(err.name(), err.message())
+}
+
+fn keyring_namespace() -> Value {
+    let generation = crate::jsdom::realm_generation();
+    let value = Value::object(HashMap::new());
+    value.set_property(
+        "get",
+        realm_function(generation, |_, args| {
+            if let Some(rejected) =
+                crate::capability_gate::reject_unless_granted(PERMISSION_KEYRING)
+            {
+                return rejected;
+            }
+            let name = args.first().map(Value::to_js_string).unwrap_or_default();
+            match crate::keyring_store::get_secret(&name) {
+                Ok(Some(secret)) => w3cos_core::promise::resolve(vec![Value::string(&secret)]),
+                Ok(None) => w3cos_core::promise::resolve(vec![Value::Null]),
+                Err(err) => keyring_rejected(err),
+            }
+        }),
+    );
+    value.set_property(
+        "set",
+        realm_function(generation, |_, args| {
+            if let Some(rejected) =
+                crate::capability_gate::reject_unless_granted(PERMISSION_KEYRING)
+            {
+                return rejected;
+            }
+            let name = args.first().map(Value::to_js_string).unwrap_or_default();
+            let Some(secret) = args.get(1).filter(|value| !value.is_undefined()) else {
+                return rejected("TypeError", "keyring.set requires a secret");
+            };
+            match crate::keyring_store::set_secret(&name, &secret.to_js_string()) {
+                Ok(()) => w3cos_core::promise::resolve(vec![Value::Undefined]),
+                Err(err) => keyring_rejected(err),
+            }
+        }),
+    );
+    value.set_property(
+        "delete",
+        realm_function(generation, |_, args| {
+            if let Some(rejected) =
+                crate::capability_gate::reject_unless_granted(PERMISSION_KEYRING)
+            {
+                return rejected;
+            }
+            let name = args.first().map(Value::to_js_string).unwrap_or_default();
+            match crate::keyring_store::delete_secret(&name) {
+                Ok(()) => w3cos_core::promise::resolve(vec![Value::Undefined]),
+                Err(err) => keyring_rejected(err),
+            }
+        }),
+    );
+    value.set_property(
+        "list",
+        realm_function(generation, |_, _| {
+            if let Some(rejected) =
+                crate::capability_gate::reject_unless_granted(PERMISSION_KEYRING)
+            {
+                return rejected;
+            }
+            match crate::keyring_store::list_secrets() {
+                Ok(names) => w3cos_core::promise::resolve(vec![Value::array(
+                    names.into_iter().map(|name| Value::string(&name)).collect(),
+                )]),
+                Err(err) => keyring_rejected(err),
+            }
+        }),
+    );
+    value
+}
+
 fn agent_namespace() -> Value {
     let generation = crate::jsdom::realm_generation();
     let value = Value::object(HashMap::new());
@@ -733,14 +808,7 @@ pub fn namespace_value() -> Value {
                 &["get", "set", "power"],
             ),
         ),
-        (
-            "keyring".into(),
-            stub_namespace(
-                PERMISSION_KEYRING,
-                "navigator.w3cos.keyring",
-                &["get", "set", "delete"],
-            ),
-        ),
+        ("keyring".into(), keyring_namespace()),
         ("agent".into(), agent_namespace()),
     ]))
 }
@@ -754,6 +822,7 @@ pub fn reset_realm() {
     PROCESSES.with(|processes| processes.borrow_mut().clear());
     refresh_active_flag();
     crate::platform_host::clear_grabs();
+    crate::keyring_store::reset_override();
 }
 
 #[cfg(test)]
@@ -890,15 +959,7 @@ mod tests {
             await_value(namespace.get_property("tray").call_method("show", vec![])).unwrap_err();
         assert_eq!(denied, "NotAllowedError");
         crate::capability_gate::grant(PERMISSION_TRAY);
-        crate::capability_gate::grant(PERMISSION_KEYRING);
         crate::capability_gate::grant(PERMISSION_SYSTEM);
-        let refused = await_value(
-            namespace
-                .get_property("keyring")
-                .call_method("set", vec![Value::string("token"), Value::string("secret")]),
-        )
-        .unwrap_err();
-        assert_eq!(refused, "NotSupportedError");
         let power = await_value(
             namespace
                 .get_property("system")
@@ -934,6 +995,87 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(cross, "NotSupportedError");
+        crate::capability_gate::reset();
+        reset_realm();
+    }
+
+    fn string_items(value: &Value) -> Vec<String> {
+        let length = value.get_property("length").to_u32();
+        (0..length)
+            .map(|index| value.get_property(&index.to_string()).to_js_string())
+            .collect()
+    }
+
+    #[test]
+    fn keyring_requires_permission_and_lists_only_the_current_origin() {
+        reset_realm();
+        crate::capability_gate::reset();
+        crate::history::reset();
+        crate::jsdom::reset_bridge();
+        crate::keyring_store::install_mock();
+        let namespace = namespace_value();
+        let keyring = namespace.get_property("keyring");
+        let denied = await_value(keyring.call_method(
+            "set",
+            vec![Value::string("token"), Value::string("super-secret-value")],
+        ))
+        .unwrap_err();
+        assert_eq!(denied, "NotAllowedError");
+
+        crate::capability_gate::grant(PERMISSION_KEYRING);
+        crate::history::location_replace("https://app.example/");
+        await_value(keyring.call_method(
+            "set",
+            vec![Value::string("token"), Value::string("super-secret-value")],
+        ))
+        .unwrap();
+        await_value(keyring.call_method(
+            "set",
+            vec![Value::string("api token.v2"), Value::string("dotted")],
+        ))
+        .unwrap();
+        let stored = await_value(keyring.call_method("get", vec![Value::string("token")])).unwrap();
+        assert_eq!(stored.to_js_string(), "super-secret-value");
+        let names = await_value(keyring.call_method("list", vec![])).unwrap();
+        assert_eq!(
+            string_items(&names),
+            vec!["api token.v2".to_string(), "token".to_string()]
+        );
+
+        crate::history::location_replace("https://app.example.evil/");
+        let foreign =
+            await_value(keyring.call_method("get", vec![Value::string("token")])).unwrap();
+        assert!(foreign.is_null());
+        let foreign_names = await_value(keyring.call_method("list", vec![])).unwrap();
+        assert_eq!(foreign_names.get_property("length").to_u32(), 0);
+        await_value(keyring.call_method(
+            "set",
+            vec![Value::string("token"), Value::string("other-secret")],
+        ))
+        .unwrap();
+
+        crate::history::location_replace("https://app.example/");
+        let still = await_value(keyring.call_method("get", vec![Value::string("token")])).unwrap();
+        assert_eq!(still.to_js_string(), "super-secret-value");
+        await_value(keyring.call_method("delete", vec![Value::string("token")])).unwrap();
+        await_value(keyring.call_method("delete", vec![Value::string("token")])).unwrap();
+        let gone = await_value(keyring.call_method("get", vec![Value::string("token")])).unwrap();
+        assert!(gone.is_null());
+
+        let missing_secret =
+            await_value(keyring.call_method("set", vec![Value::string("token")])).unwrap_err();
+        assert_eq!(missing_secret, "TypeError");
+
+        crate::keyring_store::install_unavailable(
+            "navigator.w3cos.keyring cannot reach the system secret store (no D-Bus session bus; Secret Service is unavailable); the call was refused",
+        );
+        let refused = await_value(keyring.call_method(
+            "set",
+            vec![Value::string("token"), Value::string("super-secret-value")],
+        ))
+        .unwrap_err();
+        assert_eq!(refused, "NotSupportedError");
+        crate::history::reset();
         crate::capability_gate::reset();
         reset_realm();
     }

@@ -153,6 +153,14 @@ interface W3cosShortcutHandle {
   undefined unregister();
 };
 
+[Exposed=Window]
+interface W3cosKeyring {
+  Promise<USVString?> get(USVString name);
+  Promise<undefined> set(USVString name, USVString secret);
+  Promise<undefined> delete(USVString name);
+  Promise<sequence<USVString>> list();
+};
+
 dictionary W3cosAgentOptions {
   USVString scope = "app"; // "system" | "cross-app" | "background" are refused
 };
@@ -164,10 +172,10 @@ interface W3cosAgent {
 };
 ```
 
-`tray`, `windows`, `daemon`, `system`, and `keyring` expose their method
-names (`show`, `setMenu`, `list`, `focus`, `setAlwaysOnTop`, `install`,
-`start`, `enableAutostart`, `get`, `set`, `power`, `delete`) so callers
-can feature-detect them. Each one rejects.
+`tray`, `windows`, `daemon`, and `system` expose their method names
+(`show`, `setMenu`, `list`, `focus`, `setAlwaysOnTop`, `install`,
+`start`, `enableAutostart`, `get`, `set`, `power`) so callers can
+feature-detect them. Each one rejects.
 
 ### Implemented slice
 
@@ -184,6 +192,18 @@ can feature-detect them. Each one rejects.
   when a shortcut is registered, so an empty registry does not touch the
   input hot path. The OS thread queues accelerator strings;
   `flush_global_shortcuts()` delivers them on the JavaScript thread.
+- `keyring.get` / `keyring.set` / `keyring.delete` / `keyring.list` read
+  and write the current document origin's secrets. The service name is
+  derived from that origin. `list` returns names only, and only for items
+  whose stored service matches this origin exactly, so a prefix of another
+  origin is not enough. `get` resolves `null` when the name is absent.
+  `delete` of a missing name resolves. The desktop adapter is the `keyring`
+  crate: Linux talks to the Secret Service over D-Bus (the same service
+  libsecret uses), macOS uses Keychain Services, and Windows uses
+  Credential Manager. Android, iOS, and HarmonyOS have no adapter yet.
+  A missing session bus, a locked store, or any other failure to open the
+  backend rejects `NotSupportedError`. Nothing is written to a file
+  instead. Exception text does not include the secret.
 
 ### Refused until an adapter exists
 
@@ -191,7 +211,6 @@ can feature-detect them. Each one rejects.
 - `windows.list` / `windows.focus` / `windows.setAlwaysOnTop`
 - `daemon.install` / `daemon.start` / `daemon.enableAutostart`
 - `system.get` / `system.set` / `system.power`
-- `keyring.get` / `keyring.set` / `keyring.delete`
 - `agent.accessibilityTree({ scope: "cross-app" })` and
   `agent.captureScreen({ scope: "background" })`
 
@@ -213,8 +232,13 @@ display capture as `getDisplayMedia`.
 - The accessibility tree and the capture blob describe the current app
   only. Cross-app and unprompted background capture stay refused so this
   namespace cannot bypass the bridge's screenshot and DOM-read bits.
-- The keyring stub stores nothing. A later adapter must require the
-  `w3cos-keyring` grant per origin and must not echo secrets into logs.
+- The keyring requires `w3cos-keyring` before it touches the store. Items
+  are scoped to the document origin (`w3cos://files` and `w3cos://editor`
+  do not see each other). Hosts that leave every app on the default
+  `w3cos://app` origin share that one namespace. Secrets are not written
+  to logs or exception messages. There is no in-memory fallback when the
+  system store cannot be opened; headless CI without a Secret Service
+  session gets `NotSupportedError`.
 - System power and settings are refused. A later `power("shutdown")` needs
   its own confirmation, not only the capability bit.
 
