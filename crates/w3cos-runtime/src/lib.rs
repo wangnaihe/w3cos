@@ -160,6 +160,7 @@ pub mod screen_details_web;
 #[cfg(feature = "web-sensors")]
 pub mod sensor_iio;
 pub mod sensors_web;
+pub mod serial_web;
 pub mod service_worker_web;
 pub mod tray_host;
 mod usb_adapter;
