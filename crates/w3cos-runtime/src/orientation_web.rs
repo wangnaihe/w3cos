@@ -38,6 +38,8 @@ pub struct DeviceMotionState {
 
 thread_local! {
     static PERMISSION_GRANTED: Cell<bool> = const { Cell::new(false) };
+    static ORIENTATION_LISTENERS: Cell<u32> = const { Cell::new(0) };
+    static MOTION_LISTENERS: Cell<u32> = const { Cell::new(0) };
     static DEVICE_ORIENTATION_EVENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DEVICE_MOTION_EVENT_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static DEVICE_MOTION_ACCELERATION_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -161,11 +163,12 @@ fn request_permission_value() -> Value {
         static WARNING: Once = Once::new();
         WARNING.call_once(|| {
             eprintln!(
-                "[w3cos] warning: device orientation/motion permission is denied until a \
-                 platform sensor-consent adapter grants access"
+                "[w3cos] warning: device orientation/motion permission follows the host consent \
+                 flag or an explicit accelerometer/gyroscope grant. Linux IIO sampling does not \
+                 raise a permission prompt"
             );
         });
-        w3cos_core::promise::resolve(vec![Value::string(if permission_granted() {
+        w3cos_core::promise::resolve(vec![Value::string(if motion_events_allowed() {
             "granted"
         } else {
             "denied"
@@ -286,19 +289,69 @@ pub fn permission_granted() -> bool {
     PERMISSION_GRANTED.with(Cell::get)
 }
 
+/// One sensor name is allowed when an explicit capability decision says
+/// `granted`. Accelerometer, gyroscope, and magnetometer otherwise follow the
+/// legacy host flag. Ambient light has no legacy flag.
+pub fn sensor_name_allowed(name: &str) -> bool {
+    if let Some(state) = crate::capability_gate::decision(name) {
+        return state == "granted";
+    }
+    match name {
+        "accelerometer" | "gyroscope" | "magnetometer" => permission_granted(),
+        _ => false,
+    }
+}
+
+pub fn sensor_names_allowed(names: &[&str]) -> bool {
+    names.iter().all(|name| sensor_name_allowed(name))
+}
+
+pub fn motion_events_allowed() -> bool {
+    sensor_name_allowed("accelerometer") || sensor_name_allowed("gyroscope")
+}
+
 /// Update sensor permission after platform user consent.
 pub fn set_permission_granted(granted: bool) {
     PERMISSION_GRANTED.with(|permission| permission.set(granted));
+    publish_motion_sampling();
 }
 
-pub fn dispatch_device_orientation(state: DeviceOrientationState) -> bool {
-    if !permission_granted() {
+/// Track window listeners so the sampler starts only while a page is listening.
+pub fn adjust_motion_listener(type_name: &str, delta: i32) {
+    let slot = match type_name {
+        "deviceorientation" | "deviceorientationabsolute" => Some(&ORIENTATION_LISTENERS),
+        "devicemotion" => Some(&MOTION_LISTENERS),
+        _ => None,
+    };
+    let Some(slot) = slot else {
+        return;
+    };
+    slot.with(|count| {
+        let next = (count.get() as i32 + delta).max(0) as u32;
+        count.set(next);
+    });
+    publish_motion_sampling();
+}
+
+fn publish_motion_sampling() {
+    #[cfg(feature = "web-sensors")]
+    {
+        let allowed = motion_events_allowed();
+        crate::sensor_iio::set_window_interest(
+            allowed && ORIENTATION_LISTENERS.with(Cell::get) > 0,
+            allowed && MOTION_LISTENERS.with(Cell::get) > 0,
+        );
+    }
+}
+
+fn dispatch_orientation(event_type: &str, state: DeviceOrientationState) -> bool {
+    if !motion_events_allowed() {
         return false;
     }
     let event = w3cos_core::class::construct(
         &device_orientation_event_class(),
         vec![
-            Value::string("deviceorientation"),
+            Value::string(event_type),
             Value::object(HashMap::from([
                 (
                     "alpha".into(),
@@ -321,8 +374,16 @@ pub fn dispatch_device_orientation(state: DeviceOrientationState) -> bool {
     true
 }
 
+pub fn dispatch_device_orientation(state: DeviceOrientationState) -> bool {
+    dispatch_orientation("deviceorientation", state)
+}
+
+pub fn dispatch_device_orientation_absolute(state: DeviceOrientationState) -> bool {
+    dispatch_orientation("deviceorientationabsolute", state)
+}
+
 pub fn dispatch_device_motion(state: DeviceMotionState) -> bool {
-    if !permission_granted() {
+    if !motion_events_allowed() {
         return false;
     }
     let event = w3cos_core::class::construct(
@@ -346,6 +407,8 @@ pub fn dispatch_device_motion(state: DeviceMotionState) -> bool {
 }
 
 pub fn reset() {
+    ORIENTATION_LISTENERS.with(|count| count.set(0));
+    MOTION_LISTENERS.with(|count| count.set(0));
     set_permission_granted(false);
 }
 
@@ -358,6 +421,7 @@ mod tests {
     #[test]
     fn permission_gates_trusted_orientation_and_motion_events() {
         reset();
+        crate::capability_gate::reset();
         assert!(!dispatch_device_orientation(DeviceOrientationState {
             alpha: Some(1.0),
             beta: Some(2.0),

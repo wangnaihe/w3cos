@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access", "web-sensors"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -18,6 +18,12 @@ web-media-advanced = ["dep:cpal"]
 # Desktop WebHID (hidapi hidraw) and WebUSB (nusb). The crates are desktop-only,
 # so Android, iOS, and OHOS keep the truthful rejection path.
 web-device-access = ["dep:hidapi", "dep:nusb"]
+# Linux desktop Generic Sensor / device motion telemetry via sysfs IIO and,
+# when a raw channel is missing, iio-sensor-proxy on the system bus.
+# macOS, Windows, and mobile builds that enable this feature report
+# NotReadableError instead of inventing samples. Host injection still works
+# when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
+web-sensors = []
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.

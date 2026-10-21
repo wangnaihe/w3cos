@@ -14415,7 +14415,15 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
     });
     if added {
         ensure_native_registration(node, et);
+        note_window_motion_listener(node, type_name, true);
     }
+}
+
+fn note_window_motion_listener(node: u32, type_name: &str, added: bool) {
+    if node != 0 {
+        return;
+    }
+    crate::orientation_web::adjust_motion_listener(type_name, if added { 1 } else { -1 });
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -14472,9 +14480,10 @@ fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options:
         false
     };
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().remove_one(node, et, &handler, capture);
-    });
+    let removed = LISTENERS.with(|l| l.borrow_mut().remove_one(node, et, &handler, capture));
+    if removed {
+        note_window_motion_listener(node, type_name, false);
+    }
 }
 
 fn key_code_for(key: &str, code: &str) -> u32 {
@@ -20867,6 +20876,10 @@ fn build_window_value() -> Value {
         crate::sensors_web::relative_orientation_sensor_class(),
     );
     props.insert(
+        "AmbientLightSensor".to_string(),
+        crate::sensors_web::ambient_light_sensor_class(),
+    );
+    props.insert(
         "ReadableStream".to_string(),
         crate::streams_web::readable_stream_class(),
     );
@@ -22699,6 +22712,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
         ran += crate::device_access_web::poll_device_events();
+        ran += crate::sensors_web::poll_platform_samples();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22784,6 +22798,7 @@ pub fn next_timer_deadline() -> Option<Instant> {
         script_deadline,
         crate::speech::next_deadline(),
         crate::device_access_web::next_device_deadline(),
+        crate::sensors_web::next_sample_deadline(),
     ]
     .into_iter()
     .flatten()
