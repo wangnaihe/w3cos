@@ -13,8 +13,11 @@
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render,web-sensors,web-geolocation
+//!   --no-default-features --features cpu-render,web-sensors,web-geolocation,web-device-access
 //! ```
+//!
+//! The HID and USB probes do not grant `hid` or `usb`, so `requestDevice`
+//! must not succeed. Geolocation is granted only after a denial check.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -24,6 +27,7 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 use w3cos_runtime::capability_gate;
+use w3cos_runtime::device_access_web;
 use w3cos_runtime::direct_sockets_web::{self, tcp_socket_class};
 use w3cos_runtime::dom;
 use w3cos_runtime::headless::{self, render_document_rgba_cpu};
@@ -165,6 +169,41 @@ fn webnn_add() -> Result<String, String> {
         .collect::<Vec<_>>()
         .join(",");
     Ok(values)
+}
+
+fn device_probe(kind: &str) -> (String, bool) {
+    let manager = if kind == "hid" {
+        device_access_web::hid_value()
+    } else {
+        device_access_web::usb_value()
+    };
+    let summary = if kind == "hid" {
+        device_access_web::hid_backend_summary()
+    } else {
+        device_access_web::usb_backend_summary()
+    };
+    let listed = await_value(manager.call_method("getDevices", vec![]));
+    let requested = await_value(manager.call_method(
+        "requestDevice",
+        vec![Value::object(HashMap::from([(
+            "filters".into(),
+            Value::array(vec![]),
+        )]))],
+    ));
+    let list_len = listed
+        .as_ref()
+        .map(|devices| devices.get_property("length").to_number())
+        .unwrap_or(-1.0);
+    let request_error = match &requested {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    let ok =
+        list_len == 0.0 && matches!(request_error.as_str(), "NotFoundError" | "NotAllowedError");
+    (
+        format!("{summary} devices {list_len} request {request_error}"),
+        ok,
+    )
 }
 
 fn sensor_probe() -> (String, bool) {
@@ -409,6 +448,8 @@ fn main() {
     );
     let tcp = tcp_echo();
     let webnn = webnn_add();
+    let hid = device_probe("hid");
+    let usb = device_probe("usb");
 
     dom::set_style_property(dom::body_id(), "margin", "0");
     dom::set_style_property(dom::body_id(), "background", "#101418");
@@ -507,12 +548,14 @@ fn main() {
         &webnn.clone().unwrap_or_else(|err| err),
         webnn.as_deref() == Ok("4,6"),
     );
+    row("hid", &hid.0, hid.1);
+    row("usb", &usb.0, usb.1);
     let (sensor_text, sensor_ok) = sensor_probe();
     row("accelerometer", &sensor_text, sensor_ok);
     let (geo_text, geo_ok) = geolocation_probe();
     row("geolocation", &geo_text, geo_ok);
 
-    let frame = render_document_rgba_cpu(960, 840).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 960).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
