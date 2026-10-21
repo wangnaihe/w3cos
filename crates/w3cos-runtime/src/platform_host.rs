@@ -52,12 +52,7 @@ pub struct CameraFrame {
     pub png: Vec<u8>,
 }
 
-/// Camera failure with the DOMException name `getUserMedia` should reject with.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CameraError {
-    pub name: &'static str,
-    pub message: String,
-}
+pub use crate::camera::CameraError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdleSample {
@@ -72,8 +67,6 @@ thread_local! {
     static IDLE: RefCell<Option<IdleSample>> = const { RefCell::new(None) };
     static WAKE_HOOK: RefCell<Option<fn(bool) -> Result<(), String>>> = const { RefCell::new(None) };
     static WAKE_HELD: RefCell<bool> = const { RefCell::new(false) };
-    static CAMERAS: RefCell<Option<Vec<CameraInfo>>> = const { RefCell::new(None) };
-    static CAMERA_FRAME: RefCell<Option<CameraFrame>> = const { RefCell::new(None) };
 }
 
 pub fn reset_overrides() {
@@ -83,82 +76,74 @@ pub fn reset_overrides() {
     IDLE.with(|slot| *slot.borrow_mut() = None);
     WAKE_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAKE_HELD.with(|slot| *slot.borrow_mut() = false);
-    CAMERAS.with(|slot| *slot.borrow_mut() = None);
-    CAMERA_FRAME.with(|slot| *slot.borrow_mut() = None);
+    crate::camera::reset_overrides();
 }
 
 /// Replaces host camera enumeration (`Some(vec![])` means "no cameras").
 pub fn set_camera_override(cameras: Option<Vec<CameraInfo>>) {
-    CAMERAS.with(|slot| *slot.borrow_mut() = cameras);
+    crate::camera::set_host_override(cameras.map(|cameras| {
+        cameras
+            .into_iter()
+            .map(|camera| crate::camera::HostCamera {
+                label: camera.label,
+                device_key: camera.device_key,
+                group_key: camera.group_key,
+                path: camera.path,
+            })
+            .collect()
+    }));
 }
 
 /// Replaces host camera capture for overridden cameras.
 pub fn set_camera_frame_override(frame: Option<CameraFrame>) {
-    CAMERA_FRAME.with(|slot| *slot.borrow_mut() = frame);
+    crate::camera::set_still_override(frame.map(|frame| crate::camera::Still {
+        width: frame.width,
+        height: frame.height,
+        png: frame.png,
+    }));
 }
 
-/// Video-capture devices exposed by the platform adapter (Linux: V4L2).
+/// Video-capture devices exposed by the platform adapter.
 pub fn list_cameras() -> Vec<CameraInfo> {
-    if let Some(cameras) = CAMERAS.with(|slot| slot.borrow().clone()) {
-        return cameras;
-    }
-    native_cameras()
+    crate::camera::list_devices()
+        .into_iter()
+        .map(|camera| CameraInfo {
+            label: camera.label,
+            device_key: camera.device_key,
+            group_key: camera.group_key,
+            path: camera.path,
+        })
+        .collect()
 }
 
 /// Captures one frame from `camera`, preferring `width`×`height`.
+/// Live tracks use [`crate::camera::open_camera`] instead.
 pub fn capture_camera(
     camera: &CameraInfo,
     width: u32,
     height: u32,
 ) -> Result<CameraFrame, CameraError> {
-    if CAMERAS.with(|slot| slot.borrow().is_some()) {
-        return match CAMERA_FRAME.with(|slot| slot.borrow().clone()) {
+    if crate::camera::has_device_override() {
+        return match crate::camera::still_override() {
             Some(frame) if frame.width > 0 && frame.height > 0 && !frame.png.is_empty() => {
-                Ok(frame)
+                Ok(CameraFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    png: frame.png,
+                })
             }
-            _ => Err(CameraError {
-                name: "NotReadableError",
-                message: format!("camera override for {} has no frame", camera.label),
-            }),
+            _ => Err(CameraError::named(
+                "NotReadableError",
+                format!("camera override for {} has no frame", camera.label),
+            )),
         };
     }
-    native_capture_camera(camera, width, height)
-}
-
-/// Native enumeration is skipped in unit tests unless
-/// `W3COS_CAMERA_TESTS=1`, so a developer webcam cannot change results.
-fn native_camera_enabled() -> bool {
-    !cfg!(test) || std::env::var_os("W3COS_CAMERA_TESTS").is_some()
-}
-
-fn native_cameras() -> Vec<CameraInfo> {
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    {
-        if native_camera_enabled() {
-            return v4l2::list(Path::new("/dev"));
-        }
-    }
-    let _ = native_camera_enabled;
-    Vec::new()
-}
-
-fn native_capture_camera(
-    camera: &CameraInfo,
-    width: u32,
-    height: u32,
-) -> Result<CameraFrame, CameraError> {
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    {
-        v4l2::capture(&camera.path, width, height)
-    }
-    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
-    {
-        let _ = (width, height);
-        Err(CameraError {
-            name: "NotFoundError",
-            message: format!("camera {} has no platform capture adapter", camera.label),
-        })
-    }
+    let frame = crate::camera::capture_still(&camera.path, width, height)?;
+    Ok(CameraFrame {
+        width: frame.width,
+        height: frame.height,
+        png: frame.png,
+    })
 }
 
 pub fn set_battery_sysfs_root(path: Option<PathBuf>) {
@@ -317,10 +302,6 @@ fn native_set_screen_awake(awake: bool) -> Result<(), String> {
         Err("screen wake lock has no platform power adapter".into())
     }
 }
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-#[path = "camera_v4l2.rs"]
-mod v4l2;
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod x11 {

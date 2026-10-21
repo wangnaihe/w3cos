@@ -18,6 +18,7 @@ pub(crate) mod browser_http_cache;
 #[cfg(feature = "dynamic-js")]
 pub mod browser_page_domain;
 pub mod cache_web;
+pub mod camera;
 pub mod canvas2d;
 pub mod canvas_web;
 pub mod capability_gate;
