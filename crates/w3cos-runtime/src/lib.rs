@@ -77,6 +77,7 @@ pub mod gpu_filter;
 pub mod harmony;
 #[cfg(any(feature = "skia", feature = "cpu-render"))]
 pub mod headless;
+mod hid_adapter;
 pub mod highlight_web;
 pub mod history;
 mod html_compat;
@@ -158,6 +159,7 @@ pub mod scheduler_web;
 pub mod screen_details_web;
 pub mod sensors_web;
 pub mod service_worker_web;
+mod usb_adapter;
 
 pub mod plugin_abi;
 pub mod shared_abi;

@@ -20553,6 +20553,10 @@ fn build_window_value() -> Value {
         "HIDInputReportEvent".to_string(),
         crate::device_access_web::hid_input_report_event_class(),
     );
+    props.insert(
+        "HIDConnectionEvent".to_string(),
+        crate::device_access_web::hid_connection_event_class(),
+    );
     props.insert("USB".to_string(), crate::device_access_web::usb_class());
     props.insert(
         "USBDevice".to_string(),
@@ -22694,6 +22698,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
+        ran += crate::device_access_web::poll_device_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22751,7 +22756,8 @@ pub fn has_pending_work() -> bool {
                 false
             }
         };
-    timers || raf || micro || events || native_io
+    let device_io = crate::device_access_web::has_pending_device_events();
+    timers || raf || micro || events || native_io || device_io
 }
 
 /// Earliest non-rendering deadline the bridge needs to be woken at: the
@@ -22777,6 +22783,7 @@ pub fn next_timer_deadline() -> Option<Instant> {
         socket_deadline,
         script_deadline,
         crate::speech::next_deadline(),
+        crate::device_access_web::next_device_deadline(),
     ]
     .into_iter()
     .flatten()
@@ -22869,6 +22876,7 @@ pub fn reset_bridge() {
     crate::xpath_web::reset_realm();
     crate::sanitizer_web::reset_realm();
     crate::bluetooth_web::reset_realm();
+    crate::device_access_web::reset_realm();
     crate::speech_web::reset();
     crate::speech_synthesis_web::reset();
     crate::geolocation_web::reset();

@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-device-access"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -15,6 +15,9 @@ web-graphics-advanced = ["dep:naga"]
 # Includes real-time Web Audio output and microphone capture through cpal
 # on desktop targets.
 web-media-advanced = ["dep:cpal"]
+# Desktop WebHID (hidapi hidraw) and WebUSB (nusb). The crates are desktop-only,
+# so Android, iOS, and OHOS keep the truthful rejection path.
+web-device-access = ["dep:hidapi", "dep:nusb"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
@@ -130,6 +133,20 @@ tungstenite = { workspace = true }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 # Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
+# Pure Rust USB. No libusb.
+nusb = { version = "0.2.8", optional = true }
+
+# hidraw without libusb. On Linux, `linux-native-basic-udev` talks to hidraw
+# through sysfs (basic-udev) and does not link libudev or libusb. macOS uses
+# the hidapi IOKit backend; Windows uses hid.dll directly.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["linux-native-basic-udev"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hidapi = { version = "2.6.7", optional = true, default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
