@@ -145,6 +145,17 @@ fn finish_headless_frame(
     root: &w3cos_std::Component,
     layout_results: &layout::LayoutResults,
 ) -> Result<HeadlessFrame> {
+    if crate::webgl_draw::has_live_contexts() {
+        let flat = layout::pre_flatten(root);
+        crate::webgl_draw::publish_drawing_buffers(flat.iter().enumerate().filter_map(
+            |(index, node)| match &node.on_click {
+                w3cos_std::EventAction::NativeHost { id, .. } => {
+                    u32::try_from(*id).ok().map(|id| (index, id))
+                }
+                _ => None,
+            },
+        ));
+    }
     let structure = crate::dom::with_document(|document| document.structure_generation());
     let reuse = crate::incremental_layout::take_paint_reuse();
     if reuse != crate::incremental_layout::PaintReuse::None

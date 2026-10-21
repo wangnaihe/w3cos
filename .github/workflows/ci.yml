@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libdbus-1-dev
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libdbus-1-dev mesa-vulkan-drivers libvulkan1
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
         run: |
           rustup toolchain install --no-self-update
@@ -35,7 +35,17 @@ jobs:
       - name: Test required compiler suites
         run: cargo test -p w3cos-compiler --lib --tests
       - name: Test required runtime suites
-        run: cargo test -p w3cos-runtime --lib --tests
+        run: |
+          icd="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          if [ -n "$icd" ]; then
+            echo "Using lavapipe ICD $icd"
+            export VK_DRIVER_FILES="$icd"
+            export VK_ICD_FILENAMES="$icd"
+            export W3COS_GPU_TESTS=1
+          else
+            echo "lavapipe ICD not found; WebGL GPU tests stay gated"
+          fi
+          cargo test -p w3cos-runtime --lib --tests
       - name: Test optional dynamic JavaScript path
         run: |
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
