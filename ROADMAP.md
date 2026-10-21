@@ -854,6 +854,12 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Add `Crypto`/`SubtleCrypto` identities around secure random generation;
   preserve every SubtleCrypto Promise method with explicit warning and
   `NotSupportedError` rejection until a native cryptographic provider lands.
+- [x] Back SubtleCrypto with `ring` for SHA digests, HMAC, AES-GCM (raw/JWK
+  import/export, encrypt/decrypt, wrap/unwrap) and HKDF/PBKDF2 derivation,
+  with WebCrypto error semantics and published test vectors.
+- [ ] Add asymmetric WebCrypto (ECDSA/ECDH P-256/P-384, Ed25519/X25519,
+  RSA-PSS/OAEP) with `spki`/`pkcs8`/JWK formats, AES-CBC/CTR/KW and
+  `CryptoKey` structured cloning.
 - [x] Add the `DOMStringList` identity and list methods used by
   `Location.ancestorOrigins`.
 - [x] Add the read-only maplike `EventCounts` identity with Chromium's 36
