@@ -601,6 +601,19 @@ precede ecosystem breadth or migration tooling.
 - [x] Provide browser-shaped `MediaStream` and `MediaStreamTrack` lifecycle:
   track enumeration/filtering, add/remove events, clone, stop/ended, live
   `active`, constraints facades, and permission/not-found failures.
+- [x] Linux camera platform adapter (V4L2, `platform_host` → `camera_v4l2.rs`):
+  `enumerateDevices()` lists `/dev/video*` capture nodes (one anonymous entry
+  until the `camera` capability is granted, then labels and opaque stable
+  SHA-256 `deviceId`/`groupId`); `getUserMedia({video})` honours
+  `deviceId.exact`/`width`/`height`, requires the `camera` grant, and captures a
+  YUYV/MJPEG frame (mmap streaming) that feeds `getSettings()` and
+  `ImageCapture`. Host-registered devices still take precedence. Physical
+  capture is verified only by the opt-in `W3COS_CAMERA_TESTS=1` test.
+- [ ] Continuous camera frame delivery into `MediaStreamTrackProcessor`,
+  `<video>` preview and `MediaRecorder` (the Linux adapter currently captures a
+  frame when `getUserMedia` resolves); `devicechange` hot-plug events.
+- [ ] Platform microphone adapter, plus macOS (AVFoundation), Windows (Media
+  Foundation), Android (Camera2) and iOS camera adapters.
 - [ ] Connect host media payloads to preview and capture sinks; the current
   adapter boundary exposes device/track lifecycle but not frame/audio data.
 - [ ] Add photo/evidence capture without product-specific native modules.

@@ -1,8 +1,13 @@
 //! Browser-shaped MediaDevices, MediaStream, and MediaStreamTrack facades.
 //!
-//! Native hosts register devices through [`set_devices`]. The facade remains
-//! standards-shaped when no adapter is present by rejecting `getUserMedia`
-//! with a named DOM-style error.
+//! Native hosts register devices through [`set_devices`]. When the host has
+//! registered no `videoinput`, cameras come from the platform adapter
+//! ([`crate::platform_host::list_cameras`], V4L2 on Linux): they are listed
+//! by `enumerateDevices()` (labels and ids only after the `camera` capability
+//! is granted) and `getUserMedia({video})` captures a frame from them for
+//! `ImageCapture`/`getSettings()`. The facade remains standards-shaped when
+//! no adapter is present by rejecting `getUserMedia` with a named DOM-style
+//! error. There is no platform microphone adapter.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -36,6 +41,8 @@ struct CapturedFrame {
     width: u32,
     height: u32,
     png: Vec<u8>,
+    /// `Some((deviceId, groupId))` for camera frames; `None` for screens.
+    camera: Option<(String, String)>,
 }
 
 thread_local! {
@@ -543,10 +550,98 @@ pub fn input_device_info_class() -> Value {
 
 fn store_capture_frame(id: &str, width: u32, height: u32, png: Vec<u8>) {
     CAPTURED_FRAMES.with(|frames| {
-        frames
-            .borrow_mut()
-            .insert(id.to_string(), CapturedFrame { width, height, png });
+        frames.borrow_mut().insert(
+            id.to_string(),
+            CapturedFrame {
+                width,
+                height,
+                png,
+                camera: None,
+            },
+        );
     });
+}
+
+fn store_camera_frame(id: &str, frame: crate::platform_host::CameraFrame, device: &MediaDevice) {
+    CAPTURED_FRAMES.with(|frames| {
+        frames.borrow_mut().insert(
+            id.to_string(),
+            CapturedFrame {
+                width: frame.width,
+                height: frame.height,
+                png: frame.png,
+                camera: Some((device.device_id.clone(), device.group_id.clone())),
+            },
+        );
+    });
+}
+
+fn camera_of_frame(id: &str) -> Option<(String, String)> {
+    CAPTURED_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .get(id)
+            .and_then(|frame| frame.camera.clone())
+    })
+}
+
+/// Opaque, stable `deviceId`/`groupId` derived from a host key.
+fn opaque_id(key: &str) -> String {
+    ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("w3cos-media:{key}").as_bytes(),
+    )
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// Platform cameras, used only when the host registered no `videoinput`.
+fn platform_cameras() -> Vec<(MediaDevice, crate::platform_host::CameraInfo)> {
+    let host_has_video = DEVICES.with(|devices| {
+        devices
+            .borrow()
+            .iter()
+            .any(|device| device.kind == "videoinput")
+    });
+    if host_has_video {
+        return Vec::new();
+    }
+    crate::platform_host::list_cameras()
+        .into_iter()
+        .map(|camera| {
+            (
+                MediaDevice {
+                    device_id: opaque_id(&camera.device_key),
+                    kind: "videoinput".into(),
+                    label: camera.label.clone(),
+                    group_id: opaque_id(&camera.group_key),
+                },
+                camera,
+            )
+        })
+        .collect()
+}
+
+/// Ideal/exact numeric constraint, e.g. `width: 1280` or `{ ideal: 1280 }`.
+fn numeric_constraint(constraint: &Value, name: &str) -> Option<u32> {
+    if !constraint.is_object() {
+        return None;
+    }
+    let value = constraint.get_property(name);
+    let number = if value.is_number() {
+        value
+    } else if value.is_object() {
+        ["exact", "ideal", "max", "min"]
+            .into_iter()
+            .map(|key| value.get_property(key))
+            .find(Value::is_number)?
+    } else {
+        return None;
+    };
+    let number = number.to_number();
+    (number.is_finite() && number >= 1.0).then(|| number.min(8192.0) as u32)
 }
 
 pub(crate) fn captured_frame(id: &str) -> Option<(u32, u32, Vec<u8>)> {
@@ -622,8 +717,20 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
         realm_media_function(|this, _| {
             let id = this.get_property("id").to_js_string();
             let mut settings = HashMap::from([("deviceId".to_string(), this.get_property("id"))]);
+            let camera = camera_of_frame(&id);
+            if let Some((device_id, group_id)) = &camera {
+                settings.insert("deviceId".into(), Value::string(device_id));
+                settings.insert("groupId".into(), Value::string(group_id));
+            }
             if let Some((width, height, _)) = captured_frame(&id) {
-                settings.insert("displaySurface".into(), Value::string("monitor"));
+                if camera.is_none() {
+                    settings.insert("displaySurface".into(), Value::string("monitor"));
+                } else {
+                    settings.insert(
+                        "aspectRatio".into(),
+                        Value::Number(f64::from(width) / f64::from(height.max(1))),
+                    );
+                }
                 settings.insert("width".into(), Value::Number(f64::from(width)));
                 settings.insert("height".into(), Value::Number(f64::from(height)));
             }
@@ -866,7 +973,41 @@ fn get_user_media(constraints: Value) -> Value {
             continue;
         }
         let constraint = constraints.get_property(track_kind);
-        let exact_id = exact_device_id(constraint);
+        let exact_id = exact_device_id(constraint.clone());
+        if track_kind == "video" {
+            let cameras = platform_cameras();
+            if !cameras.is_empty() {
+                let Some((device, camera)) = cameras.iter().find(|(device, _)| {
+                    exact_id
+                        .as_ref()
+                        .is_none_or(|device_id| &device.device_id == device_id)
+                }) else {
+                    return w3cos_core::promise::reject(vec![overconstrained_error(
+                        "deviceId",
+                        "No video input satisfies the exact deviceId constraint",
+                    )]);
+                };
+                if let Some(rejected) = crate::capability_gate::reject_unless_granted("camera") {
+                    return rejected;
+                }
+                let width = numeric_constraint(&constraint, "width").unwrap_or(640);
+                let height = numeric_constraint(&constraint, "height").unwrap_or(480);
+                match crate::platform_host::capture_camera(camera, width, height) {
+                    Ok(frame) => {
+                        let track = track_value("video", &device.label);
+                        store_camera_frame(&track.get_property("id").to_js_string(), frame, device);
+                        tracks.push(track);
+                        continue;
+                    }
+                    Err(error) => {
+                        return w3cos_core::promise::reject(vec![named_error(
+                            error.name,
+                            &error.message,
+                        )]);
+                    }
+                }
+            }
+        }
         let device = devices.iter().find(|device| {
             device.kind == device_kind
                 && exact_id
@@ -921,13 +1062,26 @@ pub fn media_devices_value() -> Value {
     value.set_property(
         "enumerateDevices",
         realm_media_function(|_, _| {
-            let devices = DEVICES.with(|devices| {
+            let mut devices = DEVICES.with(|devices| {
                 devices
                     .borrow()
                     .iter()
                     .map(device_value)
                     .collect::<Vec<_>>()
             });
+            let cameras = platform_cameras();
+            if crate::capability_gate::is_granted("camera") {
+                devices.extend(cameras.iter().map(|(device, _)| device_value(device)));
+            } else if !cameras.is_empty() {
+                // Media Capture and Streams: before permission, expose one
+                // device per kind with empty identifiers and label.
+                devices.push(device_value(&MediaDevice {
+                    device_id: String::new(),
+                    kind: "videoinput".into(),
+                    label: String::new(),
+                    group_id: String::new(),
+                }));
+            }
             w3cos_core::promise::resolve(vec![Value::array(devices)])
         }),
     );
@@ -1370,5 +1524,174 @@ mod tests {
             "OverconstrainedError"
         );
         assert_eq!(error.get_property("constraint").to_js_string(), "deviceId");
+    }
+
+    fn settle(promise: Value) -> (bool, Value) {
+        let result = Rc::new(RefCell::new((false, Value::Undefined)));
+        let fulfilled = Rc::clone(&result);
+        let rejected = Rc::clone(&result);
+        promise.call_method(
+            "then",
+            vec![
+                Value::function(move |_, args| {
+                    *fulfilled.borrow_mut() = (true, args.first().cloned().unwrap_or_default());
+                    Value::Undefined
+                }),
+                Value::function(move |_, args| {
+                    *rejected.borrow_mut() = (false, args.first().cloned().unwrap_or_default());
+                    Value::Undefined
+                }),
+            ],
+        );
+        crate::jsdom::drain_microtasks();
+        result.borrow().clone()
+    }
+
+    fn platform_camera() -> crate::platform_host::CameraInfo {
+        crate::platform_host::CameraInfo {
+            label: "Integrated Camera".into(),
+            device_key: "v4l2:usb-0000:00:14.0-5:Integrated Camera:/dev/video0".into(),
+            group_key: "v4l2:usb-0000:00:14.0-5".into(),
+            path: "/dev/video0".into(),
+        }
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbImage::from_pixel(width, height, image::Rgb([10, 20, 30]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    fn video(constraints: Value) -> Value {
+        Value::object(HashMap::from([("video".to_string(), constraints)]))
+    }
+
+    #[test]
+    fn platform_cameras_enumerate_behind_permission_and_capture_frames() {
+        reset();
+        crate::capability_gate::reset();
+        crate::platform_host::reset_overrides();
+        crate::platform_host::set_camera_override(Some(vec![platform_camera()]));
+        crate::platform_host::set_camera_frame_override(Some(crate::platform_host::CameraFrame {
+            width: 4,
+            height: 3,
+            png: png(4, 3),
+        }));
+        let media = media_devices_value();
+
+        let (ok, listed) = settle(media.call_method("enumerateDevices", vec![]));
+        assert!(ok);
+        assert_eq!(listed.get_property("length").to_number(), 1.0);
+        let hidden = listed.get_property("0");
+        assert_eq!(hidden.get_property("kind").to_js_string(), "videoinput");
+        assert_eq!(hidden.get_property("label").to_js_string(), "");
+        assert_eq!(hidden.get_property("deviceId").to_js_string(), "");
+
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![video(Value::Bool(true))]));
+        assert!(!ok);
+        assert_eq!(error.get_property("name").to_js_string(), "NotAllowedError");
+
+        crate::capability_gate::grant("camera");
+        let (_, listed) = settle(media.call_method("enumerateDevices", vec![]));
+        let device = listed.get_property("0");
+        assert_eq!(
+            device.get_property("label").to_js_string(),
+            "Integrated Camera"
+        );
+        let device_id = device.get_property("deviceId").to_js_string();
+        assert_eq!(device_id.len(), 64);
+        assert_ne!(device_id, device.get_property("groupId").to_js_string());
+        assert!(w3cos_core::class::instance_of(
+            &device,
+            &input_device_info_class()
+        ));
+
+        let constraints = Value::object(HashMap::from([
+            (
+                "width".to_string(),
+                Value::object(HashMap::from([(
+                    "ideal".to_string(),
+                    Value::Number(1280.0),
+                )])),
+            ),
+            (
+                "deviceId".to_string(),
+                Value::object(HashMap::from([(
+                    "exact".to_string(),
+                    Value::string(&device_id),
+                )])),
+            ),
+        ]));
+        let (ok, stream) = settle(media.call_method("getUserMedia", vec![video(constraints)]));
+        assert!(ok, "{}", stream.get_property("message").to_js_string());
+        let track = stream
+            .call_method("getVideoTracks", vec![])
+            .get_property("0");
+        assert_eq!(
+            track.get_property("label").to_js_string(),
+            "Integrated Camera"
+        );
+        let settings = track.call_method("getSettings", vec![]);
+        assert_eq!(settings.get_property("deviceId").to_js_string(), device_id);
+        assert_eq!(settings.get_property("width").to_number(), 4.0);
+        assert_eq!(settings.get_property("height").to_number(), 3.0);
+        assert!(settings.get_property("displaySurface").is_undefined());
+        let id = track.get_property("id").to_js_string();
+        assert_eq!(captured_frame(&id).map(|(w, h, _)| (w, h)), Some((4, 3)));
+
+        let mismatch = video(Value::object(HashMap::from([(
+            "deviceId".to_string(),
+            Value::object(HashMap::from([(
+                "exact".to_string(),
+                Value::string("nope"),
+            )])),
+        )])));
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![mismatch]));
+        assert!(!ok);
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "OverconstrainedError"
+        );
+
+        // No platform microphone: audio requests still need a host device.
+        let both = Value::object(HashMap::from([
+            ("audio".to_string(), Value::Bool(true)),
+            ("video".to_string(), Value::Bool(true)),
+        ]));
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![both]));
+        assert!(!ok);
+        assert_eq!(error.get_property("name").to_js_string(), "NotFoundError");
+
+        crate::platform_host::set_camera_frame_override(None);
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![video(Value::Bool(true))]));
+        assert!(!ok);
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "NotReadableError"
+        );
+
+        crate::platform_host::reset_overrides();
+        crate::capability_gate::reset();
+        reset();
+    }
+
+    #[test]
+    fn host_registered_cameras_take_precedence_over_platform_cameras() {
+        reset();
+        crate::platform_host::reset_overrides();
+        crate::platform_host::set_camera_override(Some(vec![platform_camera()]));
+        set_devices(devices());
+        let (_, listed) = settle(media_devices_value().call_method("enumerateDevices", vec![]));
+        assert_eq!(
+            listed.get_property("length").to_number(),
+            devices().len() as f64
+        );
+        crate::platform_host::reset_overrides();
+        reset();
     }
 }

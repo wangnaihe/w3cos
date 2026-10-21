@@ -33,6 +33,32 @@ pub struct CapturedImage {
     pub png: Vec<u8>,
 }
 
+/// A video-capture device reported by the host camera adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraInfo {
+    pub label: String,
+    /// Stable host identity; `mediaDevices` hashes it into `deviceId`.
+    pub device_key: String,
+    /// Shared by devices on the same physical unit; hashed into `groupId`.
+    pub group_key: String,
+    pub path: PathBuf,
+}
+
+/// One captured camera frame, PNG-encoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraFrame {
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+}
+
+/// Camera failure with the DOMException name `getUserMedia` should reject with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraError {
+    pub name: &'static str,
+    pub message: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdleSample {
     pub idle_ms: u64,
@@ -46,6 +72,8 @@ thread_local! {
     static IDLE: RefCell<Option<IdleSample>> = const { RefCell::new(None) };
     static WAKE_HOOK: RefCell<Option<fn(bool) -> Result<(), String>>> = const { RefCell::new(None) };
     static WAKE_HELD: RefCell<bool> = const { RefCell::new(false) };
+    static CAMERAS: RefCell<Option<Vec<CameraInfo>>> = const { RefCell::new(None) };
+    static CAMERA_FRAME: RefCell<Option<CameraFrame>> = const { RefCell::new(None) };
 }
 
 pub fn reset_overrides() {
@@ -55,6 +83,82 @@ pub fn reset_overrides() {
     IDLE.with(|slot| *slot.borrow_mut() = None);
     WAKE_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAKE_HELD.with(|slot| *slot.borrow_mut() = false);
+    CAMERAS.with(|slot| *slot.borrow_mut() = None);
+    CAMERA_FRAME.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Replaces host camera enumeration (`Some(vec![])` means "no cameras").
+pub fn set_camera_override(cameras: Option<Vec<CameraInfo>>) {
+    CAMERAS.with(|slot| *slot.borrow_mut() = cameras);
+}
+
+/// Replaces host camera capture for overridden cameras.
+pub fn set_camera_frame_override(frame: Option<CameraFrame>) {
+    CAMERA_FRAME.with(|slot| *slot.borrow_mut() = frame);
+}
+
+/// Video-capture devices exposed by the platform adapter (Linux: V4L2).
+pub fn list_cameras() -> Vec<CameraInfo> {
+    if let Some(cameras) = CAMERAS.with(|slot| slot.borrow().clone()) {
+        return cameras;
+    }
+    native_cameras()
+}
+
+/// Captures one frame from `camera`, preferring `width`×`height`.
+pub fn capture_camera(
+    camera: &CameraInfo,
+    width: u32,
+    height: u32,
+) -> Result<CameraFrame, CameraError> {
+    if CAMERAS.with(|slot| slot.borrow().is_some()) {
+        return match CAMERA_FRAME.with(|slot| slot.borrow().clone()) {
+            Some(frame) if frame.width > 0 && frame.height > 0 && !frame.png.is_empty() => {
+                Ok(frame)
+            }
+            _ => Err(CameraError {
+                name: "NotReadableError",
+                message: format!("camera override for {} has no frame", camera.label),
+            }),
+        };
+    }
+    native_capture_camera(camera, width, height)
+}
+
+/// Native enumeration is skipped in unit tests unless
+/// `W3COS_CAMERA_TESTS=1`, so a developer webcam cannot change results.
+fn native_camera_enabled() -> bool {
+    !cfg!(test) || std::env::var_os("W3COS_CAMERA_TESTS").is_some()
+}
+
+fn native_cameras() -> Vec<CameraInfo> {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        if native_camera_enabled() {
+            return v4l2::list(Path::new("/dev"));
+        }
+    }
+    let _ = native_camera_enabled;
+    Vec::new()
+}
+
+fn native_capture_camera(
+    camera: &CameraInfo,
+    width: u32,
+    height: u32,
+) -> Result<CameraFrame, CameraError> {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    {
+        v4l2::capture(&camera.path, width, height)
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    {
+        let _ = (width, height);
+        Err(CameraError {
+            name: "NotFoundError",
+            message: format!("camera {} has no platform capture adapter", camera.label),
+        })
+    }
 }
 
 pub fn set_battery_sysfs_root(path: Option<PathBuf>) {
@@ -213,6 +317,10 @@ fn native_set_screen_awake(awake: bool) -> Result<(), String> {
         Err("screen wake lock has no platform power adapter".into())
     }
 }
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[path = "camera_v4l2.rs"]
+mod v4l2;
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod x11 {
