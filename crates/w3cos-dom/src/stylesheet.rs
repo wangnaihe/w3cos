@@ -1295,6 +1295,31 @@ pub fn selector_matches_node_with_target(
     if selector.is_empty() || selector.starts_with(',') || selector.ends_with(',') {
         return Err(());
     }
+    // The overwhelmingly common DOM `matches()` input is one selector. Avoid
+    // allocating a one-element selector-group Vec and owned String before the
+    // cached parse. A literal comma is a conservative gate: commas nested in
+    // attributes/functions take the existing group-aware path, while a true
+    // selector list still preserves its parsing and short-circuit semantics.
+    if !selector.contains(',') {
+        let parsed = parse_selector_chain_cached(selector).ok_or(())?;
+        if let Some(class) = single_class_selector(&parsed.chain, &parsed.combinators) {
+            let node = document.get_node(node);
+            return Ok(node.node_type == NodeType::Element
+                && node
+                    .class_list
+                    .iter()
+                    .any(|candidate| candidate.as_str() == class));
+        }
+        return Ok(matches_chain_node(
+            document,
+            node,
+            &parsed.chain,
+            &parsed.combinators,
+            parsed.chain.len() - 1,
+            target_id,
+            None,
+        ));
+    }
     let parsed = split_selector_group(selector)
         .into_iter()
         .map(|single| parse_selector_chain_cached(&single))
@@ -2420,6 +2445,25 @@ fn parse_selector_chain_cached(
     selector_parse_cache::get_or_parse(selector, parse_selector_chain)
 }
 
+fn single_class_selector<'a>(
+    chain: &'a [CompoundSelector],
+    combinators: &[Combinator],
+) -> Option<&'a str> {
+    let [compound] = chain else {
+        return None;
+    };
+    (!compound.unsupported
+        && !compound.universal
+        && !compound.any_namespace
+        && compound.tag.is_none()
+        && compound.id.is_none()
+        && compound.classes.len() == 1
+        && compound.attributes.is_empty()
+        && compound.pseudo_classes.is_empty()
+        && combinators.is_empty())
+    .then(|| compound.classes[0].as_str())
+}
+
 /// Parse one compound selector starting at `pos`. Returns the compound and
 /// the index just past it.
 fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, usize)> {
@@ -3353,6 +3397,76 @@ mod tests {
             node_selector_context_constructions(),
             0,
             "node selector matching must not materialize owned SelectorContext values",
+        );
+    }
+
+    #[test]
+    fn node_matches_single_class_fast_path_preserves_parser_and_fallback_semantics() {
+        selector_parse_cache::clear_for_test();
+        let mut document = Document::new();
+        let element = document.create_element("div");
+        element.set_attribute(&mut document, "class", "active other");
+        element.set_attribute(&mut document, "data-value", ",");
+        document.append_child(document.body().id, element.id);
+
+        assert_eq!(
+            selector_matches_node(".active", &document, element.id),
+            Ok(true)
+        );
+        assert_eq!(
+            selector_matches_node(r".act\69 ve", &document, element.id),
+            Ok(true),
+            "the fast path must use the parser's decoded class token"
+        );
+        assert_eq!(
+            selector_matches_node(".inactive", &document, element.id),
+            Ok(false)
+        );
+        assert_eq!(
+            selector_matches_node(".active.other", &document, element.id),
+            Ok(true),
+            "multi-class compounds must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("div.active", &document, element.id),
+            Ok(true),
+            "tag/class compounds must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("[class~=active]", &document, element.id),
+            Ok(true),
+            "attribute selectors must retain the general matcher"
+        );
+        assert_eq!(
+            selector_matches_node("[data-value=',']", &document, element.id),
+            Ok(true),
+            "commas nested in attributes must retain the group-aware matcher"
+        );
+        assert_eq!(
+            selector_matches_node(".inactive, .active", &document, element.id),
+            Ok(true),
+            "selector lists must retain parsing and short-circuit semantics"
+        );
+        assert_eq!(
+            selector_matches_node(":is(.inactive, .active)", &document, element.id),
+            Err(()),
+            "the fast path must not swallow syntax unsupported by the main baseline"
+        );
+        assert_eq!(selector_matches_node(".", &document, element.id), Err(()));
+        assert_eq!(
+            selector_matches_node("div >", &document, element.id),
+            Err(())
+        );
+
+        let parsed = parse_selector_chain_cached(".active").unwrap();
+        assert_eq!(
+            single_class_selector(&parsed.chain, &parsed.combinators),
+            Some("active")
+        );
+        let compound = parse_selector_chain_cached(".active.other").unwrap();
+        assert_eq!(
+            single_class_selector(&compound.chain, &compound.combinators),
+            None
         );
     }
 
