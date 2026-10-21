@@ -103,6 +103,7 @@ fn state_for(name: &str) -> Option<String> {
         | "file-system"
         | "battery"
         | "display-capture"
+        | "serial"
         | "hid"
         | "usb"
         | "w3cos-process"

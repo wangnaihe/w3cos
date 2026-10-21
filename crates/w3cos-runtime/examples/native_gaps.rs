@@ -6,14 +6,15 @@
 //! shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
-//! session has no status watcher), display capture, a TCP echo, a WebNN add,
-//! and Gamepad enumeration through the desktop adapter (or the host snapshot
-//! path).
+//! session has no status watcher), display capture, Web Serial (permission
+//! or adapter rejection, then `NotFoundError` for a filter that matches
+//! nothing), a TCP echo, a WebNN add, and Gamepad enumeration through the
+//! desktop adapter (or the host snapshot path).
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render,web-sensors,web-gamepad,web-device-access
+//!   --no-default-features --features cpu-render,web-sensors,web-gamepad,web-device-access,web-serial
 //! # The probe does not grant hid/usb, so requestDevice must not succeed.
 //! ```
 
@@ -295,6 +296,10 @@ fn main() {
     w3cos_extensions::reset_realm();
 
     let namespace = namespace_value();
+    let serial_before = await_value(
+        w3cos_runtime::device_access_web::serial_value().call_method("requestPort", vec![]),
+    );
+
     let denied = await_value(namespace.get_property("process").call_method(
         "exec",
         vec![Value::object(HashMap::from([(
@@ -313,6 +318,7 @@ fn main() {
         "direct-sockets",
         "webnn",
         "w3cos-keyring",
+        "serial",
     ] {
         capability_gate::grant(name);
     }
@@ -375,6 +381,18 @@ fn main() {
     if let Ok(handle) = &tray {
         let _ = await_value(handle.call_method("remove", vec![]));
     }
+    let serial_after = await_value(
+        w3cos_runtime::device_access_web::serial_value().call_method(
+            "requestPort",
+            vec![Value::object(HashMap::from([(
+                "filters".into(),
+                Value::array(vec![Value::object(HashMap::from([
+                    ("usbVendorId".into(), Value::Number(65535.0)),
+                    ("usbProductId".into(), Value::Number(65535.0)),
+                ]))]),
+            )]))],
+        ),
+    );
     let capture = await_value(
         namespace
             .get_property("agent")
@@ -472,6 +490,22 @@ fn main() {
         Err(err) => err.clone(),
     };
     row("capture", &capture_text, capture.is_ok());
+    let serial_before_text = match &serial_before {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    let serial_after_text = match &serial_after {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    row(
+        "serial",
+        &format!("{serial_before_text} / {serial_after_text}"),
+        matches!(
+            serial_before_text.as_str(),
+            "NotAllowedError" | "NotFoundError"
+        ) && serial_after_text == "NotFoundError",
+    );
     row(
         "tcp echo",
         &tcp.clone().unwrap_or_else(|err| err),
@@ -489,7 +523,7 @@ fn main() {
     let (sensor_text, sensor_ok) = sensor_probe();
     row("accelerometer", &sensor_text, sensor_ok);
 
-    let frame = render_document_rgba_cpu(960, 1020).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 1080).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
