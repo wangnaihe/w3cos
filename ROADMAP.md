@@ -520,6 +520,17 @@ precede ecosystem breadth or migration tooling.
   truthful empty enumeration and Promise chooser rejection. Native discovery,
   permission prompts and device I/O remain host-adapter work and emit one-time
   warnings instead of reporting false success.
+- [x] Wire desktop WebHID and WebUSB to real devices. `navigator.hid` uses
+  hidapi (Linux hidraw via `linux-native-basic-udev`, macOS IOKit, Windows
+  hid.dll) for `getDevices`, filtered `requestDevice`, open/close, output and
+  feature reports, `inputreport` events from a reader thread, report-descriptor
+  collections, and connect/disconnect. `navigator.usb` uses nusb for
+  configuration and interface lifecycle, control and bulk/interrupt transfers
+  with `USBInTransferResult`/`USBOutTransferResult`, protected-interface
+  `SecurityError`, and isochronous `NotSupportedError`. `requestDevice` requires
+  an explicit `hid`/`usb` grant or a host chooser and never grants silently.
+  Android, iOS, and OHOS keep the truthful rejection path. Web Serial stays on
+  the compatibility base until its own adapter lands.
 - [x] Expose the Web NFC base with constructible `NDEFReader`, `NDEFMessage`,
   `NDEFRecord` and `NDEFReadingEvent`, usable message/record data, AbortSignal
   pre-abort handling and explicit Promise failures. Scanning, permissions and
@@ -1238,6 +1249,9 @@ generic JavaScript/Web-platform coverage.
 - [x] Bootable ISO release workflow.
 - [x] AI Bridge DOM/a11y/query/click/type/screenshot foundation.
 - [x] File system, process, PTY, IPC, menu, and dialog engine modules.
+- [x] Desktop WebHID (hidapi) and WebUSB (nusb) device I/O, with explicit
+  permission, protected USB interface classes, and truthful mobile/OHOS
+  rejection.
 - [x] Linux desktop motion and ambient-light telemetry through Industrial I/O
   (`web-sensors`). macOS, Windows, and mobile report the sensor as unavailable.
 
