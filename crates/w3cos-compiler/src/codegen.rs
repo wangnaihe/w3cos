@@ -80,6 +80,60 @@ pub struct CompileOptions {
     /// Emit a component bundle loaded by the system runtime instead of a
     /// standalone binary with the runtime linked statically.
     pub shared_runtime: bool,
+    /// Package assets/CJK-Subset.ttf. Off unless W3COS_EMBED_CJK_FONT opts in.
+    pub embed_cjk_font: bool,
+}
+
+pub(crate) const DESKTOP_IMAGE_FEATURES: &[&str] = &[
+    "image-png",
+    "image-jpeg",
+    "image-webp",
+    "image-gif",
+    "image-bmp",
+    "image-ico",
+];
+
+pub(crate) const MOBILE_IMAGE_FEATURES: &[&str] = &["image-png", "image-jpeg", "image-webp"];
+
+/// `W3COS_EMBED_CJK_FONT=0/false/off/no` forces the subset off. Any other
+/// non-empty value forces it on. An unset variable uses `options`.
+pub(crate) fn embed_cjk_font_enabled(options: &CompileOptions) -> bool {
+    if let Ok(value) = std::env::var("W3COS_EMBED_CJK_FONT") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            );
+        }
+    }
+    options.embed_cjk_font
+}
+
+pub(crate) fn push_feature(features: &mut Vec<String>, feature: &str) {
+    if !features.iter().any(|existing| existing == feature) {
+        features.push(feature.to_string());
+    }
+}
+
+pub(crate) fn append_desktop_codecs(features: &mut Vec<String>, options: &CompileOptions) {
+    for feature in DESKTOP_IMAGE_FEATURES {
+        push_feature(features, feature);
+    }
+    if embed_cjk_font_enabled(options) {
+        push_feature(features, "embed-cjk-font");
+    }
+}
+
+pub(crate) fn format_features(features: &[String]) -> String {
+    format!(
+        "[{}]",
+        features
+            .iter()
+            .map(|feature| format!("{feature:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 pub(crate) const GENERATED_RELEASE_PROFILE: &str = r#"
@@ -247,13 +301,11 @@ pub fn generate_cargo_toml(
     let workspace_root = find_workspace_root()?;
     let runtime_path = workspace_root.join("crates/w3cos-runtime");
     let std_path = workspace_root.join("crates/w3cos-std");
-    let runtime_features = if options.devtools {
-        r#"["gpu", "devtools"]"#.to_string()
-    } else if let Some(custom) = std::env::var("W3COS_RUNTIME_FEATURES")
+    let mut runtime_features = if let Some(custom) = std::env::var("W3COS_RUNTIME_FEATURES")
         .ok()
         .filter(|value| !value.trim().is_empty())
     {
-        let features = custom
+        custom
             .split(',')
             .map(str::trim)
             .filter(|feature| {
@@ -262,13 +314,20 @@ pub fn generate_cargo_toml(
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
             })
-            .map(|feature| format!("{feature:?}"))
+            .map(str::to_string)
             .collect::<Vec<_>>()
-            .join(", ");
-        format!("[{features}]")
     } else {
-        r#"["gpu"]"#.to_string()
+        let mut features = vec!["gpu".to_string()];
+        if options.devtools {
+            features.push("devtools".to_string());
+        }
+        features
     };
+    if options.devtools {
+        push_feature(&mut runtime_features, "devtools");
+    }
+    append_desktop_codecs(&mut runtime_features, options);
+    let runtime_features = format_features(&runtime_features);
 
     Ok(format!(
         r#"[package]
@@ -1935,7 +1994,7 @@ mod tests {
         };
         let toml = generate_cargo_toml(std::path::Path::new("."), &opts).unwrap();
         assert!(
-            toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
+            toml.contains(r#"default-features = false, features = ["gpu", "devtools", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]"#),
             "devtools feature missing: {toml}"
         );
     }
@@ -1945,7 +2004,7 @@ mod tests {
         let toml =
             generate_cargo_toml(std::path::Path::new("."), &CompileOptions::default()).unwrap();
         assert!(
-            toml.contains(r#"default-features = false, features = ["gpu"]"#),
+            toml.contains(r#"default-features = false, features = ["gpu", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]"#),
             "desktop applications must link one renderer: {toml}"
         );
         assert!(toml.contains("opt-level = \"z\""), "{toml}");

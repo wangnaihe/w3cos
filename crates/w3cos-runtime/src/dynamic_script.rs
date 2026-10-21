@@ -9919,23 +9919,22 @@ fn parse_source_size_length(
 }
 
 fn is_decodable_picture_type(content_type: &str) -> bool {
-    matches!(
-        content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "image/png"
-            | "image/jpeg"
-            | "image/gif"
-            | "image/webp"
-            | "image/apng"
-            | "image/bmp"
-            | "image/x-icon"
-            | "image/vnd.microsoft.icon"
-    )
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" | "image/apng" => cfg!(feature = "image-png"),
+        "image/jpeg" => cfg!(feature = "image-jpeg"),
+        "image/gif" => cfg!(feature = "image-gif"),
+        "image/webp" => cfg!(feature = "image-webp"),
+        "image/bmp" => cfg!(feature = "image-bmp"),
+        "image/x-icon" | "image/vnd.microsoft.icon" => cfg!(feature = "image-ico"),
+        _ => false,
+    }
 }
 
 /// Native lazy-loading policy. Images with established layout boxes are
@@ -16043,17 +16042,22 @@ window.__dynamicInlineHandler = dynamicInlineResult;
 
     #[test]
     fn browser_picture_mime_contract_matches_linked_decoders() {
-        for content_type in [
-            "image/png",
-            "image/jpeg",
-            "image/gif",
-            "image/webp",
-            "image/apng",
-            "image/bmp",
-            "image/x-icon",
-            "image/vnd.microsoft.icon",
-        ] {
-            assert!(is_decodable_picture_type(content_type), "{content_type}");
+        let cases = [
+            ("image/png", cfg!(feature = "image-png")),
+            ("image/jpeg", cfg!(feature = "image-jpeg")),
+            ("image/gif", cfg!(feature = "image-gif")),
+            ("image/webp", cfg!(feature = "image-webp")),
+            ("image/apng", cfg!(feature = "image-png")),
+            ("image/bmp", cfg!(feature = "image-bmp")),
+            ("image/x-icon", cfg!(feature = "image-ico")),
+            ("image/vnd.microsoft.icon", cfg!(feature = "image-ico")),
+        ];
+        for (content_type, enabled) in cases {
+            assert_eq!(
+                is_decodable_picture_type(content_type),
+                enabled,
+                "{content_type}"
+            );
         }
         assert!(!is_decodable_picture_type("image/avif"));
     }
