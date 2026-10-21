@@ -16158,6 +16158,15 @@ fn image_data_value(data: &crate::canvas2d::ImageData) -> Value {
     crate::canvas_web::image_data_value(bytes, data.width, data.height)
 }
 
+pub(crate) fn canvas_2d_rgba(node: u32) -> Option<(u32, u32, Vec<u8>)> {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        let context = contexts.get(&node)?;
+        let context = context.borrow();
+        Some((context.width, context.height, context.pixels().to_vec()))
+    })
+}
+
 fn canvas_context_value(node: u32) -> Value {
     if let Some(v) = get_expando(node, "__ctx2d") {
         return v;

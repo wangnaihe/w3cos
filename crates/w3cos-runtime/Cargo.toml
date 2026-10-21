@@ -55,7 +55,7 @@ url = { workspace = true }
 base64 = { version = "0.22", optional = true }
 ring = "0.17"
 # WebGL GLSL validation uses the same naga as wgpu (web-graphics-advanced).
-naga = { version = "28", features = ["glsl-in"], optional = true }
+naga = { version = "28", features = ["glsl-in", "wgsl-out"], optional = true }
 psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
