@@ -102,6 +102,7 @@ fn state_for(name: &str) -> Option<String> {
         | "webnn"
         | "file-system"
         | "battery"
+        | "bluetooth"
         | "display-capture"
         | "w3cos-process"
         | "w3cos-global-shortcuts"

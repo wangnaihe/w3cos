@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-sensors"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-sensors", "web-bluetooth"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -21,6 +21,11 @@ web-media-advanced = ["dep:cpal"]
 # NotReadableError instead of inventing samples. Host injection still works
 # when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
 web-sensors = []
+# Desktop Web Bluetooth over btleplug (CoreBluetooth / WinRT / BlueZ).
+# Android keeps the host-module adapter and does not link this crate.
+# Linux links libdbus (BlueZ); CI installs libdbus-1-dev. Unit tests use the
+# in-memory radio unless W3COS_BLUETOOTH_DEVICE_TESTS=1.
+web-bluetooth = ["dep:btleplug", "dep:tokio", "dep:uuid", "dep:futures"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
@@ -142,6 +147,12 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 keyring = "4.2"
 # Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
+# Web Bluetooth (CoreBluetooth / WinRT / BlueZ). Optional so Android, iOS, and
+# OHOS builds that disable `web-bluetooth` do not link a desktop radio stack.
+btleplug = { version = "0.13", optional = true }
+tokio = { version = "1", optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+uuid = { version = "1", optional = true, default-features = false, features = ["std"] }
+futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 # System tray. `ksni` is the Linux StatusNotifierItem backend (the protocol
 # Ayatana AppIndicator implements) and does not need GTK. macOS uses
 # NSStatusItem and Windows uses Shell_NotifyIcon inside the same crate.
