@@ -12,7 +12,8 @@ gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
 web-graphics-advanced = ["dep:naga"]
-# Includes real-time Web Audio output through cpal on desktop targets.
+# Includes real-time Web Audio output and microphone capture through cpal
+# on desktop targets.
 web-media-advanced = ["dep:cpal"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
@@ -127,7 +128,7 @@ tungstenite = { workspace = true }
 # rfd 0.15.4+ enables xdg-portal by default on Linux; that backend's build.rs
 # requires an async runtime feature even when we only call the sync FileDialog API.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
-# Web Audio AudioContext output (ALSA/CoreAudio/WASAPI); see audio_device.rs.
+# Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
 cpal = { version = "0.15", optional = true }
 
 [dev-dependencies]

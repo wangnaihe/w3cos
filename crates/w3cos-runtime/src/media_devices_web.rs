@@ -5,14 +5,18 @@
 //! ([`crate::platform_host::list_cameras`], V4L2 on Linux): they are listed
 //! by `enumerateDevices()` (labels and ids only after the `camera` capability
 //! is granted) and `getUserMedia({video})` captures a frame from them for
-//! `ImageCapture`/`getSettings()`. The facade remains standards-shaped when
-//! no adapter is present by rejecting `getUserMedia` with a named DOM-style
-//! error. There is no platform microphone adapter.
+//! `ImageCapture`/`getSettings()`. When the host has registered no
+//! `audioinput`, microphones come from [`crate::audio_input`] (cpal on
+//! desktop): `enumerateDevices()` hides labels until the `microphone`
+//! capability is granted, and `getUserMedia({audio})` opens a live input
+//! stream whose PCM feeds `MediaStreamAudioSourceNode`. The facade remains
+//! standards-shaped when no adapter is present by rejecting `getUserMedia`
+//! with a named DOM-style error.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use w3cos_core::Value;
 
@@ -686,6 +690,7 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
         realm_media_function(|this, _| {
             if this.get_property("readyState").to_js_string() != "ended" {
                 this.set_property("readyState", Value::string("ended"));
+                crate::audio_input::release_track(&this.get_property("id").to_js_string());
                 let event = w3cos_core::class::construct(
                     &crate::web_events::event_class(),
                     vec![Value::string("ended")],
@@ -698,10 +703,17 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
     value.set_property(
         "clone",
         realm_media_function(|this, _| {
-            track_value(
+            let cloned = track_value(
                 &this.get_property("kind").to_js_string(),
                 &this.get_property("label").to_js_string(),
-            )
+            );
+            if let Some(audibility) = crate::audio_input::clone_track(
+                &this.get_property("id").to_js_string(),
+                &cloned.get_property("id").to_js_string(),
+            ) {
+                install_mic_accessors(&cloned, audibility);
+            }
+            cloned
         }),
     );
     value.set_property(
@@ -733,6 +745,18 @@ pub(crate) fn track_value(kind: &str, label: &str) -> Value {
                 }
                 settings.insert("width".into(), Value::Number(f64::from(width)));
                 settings.insert("height".into(), Value::Number(f64::from(height)));
+            }
+            if let Some(mic) = crate::audio_input::track_mic(&id) {
+                settings.insert("deviceId".into(), Value::string(&mic.device_id));
+                settings.insert("groupId".into(), Value::string(&mic.group_id));
+                settings.insert(
+                    "sampleRate".into(),
+                    Value::Number(f64::from(mic.sample_rate)),
+                );
+                settings.insert(
+                    "channelCount".into(),
+                    Value::Number(f64::from(mic.channels)),
+                );
             }
             Value::object(settings)
         }),
@@ -948,6 +972,303 @@ fn exact_device_id(constraint: Value) -> Option<String> {
     }
 }
 
+fn reject_opened(tracks: &mut Vec<Value>, error: Value) -> Value {
+    for track in tracks.drain(..) {
+        track.call_method("stop", vec![]);
+    }
+    w3cos_core::promise::reject(vec![error])
+}
+
+fn install_mic_accessors(track: &Value, audibility: Arc<crate::audio_input::Audibility>) {
+    track.delete_property("enabled");
+    track.delete_property("muted");
+    let read_enabled = Arc::clone(&audibility);
+    track.set_property(
+        "__w3cos_getter_enabled",
+        realm_media_function(move |_, _| Value::Bool(read_enabled.enabled())),
+    );
+    let write_enabled = Arc::clone(&audibility);
+    track.set_property(
+        "__w3cos_setter_enabled",
+        realm_media_function(move |_, args| {
+            write_enabled.set_enabled(args.first().is_some_and(Value::to_bool));
+            Value::Undefined
+        }),
+    );
+    let read_muted = Arc::clone(&audibility);
+    track.set_property(
+        "__w3cos_getter_muted",
+        realm_media_function(move |_, _| Value::Bool(read_muted.muted())),
+    );
+    let write_muted = Arc::clone(&audibility);
+    track.set_property(
+        "__w3cos_setter_muted",
+        realm_media_function(move |_, args| {
+            write_muted.set_muted(args.first().is_some_and(Value::to_bool));
+            Value::Undefined
+        }),
+    );
+}
+
+/// Platform microphones, used only when the host registered no `audioinput`.
+fn platform_microphones() -> Vec<(MediaDevice, crate::audio_input::MicrophoneInfo)> {
+    let host_has_audio = DEVICES.with(|devices| {
+        devices
+            .borrow()
+            .iter()
+            .any(|device| device.kind == "audioinput")
+    });
+    if host_has_audio {
+        return Vec::new();
+    }
+    crate::audio_input::list_microphones()
+        .into_iter()
+        .map(|mic| {
+            (
+                MediaDevice {
+                    device_id: opaque_id(&mic.device_key),
+                    kind: "audioinput".into(),
+                    label: mic.label.clone(),
+                    group_id: opaque_id(&mic.group_key),
+                },
+                mic,
+            )
+        })
+        .collect()
+}
+
+fn device_id_choice(constraint: &Value) -> (Option<String>, bool) {
+    if !constraint.is_object() {
+        return (None, false);
+    }
+    let device_id = constraint.get_property("deviceId");
+    if device_id.is_object() {
+        let exact = device_id.get_property("exact");
+        if !exact.is_undefined() && !exact.is_null() {
+            return (Some(exact.to_js_string()), true);
+        }
+        let ideal = device_id.get_property("ideal");
+        if !ideal.is_undefined() && !ideal.is_null() {
+            return (Some(ideal.to_js_string()), false);
+        }
+        return (None, false);
+    }
+    if device_id.is_string() {
+        return (Some(device_id.to_js_string()), false);
+    }
+    (None, false)
+}
+
+fn finite_ulong(value: &Value) -> Option<u32> {
+    if !value.is_number() {
+        return None;
+    }
+    let number = value.to_number();
+    if number.is_finite() && number >= 1.0 && number <= f64::from(u32::MAX) {
+        Some(number as u32)
+    } else {
+        None
+    }
+}
+
+fn ulong_field(value: &Value, field: &str) -> Result<Option<u32>, ()> {
+    let inner = value.get_property(field);
+    if inner.is_undefined() {
+        return Ok(None);
+    }
+    finite_ulong(&inner).map(Some).ok_or(())
+}
+
+fn capture_prefs(constraint: &Value) -> Result<crate::audio_input::CapturePrefs, Value> {
+    if !constraint.is_object() {
+        return Ok(crate::audio_input::CapturePrefs::default());
+    }
+    for name in ["echoCancellation", "noiseSuppression", "autoGainControl"] {
+        let value = constraint.get_property(name);
+        if value.is_object()
+            && value.get_property("exact").to_bool()
+            && value.get_property("exact").is_bool()
+        {
+            let exact = value.get_property("exact").to_bool();
+            if exact {
+                return Err(overconstrained_error(
+                    name,
+                    &format!(
+                        "{name} cannot be required; the microphone adapter does not apply audio processing"
+                    ),
+                ));
+            }
+        }
+    }
+    let mut prefs = crate::audio_input::CapturePrefs::default();
+    let mut channel_min = None;
+    let mut channel_max = None;
+    let mut channel_exact = false;
+    let channel_count = fill_ulong_pref(
+        constraint,
+        "channelCount",
+        &mut channel_exact,
+        &mut channel_min,
+        &mut channel_max,
+    )?;
+    prefs.channels_exact = channel_exact;
+    prefs.channels = match channel_count {
+        Some(count) => Some(u16::try_from(count).map_err(|_| {
+            overconstrained_error(
+                "channelCount",
+                "channelCount is not a supported microphone channel count",
+            )
+        })?),
+        None if channel_exact => {
+            return Err(overconstrained_error(
+                "channelCount",
+                "channelCount is not a supported microphone channel count",
+            ));
+        }
+        None => None,
+    };
+    prefs.channels_min = match channel_min {
+        Some(count) => Some(u16::try_from(count).map_err(|_| {
+            overconstrained_error(
+                "channelCount",
+                "channelCount is outside the microphone's supported range",
+            )
+        })?),
+        None => None,
+    };
+    prefs.channels_max = match channel_max {
+        Some(count) => Some(u16::try_from(count).map_err(|_| {
+            overconstrained_error(
+                "channelCount",
+                "channelCount is outside the microphone's supported range",
+            )
+        })?),
+        None => None,
+    };
+    prefs.sample_rate = fill_ulong_pref(
+        constraint,
+        "sampleRate",
+        &mut prefs.sample_rate_exact,
+        &mut prefs.sample_rate_min,
+        &mut prefs.sample_rate_max,
+    )?;
+    Ok(prefs)
+}
+
+fn fill_ulong_pref(
+    constraint: &Value,
+    name: &str,
+    exact_flag: &mut bool,
+    min_out: &mut Option<u32>,
+    max_out: &mut Option<u32>,
+) -> Result<Option<u32>, Value> {
+    if !constraint.is_object() {
+        return Ok(None);
+    }
+    let value = constraint.get_property(name);
+    if value.is_undefined() {
+        return Ok(None);
+    }
+    if value.is_number() {
+        return finite_ulong(&value).map(Some).ok_or_else(|| {
+            overconstrained_error(
+                name,
+                &format!("{name} is not a usable microphone constraint"),
+            )
+        });
+    }
+    if !value.is_object() {
+        return Err(overconstrained_error(
+            name,
+            &format!("{name} is not a usable microphone constraint"),
+        ));
+    }
+    let exact = ulong_field(&value, "exact").map_err(|()| {
+        overconstrained_error(name, &format!("{name} exact value is not supported"))
+    })?;
+    let ideal = ulong_field(&value, "ideal").map_err(|()| {
+        overconstrained_error(name, &format!("{name} ideal value is not supported"))
+    })?;
+    *min_out = ulong_field(&value, "min")
+        .map_err(|()| overconstrained_error(name, &format!("{name} min value is not supported")))?;
+    *max_out = ulong_field(&value, "max")
+        .map_err(|()| overconstrained_error(name, &format!("{name} max value is not supported")))?;
+    if exact.is_some() {
+        *exact_flag = true;
+        return Ok(exact);
+    }
+    Ok(ideal)
+}
+
+fn default_microphone(
+    mics: &[(MediaDevice, crate::audio_input::MicrophoneInfo)],
+) -> Option<&(MediaDevice, crate::audio_input::MicrophoneInfo)> {
+    mics.iter()
+        .find(|(_, mic)| mic.is_default)
+        .or_else(|| mics.first())
+}
+
+fn mic_failure(error: crate::audio_input::MicError) -> Value {
+    if error.name == "OverconstrainedError" {
+        overconstrained_error(error.constraint.unwrap_or("deviceId"), &error.message)
+    } else {
+        named_error(error.name, &error.message)
+    }
+}
+
+/// `None` when the host already supplied `audioinput` devices or the platform
+/// has no microphones, so the caller falls through to the host list.
+fn open_platform_microphone(constraint: &Value) -> Option<Result<Value, Value>> {
+    let mics = platform_microphones();
+    if mics.is_empty() {
+        return None;
+    }
+    let (wanted_id, exact) = device_id_choice(constraint);
+    let chosen = if exact {
+        let Some(id) = wanted_id.as_deref() else {
+            return Some(Err(overconstrained_error(
+                "deviceId",
+                "No audio input satisfies the exact deviceId constraint",
+            )));
+        };
+        let Some(mic) = mics.iter().find(|(device, _)| device.device_id == id) else {
+            return Some(Err(overconstrained_error(
+                "deviceId",
+                "No audio input satisfies the exact deviceId constraint",
+            )));
+        };
+        mic
+    } else if let Some(id) = wanted_id.as_deref() {
+        mics.iter()
+            .find(|(device, _)| device.device_id == id)
+            .or_else(|| default_microphone(&mics))?
+    } else {
+        default_microphone(&mics)?
+    };
+    if !crate::capability_gate::is_granted("microphone") {
+        return Some(Err(crate::capability_gate::not_allowed("microphone")));
+    }
+    let prefs = match capture_prefs(constraint) {
+        Ok(prefs) => prefs,
+        Err(error) => return Some(Err(error)),
+    };
+    let device = &chosen.0;
+    let mic = &chosen.1;
+    let opened = match crate::audio_input::open_microphone(mic, &prefs) {
+        Ok(opened) => opened,
+        Err(error) => return Some(Err(mic_failure(error))),
+    };
+    let track = track_value("audio", &device.label);
+    let audibility = crate::audio_input::bind_track(
+        &track.get_property("id").to_js_string(),
+        opened,
+        device.device_id.clone(),
+        device.group_id.clone(),
+    );
+    install_mic_accessors(&track, audibility);
+    Some(Ok(track))
+}
+
 fn get_user_media(constraints: Value) -> Value {
     if PERMISSION_DENIED.with(Cell::get) {
         return w3cos_core::promise::reject(vec![named_error(
@@ -974,6 +1295,16 @@ fn get_user_media(constraints: Value) -> Value {
         }
         let constraint = constraints.get_property(track_kind);
         let exact_id = exact_device_id(constraint.clone());
+        if track_kind == "audio" {
+            match open_platform_microphone(&constraint) {
+                Some(Ok(track)) => {
+                    tracks.push(track);
+                    continue;
+                }
+                Some(Err(error)) => return reject_opened(&mut tracks, error),
+                None => {}
+            }
+        }
         if track_kind == "video" {
             let cameras = platform_cameras();
             if !cameras.is_empty() {
@@ -982,13 +1313,19 @@ fn get_user_media(constraints: Value) -> Value {
                         .as_ref()
                         .is_none_or(|device_id| &device.device_id == device_id)
                 }) else {
-                    return w3cos_core::promise::reject(vec![overconstrained_error(
-                        "deviceId",
-                        "No video input satisfies the exact deviceId constraint",
-                    )]);
+                    return reject_opened(
+                        &mut tracks,
+                        overconstrained_error(
+                            "deviceId",
+                            "No video input satisfies the exact deviceId constraint",
+                        ),
+                    );
                 };
-                if let Some(rejected) = crate::capability_gate::reject_unless_granted("camera") {
-                    return rejected;
+                if !crate::capability_gate::is_granted("camera") {
+                    return reject_opened(
+                        &mut tracks,
+                        crate::capability_gate::not_allowed("camera"),
+                    );
                 }
                 let width = numeric_constraint(&constraint, "width").unwrap_or(640);
                 let height = numeric_constraint(&constraint, "height").unwrap_or(480);
@@ -1000,10 +1337,7 @@ fn get_user_media(constraints: Value) -> Value {
                         continue;
                     }
                     Err(error) => {
-                        return w3cos_core::promise::reject(vec![named_error(
-                            error.name,
-                            &error.message,
-                        )]);
+                        return reject_opened(&mut tracks, named_error(error.name, &error.message));
                     }
                 }
             }
@@ -1016,15 +1350,21 @@ fn get_user_media(constraints: Value) -> Value {
         });
         let Some(device) = device else {
             if exact_id.is_some() {
-                return w3cos_core::promise::reject(vec![overconstrained_error(
-                    "deviceId",
-                    &format!("No {track_kind} input satisfies the exact deviceId constraint"),
-                )]);
+                return reject_opened(
+                    &mut tracks,
+                    overconstrained_error(
+                        "deviceId",
+                        &format!("No {track_kind} input satisfies the exact deviceId constraint"),
+                    ),
+                );
             }
-            return w3cos_core::promise::reject(vec![named_error(
-                "NotFoundError",
-                &format!("No {track_kind} input device is available"),
-            )]);
+            return reject_opened(
+                &mut tracks,
+                named_error(
+                    "NotFoundError",
+                    &format!("No {track_kind} input device is available"),
+                ),
+            );
         };
         tracks.push(track_value(track_kind, &device.label));
     }
@@ -1078,6 +1418,17 @@ pub fn media_devices_value() -> Value {
                 devices.push(device_value(&MediaDevice {
                     device_id: String::new(),
                     kind: "videoinput".into(),
+                    label: String::new(),
+                    group_id: String::new(),
+                }));
+            }
+            let mics = platform_microphones();
+            if crate::capability_gate::is_granted("microphone") {
+                devices.extend(mics.iter().map(|(device, _)| device_value(device)));
+            } else if !mics.is_empty() {
+                devices.push(device_value(&MediaDevice {
+                    device_id: String::new(),
+                    kind: "audioinput".into(),
                     label: String::new(),
                     group_id: String::new(),
                 }));
@@ -1170,6 +1521,8 @@ pub fn set_permission_denied(denied: bool) {
 }
 
 pub fn reset() {
+    crate::audio_input::reset_tracks();
+    crate::audio_input::reset_overrides();
     DEVICES.with(|devices| devices.borrow_mut().clear());
     TRACK_GENERATORS.with(|generators| generators.borrow_mut().clear());
     PERMISSION_DENIED.with(|permission| permission.set(false));
@@ -1658,7 +2011,7 @@ mod tests {
             "OverconstrainedError"
         );
 
-        // No platform microphone: audio requests still need a host device.
+        // No microphone override: audio requests still need a host device.
         let both = Value::object(HashMap::from([
             ("audio".to_string(), Value::Bool(true)),
             ("video".to_string(), Value::Bool(true)),
@@ -1692,6 +2045,205 @@ mod tests {
             devices().len() as f64
         );
         crate::platform_host::reset_overrides();
+        reset();
+    }
+
+    fn fixture_mic(key: &str, label: &str, default: bool) -> crate::audio_input::MicrophoneInfo {
+        crate::audio_input::MicrophoneInfo {
+            label: label.into(),
+            device_key: key.into(),
+            group_key: format!("group:{key}"),
+            sample_rate: 8_000,
+            channels: 1,
+            is_default: default,
+        }
+    }
+
+    #[test]
+    fn platform_microphones_enumerate_behind_permission_and_open_a_live_track() {
+        reset();
+        crate::capability_gate::reset();
+        let primary = fixture_mic("media-test:default", "Fixture Microphone", true);
+        let other = fixture_mic("media-test:other", "Other Microphone", false);
+        crate::audio_input::set_microphone_override(Some(vec![primary.clone(), other.clone()]));
+        let media = media_devices_value();
+
+        let (ok, listed) = settle(media.call_method("enumerateDevices", vec![]));
+        assert!(ok);
+        assert_eq!(listed.get_property("length").to_number(), 1.0);
+        let hidden = listed.get_property("0");
+        assert_eq!(hidden.get_property("kind").to_js_string(), "audioinput");
+        assert_eq!(hidden.get_property("label").to_js_string(), "");
+        assert_eq!(hidden.get_property("deviceId").to_js_string(), "");
+
+        let audio =
+            |constraints: Value| Value::object(HashMap::from([("audio".to_string(), constraints)]));
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![audio(Value::Bool(true))]));
+        assert!(!ok);
+        assert_eq!(error.get_property("name").to_js_string(), "NotAllowedError");
+        assert_eq!(crate::audio_input::live_track_count(), 0);
+
+        crate::capability_gate::grant("microphone");
+        let (_, listed) = settle(media.call_method("enumerateDevices", vec![]));
+        assert_eq!(listed.get_property("length").to_number(), 2.0);
+        let device = listed.get_property("0");
+        assert_eq!(
+            device.get_property("label").to_js_string(),
+            "Fixture Microphone"
+        );
+        let device_id = device.get_property("deviceId").to_js_string();
+        assert_eq!(device_id.len(), 64);
+        assert_ne!(device_id, device.get_property("groupId").to_js_string());
+        assert!(w3cos_core::class::instance_of(
+            &device,
+            &input_device_info_class()
+        ));
+
+        let (ok, stream) =
+            settle(media.call_method("getUserMedia", vec![audio(Value::Bool(true))]));
+        assert!(ok, "{}", stream.get_property("message").to_js_string());
+        let track = stream
+            .call_method("getAudioTracks", vec![])
+            .get_property("0");
+        assert_eq!(track.get_property("readyState").to_js_string(), "live");
+        assert!(track.get_property("enabled").to_bool());
+        let settings = track.call_method("getSettings", vec![]);
+        assert_eq!(settings.get_property("deviceId").to_js_string(), device_id);
+        assert_eq!(settings.get_property("sampleRate").to_number(), 8_000.0);
+        assert_eq!(settings.get_property("channelCount").to_number(), 1.0);
+        let track_id = track.get_property("id").to_js_string();
+        assert!(crate::audio_input::source_for_track(&track_id).is_some());
+
+        track.set_property("enabled", Value::Bool(false));
+        assert!(!track.get_property("enabled").to_bool());
+        let cloned = track.call_method("clone", vec![]);
+        assert!(!cloned.get_property("enabled").to_bool());
+        cloned.set_property("enabled", Value::Bool(true));
+        assert!(!track.get_property("enabled").to_bool());
+        assert!(cloned.get_property("enabled").to_bool());
+        assert_eq!(crate::audio_input::live_track_count(), 2);
+
+        let other_id = listed
+            .get_property("1")
+            .get_property("deviceId")
+            .to_js_string();
+        let exact_other = audio(Value::object(HashMap::from([(
+            "deviceId".to_string(),
+            Value::object(HashMap::from([(
+                "exact".to_string(),
+                Value::string(&other_id),
+            )])),
+        )])));
+        let (ok, other_stream) = settle(media.call_method("getUserMedia", vec![exact_other]));
+        assert!(
+            ok,
+            "{}",
+            other_stream.get_property("message").to_js_string()
+        );
+        assert_eq!(
+            other_stream
+                .call_method("getAudioTracks", vec![])
+                .get_property("0")
+                .get_property("label")
+                .to_js_string(),
+            "Other Microphone"
+        );
+
+        let mismatch = audio(Value::object(HashMap::from([(
+            "deviceId".to_string(),
+            Value::object(HashMap::from([(
+                "exact".to_string(),
+                Value::string("missing"),
+            )])),
+        )])));
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![mismatch]));
+        assert!(!ok);
+        assert_eq!(error.get_property("constraint").to_js_string(), "deviceId");
+
+        let processing = audio(Value::object(HashMap::from([(
+            "echoCancellation".to_string(),
+            Value::object(HashMap::from([("exact".to_string(), Value::Bool(true))])),
+        )])));
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![processing]));
+        assert!(!ok);
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "OverconstrainedError"
+        );
+        assert_eq!(
+            error.get_property("constraint").to_js_string(),
+            "echoCancellation"
+        );
+
+        let wrong_rate = audio(Value::object(HashMap::from([(
+            "sampleRate".to_string(),
+            Value::object(HashMap::from([(
+                "exact".to_string(),
+                Value::Number(16_000.0),
+            )])),
+        )])));
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![wrong_rate]));
+        assert!(!ok);
+        assert_eq!(
+            error.get_property("constraint").to_js_string(),
+            "sampleRate"
+        );
+
+        let ideal_rate = audio(Value::object(HashMap::from([(
+            "sampleRate".to_string(),
+            Value::object(HashMap::from([(
+                "ideal".to_string(),
+                Value::Number(16_000.0),
+            )])),
+        )])));
+        let (ok, ideal_stream) = settle(media.call_method("getUserMedia", vec![ideal_rate]));
+        assert!(
+            ok,
+            "{}",
+            ideal_stream.get_property("message").to_js_string()
+        );
+        assert_eq!(
+            ideal_stream
+                .call_method("getAudioTracks", vec![])
+                .get_property("0")
+                .call_method("getSettings", vec![])
+                .get_property("sampleRate")
+                .to_number(),
+            8_000.0
+        );
+
+        let both = Value::object(HashMap::from([
+            ("audio".to_string(), Value::Bool(true)),
+            ("video".to_string(), Value::Bool(true)),
+        ]));
+        let before = crate::audio_input::live_track_count();
+        let (ok, error) = settle(media.call_method("getUserMedia", vec![both]));
+        assert!(!ok);
+        assert_eq!(error.get_property("name").to_js_string(), "NotFoundError");
+        assert_eq!(crate::audio_input::live_track_count(), before);
+
+        track.call_method("stop", vec![]);
+        cloned.call_method("stop", vec![]);
+        assert_eq!(track.get_property("readyState").to_js_string(), "ended");
+        assert!(crate::audio_input::source_for_track(&track_id).is_none());
+
+        set_devices(devices());
+        let (_, listed) = settle(media.call_method("enumerateDevices", vec![]));
+        assert_eq!(
+            listed.get_property("length").to_number(),
+            devices().len() as f64
+        );
+        let labels = (0..listed.get_property("length").to_u32())
+            .map(|index| {
+                listed
+                    .get_property(&index.to_string())
+                    .get_property("label")
+                    .to_js_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(!labels.iter().any(|label| label == "Fixture Microphone"));
+
+        crate::capability_gate::reset();
         reset();
     }
 }

@@ -11,10 +11,12 @@
 //! Rendered node types: `OscillatorNode` (sine/square/sawtooth/triangle and
 //! `PeriodicWave`), `AudioBufferSourceNode` (playback rate, detune, offset,
 //! duration, looping, linear resampling), `ConstantSourceNode`, `GainNode`,
-//! `StereoPannerNode` and `AudioDestinationNode`. Every other node renders
-//! silence and is listed in [`GraphSnapshot::unsupported`] so the caller can
-//! warn. AudioParams are sampled at their current `value`; automation
-//! timelines and AudioParam inputs are not rendered yet.
+//! `StereoPannerNode`, `MediaStreamAudioSourceNode` (live PCM from a
+//! microphone queue, with linear resampling when the capture rate differs)
+//! and `AudioDestinationNode`. Every other node renders silence and is listed
+//! in [`GraphSnapshot::unsupported`] so the caller can warn. AudioParams are
+//! sampled at their current `value`; automation timelines and AudioParam
+//! inputs are not rendered yet.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -65,6 +67,14 @@ pub enum NodeKind {
         duration: Option<f64>,
         schedule: Schedule,
     },
+    /// Live microphone (or other captured) PCM. `audibility` is loaded while
+    /// rendering so mute, disable, and `stop()` take effect immediately.
+    MediaStream {
+        queue: Arc<crate::audio_input::PcmQueue>,
+        audibility: Arc<crate::audio_input::Audibility>,
+        channels: u16,
+        sample_rate: u32,
+    },
     /// A node type this renderer does not process yet; renders silence.
     Silent,
 }
@@ -112,6 +122,8 @@ struct SourceState {
     phase: f64,
     position: Option<f64>,
     finished: bool,
+    /// Absolute capture-frame position of a media-stream source.
+    mic_pos: Option<f64>,
 }
 
 /// Pull-model renderer with persistent per-source state.
@@ -367,7 +379,76 @@ impl Renderer {
                 }
                 out
             }
+            NodeKind::MediaStream {
+                queue,
+                audibility,
+                channels,
+                sample_rate,
+            } => self.render_media(id, queue, audibility, *channels, *sample_rate, frames),
         }
+    }
+
+    fn render_media(
+        &mut self,
+        id: u64,
+        queue: &crate::audio_input::PcmQueue,
+        audibility: &crate::audio_input::Audibility,
+        channels: u16,
+        sample_rate: u32,
+        frames: usize,
+    ) -> Bus {
+        let channels = channels.max(1) as usize;
+        let mut out = vec![vec![0.0f32; frames]; channels];
+        if frames == 0 {
+            return out;
+        }
+        let in_rate = f64::from(sample_rate.max(1));
+        let step = in_rate / self.sample_rate.max(1.0);
+        let mut pos = self
+            .state
+            .get(&id)
+            .and_then(|state| state.mic_pos)
+            .unwrap_or_else(|| queue.start_cursor() as f64);
+        if (step - 1.0).abs() < 1e-9 && (pos - pos.round()).abs() < 1e-6 {
+            let mut cursor = pos.round() as u64;
+            let raw = queue.read_frames(&mut cursor, frames);
+            let got = raw.len() / channels;
+            for frame in 0..got {
+                if !audibility.audible() {
+                    continue;
+                }
+                for channel in 0..channels {
+                    out[channel][frame] = raw[frame * channels + channel];
+                }
+            }
+            pos = cursor as f64;
+        } else {
+            for frame in 0..frames {
+                let left_index = pos.floor() as u64;
+                let fraction = (pos - left_index as f64) as f32;
+                let Some(left) = queue.copy_frame(left_index) else {
+                    break;
+                };
+                let right = if fraction > 0.0 {
+                    let Some(right) = queue.copy_frame(left_index + 1) else {
+                        break;
+                    };
+                    right
+                } else {
+                    left.clone()
+                };
+                if audibility.audible() {
+                    for channel in 0..channels {
+                        let start = left.get(channel).copied().unwrap_or(0.0);
+                        let end = right.get(channel).copied().unwrap_or(start);
+                        out[channel][frame] = start + (end - start) * fraction;
+                    }
+                }
+                pos += step;
+            }
+        }
+        self.state.entry(id).or_default().mic_pos = Some(pos);
+        out
     }
 }
 
@@ -703,5 +784,69 @@ mod tests {
         ]);
         let mut renderer = Renderer::new(8.0, 1, 0.0);
         assert_eq!(renderer.render_planar(&graph, 2)[0], vec![0.0, 0.0]);
+    }
+
+    fn media_stream(samples: &[f32], capture_rate: u32, audible: bool) -> NodeKind {
+        let queue = crate::audio_input::PcmQueue::new(1, capture_rate);
+        queue.push_interleaved(samples);
+        let audibility = Arc::new(crate::audio_input::Audibility::new());
+        audibility.set_enabled(audible);
+        NodeKind::MediaStream {
+            queue,
+            audibility,
+            channels: 1,
+            sample_rate: capture_rate,
+        }
+    }
+
+    #[test]
+    fn media_stream_copies_matching_rate_and_silence_when_muted() {
+        let connected = graph(vec![
+            (1, NodeKind::Destination, vec![3]),
+            (
+                2,
+                media_stream(&[0.25, -0.5, 0.125, -0.125], 8_000, true),
+                vec![],
+            ),
+            (3, NodeKind::Gain { gain: 0.5 }, vec![2]),
+        ]);
+        let mut renderer = Renderer::new(8_000.0, 2, 0.0);
+        let out = renderer.render_planar(&connected, 4);
+        assert_eq!(out[0], vec![0.125, -0.25, 0.0625, -0.0625]);
+        assert_eq!(out[0], out[1]);
+
+        let muted = graph(vec![
+            (1, NodeKind::Destination, vec![2]),
+            (2, media_stream(&[1.0, 1.0, 1.0, 1.0], 8_000, false), vec![]),
+        ]);
+        let mut renderer = Renderer::new(8_000.0, 1, 0.0);
+        assert_eq!(renderer.render_planar(&muted, 4)[0], vec![0.0; 4]);
+        assert_eq!(renderer.render_planar(&muted, 4)[0], vec![0.0; 4]);
+    }
+
+    #[test]
+    fn media_stream_resamples_linearly_between_capture_and_context_rates() {
+        let up = graph(vec![
+            (1, NodeKind::Destination, vec![2]),
+            (2, media_stream(&[0.0, 1.0, 0.0, -1.0], 8_000, true), vec![]),
+        ]);
+        let mut renderer = Renderer::new(16_000.0, 1, 0.0);
+        let out = renderer.render_planar(&up, 8);
+        let expected = [0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, 0.0];
+        for (index, (sample, expected)) in out[0].iter().zip(expected).enumerate() {
+            assert!(
+                (sample - expected).abs() < 1e-5,
+                "upsample frame {index}: {sample} != {expected}"
+            );
+        }
+
+        let down = graph(vec![
+            (1, NodeKind::Destination, vec![2]),
+            (2, media_stream(&[1.0, 2.0, 3.0, 4.0], 8_000, true), vec![]),
+        ]);
+        let mut renderer = Renderer::new(4_000.0, 1, 0.0);
+        let out = renderer.render_planar(&down, 2);
+        assert!((out[0][0] - 1.0).abs() < 1e-5);
+        assert!((out[0][1] - 3.0).abs() < 1e-5);
     }
 }

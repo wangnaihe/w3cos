@@ -1,5 +1,6 @@
 pub mod animations_web;
 pub mod audio_device;
+pub mod audio_input;
 pub mod audio_render;
 pub mod audio_web;
 mod background_image;
