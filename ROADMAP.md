@@ -1085,7 +1085,15 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     copy clean tiles and rerasterize only dirty bounding boxes. Topology or
     geometry changes still take a full tiled raster. SMIL and Web Animations
     still do not write computed values into this raster path.
-  - [ ] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+  - [x] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+    When the wgpu/Vello backend is active, each SVG element is encoded as GPU
+    vector geometry (paths, solid and gradient fills and strokes, transforms,
+    clip paths, opacity, blend modes, and text glyph outlines) or, for a mask,
+    filter, pattern paint, miter-clip join, or non-outline glyphs, as a CPU
+    pixmap of that element only. The choice and the reason are logged per
+    element. `W3COS_SVG_CPU_TILES=1` keeps the full 32px tile upload. CPU and
+    Skia backends keep the tiled resvg raster. SMIL and Web Animations still
+    do not write computed values into this paint path.
 - [x] Define cookie behavior: real per-origin session store instead of inert
   assignment.
 
