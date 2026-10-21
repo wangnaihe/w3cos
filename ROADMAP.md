@@ -3014,11 +3014,11 @@ W3COS.
   - [x] Linkage-probe reports now record executable text, file-backed data,
     read-only data, bss, gzip level 9 of the stripped bytes, and an embedded
     font/image scan. On `x86_64-unknown-linux-gnu` with Rust 1.99.1 the
-    stripped probes are 11,884,064 bytes (text 7,720,216, data 3,349,233,
-    gzip 5,100,001, embedded 0) for ordinary AOT and 15,694,896 bytes
-    (text 10,198,344, data 4,466,917, gzip 6,832,141, embedded 0) for the
-    dynamic browser probe. The same-runner dynamic increment is 3,810,832
-    bytes (32.07%).
+    checked-in stripped probes are 11,905,440 bytes (text 7,737,496, data
+    3,352,409, gzip 5,110,163, embedded 0) for ordinary AOT and 15,718,704
+    bytes (text 10,217,736, data 4,472,109, gzip 6,842,849, embedded 0) for
+    the dynamic browser probe. The same-runner dynamic increment is 3,813,264
+    bytes (32.03%). `web-bluetooth` is off in both probes.
   - Product gates still need native-library rows, Android ABI-split, and iOS App Store device-slice artifacts
 - [x] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
   - `w3cos-size-audit` reads the unstripped symbol table and records crate totals, the largest symbols, and feature buckets in the uploaded JSON and markdown reports.

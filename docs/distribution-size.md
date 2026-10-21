@@ -146,27 +146,33 @@ every default feature. The reproducible replacements are the per-closure rows
 in the baseline file, with per-feature symbol bytes beside them. Render, font,
 and image-codec product slices are not given a new absolute baseline here.
 
-On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after `strip --strip-all`:
+On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after `strip --strip-all`, the
+checked-in rows are:
 
 | Probe | Stripped bytes | text | data | gzip -9 | Embedded |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ordinary AOT | 11,884,064 | 7,720,216 | 3,349,233 | 5,100,001 | 0 |
-| dynamic browser | 15,694,896 | 10,198,344 | 4,466,917 | 6,832,141 | 0 |
+| ordinary AOT | 11,905,440 | 7,737,496 | 3,352,409 | 5,110,163 | 0 |
+| dynamic browser | 15,718,704 | 10,217,736 | 4,472,109 | 6,842,849 | 0 |
 
-Data includes read-only data (2,709,441 bytes AOT, 3,634,705 bytes browser).
-The same-runner dynamic increment is 3,810,832 bytes (32.07% of the AOT
+Data includes read-only data (2,713,001 bytes AOT, 3,638,553 bytes browser).
+The same-runner dynamic increment is 3,813,264 bytes (32.03% of the AOT
 probe). Symbol attribution assigns 686,785 of the browser symbol bytes to
 `dynamic-js` crates and 435,725 to image-codec crates. Those codec bytes are
-reported only; codec selection is a separate change.
+reported only; codec selection is a separate change. `web-bluetooth` is off
+in both probes, and its `btleplug` symbol bucket is 0.
 
 Moving `navigator.w3cos.tray` and `navigator.w3cos.keyring` behind `host-tray`
 and `host-keyring` removed them from both probes. The runtime default set and
-the desktop shell still enable both features. Measured on this same toolchain
-and strip, ordinary AOT fell from 12,814,744 to 11,884,064 bytes (930,680
-bytes, 7.26%) and its gzip proxy from 5,497,725 to 5,100,001. The browser
-probe fell from 16,621,992 to 15,694,896 bytes (927,096 bytes, 5.58%). Calls
-without the feature reject `NotSupportedError` and do not install an icon or
-store a secret.
+the desktop shell still enable both features, and the shell also enables
+`web-bluetooth`. Measured on this same toolchain and strip, before that
+bluetooth code was in the tree, ordinary AOT fell from 12,814,744 to
+11,884,064 bytes (930,680 bytes, 7.26%) and its gzip proxy from 5,497,725 to
+5,100,001. The browser probe fell from 16,621,992 to 15,694,896 bytes
+(927,096 bytes, 5.58%). Calls without the feature reject `NotSupportedError`
+and do not install an icon or store a secret. Desktop `web-bluetooth` landing
+with the feature still off, and with no `btleplug` symbols, then added 21,376
+bytes to ordinary AOT and 23,808 bytes to the browser probe. Those post-merge
+sizes are the checked-in rows above.
 
 On the current arm64 macOS measurement, the stripped probes are 6,083,264 bytes
 for ordinary AOT and 7,148,896 bytes for dynamic Browser linkage: a 1,065,632-byte
