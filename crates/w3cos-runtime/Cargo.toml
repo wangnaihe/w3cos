@@ -13,8 +13,9 @@ cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
 web-graphics-advanced = ["dep:naga"]
 # Includes real-time Web Audio output and microphone capture through cpal
-# on desktop targets.
-web-media-advanced = ["dep:cpal"]
+# on desktop targets, plus macOS AVFoundation and Windows Media Foundation
+# cameras through nokhwa. Linux V4L2 capture does not use this feature.
+web-media-advanced = ["dep:cpal", "dep:nokhwa", "dep:nokhwa-bindings-macos"]
 # Host serial ports for navigator.serial on macOS, Windows, and Linux desktop.
 # libudev stays off so CI does not need libudev-dev; Linux USB ids come from sysfs.
 web-serial = ["dep:serialport"]
@@ -124,10 +125,15 @@ winit = { workspace = true }
 skia-safe = { version = "=0.93.1", optional = true, features = ["metal"] }
 security-framework = "3.7"
 
+# macOS location and camera. Core Location is objc2. `nokhwa` captures through
+# AVFoundation; the bindings crate exposes AVAuthorizationStatus. Camera crates
+# are target-gated, so Linux CI does not compile them or link new libraries.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.3", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSObject"] }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-avfoundation", "decoding"] }
+nokhwa-bindings-macos = { version = "0.2.4", optional = true }
 # hidraw IOKit backend. No libusb.
 hidapi = { version = "2.6.7", optional = true, default-features = false }
 
@@ -187,6 +193,7 @@ hidapi = { version = "2.6.7", optional = true, default-features = false, feature
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", optional = true, features = ["Devices_Geolocation", "Foundation"] }
+nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-msmf", "decoding"] }
 hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]

@@ -4,7 +4,9 @@
 //! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
 //! honest `NotReadableError` when this host has no live sensor), a geolocation
 //! fix (or an honest position error when this host has no location service),
-//! an application shortcut, the
+//! a camera frame (or an honest `NotFoundError` / `NotAllowedError` /
+//! `NotReadableError` when this host has no usable camera), an application
+//! shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
 //! session has no status watcher), display capture, Web Serial (permission
@@ -14,7 +16,7 @@
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render,web-sensors,web-serial,web-geolocation,web-device-access
+//!   --no-default-features --features cpu-render,web-sensors,web-serial,web-geolocation,web-media-advanced,web-device-access
 //! ```
 //!
 //! The HID and USB probes do not grant `hid` or `usb`, so `requestDevice`
@@ -352,6 +354,43 @@ fn geolocation_probe() -> (String, bool) {
     report
 }
 
+fn camera_probe() -> (String, bool) {
+    capability_gate::grant("camera");
+    let media = w3cos_runtime::media_devices_web::media_devices_value();
+    let opened = await_value(media.call_method(
+        "getUserMedia",
+        vec![Value::object(HashMap::from([(
+            "video".into(),
+            Value::Bool(true),
+        )]))],
+    ));
+    let result = match opened {
+        Ok(stream) => {
+            let track = stream
+                .call_method("getVideoTracks", vec![])
+                .get_property("0");
+            let settings = track.call_method("getSettings", vec![]);
+            let width = settings.get_property("width").to_number();
+            let height = settings.get_property("height").to_number();
+            let label = track.get_property("label").to_js_string();
+            track.call_method("stop", vec![]);
+            (
+                format!("{label} {width}x{height}"),
+                width > 0.0 && height > 0.0,
+            )
+        }
+        Err(err) => {
+            let honest = matches!(
+                err.as_str(),
+                "NotFoundError" | "NotAllowedError" | "NotReadableError" | "OverconstrainedError"
+            );
+            (err, honest)
+        }
+    };
+    w3cos_runtime::media_devices_web::reset();
+    result
+}
+
 fn main() {
     dom::reset_document();
     jsdom::reset_bridge();
@@ -588,8 +627,10 @@ fn main() {
     row("accelerometer", &sensor_text, sensor_ok);
     let (geo_text, geo_ok) = geolocation_probe();
     row("geolocation", &geo_text, geo_ok);
+    let (camera_text, camera_ok) = camera_probe();
+    row("camera", &camera_text, camera_ok);
 
-    let frame = render_document_rgba_cpu(960, 1080).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 1140).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
