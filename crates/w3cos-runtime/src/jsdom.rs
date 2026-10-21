@@ -19763,7 +19763,7 @@ fn storage_value(persistent: bool) -> Value {
     value
 }
 
-fn crypto_key_class() -> Value {
+pub(crate) fn crypto_key_class() -> Value {
     CRYPTO_KEY_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
@@ -19817,17 +19817,7 @@ fn crypto_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     props.insert(
         "getRandomValues".to_string(),
-        func(|_, args| {
-            let arr = arg(&args, 0);
-            let length = arr.get_property("length").to_u32() as usize;
-            let mut bytes = vec![0u8; length];
-            if getrandom::fill(&mut bytes).is_ok() {
-                for (index, byte) in bytes.into_iter().enumerate() {
-                    arr.set_property(&index.to_string(), Value::Number(byte as f64));
-                }
-            }
-            arr
-        }),
+        func(|_, args| crate::subtle_crypto_web::get_random_values(&arg(&args, 0))),
     );
     props.insert(
         "randomUUID".to_string(),
@@ -19853,73 +19843,7 @@ fn crypto_value() -> Value {
 
 fn subtle_crypto_value() -> Value {
     let mut props = HashMap::new();
-    props.insert(
-        "digest".to_string(),
-        func(|_, args| {
-            let algorithm = arg(&args, 0);
-            let algorithm_name = if algorithm.is_object() {
-                algorithm.get_property("name").to_js_string()
-            } else {
-                algorithm.to_js_string()
-            };
-            let algorithm_name = algorithm_name.to_ascii_uppercase();
-            let algorithm = match algorithm_name.as_str() {
-                "SHA-1" => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-                "SHA-256" => &ring::digest::SHA256,
-                "SHA-384" => &ring::digest::SHA384,
-                "SHA-512" => &ring::digest::SHA512,
-                _ => {
-                    return w3cos_core::promise::reject(vec![
-                        w3cos_core::web::dom_exception_instance(
-                            &format!("Unrecognized digest algorithm: {algorithm_name}"),
-                            "NotSupportedError",
-                        ),
-                    ]);
-                }
-            };
-            let input = arg(&args, 1);
-            let Some(bytes) = w3cos_core::binary::bytes_of(&input) else {
-                return w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
-                    "crypto.subtle.digest() requires an ArrayBuffer or ArrayBufferView",
-                    "TypeError",
-                )]);
-            };
-            let digest = ring::digest::digest(algorithm, &bytes);
-            w3cos_core::promise::resolve(vec![w3cos_core::binary::array_buffer_value(
-                digest.as_ref().to_vec(),
-            )])
-        }),
-    );
-    for method in [
-        "decrypt",
-        "deriveBits",
-        "deriveKey",
-        "encrypt",
-        "exportKey",
-        "generateKey",
-        "importKey",
-        "sign",
-        "unwrapKey",
-        "verify",
-        "wrapKey",
-    ] {
-        props.insert(
-            method.to_string(),
-            func(move |_, _| {
-                static WARNING: std::sync::Once = std::sync::Once::new();
-                WARNING.call_once(|| {
-                    eprintln!(
-                        "[w3cos] warning: crypto.subtle preserves the Web Crypto Promise API, \
-                         but cryptographic operations require a configured native provider"
-                    );
-                });
-                w3cos_core::promise::reject(vec![w3cos_core::web::dom_exception_instance(
-                    &format!("crypto.subtle.{method}() is unavailable"),
-                    "NotSupportedError",
-                )])
-            }),
-        );
-    }
+    crate::subtle_crypto_web::install_methods(&mut props);
     let value = Value::object(props);
     w3cos_core::class::set_prototype_of(
         &value,
@@ -22769,6 +22693,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::eventsource::poll_js_events();
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
+        ran += crate::audio_web::poll_live_outputs();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22925,6 +22850,7 @@ pub fn reset_bridge() {
     crate::platform_host::reset_overrides();
     crate::direct_sockets_web::reset_realm();
     crate::webnn_web::reset_realm();
+    crate::subtle_crypto_web::reset_realm();
     crate::w3cos_extensions::reset_realm();
     crate::close_watcher_web::reset_realm();
     crate::network_information_web::reset_realm();
@@ -24336,6 +24262,566 @@ mod tests {
                 0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e, 0x73, 0x04, 0x33, 0x62,
                 0x93, 0x8b, 0x98, 0x24,
             ]
+        );
+    }
+
+    fn crypto_bytes(bytes: &[u8]) -> Value {
+        w3cos_core::binary::typed_array_value(
+            bytes
+                .iter()
+                .map(|byte| Value::Number(*byte as f64))
+                .collect(),
+        )
+    }
+
+    fn crypto_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn crypto_dict(entries: Vec<(&str, Value)>) -> Value {
+        Value::object(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect(),
+        )
+    }
+
+    fn crypto_usages(usages: &[&str]) -> Value {
+        Value::array(usages.iter().map(|usage| Value::string(usage)).collect())
+    }
+
+    fn crypto_fulfilled(promise: Value) -> Value {
+        match w3cos_core::promise::status(&promise) {
+            Some(w3cos_core::promise::PromiseStatus::Fulfilled(value)) => value,
+            Some(w3cos_core::promise::PromiseStatus::Rejected(error)) => panic!(
+                "promise rejected: {} {}",
+                error.get_property("name").to_js_string(),
+                error.get_property("message").to_js_string()
+            ),
+            _ => panic!("promise is pending"),
+        }
+    }
+
+    fn crypto_rejection(promise: Value) -> String {
+        match w3cos_core::promise::status(&promise) {
+            Some(w3cos_core::promise::PromiseStatus::Rejected(error)) => {
+                error.get_property("name").to_js_string()
+            }
+            _ => panic!("promise did not reject"),
+        }
+    }
+
+    fn subtle() -> Value {
+        window_value().get_property("crypto").get_property("subtle")
+    }
+
+    #[test]
+    fn subtle_crypto_digest_covers_the_sha_family_and_rejects_unknown_hashes() {
+        setup();
+        let cases = [
+            ("SHA-1", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+            (
+                "sha-384",
+                "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+            ),
+            (
+                "SHA-512",
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+            ),
+        ];
+        for (name, expected) in cases {
+            let digest = crypto_fulfilled(
+                subtle().call_method("digest", vec![Value::string(name), crypto_bytes(b"abc")]),
+            );
+            assert_eq!(
+                w3cos_core::binary::bytes_of(&digest).unwrap(),
+                crypto_hex(expected),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            crypto_rejection(
+                subtle().call_method("digest", vec![Value::string("MD5"), crypto_bytes(b"abc")])
+            ),
+            "NotSupportedError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "digest",
+                vec![Value::string("SHA-256"), Value::string("abc")]
+            )),
+            "TypeError"
+        );
+    }
+
+    #[test]
+    fn subtle_crypto_hmac_matches_rfc4231_and_enforces_key_usages() {
+        setup();
+        let algorithm = crypto_dict(vec![
+            ("name", Value::string("HMAC")),
+            ("hash", Value::string("SHA-256")),
+        ]);
+        let key = crypto_fulfilled(subtle().call_method(
+            "importKey",
+            vec![
+                Value::string("raw"),
+                crypto_bytes(b"Jefe"),
+                algorithm.clone(),
+                Value::Bool(true),
+                crypto_usages(&["verify", "sign", "sign"]),
+            ],
+        ));
+        assert!(w3cos_core::class::instance_of(
+            &key,
+            &window_value().get_property("CryptoKey")
+        ));
+        assert_eq!(key.get_property("type").to_js_string(), "secret");
+        assert_eq!(
+            key.get_property("usages")
+                .get_property("length")
+                .to_number(),
+            2.0
+        );
+        assert_eq!(
+            key.get_property("usages").get_property("0").to_js_string(),
+            "sign"
+        );
+        assert_eq!(
+            key.get_property("algorithm")
+                .get_property("hash")
+                .get_property("name")
+                .to_js_string(),
+            "SHA-256"
+        );
+        assert_eq!(
+            key.get_property("algorithm")
+                .get_property("length")
+                .to_number(),
+            32.0
+        );
+        let data = crypto_bytes(b"what do ya want for nothing?");
+        let mac = crypto_fulfilled(subtle().call_method(
+            "sign",
+            vec![Value::string("HMAC"), key.clone(), data.clone()],
+        ));
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&mac).unwrap(),
+            crypto_hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+        );
+        let ok = crypto_fulfilled(subtle().call_method(
+            "verify",
+            vec![
+                Value::string("HMAC"),
+                key.clone(),
+                mac.clone(),
+                data.clone(),
+            ],
+        ));
+        assert!(ok.to_bool());
+        let tampered = crypto_fulfilled(subtle().call_method(
+            "verify",
+            vec![
+                Value::string("HMAC"),
+                key.clone(),
+                mac,
+                crypto_bytes(b"what do ya want for nothing!"),
+            ],
+        ));
+        assert!(!tampered.to_bool());
+
+        let jwk = crypto_fulfilled(
+            subtle().call_method("exportKey", vec![Value::string("jwk"), key.clone()]),
+        );
+        assert_eq!(jwk.get_property("kty").to_js_string(), "oct");
+        assert_eq!(jwk.get_property("k").to_js_string(), "SmVmZQ");
+        assert_eq!(jwk.get_property("alg").to_js_string(), "HS256");
+        let reimported = crypto_fulfilled(subtle().call_method(
+            "importKey",
+            vec![
+                Value::string("jwk"),
+                jwk,
+                algorithm.clone(),
+                Value::Bool(false),
+                crypto_usages(&["verify"]),
+            ],
+        ));
+        assert_eq!(
+            crypto_rejection(
+                subtle().call_method("exportKey", vec![Value::string("raw"), reimported.clone()])
+            ),
+            "InvalidAccessError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "sign",
+                vec![Value::string("HMAC"), reimported, data.clone()],
+            )),
+            "InvalidAccessError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "importKey",
+                vec![
+                    Value::string("raw"),
+                    crypto_bytes(b"Jefe"),
+                    algorithm.clone(),
+                    Value::Bool(true),
+                    crypto_usages(&["encrypt"]),
+                ],
+            )),
+            "SyntaxError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "importKey",
+                vec![
+                    Value::string("raw"),
+                    crypto_bytes(b"Jefe"),
+                    algorithm,
+                    Value::Bool(true),
+                    crypto_usages(&[]),
+                ],
+            )),
+            "SyntaxError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "sign",
+                vec![Value::string("HMAC"), crypto_dict(vec![]), data],
+            )),
+            "TypeError"
+        );
+
+        let generated = crypto_fulfilled(subtle().call_method(
+            "generateKey",
+            vec![
+                crypto_dict(vec![
+                    ("name", Value::string("hmac")),
+                    (
+                        "hash",
+                        crypto_dict(vec![("name", Value::string("SHA-512"))]),
+                    ),
+                ]),
+                Value::Bool(true),
+                crypto_usages(&["sign"]),
+            ],
+        ));
+        assert_eq!(
+            generated
+                .get_property("algorithm")
+                .get_property("length")
+                .to_number(),
+            1024.0
+        );
+        let raw = crypto_fulfilled(
+            subtle().call_method("exportKey", vec![Value::string("raw"), generated]),
+        );
+        assert_eq!(w3cos_core::binary::bytes_of(&raw).unwrap().len(), 128);
+    }
+
+    #[test]
+    fn subtle_crypto_aes_gcm_matches_nist_vector_and_detects_tampering() {
+        setup();
+        let key = crypto_fulfilled(subtle().call_method(
+            "importKey",
+            vec![
+                Value::string("raw"),
+                crypto_bytes(&crypto_hex("feffe9928665731c6d6a8f9467308308")),
+                Value::string("AES-GCM"),
+                Value::Bool(true),
+                crypto_usages(&["encrypt", "decrypt", "wrapKey", "unwrapKey"]),
+            ],
+        ));
+        assert_eq!(
+            key.get_property("algorithm")
+                .get_property("length")
+                .to_number(),
+            128.0
+        );
+        let params = crypto_dict(vec![
+            ("name", Value::string("AES-GCM")),
+            ("iv", crypto_bytes(&crypto_hex("cafebabefacedbaddecaf888"))),
+        ]);
+        let plaintext = crypto_hex(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255",
+        );
+        let ciphertext = crypto_fulfilled(subtle().call_method(
+            "encrypt",
+            vec![params.clone(), key.clone(), crypto_bytes(&plaintext)],
+        ));
+        let expected = crypto_hex(
+            "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f59854d5c2af327cd64a62cf35abd2ba6fab4",
+        );
+        assert_eq!(w3cos_core::binary::bytes_of(&ciphertext).unwrap(), expected);
+        let decrypted = crypto_fulfilled(
+            subtle().call_method("decrypt", vec![params.clone(), key.clone(), ciphertext]),
+        );
+        assert_eq!(w3cos_core::binary::bytes_of(&decrypted).unwrap(), plaintext);
+        let mut tampered = expected.clone();
+        tampered[0] ^= 1;
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "decrypt",
+                vec![params.clone(), key.clone(), crypto_bytes(&tampered)],
+            )),
+            "OperationError"
+        );
+        let with_aad = crypto_dict(vec![
+            ("name", Value::string("AES-GCM")),
+            ("iv", crypto_bytes(&crypto_hex("cafebabefacedbaddecaf888"))),
+            ("additionalData", crypto_bytes(b"header")),
+        ]);
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "decrypt",
+                vec![with_aad, key.clone(), crypto_bytes(&expected)],
+            )),
+            "OperationError"
+        );
+        let short_iv = crypto_dict(vec![
+            ("name", Value::string("AES-GCM")),
+            ("iv", crypto_bytes(&[0; 16])),
+        ]);
+        assert_eq!(
+            crypto_rejection(
+                subtle().call_method("encrypt", vec![short_iv, key.clone(), crypto_bytes(b"x")],)
+            ),
+            "NotSupportedError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "encrypt",
+                vec![
+                    crypto_dict(vec![
+                        ("name", Value::string("AES-CBC")),
+                        ("iv", crypto_bytes(&[0; 16]))
+                    ]),
+                    key.clone(),
+                    crypto_bytes(b"x"),
+                ],
+            )),
+            "NotSupportedError"
+        );
+
+        let generated = crypto_fulfilled(subtle().call_method(
+            "generateKey",
+            vec![
+                crypto_dict(vec![
+                    ("name", Value::string("AES-GCM")),
+                    ("length", Value::Number(256.0)),
+                ]),
+                Value::Bool(true),
+                crypto_usages(&["encrypt", "decrypt"]),
+            ],
+        ));
+        let wrapped = crypto_fulfilled(subtle().call_method(
+            "wrapKey",
+            vec![
+                Value::string("jwk"),
+                generated.clone(),
+                key.clone(),
+                params.clone(),
+            ],
+        ));
+        let unwrapped = crypto_fulfilled(subtle().call_method(
+            "unwrapKey",
+            vec![
+                Value::string("jwk"),
+                wrapped,
+                key,
+                params.clone(),
+                Value::string("AES-GCM"),
+                Value::Bool(true),
+                crypto_usages(&["decrypt"]),
+            ],
+        ));
+        let original = crypto_fulfilled(
+            subtle().call_method("exportKey", vec![Value::string("raw"), generated.clone()]),
+        );
+        let restored = crypto_fulfilled(
+            subtle().call_method("exportKey", vec![Value::string("raw"), unwrapped.clone()]),
+        );
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&original).unwrap(),
+            w3cos_core::binary::bytes_of(&restored).unwrap()
+        );
+        let sealed = crypto_fulfilled(subtle().call_method(
+            "encrypt",
+            vec![params.clone(), generated, crypto_bytes(b"hi")],
+        ));
+        let opened =
+            crypto_fulfilled(subtle().call_method("decrypt", vec![params, unwrapped, sealed]));
+        assert_eq!(w3cos_core::binary::bytes_of(&opened).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn subtle_crypto_pbkdf2_and_hkdf_match_published_vectors() {
+        setup();
+        let password = crypto_fulfilled(subtle().call_method(
+            "importKey",
+            vec![
+                Value::string("raw"),
+                crypto_bytes(b"password"),
+                Value::string("PBKDF2"),
+                Value::Bool(false),
+                crypto_usages(&["deriveBits", "deriveKey"]),
+            ],
+        ));
+        let pbkdf2 = crypto_dict(vec![
+            ("name", Value::string("PBKDF2")),
+            ("hash", Value::string("SHA-256")),
+            ("salt", crypto_bytes(b"salt")),
+            ("iterations", Value::Number(1.0)),
+        ]);
+        let bits = crypto_fulfilled(subtle().call_method(
+            "deriveBits",
+            vec![pbkdf2.clone(), password.clone(), Value::Number(256.0)],
+        ));
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&bits).unwrap(),
+            crypto_hex("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "deriveBits",
+                vec![pbkdf2.clone(), password.clone(), Value::Null],
+            )),
+            "OperationError"
+        );
+        let derived = crypto_fulfilled(subtle().call_method(
+            "deriveKey",
+            vec![
+                pbkdf2,
+                password,
+                crypto_dict(vec![
+                    ("name", Value::string("AES-GCM")),
+                    ("length", Value::Number(128.0)),
+                ]),
+                Value::Bool(true),
+                crypto_usages(&["encrypt"]),
+            ],
+        ));
+        let raw = crypto_fulfilled(
+            subtle().call_method("exportKey", vec![Value::string("raw"), derived]),
+        );
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&raw).unwrap(),
+            crypto_hex("120fb6cffcf8b32c43e7225256c4f837")
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "importKey",
+                vec![
+                    Value::string("raw"),
+                    crypto_bytes(b"password"),
+                    Value::string("PBKDF2"),
+                    Value::Bool(true),
+                    crypto_usages(&["deriveBits"]),
+                ],
+            )),
+            "SyntaxError"
+        );
+
+        let ikm = crypto_fulfilled(subtle().call_method(
+            "importKey",
+            vec![
+                Value::string("raw"),
+                crypto_bytes(&[0x0b; 22]),
+                Value::string("HKDF"),
+                Value::Bool(false),
+                crypto_usages(&["deriveBits"]),
+            ],
+        ));
+        let hkdf = crypto_dict(vec![
+            ("name", Value::string("HKDF")),
+            ("hash", Value::string("SHA-256")),
+            (
+                "salt",
+                crypto_bytes(&crypto_hex("000102030405060708090a0b0c")),
+            ),
+            ("info", crypto_bytes(&crypto_hex("f0f1f2f3f4f5f6f7f8f9"))),
+        ]);
+        let okm = crypto_fulfilled(subtle().call_method(
+            "deriveBits",
+            vec![hkdf.clone(), ikm.clone(), Value::Number(336.0)],
+        ));
+        assert_eq!(
+            w3cos_core::binary::bytes_of(&okm).unwrap(),
+            crypto_hex(
+                "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+            )
+        );
+        assert_eq!(
+            crypto_rejection(
+                subtle().call_method("deriveBits", vec![hkdf, ikm, Value::Number(12.0)],)
+            ),
+            "OperationError"
+        );
+    }
+
+    #[test]
+    fn subtle_crypto_rejects_unimplemented_algorithms_explicitly() {
+        setup();
+        let ecdsa = crypto_dict(vec![
+            ("name", Value::string("ECDSA")),
+            ("namedCurve", Value::string("P-256")),
+        ]);
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "generateKey",
+                vec![ecdsa, Value::Bool(true), crypto_usages(&["sign"])],
+            )),
+            "NotSupportedError"
+        );
+        assert_eq!(
+            crypto_rejection(subtle().call_method(
+                "generateKey",
+                vec![
+                    crypto_dict(vec![
+                        ("name", Value::string("AES-GCM")),
+                        ("length", Value::Number(192.0)),
+                    ]),
+                    Value::Bool(true),
+                    crypto_usages(&["encrypt"]),
+                ],
+            )),
+            "NotSupportedError"
+        );
+    }
+
+    #[test]
+    fn crypto_get_random_values_validates_type_and_quota() {
+        setup();
+        let crypto = window_value().get_property("crypto");
+        let array = crypto_bytes(&[0; 32]);
+        let same = crypto.call_method("getRandomValues", vec![array.clone()]);
+        assert!(same.strict_eq(&array));
+        assert!(
+            w3cos_core::binary::bytes_of(&array)
+                .unwrap()
+                .iter()
+                .any(|b| *b != 0)
+        );
+        let float = w3cos_core::class::construct(
+            &w3cos_core::binary::typed_array_class("Float32Array"),
+            vec![Value::Number(4.0)],
+        );
+        let error = w3cos_core::catch_js(|| crypto.call_method("getRandomValues", vec![float]))
+            .expect_err("Float32Array must be rejected");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "TypeMismatchError"
+        );
+        let huge = crypto_bytes(&vec![0; 65_537]);
+        let error = w3cos_core::catch_js(|| crypto.call_method("getRandomValues", vec![huge]))
+            .expect_err("quota must be enforced");
+        assert_eq!(
+            error.get_property("name").to_js_string(),
+            "QuotaExceededError"
         );
     }
 

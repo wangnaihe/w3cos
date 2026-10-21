@@ -253,6 +253,18 @@ suite is red.
   AudioWorklet ports and deterministic OfflineAudioContext silent rendering.
   Real-time output, compressed decoding, sink selection and worklet processor
   execution remain explicit warning-backed native-adapter boundaries.
+- [x] Render connected Web Audio graphs: oscillator (built-in and
+  `PeriodicWave`), buffer-source (rate, detune, offset, duration, loop),
+  constant-source, gain, stereo-panner and `MediaStreamAudioSourceNode`
+  (live microphone PCM, linear resampling) nodes with speaker up/down-mixing,
+  shared by `OfflineAudioContext.startRendering()` and real-time
+  `AudioContext` output on the default device through cpal (macOS, Windows,
+  Linux desktop).
+- [ ] Render AudioParam automation timelines and AudioParam inputs, and the
+  remaining processing nodes (biquad/IIR, delay, convolver, compressor,
+  wave shaper, panner, analyser data, channel splitter/merger).
+- [ ] Add Android (AAudio) and iOS (AVAudioEngine) output adapters, output
+  device selection (`setSinkId`) and `decodeAudioData`.
 - [x] Implement `ImageDecoder`, `ImageTrack` and `ImageTrackList` over the
   existing native image codecs, including MIME capability queries, static
   PNG/JPEG-family decode, GIF/WebP/APNG frame extraction, repetition/frame
@@ -282,9 +294,16 @@ suite is red.
   command encoder/submission, while retaining explicit warnings for pending
   bind-group/pipeline/pass/canvas descriptor translation.
 - [x] Add WebGL 1/2 contexts, resource identities, shader/program lifecycle,
-  state queries and current Chrome method/constant surfaces. GLSL-to-wgpu
-  translation and draw/upload execution remain a warning-backed renderer
-  boundary.
+  state queries and current Chrome method/constant surfaces.
+- [x] Compile WebGL GLSL ES 1.00/3.00 against the native shader stack: the
+  dialect is rewritten line-preservingly to GLSL 450 and parsed/validated by
+  `naga` (same version as wgpu), so `COMPILE_STATUS`, info logs with original
+  line numbers, `linkProgram` varying/uniform checks, attribute locations,
+  active attribute/uniform introspection, uniform locations, `useProgram`
+  and `getError` are real (`webgl_shader.rs`, `webgl_program.rs`).
+- [ ] WebGL draw/upload execution on the wgpu compositor (buffers, textures,
+  uniform upload, pipelines, `drawArrays`/`drawElements`, `readPixels`),
+  uniform-block introspection, unused-uniform elimination, extensions.
 - [x] Brand the host-backed Web Bluetooth device/GATT server/service/
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`
@@ -583,8 +602,35 @@ precede ecosystem breadth or migration tooling.
 - [x] Provide browser-shaped `MediaStream` and `MediaStreamTrack` lifecycle:
   track enumeration/filtering, add/remove events, clone, stop/ended, live
   `active`, constraints facades, and permission/not-found failures.
-- [ ] Connect host media payloads to preview and capture sinks; the current
-  adapter boundary exposes device/track lifecycle but not frame/audio data.
+- [x] Linux camera platform adapter (V4L2, `platform_host` → `camera_v4l2.rs`):
+  `enumerateDevices()` lists `/dev/video*` capture nodes (one anonymous entry
+  until the `camera` capability is granted, then labels and opaque stable
+  SHA-256 `deviceId`/`groupId`); `getUserMedia({video})` honours
+  `deviceId.exact`/`width`/`height`, requires the `camera` grant, and captures a
+  YUYV/MJPEG frame (mmap streaming) that feeds `getSettings()` and
+  `ImageCapture`. Host-registered devices still take precedence. Physical
+  capture is verified only by the opt-in `W3COS_CAMERA_TESTS=1` test.
+- [ ] Continuous camera frame delivery into `MediaStreamTrackProcessor`,
+  `<video>` preview and `MediaRecorder` (the Linux adapter currently captures a
+  frame when `getUserMedia` resolves); `devicechange` hot-plug events.
+- [x] Desktop microphone adapter (cpal, `audio_input.rs`, macOS / Windows /
+  Linux desktop, gated by `web-media-advanced`): `enumerateDevices()` lists
+  input devices (one anonymous `audioinput` until the `microphone` capability
+  is granted, then labels and opaque stable SHA-256 `deviceId`/`groupId`);
+  `getUserMedia({audio})` requires that grant, honours `deviceId`,
+  `sampleRate` and `channelCount`, and opens a live cpal input stream.
+  `MediaStreamAudioSourceNode` pulls those samples into an `AudioContext` or
+  `OfflineAudioContext` (linear resampling when the rates differ).
+  `echoCancellation`, `noiseSuppression` and `autoGainControl` with
+  `exact: true` reject `OverconstrainedError` because the adapter does not
+  apply them. Host-registered `audioinput` devices still take precedence and
+  carry no PCM. Android, iOS and OHOS have no input adapter. Physical capture
+  is verified only by the opt-in `W3COS_AUDIO_DEVICE_TESTS=1` test.
+- [ ] macOS (AVFoundation), Windows (Media Foundation), Android (Camera2) and
+  iOS camera adapters.
+- [ ] Connect camera frames to preview and `MediaRecorder`. Microphone PCM
+  reaches `MediaStreamAudioSourceNode` but not `MediaStreamTrackProcessor` or
+  an `<audio>` element.
 - [ ] Add photo/evidence capture without product-specific native modules.
 - [ ] Validate camera/microphone denial and interruption on physical devices.
 
@@ -854,6 +900,12 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Add `Crypto`/`SubtleCrypto` identities around secure random generation;
   preserve every SubtleCrypto Promise method with explicit warning and
   `NotSupportedError` rejection until a native cryptographic provider lands.
+- [x] Back SubtleCrypto with `ring` for SHA digests, HMAC, AES-GCM (raw/JWK
+  import/export, encrypt/decrypt, wrap/unwrap) and HKDF/PBKDF2 derivation,
+  with WebCrypto error semantics and published test vectors.
+- [ ] Add asymmetric WebCrypto (ECDSA/ECDH P-256/P-384, Ed25519/X25519,
+  RSA-PSS/OAEP) with `spki`/`pkcs8`/JWK formats, AES-CBC/CTR/KW and
+  `CryptoKey` structured cloning.
 - [x] Add the `DOMStringList` identity and list methods used by
   `Location.ancestorOrigins`.
 - [x] Add the read-only maplike `EventCounts` identity with Chromium's 36

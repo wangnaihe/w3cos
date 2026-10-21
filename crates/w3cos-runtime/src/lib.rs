@@ -1,4 +1,7 @@
 pub mod animations_web;
+pub mod audio_device;
+pub mod audio_input;
+pub mod audio_render;
 pub mod audio_web;
 mod background_image;
 pub mod badging_web;
@@ -170,6 +173,7 @@ pub mod storage_buckets_web;
 pub mod storage_manager_web;
 pub mod streams;
 pub mod streams_web;
+pub mod subtle_crypto_web;
 #[cfg(feature = "skia")]
 mod svg_image_document;
 pub mod svg_renderer;
@@ -197,6 +201,8 @@ pub mod web_share;
 pub mod web_transport_web;
 pub mod webcodecs_web;
 mod webgl_constants_generated;
+pub mod webgl_program;
+pub mod webgl_shader;
 pub mod webgl_web;
 pub mod webgpu_web;
 pub mod webnn_web;

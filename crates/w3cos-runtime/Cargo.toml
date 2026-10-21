@@ -11,8 +11,10 @@ default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-adva
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
-web-graphics-advanced = []
-web-media-advanced = []
+web-graphics-advanced = ["dep:naga"]
+# Includes real-time Web Audio output and microphone capture through cpal
+# on desktop targets.
+web-media-advanced = ["dep:cpal"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
@@ -43,6 +45,8 @@ w3cos-vm = { workspace = true, optional = true }
 url = { workspace = true }
 base64 = { version = "0.22", optional = true }
 ring = "0.17"
+# WebGL GLSL validation uses the same naga as wgpu (web-graphics-advanced).
+naga = { version = "28", features = ["glsl-in"], optional = true }
 psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
@@ -130,6 +134,8 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 # Default `v1` feature: macOS Keychain, Windows Credential Manager, and the
 # Secret Service over D-Bus (the service libsecret talks to) on Linux.
 keyring = "4.2"
+# Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
+cpal = { version = "0.15", optional = true }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
