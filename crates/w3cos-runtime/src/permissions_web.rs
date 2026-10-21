@@ -102,6 +102,7 @@ fn state_for(name: &str) -> Option<String> {
         | "webnn"
         | "file-system"
         | "battery"
+        | "bluetooth"
         | "display-capture"
         | "serial"
         | "hid"
