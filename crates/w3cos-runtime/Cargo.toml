@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
+autobins = false
 
 [features]
 default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]
@@ -230,6 +231,13 @@ hidapi = { version = "2.6.7", optional = true, default-features = false, feature
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
+
+[[bin]]
+name = "w3cos-runtime-bench"
+path = "src/bin/w3cos-runtime-bench.rs"
+# `headless` exists only with a raster backend. Feature-gated package tests
+# such as `dynamic-js` must not compile this bin.
+required-features = ["cpu-render"]
 
 [[example]]
 name = "native_gaps"

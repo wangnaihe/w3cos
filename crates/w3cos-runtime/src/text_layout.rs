@@ -59,14 +59,13 @@ pub(crate) fn authored_line_styles(
     Some(result)
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct TextPaintKey {
-    text: String,
+struct TextPaintSlot {
     max_width: u32,
     line_widths: Vec<u32>,
     font: u64,
     font_size: u32,
     white_space: u8,
+    layout: Rc<TextPaintLayout>,
 }
 
 /// Retained shaped text data shared by CPU and GPU painters. Blink keeps the
@@ -287,7 +286,9 @@ pub struct TextPrepaintRequest {
 
 #[derive(Default)]
 struct TextPaintCache {
-    entries: HashMap<TextPaintKey, Rc<TextPaintLayout>>,
+    /// Keyed by the text alone so a hit does not allocate the key.
+    entries: HashMap<String, Vec<TextPaintSlot>>,
+    len: usize,
 }
 
 thread_local! {
@@ -1433,29 +1434,19 @@ pub fn retained_text_paint_layout_with(
     char_width: impl FnMut(char) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: vec![max_width.to_bits()],
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
-    TEXT_PAINT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, layout.clone());
-    });
-    layout
+    cached_text_paint_layout(
+        text,
+        max_width,
+        &[max_width],
+        font_size,
+        white_space,
+        font_identity,
+        || {
+            let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
 }
 
 pub fn retained_text_paint_layout_with_first_line(
@@ -1468,35 +1459,25 @@ pub fn retained_text_paint_layout_with_first_line(
     char_width: impl FnMut(char) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: vec![first_line_width.to_bits()],
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_char_width_and_first_line(
+    cached_text_paint_layout(
         text,
         max_width,
-        first_line_width,
+        &[first_line_width],
+        font_size,
         white_space,
-        char_width,
-    );
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
-    TEXT_PAINT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, layout.clone());
-    });
-    layout
+        font_identity,
+        || {
+            let lines = wrap_text_with_char_width_and_first_line(
+                text,
+                max_width,
+                first_line_width,
+                white_space,
+                char_width,
+            );
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
 }
 
 pub fn retained_text_paint_layout_with_run_width(
@@ -1508,29 +1489,19 @@ pub fn retained_text_paint_layout_with_run_width(
     run_width: impl FnMut(&str) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: vec![max_width.to_bits()],
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
-    TEXT_PAINT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
-            cache.entries.clear();
-        }
-        cache.entries.insert(key, layout.clone());
-    });
-    layout
+    cached_text_paint_layout(
+        text,
+        max_width,
+        &[max_width],
+        font_size,
+        white_space,
+        font_identity,
+        || {
+            let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
 }
 
 pub fn retained_text_paint_layout_with_run_width_and_first_line(
@@ -1567,33 +1538,82 @@ pub fn retained_text_paint_layout_with_run_width_and_line_widths(
     run_width: impl FnMut(&str) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
-    let key = TextPaintKey {
-        text: text.to_owned(),
-        max_width: max_width.to_bits(),
-        line_widths: line_widths.iter().map(|width| width.to_bits()).collect(),
-        font: font_identity,
-        font_size: font_size.to_bits(),
-        white_space: white_space_key(white_space),
-    };
-    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| cache.borrow().entries.get(&key).cloned()) {
-        return cached;
-    }
-
-    let lines = wrap_text_with_run_width_and_line_widths(
+    cached_text_paint_layout(
         text,
         max_width,
         line_widths,
+        font_size,
         white_space,
-        run_width,
-    );
-    let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
-    let layout = Rc::new(TextPaintLayout { lines, ink_bounds });
+        font_identity,
+        || {
+            let lines = wrap_text_with_run_width_and_line_widths(
+                text,
+                max_width,
+                line_widths,
+                white_space,
+                run_width,
+            );
+            let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
+            TextPaintLayout { lines, ink_bounds }
+        },
+    )
+}
+
+fn cached_text_paint_layout(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    font_size: f32,
+    white_space: WhiteSpace,
+    font_identity: u64,
+    build: impl FnOnce() -> TextPaintLayout,
+) -> Rc<TextPaintLayout> {
+    let max_width_bits = max_width.to_bits();
+    let font_size_bits = font_size.to_bits();
+    let white_space = white_space_key(white_space);
+    if let Some(cached) = TEXT_PAINT_CACHE.with(|cache| {
+        cache.borrow().entries.get(text).and_then(|slots| {
+            slots
+                .iter()
+                .find(|slot| {
+                    slot.max_width == max_width_bits
+                        && slot.font == font_identity
+                        && slot.font_size == font_size_bits
+                        && slot.white_space == white_space
+                        && slot.line_widths.len() == line_widths.len()
+                        && slot
+                            .line_widths
+                            .iter()
+                            .zip(line_widths)
+                            .all(|(bits, width)| *bits == width.to_bits())
+                })
+                .map(|slot| slot.layout.clone())
+        })
+    }) {
+        return cached;
+    }
+
+    let layout = Rc::new(build());
     TEXT_PAINT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.entries.len() >= TEXT_PAINT_CACHE_CAPACITY {
+        if cache.len >= TEXT_PAINT_CACHE_CAPACITY {
             cache.entries.clear();
+            cache.len = 0;
         }
-        cache.entries.insert(key, layout.clone());
+        let slot = TextPaintSlot {
+            max_width: max_width_bits,
+            line_widths: line_widths.iter().map(|width| width.to_bits()).collect(),
+            font: font_identity,
+            font_size: font_size_bits,
+            white_space,
+            layout: layout.clone(),
+        };
+        if let Some(slots) = cache.entries.get_mut(text) {
+            slots.push(slot);
+        } else {
+            cache.entries.insert(text.to_owned(), vec![slot]);
+        }
+        cache.len += 1;
     });
     layout
 }
@@ -1622,7 +1642,11 @@ pub fn prepaint_text_interest_rect(
 }
 
 pub fn clear_paint_cache() {
-    TEXT_PAINT_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+    TEXT_PAINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.entries.clear();
+        cache.len = 0;
+    });
 }
 
 #[cfg(test)]
@@ -1993,7 +2017,7 @@ mod tests {
 
     #[test]
     fn retained_paint_layout_reuses_shaping_for_same_interest_item() {
-        TEXT_PAINT_CACHE.with(|cache| cache.borrow_mut().entries.clear());
+        clear_paint_cache();
         let font = fontdue::Font::from_bytes(
             include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
             fontdue::FontSettings::default(),

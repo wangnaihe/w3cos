@@ -273,6 +273,7 @@ fn patch_and_compute(
         return ok;
     }
     let mut styles = Vec::with_capacity(dirty.len());
+    let mut paint_only = true;
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         if !style_patch_is_safe(&style) {
@@ -285,6 +286,11 @@ fn patch_and_compute(
             if !geometry_only_change(&old, &style) {
                 return false;
             }
+            paint_only &= local_paint_only(&old, &style);
+        } else if let Some(old) = component_style(&cache.component, id.as_u32()) {
+            paint_only &= local_paint_only(old, &style);
+        } else {
+            paint_only = false;
         }
         styles.push((id.as_u32(), style));
     }
@@ -307,6 +313,12 @@ fn patch_and_compute(
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
         }
+    }
+    if paint_only
+        && cache.viewport_w_bits == viewport_w.to_bits()
+        && cache.viewport_h_bits == viewport_h.to_bits()
+    {
+        return true;
     }
     if let Some(rects) = memo_hit {
         restore_rects(&rects);
@@ -782,20 +794,31 @@ fn sync_paint_cache(
     }
     let mut styles = Vec::with_capacity(dirty.len());
     let mut insets_only = true;
+    let mut paint_only = true;
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         let Some(old) = component_style(&cache.component, id.as_u32()) else {
             return false;
         };
-        if !paint_geometry_edit(old, &style) || !style_patch_is_safe(&style) {
+        if !style_patch_is_safe(&style) {
             return false;
         }
-        insets_only &= paint_insets_only(old, &style);
+        if paint_geometry_edit(old, &style) {
+            paint_only = false;
+            insets_only &= paint_insets_only(old, &style);
+        } else if local_paint_only(old, &style) {
+            insets_only = false;
+        } else {
+            return false;
+        }
         styles.push((id.as_u32(), style));
     }
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
             return false;
+        }
+        if paint_only {
+            continue;
         }
         let Some(index) = cache.node_ids.iter().position(|node| node == id) else {
             return false;
@@ -806,6 +829,11 @@ fn sync_paint_cache(
         {
             return false;
         }
+    }
+    if paint_only {
+        cache.cascade = cascade;
+        note_paint_patch();
+        return true;
     }
     let flat = pre_flatten(&cache.component);
     if flat.len() != cache.node_ids.len()
@@ -1101,6 +1129,51 @@ fn paint_geometry_edit(old: &w3cos_std::style::Style, new: &w3cos_std::style::St
     neutralize_paint_geometry(&mut left);
     neutralize_paint_geometry(&mut right);
     left == right
+}
+
+/// Background, opacity, border colors, radii, shadows, outlines, and
+/// `z-index` do not change used boxes. Color and font stay in the comparison
+/// because descendants copy them when the component tree is built.
+fn local_paint_only(old: &w3cos_std::style::Style, new: &w3cos_std::style::Style) -> bool {
+    if old == new {
+        return true;
+    }
+    let mut left = old.clone();
+    let mut right = new.clone();
+    neutralize_local_paint(&mut left);
+    neutralize_local_paint(&mut right);
+    left == right
+}
+
+fn neutralize_local_paint(style: &mut w3cos_std::style::Style) {
+    use w3cos_std::style::OutlineStyle;
+    let clear = w3cos_std::color::Color::BLACK;
+    style.background = clear;
+    style.background_image = None;
+    style.background_size = None;
+    style.background_position = None;
+    style.background_repeat = None;
+    style.background_origin = None;
+    style.background_clip = None;
+    style.background_attachment = None;
+    style.background_blend_mode = None;
+    style.opacity = 1.0;
+    style.border_color = clear;
+    style.border_top_color = None;
+    style.border_right_color = None;
+    style.border_bottom_color = None;
+    style.border_left_color = None;
+    style.border_radius = 0.0;
+    style.border_top_left_radius = None;
+    style.border_top_right_radius = None;
+    style.border_bottom_right_radius = None;
+    style.border_bottom_left_radius = None;
+    style.box_shadow = None;
+    style.box_shadows.clear();
+    style.outline_width = 0.0;
+    style.outline_color = clear;
+    style.outline_style = OutlineStyle::None;
+    style.z_index = 0;
 }
 
 fn neutralize_paint_geometry(style: &mut w3cos_std::style::Style) {
@@ -1547,5 +1620,176 @@ mod paint_layout_tests {
             height > 40.0,
             "the new text must wrap once height is auto, got {height}"
         );
+    }
+
+    fn component_background(component: &Component, id: u32) -> Option<w3cos_std::color::Color> {
+        if host_id(component) == Some(id) {
+            return Some(component.style.background);
+        }
+        component
+            .children
+            .iter()
+            .find_map(|child| component_background(child, id))
+    }
+
+    #[test]
+    fn background_edit_patches_without_rebuilding_layout() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        crate::dom::set_style_property(parent, "display", "flex");
+        let painted = crate::dom::create_element("div");
+        crate::dom::set_style_property(painted, "width", "40px");
+        crate::dom::set_style_property(painted, "height", "20px");
+        crate::dom::set_style_property(painted, "background", "#112233");
+        let sibling = crate::dom::create_element("div");
+        crate::dom::set_style_property(sibling, "width", "40px");
+        crate::dom::set_style_property(sibling, "height", "20px");
+        crate::dom::append_child(parent, painted);
+        crate::dom::append_child(parent, sibling);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+
+        let (rebuilds, _) = paint_layout_stats();
+        let sibling_before = paint_rect(sibling);
+        let (rebuilds_after, patches_after) = paint_layout_stats();
+        assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
+
+        crate::dom::set_style_property(painted, "background", "#abcdef");
+        let sibling_after = paint_rect(sibling);
+        let (rebuilds_bg, patches_bg) = paint_layout_stats();
+        assert_eq!(rebuilds_bg, rebuilds_after, "background must not rebuild");
+        assert_eq!(patches_bg - patches_after, 1, "background patches the tree");
+        assert!(
+            (sibling_before.x - sibling_after.x).abs() < 0.05
+                && (sibling_before.y - sibling_after.y).abs() < 0.05
+                && (sibling_before.width - sibling_after.width).abs() < 0.05
+                && (sibling_before.height - sibling_after.height).abs() < 0.05,
+            "background moved the sibling {sibling_before:?} -> {sibling_after:?}"
+        );
+        let expected = crate::dom::with_document(|document| {
+            document
+                .computed_style_for(NodeId::from_u32(painted))
+                .background
+        });
+        let stored = with_paint_layout(1024.0, 768.0, |component, _| {
+            Ok(component_background(component, painted).expect("painted node"))
+        })
+        .expect("paint");
+        assert_eq!(stored, expected);
+        assert_ne!(expected, w3cos_std::color::Color::BLACK);
+    }
+
+    #[test]
+    fn width_edit_still_relayouts() {
+        crate::dom::reset_document();
+        let node = crate::dom::create_element("div");
+        crate::dom::set_style_property(node, "width", "40px");
+        crate::dom::set_style_property(node, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), node);
+        let before = paint_rect(node);
+        let (rebuilds, _) = paint_layout_stats();
+        crate::dom::set_style_property(node, "width", "120px");
+        let after = paint_rect(node);
+        let fresh = fresh_rect(node);
+        let (rebuilds_after, _) = paint_layout_stats();
+        assert_eq!(rebuilds_after, rebuilds, "width stays on the retained tree");
+        assert!(
+            after.width > before.width + 40.0,
+            "width edit must move the used box {before:?} -> {after:?}"
+        );
+        assert!(
+            (after.x - fresh.x).abs() < 0.05
+                && (after.y - fresh.y).abs() < 0.05
+                && (after.width - fresh.width).abs() < 0.05
+                && (after.height - fresh.height).abs() < 0.05,
+            "width edit {after:?} diverges from full layout {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_color_updates_child_without_own_color() {
+        crate::dom::reset_document();
+        let parent = crate::dom::create_element("div");
+        crate::dom::set_style_property(parent, "color", "red");
+        let child = crate::dom::create_element("span");
+        crate::dom::append_child(parent, child);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let red = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(child)).color
+        });
+        crate::dom::set_style_property(parent, "color", "blue");
+        let blue = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(child)).color
+        });
+        let parent_blue = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(parent)).color
+        });
+        assert_ne!(red, blue, "the child had no color of its own");
+        assert_eq!(blue, parent_blue);
+    }
+
+    #[test]
+    fn local_width_keeps_sibling_class_color() {
+        crate::dom::reset_document();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(".alt", &[("color", "green")]);
+        let parent = crate::dom::create_element("div");
+        let edited = crate::dom::create_element("div");
+        let sibling = crate::dom::create_element("div");
+        crate::dom::set_attribute(edited, "class", "alt");
+        crate::dom::set_attribute(sibling, "class", "alt");
+        crate::dom::append_child(parent, edited);
+        crate::dom::append_child(parent, sibling);
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let before = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(sibling)).color
+        });
+        crate::dom::set_style_property(edited, "width", "80px");
+        let after = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(sibling)).color
+        });
+        let edited_width = crate::dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(edited)).width
+        });
+        w3cos_dom::stylesheet::clear_rules();
+        assert_eq!(before, after);
+        assert_eq!(
+            after,
+            w3cos_std::color::Color::from_css("green").expect("green")
+        );
+        assert_eq!(edited_width, w3cos_std::style::Dimension::Px(80.0));
+    }
+
+    #[test]
+    fn same_class_different_ids_share_style_but_dir_does_not() {
+        crate::dom::reset_document();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::stylesheet::register_rule(".cell", &[("color", "purple"), ("width", "30px")]);
+        let parent = crate::dom::create_element("div");
+        let first = crate::dom::create_element("div");
+        let second = crate::dom::create_element("div");
+        let directed = crate::dom::create_element("div");
+        for (node, id) in [(first, "a"), (second, "b"), (directed, "c")] {
+            crate::dom::set_attribute(node, "class", "cell");
+            crate::dom::set_attribute(node, "id", id);
+            crate::dom::append_child(parent, node);
+        }
+        crate::dom::set_attribute(directed, "dir", "rtl");
+        crate::dom::append_child(crate::dom::body_id(), parent);
+        let (first_style, second_style, directed_style) = crate::dom::with_document(|document| {
+            (
+                document.computed_style_for(NodeId::from_u32(first)),
+                document.computed_style_for(NodeId::from_u32(second)),
+                document.computed_style_for(NodeId::from_u32(directed)),
+            )
+        });
+        w3cos_dom::stylesheet::clear_rules();
+        assert_eq!(first_style.color, second_style.color);
+        assert_eq!(first_style.width, second_style.width);
+        assert_eq!(first_style.direction, second_style.direction);
+        assert_eq!(
+            first_style.color,
+            w3cos_std::color::Color::from_css("purple").expect("purple")
+        );
+        assert_ne!(directed_style.direction, first_style.direction);
     }
 }

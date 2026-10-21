@@ -110,3 +110,57 @@ jobs:
             target/size-audit-browser.json
             target/size-audit-browser.md
             target/size-audit-mobile-skia.json
+
+  # Report-only runtime timings. Absolute microseconds are not a gate: the
+  # job fails only when the harness crashes or a same-run sanity check shows
+  # the incremental edit cost more than four times a full style+layout pass.
+  runtime-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build runtime bench
+        run: cargo build --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --no-default-features --features cpu-render
+      - name: Run runtime bench
+        run: target/runtime-bench/w3cos-runtime-bench --output runtime-bench.json --samples 3
+      - name: Check harness sanity
+        run: |
+          python3 - <<'PY'
+          import json
+          with open("runtime-bench.json") as handle:
+              report = json.load(handle)
+          style = report["style_layout"]
+          width = report["incremental_width"]
+          background = report["incremental_background"]
+          paint = report["paint_scroll"]
+          host = report["host_calls"]
+          assert style["nodes"] >= 5000, style["nodes"]
+          assert style["median_us"] > 0
+          assert width["median_us"] > 0
+          assert background["median_us"] > 0
+          assert width["after_width"] != width["before_width"]
+          assert paint["rows"] >= 200
+          assert paint["first_us"] > 0
+          assert paint["checksum"] != 0
+          assert host["median_ns_per_call"] > 0
+          assert report["startup"]["wall_us"] > 0
+          # Same-runner relative check. A one-node edit that is several times
+          # slower than laying out the whole tree means the harness measured
+          # the wrong work, not a noisy clock.
+          limit = style["median_us"] * 4
+          assert width["median_us"] < limit, (width["median_us"], limit)
+          assert background["median_us"] < limit, (background["median_us"], limit)
+          print("runtime bench sanity ok")
+          PY
+      - name: Upload runtime bench report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-bench
+          path: runtime-bench.json
