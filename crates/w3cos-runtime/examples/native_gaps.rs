@@ -7,8 +7,9 @@
 //! when this host has no usable camera), an application shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
-//! session has no status watcher), display capture, a TCP echo, and a WebNN
-//! add.
+//! session has no status watcher), display capture, Web Serial (permission
+//! or adapter rejection, then `NotFoundError` for a filter that matches
+//! nothing), a TCP echo, and a WebNN add.
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
@@ -310,6 +311,10 @@ fn main() {
     w3cos_extensions::reset_realm();
 
     let namespace = namespace_value();
+    let serial_before = await_value(
+        w3cos_runtime::device_access_web::serial_value().call_method("requestPort", vec![]),
+    );
+
     let denied = await_value(namespace.get_property("process").call_method(
         "exec",
         vec![Value::object(HashMap::from([(
@@ -328,6 +333,7 @@ fn main() {
         "direct-sockets",
         "webnn",
         "w3cos-keyring",
+        "serial",
     ] {
         capability_gate::grant(name);
     }
@@ -390,6 +396,18 @@ fn main() {
     if let Ok(handle) = &tray {
         let _ = await_value(handle.call_method("remove", vec![]));
     }
+    let serial_after = await_value(
+        w3cos_runtime::device_access_web::serial_value().call_method(
+            "requestPort",
+            vec![Value::object(HashMap::from([(
+                "filters".into(),
+                Value::array(vec![Value::object(HashMap::from([
+                    ("usbVendorId".into(), Value::Number(65535.0)),
+                    ("usbProductId".into(), Value::Number(65535.0)),
+                ]))]),
+            )]))],
+        ),
+    );
     let capture = await_value(
         namespace
             .get_property("agent")
@@ -487,6 +505,22 @@ fn main() {
         Err(err) => err.clone(),
     };
     row("capture", &capture_text, capture.is_ok());
+    let serial_before_text = match &serial_before {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    let serial_after_text = match &serial_after {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    row(
+        "serial",
+        &format!("{serial_before_text} / {serial_after_text}"),
+        matches!(
+            serial_before_text.as_str(),
+            "NotAllowedError" | "NotFoundError"
+        ) && serial_after_text == "NotFoundError",
+    );
     row(
         "tcp echo",
         &tcp.clone().unwrap_or_else(|err| err),
