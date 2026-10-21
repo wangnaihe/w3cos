@@ -564,9 +564,14 @@ precede ecosystem breadth or migration tooling.
   host-unavailable errors and host-injectable idle/screen state. Native idle
   sampling and screen-color picking emit one-time compatibility warnings.
 - [x] Expose Gamepad (`navigator.getGamepads()`, `Gamepad`, `GamepadButton`,
-  `GamepadEvent`) with stable indexed snapshots, axes/buttons, trusted
-  connect/disconnect events and a host update entry point. Physical controller
-  discovery requires a platform gamepad adapter and emits a warning.
+  `GamepadEvent`) with event-loop snapshots from a gilrs side thread on macOS,
+  Windows and Linux desktop (`web-gamepad`). Recognized controllers use the
+  W3C `standard` mapping (17 buttons, 4 axes); unrecognized controllers keep
+  mapping `""`. Trusted connect/disconnect events fire after a gamepad user
+  gesture. `dual-rumble` uses gilrs force feedback where the device supports
+  it and otherwise rejects `NotSupportedError` with a warning. Android, iOS
+  and OHOS keep host-injectable snapshots and the compatible haptic completion
+  warning. Linux links libudev.
 - [x] Expose Device Orientation and Motion (`DeviceOrientationEvent`,
   `DeviceMotionEvent`, acceleration and rotation-rate value identities) with
   standard fields/identity, permission-gated trusted window events, Permissions

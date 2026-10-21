@@ -10,13 +10,13 @@
 //! open), a system-tray adapter (or an honest `NotSupportedError` when the
 //! session has no status watcher), display capture, Web Serial (permission
 //! or adapter rejection, then `NotFoundError` for a filter that matches
-//! nothing), a TCP echo, and a WebNN add.
+//! nothing), a TCP echo, a WebNN add, and Gamepad enumeration through the
+//! desktop adapter (or the host snapshot path).
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render,web-sensors,web-bluetooth
-//! # Optional: add web-device-access to print live hidapi/nusb summaries.
+//!   --no-default-features --features cpu-render,web-sensors,web-bluetooth,web-gamepad,web-device-access,web-serial
 //! # The probe does not grant hid/usb, so requestDevice must not succeed.
 //! ```
 
@@ -68,6 +68,29 @@ fn await_value(promise: Value) -> Result<Value, String> {
         return Err(error);
     }
     ok.borrow().clone().ok_or_else(|| "unresolved".into())
+}
+
+fn gamepad_probe() -> (String, bool) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w3cos_runtime::gamepad_web::get_gamepads_value().call(Value::Undefined, vec![])
+    }));
+    match result {
+        Ok(list) => {
+            let backend = w3cos_runtime::gamepad_web::platform_backend_name();
+            let length = list.get_property("length").to_u32();
+            let mut connected = 0u32;
+            for index in 0..length {
+                if !list.get_property(&index.to_string()).is_null() {
+                    connected += 1;
+                }
+            }
+            (
+                format!("{backend} connected {connected}"),
+                backend != "gilrs-unavailable",
+            )
+        }
+        Err(_) => ("call failed".into(), false),
+    }
 }
 
 fn row(label: &str, detail: &str, ok: bool) {
@@ -568,6 +591,8 @@ fn main() {
         &webnn.clone().unwrap_or_else(|err| err),
         webnn.as_deref() == Ok("4,6"),
     );
+    let (gamepad_text, gamepad_ok) = gamepad_probe();
+    row("gamepad", &gamepad_text, gamepad_ok);
     row("hid", &hid.0, hid.1);
     row("usb", &usb.0, usb.1);
     let (sensor_text, sensor_ok) = sensor_probe();
@@ -577,7 +602,7 @@ fn main() {
     let (camera_text, camera_ok) = camera_probe();
     row("camera", &camera_text, camera_ok);
 
-    let frame = render_document_rgba_cpu(960, 1100).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 1160).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

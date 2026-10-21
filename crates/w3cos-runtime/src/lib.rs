@@ -70,6 +70,12 @@ pub mod fs;
     not(target_env = "ohos")
 ))]
 pub mod fs_watch;
+#[cfg(all(
+    feature = "web-gamepad",
+    any(target_os = "macos", target_os = "windows", target_os = "linux"),
+    not(target_env = "ohos")
+))]
+mod gamepad_gilrs;
 pub mod gamepad_web;
 pub mod geolocation_web;
 pub mod geometry_web;

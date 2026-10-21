@@ -19681,6 +19681,7 @@ pub fn set_document_visibility(state: &str) -> bool {
         return true;
     }
     crate::observers_web::record_visibility_state(state, performance_now());
+    crate::gamepad_web::on_document_visibility(state);
     let event = w3cos_core::class::construct(
         &crate::web_events::event_class(),
         vec![Value::string("visibilitychange")],
@@ -22720,6 +22721,7 @@ pub fn drain_microtasks() -> usize {
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
+        ran += crate::gamepad_web::poll();
         ran += crate::serial_web::poll_serial_io();
         ran += crate::device_access_web::poll_device_events();
         ran += crate::sensors_web::poll_platform_samples();
