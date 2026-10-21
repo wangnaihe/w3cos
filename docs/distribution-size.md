@@ -162,9 +162,12 @@ reported only; codec selection is a separate change. `web-bluetooth` is off
 in both probes, and its `btleplug` symbol bucket is 0.
 
 Moving `navigator.w3cos.tray` and `navigator.w3cos.keyring` behind `host-tray`
-and `host-keyring` removed them from both probes. The runtime default set and
-the desktop shell still enable both features, and the shell also enables
-`web-bluetooth`. Measured on this same toolchain and strip, before that
+and `host-keyring` removed them from both probes. The runtime `default`
+feature set and `w3cos-shell` still enable both, and the shell also enables
+`web-bluetooth`. A generated app uses `default-features = false`, so it
+enables them with `W3COS_RUNTIME_FEATURES=host-tray,host-keyring` or by
+listing those Cargo features. Without the feature the call rejects
+`NotSupportedError`. Measured on this same toolchain and strip, before that
 bluetooth code was in the tree, ordinary AOT fell from 12,814,744 to
 11,884,064 bytes (930,680 bytes, 7.26%) and its gzip proxy from 5,497,725 to
 5,100,001. The browser probe fell from 16,621,992 to 15,694,896 bytes

@@ -15,6 +15,11 @@
 //! an error. Callers reject that error. They do not report a successful
 //! icon that was never installed. Tests install an in-memory recorder so
 //! the JavaScript behavior can run without a display.
+//!
+//! The desktop adapter is the `host-tray` feature. It is part of the crate
+//! `default` set and of `w3cos-shell`. Builds with `default-features = false`
+//! leave it off unless the feature is named explicitly
+//! (`W3COS_RUNTIME_FEATURES=host-tray` for a generated app).
 
 use std::cell::RefCell;
 use std::collections::HashMap;

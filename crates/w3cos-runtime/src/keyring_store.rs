@@ -10,6 +10,11 @@
 //! Credential Manager on Windows. There is no file fallback. A missing or
 //! unreachable store rejects the call. Tests install an in-memory store and
 //! never open the host keyring.
+//!
+//! The desktop adapter is the `host-keyring` feature. It is part of the crate
+//! `default` set and of `w3cos-shell`. Builds with `default-features = false`
+//! leave it off unless the feature is named explicitly
+//! (`W3COS_RUNTIME_FEATURES=host-keyring` for a generated app).
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};

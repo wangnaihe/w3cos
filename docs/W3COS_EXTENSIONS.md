@@ -233,6 +233,16 @@ rejects. `tray.show`, `tray.setMenu`, and the `keyring` methods are real.
   when a shortcut is registered, so an empty registry does not touch the
   input hot path. The OS thread queues accelerator strings;
   `flush_global_shortcuts()` delivers them on the JavaScript thread.
+- `navigator.w3cos.tray` and `navigator.w3cos.keyring` stay available as
+  explicit `w3cos-runtime` features. `host-tray` and `host-keyring` are in
+  the crate `default` set and in `w3cos-shell`
+  (`features = ["web-sensors", "web-bluetooth", "host-tray", "host-keyring"]`).
+  Ordinary AOT, the size probes, and generated apps use
+  `default-features = false` and leave both off, so the call rejects
+  `NotSupportedError` and does not link `ksni`, `tray-icon`, or `keyring`.
+  Turn them back on for a generated app with
+  `W3COS_RUNTIME_FEATURES=host-tray,host-keyring`, or by adding those names
+  to the runtime `features` list.
 - `tray.show({ tooltip, title, menu, icon })` installs a status item and
   returns a handle. `update` changes that item. `setMenu` replaces its
   menu; the namespace method updates the most recently shown icon that is
