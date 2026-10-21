@@ -8,6 +8,22 @@ description = "Linkage probes for reproducible W3COS AOT and dynamic-browser siz
 
 [features]
 browser = ["w3cos-runtime/dynamic-js"]
+mobile-skia = [
+    "w3cos-runtime/skia",
+    "w3cos-runtime/image-png",
+    "w3cos-runtime/image-jpeg",
+    "w3cos-runtime/image-webp",
+]
+mobile-legacy = [
+    "w3cos-runtime/cpu-render",
+    "w3cos-runtime/skia",
+    "w3cos-runtime/image-png",
+    "w3cos-runtime/image-jpeg",
+    "w3cos-runtime/image-webp",
+    "w3cos-runtime/image-gif",
+    "w3cos-runtime/image-bmp",
+    "w3cos-runtime/image-ico",
+]
 
 [dependencies]
 w3cos-core = { workspace = true }
@@ -21,3 +37,13 @@ path = "src/aot.rs"
 name = "w3cos-browser-size-probe"
 path = "src/browser.rs"
 required-features = ["browser"]
+
+[[bin]]
+name = "w3cos-mobile-skia-size-probe"
+path = "src/mobile_skia.rs"
+required-features = ["mobile-skia"]
+
+[[bin]]
+name = "w3cos-mobile-legacy-size-probe"
+path = "src/mobile_legacy.rs"
+required-features = ["mobile-legacy"]

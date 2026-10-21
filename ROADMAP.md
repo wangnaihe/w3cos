@@ -2979,9 +2979,17 @@ W3COS.
 
 ### Standalone iOS/Android model
 - [ ] Produce capability-driven runtime feature sets; applications link only the APIs and subsystems reachable from their manifest/build graph
-- [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
-- [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
-- [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+- [x] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
+  - Generated iOS, Android, and Harmony manifests enable `skia`, or `gpu` plus `web-graphics-advanced` when the application references WebGPU/WebGL/WebXR. `cpu-render` (tiny-skia and softbuffer) is not combined with that primary backend.
+  - `scripts/check-mobile-renderer-boundary.sh` rejects a Skia closure containing softbuffer, vello, wgpu, ravif, or rav1e, and a GPU closure containing skia-safe or softbuffer. resvg's transitive tiny-skia crate is not a second presenter.
+  - Linux x86_64 host linkage, rustc 1.99.1, `release-size`, stripped, same DOM/jsdom touch: 12,796,192 bytes with no renderer, and 16,057,800 bytes with Skia plus PNG/JPEG/WebP (+3,261,608 bytes). The Skia probe links libstdc++ and Skia objects and has no vello, wgpu, or softbuffer strings. This is not an Android ABI split or an iOS device slice.
+- [x] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
+  - `assets/CJK-Subset.ttf` is 10,028,840 bytes and is `include_bytes!` only for tests and the explicit `embed-cjk-font` feature. Web codegen copies it only when `CompileOptions.embed_cjk_font` or `W3COS_EMBED_CJK_FONT` opts in.
+  - Production fallback uses fontconfig, then Android `AFontMatcher`, Apple Core Text, or the Windows `NONCLIENTMETRICS` UI face, then named families and a directory scan. A missing CJK face warns once and is not drawn. With no system font at all, `host_ui_font` still panics unless a non-test build enabled `embed-cjk-font`.
+  - The probes above do not enable `embed-cjk-font`, and neither binary contains that subset.
+- [x] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+  - The workspace `image` crate is `default-features = false`. Raster formats are explicit `w3cos-runtime` features. Generated iOS, Android, and Harmony manifests enable `image-png`, `image-jpeg`, and `image-webp` only.
+  - The runtime crate default, desktop generated apps, shell, demo, rn-compat, and the WPT runner still enable `image-gif`, `image-bmp`, and `image-ico` so existing desktop decode paths keep working.
   - [x] Remove the unused AVIF encoder (`ravif`/`rav1e`) from the ordinary
     raster closure and retain it as explicit `image-avif-encode` capability.
     AVIF decoding is a separate native-decoder boundary.
@@ -3011,6 +3019,12 @@ W3COS.
     parses HTML and executes SWC → W3IR → W3VM while retaining the network
     loader, WOFF/WOFF2 decoder and configurable persistent-cache/retry path, a
     1,065,632-byte (17.52%) dynamic increment.
+  - [x] The 2026-10-21 Linux x86_64 `release-size` probes (rustc 1.99.1,
+    stripped) measure 12,839,200 bytes for ordinary DOM/jsdom AOT at
+    `ff70045` and 12,796,192 bytes after moving raster codecs onto explicit
+    features (-43,008 bytes; LTO had already dropped unreferenced decoders).
+    The same DOM touch plus Skia and PNG/JPEG/WebP is 16,057,800 bytes.
+    CI builds that Skia probe and audits it with `--profile runtime`.
   - Product gates still need Android ABI-split and iOS App Store device-slice artifacts
 - [ ] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
 - [ ] Track the current full-runtime Monaco artifact as a baseline (about 172 MB unstripped / 120 MB fully stripped on arm64 macOS); replace it with reproducible per-feature baselines

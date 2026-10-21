@@ -121,6 +121,50 @@ compiler, W3IR, W3VM, dynamic loader, and WOFF/WOFF2 decoder. These are host
 linkage lower bounds, not mobile product-package baselines: neither includes a renderer, packaged fonts,
 application assets, ABI packaging overhead, or platform native libraries.
 
+### Linux host probes for the standalone mobile closure (2026-10-21)
+
+Same machine, `x86_64-unknown-linux-gnu`, rustc 1.99.1
+(`58cf8f9c3 2026-10-13`), `--profile release-size`, symbols stripped. Each
+probe touches DOM/jsdom through `document.body.setAttribute` /
+`getAttribute`. Byte counts are `stat` of the ELF, not a compressed package
+and not an Android ABI split or iOS device slice. Shared libraries reported
+by `ldd` are outside the executable.
+
+| Probe | Features beyond the DOM touch | Bytes | `size` text / data / bss |
+| --- | --- | ---: | --- |
+| Ordinary AOT at `ff70045` | none (workspace `image` features were still unconditional; the probe never calls a decoder) | 12,839,200 | not re-sectioned |
+| Ordinary AOT after explicit codecs | none (`image` is `default-features = false`; no renderer) | 12,796,192 | 12,138,773 / 651,176 / 22,920 |
+| `mobile-skia` | `skia`, `image-png`, `image-jpeg`, `image-webp`, plus `distribution_linkage_anchor` | 16,057,800 | 15,284,451 / 769,080 / 28,189 |
+| `mobile-legacy` (diagnostic, not a generated mobile manifest and not a CI build) | `mobile-skia` plus `cpu-render`, `image-gif`, `image-bmp`, `image-ico` | 16,114,328 | 15,337,927 / 772,208 / 29,141 |
+
+The ordinary AOT executable shrank by 43,008 bytes. Fat LTO had already
+discarded unreferenced decoder code at `ff70045`, so this delta is the
+feature-gated residue, not a claim that PNG/JPEG/WebP previously occupied
+megabytes of the AOT probe. Adding Skia and those three decoders, and calling
+them from the anchor, costs 3,261,608 bytes over the after-AOT probe (text
++3,145,678, data +117,904).
+
+The Skia probe's dynamic dependencies add `libstdc++`, `libfontconfig`,
+`libfreetype`, and `libpng16` on top of the AOT probe's `libsqlite3`,
+`libX11`, and `libXss`. Its strings include Skia `.cpp` paths and the PNG,
+JPEG, and WebP decoders. They do not include `vello`, `wgpu`, `softbuffer`,
+`tiny-skia`, `ravif`, `rav1e`, or `CJK-Subset`. `assets/CJK-Subset.ttf` on
+disk is 10,028,840 bytes and is not linked unless `embed-cjk-font` is on.
+16,057,800 bytes is under the 60 MiB `runtime` budget for this host probe.
+That does not close the per-ABI product gate.
+
+`mobile-legacy` is 56,528 bytes larger than `mobile-skia` (text +53,476, data
++3,128). Strings that appear only in that binary include `gif` 0.14.2 and
+`image` `codecs/bmp/decoder.rs`, plus the anchor label `cpu:`. `softbuffer`
+and `tiny-skia` path strings are absent: the probe constructs an 8x8 pixmap
+and the extra decoders, and fat LTO drops the unused software presenter.
+56,528 bytes is that residue, not the cost of a second full renderer. Generated
+mobile manifests do not enable this combination.
+
+CI builds `w3cos-mobile-skia-size-probe` with `--features mobile-skia` and
+`--profile release-size`, requires stdout `mobile-skia`, and audits it with
+`w3cos-size-audit --profile runtime`.
+
 Mobile release gates must audit an Android App Bundle device/ABI split and an iOS
 App Store device slice. Universal simulator builds are diagnostic only and must
 not become product baselines.

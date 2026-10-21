@@ -630,12 +630,7 @@ mod x11 {
             XDestroyImage(ximage);
         }
         check_error(&display, "XGetImage")?;
-        let mut png = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut png);
-        use image::ImageEncoder;
-        encoder
-            .write_image(&rgba, out_w, out_h, image::ExtendedColorType::Rgba8)
-            .map_err(|err| format!("PNG encode failed: {err}"))?;
+        let png = crate::frame_cache::encode_rgba_png(out_w, out_h, &rgba)?;
         Ok(CapturedImage {
             width: out_w,
             height: out_h,

@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-bluetooth"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-bluetooth", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -41,6 +41,16 @@ web-bluetooth = ["dep:btleplug", "dep:tokio", "dep:uuid", "dep:futures"]
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
 image-avif-encode = ["image/avif"]
+# Required standalone raster set. Desktop defaults also opt into GIF/BMP/ICO.
+image-png = ["image/png"]
+image-jpeg = ["image/jpeg"]
+image-webp = ["image/webp"]
+image-gif = ["image/gif"]
+image-bmp = ["image/bmp"]
+image-ico = ["image/ico"]
+# Package assets/CJK-Subset.ttf (about 9.6 MiB). Leave this off so standalone
+# apps use the platform font API and warn when no CJK face is installed.
+embed-cjk-font = []
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
 # Compile the desktop into this cdylib so /usr/bin/w3cos-shell can dlopen one runtime.
@@ -80,7 +90,7 @@ rustybuzz = { version = "=0.20.1", optional = true }
 unicode-ccc = { version = "=0.4.0", optional = true }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, default-features = false }
 flate2 = { workspace = true }
 encoding_rs = { workspace = true }
 wuff = { workspace = true, optional = true }

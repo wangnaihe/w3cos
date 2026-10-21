@@ -513,18 +513,23 @@ fn mobile_runtime_features(
     options: &CompileOptions,
     capabilities: MobileRuntimeCapabilities,
 ) -> Vec<&'static str> {
-    // The mobile window path presents through Skia Metal/Vulkan. The current
-    // presenter is hosted by the cpu-render window owner, so both features are
-    // required while Vello/WGPU remains opt-in for WebGPU/WebGL/WebXR usage.
-    let mut features = vec!["cpu-render", "skia"];
-    if capabilities.web_graphics_advanced {
-        features.extend(["gpu", "web-graphics-advanced"]);
-    }
+    // Exactly one primary renderer. Skia Metal/Vulkan is the mobile default.
+    // WebGPU/WebGL/WebXR draws on the wgpu compositor, so that artifact links
+    // gpu instead of Skia. cpu-render (tiny-skia + softbuffer) stays off.
+    let mut features = if capabilities.web_graphics_advanced {
+        vec!["gpu", "web-graphics-advanced"]
+    } else {
+        vec!["skia"]
+    };
+    features.extend(crate::codegen::MOBILE_IMAGE_FEATURES);
     if capabilities.web_media_advanced {
         features.push("web-media-advanced");
     }
     if options.devtools {
         features.push("devtools");
+    }
+    if crate::codegen::embed_cjk_font_enabled(options) {
+        features.push("embed-cjk-font");
     }
     features
 }
@@ -623,11 +628,14 @@ winit = {{ version = "0.30", features = ["android-native-activity"] }}
 
 pub fn generate_harmony_cargo_toml(options: &CompileOptions) -> Result<String> {
     let root = find_workspace_root()?;
-    let runtime_features = if options.devtools {
-        r#"["skia", "devtools"]"#
-    } else {
-        r#"["skia"]"#
-    };
+    let runtime_features = format!(
+        "[{}]",
+        mobile_runtime_features(options, MobileRuntimeCapabilities::default())
+            .into_iter()
+            .map(|feature| format!("{feature:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     Ok(format!(
         r#"[package]
 name = "w3cos-mobile-app"
@@ -719,7 +727,7 @@ pub fn run_entry() { m0::init(); m1::init(); }\n";
         ] {
             assert!(manifest.contains(r#"w3cos-runtime = { path = "#));
             assert!(manifest.contains(
-                r#"default-features = false, features = ["cpu-render", "skia", "devtools"]"#
+                r#"default-features = false, features = ["skia", "image-png", "image-jpeg", "image-webp", "devtools"]"#
             ));
             assert!(!manifest.contains(r#"features = ["gpu""#));
             assert!(manifest.contains("[profile.release]"));
@@ -741,7 +749,9 @@ pub fn run_entry() { m0::init(); m1::init(); }\n";
         .unwrap();
 
         assert!(manifest.contains(
-            r#"features = ["cpu-render", "skia", "gpu", "web-graphics-advanced", "web-media-advanced"]"#
+            r#"features = ["gpu", "web-graphics-advanced", "image-png", "image-jpeg", "image-webp", "web-media-advanced"]"#
         ));
+        assert!(!manifest.contains("cpu-render"));
+        assert!(!manifest.contains("\"skia\""));
     }
 }
