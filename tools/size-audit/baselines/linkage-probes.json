@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "threshold": {
+    "max_regression_percent": 3.0,
+    "max_regression_bytes": 204800
+  },
+  "probes": {
+    "aot": {
+      "description": "Ordinary DOM/jsdom AOT linkage. No default runtime features and no dynamic-js.",
+      "features": [],
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "total_bytes": 11884064,
+          "text_bytes": 7720216,
+          "data_bytes": 3349233,
+          "readonly_data_bytes": 2709441,
+          "gzip_bytes": 5100001,
+          "embedded_bytes": 0,
+          "feature_symbol_bytes": {
+            "cpu-render": 0,
+            "dynamic-js": 0,
+            "gpu": 0,
+            "host-keyring": 0,
+            "host-tray": 0,
+            "image-codecs": 17072,
+            "skia": 0,
+            "web-device-access": 0,
+            "web-gamepad": 0,
+            "web-graphics-advanced": 0,
+            "web-media-advanced": 0,
+            "web-serial": 0
+          },
+          "note": "Initial x86_64-unknown-linux-gnu release-size rows. host-tray and host-keyring are explicit features and are not in these ordinary AOT or dynamic-browser probes."
+        }
+      }
+    },
+    "browser": {
+      "description": "Dynamic browser linkage: ordinary AOT plus SWC, W3IR, W3VM, the network script loader, and WOFF/WOFF2.",
+      "features": [
+        "dynamic-js"
+      ],
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "total_bytes": 15694896,
+          "text_bytes": 10198344,
+          "data_bytes": 4466917,
+          "readonly_data_bytes": 3634705,
+          "gzip_bytes": 6832141,
+          "embedded_bytes": 0,
+          "feature_symbol_bytes": {
+            "cpu-render": 0,
+            "dynamic-js": 686785,
+            "gpu": 0,
+            "host-keyring": 0,
+            "host-tray": 0,
+            "image-codecs": 435725,
+            "skia": 0,
+            "web-device-access": 0,
+            "web-gamepad": 0,
+            "web-graphics-advanced": 0,
+            "web-media-advanced": 0,
+            "web-serial": 0
+          },
+          "note": "Initial x86_64-unknown-linux-gnu release-size rows. host-tray and host-keyring are explicit features and are not in these ordinary AOT or dynamic-browser probes."
+        }
+      }
+    }
+  },
+  "retired": [
+    {
+      "name": "monaco-full-runtime-arm64-macos",
+      "status": "retired",
+      "reason": "The single about-172-MB-unstripped / about-120-MB-stripped arm64 macOS Monaco artifact mixed application modules with every default runtime feature and is not a same-runner measurement. CI tracks per-closure linkage baselines in this file instead. Render, font, and image-codec product slices are outside this gate."
+    }
+  ]
+}
