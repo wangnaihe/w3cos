@@ -7,7 +7,7 @@ license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-sensors"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-sensors", "web-geolocation"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
@@ -21,6 +21,18 @@ web-media-advanced = ["dep:cpal"]
 # NotReadableError instead of inventing samples. Host injection still works
 # when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
 web-sensors = []
+# Desktop `navigator.geolocation` on a dedicated thread. Linux uses GeoClue2
+# through zbus (no extra system libraries). macOS uses CoreLocation and Windows
+# uses Windows.Devices.Geolocation. iOS, Android, and OHOS stay unavailable.
+# Host `update_position` still works when the feature is off. Unit tests do not
+# open a real provider unless W3COS_GEOLOCATION_DEVICE_TESTS=1.
+web-geolocation = [
+    "dep:zbus",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-core-location",
+    "dep:windows",
+]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
@@ -106,6 +118,11 @@ winit = { workspace = true }
 skia-safe = { version = "=0.93.1", optional = true, features = ["metal"] }
 security-framework = "3.7"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.3", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSObject"] }
+objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.5.2"
 block2_05 = { package = "block2", version = "=0.5.1" }
@@ -147,6 +164,13 @@ cpal = { version = "0.15", optional = true }
 # NSStatusItem and Windows uses Shell_NotifyIcon inside the same crate.
 # The default `libappindicator` feature links GTK and is intentionally off.
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+
+# GeoClue2 over the system bus. Pure Rust; Linux CI does not need libdbus.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+zbus = { version = "5", optional = true, default-features = false, features = ["blocking-api"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", optional = true, features = ["Devices_Geolocation", "Foundation"] }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
