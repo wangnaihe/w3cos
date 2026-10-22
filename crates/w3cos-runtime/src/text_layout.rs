@@ -1085,6 +1085,18 @@ pub fn text_intrinsic_size_font(
     wrap_width: f32,
     font: &fontdue::Font,
 ) -> (f32, f32) {
+    if let Some(measured) = fast_text_intrinsic_size(content, style, wrap_width, font) {
+        return measured;
+    }
+    text_intrinsic_size_font_slow(content, style, wrap_width, font)
+}
+
+fn text_intrinsic_size_font_slow(
+    content: &str,
+    style: &Style,
+    wrap_width: f32,
+    font: &fontdue::Font,
+) -> (f32, f32) {
     let inner_w =
         (wrap_width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
@@ -1115,6 +1127,18 @@ pub fn wrapped_block_height_font(
     style: &Style,
     font: &fontdue::Font,
 ) -> f32 {
+    if let Some(height) = fast_wrapped_block_height(content, width, style, font) {
+        return height;
+    }
+    wrapped_block_height_font_slow(content, width, style, font)
+}
+
+fn wrapped_block_height_font_slow(
+    content: &str,
+    width: f32,
+    style: &Style,
+    font: &fontdue::Font,
+) -> f32 {
     let inner_w = (width - style.padding_lengths().left - style.padding_lengths().right).max(1.0);
     let lines = wrap_text_font(content, inner_w, style.font_size, font, style.white_space);
     let line_h = crate::layout::inline_style_line_height(&style);
@@ -1139,21 +1163,10 @@ pub fn single_line_vertical_metrics(
     let mut top = f32::MAX;
     let mut bottom = f32::MIN;
     for character in text.chars() {
-        if is_non_rendering_format_character(character) {
+        let Some((char_top, char_bottom)) = glyph_vertical_extent(character, font_size, font)
+        else {
             continue;
-        }
-        let ch = font_glyph_character(character);
-        if !font.chars().contains_key(&ch) {
-            top = top.min(-font_size * 0.88);
-            bottom = bottom.max(font_size * 0.12);
-            continue;
-        }
-        let m = font.metrics(ch, font_size);
-        if m.width == 0 && m.height == 0 {
-            continue;
-        }
-        let char_top = -(m.height as f32) - m.ymin as f32;
-        let char_bottom = -m.ymin as f32;
+        };
         top = top.min(char_top);
         bottom = bottom.max(char_bottom);
     }
@@ -1162,6 +1175,167 @@ pub fn single_line_vertical_metrics(
     } else {
         (top, bottom)
     }
+}
+
+thread_local! {
+    /// Per-ASCII vertical extents for one (font, em, size). `tag` 0 is empty,
+    /// 1 is a zero-ink glyph that does not contribute, 2 is a real extent.
+    static ASCII_VERTICAL: RefCell<(usize, u32, u32, [(u8, f32, f32); 128])> =
+        const { RefCell::new((0, 0, 0, [(0, 0.0, 0.0); 128])) };
+}
+
+fn glyph_vertical_extent(
+    character: char,
+    font_size: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    if is_non_rendering_format_character(character) {
+        return None;
+    }
+    let ch = font_glyph_character(character);
+    if (ch as u32) < 128 {
+        let font_id = font as *const fontdue::Font as usize;
+        let em = font.units_per_em().to_bits();
+        let size_bits = font_size.to_bits();
+        let cached = ASCII_VERTICAL.with(|slot| {
+            let slot = slot.borrow();
+            (slot.0 == font_id && slot.1 == em && slot.2 == size_bits).then(|| slot.3[ch as usize])
+        });
+        if let Some(entry) = cached {
+            return match entry.0 {
+                1 => None,
+                2 => Some((entry.1, entry.2)),
+                _ => {
+                    let extent = uncached_glyph_vertical_extent(ch, font_size, font);
+                    store_ascii_vertical(font_id, em, size_bits, ch, extent);
+                    extent
+                }
+            };
+        }
+        let extent = uncached_glyph_vertical_extent(ch, font_size, font);
+        store_ascii_vertical(font_id, em, size_bits, ch, extent);
+        return extent;
+    }
+    uncached_glyph_vertical_extent(ch, font_size, font)
+}
+
+fn store_ascii_vertical(
+    font_id: usize,
+    em: u32,
+    size_bits: u32,
+    ch: char,
+    extent: Option<(f32, f32)>,
+) {
+    ASCII_VERTICAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.0 != font_id || slot.1 != em || slot.2 != size_bits {
+            *slot = (font_id, em, size_bits, [(0, 0.0, 0.0); 128]);
+        }
+        slot.3[ch as usize] = match extent {
+            None => (1, 0.0, 0.0),
+            Some((top, bottom)) => (2, top, bottom),
+        };
+    });
+}
+
+fn uncached_glyph_vertical_extent(
+    ch: char,
+    font_size: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    if !font.chars().contains_key(&ch) {
+        return Some((-font_size * 0.88, font_size * 0.12));
+    }
+    let metrics = font.metrics(ch, font_size);
+    if metrics.width == 0 && metrics.height == 0 {
+        return None;
+    }
+    Some((
+        -(metrics.height as f32) - metrics.ymin as f32,
+        -metrics.ymin as f32,
+    ))
+}
+
+/// CSS white-space collapse leaves this string unchanged, so a single-line
+/// measure can skip the allocating wrap. Anything else (controls, non-ASCII,
+/// leading/trailing/doubled spaces) stays on the slow path.
+fn css_collapse_is_identity(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.iter().any(|byte| !byte.is_ascii() || *byte < b' ') {
+        return false;
+    }
+    if bytes.first() == Some(&b' ') || bytes.last() == Some(&b' ') {
+        return false;
+    }
+    let mut previous_space = false;
+    for &byte in bytes {
+        let space = byte == b' ';
+        if space && previous_space {
+            return false;
+        }
+        previous_space = space;
+    }
+    true
+}
+
+/// Intrinsic size of one unwrapped line, or `None` when wrapping or whitespace
+/// collapse might disagree with [`text_intrinsic_size_font_slow`].
+pub(crate) fn fast_text_intrinsic_size(
+    content: &str,
+    style: &Style,
+    wrap_width: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    let (advance, content_height) = fast_single_line(content, style, wrap_width, font)?;
+    let padding = style.padding_lengths();
+    let mut width = advance + padding.left + padding.right;
+    if let w3cos_std::style::Dimension::Px(min_width) = style.min_width {
+        width = width.max(min_width);
+    }
+    Some((width, content_height + padding.top + padding.bottom))
+}
+
+/// Block height of one unwrapped line, or `None` when [`wrapped_block_height_font_slow`]
+/// might break the line or collapse whitespace.
+pub(crate) fn fast_wrapped_block_height(
+    content: &str,
+    width: f32,
+    style: &Style,
+    font: &fontdue::Font,
+) -> Option<f32> {
+    let (_, content_height) = fast_single_line(content, style, width, font)?;
+    let padding = style.padding_lengths();
+    Some(content_height + padding.top + padding.bottom)
+}
+
+fn fast_single_line(
+    content: &str,
+    style: &Style,
+    wrap_width: f32,
+    font: &fontdue::Font,
+) -> Option<(f32, f32)> {
+    if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap) {
+        return None;
+    }
+    if !css_collapse_is_identity(content) {
+        return None;
+    }
+    let padding = style.padding_lengths();
+    let raw_inner = wrap_width - padding.left - padding.right;
+    let advance = measure_text_width_font(content, style.font_size, font);
+    if style.white_space == WhiteSpace::Normal {
+        // `wrap_greedy` treats a max width of 1px as the narrow-constraint
+        // path, and a run wraps only when the next glyph would exceed it.
+        if raw_inner <= 1.0 || advance > raw_inner {
+            return None;
+        }
+    }
+    let content_height = if style.line_height_computed_px.is_none() {
+        single_line_content_height(content, style.font_size, style.line_height, font)
+    } else {
+        crate::layout::inline_style_line_height(style)
+    };
+    Some((advance, content_height))
 }
 
 /// `y` argument for [`draw_text_line`] so glyphs are vertically centered in `box_height`.
@@ -2665,5 +2839,87 @@ mod tests {
             // remain a separate strict-reference result.
             "ἈΙἨΙὨΙΑΙΗΙΩΙ"
         );
+    }
+
+    fn inter_font() -> fontdue::Font {
+        fontdue::Font::from_bytes(
+            include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+            fontdue::FontSettings::default(),
+        )
+        .unwrap()
+    }
+
+    fn assert_same_size(left: (f32, f32), right: (f32, f32)) {
+        assert_eq!(left.0.to_bits(), right.0.to_bits(), "width");
+        assert_eq!(left.1.to_bits(), right.1.to_bits(), "height");
+    }
+
+    #[test]
+    fn single_line_fast_path_matches_wrapping_measure() {
+        let font = inter_font();
+        let mut style = Style {
+            font_size: 14.0,
+            ..Style::default()
+        };
+        style.padding.top = w3cos_std::style::Spacing::Px(4.0);
+        style.padding.right = w3cos_std::style::Spacing::Px(4.0);
+        style.padding.bottom = w3cos_std::style::Spacing::Px(4.0);
+        style.padding.left = w3cos_std::style::Spacing::Px(4.0);
+        style.min_width = w3cos_std::style::Dimension::Px(8.0);
+
+        for white_space in [WhiteSpace::Normal, WhiteSpace::NoWrap] {
+            style.white_space = white_space;
+            for (text, width) in [
+                ("Item 12", 360.0),
+                ("Item 12", 80.0),
+                ("", 360.0),
+                ("abc", 40.0),
+                ("a b c d e f", 200.0),
+            ] {
+                let slow = text_intrinsic_size_font_slow(text, &style, width, &font);
+                let fast = fast_text_intrinsic_size(text, &style, width, &font);
+                if let Some(fast) = fast {
+                    assert_same_size(fast, slow);
+                }
+                assert_same_size(text_intrinsic_size_font(text, &style, width, &font), slow);
+                let slow_height = wrapped_block_height_font_slow(text, width, &style, &font);
+                if let Some(fast_height) = fast_wrapped_block_height(text, width, &style, &font) {
+                    assert_eq!(fast_height.to_bits(), slow_height.to_bits());
+                }
+                assert_eq!(
+                    wrapped_block_height_font(text, width, &style, &font).to_bits(),
+                    slow_height.to_bits()
+                );
+            }
+        }
+
+        style.white_space = WhiteSpace::Normal;
+        let narrow = "Item 12 Item 12 Item 12 Item 12";
+        assert!(fast_text_intrinsic_size(narrow, &style, 40.0, &font).is_none());
+        let wrapped = text_intrinsic_size_font_slow(narrow, &style, 40.0, &font);
+        let unwrapped = text_intrinsic_size_font_slow("Item", &style, 400.0, &font);
+        assert!(wrapped.1 > unwrapped.1);
+
+        style.line_height_computed_px = Some(20.0);
+        let authored = text_intrinsic_size_font_slow("Item 3", &style, 360.0, &font);
+        assert_same_size(
+            fast_text_intrinsic_size("Item 3", &style, 360.0, &font).unwrap(),
+            authored,
+        );
+
+        style.line_height_computed_px = None;
+        style.white_space = WhiteSpace::Normal;
+        for text in [" Item", "Item ", "Item  2", "a\nb", "你好", "pre\t"] {
+            assert!(
+                fast_text_intrinsic_size(text, &style, 360.0, &font).is_none(),
+                "{text}"
+            );
+            assert!(
+                fast_wrapped_block_height(text, 360.0, &style, &font).is_none(),
+                "{text}"
+            );
+        }
+        style.white_space = WhiteSpace::Pre;
+        assert!(fast_text_intrinsic_size("Item 1", &style, 360.0, &font).is_none());
     }
 }

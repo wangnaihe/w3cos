@@ -72,8 +72,9 @@ use w3cos_std::style::{
     AlignContent as WAlignContent, AlignItems as WAlign, AlignSelf as WAlignSelf,
     BoxSizing as WBoxSizing, Clear as WClear, Dimension as WDim, Display as WDisplay, EdgeLengths,
     FlexDirection as WDir, FlexWrap as WWrap, Float as WFloat, JustifyContent as WJustify,
-    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, Visibility as WVisibility,
-    WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
+    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, TextDirection as WTextDirection,
+    UnicodeBidi as WUnicodeBidi, Visibility as WVisibility, WhiteSpace as WWhiteSpace,
+    WordBreak as WWordBreak,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -137,6 +138,143 @@ thread_local! {
     /// bounded per-UI-thread cache provides the same retained-measure behavior
     /// without coupling the layout engine to a particular application tree.
     static TEXT_MEASURE_CACHE: RefCell<TextMeasureCache> = RefCell::new(TextMeasureCache::default());
+}
+
+fn layout_phases_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_LAYOUT_PHASES").is_some())
+}
+
+#[derive(Default, Clone, Copy)]
+struct TextMeasureStats {
+    intrinsic_hit_n: u32,
+    intrinsic_hit_us: u128,
+    intrinsic_miss_n: u32,
+    intrinsic_miss_us: u128,
+    wrapped_hit_n: u32,
+    wrapped_hit_us: u128,
+    wrapped_miss_n: u32,
+    wrapped_miss_us: u128,
+}
+
+thread_local! {
+    static TEXT_MEASURE_STATS: RefCell<TextMeasureStats> = const { RefCell::new(TextMeasureStats {
+        intrinsic_hit_n: 0,
+        intrinsic_hit_us: 0,
+        intrinsic_miss_n: 0,
+        intrinsic_miss_us: 0,
+        wrapped_hit_n: 0,
+        wrapped_hit_us: 0,
+        wrapped_miss_n: 0,
+        wrapped_miss_us: 0,
+    }) };
+}
+
+const TEXT_MEASURE_INTRINSIC: u8 = 0;
+const TEXT_MEASURE_WRAPPED: u8 = 1;
+
+struct TextMeasureSpan {
+    start: Option<std::time::Instant>,
+    kind: u8,
+    miss: bool,
+}
+
+impl TextMeasureSpan {
+    fn begin(kind: u8) -> Self {
+        Self {
+            start: layout_phases_enabled().then(std::time::Instant::now),
+            kind,
+            miss: false,
+        }
+    }
+
+    fn miss(&mut self) {
+        self.miss = true;
+    }
+}
+
+impl Drop for TextMeasureSpan {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed().as_micros();
+        TEXT_MEASURE_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            match (self.kind, self.miss) {
+                (TEXT_MEASURE_INTRINSIC, false) => {
+                    stats.intrinsic_hit_n += 1;
+                    stats.intrinsic_hit_us += elapsed;
+                }
+                (TEXT_MEASURE_INTRINSIC, true) => {
+                    stats.intrinsic_miss_n += 1;
+                    stats.intrinsic_miss_us += elapsed;
+                }
+                (_, false) => {
+                    stats.wrapped_hit_n += 1;
+                    stats.wrapped_hit_us += elapsed;
+                }
+                (_, true) => {
+                    stats.wrapped_miss_n += 1;
+                    stats.wrapped_miss_us += elapsed;
+                }
+            }
+        });
+    }
+}
+
+struct PhaseLog {
+    on: bool,
+    last: Option<std::time::Instant>,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl PhaseLog {
+    fn new() -> Self {
+        let on = layout_phases_enabled();
+        if on {
+            TEXT_MEASURE_STATS.with(|stats| *stats.borrow_mut() = TextMeasureStats::default());
+        }
+        Self {
+            on,
+            last: on.then(std::time::Instant::now),
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        let Some(last) = self.last else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        self.phases
+            .push((name, now.duration_since(last).as_micros()));
+        self.last = Some(now);
+    }
+
+    fn finish(self, nodes: usize, second_pass: bool) {
+        if !self.on {
+            return;
+        }
+        let text = TEXT_MEASURE_STATS.with(|stats| *stats.borrow());
+        let body = self
+            .phases
+            .iter()
+            .map(|(name, us)| format!("{name}={us}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "W3COS_LAYOUT_PHASE nodes={nodes} second={second_pass} {body} intrinsic_hit={}/{} intrinsic_miss={}/{} wrapped_hit={}/{} wrapped_miss={}/{}",
+            text.intrinsic_hit_n,
+            text.intrinsic_hit_us,
+            text.intrinsic_miss_n,
+            text.intrinsic_miss_us,
+            text.wrapped_hit_n,
+            text.wrapped_hit_us,
+            text.wrapped_miss_n,
+            text.wrapped_miss_us,
+        );
+    }
 }
 
 pub(crate) fn layout_font() -> &'static fontdue::Font {
@@ -3839,11 +3977,32 @@ pub(crate) fn resolve_spacing_for_layout(
 }
 
 pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
+    let mut text_span = TextMeasureSpan::begin(TEXT_MEASURE_INTRINSIC);
     if let Some(advance) = crate::list_marker::inside_advance(style) {
         let padding = style.padding_lengths();
         return (
             advance + padding.left + padding.right,
             crate::layout::inline_style_line_height(&style) + padding.top + padding.bottom,
+        );
+    }
+    // A single unwrapped line does not need the measure-key hash, the cascade
+    // string, or the text cache. Registered families and the skia shaper stay
+    // on the existing path so paint and layout keep one metric space.
+    #[cfg(not(feature = "skia"))]
+    if style.font_family.is_none()
+        && let Some(measured) = text_layout::fast_text_intrinsic_size(
+            content,
+            style,
+            DEFAULT_TEXT_WRAP_WIDTH,
+            layout_font(),
+        )
+    {
+        let padding = style.padding_lengths();
+        return (
+            text_layout::inline_layout_advance(measured.0 - padding.left - padding.right)
+                + padding.left
+                + padding.right,
+            measured.1,
         );
     }
     let registry = crate::font_face::FontRegistry::global();
@@ -3863,6 +4022,7 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         return measured;
     }
 
+    text_span.miss();
     let measured = {
         #[cfg(feature = "skia")]
         {
@@ -4104,6 +4264,14 @@ pub(crate) fn wrapped_text_height(
     width: f32,
     style: &w3cos_std::style::Style,
 ) -> f32 {
+    let mut text_span = TextMeasureSpan::begin(TEXT_MEASURE_WRAPPED);
+    #[cfg(not(feature = "skia"))]
+    if style.font_family.is_none()
+        && let Some(height) =
+            text_layout::fast_wrapped_block_height(content, width, style, layout_font())
+    {
+        return height;
+    }
     let registry = crate::font_face::FontRegistry::global();
     let revision = registry.revision();
     let probe = text_measure_key(width, style, 0);
@@ -4141,6 +4309,7 @@ pub(crate) fn wrapped_text_height(
         return measured;
     }
 
+    text_span.miss();
     let key = text_measure_key(width, style, cascade);
     let measured = {
         #[cfg(feature = "skia")]
@@ -5118,6 +5287,153 @@ pub fn compute_with_scroll(
     ))
 }
 
+struct ColdLayoutPlan {
+    float_or_clear: bool,
+    table: bool,
+    complex_inline: bool,
+}
+
+fn is_table_display(display: WDisplay) -> bool {
+    matches!(
+        display,
+        WDisplay::Table
+            | WDisplay::InlineTable
+            | WDisplay::TableRow
+            | WDisplay::TableRowGroup
+            | WDisplay::TableHeaderGroup
+            | WDisplay::TableFooterGroup
+            | WDisplay::TableColumn
+            | WDisplay::TableColumnGroup
+            | WDisplay::TableCell
+            | WDisplay::TableCaption
+    )
+}
+
+fn node_needs_complex_inline(node: &FlatNodeInfo<'_>) -> bool {
+    let style = node.style;
+    if matches!(
+        style.display,
+        WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+    ) || style.direction != WTextDirection::Ltr
+        || style.column_count.is_some()
+        || style.unicode_bidi != WUnicodeBidi::Normal
+        || !matches!(style.white_space, WWhiteSpace::Normal | WWhiteSpace::NoWrap)
+        || !matches!(
+            style.align_self,
+            WAlignSelf::Auto | WAlignSelf::Baseline | WAlignSelf::Stretch
+        )
+    {
+        return true;
+    }
+    if matches!(
+        node.kind,
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::SvgPath { .. }
+            | ComponentKind::SvgDocument { .. }
+            | ComponentKind::Button { .. }
+            | ComponentKind::TextInput { .. }
+    ) {
+        return true;
+    }
+    if let ComponentKind::Text { content } = node.kind {
+        if content.ends_with([' ', '\t', '\u{200b}'])
+            || content.contains(['\n', '\r', '\u{000c}', '\t', '\u{2028}', '\u{2029}'])
+        {
+            return true;
+        }
+    }
+    style.custom_properties.as_ref().is_some_and(|properties| {
+        properties.contains_key("--w3cos-internal-inline-formatting-context")
+            || properties.contains_key("--w3cos-internal-vertical-align-keyword")
+            || properties.contains_key("--w3cos-internal-vertical-align-length")
+            || properties.contains_key("--w3cos-internal-line-extra-ascent")
+            || properties.contains_key("--w3cos-internal-unbroken-inline-word")
+            || properties.contains_key("--w3cos-internal-full-width-atomic-line-break")
+            || properties.contains_key("--w3cos-internal-text-line-width")
+            || properties.contains_key("--w3cos-internal-reserved-line-lift")
+            || properties.contains_key("--w3cos-internal-anonymous-float-group")
+    })
+}
+
+/// Features that make a post-Taffy projection more than a walk. Float and
+/// table bits match the passes `LayoutEngine` already skips; complex inline
+/// covers forced breaks, atomics, and replaced boxes whose passes also
+/// propagate height deltas.
+fn cold_layout_plan(flat: &[FlatNodeInfo<'_>]) -> ColdLayoutPlan {
+    let mut plan = ColdLayoutPlan {
+        float_or_clear: false,
+        table: false,
+        complex_inline: false,
+    };
+    for (index, node) in flat.iter().enumerate() {
+        let style = node.style;
+        if style.float != WFloat::None || style.clear != WClear::None {
+            plan.float_or_clear = true;
+        }
+        if is_table_display(style.display) || crate::table_grid::row_span(style) != 1 {
+            plan.table = true;
+        }
+        if !plan.complex_inline && node_needs_complex_inline(node) {
+            plan.complex_inline = true;
+        }
+        if !plan.complex_inline && flex_baseline_texts_need_line_alignment(flat, index) {
+            plan.complex_inline = true;
+        }
+    }
+    plan
+}
+
+/// Flex `align-items: baseline` plus equal-font inline texts whose struts
+/// differ. `align_inline_block_last_line_baselines` is what puts those runs
+/// on one baseline; Taffy's leaf-bottom baseline leaves the shorter strut
+/// low. Ordinary flex rows (the bench tree) do not use baseline alignment.
+fn flex_baseline_texts_need_line_alignment(flat: &[FlatNodeInfo<'_>], index: usize) -> bool {
+    let parent = &flat[index];
+    if parent.style.display != WDisplay::Flex || parent.style.align_items != WAlign::Baseline {
+        return false;
+    }
+    let mut child = index + 1;
+    let mut saw = false;
+    let mut min_lh = f32::INFINITY;
+    let mut max_lh = inline_style_line_height(parent.style);
+    while child < parent.subtree_end && child < flat.len() {
+        let info = &flat[child];
+        let in_flow = info.style.display != WDisplay::None
+            && info.style.float == WFloat::None
+            && !matches!(info.style.position, WPos::Absolute | WPos::Fixed);
+        if in_flow {
+            let same_face = info.style.display == WDisplay::Inline
+                && matches!(info.kind, ComponentKind::Text { .. })
+                && info.style.font_size == parent.style.font_size
+                && info.style.font_family == parent.style.font_family
+                && info.style.font_weight == parent.style.font_weight
+                && info.style.font_style == parent.style.font_style
+                && info.style.font_variant == parent.style.font_variant
+                && matches!(
+                    info.style.align_self,
+                    WAlignSelf::Auto | WAlignSelf::Baseline
+                )
+                && info
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .is_none_or(|properties| {
+                        !properties.contains_key("--w3cos-internal-vertical-align-length")
+                    });
+            if !same_face {
+                return false;
+            }
+            let line_height = inline_style_line_height(info.style);
+            min_lh = min_lh.min(line_height);
+            max_lh = max_lh.max(line_height);
+            saw = true;
+        }
+        child = info.subtree_end;
+    }
+    saw && max_lh - min_lh > 0.01
+}
+
 pub fn compute_with_scroll_details(
     root: &Component,
     viewport_w: f32,
@@ -5152,23 +5468,46 @@ pub fn compute_with_scroll_details(
                     .all(|style| style.is_some_and(|style| !style.is_visible())))
             || component.children.iter().any(needs_used_borders)
     }
+    let mut phase = PhaseLog::new();
     let used_root = needs_used_borders(root).then(|| {
         let mut used = root.clone();
         resolve_used_borders(&mut used);
         used
     });
+    phase.mark("borders");
     let root = used_root.as_ref().unwrap_or(root);
+    let _subtree_sizes = SubtreeSizeScope::new(root);
     let flat = pre_flatten(root);
-    let mut layout_root = root.clone();
-    resolve_collapsed_table_layout_borders(&mut layout_root);
-    crate::table_grid::annotate(&mut layout_root);
+    phase.mark("flatten");
+    let plan = cold_layout_plan(&flat);
+    phase.mark("plan");
+    let gates_on = projection_gates_enabled();
+    let run_table = plan.table || !gates_on;
+    let run_float = plan.float_or_clear || !gates_on;
+    let run_complex = plan.complex_inline || !gates_on;
+    // Collapsed borders and rowspan annotation mutate a copy. A tree with
+    // neither can build Taffy from the border-resolved component tree.
+    let mut prepared_table = if run_table {
+        let mut cloned = root.clone();
+        phase.mark("clone");
+        resolve_collapsed_table_layout_borders(&mut cloned);
+        phase.mark("collapsed_borders");
+        crate::table_grid::annotate(&mut cloned);
+        phase.mark("annotate");
+        Some(cloned)
+    } else {
+        phase.mark("clone");
+        phase.mark("collapsed_borders");
+        phase.mark("annotate");
+        None
+    };
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     tree.disable_rounding();
     let mut node_index: usize = 0;
 
     let root_node = build_taffy_tree(
         &mut tree,
-        &layout_root,
+        prepared_table.as_ref().unwrap_or(root),
         &mut node_index,
         None,
         None,
@@ -5187,6 +5526,7 @@ pub fn compute_with_scroll_details(
         false,
         None,
     )?;
+    phase.mark("taffy_build");
     let root_margins = root_used_margins(
         flat.first().map(|entry| entry.style),
         viewport_w,
@@ -5197,8 +5537,12 @@ pub fn compute_with_scroll_details(
         height: AvailableSpace::Definite(viewport_h),
     };
     tree.compute_layout(root_node, space)?;
-    if update_text_leaf_heights(&mut tree, root_node, &flat, None)? {
+    phase.mark("taffy_1");
+    let second_pass = update_text_leaf_heights(&mut tree, root_node, &flat, None)?;
+    phase.mark("text_heights");
+    if second_pass {
         tree.compute_layout(root_node, space)?;
+        phase.mark("taffy_2");
     }
 
     let mut results = Vec::new();
@@ -5243,108 +5587,353 @@ pub fn compute_with_scroll_details(
         &mut clip_only,
         &mut scroll_ancestor,
     );
+    phase.mark("collect");
 
-    let inline_original_rects = flat
-        .iter()
-        .any(|node| {
-            matches!(
-                node.style.display,
-                WDisplay::TableCell | WDisplay::TableCaption
-            )
-        })
-        .then(|| results.clone())
-        .unwrap_or_default();
-    let inline_height_constraints =
-        used_inline_height_constraints(&tree, root_node, &flat, &results)?;
-    apply_inline_line_extra_ascent(&mut results, root);
-    apply_inline_vertical_align_length(&mut results, root);
-    project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h);
-    project_empty_painted_inline_boxes(&mut results, &flat);
-    project_mixed_inline_block_definite_widths(&mut results, &flat, viewport_w, viewport_h);
-    project_inline_background_widths(&mut results, root);
-    project_fixed_table_cell_rects(&mut results, &layout_root, viewport_w, viewport_h);
-    project_inline_block_atomic_line_descent(&mut results, root);
-    project_single_baseline_replaced_image(&mut results, root);
-    project_forced_break_inline_block_alignment(&mut results, root);
-    let forced_break_tree = (has_collapsed_table_root(&flat)
-        && !flat
-            .iter()
-            .any(|node| crate::table_grid::row_span(node.style) != 1))
-    .then_some(&mut layout_root);
-    project_forced_break_lines_with_shared_tree(
-        &mut results,
-        root,
-        forced_break_tree,
-        &inline_height_constraints,
+    // W3COS_PROJECTION_GATES=0 runs every pass. W3COS_PROJECTION_VERIFY=1
+    // runs a skipped pass and panics if any box moved.
+    macro_rules! gate {
+        ($run:expr, $name:literal, $call:expr) => {{
+            if $run {
+                $call;
+            } else if projection_verify_enabled() {
+                let before = results.clone();
+                $call;
+                assert_layouts_unchanged(&before, &results, $name);
+            }
+            phase.mark($name);
+        }};
+    }
+    let inline_original_rects = if run_table || projection_verify_enabled() {
+        flat.iter()
+            .any(|node| {
+                matches!(
+                    node.style.display,
+                    WDisplay::TableCell | WDisplay::TableCaption
+                )
+            })
+            .then(|| results.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    phase.mark("inline_setup");
+    let inline_height_constraints = if run_complex || projection_verify_enabled() {
+        used_inline_height_constraints(&tree, root_node, &flat, &results)?
+    } else {
+        HashMap::default()
+    };
+    phase.mark("inline_constraints");
+    gate!(
+        run_complex,
+        "inline_ascent",
+        apply_inline_line_extra_ascent(&mut results, root)
     );
-    project_inline_continuation_after_wrapped_row(&mut results, root);
-    crate::inline_whitespace::project(&mut results, root);
-    project_forced_break_inline_block_alignment(&mut results, root);
-    align_inline_block_last_line_baselines(&mut results, root);
-    project_inline_block_vertical_align_keywords(&mut results, root, viewport_w, viewport_h);
-    project_table_block_inline_height_changes(&mut results, root, &inline_original_rects);
+    gate!(
+        run_complex,
+        "inline_valign",
+        apply_inline_vertical_align_length(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_rtl",
+        project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h)
+    );
+    project_empty_painted_inline_boxes(&mut results, &flat);
+    phase.mark("inline_empty");
+    project_mixed_inline_block_definite_widths(&mut results, &flat, viewport_w, viewport_h);
+    phase.mark("inline_mixed");
+    project_inline_background_widths(&mut results, root);
+    phase.mark("inline_bg");
+    gate!(run_table, "inline_table_cells", {
+        project_fixed_table_cell_rects(
+            &mut results,
+            prepared_table.as_ref().unwrap_or(root),
+            viewport_w,
+            viewport_h,
+        );
+    });
+    gate!(
+        run_complex,
+        "inline_descent",
+        project_inline_block_atomic_line_descent(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_image",
+        project_single_baseline_replaced_image(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_forced_align",
+        project_forced_break_inline_block_alignment(&mut results, root)
+    );
+    // Soft-line placement runs for ordinary blocks that contain inline text.
+    // That is not an atomic/forced-break feature, so the complex-inline bit
+    // must not skip it.
+    gate!(true, "inline_forced_lines", {
+        let forced_break_tree = if has_collapsed_table_root(&flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1)
+        {
+            prepared_table.as_mut()
+        } else {
+            None
+        };
+        project_forced_break_lines_with_shared_tree(
+            &mut results,
+            root,
+            forced_break_tree,
+            &inline_height_constraints,
+        );
+    });
+    gate!(
+        run_complex,
+        "inline_continuation",
+        project_inline_continuation_after_wrapped_row(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_whitespace",
+        crate::inline_whitespace::project(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_forced_align2",
+        project_forced_break_inline_block_alignment(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_baselines",
+        align_inline_block_last_line_baselines(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_keywords",
+        project_inline_block_vertical_align_keywords(&mut results, root, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "inline_table_heights",
+        project_table_block_inline_height_changes(&mut results, root, &inline_original_rects)
+    );
     project_collapsible_line_end_whitespace(&mut results, &flat);
+    phase.mark("inline_eol_space");
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
+    phase.mark("inline_margins");
     project_inline_after_leading_empty_blocks(&mut results, root);
+    phase.mark("inline_empty_blocks");
     project_constrained_height_trailing_margin_containment(
         &mut results,
         root,
         viewport_w,
         viewport_h,
     );
-    project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h);
-    project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
-    project_table_into_float_band(&mut results, &flat);
-    project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h);
-    project_adjoining_clearance_auto_heights(&mut results, &flat, viewport_w, viewport_h);
-    project_empty_clear_margin_past_float(&mut results, &flat);
-    project_shared_bfc_float_collisions(&mut results, &flat, viewport_w, viewport_h);
-    project_nonadjoining_bfc_margin_separation(&mut results, &flat, viewport_w, viewport_h);
-    project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h);
-    project_anonymous_float_group_following_image(&mut results, &flat, viewport_w, viewport_h);
-    project_bottom_aligned_float_inline_rows(&mut results, &flat, viewport_w, viewport_h);
-    project_staggered_float_inline_bands(&mut results, &flat, viewport_w, viewport_h);
-    project_inline_block_atomic_line_descent(&mut results, root);
-    project_indented_inline_after_leading_float(&mut results, &flat, viewport_w, viewport_h);
-    project_block_after_floated_inline_line(&mut results, &flat);
-    project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
-    project_float_followed_by_clearing_block_height(&mut results, &flat, viewport_w, viewport_h);
-    project_nested_margin_inline_float_band(&mut results, &flat, viewport_w, viewport_h);
-    project_clearance_empty_margin_collapse(&mut results, &flat, viewport_w, viewport_h);
-    project_self_collapsing_clear_following_block(&mut results, &flat, viewport_w, viewport_h);
-    project_table_column_background_rects(&mut results, &flat);
-    project_collapsed_table_row_rects(&mut results, &flat);
-    table_replaced_baseline::project(&mut results, root, &flat, viewport_w, viewport_h);
-    project_table_rows_after_content_settlement(&mut results, root, &flat, viewport_w, viewport_h);
-    project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h);
-    crate::table_grid::project_rowspan_extents(&mut results, &flat);
-    let prepared_flat;
-    let shared_resolved = if has_collapsed_table_root(&flat)
-        && !flat
-            .iter()
-            .any(|node| crate::table_grid::row_span(node.style) != 1)
-    {
-        prepared_flat = pre_flatten(&layout_root);
-        Some(prepared_flat.as_slice())
-    } else {
-        None
-    };
-    align_table_cell_baselines_with_resolved_borders(
-        &mut results,
-        root,
-        &flat,
-        shared_resolved,
-        viewport_w,
-        viewport_h,
+    phase.mark("inline_trailing_margin");
+    gate!(
+        run_float,
+        "float_clearance",
+        project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h)
     );
-    project_table_cell_inline_vertical_padding(&mut results, &flat);
-    align_inline_table_first_row_baselines(&mut results, &flat);
-    align_empty_inline_table_baselines(&mut results, &flat);
-    project_top_table_captions_outside_border(&mut results, root, &flat);
-    project_zero_width_float_bfc_clearance(&mut results, &flat, viewport_w, viewport_h);
-    project_right_float_text_containment(&mut results, &flat, viewport_w, viewport_h);
-    project_cleared_descendant_bfc_heights(&mut results, &flat);
-    project_negative_clearance_after_bottom_margin(&mut results, &flat);
+    gate!(
+        run_float,
+        "float_simple",
+        project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_table_band",
+        project_table_into_float_band(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_clearance2",
+        project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_adjoining",
+        project_adjoining_clearance_auto_heights(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_empty_clear",
+        project_empty_clear_margin_past_float(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_shared",
+        project_shared_bfc_float_collisions(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_nonadj",
+        project_nonadjoining_bfc_margin_separation(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_text",
+        project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_anon",
+        project_anonymous_float_group_following_image(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_bottom",
+        project_bottom_aligned_float_inline_rows(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_staggered",
+        project_staggered_float_inline_bands(&mut results, &flat, viewport_w, viewport_h)
+    );
+    // This second descent pass propagates inline-block line growth. It is not
+    // a float projection, so the float bit must not skip it.
+    gate!(
+        run_complex,
+        "float_descent",
+        project_inline_block_atomic_line_descent(&mut results, root)
+    );
+    gate!(
+        run_float,
+        "float_indent",
+        project_indented_inline_after_leading_float(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_after_line",
+        project_block_after_floated_inline_line(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_bfc_height",
+        project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_clear_block",
+        project_float_followed_by_clearing_block_height(
+            &mut results,
+            &flat,
+            viewport_w,
+            viewport_h
+        )
+    );
+    gate!(
+        run_float,
+        "float_nested_margin",
+        project_nested_margin_inline_float_band(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_clear_collapse",
+        project_clearance_empty_margin_collapse(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_self_collapse",
+        project_self_collapsing_clear_following_block(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "table_col_bg",
+        project_table_column_background_rects(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_rows",
+        project_collapsed_table_row_rects(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_baseline",
+        table_replaced_baseline::project(&mut results, root, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "table_settle",
+        project_table_rows_after_content_settlement(
+            &mut results,
+            root,
+            &flat,
+            viewport_w,
+            viewport_h
+        )
+    );
+    gate!(
+        run_table,
+        "table_auto_h",
+        project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "table_rowspan",
+        crate::table_grid::project_rowspan_extents(&mut results, &flat)
+    );
+    gate!(run_table, "table_align", {
+        let prepared_flat;
+        let shared_resolved = if has_collapsed_table_root(&flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1)
+        {
+            prepared_flat = pre_flatten(prepared_table.as_ref().expect("collapsed table tree"));
+            Some(prepared_flat.as_slice())
+        } else {
+            None
+        };
+        align_table_cell_baselines_with_resolved_borders(
+            &mut results,
+            root,
+            &flat,
+            shared_resolved,
+            viewport_w,
+            viewport_h,
+        );
+    });
+    gate!(
+        run_table,
+        "table_pad",
+        project_table_cell_inline_vertical_padding(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_inline_base",
+        align_inline_table_first_row_baselines(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_empty_base",
+        align_empty_inline_table_baselines(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_caption",
+        project_top_table_captions_outside_border(&mut results, root, &flat)
+    );
+    gate!(
+        run_float,
+        "float_zero",
+        project_zero_width_float_bfc_clearance(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_right",
+        project_right_float_text_containment(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_cleared",
+        project_cleared_descendant_bfc_heights(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_negative",
+        project_negative_clearance_after_bottom_margin(&mut results, &flat)
+    );
     project_absolute_insets_from_final_containing_blocks(
         &mut results,
         &flat,
@@ -5367,8 +5956,10 @@ pub fn compute_with_scroll_details(
     }
     refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
+    phase.mark("proj_rest");
 
     results.extend(fixed_results);
+    phase.finish(flat.len(), second_pass);
     Ok(LayoutResults {
         layout_cache: results,
         scrollable_nodes: scrollable,
@@ -24077,17 +24668,23 @@ fn apply_measured_text_height(
         let padding = style.padding_lengths();
         h = (h - padding.top - padding.bottom).max(0.0);
     }
-    let mut taffy_style = tree.style(node)?.clone();
     let measured_height = Dimension::length(h);
-    let measured_min_height =
-        if matches!(style.min_height, WDim::Auto) && matches!(style.max_height, WDim::Auto) {
-            measured_height
-        } else {
-            taffy_style.min_size.height
-        };
-    if taffy_style.min_size.height != measured_min_height
-        || taffy_style.size.height != measured_height
-    {
+    let (changed, measured_min_height) = {
+        let current = tree.style(node)?;
+        let measured_min_height =
+            if matches!(style.min_height, WDim::Auto) && matches!(style.max_height, WDim::Auto) {
+                measured_height
+            } else {
+                current.min_size.height
+            };
+        (
+            current.min_size.height != measured_min_height
+                || current.size.height != measured_height,
+            measured_min_height,
+        )
+    };
+    if changed {
+        let mut taffy_style = tree.style(node)?.clone();
         taffy_style.min_size.height = measured_min_height;
         taffy_style.size.height = measured_height;
         tree.set_style(node, taffy_style)?;
