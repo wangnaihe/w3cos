@@ -11,10 +11,31 @@ WPT checkout (sparse) needs: `common resources fonts images infrastructure
 css/support css/reference css/CSS2 css/css-{flexbox,grid,tables,display,
 position,sizing,overflow,text,inline} dom/nodes`.
 
-Baseline pass set: `tests/wpt/layout-baseline-pass.txt` (origin/main c33c102,
-the #124 squash; 3857 passes, a superset of f111676's 3854: the 3 #113
-regressions fixed, none lost). Earlier mains shown for reference.
-Gate: the candidate's pass set must be a superset of it (zero regressions).
+Baseline pass set: `tests/wpt/layout-baseline-pass.txt` — the NG-off pass
+set of this engine at origin/main `39565da` (#195), 4472 passes. NG off is
+the legacy engine, so this is the current main bar. The gate requires the
+candidate pass set (NG on) to be a superset of it (zero regressions).
+
+The previous file (3857 passes, origin/main c33c102 / #124) is historical;
+per-dir counts from that day are kept below. Current NG-off counts:
+
+| dir | total | NG-off 39565da |
+|---|---:|---:|
+| css/CSS2/floats | 120 | 107 |
+| css/CSS2/floats-clear | 215 | 208 |
+| css/CSS2/linebox | 198 | 185 |
+| css/CSS2/margin-padding-clear | 682 | 672 |
+| css/CSS2/normal-flow | 810 | 789 |
+| css/css-display | 242 | 106 |
+| css/css-flexbox | 1350 | 446 |
+| css/css-grid | 2281 | 490 |
+| css/css-inline | 234 | 44 |
+| css/css-overflow | 651 | 154 |
+| css/css-position | 350 | 114 |
+| css/css-sizing | 733 | 169 |
+| css/css-tables | 297 | 115 |
+| css/css-text | 1615 | 873 |
+| **all** | 9778 | 4472 |
 
 ```sh
 cargo build --release -p w3cos-wpt

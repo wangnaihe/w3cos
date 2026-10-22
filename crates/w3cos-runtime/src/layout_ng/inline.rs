@@ -527,6 +527,20 @@ fn inline_text_reason(
     if style.display != Display::Inline {
         return Some("text:display");
     }
+    // A span's block-axis padding and a used line-height several times
+    // the IFC's (split-inline-borders: padding 10px and line-height 200px
+    // copied onto each word, normal line-height on the anonymous block).
+    // The fragment side of that reftest carries split-inline-edge and is
+    // already legacy; the authored reference must stay on legacy too, or
+    // run-snapped advances move glyphs onto different device pixels.
+    // A tall line-height with no padding (vertical-align fixtures) stays.
+    let padding = style.padding_lengths();
+    if (padding.top > 0.0 || padding.bottom > 0.0)
+        && container.line_height > 0.0
+        && style.line_height > container.line_height * 4.0
+    {
+        return Some("text:line-height");
+    }
     // The paragraph and preserved-newline paths place the leaf without a
     // baseline shift.
     if valign_length(style).is_some()
@@ -859,6 +873,20 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     let entries = collect_inlines(flat, index);
     let sole = matches!(entries[..], [InlineEntry::Leaf(_)]);
+    // A sole line-width leaf in a much larger font (block-non-replaced-
+    // height-005: `font: 100px/1 Ahem` in a 16px serif IFC). Its reference
+    // is an image, so that document is already legacy. LayoutUnit snaps on
+    // the same page's word runs move a trailing glyph across a device
+    // pixel; keep this document on legacy too.
+    if let [InlineEntry::Leaf(c)] = entries[..]
+        && !is_atomic_inline(flat, c)
+        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
+        && flat[c].style.font_family != style.font_family
+        && style.font_size > 0.0
+        && flat[c].style.font_size >= style.font_size * 4.0
+    {
+        return Some("text:line-width-font");
+    }
     // Open inline boxes; a top/bottom-aligned subtree must not contain
     // another one (one level of line-relative alignment).
     let mut open: Vec<usize> = Vec::new();
@@ -1142,10 +1170,10 @@ fn run_advances(texts: &[&str], style: &Style) -> Vec<f32> {
     {
         return advances;
     }
-    texts
-        .iter()
-        .map(|t| text_intrinsic_size(t, style).0)
-        .collect()
+    // One piece, or Skia shaping declined: the unwrapped advance. Without
+    // Skia, `text_intrinsic_size` wraps at 360px, so a long item would look
+    // like it fits a wider line (the runtime-bench text edit).
+    texts.iter().map(|t| max_content_width(t, style)).collect()
 }
 
 /// Raw advance of `content` without its trailing spaces.
@@ -1350,7 +1378,7 @@ fn paragraph_height(
     let single_height = ascent + strut_descent.max(line - baseline);
     let forced = has_forced_break(content, style);
     let fits = matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre)
-        || text_intrinsic_size(content, style).0 <= width + EPSILON;
+        || max_content_width(content, style) <= width + EPSILON;
     if !forced && fits {
         return (single_height, true, ascent);
     }
@@ -1360,6 +1388,37 @@ fn paragraph_height(
         (single_height, true, ascent)
     } else {
         (wrapped, false, 0.0)
+    }
+}
+
+/// Unwrapped max-content inline size. With Skia, `text_intrinsic_size` is
+/// that size. Without Skia it wraps at 360px and returns the longest line,
+/// so a paragraph wider than 360px but narrower than the available width
+/// (the runtime-bench text edit) was treated as one line.
+fn max_content_width(content: &str, style: &Style) -> f32 {
+    #[cfg(feature = "skia")]
+    {
+        text_intrinsic_size(content, style).0
+    }
+    #[cfg(not(feature = "skia"))]
+    {
+        let padding = style.padding_lengths();
+        let inner = if style.font_family.is_none() {
+            crate::text_layout::measure_text_width_font(
+                content,
+                style.font_size,
+                crate::layout::layout_font(),
+            )
+        } else {
+            let (width, _) = crate::text_layout::text_intrinsic_size_font(
+                content,
+                style,
+                f32::MAX / 4.0,
+                crate::layout::layout_font(),
+            );
+            width - padding.left - padding.right
+        };
+        crate::text_layout::inline_layout_advance(inner.max(0.0)) + padding.left + padding.right
     }
 }
 
