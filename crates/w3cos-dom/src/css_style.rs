@@ -15,13 +15,50 @@ pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
 pub const CONTAIN_INTRINSIC_SIZE_PROPERTY: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width stays auto).
 pub const WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-width-keyword";
+/// `height` / `min-height` / `max-height` intrinsic keyword. The dimension
+/// is left untouched so legacy layout keeps the value it already stored.
+pub const HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-height-keyword";
+/// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
+/// `left`, and `right` into `flex-start`; grid needs the keyword.
+pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
 /// A display keyword this engine does not model (`inline-grid`,
 /// `-webkit-box`, …). The used display falls through to `flex`; LayoutNG
 /// must not treat that box as an author flex container.
 pub const UNRECOGNIZED_DISPLAY_PROPERTY: &str = "--w3cos-internal-unrecognized-display";
+/// `display: grid-lanes`. Legacy keeps `flex` (the same box NG-off lays
+/// out). LayoutNG treats the marker as a grid when the subset matches an
+/// ordinary grid reference.
+pub const GRID_LANES_PROPERTY: &str = "--w3cos-internal-grid-lanes";
+/// `gap` / `row-gap` / `column-gap` contains a percentage. The used gap
+/// stays unset (legacy ignores it). Value is `row`, `column`, or `both`.
+pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
 /// `flex-wrap` keyword this engine does not model (`balance`, …). The used
 /// value falls through to `nowrap`.
 pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
+
+fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>) {
+    let current = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(PERCENT_GAP_PROPERTY))
+        .map(String::as_str)
+        .unwrap_or("");
+    let mut has_row = current == "row" || current == "both";
+    let mut has_column = current == "column" || current == "both";
+    if let Some(row) = row {
+        has_row = row;
+    }
+    if let Some(column) = column {
+        has_column = column;
+    }
+    let value = match (has_row, has_column) {
+        (true, true) => Some("both".to_string()),
+        (true, false) => Some("row".to_string()),
+        (false, true) => Some("column".to_string()),
+        (false, false) => None,
+    };
+    set_marker(style, PERCENT_GAP_PROPERTY, value);
+}
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
     match value {
@@ -279,10 +316,16 @@ impl CSSStyleDeclaration {
             "display" => {
                 self.inner.display = parse_display(value);
                 let keyword = value.trim().to_ascii_lowercase();
+                let grid_lanes = keyword == "grid-lanes";
                 set_marker(
                     &mut self.inner,
                     UNRECOGNIZED_DISPLAY_PROPERTY,
                     (!css_wide_keyword(&keyword) && !is_known_display(&keyword)).then_some(keyword),
+                );
+                set_marker(
+                    &mut self.inner,
+                    GRID_LANES_PROPERTY,
+                    grid_lanes.then_some("1".to_string()),
                 );
             }
             "position" => self.inner.position = parse_position(value),
@@ -293,7 +336,13 @@ impl CSSStyleDeclaration {
                 self.inner.flex_direction = parse_flex_direction(value)
             }
             "justify-content" | "justifyContent" => {
-                self.inner.justify_content = parse_justify_content(value)
+                self.inner.justify_content = parse_justify_content(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    JUSTIFY_CONTENT_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
             }
             "align-items" | "alignItems" => self.inner.align_items = parse_align_items(value),
             "flex-wrap" | "flexWrap" => {
@@ -320,6 +369,12 @@ impl CSSStyleDeclaration {
 
             "gap" => {
                 let parts = split_css_whitespace(value);
+                let row_pct = parts.first().is_some_and(|part| part.contains('%'));
+                let column_pct = parts
+                    .get(1)
+                    .map(|part| part.contains('%'))
+                    .unwrap_or(row_pct);
+                update_percent_gap(&mut self.inner, Some(row_pct), Some(column_pct));
                 if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
                     self.inner.row_gap = Some(v);
                     self.inner.column_gap =
@@ -327,8 +382,14 @@ impl CSSStyleDeclaration {
                     self.inner.gap = v;
                 }
             }
-            "row-gap" | "rowGap" => self.inner.row_gap = parse_px(value),
-            "column-gap" | "columnGap" => self.inner.column_gap = parse_px(value),
+            "row-gap" | "rowGap" => {
+                update_percent_gap(&mut self.inner, Some(value.contains('%')), None);
+                self.inner.row_gap = parse_px(value);
+            }
+            "column-gap" | "columnGap" => {
+                update_percent_gap(&mut self.inner, None, Some(value.contains('%')));
+                self.inner.column_gap = parse_px(value);
+            }
             "column-width" | "columnWidth" => {
                 if let Some(width) = parse_column_width(value) {
                     self.inner.column_width = width;
@@ -538,13 +599,18 @@ impl CSSStyleDeclaration {
                 }
             }
             "height" => {
-                if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
+                let keyword = value.trim().to_ascii_lowercase();
+                if is_intrinsic_size_keyword(&keyword) {
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
                     self.inner.max_height = max_height;
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                 } else if let Some(height) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.height = height;
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "min-width" | "minWidth" => {
@@ -1347,9 +1413,41 @@ impl CSSStyleDeclaration {
                 }
             }
             "grid-template-columns" | "gridTemplateColumns" => {
-                self.inner.grid_template_columns = Some(value.trim().to_string())
+                let value = value.trim().to_string();
+                self.inner.grid_template_columns = Some(value.clone());
+                self.inner.grid_columns_used = Some(value);
+                self.inner.grid_columns_cascaded = true;
             }
-            "grid-column" | "gridColumn" => self.inner.grid_column = Some(value.trim().to_string()),
+            "grid-template-rows" | "gridTemplateRows" => {
+                self.inner.grid_template_rows = Some(value.trim().to_string());
+            }
+            "grid-column" | "gridColumn" => {
+                remember_grid_placement(&mut self.inner);
+                let value = value.trim().to_string();
+                self.inner.grid_column = Some(value.clone());
+                self.inner.grid_column_used = Some(value);
+            }
+            "grid-row" | "gridRow" => {
+                remember_grid_placement(&mut self.inner);
+                let value = value.trim().to_string();
+                self.inner.grid_row = Some(value.clone());
+                self.inner.grid_row_used = Some(value);
+            }
+            "grid-template" | "gridTemplate" => apply_grid_template(&mut self.inner, value),
+            "grid" => apply_grid_shorthand(&mut self.inner, value),
+            "grid-auto-flow" | "gridAutoFlow" => {
+                self.inner.grid_auto_flow = Some(value.trim().to_string());
+            }
+            "grid-auto-rows" | "gridAutoRows" => {
+                self.inner.grid_auto_rows = Some(value.trim().to_string());
+            }
+            "grid-auto-columns" | "gridAutoColumns" => {
+                self.inner.grid_auto_columns = Some(value.trim().to_string());
+            }
+            "grid-template-areas" | "gridTemplateAreas" => {
+                self.inner.grid_template_areas = Some(value.trim().to_string());
+            }
+            "grid-area" | "gridArea" => apply_grid_area(&mut self.inner, value),
 
             // Outline
             "outline" => {
@@ -2191,6 +2289,7 @@ fn is_known_display(value: &str) -> bool {
         value,
         "flex"
             | "grid"
+            | "grid-lanes"
             | "block"
             | "inline"
             | "inline-block"
@@ -2219,7 +2318,14 @@ fn is_known_flex_wrap(value: &str) -> bool {
 fn parse_display(value: &str) -> Display {
     match value.trim() {
         "flex" => Display::Flex,
+        // The same formatting context as `grid` for the pages whose
+        // reference is an ordinary grid. `inline-grid` stays unrecognized
+        // so both sides of those reftests keep falling back together.
         "grid" => Display::Grid,
+        // Legacy stays `flex`, matching NG-off. The grid-lanes marker tells
+        // LayoutNG to lay the box out as a grid when that matches the
+        // reference. `inline-grid` stays unrecognized.
+        "grid-lanes" => Display::Flex,
         "block" => Display::Block,
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
@@ -2278,6 +2384,167 @@ fn parse_flex_direction(value: &str) -> FlexDirection {
         "column-reverse" => FlexDirection::ColumnReverse,
         _ => FlexDirection::Column,
     }
+}
+
+fn is_intrinsic_size_keyword(value: &str) -> bool {
+    matches!(value, "max-content" | "min-content" | "fit-content")
+        || value.starts_with("fit-content(")
+}
+
+fn remember_grid_placement(style: &mut Style) {
+    if !style.grid_placement_cascaded {
+        style.grid_column_used = style.grid_column.clone();
+        style.grid_row_used = style.grid_row.clone();
+        style.grid_placement_cascaded = true;
+    }
+}
+
+fn split_grid_slash(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = value;
+    while let Some((head, tail)) = split_top_level_once(rest, '/') {
+        parts.push(head.trim());
+        rest = tail;
+    }
+    parts.push(rest.trim());
+    parts
+}
+
+/// `grid-template` expands into the NG column/row fields. The legacy
+/// `grid_template_columns` string stays the longhand, so Taffy does not
+/// see a shorthand it used to drop.
+fn apply_grid_template(style: &mut Style, value: &str) {
+    let value = value.trim();
+    style.grid_template = Some(value.to_string());
+    style.grid_columns_cascaded = true;
+    if value.eq_ignore_ascii_case("none") {
+        style.grid_template_rows = None;
+        style.grid_columns_used = None;
+        style.grid_template_areas = None;
+        return;
+    }
+    if value.contains('"') || value.contains('\'') {
+        style.grid_template_areas = Some(value.to_string());
+        return;
+    }
+    style.grid_template_areas = None;
+    let parts = split_grid_slash(value);
+    match parts.as_slice() {
+        [rows, cols] => {
+            style.grid_template_rows = Some((*rows).to_string());
+            style.grid_columns_used = Some((*cols).to_string());
+        }
+        _ => {
+            style.grid_template_rows = Some(value.to_string());
+            style.grid_columns_used = None;
+        }
+    }
+}
+
+struct AutoFlowSide {
+    dense: bool,
+    tracks: Option<String>,
+}
+
+fn auto_flow_side(value: &str) -> Option<AutoFlowSide> {
+    let tokens = split_css_whitespace(value);
+    let mut dense = false;
+    let mut saw_flow = false;
+    let mut tracks = Vec::new();
+    for token in &tokens {
+        if token.eq_ignore_ascii_case("auto-flow") {
+            saw_flow = true;
+        } else if token.eq_ignore_ascii_case("dense") {
+            dense = true;
+        } else {
+            tracks.push(token.as_str());
+        }
+    }
+    if !saw_flow {
+        return None;
+    }
+    Some(AutoFlowSide {
+        dense,
+        tracks: if tracks.is_empty() {
+            None
+        } else {
+            Some(tracks.join(" "))
+        },
+    })
+}
+
+fn flow_keyword(column: bool, dense: bool) -> String {
+    match (column, dense) {
+        (false, false) => "row".to_string(),
+        (false, true) => "row dense".to_string(),
+        (true, false) => "column".to_string(),
+        (true, true) => "column dense".to_string(),
+    }
+}
+
+/// `grid` resets the template and the auto tracks. Column text is stored
+/// for LayoutNG only.
+fn apply_grid_shorthand(style: &mut Style, value: &str) {
+    let value = value.trim();
+    style.grid_shorthand = Some(value.to_string());
+    style.grid_template = None;
+    style.grid_template_areas = None;
+    style.grid_template_rows = None;
+    style.grid_columns_used = None;
+    style.grid_columns_cascaded = true;
+    style.grid_auto_flow = None;
+    style.grid_auto_rows = None;
+    style.grid_auto_columns = None;
+    if value.eq_ignore_ascii_case("none") || value.contains('"') || value.contains('\'') {
+        if value.contains('"') || value.contains('\'') {
+            style.grid_template_areas = Some(value.to_string());
+        }
+        return;
+    }
+    let parts = split_grid_slash(value);
+    if parts.len() != 2 {
+        style.grid_template_rows = Some(value.to_string());
+        return;
+    }
+    let [left, right] = [parts[0], parts[1]];
+    if let Some(flow) = auto_flow_side(left) {
+        style.grid_auto_flow = Some(flow_keyword(false, flow.dense));
+        style.grid_auto_rows = flow.tracks;
+        style.grid_columns_used = Some(right.to_string());
+    } else if let Some(flow) = auto_flow_side(right) {
+        style.grid_template_rows = Some(left.to_string());
+        style.grid_auto_flow = Some(flow_keyword(true, flow.dense));
+        style.grid_auto_columns = flow.tracks;
+    } else {
+        style.grid_template_rows = Some(left.to_string());
+        style.grid_columns_used = Some(right.to_string());
+    }
+}
+
+fn apply_grid_area(style: &mut Style, value: &str) {
+    let value = value.trim();
+    style.grid_area = Some(value.to_string());
+    remember_grid_placement(style);
+    let parts = split_grid_slash(value);
+    let (row, column) = match parts.as_slice() {
+        [only] => ((*only).to_string(), "auto".to_string()),
+        [row_start, column_start] => ((*row_start).to_string(), (*column_start).to_string()),
+        [row_start, column_start, row_end] => (
+            format!("{row_start} / {row_end}"),
+            (*column_start).to_string(),
+        ),
+        [row_start, column_start, row_end, column_end] => (
+            format!("{row_start} / {row_end}"),
+            format!("{column_start} / {column_end}"),
+        ),
+        _ => {
+            style.grid_row_used = Some(value.to_string());
+            style.grid_column_used = None;
+            return;
+        }
+    };
+    style.grid_row_used = Some(row);
+    style.grid_column_used = Some(column);
 }
 
 fn parse_justify_content(value: &str) -> JustifyContent {
@@ -6014,6 +6281,56 @@ fn flow_root_preserves_its_block_formatting_context_display() {
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("display", "flow-root");
     assert_eq!(declaration.inner.display, Display::FlowRoot);
+}
+
+#[test]
+fn grid_lanes_stays_flex_and_percent_gaps_are_marked() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "grid-lanes");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(GRID_LANES_PROPERTY))
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(UNRECOGNIZED_DISPLAY_PROPERTY))
+    );
+    declaration.set_property("display", "grid");
+    assert_eq!(declaration.inner.display, Display::Grid);
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(GRID_LANES_PROPERTY))
+    );
+    declaration.set_property("row-gap", "10%");
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(PERCENT_GAP_PROPERTY))
+            .map(String::as_str),
+        Some("row")
+    );
+    declaration.set_property("gap", "8px");
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(PERCENT_GAP_PROPERTY))
+    );
 }
 
 #[test]

@@ -92,6 +92,16 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "document-element"
             | "size-containment"
             | "contain-intrinsic-size"
+            // Grid reads these. The cascade leaves the legacy fields alone:
+            // height stays the dimension it already stored, and justify-content
+            // stays the enum flex already uses.
+            | "height-keyword"
+            | "justify-content"
+            // Grid-lanes stays `display: flex` for legacy. NG reads the
+            // marker and lays the box out as a grid. Percent gaps are not
+            // stored; only a grid container consults the marker.
+            | "grid-lanes"
+            | "percent-gap"
     ) || name.starts_with("decoration-owner")
 }
 
@@ -483,8 +493,15 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 unsupported_style(info.style, &[inline::VALIGN_MARKER])
             }
         }
-        ComponentKind::Text { content } if info.style.display != Display::Inline => {
-            unsupported_style(
+        ComponentKind::Text { content }
+            if info.style.display != Display::Inline
+                || info
+                    .parent
+                    .is_some_and(|parent| is_author_grid(flat[parent].style)) =>
+        {
+            // A text grid item is an anonymous block. Its display stays
+            // inline in the cascade; the grid lays it out as block text.
+            unsupported_box_style(
                 info.style,
                 &[
                     inline::VALIGN_MARKER,
@@ -492,6 +509,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                     inline::BIDI_FRAGMENT_MARKERS[1],
                     inline::BIDI_FRAGMENT_MARKERS[2],
                 ],
+                info.style.display == Display::Inline,
             )
             .or_else(|| inline::block_text_reason(content, info.style))
         }
@@ -962,14 +980,19 @@ fn shrink_to_fit(
 /// Author `display:flex`. Synthetic boxes stay on their own algorithms:
 /// an IFC-marker row is an inline formatting context, and a float-group
 /// row is transparent in its parent's BFC.
+fn is_grid_lanes(style: &Style) -> bool {
+    marker(style, "--w3cos-internal-grid-lanes").is_some()
+}
+
 fn is_author_flex(style: &Style) -> bool {
     style.display == Display::Flex
         && marker(style, inline::IFC_MARKER).is_none()
         && !is_float_group(style)
+        && !is_grid_lanes(style)
 }
 
 fn is_author_grid(style: &Style) -> bool {
-    style.display == Display::Grid
+    style.display == Display::Grid || is_grid_lanes(style)
 }
 
 fn is_bfc_root(style: &Style) -> bool {

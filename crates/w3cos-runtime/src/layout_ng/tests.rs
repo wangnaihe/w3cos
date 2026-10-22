@@ -196,11 +196,11 @@ fn percent_height_resolves_against_definite_parent() {
 
 #[test]
 fn unsupported_trees_fall_back() {
-    // An empty grid with no template is S5. `minmax()` tracks stay on legacy.
+    // An empty grid with no template is S5. `subgrid` stays on legacy.
     let grid_root = node(
         Style {
             display: Display::Grid,
-            grid_template_columns: Some("minmax(0, 1fr)".to_string()),
+            grid_template_columns: Some("subgrid".to_string()),
             ..Style::default()
         },
         vec![],
