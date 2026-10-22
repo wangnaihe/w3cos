@@ -35,7 +35,8 @@ use crate::layout::{
 };
 use w3cos_std::ComponentKind;
 use w3cos_std::style::{
-    Dimension, Display, Float, Position, Style, TextAlign, TextDirection, WhiteSpace,
+    Dimension, Display, Float, LineBreak, Position, Style, TextAlign, TextDirection, WhiteSpace,
+    WordBreak,
 };
 
 const EPSILON: f32 = 1.0 / 128.0;
@@ -203,7 +204,7 @@ fn is_soft_wrap_char(c: char) -> bool {
 }
 
 /// Text style requirements shared by every S2a text leaf.
-fn text_style_reason(style: &Style) -> Option<&'static str> {
+fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.position != Position::Static || style.float != Float::None {
         return Some("text:positioned");
     }
@@ -223,6 +224,22 @@ fn text_style_reason(style: &Style) -> Option<&'static str> {
     }
     if style.text_indent != Dimension::Px(0.0) {
         return Some("text:indent");
+    }
+    // The NG breaker does not apply these. Leaving them on NG lays the
+    // page out as if they were absent. ASCII hanging-punctuation stays:
+    // an overflowing quote already paints on the same line, and falling
+    // only that page back disagrees with the NG reference.
+    if style.hanging_punctuation_last && !content.chars().all(|c| c.is_ascii()) {
+        return Some("text:hanging-punctuation");
+    }
+    if !matches!(style.line_break, LineBreak::Auto | LineBreak::Normal) {
+        return Some("text:line-break");
+    }
+    if style.break_spaces {
+        return Some("text:break-spaces");
+    }
+    if style.word_break != WordBreak::Normal {
+        return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
         return Some("text:justify");
@@ -441,7 +458,7 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     if !super::block::block_unicode_bidi_ok(style) {
         return Some("unicode-bidi");
     }
-    text_style_reason(style)
+    text_style_reason(content, style)
 }
 
 /// Inline box edges the cascade put on a word item of a decorated inline
@@ -605,7 +622,7 @@ fn inline_text_reason(
             return Some("text:internal-break");
         }
     }
-    text_style_reason(style)
+    text_style_reason(content, style)
 }
 
 pub(super) fn rendered_children<'a>(
