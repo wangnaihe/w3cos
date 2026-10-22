@@ -204,7 +204,45 @@ fn run(args: impl Iterator<Item = String>) -> Result<bool, String> {
         .baseline
         .as_ref()
         .is_none_or(|baseline| baseline.within_threshold);
-    Ok(report.within_budget && baseline_ok && checked_in_ok)
+    let within = report.within_budget && baseline_ok && checked_in_ok;
+    if !within {
+        explain_limit(&report, report.within_budget, baseline_ok, checked_in_ok);
+    }
+    Ok(within)
+}
+
+/// CI only keeps this process's stderr. The markdown report stays on the
+/// runner, so a failing gate has to say which row moved.
+fn explain_limit(report: &Report, budget_ok: bool, baseline_ok: bool, checked_in_ok: bool) {
+    let target = report.target.as_deref().unwrap_or("unknown-target");
+    if !budget_ok {
+        eprintln!(
+            "w3cos-size-audit: {} {target} is {} bytes, over the {} byte budget",
+            report.probe, report.total_bytes, report.budget_bytes
+        );
+    }
+    if !baseline_ok && let Some(baseline) = &report.baseline {
+        eprintln!(
+            "w3cos-size-audit: {} grew {} bytes ({:.4}%) from {} bytes; limit {:.4}%",
+            report.probe,
+            baseline.change_bytes,
+            baseline.change_percent,
+            baseline.bytes,
+            baseline.max_regression_percent
+        );
+    }
+    if !checked_in_ok && let Some(checked) = &report.checked_in_baseline {
+        eprintln!(
+            "w3cos-size-audit: {} {target} is {} bytes, {} bytes ({:.4}%) from the checked-in {} byte baseline; fails above {:.4}% or {} bytes",
+            report.probe,
+            report.total_bytes,
+            checked.change_bytes,
+            checked.change_percent,
+            checked.bytes.unwrap_or(0),
+            checked.max_regression_percent,
+            checked.max_regression_bytes
+        );
+    }
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Config, String> {
