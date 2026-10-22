@@ -54,7 +54,10 @@ fn mobile_ios_writes_main_rs() {
     assert!(cargo.contains("[profile.release]"));
     assert!(cargo.contains("opt-level = \"z\""));
     assert!(cargo.contains("strip = \"symbols\""));
-    assert!(cargo.contains(r#"default-features = false, features = ["cpu-render", "skia"]"#));
+    assert!(cargo.contains(
+        r#"default-features = false, features = ["skia", "image-png", "image-jpeg", "image-webp"]"#
+    ));
+    assert!(!cargo.contains("cpu-render"));
 }
 
 #[test]
@@ -101,7 +104,7 @@ fn mobile_android_devtools_cargo_feature() {
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(
         cargo
-            .contains(r#"default-features = false, features = ["cpu-render", "skia", "devtools"]"#),
+            .contains(r#"default-features = false, features = ["skia", "image-png", "image-jpeg", "image-webp", "devtools"]"#),
         "devtools feature missing: {cargo}"
     );
 }
@@ -129,7 +132,7 @@ fn mobile_dom_restores_referenced_advanced_capabilities() {
 
     let cargo = std::fs::read_to_string(output.path().join("Cargo.toml")).unwrap();
     assert!(cargo.contains(
-        r#"features = ["cpu-render", "skia", "gpu", "web-graphics-advanced", "web-media-advanced"]"#
+        r#"features = ["gpu", "web-graphics-advanced", "image-png", "image-jpeg", "image-webp", "web-media-advanced"]"#
     ));
 }
 
@@ -163,7 +166,10 @@ fn mobile_harmony_writes_xcomponent_abi() {
 
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(cargo.contains(r#"crate-type = ["cdylib"]"#));
-    assert!(cargo.contains(r#"default-features = false, features = ["skia"]"#));
+    assert!(cargo.contains(
+        r#"default-features = false, features = ["skia", "image-png", "image-jpeg", "image-webp"]"#
+    ));
+    assert!(!cargo.contains("cpu-render"));
     assert!(!cargo.contains("winit"));
 }
 
@@ -188,7 +194,11 @@ fn mobile_harmony_dom_writes_surface_entry() {
     assert!(lib_rs.contains("InteractiveWidget::OverlaysContent"));
     assert!(lib_rs.contains("let _ = crate::esm_bundle::run_entry_async();"));
     let cargo = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
-    assert!(cargo.contains(r#"features = ["skia", "devtools"]"#));
+    assert!(
+        cargo.contains(
+            r#"features = ["skia", "image-png", "image-jpeg", "image-webp", "devtools"]"#
+        )
+    );
 }
 
 #[test]

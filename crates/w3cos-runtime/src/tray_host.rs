@@ -15,6 +15,11 @@
 //! an error. Callers reject that error. They do not report a successful
 //! icon that was never installed. Tests install an in-memory recorder so
 //! the JavaScript behavior can run without a display.
+//!
+//! The desktop adapter is the `host-tray` feature. It is part of the crate
+//! `default` set and of `w3cos-shell`. Builds with `default-features = false`
+//! leave it off unless the feature is named explicitly
+//! (`W3COS_RUNTIME_FEATURES=host-tray` for a generated app).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,19 +92,20 @@ pub fn default_icon() -> TrayIconPixels {
 
 /// Name of the adapter this build will call. `"none"` has no host backend.
 pub fn backend_name() -> &'static str {
-    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    #[cfg(all(feature = "host-tray", target_os = "linux", not(target_env = "ohos")))]
     {
         "StatusNotifierItem"
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "host-tray", target_os = "macos"))]
     {
         "NSStatusItem"
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(feature = "host-tray", target_os = "windows"))]
     {
         "Shell_NotifyIcon"
     }
     #[cfg(not(all(
+        feature = "host-tray",
         any(target_os = "macos", target_os = "linux", target_os = "windows"),
         not(target_env = "ohos")
     )))]
@@ -167,6 +173,7 @@ fn check_spec(spec: &TraySpec) -> Result<(), String> {
 }
 
 #[cfg(not(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
@@ -175,6 +182,7 @@ fn no_adapter() -> String {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -275,6 +283,7 @@ fn recorder_reset() {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -454,6 +463,7 @@ mod native {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -462,6 +472,7 @@ fn create_native(spec: &TraySpec) -> Result<u64, String> {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -470,6 +481,7 @@ fn update_native(id: u64, spec: &TraySpec) -> Result<(), String> {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -478,6 +490,7 @@ fn remove_native(id: u64) -> Result<(), String> {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -486,6 +499,7 @@ fn clear_native() {
 }
 
 #[cfg(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -494,6 +508,7 @@ fn poll_native() -> Vec<TrayEvent> {
 }
 
 #[cfg(not(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
@@ -502,6 +517,7 @@ fn create_native(_spec: &TraySpec) -> Result<u64, String> {
 }
 
 #[cfg(not(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
@@ -510,6 +526,7 @@ fn update_native(_id: u64, _spec: &TraySpec) -> Result<(), String> {
 }
 
 #[cfg(not(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
@@ -518,12 +535,14 @@ fn remove_native(_id: u64) -> Result<(), String> {
 }
 
 #[cfg(not(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
 fn clear_native() {}
 
 #[cfg(not(all(
+    feature = "host-tray",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
@@ -546,13 +565,14 @@ mod tests {
 
     #[test]
     fn backend_name_matches_the_compiled_adapter() {
-        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        #[cfg(all(feature = "host-tray", target_os = "linux", not(target_env = "ohos")))]
         assert_eq!(backend_name(), "StatusNotifierItem");
-        #[cfg(target_os = "macos")]
+        #[cfg(all(feature = "host-tray", target_os = "macos"))]
         assert_eq!(backend_name(), "NSStatusItem");
-        #[cfg(target_os = "windows")]
+        #[cfg(all(feature = "host-tray", target_os = "windows"))]
         assert_eq!(backend_name(), "Shell_NotifyIcon");
         #[cfg(not(all(
+            feature = "host-tray",
             any(target_os = "macos", target_os = "linux", target_os = "windows"),
             not(target_env = "ohos")
         )))]

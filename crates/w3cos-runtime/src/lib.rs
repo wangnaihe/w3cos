@@ -8,6 +8,7 @@ pub mod badging_web;
 pub mod barcode_detection_web;
 pub mod battery_web;
 mod bidi_paint;
+pub mod bluetooth_adapter;
 pub mod bluetooth_web;
 mod blur;
 mod border_paint;
@@ -76,7 +77,18 @@ pub mod fs_watch;
 ))]
 mod gamepad_gilrs;
 pub mod gamepad_web;
+#[cfg(all(
+    feature = "web-geolocation",
+    target_os = "linux",
+    not(target_env = "ohos")
+))]
+mod geolocation_linux;
+#[cfg(all(feature = "web-geolocation", target_os = "macos"))]
+mod geolocation_macos;
+mod geolocation_provider;
 pub mod geolocation_web;
+#[cfg(all(feature = "web-geolocation", target_os = "windows"))]
+mod geolocation_windows;
 pub mod geometry_web;
 #[cfg(feature = "gpu")]
 pub mod gpu_filter;
@@ -187,6 +199,8 @@ pub mod storage_manager_web;
 pub mod streams;
 pub mod streams_web;
 pub mod subtle_crypto_web;
+#[cfg(feature = "gpu")]
+pub mod svg_gpu;
 #[cfg(feature = "skia")]
 mod svg_image_document;
 pub mod svg_renderer;
@@ -326,6 +340,77 @@ pub fn run_app_on_android_dom(
         }
     }
     window::run_dom_android(android_app, setup)
+}
+
+/// Touch opt-in subsystems so a size probe's LTO cannot delete them.
+///
+/// The returned string is diagnostic. Callers should pass it through
+/// `std::hint::black_box` when the probe's only job is to keep the linkage.
+pub fn distribution_linkage_anchor() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    #[cfg(feature = "skia")]
+    {
+        let surface = skia_safe::Surface::new_raster_n32_premul((8, 8));
+        parts.push(format!(
+            "skia:{}",
+            std::hint::black_box(surface.is_some()) as u8
+        ));
+    }
+    #[cfg(feature = "cpu-render")]
+    {
+        let pixmap = tiny_skia::Pixmap::new(8, 8);
+        parts.push(format!(
+            "cpu:{}",
+            std::hint::black_box(pixmap.is_some()) as u8
+        ));
+    }
+    #[cfg(feature = "gpu")]
+    {
+        let mut scene = vello::Scene::new();
+        scene.reset();
+        let _ = std::hint::black_box(scene);
+        let _ = std::hint::black_box(vello::wgpu::Backends::all());
+        parts.push("gpu".to_string());
+    }
+    #[cfg(feature = "image-png")]
+    {
+        let cursor = std::io::Cursor::new(&[][..]);
+        let _ = std::hint::black_box(image::codecs::png::PngDecoder::new(cursor));
+        parts.push("png".to_string());
+    }
+    #[cfg(feature = "image-jpeg")]
+    {
+        let cursor = std::io::Cursor::new(&[][..]);
+        let _ = std::hint::black_box(image::codecs::jpeg::JpegDecoder::new(cursor));
+        parts.push("jpeg".to_string());
+    }
+    #[cfg(feature = "image-webp")]
+    {
+        let cursor = std::io::Cursor::new(&[][..]);
+        let _ = std::hint::black_box(image::codecs::webp::WebPDecoder::new(cursor));
+        parts.push("webp".to_string());
+    }
+    #[cfg(feature = "image-gif")]
+    {
+        let cursor = std::io::Cursor::new(&[][..]);
+        let _ = std::hint::black_box(image::codecs::gif::GifDecoder::new(cursor));
+        parts.push("gif".to_string());
+    }
+    #[cfg(feature = "image-bmp")]
+    {
+        let cursor = std::io::Cursor::new(&[][..]);
+        let _ = std::hint::black_box(image::codecs::bmp::BmpDecoder::new(cursor));
+        parts.push("bmp".to_string());
+    }
+    #[cfg(feature = "image-ico")]
+    {
+        let cursor = std::io::Cursor::new(&[][..]);
+        let _ = std::hint::black_box(image::codecs::ico::IcoDecoder::new(cursor));
+        parts.push("ico".to_string());
+    }
+    #[cfg(feature = "embed-cjk-font")]
+    parts.push(format!("cjk:{}", font_face::embedded_cjk_subset_len()));
+    parts.join(",")
 }
 
 /// Run a W3C OS application using the dynamic DOM model.

@@ -2,7 +2,9 @@
 //!
 //! Exercises permission denial, a real process, window-management displays,
 //! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
-//! honest `NotReadableError` when this host has no live sensor), a camera
+//! honest `NotReadableError` when this host has no live sensor), a geolocation
+//! fix (or an honest position error when this host has no location service),
+//! Bluetooth availability (or `NotSupportedError` / `NotFoundError`), a camera
 //! frame (or an honest `NotFoundError` / `NotAllowedError` / `NotReadableError`
 //! when this host has no usable camera), an application shortcut, the
 //! origin-scoped keyring (or `NotSupportedError` when no secret store is
@@ -15,9 +17,11 @@
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render,web-sensors,web-gamepad,web-device-access,web-serial
-//! # The probe does not grant hid/usb, so requestDevice must not succeed.
+//!   --no-default-features --features cpu-render,web-sensors,web-serial,web-geolocation,web-bluetooth,web-gamepad,web-media-advanced,web-device-access
 //! ```
+//!
+//! The HID and USB probes do not grant `hid` or `usb`, so `requestDevice`
+//! must not succeed. Geolocation is granted only after a denial check.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -285,6 +289,129 @@ fn sensor_probe() -> (String, bool) {
     w3cos_runtime::orientation_web::reset();
     w3cos_runtime::sensors_web::reset();
     (text, ok)
+}
+
+fn geolocation_probe() -> (String, bool) {
+    let geo = w3cos_runtime::geolocation_web::geolocation_value();
+    let denied = Rc::new(RefCell::new(0.0));
+    let denied_slot = Rc::clone(&denied);
+    geo.call_method(
+        "getCurrentPosition",
+        vec![
+            Value::Undefined,
+            Value::function(move |_, args| {
+                *denied_slot.borrow_mut() = args
+                    .first()
+                    .map(|error| error.get_property("code").to_number())
+                    .unwrap_or(0.0);
+                Value::Undefined
+            }),
+            Value::object(HashMap::from([("timeout".into(), Value::Number(200.0))])),
+        ],
+    );
+    jsdom::drain_microtasks();
+    if *denied.borrow() != 1.0 {
+        return (format!("deny {}", denied.borrow()), false);
+    }
+
+    capability_gate::grant("geolocation");
+    let outcome: Rc<RefCell<Option<Result<(f64, f64, f64), f64>>>> = Rc::new(RefCell::new(None));
+    let success_slot = Rc::clone(&outcome);
+    let error_slot = Rc::clone(&outcome);
+    geo.call_method(
+        "getCurrentPosition",
+        vec![
+            Value::function(move |_, args| {
+                let coords = args
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+                    .get_property("coords");
+                *success_slot.borrow_mut() = Some(Ok((
+                    coords.get_property("latitude").to_number(),
+                    coords.get_property("longitude").to_number(),
+                    coords.get_property("accuracy").to_number(),
+                )));
+                Value::Undefined
+            }),
+            Value::function(move |_, args| {
+                *error_slot.borrow_mut() = Some(Err(args
+                    .first()
+                    .map(|error| error.get_property("code").to_number())
+                    .unwrap_or(0.0)));
+                Value::Undefined
+            }),
+            Value::object(HashMap::from([
+                ("timeout".into(), Value::Number(1_500.0)),
+                ("maximumAge".into(), Value::Number(0.0)),
+                ("enableHighAccuracy".into(), Value::Bool(false)),
+            ])),
+        ],
+    );
+    for _ in 0..40 {
+        jsdom::drain_microtasks();
+        if outcome.borrow().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let report = match outcome.borrow().clone() {
+        Some(Ok((latitude, longitude, accuracy)))
+            if latitude.is_finite()
+                && longitude.is_finite()
+                && accuracy.is_finite()
+                && accuracy >= 0.0 =>
+        {
+            (
+                format!("{latitude:.5},{longitude:.5} ±{accuracy:.0}m"),
+                true,
+            )
+        }
+        Some(Err(code)) if code == 1.0 || code == 2.0 || code == 3.0 => {
+            (format!("code {code}"), true)
+        }
+        Some(Ok(_)) => ("non-finite fix".to_string(), false),
+        Some(Err(code)) => (format!("code {code}"), false),
+        None => ("no response".to_string(), false),
+    };
+    w3cos_runtime::geolocation_web::reset();
+    report
+}
+
+fn bluetooth_probe() -> (String, bool) {
+    let bluetooth = w3cos_runtime::bluetooth_web::bluetooth_value();
+    let request = Value::object(HashMap::from([(
+        "acceptAllDevices".into(),
+        Value::Bool(true),
+    )]));
+    let denied = await_value(bluetooth.call_method("requestDevice", vec![request.clone()]));
+    if matches!(denied.as_ref(), Err(name) if name == "NotSupportedError") {
+        return ("NotSupportedError".to_string(), true);
+    }
+    let denied_ok = matches!(denied.as_ref(), Err(name) if name == "NotAllowedError");
+    capability_gate::grant("bluetooth");
+    let available = await_value(bluetooth.call_method("getAvailability", vec![]));
+    let available_text = match &available {
+        Ok(value) => format!("available {}", value.to_bool()),
+        Err(err) => err.clone(),
+    };
+    let found = await_value(bluetooth.call_method("requestDevice", vec![request]));
+    let detail = match &found {
+        Ok(device) => format!(
+            "{available_text}; {}",
+            device.get_property("id").to_js_string()
+        ),
+        Err(err) => format!("{available_text}; {err}"),
+    };
+    let ok = denied_ok
+        && available
+            .as_ref()
+            .is_ok_and(|value| value.as_bool().is_some())
+        && match &found {
+            Ok(device) => device.get_property("id").to_js_string().starts_with("ble:"),
+            Err(err) => err == "NotFoundError",
+        };
+    (detail, ok)
 }
 
 fn camera_probe() -> (String, bool) {
@@ -560,10 +687,14 @@ fn main() {
     row("usb", &usb.0, usb.1);
     let (sensor_text, sensor_ok) = sensor_probe();
     row("accelerometer", &sensor_text, sensor_ok);
+    let (geo_text, geo_ok) = geolocation_probe();
+    row("geolocation", &geo_text, geo_ok);
+    let (bluetooth_text, bluetooth_ok) = bluetooth_probe();
+    row("bluetooth", &bluetooth_text, bluetooth_ok);
     let (camera_text, camera_ok) = camera_probe();
     row("camera", &camera_text, camera_ok);
 
-    let frame = render_document_rgba_cpu(960, 1080).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 1260).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

@@ -72,6 +72,33 @@ These are source and focused-test milestones. They do not close the physical
 Android/iOS device, full gesture, lifecycle, signing, or downstream-product
 gates in R3.
 
+## Performance
+
+Measured with `w3cos-runtime-bench` (`runtime-bench` profile, CPU raster).
+See `docs/performance.md`.
+
+Done:
+
+- Report-only CI job uploads a JSON timing report. It fails only when the
+  harness crashes or a one-node edit costs more than four times a full
+  style-plus-layout pass on that same run.
+- Matched-properties sharing no longer keys on the `id` attribute. On an
+  8201-node flex/grid tree, style recalc median dropped from 76.3 ms to
+  29.6 ms. Layout checksums stayed the same.
+- A one-node width edit still relayouts. A background edit patches the
+  retained tree. Inherited `color` still restyles descendants. `dir` still
+  changes computed direction when `id` differs.
+
+Pending:
+
+- Layout of that tree is still about 55 ms and is dominated by text
+  measurement and Taffy, which this pass does not rewrite.
+- Scroll-list paint and JS-to-DOM host-call medians did not move outside
+  run noise.
+- Cold startup is still dominated by the first fontconfig load.
+- Escape analysis and JIT stay deferred until correctness and Web API
+  conformance land.
+
 ---
 
 ## R0 — Restore a Trustworthy Main Branch
@@ -318,6 +345,14 @@ suite is red.
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`
   canonicalization. Host-unsupported enumeration/I/O rejects explicitly.
+- [x] Desktop `navigator.bluetooth` (`web-bluetooth`) uses `btleplug`
+  (CoreBluetooth, WinRT, BlueZ over D-Bus) for real adapter availability,
+  filtered `requestDevice` (explicit `bluetooth` grant or a chooser; no silent
+  grant), `getDevices`, GATT connect/disconnect, services, characteristics,
+  descriptors, reads, writes, and notifications. The Web Bluetooth GATT
+  blocklist applies. Linux CI installs `libdbus-1-dev`. macOS bundles need
+  `NSBluetoothAlwaysUsageDescription`. The Android host-module adapter is
+  unchanged.
 - [ ] Separate test labels for:
   - direct Rust engine API;
   - ESM/JavaScript Web surface;
@@ -619,6 +654,15 @@ precede ecosystem breadth or migration tooling.
 - [x] Support `getCurrentPosition`, `watchPosition`, and `clearWatch`.
 - [x] Implement timeout, maximum age, accuracy fields, permission denial, and
   platform-disabled errors.
+- [x] Desktop providers behind `web-geolocation`: Linux GeoClue2 on the system
+  bus (zbus, desktop id `w3cos`, city vs exact accuracy; allow `[w3cos]` in
+  `geoclue.conf` when no agent is running), macOS Core Location when-in-use
+  (`NSLocationWhenInUseUsageDescription`, `NSLocationUsageDescription`, and
+  entitlement `com.apple.security.personal-information.location`), and Windows
+  `Windows.Devices.Geolocation` (honors the location privacy setting).
+  Acquisition runs on a dedicated thread and is delivered on the event loop.
+  Host `update_position` remains for tests. `W3COS_GEOLOCATION_DEVICE_TESTS=1`
+  opts into a hardware run. Coordinates are never synthesized.
 - [ ] Add iOS Core Location and Android location adapters with manifest/plist
   generation.
 
@@ -1068,7 +1112,15 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     copy clean tiles and rerasterize only dirty bounding boxes. Topology or
     geometry changes still take a full tiled raster. SMIL and Web Animations
     still do not write computed values into this raster path.
-  - [ ] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+  - [x] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+    When the wgpu/Vello backend is active, each SVG element is encoded as GPU
+    vector geometry (paths, solid and gradient fills and strokes, transforms,
+    clip paths, opacity, blend modes, and text glyph outlines) or, for a mask,
+    filter, pattern paint, miter-clip join, or non-outline glyphs, as a CPU
+    pixmap of that element only. The choice and the reason are logged per
+    element. `W3COS_SVG_CPU_TILES=1` keeps the full 32px tile upload. CPU and
+    Skia backends keep the tiled resvg raster. SMIL and Web Animations still
+    do not write computed values into this paint path.
 - [x] Define cookie behavior: real per-origin session store instead of inert
   assignment.
 
@@ -2971,9 +3023,17 @@ W3COS.
 
 ### Standalone iOS/Android model
 - [ ] Produce capability-driven runtime feature sets; applications link only the APIs and subsystems reachable from their manifest/build graph
-- [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
-- [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
-- [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+- [x] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
+  - Generated iOS, Android, and Harmony manifests enable `skia`, or `gpu` plus `web-graphics-advanced` when the application references WebGPU/WebGL/WebXR. `cpu-render` (tiny-skia and softbuffer) is not combined with that primary backend.
+  - `scripts/check-mobile-renderer-boundary.sh` rejects a Skia closure containing softbuffer, vello, wgpu, ravif, or rav1e, and a GPU closure containing skia-safe or softbuffer. resvg's transitive tiny-skia crate is not a second presenter.
+  - Linux x86_64 host linkage, rustc 1.99.1, `release-size`, stripped, same DOM/jsdom touch: 12,796,192 bytes with no renderer, and 16,057,800 bytes with Skia plus PNG/JPEG/WebP (+3,261,608 bytes). The Skia probe links libstdc++ and Skia objects and has no vello, wgpu, or softbuffer strings. This is not an Android ABI split or an iOS device slice.
+- [x] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
+  - `assets/CJK-Subset.ttf` is 10,028,840 bytes and is `include_bytes!` only for tests and the explicit `embed-cjk-font` feature. Web codegen copies it only when `CompileOptions.embed_cjk_font` or `W3COS_EMBED_CJK_FONT` opts in.
+  - Production fallback uses fontconfig, then Android `AFontMatcher`, Apple Core Text, or the Windows `NONCLIENTMETRICS` UI face, then named families and a directory scan. A missing CJK face warns once and is not drawn. With no system font at all, `host_ui_font` still panics unless a non-test build enabled `embed-cjk-font`.
+  - The probes above do not enable `embed-cjk-font`, and neither binary contains that subset.
+- [x] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+  - The workspace `image` crate is `default-features = false`. Raster formats are explicit `w3cos-runtime` features. Generated iOS, Android, and Harmony manifests enable `image-png`, `image-jpeg`, and `image-webp` only.
+  - The runtime crate default, desktop generated apps, shell, demo, rn-compat, and the WPT runner still enable `image-gif`, `image-bmp`, and `image-ico` so existing desktop decode paths keep working.
   - [x] Remove the unused AVIF encoder (`ravif`/`rav1e`) from the ordinary
     raster closure and retain it as explicit `image-avif-encode` capability.
     AVIF decoding is a separate native-decoder boundary.
@@ -3003,9 +3063,29 @@ W3COS.
     parses HTML and executes SWC → W3IR → W3VM while retaining the network
     loader, WOFF/WOFF2 decoder and configurable persistent-cache/retry path, a
     1,065,632-byte (17.52%) dynamic increment.
-  - Product gates still need Android ABI-split and iOS App Store device-slice artifacts
-- [ ] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+  - [x] Linkage-probe reports now record executable text, file-backed data,
+    read-only data, bss, gzip level 9 of the stripped bytes, and an embedded
+    font/image scan. On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after
+    explicit image codecs and the SVG GPU path landed and with those codecs
+    off in these probes, the checked-in stripped sizes are 11,877,576 bytes
+    for ordinary AOT and 15,372,632 bytes for the dynamic browser probe
+    (gzip 5,095,951 and 6,693,042; embedded 0). The same-runner dynamic
+    increment is 3,495,056 bytes (29.43%). `web-bluetooth` and
+    `web-geolocation` are off in both probes.
+  - [x] The 2026-10-21 Linux x86_64 `release-size` probes (rustc 1.99.1,
+    stripped) measure 12,839,200 bytes for ordinary DOM/jsdom AOT at
+    `ff70045` and 12,796,192 bytes after moving raster codecs onto explicit
+    features (-43,008 bytes; LTO had already dropped unreferenced decoders).
+    The same DOM touch plus Skia and PNG/JPEG/WebP is 16,057,800 bytes.
+    CI builds that Skia probe and audits it with `--profile runtime`.
+  - Product gates still need native-library rows, Android ABI-split, and iOS App Store device-slice artifacts
+- [x] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+  - `w3cos-size-audit` reads the unstripped symbol table and records crate totals, the largest symbols, and feature buckets in the uploaded JSON and markdown reports.
+  - CI fails when a probe's stripped size grows by more than 3% or more than 200 KiB versus the checked-in row for the same rustc host triple in `tools/size-audit/baselines/linkage-probes.json`. Other architectures are not compared. Update that row with `scripts/audit-linkage-sizes.sh --update-baseline --baseline-note "..."` and review the diff.
+  - `host-tray` and `host-keyring` are explicit features, on for the runtime default set and the desktop shell, off for ordinary AOT. On the same `x86_64-unknown-linux-gnu` toolchain, before the later codec split, ordinary AOT fell from 12,814,744 to 11,884,064 bytes (930,680 bytes, 7.26%) and the browser probe from 16,621,992 to 15,694,896 bytes (927,096 bytes, 5.58%).
 - [ ] Track the current full-runtime Monaco artifact as a baseline (about 172 MB unstripped / 120 MB fully stripped on arm64 macOS); replace it with reproducible per-feature baselines
+  - [x] The single arm64 macOS 172 MB / 120 MB figure is retired as a CI gate. It mixed application modules with every default feature and is not reproducible on the Linux runner.
+  - [x] The two checked-in linkage closures, plus per-feature symbol-byte buckets, are the reproducible baselines. A full default-feature Monaco product artifact (renderers, embedded fonts, application JS) is still not rebuilt here.
 - [ ] Verify that standalone W3COS applications remain materially smaller than shipping a complete Chromium stack; treat a regression toward Chromium-class size as an architecture issue, not something `strip` alone will fix
 
 ## Phase 4 — Operating System ✅ (core done)

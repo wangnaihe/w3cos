@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "threshold": {
+    "max_regression_percent": 3.0,
+    "max_regression_bytes": 204800
+  },
+  "probes": {
+    "aot": {
+      "description": "Ordinary DOM/jsdom AOT linkage. No default runtime features and no dynamic-js.",
+      "features": [],
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "total_bytes": 11877576,
+          "text_bytes": 7726552,
+          "data_bytes": 3338845,
+          "readonly_data_bytes": 2703813,
+          "gzip_bytes": 5095951,
+          "embedded_bytes": 0,
+          "feature_symbol_bytes": {
+            "cpu-render": 0,
+            "dynamic-js": 0,
+            "gpu": 0,
+            "host-keyring": 0,
+            "host-tray": 0,
+            "image-codecs": 0,
+            "skia": 0,
+            "web-bluetooth": 0,
+            "web-device-access": 0,
+            "web-gamepad": 0,
+            "web-graphics-advanced": 0,
+            "web-media-advanced": 0,
+            "web-serial": 0
+          },
+          "note": "x86_64-unknown-linux-gnu release-size rows after merging explicit image codecs and the SVG GPU path. Ordinary AOT and dynamic-browser probes leave image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring off. Rust 1.99.1."
+        }
+      }
+    },
+    "browser": {
+      "description": "Dynamic browser linkage: ordinary AOT plus SWC, W3IR, W3VM, the network script loader, and WOFF/WOFF2.",
+      "features": [
+        "dynamic-js"
+      ],
+      "targets": {
+        "x86_64-unknown-linux-gnu": {
+          "total_bytes": 15372632,
+          "text_bytes": 9963144,
+          "data_bytes": 4399109,
+          "readonly_data_bytes": 3586561,
+          "gzip_bytes": 6693042,
+          "embedded_bytes": 0,
+          "feature_symbol_bytes": {
+            "cpu-render": 0,
+            "dynamic-js": 686785,
+            "gpu": 0,
+            "host-keyring": 0,
+            "host-tray": 0,
+            "image-codecs": 192080,
+            "skia": 0,
+            "web-bluetooth": 0,
+            "web-device-access": 0,
+            "web-gamepad": 0,
+            "web-graphics-advanced": 0,
+            "web-media-advanced": 0,
+            "web-serial": 0
+          },
+          "note": "x86_64-unknown-linux-gnu release-size rows after merging explicit image codecs and the SVG GPU path. Ordinary AOT and dynamic-browser probes leave image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring off. Rust 1.99.1."
+        }
+      }
+    }
+  },
+  "retired": [
+    {
+      "name": "monaco-full-runtime-arm64-macos",
+      "status": "retired",
+      "reason": "The single about-172-MB-unstripped / about-120-MB-stripped arm64 macOS Monaco artifact mixed application modules with every default runtime feature and is not a same-runner measurement. CI tracks per-closure linkage baselines in this file instead. Render, font, and image-codec product slices are outside this gate."
+    }
+  ]
+}

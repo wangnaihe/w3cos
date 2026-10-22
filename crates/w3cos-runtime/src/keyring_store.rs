@@ -10,6 +10,11 @@
 //! Credential Manager on Windows. There is no file fallback. A missing or
 //! unreachable store rejects the call. Tests install an in-memory store and
 //! never open the host keyring.
+//!
+//! The desktop adapter is the `host-keyring` feature. It is part of the crate
+//! `default` set and of `w3cos-shell`. Builds with `default-features = false`
+//! leave it off unless the feature is named explicitly
+//! (`W3COS_RUNTIME_FEATURES=host-keyring` for a generated app).
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -288,6 +293,7 @@ fn platform_store() -> Result<Arc<keyring_core::CredentialStore>, KeyringError> 
 }
 
 #[cfg(all(
+    feature = "host-keyring",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 ))]
@@ -320,12 +326,13 @@ fn open_desktop_store() -> Result<Arc<keyring_core::CredentialStore>, KeyringErr
 }
 
 #[cfg(not(all(
+    feature = "host-keyring",
     any(target_os = "macos", target_os = "linux", target_os = "windows"),
     not(target_env = "ohos")
 )))]
 fn open_desktop_store() -> Result<Arc<keyring_core::CredentialStore>, KeyringError> {
     Err(KeyringError::Unavailable(
-        "navigator.w3cos.keyring has no platform adapter on this operating system; the call was refused"
+        "navigator.w3cos.keyring has no platform adapter in this build; the call was refused"
             .to_string(),
     ))
 }
@@ -333,7 +340,11 @@ fn open_desktop_store() -> Result<Arc<keyring_core::CredentialStore>, KeyringErr
 /// Secret Service needs a session bus. Headless CI usually has neither the
 /// address nor `$XDG_RUNTIME_DIR/bus`. Skipping the connect avoids a hang
 /// and reports the same refusal a failed open would.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[cfg(all(
+    feature = "host-keyring",
+    target_os = "linux",
+    not(target_env = "ohos")
+))]
 fn session_bus_missing() -> bool {
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
         return false;
@@ -344,7 +355,10 @@ fn session_bus_missing() -> bool {
     !std::path::Path::new(&runtime).join("bus").exists()
 }
 
-#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+#[cfg(all(
+    feature = "host-keyring",
+    not(all(target_os = "linux", not(target_env = "ohos")))
+))]
 fn session_bus_missing() -> bool {
     false
 }
@@ -473,6 +487,10 @@ mod tests {
         reset_override();
     }
 
+    /// The session-bus probe only exists when the desktop keyring adapter is
+    /// linked. Ordinary AOT builds refuse earlier, inside `open_desktop_store`,
+    /// and do not compile this check.
+    #[cfg(feature = "host-keyring")]
     #[test]
     fn headless_linux_refuses_before_writing_a_secret() {
         if !session_bus_missing() {

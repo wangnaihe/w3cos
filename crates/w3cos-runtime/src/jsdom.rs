@@ -22759,6 +22759,8 @@ pub fn drain_microtasks() -> usize {
         ran += crate::serial_web::poll_serial_io();
         ran += crate::device_access_web::poll_device_events();
         ran += crate::sensors_web::poll_platform_samples();
+        ran += crate::geolocation_web::poll_platform_events();
+        ran += crate::bluetooth_web::poll_platform_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22845,6 +22847,7 @@ pub fn next_timer_deadline() -> Option<Instant> {
         crate::speech::next_deadline(),
         crate::device_access_web::next_device_deadline(),
         crate::sensors_web::next_sample_deadline(),
+        crate::geolocation_web::next_deadline(),
     ]
     .into_iter()
     .flatten()

@@ -1190,6 +1190,10 @@ pub fn matching_pseudo_declarations_for_node(
     node: NodeId,
     pseudo_element: &str,
 ) -> Vec<(String, String, u32)> {
+    let has_rules = RULES.with(|rules| rules.borrow().has_pseudo_kind(pseudo_element));
+    if !has_rules {
+        return Vec::new();
+    }
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
     RULES.with(|rules| {
         let rules = rules.borrow();
@@ -3966,6 +3970,26 @@ mod tests {
         assert_eq!(
             matching_declarations("div", None, &["page-b"], &[])[0].1,
             "page-b"
+        );
+    }
+
+    #[test]
+    fn before_matches_when_unrelated_rules_exist_and_after_stays_empty() {
+        setup();
+        register_rule("div", &[("color", "black")]);
+        register_rule(".item::before", &[("content", "'mark'")]);
+        let mut document = Document::new();
+        let target = document.create_element("div");
+        target.set_attribute(&mut document, "class", "item");
+        document.append_child(document.body().id, target.id);
+
+        let before = matching_pseudo_declarations_for_node(&document, target.id, "::before");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].0, "content");
+        assert_eq!(before[0].1, "'mark'");
+        assert!(matching_pseudo_declarations_for_node(&document, target.id, "::after").is_empty());
+        assert!(
+            matching_pseudo_declarations_for_node(&document, target.id, "::first-line").is_empty()
         );
     }
 }

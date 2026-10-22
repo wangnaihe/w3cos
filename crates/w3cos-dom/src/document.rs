@@ -2287,13 +2287,17 @@ impl Document {
         self.record_layout_dirty(id);
     }
 
-    fn touch_style_revision(&mut self, id: NodeId) {
+    fn bump_node_style_revision(&mut self, id: NodeId) {
         self.style_revision_clock = self.style_revision_clock.wrapping_add(1);
-        self.last_match_change = self.style_revision_clock;
         let revision = self.style_revision_clock;
         if let Some(slot) = self.style_revisions.get_mut(id.0 as usize) {
             *slot = revision;
         }
+    }
+
+    fn touch_style_revision(&mut self, id: NodeId) {
+        self.bump_node_style_revision(id);
+        self.last_match_change = self.style_revision_clock;
     }
 
     /// Invalidate selectors whose subject, ancestor chain, or preceding
@@ -2487,8 +2491,16 @@ impl Document {
     }
 
     /// Non-inherited inline edits: restyle this node only.
+    ///
+    /// Width, background, and the other local properties do not change which
+    /// rules match. Bumping `last_match_change` would drop every element's
+    /// matched-rule memo for a one-node paint or geometry edit.
     pub fn note_local_style(&mut self, id: NodeId) {
-        self.touch_style_revision(id);
+        if stylesheet::matched_rules_survive_inline_style_edits() {
+            self.bump_node_style_revision(id);
+        } else {
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
     }
 
@@ -3429,7 +3441,17 @@ impl Document {
         };
         for (prop, value, _specificity) in &author_declarations {
             if !prop.starts_with("--") {
-                let value = resolve_css_variables(value, &custom_properties);
+                // The loop above already substituted `var()`. Calling
+                // `resolve_css_variables` here would `to_string` every
+                // declaration on the style path, including values with no
+                // variable reference.
+                let resolved;
+                let value = if value.contains("var(") {
+                    resolved = resolve_css_variables(value, &custom_properties);
+                    resolved.as_str()
+                } else {
+                    value.as_str()
+                };
                 if declaration_value_is_valid(prop, &value) {
                     merged.set_property(prop, &value);
                     if css_property_eq(prop, "text-decoration-color")
@@ -5157,9 +5179,13 @@ impl Document {
         }
         Some(MatchedPropertiesKey {
             tag: node.tag.as_u32(),
+            // `id` is not a presentational hint. Rules that match on it are
+            // already part of `matched`, so keeping the unique value in the
+            // key stops otherwise identical elements from sharing a style.
             attributes: node
                 .attributes
                 .iter()
+                .filter(|(name, _)| !name.as_static().eq_ignore_ascii_case("id"))
                 .map(|(name, value)| (name.as_u32(), value.as_str()))
                 .collect(),
             matched: matched.to_vec(),
