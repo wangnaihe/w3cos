@@ -15,6 +15,13 @@ pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
 pub const CONTAIN_INTRINSIC_SIZE_PROPERTY: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width stays auto).
 pub const WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-width-keyword";
+/// A display keyword this engine does not model (`inline-grid`,
+/// `-webkit-box`, …). The used display falls through to `flex`; LayoutNG
+/// must not treat that box as an author flex container.
+pub const UNRECOGNIZED_DISPLAY_PROPERTY: &str = "--w3cos-internal-unrecognized-display";
+/// `flex-wrap` keyword this engine does not model (`balance`, …). The used
+/// value falls through to `nowrap`.
+pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
     match value {
@@ -269,7 +276,15 @@ impl CSSStyleDeclaration {
                         .insert(LIST_IMAGE_PROPERTY.into(), image);
                 }
             }
-            "display" => self.inner.display = parse_display(value),
+            "display" => {
+                self.inner.display = parse_display(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    UNRECOGNIZED_DISPLAY_PROPERTY,
+                    (!css_wide_keyword(&keyword) && !is_known_display(&keyword)).then_some(keyword),
+                );
+            }
             "position" => self.inner.position = parse_position(value),
             "float" | "cssFloat" => self.inner.float = parse_float(value),
             "clear" => self.inner.clear = parse_clear(value),
@@ -281,7 +296,16 @@ impl CSSStyleDeclaration {
                 self.inner.justify_content = parse_justify_content(value)
             }
             "align-items" | "alignItems" => self.inner.align_items = parse_align_items(value),
-            "flex-wrap" | "flexWrap" => self.inner.flex_wrap = parse_flex_wrap(value),
+            "flex-wrap" | "flexWrap" => {
+                self.inner.flex_wrap = parse_flex_wrap(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    UNRECOGNIZED_FLEX_WRAP_PROPERTY,
+                    (!css_wide_keyword(&keyword) && !is_known_flex_wrap(&keyword))
+                        .then_some(keyword),
+                );
+            }
             "flex-grow" | "flexGrow" => {
                 if let Ok(v) = value.parse() {
                     self.inner.flex_grow = v
@@ -2153,6 +2177,43 @@ fn contain_to_css(c: Contain) -> String {
         Contain::Content => "content".to_string(),
         Contain::Strict => "strict".to_string(),
     }
+}
+
+fn css_wide_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+fn is_known_display(value: &str) -> bool {
+    matches!(
+        value,
+        "flex"
+            | "grid"
+            | "block"
+            | "inline"
+            | "inline-block"
+            | "inline-flex"
+            | "flow-root"
+            | "table"
+            | "inline-table"
+            | "table-row-group"
+            | "table-header-group"
+            | "table-footer-group"
+            | "table-row"
+            | "table-column-group"
+            | "table-column"
+            | "table-cell"
+            | "table-caption"
+            | "list-item"
+            | "contents"
+            | "none"
+    )
+}
+
+fn is_known_flex_wrap(value: &str) -> bool {
+    matches!(value, "nowrap" | "wrap" | "wrap-reverse")
 }
 
 fn parse_display(value: &str) -> Display {
@@ -5953,6 +6014,59 @@ fn flow_root_preserves_its_block_formatting_context_display() {
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("display", "flow-root");
     assert_eq!(declaration.inner.display, Display::FlowRoot);
+}
+
+#[test]
+fn unrecognized_display_and_flex_wrap_keep_a_marker() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "-webkit-box");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY))
+            .map(String::as_str),
+        Some("-webkit-box")
+    );
+    declaration.set_property("display", "flex");
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(UNRECOGNIZED_DISPLAY_PROPERTY))
+    );
+    declaration.set_property("display", "inline-grid");
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(UNRECOGNIZED_DISPLAY_PROPERTY))
+            .map(String::as_str),
+        Some("inline-grid")
+    );
+    declaration.set_property("flex-wrap", "balance");
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
+            .map(String::as_str),
+        Some("balance")
+    );
+    declaration.set_property("flex-wrap", "nowrap");
+    assert!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_none_or(|props| !props.contains_key(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
+    );
 }
 
 #[test]

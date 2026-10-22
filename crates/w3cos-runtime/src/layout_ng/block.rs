@@ -65,7 +65,7 @@ pub(super) fn size_contained(style: &Style) -> bool {
 /// The content-box size a size-contained box is laid out as if it had
 /// (Blink ComputeMinMaxSizes / ComputeIntrinsicBlockSize with
 /// ShouldApplySizeContainment: the contain-intrinsic size, else 0).
-fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
+pub(super) fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
     let mut axes = marker(style, CONTAIN_INTRINSIC_SIZE)
         .unwrap_or("")
         .split_ascii_whitespace()
@@ -89,6 +89,7 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "text-source-run"
             | "text-fragment-ends"
             | "quirks-mode"
+            | "document-element"
             | "size-containment"
             | "contain-intrinsic-size"
     ) || name.starts_with("decoration-owner")
@@ -105,7 +106,17 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if let Some(reason) = unsupported_marker(style, allowed) {
         return Some(reason);
     }
-    if !atomic && !matches!(style.display, Display::Block | Display::FlowRoot) {
+    // A flex row the DOM lowered from an inline formatting context carries
+    // the IFC marker and is laid out as an IFC, not by the flex algorithm.
+    // An author `display:flex` (no marker) is a flex container (S5).
+    let lowered_ifc = matches!(style.display, Display::Flex | Display::InlineFlex)
+        && marker(style, inline::IFC_MARKER).is_some();
+    let author_flex = style.display == Display::Flex && !lowered_ifc;
+    if !atomic
+        && !matches!(style.display, Display::Block | Display::FlowRoot)
+        && !lowered_ifc
+        && !author_flex
+    {
         return Some(match style.display {
             Display::Inline => "display:inline",
             Display::InlineBlock => "display:inline-block",
@@ -448,6 +459,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             if inline::is_inline_box(flat, index) {
                 // Validated with its IFC container (container_reason).
                 (!inline::in_inline_container(flat, index)).then_some("display:inline")
+            } else if is_author_flex(info.style) {
+                unsupported_style(info.style, &[inline::VALIGN_MARKER])
+                    .or_else(|| super::flex::container_reason(flat, index))
             } else if inline::is_inline_container(flat, index) {
                 unsupported_style(
                     info.style,
@@ -626,15 +640,15 @@ fn resolve_dim(
     }
 }
 
-struct BoxMetrics {
-    margin: [f32; 4],
-    border: [f32; 4],
-    padding: [f32; 4],
-    content_width: f32,
+pub(super) struct BoxMetrics {
+    pub margin: [f32; 4],
+    pub border: [f32; 4],
+    pub padding: [f32; 4],
+    pub content_width: f32,
 }
 
 /// CSS2 10.3.3 (+10.4) used width and horizontal margins.
-fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
+pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     let cb = space.available_inline;
     let spacing =
         |s: Spacing| resolve_spacing_for_layout(s, cb, style, space.viewport_w, space.viewport_h);
@@ -737,12 +751,12 @@ impl MinMax {
     }
 
     /// MinMaxSizes::Encompass.
-    fn encompass(&mut self, other: MinMax) {
+    pub(super) fn encompass(&mut self, other: MinMax) {
         self.min = self.min.zip(other.min).map(|(a, b)| a.max(b));
         self.max = self.max.max(other.max);
     }
 
-    fn map(self, f: impl Fn(f32) -> f32) -> Self {
+    pub(super) fn map(self, f: impl Fn(f32) -> f32) -> Self {
         MinMax {
             min: self.min.map(&f),
             max: f(self.max),
@@ -932,8 +946,18 @@ fn shrink_to_fit(
     Some(clamp_inline(style, space, edges, width.max(0.0)))
 }
 
+/// Author `display:flex`. Synthetic boxes stay on their own algorithms:
+/// an IFC-marker row is an inline formatting context, and a float-group
+/// row is transparent in its parent's BFC.
+fn is_author_flex(style: &Style) -> bool {
+    style.display == Display::Flex
+        && marker(style, inline::IFC_MARKER).is_none()
+        && !is_float_group(style)
+}
+
 fn is_bfc_root(style: &Style) -> bool {
-    style.display == Display::FlowRoot
+    // A flex container establishes a BFC (CSS Flexbox §3).
+    style.display == Display::FlowRoot || is_author_flex(style)
 }
 
 /// Lay out the root box inside the initial containing block.  Root margins
@@ -1025,6 +1049,11 @@ fn layout_block_in(
 ) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
+    // NGFlexLayoutAlgorithm. Lowered IFC rows and synthetic float groups
+    // stay on the paths below.
+    if is_author_flex(style) {
+        return super::flex::layout(flat, index, space, sized);
+    }
     let mut metrics = resolve_inline(style, space);
     if let Some((width, _)) = sized {
         metrics.content_width = width;

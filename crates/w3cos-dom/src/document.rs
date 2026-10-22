@@ -384,6 +384,10 @@ struct CachedComputedStyle {
 
 /// Set on the document element's component in quirks mode (BackCompat).
 pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
+/// Set on the document element itself. A value carrier: it does not fall
+/// the page back, and flex layout uses it to leave `display:flex` on the
+/// root element to the legacy engine.
+pub const DOCUMENT_ELEMENT_MARKER: &str = "--w3cos-internal-document-element";
 /// Set on a block whose first line is styled by `::first-line`.
 pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
 
@@ -2653,6 +2657,10 @@ impl Document {
             // changes pixels, so always retain the document element.
             let mut tree = self.to_component_subtree(document_element);
             self.collapse_document_body_first_child_margin(&mut tree);
+            tree.style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(DOCUMENT_ELEMENT_MARKER.to_string(), "1".to_string());
             if self.quirks_mode {
                 // Quirks "line height calculation quirk": layout needs the
                 // document mode to drop a root inline box's strut.

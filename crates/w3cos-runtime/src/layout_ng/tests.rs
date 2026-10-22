@@ -196,9 +196,16 @@ fn percent_height_resolves_against_definite_parent() {
 
 #[test]
 fn unsupported_trees_fall_back() {
-    let flex_root = node(Style::default(), vec![]);
-    let flat = pre_flatten(&flex_root);
-    assert!(layout_tree(&flex_root, &flat, 800.0, 600.0).is_none());
+    // An empty nowrap flex container is S5. Grid is still outside it.
+    let grid_root = node(
+        Style {
+            display: Display::Grid,
+            ..Style::default()
+        },
+        vec![],
+    );
+    let flat = pre_flatten(&grid_root);
+    assert!(layout_tree(&grid_root, &flat, 800.0, 600.0).is_none());
 }
 
 #[test]
