@@ -3,7 +3,8 @@
 //! Scenarios:
 //! - cold process start through the first painted frame of a small example page
 //! - style recalc and layout of a large flex/grid/text DOM
-//! - incremental relayout after one width edit, and after one paint-only edit
+//! - incremental relayout after a width edit, a paint-only edit, a text edit,
+//!   a geometry class toggle, and inserting or removing a child
 //! - CPU raster of a scrolling list
 //! - JS `Value` host calls into the DOM (`createElement`, `setAttribute`,
 //!   `appendChild`, `getAttribute`, `textContent`)
@@ -81,8 +82,14 @@ fn main() {
     let paint = measure_scroll_paint(samples);
     let host = measure_host_calls(samples);
     let report = format!(
-        "{{\n  \"harness\": \"w3cos-runtime-bench\",\n  \"profile\": \"runtime-bench\",\n  \"viewport\": [{VIEW_W}, {VIEW_H}],\n  \"startup\": {startup},\n  \"style_layout\": {},\n  \"incremental_width\": {},\n  \"incremental_background\": {},\n  \"paint_scroll\": {paint},\n  \"host_calls\": {host}\n}}\n",
-        style.0, style.1, style.2
+        "{{\n  \"harness\": \"w3cos-runtime-bench\",\n  \"profile\": \"runtime-bench\",\n  \"viewport\": [{VIEW_W}, {VIEW_H}],\n  \"startup\": {startup},\n  \"style_layout\": {},\n  \"incremental_width\": {},\n  \"incremental_background\": {},\n  \"incremental_text\": {},\n  \"incremental_class\": {},\n  \"incremental_insert\": {},\n  \"incremental_remove\": {},\n  \"paint_scroll\": {paint},\n  \"host_calls\": {host}\n}}\n",
+        style.style,
+        style.width,
+        style.background,
+        style.text,
+        style.class_toggle,
+        style.insert,
+        style.remove,
     );
     print!("{report}");
     if let Some(path) = output {
@@ -242,7 +249,24 @@ fn push_text(parent: u32, tag: &str, class_name: &str, text: &str) -> usize {
     2
 }
 
-fn measure_style_and_incremental(samples: usize) -> (String, String, String) {
+struct StyleIncremental {
+    style: String,
+    width: String,
+    background: String,
+    text: String,
+    class_toggle: String,
+    insert: String,
+    remove: String,
+}
+
+struct TimedFlush {
+    us: u128,
+    kind: &'static str,
+    solved: u32,
+    shifted: u32,
+}
+
+fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
     jsdom::set_viewport(f64::from(VIEW_W), f64::from(VIEW_H));
     // One tiny frame loads the UI font before the timed samples.
     warm_font();
@@ -297,14 +321,15 @@ fn measure_style_and_incremental(samples: usize) -> (String, String, String) {
     for index in 0..samples {
         let px = 160 + index * 17;
         dom::set_style_property(target, "width", &format!("{px}px"));
-        let started = Instant::now();
-        let ok = incremental_layout::flush();
-        let elapsed = started.elapsed().as_micros();
-        if !ok {
-            eprintln!("width flush failed");
-            std::process::exit(1);
+        let sample = time_flush("width");
+        if subtree_gate() {
+            assert_subtree("width", &sample, nodes);
+            if sample.kind != "style-subtree" {
+                eprintln!("width flush kind {}", sample.kind);
+                std::process::exit(1);
+            }
         }
-        width_samples.push(elapsed);
+        width_samples.push(sample);
     }
     let after_width = node_width(target);
     if (after_width - before_width).abs() < 1.0 && after_width < 100.0 {
@@ -316,14 +341,7 @@ fn measure_style_and_incremental(samples: usize) -> (String, String, String) {
     for index in 0..samples {
         let color = format!("#{:02x}2040", 20 + index * 40);
         dom::set_style_property(target, "background", &color);
-        let started = Instant::now();
-        let ok = incremental_layout::flush();
-        let elapsed = started.elapsed().as_micros();
-        if !ok {
-            eprintln!("background flush failed");
-            std::process::exit(1);
-        }
-        background_samples.push(elapsed);
+        background_samples.push(time_flush("background"));
     }
     let sibling_after = node_rect(sibling);
     let sibling_moved = rects_differ(sibling_before, sibling_after);
@@ -336,6 +354,124 @@ fn measure_style_and_incremental(samples: usize) -> (String, String, String) {
         eprintln!("background edit did not produce a painted color: {background:?}");
         std::process::exit(1);
     }
+
+    // cell-40 is section 2, an even column. Text and child-list edits stay
+    // inside that section. cell-80 is section 4, also a column, so the class
+    // toggle does not land on the width target.
+    let text_cell = element_by_id("cell-40");
+    let text_node = first_child(text_cell);
+    let before_text_height = node_height(text_cell);
+    let mut text_samples = Vec::with_capacity(samples);
+    for index in 0..samples {
+        let words = "alpha beta gamma delta epsilon zeta eta theta ".repeat(8 + index * 4);
+        dom::set_text_content(text_node, &words);
+        let sample = time_flush("text");
+        if subtree_gate() {
+            assert_subtree("text", &sample, nodes);
+            if sample.kind != "splice" {
+                eprintln!("text flush kind {}", sample.kind);
+                std::process::exit(1);
+            }
+        }
+        text_samples.push(sample);
+    }
+    let after_text_height = node_height(text_cell);
+    if (after_text_height - before_text_height).abs() < 1.0 {
+        eprintln!(
+            "text edit did not change height: before {before_text_height} after {after_text_height}"
+        );
+        std::process::exit(1);
+    }
+
+    let class_cell = element_by_id("cell-80");
+    let before_class_width = node_width(class_cell);
+    let mut class_samples = Vec::with_capacity(samples);
+    let mut class_width_changed = false;
+    let mut previous_class_width = before_class_width;
+    for index in 0..samples {
+        if index % 2 == 0 {
+            dom::class_list_add(class_cell, "wide");
+        } else {
+            dom::class_list_remove(class_cell, "wide");
+        }
+        let sample = time_flush("class");
+        if subtree_gate() {
+            assert_subtree("class", &sample, nodes);
+            if sample.kind != "style-subtree" {
+                eprintln!("class flush kind {}", sample.kind);
+                std::process::exit(1);
+            }
+        }
+        let width = node_width(class_cell);
+        if (width - previous_class_width).abs() >= 1.0 {
+            class_width_changed = true;
+        }
+        previous_class_width = width;
+        class_samples.push(sample);
+    }
+    let after_class_width = node_width(class_cell);
+    if !class_width_changed {
+        eprintln!(
+            "class toggle did not change width: before {before_class_width} after {after_class_width}"
+        );
+        std::process::exit(1);
+    }
+
+    let column = dom::parent_node(text_cell).expect("column parent");
+    let before_children = dom::children(column).len();
+    let mut insert_samples = Vec::with_capacity(samples);
+    let mut remove_samples = Vec::with_capacity(samples);
+    for index in 0..samples {
+        let cell = dom::create_element("div");
+        dom::class_list_add(cell, "cell");
+        let text = dom::create_text_node(&format!("Inserted {index} alpha beta gamma delta"));
+        dom::append_child(cell, text);
+        dom::append_child(column, cell);
+        let sample = time_flush("insert");
+        if subtree_gate() {
+            assert_subtree("insert", &sample, nodes);
+            if sample.kind != "splice" {
+                eprintln!("insert flush kind {}", sample.kind);
+                std::process::exit(1);
+            }
+        }
+        if dom::children(column).len() != before_children + 1 {
+            eprintln!("insert did not add a child");
+            std::process::exit(1);
+        }
+        insert_samples.push(sample);
+        dom::remove_child(column, cell);
+        if !incremental_layout::flush() {
+            eprintln!("insert reset flush failed");
+            std::process::exit(1);
+        }
+    }
+    for index in 0..samples {
+        let cell = dom::create_element("div");
+        dom::class_list_add(cell, "cell");
+        let text = dom::create_text_node(&format!("Removed {index} alpha beta gamma delta"));
+        dom::append_child(cell, text);
+        dom::append_child(column, cell);
+        if !incremental_layout::flush() {
+            eprintln!("remove setup flush failed");
+            std::process::exit(1);
+        }
+        dom::remove_child(column, cell);
+        let sample = time_flush("remove");
+        if subtree_gate() {
+            assert_subtree("remove", &sample, nodes);
+            if sample.kind != "splice" {
+                eprintln!("remove flush kind {}", sample.kind);
+                std::process::exit(1);
+            }
+        }
+        if dom::children(column).len() != before_children {
+            eprintln!("remove did not restore the child count");
+            std::process::exit(1);
+        }
+        remove_samples.push(sample);
+    }
+
     let style = format!(
         "{{\"nodes\": {nodes}, \"median_us\": {}, \"style_median_us\": {}, \"layout_median_us\": {}, \"samples_us\": {}, \"style_samples_us\": {}, \"layout_samples_us\": {}, \"layout_checksum\": {layout_checksum}}}",
         median(&total_samples),
@@ -346,16 +482,115 @@ fn measure_style_and_incremental(samples: usize) -> (String, String, String) {
         json_us(&layout_samples),
     );
     let width = format!(
-        "{{\"median_us\": {}, \"samples_us\": {}, \"before_width\": {before_width}, \"after_width\": {after_width}}}",
-        median(&width_samples),
-        json_us(&width_samples),
+        "{}, \"before_width\": {before_width}, \"after_width\": {after_width}}}",
+        mutation_json(&width_samples),
     );
+    let background_us: Vec<u128> = background_samples.iter().map(|sample| sample.us).collect();
+    let background_kind = background_samples
+        .last()
+        .map(|sample| sample.kind)
+        .unwrap_or("none");
     let background = format!(
-        "{{\"median_us\": {}, \"samples_us\": {}, \"sibling_moved\": {sibling_moved}}}",
-        median(&background_samples),
-        json_us(&background_samples),
+        "{{\"median_us\": {}, \"samples_us\": {}, \"kind\": \"{background_kind}\", \"sibling_moved\": {sibling_moved}}}",
+        median(&background_us),
+        json_us(&background_us),
     );
-    (style, width, background)
+    StyleIncremental {
+        style,
+        width,
+        background,
+        text: format!(
+            "{}, \"before_height\": {before_text_height}, \"after_height\": {after_text_height}}}",
+            mutation_json(&text_samples),
+        ),
+        class_toggle: format!(
+            "{}, \"before_width\": {before_class_width}, \"after_width\": {after_class_width}}}",
+            mutation_json(&class_samples),
+        ),
+        insert: format!(
+            "{}, \"children_before\": {before_children}, \"children_after\": {}}}",
+            mutation_json(&insert_samples),
+            before_children + 1,
+        ),
+        remove: format!(
+            "{}, \"children_before\": {}, \"children_after\": {before_children}}}",
+            mutation_json(&remove_samples),
+            before_children + 1,
+        ),
+    }
+}
+
+fn subtree_gate() -> bool {
+    !matches!(
+        std::env::var("W3COS_SUBTREE_RELAYOUT").ok().as_deref(),
+        Some("0") | Some("false")
+    )
+}
+
+fn time_flush(label: &str) -> TimedFlush {
+    let started = Instant::now();
+    let ok = incremental_layout::flush();
+    let us = started.elapsed().as_micros();
+    if !ok {
+        eprintln!("{label} flush failed");
+        std::process::exit(1);
+    }
+    let stats = incremental_layout::last_flush_stats();
+    TimedFlush {
+        us,
+        kind: stats.kind,
+        solved: stats.solved_nodes,
+        shifted: stats.shifted_nodes,
+    }
+}
+
+/// A one-node edit that lays out the whole document is the old path.
+fn assert_subtree(label: &str, sample: &TimedFlush, nodes: usize) {
+    if sample.kind == "retained" || sample.kind == "rebuild" || sample.solved as usize * 4 >= nodes
+    {
+        eprintln!(
+            "{label} solved the whole tree: kind {} solved {} shifted {} nodes {nodes}",
+            sample.kind, sample.solved, sample.shifted
+        );
+        std::process::exit(1);
+    }
+}
+
+fn mutation_json(samples: &[TimedFlush]) -> String {
+    let us: Vec<u128> = samples.iter().map(|sample| sample.us).collect();
+    let last = samples.last().expect("samples");
+    format!(
+        "{{\"median_us\": {}, \"samples_us\": {}, \"kind\": \"{}\", \"solved_nodes\": {}, \"shifted_nodes\": {}",
+        median(&us),
+        json_us(&us),
+        last.kind,
+        last.solved,
+        last.shifted,
+    )
+}
+
+fn element_by_id(id: &str) -> u32 {
+    dom::with_document(|document| {
+        document
+            .get_element_by_id(id)
+            .unwrap_or_else(|| panic!("{id}"))
+            .id
+            .as_u32()
+    })
+}
+
+fn first_child(id: u32) -> u32 {
+    dom::with_document(|document| {
+        document
+            .get_node(NodeId::from_u32(id))
+            .first_child
+            .expect("child")
+            .as_u32()
+    })
+}
+
+fn node_height(id: u32) -> f32 {
+    node_rect(id).height
 }
 
 fn register_large_rules() {
@@ -371,6 +606,7 @@ fn register_large_rules() {
     stylesheet::register_rule(".grid", &[("display", "grid"), ("width", "100%")]);
     stylesheet::register_rule(".cell", &[("padding", "4px"), ("margin", "2px")]);
     stylesheet::register_rule(".cell.alt", &[("background", "#eef2ff")]);
+    stylesheet::register_rule(".cell.wide", &[("width", "180px")]);
     stylesheet::register_rule(".grid > .cell", &[("min-height", "18px")]);
 }
 
