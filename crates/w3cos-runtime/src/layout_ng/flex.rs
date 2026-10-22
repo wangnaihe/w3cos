@@ -5,7 +5,10 @@
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
 //! lengths, alignment, line breaking). Baseline alignment, inline-flex,
-//! column wrap, and an indefinite percentage basis stay on the legacy engine.
+//! wrap-reverse, column wrap, and an indefinite percentage basis stay on
+//! the legacy engine. A definite-height row wrap with a gap and
+//! auto-height items stays there too (`flex-wrap: balance` is
+//! unrecognized, and its wrap reference must use the same engine).
 //!
 //! A flex row the DOM lowered from an inline formatting context carries the
 //! IFC marker and is not a flex container; the block algorithm lays it out
