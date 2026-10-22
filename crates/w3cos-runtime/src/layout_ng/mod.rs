@@ -26,6 +26,7 @@
 mod block;
 mod exclusion;
 mod flex;
+mod grid;
 mod inline;
 mod oof;
 

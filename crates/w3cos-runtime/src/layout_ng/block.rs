@@ -112,16 +112,20 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     let lowered_ifc = matches!(style.display, Display::Flex | Display::InlineFlex)
         && marker(style, inline::IFC_MARKER).is_some();
     let author_flex = style.display == Display::Flex && !lowered_ifc;
+    // `display:grid` is a grid container when `grid::container_reason` accepts
+    // the template. `inline-grid` is not a `Display::Grid` (it stays a flex
+    // box plus the unrecognized-display marker).
+    let author_grid = style.display == Display::Grid;
     if !atomic
         && !matches!(style.display, Display::Block | Display::FlowRoot)
         && !lowered_ifc
         && !author_flex
+        && !author_grid
     {
         return Some(match style.display {
             Display::Inline => "display:inline",
             Display::InlineBlock => "display:inline-block",
             Display::Flex | Display::InlineFlex => "display:flex",
-            Display::Grid => "display:grid",
             _ => "display:other",
         });
     }
@@ -462,6 +466,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             } else if is_author_flex(info.style) {
                 unsupported_style(info.style, &[inline::VALIGN_MARKER])
                     .or_else(|| super::flex::container_reason(flat, index))
+            } else if is_author_grid(info.style) {
+                unsupported_style(info.style, &[inline::VALIGN_MARKER])
+                    .or_else(|| super::grid::container_reason(flat, index))
             } else if inline::is_inline_container(flat, index) {
                 unsupported_style(
                     info.style,
@@ -819,6 +826,12 @@ pub(super) fn intrinsic_sizes(
     {
         return super::bail("intrinsic-percent");
     }
+    if is_author_grid(info.style) {
+        // A grid's min/max-content size is the sum of its tracks, not the
+        // block-flow sum below. Shrink-to-fit of an auto-width grid stays
+        // on the legacy engine.
+        return super::bail("grid:intrinsic");
+    }
     if let ComponentKind::Text { content } = info.kind {
         return Some(inline::text_min_max(content, info.style));
     }
@@ -955,9 +968,14 @@ fn is_author_flex(style: &Style) -> bool {
         && !is_float_group(style)
 }
 
+fn is_author_grid(style: &Style) -> bool {
+    style.display == Display::Grid
+}
+
 fn is_bfc_root(style: &Style) -> bool {
-    // A flex container establishes a BFC (CSS Flexbox §3).
-    style.display == Display::FlowRoot || is_author_flex(style)
+    // A flex or grid container establishes an independent formatting
+    // context (CSS Flexbox §3, CSS Grid §1).
+    style.display == Display::FlowRoot || is_author_flex(style) || is_author_grid(style)
 }
 
 /// Lay out the root box inside the initial containing block.  Root margins
@@ -1053,6 +1071,9 @@ fn layout_block_in(
     // stay on the paths below.
     if is_author_flex(style) {
         return super::flex::layout(flat, index, space, sized);
+    }
+    if is_author_grid(style) {
+        return super::grid::layout(flat, index, space, sized);
     }
     let mut metrics = resolve_inline(style, space);
     if let Some((width, _)) = sized {
