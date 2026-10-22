@@ -91,8 +91,10 @@ Done:
 
 Pending:
 
-- Layout of that tree is still about 55 ms and is dominated by text
-  measurement and Taffy, which this pass does not rewrite.
+- Layout of that tree is about 24–25 ms on the machine that measured
+  48.9 ms before this pass (7 samples, two processes, checksum unchanged).
+  What remains is the Taffy solve, Taffy tree build, and soft-line
+  placement for ordinary blocks of inline text. See `docs/performance.md`.
 - Scroll-list paint and JS-to-DOM host-call medians did not move outside
   run noise.
 - Cold startup is still dominated by the first fontconfig load.

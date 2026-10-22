@@ -106,9 +106,59 @@ showed and because the tests lock the old behavior:
   properties) no longer drops every element's matched-rule memo, unless a
   container query or `[style]` selector is registered.
 
+## Cold full layout
+
+Same machine, `runtime-bench` profile, `cpu-render`, viewport `1280×720`,
+7 samples per process. The before binary is the tree before this pass. The
+after binary is two later processes. Layout checksum `18294915160932`,
+startup paint checksum `150112521`, and scroll checksum `3575553302` matched.
+The width edit still moved cell 0 from 1260 px to 270 px. The background
+edit did not move the sibling.
+
+| Scenario | Before (warm process) | After (two processes) |
+| --- | ---: | ---: |
+| Layout, 8201 nodes | 48.9 ms | 24.4 ms, 24.8 ms |
+| Style recalc | 28.0 ms | 27.4 ms, 27.4 ms |
+| Style + layout | 76.8 ms | 51.8 ms, 52.3 ms |
+| One-node width edit | 3.91 ms | 3.77 ms, 3.86 ms |
+
+Before layout samples, colder process then warmer process, microseconds:
+`56980` median of `[68937, 57061, 62516, 56980, 54260, 49518, 51610]`, then
+`48895` median of `[53194, 48290, 48690, 48895, 49373, 48492, 50303]`.
+After: `24439` median of `[28575, 24816, 26762, 24241, 24369, 24222, 24439]`,
+then `24799` median of `[28806, 25355, 27203, 24798, 24799, 23212, 24521]`.
+The first sample of each process is slower than the rest.
+
+`W3COS_LAYOUT_PHASES=1` prints one line of phase microseconds per layout.
+On a warm 8201-node sample after this pass the large buckets were Taffy
+tree build (~9.3 ms), one Taffy solve (~5.6 ms), the forced/soft line
+projection (~4.4 ms), wrapped text heights (~1.8 ms), and layout collection
+(~1.2 ms). There is no second Taffy solve on this tree.
+
+What changed:
+
+- Single-line fontdue measurement skips whitespace allocation and the text
+  cache when collapse would not change the string and the line fits.
+  `normal` text that would wrap, and anything with controls, non-ASCII, or
+  leading/trailing/doubled spaces, stays on the old path. Skia builds do
+  not take this path. ASCII vertical extents are cached next to glyph
+  advances. A unit test compares the fast path with the wrapping measure.
+- Public `compute` skips the table-tree clone and table projections when
+  the tree has no table box and no rowspan, and skips float/clear
+  projections when nothing floats or clears. Inline passes that only repair
+  atomics, replaced boxes, forced breaks, or preserved whitespace are
+  skipped unless the tree has those features. Soft line placement for a
+  block of inline text still runs. `W3COS_PROJECTION_GATES=0` runs every
+  pass. `W3COS_PROJECTION_VERIFY=1` runs a skipped pass and panics if a box
+  moves.
+- Text height updates compare the existing Taffy size before cloning a
+  style. `count_nodes` is memoized for the public layout the same way the
+  incremental engine already memoizes it.
+
 ## Still open
 
-Layout of the 8201-node tree is about 55 ms and is mostly text measurement
-and Taffy. Scroll-list paint and host-call throughput did not move in this
-harness. Escape analysis and JIT remain deferred until correctness and Web
-API conformance land.
+The 8201-node layout is about 24–25 ms on this machine. What is left is the
+Taffy solve, building the Taffy tree, and the soft-line projection that
+ordinary blocks of inline text still need. Scroll-list paint and host-call
+throughput did not move in this harness. Escape analysis and JIT remain
+deferred until correctness and Web API conformance land.
