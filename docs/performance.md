@@ -20,7 +20,8 @@ Scenarios:
 
 - cold startup through the first painted frame of a small page
 - style recalc and layout of 8201 flex/grid/text nodes
-- one width edit, then one background edit, against the retained layout
+- one width edit, one background edit, one text edit, one geometry
+  class toggle, and one child insert and remove, against the retained layout
 - CPU raster of a 240-row scrolling list
 - JS `Value` calls into `createElement`, `setAttribute`, `textContent`,
   `appendChild`, and `getAttribute`
@@ -32,8 +33,10 @@ not change the DOM or layout it claims to measure.
 
 `.github/workflows/ci.yml` job `runtime-bench` builds the same binary, runs
 `--samples 3`, checks that the tree has at least 5000 nodes, that medians
-are positive, that the width edit changes used width, and that a one-node
-edit is faster than four times the same run's full style-plus-layout median.
+are positive, that each edit changes the box it claims to change, that a
+one-node edit is faster than four times the same run's full style-plus-layout
+median, and that the width, text, class, insert, and remove edits lay out a
+subtree (`solved_nodes * 4 < nodes`) rather than the whole tree.
 The job uploads `runtime-bench.json` as the `runtime-bench` artifact. Absolute
 microseconds are not a gate.
 
@@ -80,8 +83,9 @@ What the table supports:
   that depend on `id` stay in the matched-rule list. `dir` is still part
   of the key, and a unit test checks that `dir="rtl"` does not share
   direction with an otherwise identical element.
-- Layout time and the layout checksum did not move. The width edit still
-  relayouts.
+- Layout time and the layout checksum did not move. The width edit in this
+  table still walked the retained tree. The subtree path below is a later
+  measurement.
 - Background, scroll, and host-call deltas sit inside run noise. The
   background path does skip a Taffy solve when every dirty style differs
   only by paint fields (background, opacity, border colors, radii,
@@ -148,17 +152,97 @@ What changed:
   projections when nothing floats or clears. Inline passes that only repair
   atomics, replaced boxes, forced breaks, or preserved whitespace are
   skipped unless the tree has those features. Soft line placement for a
-  block of inline text still runs. `W3COS_PROJECTION_GATES=0` runs every
-  pass. `W3COS_PROJECTION_VERIFY=1` runs a skipped pass and panics if a box
-  moves.
+  block of inline text still runs. A flex row with `align-items: baseline`
+  and unequal line heights still runs the baseline pass. `W3COS_PROJECTION_GATES=0`
+  runs every pass. `W3COS_PROJECTION_VERIFY=1` runs a skipped pass and panics
+  if a box moves.
 - Text height updates compare the existing Taffy size before cloning a
   style. `count_nodes` is memoized for the public layout the same way the
   incremental engine already memoizes it.
 
+## Incremental subtree relayout
+
+A later pass stopped walking the whole 8201-node tree after a local edit.
+Numbers below are five samples on one machine, `runtime-bench` profile,
+viewport `1280×720`. The before column for width and background is the
+harness binary from before this pass (`/tmp/runtime-bench-before.json`).
+Text, class, insert, and remove were not in that binary. Their before
+column is the same new binary with `W3COS_SUBTREE_RELAYOUT=0`, which keeps
+the previous flush. Medians, then the five samples.
+
+`LayoutEngine::compute` on the retained tree was the width cost. With
+`W3COS_LAYOUT_PHASES=1` on that fallback, five width edits of 8201 nodes
+spent about 175–192 µs flattening, 3900–3991 µs in `compute`, and about
+65 µs writing rects, one compute pass. Taffy already skips clean subtrees.
+The walk that still touched every node was the text-height update and the
+layout collect inside that compute.
+
+| Scenario | Before | After |
+| --- | ---: | ---: |
+| One-node width edit | 4.02 ms | 0.254 ms |
+| One-node background edit | 0.275 ms | 0.241 ms |
+| Text edit in a column cell | 50.5 ms | 0.220 ms |
+| `.wide` class toggle | 4.44 ms | 0.231 ms |
+| Insert a cell in a column | 52.4 ms | 0.385 ms |
+| Remove that cell | 53.0 ms | 0.362 ms |
+
+Samples, microseconds:
+
+- Width before `[4392, 4017, 3930, 3946, 4031]`, after `[603, 276, 254, 246, 244]`.
+  Used width 1260 px to 236 px in both. After solves 2 nodes (`style-subtree`).
+  Height did not change, so no follower was translated.
+- Background before `[275, 246, 245, 322, 290]`, after `[246, 241, 237, 241, 242]`.
+  Kind `paint`. The sibling box did not move.
+- Text before `[54533, 51048, 49996, 50500, 50407]` (kind `rebuild`, 8201 nodes),
+  after `[296, 221, 210, 213, 220]` (kind `splice`, 2 solved, 4156 shifted).
+  Cell height 24.8 px to 360.8 px.
+- Class before `[5892, 4544, 273, 4441, 260]`. The 273 µs and 260 µs samples
+  are full-tree width-memo hits of the repeated 180 px value. The other three
+  are retained computes of 8201 nodes. After `[322, 231, 224, 251, 228]`
+  (kind `style-subtree`, 2 solved). Used width 1260 px to 188 px. The last
+  sample is the wide state because the run has an odd sample count.
+- Insert before `[50790, 52031, 57554, 52422, 52724]` (rebuild, 8203 nodes),
+  after `[465, 398, 385, 380, 384]` (splice, 43 solved, 4137 shifted).
+- Remove before `[52278, 52522, 53029, 52966, 53630]` (rebuild, 8201 nodes),
+  after `[368, 359, 360, 384, 362]` (splice, 41 solved, 4137 shifted).
+
+Cold style-plus-layout on this machine stayed in the same band (before
+median 75.8 ms, layout 48.4 ms; after-run median 76.3 ms, layout 49.4 ms).
+Layout checksum `18294915160932` matched. Scroll checksum `2683200085`
+matched. This pass does not change the cold layout.
+
+What changed:
+
+- A geometry edit whose parent is a block or a safe column flex (no wrap,
+  no gap, flex-start, every item `flex-grow: 0`) lays out that element in
+  the parent's content box and pins the border-box origin. Following
+  siblings move only when the border-box height changes. A flex or grid
+  parent that is not a vertical stack is solved as a container when its
+  used width is definite and the container is at most 512 nodes.
+- A text edit or a child insert/remove under that column flex uses the
+  existing block splice. The same edit under a definite-width flex or grid
+  re-solves that container and shifts what follows. `ancestor_levels` used
+  to reject every flex and grid parent, so those edits rebuilt the document.
+- Splice no longer walks all 8201 nodes to decide whether text must be
+  measured. A definite-height ancestor still suppresses that measure, which
+  is what the chat-log splice tests require.
+- The retained Taffy tree is invalidated after a subtree write, and the
+  whole-tree width memo is cleared, so a later full compute cannot restore
+  stale rects.
+
+Unit tests lay out a fresh tree after a column-flex width, text, append,
+and remove; a grid text, append, and remove; a width class toggle; and a
+row-flex width edit. Every host rect must match within 0.05 px.
+
 ## Still open
 
-The 8201-node layout is about 24–25 ms on this machine. What is left is the
-Taffy solve, building the Taffy tree, and the soft-line projection that
-ordinary blocks of inline text still need. Scroll-list paint and host-call
-throughput did not move in this harness. Escape analysis and JIT remain
-deferred until correctness and Web API conformance land.
+The 8201-node layout is about 24–25 ms on the machine that measured the
+cold-layout pass. What is left there is the Taffy solve, building the Taffy
+tree, and the soft-line projection that ordinary blocks of inline text still
+need. A flex or grid container above 512 nodes, a wrapping or gapped column,
+center or flex-end alignment, and any tree with a float, absolute, fixed, or
+sticky box still takes the retained or full rebuild path. A height change
+still adds `dy` to every following host; that translation is counted in the
+text and insert numbers above. Scroll-list paint and host-call throughput
+did not move in this harness. Escape analysis and JIT remain deferred until
+correctness and Web API conformance land.

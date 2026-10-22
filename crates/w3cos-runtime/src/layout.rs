@@ -5315,7 +5315,7 @@ fn cold_layout_plan(flat: &[FlatNodeInfo<'_>]) -> ColdLayoutPlan {
         table: false,
         complex_inline: false,
     };
-    for node in flat {
+    for (index, node) in flat.iter().enumerate() {
         let style = node.style;
         if style.float != WFloat::None || style.clear != WClear::None {
             plan.float_or_clear = true;
@@ -5326,8 +5326,61 @@ fn cold_layout_plan(flat: &[FlatNodeInfo<'_>]) -> ColdLayoutPlan {
         if !plan.complex_inline && node_needs_complex_inline(node) {
             plan.complex_inline = true;
         }
+        if !plan.complex_inline && flex_baseline_texts_need_line_alignment(flat, index) {
+            plan.complex_inline = true;
+        }
     }
     plan
+}
+
+/// Flex `align-items: baseline` plus equal-font inline texts whose struts
+/// differ. `align_inline_block_last_line_baselines` is what puts those runs
+/// on one baseline; Taffy's leaf-bottom baseline leaves the shorter strut
+/// low. Ordinary flex rows (the bench tree) do not use baseline alignment.
+fn flex_baseline_texts_need_line_alignment(flat: &[FlatNodeInfo<'_>], index: usize) -> bool {
+    let parent = &flat[index];
+    if parent.style.display != WDisplay::Flex || parent.style.align_items != WAlign::Baseline {
+        return false;
+    }
+    let mut child = index + 1;
+    let mut saw = false;
+    let mut min_lh = f32::INFINITY;
+    let mut max_lh = inline_style_line_height(parent.style);
+    while child < parent.subtree_end && child < flat.len() {
+        let info = &flat[child];
+        let in_flow = info.style.display != WDisplay::None
+            && info.style.float == WFloat::None
+            && !matches!(info.style.position, WPos::Absolute | WPos::Fixed);
+        if in_flow {
+            let same_face = info.style.display == WDisplay::Inline
+                && matches!(info.kind, ComponentKind::Text { .. })
+                && info.style.font_size == parent.style.font_size
+                && info.style.font_family == parent.style.font_family
+                && info.style.font_weight == parent.style.font_weight
+                && info.style.font_style == parent.style.font_style
+                && info.style.font_variant == parent.style.font_variant
+                && matches!(
+                    info.style.align_self,
+                    WAlignSelf::Auto | WAlignSelf::Baseline
+                )
+                && info
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .is_none_or(|properties| {
+                        !properties.contains_key("--w3cos-internal-vertical-align-length")
+                    });
+            if !same_face {
+                return false;
+            }
+            let line_height = inline_style_line_height(info.style);
+            min_lh = min_lh.min(line_height);
+            max_lh = max_lh.max(line_height);
+            saw = true;
+        }
+        child = info.subtree_end;
+    }
+    saw && max_lh - min_lh > 0.01
 }
 
 pub fn compute_with_scroll_details(

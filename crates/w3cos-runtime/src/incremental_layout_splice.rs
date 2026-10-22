@@ -15,7 +15,10 @@
 //! shape returns false and the caller rebuilds the whole tree.
 
 use w3cos_dom::node::{NodeId, NodeType};
-use w3cos_std::style::{Dimension, Display, Edges, Float, Overflow, Position, Spacing, Style};
+use w3cos_std::style::{
+    AlignItems, AlignSelf, Dimension, Display, Edges, FlexDirection, FlexWrap, Float,
+    JustifyContent, Overflow, Position, Spacing, Style,
+};
 use w3cos_std::{Component, ComponentKind};
 
 use super::{Cache, can_skip_projections, flat_host_id, host_id, needs_text_metric};
@@ -37,6 +40,18 @@ fn bail(reason: &str) -> bool {
         eprintln!("[splice] rebuild: {reason}");
     }
     false
+}
+
+/// `W3COS_SUBTREE_RELAYOUT=0` keeps the previous whole-tree fallback so a
+/// profile can compare the two on one binary.
+pub(super) fn subtree_relayout_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("W3COS_SUBTREE_RELAYOUT").ok().as_deref(),
+            Some("0") | Some("false")
+        )
+    })
 }
 
 pub(crate) fn splice_counts() -> (u32, u32) {
@@ -210,6 +225,40 @@ fn collect_hosts(component: &Component, out: &mut Vec<u32>) {
     }
 }
 
+/// A column flex container stacks its items the same way a block stacks
+/// its in-flow children: a used-height change translates the tail and grows
+/// auto-height ancestors. Definite free space, wrapping, and gaps that the
+/// shift does not model are rejected.
+fn column_flex_stacks(component: &Component) -> bool {
+    if !subtree_relayout_enabled() {
+        return false;
+    }
+    let style = &component.style;
+    if style.display != Display::Flex
+        || style.flex_direction != FlexDirection::Column
+        || style.flex_wrap != FlexWrap::NoWrap
+        || style.justify_content != JustifyContent::FlexStart
+        || !in_flow_static(style)
+        || is_table_like(component)
+        || style.gap != 0.0
+        || style.row_gap.is_some()
+        || style.column_gap.is_some()
+    {
+        return false;
+    }
+    let definite = matches!(style.height, Dimension::Px(_));
+    component
+        .children
+        .iter()
+        .all(|child| child.style.flex_grow == 0.0 && (!definite || child.style.flex_shrink == 0.0))
+}
+
+fn stacking_parent(component: &Component) -> bool {
+    let style = &component.style;
+    (is_block_flow(style.display) && in_flow_static(style) && !is_table_like(component))
+        || column_flex_stacks(component)
+}
+
 /// Ancestors between `path`'s target and the first definite-height block
 /// only move or grow. Returns the number of path levels (from the target
 /// upwards) whose following siblings must shift, or None when an ancestor
@@ -219,10 +268,10 @@ fn ancestor_levels(root: &Component, path: &[usize]) -> Option<usize> {
     for depth in (0..path.len()).rev() {
         let parent = at_path(root, &path[..depth]);
         levels += 1;
-        let style = &parent.style;
-        if !is_block_flow(style.display) || !in_flow_static(style) || is_table_like(parent) {
+        if !stacking_parent(parent) {
             return None;
         }
+        let style = &parent.style;
         match style.height {
             Dimension::Px(_) => return Some(levels),
             Dimension::Auto => {}
@@ -311,6 +360,9 @@ fn plan_splice(cache: &Cache, dirty: &[NodeId]) -> Result<Option<Plan>, ()> {
                 return Ok(Some(plan));
             }
             if let Some(plan) = try_candidate(cache, document, &chain, node) {
+                return Ok(Some(plan));
+            }
+            if let Some(plan) = try_container(cache, document, &chain, node) {
                 return Ok(Some(plan));
             }
             chain.pop();
@@ -466,6 +518,64 @@ fn try_candidate(
         || !edge_blocks_margin_collapse(&fresh, false)
         || !edge_blocks_margin_collapse(old, true)
         || !edge_blocks_margin_collapse(old, false)
+    {
+        return None;
+    }
+    Some(Plan {
+        path,
+        node,
+        kind: PlanKind::Subtree(fresh),
+    })
+}
+
+const MAX_SOLVE_NODES: usize = 512;
+
+fn width_is_definite(style: &Style) -> bool {
+    match style.width {
+        Dimension::Px(px) => px.is_finite() && px >= 0.0,
+        Dimension::Percent(percent) => percent.is_finite() && percent >= 0.0,
+        _ => false,
+    }
+}
+
+fn is_flex_or_grid(style: &Style) -> bool {
+    matches!(
+        style.display,
+        Display::Flex | Display::InlineFlex | Display::Grid
+    )
+}
+
+/// Child-list edits under a flex or grid container re-solve that container
+/// when its used width is definite and the container is smaller than the
+/// document. The existing block tail plan does not apply: flex items do not
+/// collapse margins, and grid items are not a vertical stack.
+fn try_container(
+    cache: &Cache,
+    document: &w3cos_dom::document::Document,
+    chain: &[u32],
+    node: u32,
+) -> Option<Plan> {
+    if !subtree_relayout_enabled()
+        || chain.len() <= 1
+        || chain.last() == Some(&crate::dom::body_id())
+    {
+        return None;
+    }
+    let path = component_path(&cache.component, chain)?;
+    let old = at_path(&cache.component, &path);
+    if !is_flex_or_grid(&old.style)
+        || !in_flow_static(&old.style)
+        || !width_is_definite(&old.style)
+        || crate::layout::count_nodes(old) > MAX_SOLVE_NODES
+    {
+        return None;
+    }
+    ancestor_levels(&cache.component, &path)?;
+    let fresh = document.to_component_subtree(NodeId::from_u32(node));
+    if host_id(&fresh) != Some(node)
+        || fresh.style != old.style
+        || !tree_is_spliceable(&fresh)
+        || crate::layout::count_nodes(&fresh) > MAX_SOLVE_NODES
     {
         return None;
     }
@@ -723,7 +833,7 @@ pub(super) fn try_splice(
                 std::slice::from_ref(&old_subtree),
                 std::slice::from_ref(at_path(&cache.component, &plan.path)),
             );
-            let measure = needs_text_metric(&cache.component);
+            let measure = text_metric_after_edit(cache, &plan.path);
             let fresh =
                 std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
             let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
@@ -757,7 +867,7 @@ pub(super) fn try_splice(
                 &removed,
                 &at_path(&cache.component, &plan.path).children[keep..],
             );
-            let measure = needs_text_metric(&cache.component);
+            let measure = text_metric_after_edit(cache, &plan.path);
             let target = at_path_mut(&mut cache.component, &plan.path);
             let tail = target.children.split_off(keep);
             target.children.extend(removed);
@@ -844,6 +954,9 @@ pub(super) fn try_splice(
     } else {
         grown.clear();
     }
+    shifted.sort_unstable();
+    shifted.dedup();
+    let shifted_nodes = shifted.len() as u32;
     crate::dom::with_document_mut(|document| {
         for (id, rect) in &rects {
             document.set_layout_rect(
@@ -851,8 +964,6 @@ pub(super) fn try_splice(
                 w3cos_dom::DOMRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
             );
         }
-        shifted.sort_unstable();
-        shifted.dedup();
         for id in shifted {
             let id = NodeId::from_u32(id);
             let mut rect = document.get_layout_rect(id);
@@ -885,9 +996,238 @@ pub(super) fn try_splice(
     }
     cache.node_ids_stale = true;
     cache.width_memos.clear();
+    let solved = crate::layout::count_nodes(at_path(&cache.component, &plan.path)) as u32;
+    super::note_flush("splice", solved, shifted_nodes);
     if std::env::var_os("W3COS_SPLICE_VERIFY").is_some() {
         verify(viewport_w, viewport_h, plan.node);
     }
+    true
+}
+
+/// Whole-tree `needs_text_metric`, without walking nodes the cache already
+/// classified. A definite-height or out-of-flow ancestor makes that predicate
+/// ignore the subtree, so a tail inside a scroller must not turn measurement
+/// on by itself.
+fn text_metric_after_edit(cache: &Cache, path: &[usize]) -> bool {
+    if cache.measure_text {
+        return true;
+    }
+    for depth in 0..path.len() {
+        let style = &at_path(&cache.component, &path[..depth]).style;
+        if matches!(style.position, Position::Absolute | Position::Fixed)
+            || matches!(style.height, Dimension::Px(_))
+        {
+            return false;
+        }
+    }
+    needs_text_metric(at_path(&cache.component, path))
+}
+
+fn content_box_width(style: &Style, border_box: f32) -> f32 {
+    let padding = style.padding_lengths();
+    let border = border_side(style, 1) + border_side(style, 3);
+    (border_box - padding.left - padding.right - border).max(0.0)
+}
+
+fn margins_are_lengths(style: &Style) -> bool {
+    px_spacing(style.margin.left).is_some()
+        && px_spacing(style.margin.right).is_some()
+        && px_spacing(style.margin.top).is_some()
+        && px_spacing(style.margin.bottom).is_some()
+}
+
+fn origin_stable(old: &Style, new: &Style) -> bool {
+    old.margin == new.margin
+        && old.position == new.position
+        && old.top == new.top
+        && old.right == new.right
+        && old.bottom == new.bottom
+        && old.left == new.left
+        && old.display == new.display
+        && old.float == new.float
+        && old.flex_direction == new.flex_direction
+        && old.flex_wrap == new.flex_wrap
+        && old.flex_grow == new.flex_grow
+        && old.flex_shrink == new.flex_shrink
+        && old.align_self == new.align_self
+        && old.justify_content == new.justify_content
+        && old.align_items == new.align_items
+        && margins_are_lengths(new)
+}
+
+/// The border-box origin stays put when the cross size changes. Center,
+/// flex-end, and baseline alignment move it.
+fn cross_axis_start_stable(parent: &Style, child: &Style) -> bool {
+    if is_block_flow(parent.display) {
+        return in_flow_static(child);
+    }
+    if parent.display != Display::Flex || parent.flex_direction != FlexDirection::Column {
+        return false;
+    }
+    let align = match child.align_self {
+        AlignSelf::Auto => parent.align_items,
+        AlignSelf::FlexStart => AlignItems::FlexStart,
+        AlignSelf::FlexEnd => AlignItems::FlexEnd,
+        AlignSelf::Center => AlignItems::Center,
+        AlignSelf::Baseline => AlignItems::Baseline,
+        AlignSelf::Stretch => AlignItems::Stretch,
+    };
+    matches!(align, AlignItems::Stretch | AlignItems::FlexStart)
+}
+
+fn follower_shift(component: &Component, path: &[usize], dh: f32) -> Option<(Vec<u32>, Vec<u32>)> {
+    let levels = ancestor_levels(component, path)?;
+    let mut shifted = Vec::new();
+    let mut grown = Vec::new();
+    if dh != 0.0 {
+        for level in 0..levels {
+            let depth = path.len() - 1 - level;
+            let parent = at_path(component, &path[..depth]);
+            for sibling in &parent.children[path[depth] + 1..] {
+                collect_hosts(sibling, &mut shifted);
+            }
+            if let Some(id) = host_id(parent)
+                && !matches!(parent.style.height, Dimension::Px(_))
+            {
+                grown.push(id);
+            }
+        }
+    }
+    shifted.sort_unstable();
+    shifted.dedup();
+    Some((shifted, grown))
+}
+
+/// A geometry edit on one element. Lay out that element, or its flex/grid
+/// container when siblings share the formatting context, and translate the
+/// tail. Returns false when the result would not match a full solve.
+pub(super) fn try_style_subtree(
+    cache: &mut Cache,
+    id: u32,
+    old: &Style,
+    new: &Style,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> bool {
+    if !subtree_relayout_enabled()
+        || !cache.splice_ok
+        || !cache.skip_projections
+        || cache.viewport_w_bits != viewport_w.to_bits()
+        || cache.viewport_h_bits != viewport_h.to_bits()
+        || !origin_stable(old, new)
+    {
+        return bail("style precondition");
+    }
+    let Some(root_id) = host_id(&cache.component) else {
+        return bail("style root");
+    };
+    let Some(chain) = crate::dom::with_document(|document| {
+        element_chain(document, NodeId::from_u32(id), root_id)
+    }) else {
+        return bail("style chain");
+    };
+    let Some(path) = component_path(&cache.component, &chain) else {
+        return bail("style path");
+    };
+    if path.is_empty() || host_id(at_path(&cache.component, &path)) != Some(id) {
+        return bail("style host");
+    }
+    let parent = at_path(&cache.component, &path[..path.len() - 1]);
+    let node_alone = stacking_parent(parent)
+        && cross_axis_start_stable(&parent.style, new)
+        && crate::layout::count_nodes(at_path(&cache.component, &path)) <= MAX_SOLVE_NODES
+        && ancestor_levels(&cache.component, &path).is_some();
+    let solve_path: Vec<usize> = if node_alone {
+        path.clone()
+    } else if is_flex_or_grid(&parent.style)
+        && width_is_definite(&parent.style)
+        && crate::layout::count_nodes(parent) <= MAX_SOLVE_NODES
+        && ancestor_levels(&cache.component, &path[..path.len() - 1]).is_some()
+    {
+        path[..path.len() - 1].to_vec()
+    } else {
+        return bail("style scope");
+    };
+    if solve_path.is_empty() {
+        return bail("style scope root");
+    }
+    let target = at_path(&cache.component, &solve_path);
+    let Some(host) = host_id(target) else {
+        return bail("style scope host");
+    };
+    let old_rect =
+        crate::dom::with_document(|document| document.get_layout_rect(NodeId::from_u32(host)));
+    if !(old_rect.height > 0.0) || !(old_rect.width > 0.0) {
+        return bail("style old box");
+    }
+    let parent_of_target = at_path(&cache.component, &solve_path[..solve_path.len() - 1]);
+    let wrapper_width = if node_alone && solve_path == path {
+        let Some(parent_id) = host_id(parent_of_target) else {
+            return bail("style parent host");
+        };
+        let parent_rect = crate::dom::with_document(|document| {
+            document.get_layout_rect(NodeId::from_u32(parent_id))
+        });
+        content_box_width(&parent_of_target.style, parent_rect.width)
+    } else {
+        let margins = target.style.margin_lengths();
+        old_rect.width + margins.left + margins.right
+    };
+    if !wrapper_width.is_finite() || wrapper_width <= 0.0 {
+        return bail("style width");
+    }
+    let fresh = target.clone();
+    let solved_nodes = crate::layout::count_nodes(&fresh) as u32;
+    let wrapper = wrapper_for(parent_of_target, wrapper_width, vec![fresh]);
+    let Some((rects, _)) = solve(
+        &wrapper,
+        true,
+        text_metric_after_edit(cache, &solve_path),
+        viewport_w,
+        viewport_h,
+    ) else {
+        return bail("style solve");
+    };
+    let Some(new_rect) = rect_of(&rects, host) else {
+        return bail("style solved host");
+    };
+    if !(new_rect.height > 0.0) || !new_rect.width.is_finite() {
+        return bail("style solved box");
+    }
+    let container_solve = solve_path != path;
+    if container_solve && (new_rect.width - old_rect.width).abs() > 0.05 {
+        return bail("style container width");
+    }
+    let dx = old_rect.x - new_rect.x;
+    let dy = old_rect.y - new_rect.y;
+    let dh = new_rect.height - old_rect.height;
+    let Some((shifted, grown)) = follower_shift(&cache.component, &solve_path, dh) else {
+        return bail("style ancestors");
+    };
+    let shifted_nodes = shifted.len() as u32;
+    crate::dom::with_document_mut(|document| {
+        for (node_id, rect) in &rects {
+            document.set_layout_rect(
+                NodeId::from_u32(*node_id),
+                w3cos_dom::DOMRect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
+            );
+        }
+        for id in shifted {
+            let id = NodeId::from_u32(id);
+            let mut rect = document.get_layout_rect(id);
+            rect.y += dh;
+            document.set_layout_rect(id, rect);
+        }
+        for id in grown {
+            let id = NodeId::from_u32(id);
+            let mut rect = document.get_layout_rect(id);
+            rect.height += dh;
+            document.set_layout_rect(id, rect);
+        }
+    });
+    cache.engine.invalidate();
+    cache.width_memos.clear();
+    super::note_flush("style-subtree", solved_nodes, shifted_nodes);
     true
 }
 
@@ -1185,5 +1525,192 @@ mod tests {
             5,
             "appends under a px-height scroller splice"
         );
+    }
+
+    fn flex_column() -> (u32, Vec<u32>) {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let column = crate::dom::create_element("div");
+        style(
+            column,
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("width", "420px"),
+            ],
+        );
+        crate::dom::append_child(crate::dom::body_id(), column);
+        let mut items = Vec::new();
+        for index in 0..6 {
+            let item = crate::dom::create_element("div");
+            style(item, &[("margin", "4px"), ("padding", "4px")]);
+            crate::dom::append_child(
+                item,
+                crate::dom::create_text_node(&format!(
+                    "item {index} alpha beta gamma delta epsilon zeta"
+                )),
+            );
+            crate::dom::append_child(column, item);
+            items.push(item);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("flex initial");
+        (column, items)
+    }
+
+    #[test]
+    fn flex_column_mutations_match_full_layout() {
+        let (column, items) = flex_column();
+        crate::dom::set_style_property(items[1], "width", "36px");
+        assert!(crate::incremental_layout::flush());
+        let stats = crate::incremental_layout::last_flush_stats();
+        assert_eq!(
+            stats.kind, "style-subtree",
+            "width edit solved {}",
+            stats.kind
+        );
+        assert!(
+            stats.solved_nodes < 30,
+            "width edit solved {} nodes",
+            stats.solved_nodes
+        );
+        assert_matches_full("flex width");
+
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(items[2]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(
+            text,
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
+        );
+        assert!(crate::incremental_layout::flush());
+        assert_eq!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "splice",
+            "text edit"
+        );
+        assert_matches_full("flex text");
+
+        let extra = crate::dom::create_element("div");
+        style(extra, &[("margin", "4px"), ("padding", "4px")]);
+        crate::dom::append_child(extra, crate::dom::create_text_node("appended row"));
+        crate::dom::append_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        assert_eq!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "splice",
+            "append"
+        );
+        assert_matches_full("flex append");
+
+        crate::dom::remove_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        assert_eq!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "splice",
+            "remove"
+        );
+        assert_matches_full("flex remove");
+    }
+
+    #[test]
+    fn grid_text_and_append_match_full_layout() {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let grid = crate::dom::create_element("div");
+        style(
+            grid,
+            &[
+                ("display", "grid"),
+                ("width", "480px"),
+                ("grid-template-columns", "1fr 1fr 1fr 1fr"),
+            ],
+        );
+        crate::dom::append_child(crate::dom::body_id(), grid);
+        let mut cells = Vec::new();
+        for index in 0..8 {
+            let cell = crate::dom::create_element("div");
+            style(cell, &[("margin", "2px"), ("padding", "2px")]);
+            crate::dom::append_child(cell, crate::dom::create_text_node(&format!("cell {index}")));
+            crate::dom::append_child(grid, cell);
+            cells.push(cell);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid initial");
+
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(cells[1]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(
+            text,
+            "a much longer grid cell that wraps onto another row of the track",
+        );
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid text");
+
+        let extra = crate::dom::create_element("div");
+        style(extra, &[("margin", "2px"), ("padding", "2px")]);
+        crate::dom::append_child(extra, crate::dom::create_text_node("extra cell"));
+        crate::dom::append_child(grid, extra);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid append");
+        crate::dom::remove_child(grid, extra);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("grid remove");
+    }
+
+    #[test]
+    fn class_width_toggle_matches_full_layout() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".wide", &[("width", "48px")]);
+        let (_column, items) = flex_column();
+        crate::dom::class_list_add(items[0], "wide");
+        assert!(crate::incremental_layout::flush());
+        let stats = crate::incremental_layout::last_flush_stats();
+        assert_eq!(stats.kind, "style-subtree", "class toggle {}", stats.kind);
+        assert_matches_full("class on");
+        crate::dom::class_list_remove(items[0], "wide");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("class off");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn flex_row_width_matches_full_layout() {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        let row = crate::dom::create_element("div");
+        style(
+            row,
+            &[
+                ("display", "flex"),
+                ("flex-direction", "row"),
+                ("width", "420px"),
+            ],
+        );
+        crate::dom::append_child(crate::dom::body_id(), row);
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let item = crate::dom::create_element("div");
+            style(item, &[("margin", "4px"), ("padding", "4px")]);
+            crate::dom::append_child(item, crate::dom::create_text_node(&format!("row {index}")));
+            crate::dom::append_child(row, item);
+            items.push(item);
+        }
+        assert!(crate::incremental_layout::flush());
+        crate::dom::set_style_property(items[0], "width", "80px");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("flex row width");
     }
 }
