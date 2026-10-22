@@ -226,6 +226,50 @@ impl<'de> Deserialize<'de> for CustomProperties {
     }
 }
 
+/// LayoutNG-only grid cascade. Kept off `Style` until a grid property is
+/// set, so recursive tree walks do not copy unused strings on the stack.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct GridNg {
+    /// `grid-template-rows`. Legacy track sizing does not read this.
+    #[serde(default)]
+    pub grid_template_rows: Option<String>,
+    /// `grid-row`. Legacy placement does not read this.
+    #[serde(default)]
+    pub grid_row: Option<String>,
+    /// Raw `grid-template` shorthand, after the cascade.
+    #[serde(default)]
+    pub grid_template: Option<String>,
+    /// Raw `grid` shorthand, after the cascade.
+    #[serde(default)]
+    pub grid_shorthand: Option<String>,
+    #[serde(default)]
+    pub grid_auto_flow: Option<String>,
+    #[serde(default)]
+    pub grid_auto_rows: Option<String>,
+    #[serde(default)]
+    pub grid_auto_columns: Option<String>,
+    #[serde(default)]
+    pub grid_template_areas: Option<String>,
+    /// Raw `grid-area`. Not copied into `grid_column`, which Taffy reads.
+    #[serde(default)]
+    pub grid_area: Option<String>,
+    /// Cascaded column template for LayoutNG. `None` with
+    /// `grid_columns_cascaded` is an explicit `none` or a shorthand that
+    /// reset the columns. Legacy keeps reading `grid_template_columns`.
+    #[serde(default)]
+    pub grid_columns_used: Option<String>,
+    #[serde(default)]
+    pub grid_columns_cascaded: bool,
+    /// Cascaded `grid-column` / `grid-row` for LayoutNG, including
+    /// `grid-area`. Absent until one of those properties is set.
+    #[serde(default)]
+    pub grid_column_used: Option<String>,
+    #[serde(default)]
+    pub grid_row_used: Option<String>,
+    #[serde(default)]
+    pub grid_placement_cascaded: bool,
+}
+
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Style {
@@ -471,44 +515,11 @@ pub struct Style {
     pub grid_template_columns: Option<String>,
     #[serde(default)]
     pub grid_column: Option<String>,
-    /// `grid-template-rows`. Legacy track sizing does not read this.
+    /// LayoutNG grid cascade. One heap box so the eleven strings are not
+    /// copied onto the stack of every recursive style walk. Legacy track
+    /// sizing still reads only `grid_template_columns` and `grid_column`.
     #[serde(default)]
-    pub grid_template_rows: Option<String>,
-    /// `grid-row`. Legacy placement does not read this.
-    #[serde(default)]
-    pub grid_row: Option<String>,
-    /// Raw `grid-template` shorthand, after the cascade.
-    #[serde(default)]
-    pub grid_template: Option<String>,
-    /// Raw `grid` shorthand, after the cascade.
-    #[serde(default)]
-    pub grid_shorthand: Option<String>,
-    #[serde(default)]
-    pub grid_auto_flow: Option<String>,
-    #[serde(default)]
-    pub grid_auto_rows: Option<String>,
-    #[serde(default)]
-    pub grid_auto_columns: Option<String>,
-    #[serde(default)]
-    pub grid_template_areas: Option<String>,
-    /// Raw `grid-area`. Not copied into `grid_column`, which Taffy reads.
-    #[serde(default)]
-    pub grid_area: Option<String>,
-    /// Cascaded column template for LayoutNG. `None` with
-    /// `grid_columns_cascaded` is an explicit `none` or a shorthand that
-    /// reset the columns. Legacy keeps reading `grid_template_columns`.
-    #[serde(default)]
-    pub grid_columns_used: Option<String>,
-    #[serde(default)]
-    pub grid_columns_cascaded: bool,
-    /// Cascaded `grid-column` / `grid-row` for LayoutNG, including
-    /// `grid-area`. Absent until one of those properties is set.
-    #[serde(default)]
-    pub grid_column_used: Option<String>,
-    #[serde(default)]
-    pub grid_row_used: Option<String>,
-    #[serde(default)]
-    pub grid_placement_cascaded: bool,
+    pub grid_ng: Option<Box<GridNg>>,
 
     // Interaction
     pub cursor: Cursor,
@@ -643,20 +654,7 @@ impl Default for Style {
             justify_items: AlignItems::Stretch,
             grid_template_columns: None,
             grid_column: None,
-            grid_template_rows: None,
-            grid_row: None,
-            grid_template: None,
-            grid_shorthand: None,
-            grid_auto_flow: None,
-            grid_auto_rows: None,
-            grid_auto_columns: None,
-            grid_template_areas: None,
-            grid_area: None,
-            grid_columns_used: None,
-            grid_columns_cascaded: false,
-            grid_column_used: None,
-            grid_row_used: None,
-            grid_placement_cascaded: false,
+            grid_ng: None,
             cursor: Cursor::Default,
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
@@ -832,20 +830,7 @@ impl Style {
             justify_items,
             grid_template_columns,
             grid_column,
-            grid_template_rows,
-            grid_row,
-            grid_template,
-            grid_shorthand,
-            grid_auto_flow,
-            grid_auto_rows,
-            grid_auto_columns,
-            grid_template_areas,
-            grid_area,
-            grid_columns_used,
-            grid_columns_cascaded,
-            grid_column_used,
-            grid_row_used,
-            grid_placement_cascaded,
+            grid_ng,
             cursor,
             pointer_events,
             user_select,
@@ -971,20 +956,7 @@ impl Style {
             justify_items: justify_items_b,
             grid_template_columns: grid_template_columns_b,
             grid_column: grid_column_b,
-            grid_template_rows: grid_template_rows_b,
-            grid_row: grid_row_b,
-            grid_template: grid_template_b,
-            grid_shorthand: grid_shorthand_b,
-            grid_auto_flow: grid_auto_flow_b,
-            grid_auto_rows: grid_auto_rows_b,
-            grid_auto_columns: grid_auto_columns_b,
-            grid_template_areas: grid_template_areas_b,
-            grid_area: grid_area_b,
-            grid_columns_used: grid_columns_used_b,
-            grid_columns_cascaded: grid_columns_cascaded_b,
-            grid_column_used: grid_column_used_b,
-            grid_row_used: grid_row_used_b,
-            grid_placement_cascaded: grid_placement_cascaded_b,
+            grid_ng: grid_ng_b,
             cursor: cursor_b,
             pointer_events: pointer_events_b,
             user_select: user_select_b,
@@ -1108,20 +1080,7 @@ impl Style {
             && justify_items == justify_items_b
             && grid_template_columns == grid_template_columns_b
             && grid_column == grid_column_b
-            && grid_template_rows == grid_template_rows_b
-            && grid_row == grid_row_b
-            && grid_template == grid_template_b
-            && grid_shorthand == grid_shorthand_b
-            && grid_auto_flow == grid_auto_flow_b
-            && grid_auto_rows == grid_auto_rows_b
-            && grid_auto_columns == grid_auto_columns_b
-            && grid_template_areas == grid_template_areas_b
-            && grid_area == grid_area_b
-            && grid_columns_used == grid_columns_used_b
-            && grid_columns_cascaded == grid_columns_cascaded_b
-            && grid_column_used == grid_column_used_b
-            && grid_row_used == grid_row_used_b
-            && grid_placement_cascaded == grid_placement_cascaded_b
+            && grid_ng == grid_ng_b
             && cursor == cursor_b
             && pointer_events == pointer_events_b
             && user_select == user_select_b
@@ -1145,6 +1104,62 @@ const fn default_text_indent() -> Dimension {
 }
 
 impl Style {
+    /// The NG grid cascade, created on the first write.
+    pub fn grid_ng_mut(&mut self) -> &mut GridNg {
+        self.grid_ng
+            .get_or_insert_with(|| Box::new(GridNg::default()))
+    }
+
+    fn ng(&self) -> Option<&GridNg> {
+        self.grid_ng.as_deref()
+    }
+
+    pub fn grid_rows(&self) -> Option<&str> {
+        self.ng()
+            .and_then(|grid| grid.grid_template_rows.as_deref())
+    }
+
+    pub fn grid_flow(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_auto_flow.as_deref())
+    }
+
+    pub fn grid_auto_row_spec(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_auto_rows.as_deref())
+    }
+
+    pub fn grid_auto_column_spec(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_auto_columns.as_deref())
+    }
+
+    pub fn grid_areas(&self) -> Option<&str> {
+        self.ng()
+            .and_then(|grid| grid.grid_template_areas.as_deref())
+    }
+
+    pub fn grid_columns_cascaded(&self) -> bool {
+        self.ng().is_some_and(|grid| grid.grid_columns_cascaded)
+    }
+
+    pub fn grid_columns_used(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_columns_used.as_deref())
+    }
+
+    pub fn grid_placement_cascaded(&self) -> bool {
+        self.ng().is_some_and(|grid| grid.grid_placement_cascaded)
+    }
+
+    pub fn grid_row_used(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_row_used.as_deref())
+    }
+
+    pub fn grid_column_used(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_column_used.as_deref())
+    }
+
+    pub fn grid_row_spec(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_row.as_deref())
+    }
+
     /// Resolve `text-indent` against the containing block and viewport.
     pub fn resolved_text_indent(
         &self,

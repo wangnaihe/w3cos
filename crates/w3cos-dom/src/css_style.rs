@@ -1415,37 +1415,39 @@ impl CSSStyleDeclaration {
             "grid-template-columns" | "gridTemplateColumns" => {
                 let value = value.trim().to_string();
                 self.inner.grid_template_columns = Some(value.clone());
-                self.inner.grid_columns_used = Some(value);
-                self.inner.grid_columns_cascaded = true;
+                let ng = self.inner.grid_ng_mut();
+                ng.grid_columns_used = Some(value);
+                ng.grid_columns_cascaded = true;
             }
             "grid-template-rows" | "gridTemplateRows" => {
-                self.inner.grid_template_rows = Some(value.trim().to_string());
+                self.inner.grid_ng_mut().grid_template_rows = Some(value.trim().to_string());
             }
             "grid-column" | "gridColumn" => {
                 remember_grid_placement(&mut self.inner);
                 let value = value.trim().to_string();
                 self.inner.grid_column = Some(value.clone());
-                self.inner.grid_column_used = Some(value);
+                self.inner.grid_ng_mut().grid_column_used = Some(value);
             }
             "grid-row" | "gridRow" => {
                 remember_grid_placement(&mut self.inner);
                 let value = value.trim().to_string();
-                self.inner.grid_row = Some(value.clone());
-                self.inner.grid_row_used = Some(value);
+                let ng = self.inner.grid_ng_mut();
+                ng.grid_row = Some(value.clone());
+                ng.grid_row_used = Some(value);
             }
             "grid-template" | "gridTemplate" => apply_grid_template(&mut self.inner, value),
             "grid" => apply_grid_shorthand(&mut self.inner, value),
             "grid-auto-flow" | "gridAutoFlow" => {
-                self.inner.grid_auto_flow = Some(value.trim().to_string());
+                self.inner.grid_ng_mut().grid_auto_flow = Some(value.trim().to_string());
             }
             "grid-auto-rows" | "gridAutoRows" => {
-                self.inner.grid_auto_rows = Some(value.trim().to_string());
+                self.inner.grid_ng_mut().grid_auto_rows = Some(value.trim().to_string());
             }
             "grid-auto-columns" | "gridAutoColumns" => {
-                self.inner.grid_auto_columns = Some(value.trim().to_string());
+                self.inner.grid_ng_mut().grid_auto_columns = Some(value.trim().to_string());
             }
             "grid-template-areas" | "gridTemplateAreas" => {
-                self.inner.grid_template_areas = Some(value.trim().to_string());
+                self.inner.grid_ng_mut().grid_template_areas = Some(value.trim().to_string());
             }
             "grid-area" | "gridArea" => apply_grid_area(&mut self.inner, value),
 
@@ -2392,11 +2394,15 @@ fn is_intrinsic_size_keyword(value: &str) -> bool {
 }
 
 fn remember_grid_placement(style: &mut Style) {
-    if !style.grid_placement_cascaded {
-        style.grid_column_used = style.grid_column.clone();
-        style.grid_row_used = style.grid_row.clone();
-        style.grid_placement_cascaded = true;
+    if style.grid_placement_cascaded() {
+        return;
     }
+    let column = style.grid_column.clone();
+    let row = style.grid_row_spec().map(str::to_string);
+    let ng = style.grid_ng_mut();
+    ng.grid_column_used = column;
+    ng.grid_row_used = row;
+    ng.grid_placement_cascaded = true;
 }
 
 fn split_grid_slash(value: &str) -> Vec<&str> {
@@ -2415,28 +2421,29 @@ fn split_grid_slash(value: &str) -> Vec<&str> {
 /// see a shorthand it used to drop.
 fn apply_grid_template(style: &mut Style, value: &str) {
     let value = value.trim();
-    style.grid_template = Some(value.to_string());
-    style.grid_columns_cascaded = true;
+    let ng = style.grid_ng_mut();
+    ng.grid_template = Some(value.to_string());
+    ng.grid_columns_cascaded = true;
     if value.eq_ignore_ascii_case("none") {
-        style.grid_template_rows = None;
-        style.grid_columns_used = None;
-        style.grid_template_areas = None;
+        ng.grid_template_rows = None;
+        ng.grid_columns_used = None;
+        ng.grid_template_areas = None;
         return;
     }
     if value.contains('"') || value.contains('\'') {
-        style.grid_template_areas = Some(value.to_string());
+        ng.grid_template_areas = Some(value.to_string());
         return;
     }
-    style.grid_template_areas = None;
+    ng.grid_template_areas = None;
     let parts = split_grid_slash(value);
     match parts.as_slice() {
         [rows, cols] => {
-            style.grid_template_rows = Some((*rows).to_string());
-            style.grid_columns_used = Some((*cols).to_string());
+            ng.grid_template_rows = Some((*rows).to_string());
+            ng.grid_columns_used = Some((*cols).to_string());
         }
         _ => {
-            style.grid_template_rows = Some(value.to_string());
-            style.grid_columns_used = None;
+            ng.grid_template_rows = Some(value.to_string());
+            ng.grid_columns_used = None;
         }
     }
 }
@@ -2486,44 +2493,45 @@ fn flow_keyword(column: bool, dense: bool) -> String {
 /// for LayoutNG only.
 fn apply_grid_shorthand(style: &mut Style, value: &str) {
     let value = value.trim();
-    style.grid_shorthand = Some(value.to_string());
-    style.grid_template = None;
-    style.grid_template_areas = None;
-    style.grid_template_rows = None;
-    style.grid_columns_used = None;
-    style.grid_columns_cascaded = true;
-    style.grid_auto_flow = None;
-    style.grid_auto_rows = None;
-    style.grid_auto_columns = None;
+    let ng = style.grid_ng_mut();
+    ng.grid_shorthand = Some(value.to_string());
+    ng.grid_template = None;
+    ng.grid_template_areas = None;
+    ng.grid_template_rows = None;
+    ng.grid_columns_used = None;
+    ng.grid_columns_cascaded = true;
+    ng.grid_auto_flow = None;
+    ng.grid_auto_rows = None;
+    ng.grid_auto_columns = None;
     if value.eq_ignore_ascii_case("none") || value.contains('"') || value.contains('\'') {
         if value.contains('"') || value.contains('\'') {
-            style.grid_template_areas = Some(value.to_string());
+            ng.grid_template_areas = Some(value.to_string());
         }
         return;
     }
     let parts = split_grid_slash(value);
     if parts.len() != 2 {
-        style.grid_template_rows = Some(value.to_string());
+        ng.grid_template_rows = Some(value.to_string());
         return;
     }
     let [left, right] = [parts[0], parts[1]];
     if let Some(flow) = auto_flow_side(left) {
-        style.grid_auto_flow = Some(flow_keyword(false, flow.dense));
-        style.grid_auto_rows = flow.tracks;
-        style.grid_columns_used = Some(right.to_string());
+        ng.grid_auto_flow = Some(flow_keyword(false, flow.dense));
+        ng.grid_auto_rows = flow.tracks;
+        ng.grid_columns_used = Some(right.to_string());
     } else if let Some(flow) = auto_flow_side(right) {
-        style.grid_template_rows = Some(left.to_string());
-        style.grid_auto_flow = Some(flow_keyword(true, flow.dense));
-        style.grid_auto_columns = flow.tracks;
+        ng.grid_template_rows = Some(left.to_string());
+        ng.grid_auto_flow = Some(flow_keyword(true, flow.dense));
+        ng.grid_auto_columns = flow.tracks;
     } else {
-        style.grid_template_rows = Some(left.to_string());
-        style.grid_columns_used = Some(right.to_string());
+        ng.grid_template_rows = Some(left.to_string());
+        ng.grid_columns_used = Some(right.to_string());
     }
 }
 
 fn apply_grid_area(style: &mut Style, value: &str) {
     let value = value.trim();
-    style.grid_area = Some(value.to_string());
+    style.grid_ng_mut().grid_area = Some(value.to_string());
     remember_grid_placement(style);
     let parts = split_grid_slash(value);
     let (row, column) = match parts.as_slice() {
@@ -2538,13 +2546,15 @@ fn apply_grid_area(style: &mut Style, value: &str) {
             format!("{column_start} / {column_end}"),
         ),
         _ => {
-            style.grid_row_used = Some(value.to_string());
-            style.grid_column_used = None;
+            let ng = style.grid_ng_mut();
+            ng.grid_row_used = Some(value.to_string());
+            ng.grid_column_used = None;
             return;
         }
     };
-    style.grid_row_used = Some(row);
-    style.grid_column_used = Some(column);
+    let ng = style.grid_ng_mut();
+    ng.grid_row_used = Some(row);
+    ng.grid_column_used = Some(column);
 }
 
 fn parse_justify_content(value: &str) -> JustifyContent {

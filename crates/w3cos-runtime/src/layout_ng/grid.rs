@@ -86,22 +86,22 @@ fn inset_set(style: &Style) -> bool {
 }
 
 fn columns_spec(style: &Style) -> Option<&str> {
-    if style.grid_columns_cascaded {
-        style.grid_columns_used.as_deref()
+    if style.grid_columns_cascaded() {
+        style.grid_columns_used()
     } else {
         style.grid_template_columns.as_deref()
     }
 }
 
 fn placement<'a>(style: &'a Style, row: bool) -> Option<&'a str> {
-    if style.grid_placement_cascaded {
+    if style.grid_placement_cascaded() {
         if row {
-            style.grid_row_used.as_deref()
+            style.grid_row_used()
         } else {
-            style.grid_column_used.as_deref()
+            style.grid_column_used()
         }
     } else if row {
-        style.grid_row.as_deref()
+        style.grid_row_spec()
     } else {
         style.grid_column.as_deref()
     }
@@ -209,7 +209,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-width-keyword") {
         return Some("grid:width-keyword");
     }
-    if style.grid_template_areas.is_some() {
+    if style.grid_areas().is_some() {
         return Some("grid:areas");
     }
     if is_baseline(style.align_items) || is_baseline(style.justify_items) {
@@ -219,8 +219,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         return Some("grid:template");
     }
     if style
-        .grid_template_rows
-        .as_deref()
+        .grid_rows()
         .is_some_and(|spec| parse_template(spec, true).is_none())
     {
         return Some("grid:template");
@@ -233,39 +232,31 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         return Some("grid:lanes");
     }
     if rows_match_legacy_lanes(flat, index)
-        && style
-            .grid_template_rows
-            .as_deref()
-            .is_some_and(rows_are_sized)
+        && style.grid_rows().is_some_and(rows_are_sized)
         && indefinite_block(style)
     {
         return Some("grid:indefinite-rows");
     }
     if rows_match_legacy_lanes(flat, index)
         && has_marker(style, "--w3cos-internal-percent-gap")
-        && style
-            .grid_template_rows
-            .as_deref()
-            .is_some_and(rows_are_sized)
+        && style.grid_rows().is_some_and(rows_are_sized)
         && !indefinite_block(style)
     {
         return Some("grid:percent-gap");
     }
     if style
-        .grid_auto_columns
-        .as_deref()
+        .grid_auto_column_spec()
         .is_some_and(|spec| parse_one_track(spec).is_none())
     {
         return Some("grid:auto-columns");
     }
     if style
-        .grid_auto_rows
-        .as_deref()
+        .grid_auto_row_spec()
         .is_some_and(|spec| parse_one_track(spec).is_none())
     {
         return Some("grid:auto-rows");
     }
-    if parse_flow(style.grid_auto_flow.as_deref()).is_none() {
+    if parse_flow(style.grid_flow()).is_none() {
         return Some("grid:auto-flow");
     }
     for child in rendered_children(flat, index) {
@@ -369,7 +360,7 @@ fn lanes_like_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
     }) {
         return true;
     }
-    let Some(rows) = style.grid_template_rows.as_deref() else {
+    let Some(rows) = style.grid_rows() else {
         return false;
     };
     if !rows_all_definite(rows) || indefinite_block(style) {
@@ -385,7 +376,7 @@ fn rows_match_legacy_lanes(flat: &[FlatNodeInfo], index: usize) -> bool {
     if has_marker(style, "--w3cos-internal-grid-lanes") {
         return true;
     }
-    if parse_flow(style.grid_auto_flow.as_deref()).is_some_and(|flow| flow.column) {
+    if parse_flow(style.grid_flow()).is_some_and(|flow| flow.column) {
         return true;
     }
     if columns_spec(style).is_some() {
@@ -1658,11 +1649,11 @@ pub(super) fn layout(
         None => parse_template("", false).why("grid:template")?,
         Some(spec) => parse_template(spec, false).why("grid:template")?,
     };
-    let rows_template = match style.grid_template_rows.as_deref() {
+    let rows_template = match style.grid_rows() {
         None => parse_template("", true).why("grid:template")?,
         Some(spec) => parse_template(spec, true).why("grid:template")?,
     };
-    let flow = parse_flow(style.grid_auto_flow.as_deref()).why("grid:auto-flow")?;
+    let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
     let inner_u = units(inner_width);
     let inflow = rendered_children(flat, index)
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
@@ -1683,11 +1674,11 @@ pub(super) fn layout(
         inflow,
     )
     .why("grid:repeat")?;
-    let implicit_column = match style.grid_auto_columns.as_deref() {
+    let implicit_column = match style.grid_auto_column_spec() {
         Some(spec) => parse_one_track(spec).why("grid:auto-columns")?,
         None => Spec::One(Breadth::Auto),
     };
-    let implicit_row = match style.grid_auto_rows.as_deref() {
+    let implicit_row = match style.grid_auto_row_spec() {
         Some(spec) => parse_one_track(spec).why("grid:auto-rows")?,
         None => Spec::One(Breadth::Auto),
     };
@@ -2800,7 +2791,7 @@ mod tests {
             ],
         );
         let mut rows = grid_style(100.0, None, Some("100px"));
-        rows.grid_template_rows = Some("30px 30px".to_string());
+        rows.grid_ng_mut().grid_template_rows = Some("30px 30px".to_string());
         expect(
             &Component::boxed(
                 rows,
@@ -2956,8 +2947,8 @@ mod tests {
     #[test]
     fn column_flow_shorthand_tracks_and_text_item() {
         let mut flow = grid_style(300.0, Some(40.0), None);
-        flow.grid_template_rows = Some("20px 20px".to_string());
-        flow.grid_auto_flow = Some("column".to_string());
+        flow.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());
+        flow.grid_ng_mut().grid_auto_flow = Some("column".to_string());
         expect(
             &Component::boxed(
                 flow,
@@ -2975,8 +2966,8 @@ mod tests {
             ],
         );
         let mut columns = grid_style(200.0, None, Some("1fr 1fr"));
-        columns.grid_columns_cascaded = true;
-        columns.grid_columns_used = Some("80px 80px".to_string());
+        columns.grid_ng_mut().grid_columns_cascaded = true;
+        columns.grid_ng_mut().grid_columns_used = Some("80px 80px".to_string());
         expect(
             &Component::boxed(
                 columns,
@@ -3021,15 +3012,15 @@ mod tests {
     #[test]
     fn indefinite_sized_rows_and_percent_row_gaps_stay_on_legacy() {
         let mut flow = grid_style(300.0, None, None);
-        flow.grid_template_rows = Some("20px 20px".to_string());
-        flow.grid_auto_flow = Some("column".to_string());
+        flow.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());
+        flow.grid_ng_mut().grid_auto_flow = Some("column".to_string());
         let root = Component::boxed(flow, vec![leaf(block_box(None, Some(10.0)))]);
         let flat = pre_flatten(&root);
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
 
         let mut lanes = grid_style(100.0, None, None);
         lanes.display = Display::Flex;
-        lanes.grid_template_rows = Some("30px 30px".to_string());
+        lanes.grid_ng_mut().grid_template_rows = Some("30px 30px".to_string());
         lanes.custom_properties = Some(CustomProperties::from_iter([(
             "--w3cos-internal-grid-lanes".to_string(),
             "1".to_string(),
@@ -3039,8 +3030,8 @@ mod tests {
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
 
         let mut gapped = grid_style(100.0, None, None);
-        gapped.grid_template_rows = Some("20px 20px".to_string());
-        gapped.grid_auto_flow = Some("column".to_string());
+        gapped.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());
+        gapped.grid_ng_mut().grid_auto_flow = Some("column".to_string());
         gapped.min_height = Dimension::Px(80.0);
         gapped.custom_properties = Some(CustomProperties::from_iter([(
             "--w3cos-internal-percent-gap".to_string(),
@@ -3053,7 +3044,7 @@ mod tests {
         let mut lane = block_box(None, Some(10.0));
         lane.display = Display::Flex;
         let mut host = grid_style(100.0, None, None);
-        host.grid_template_rows = Some("20px 20px".to_string());
+        host.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());
         let root = Component::boxed(host, vec![leaf(lane)]);
         let flat = pre_flatten(&root);
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
