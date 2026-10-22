@@ -1,11 +1,11 @@
-//! Flex formatting context, stage S5: one nowrap line.
+//! Flex formatting context, stage S5: one flex line, or several row lines.
 //!
 //! Structure follows Blink's NGFlexLayoutAlgorithm
 //! (third_party/blink/renderer/core/layout/flex/flex_layout_algorithm.cc,
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
-//! lengths, alignment). Wrapped lines, baseline alignment, inline-flex and
-//! an indefinite percentage basis stay on the legacy engine.
+//! lengths, alignment, line breaking). Baseline alignment, inline-flex,
+//! column wrap, and an indefinite percentage basis stay on the legacy engine.
 //!
 //! A flex row the DOM lowered from an inline formatting context carries the
 //! IFC marker and is not a flex container; the block algorithm lays it out
@@ -47,8 +47,8 @@ fn reverse_axis(direction: FlexDirection) -> bool {
     )
 }
 
-/// Why this author flex container is outside S5. `None` when the nowrap
-/// line can be laid out. The IFC marker is not a flex container.
+/// Why this author flex container is outside S5. `None` when the line
+/// (or the row wrap) can be laid out. The IFC marker is not a flex container.
 pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     // `display:flex` on the document element (the root flex item is the
@@ -62,8 +62,32 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-width-keyword") {
         return Some("flex:width-keyword");
     }
-    if style.flex_wrap != FlexWrap::NoWrap {
-        return Some("flex:wrap");
+    // wrap-reverse flips the cross-start of each line (Flexbox §5.2). That
+    // alignment stays on the legacy engine. Column wrap sizes each line's
+    // cross size before stretch and stays there too. An indefinite main
+    // size does not wrap (Flexbox §9.2).
+    if style.flex_wrap == FlexWrap::WrapReverse {
+        return Some("flex:wrap-reverse");
+    }
+    if style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction) {
+        return Some("flex:wrap-column");
+    }
+    // `flex-wrap: balance` stays on legacy (the keyword is unrecognized).
+    // Its reference is an ordinary wrap with a gap and a definite height,
+    // and legacy leaves those auto-height items at 0 while NG would
+    // stretch them to the line. Both sides of that reftest have to stay
+    // on legacy. A wrap whose items have a specified cross size, or whose
+    // container height is auto, still wraps here.
+    if style.flex_wrap == FlexWrap::Wrap
+        && row_axis(style.flex_direction)
+        && !matches!(style.height, Dimension::Auto)
+        && (style.gap > 0.0
+            || style.row_gap.unwrap_or(0.0) > 0.0
+            || style.column_gap.unwrap_or(0.0) > 0.0)
+        && rendered_children(flat, index)
+            .all(|child| matches!(flat[child].style.height, Dimension::Auto))
+    {
+        return Some("flex:wrap-gap");
     }
     if style.align_items == AlignItems::Baseline {
         return Some("flex:baseline");
@@ -780,6 +804,26 @@ pub(super) fn layout(
     }
     items.sort_by(|a, b| a.order.cmp(&b.order).then(a.index.cmp(&b.index)));
 
+    // A definite main size is what makes a flex line wrap (Flexbox §9.2).
+    // Column wrap is rejected in container_reason; an auto column height
+    // has no definite main size and stays on the single-line path.
+    if style.flex_wrap != FlexWrap::NoWrap
+        && let Some(inner) = inner_main
+    {
+        return layout_wrapped(
+            flat,
+            index,
+            space,
+            style,
+            &metrics,
+            &mut items,
+            inner_width,
+            specified_height,
+            inner,
+            gap,
+        );
+    }
+
     let gap_sum = gap * items.len().saturating_sub(1) as f32;
     let main_inner = if let Some(inner) = inner_main {
         if !items.is_empty() {
@@ -1003,6 +1047,321 @@ pub(super) fn layout(
         end_strut,
         self_collapsing: false,
         oof,
+        bfc_dependent: false,
+        float_overlap: false,
+    })
+}
+
+/// Flex lines from hypothetical outer main sizes (Flexbox §9.3). A line
+/// keeps at least one item, even when that item is wider than the container.
+fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)> {
+    if items.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut used = 0.0;
+    for (i, item) in items.iter().enumerate() {
+        let outer = item.outer_main();
+        if i > start && used + gap + outer > inner + EPS {
+            lines.push((start, i));
+            start = i;
+            used = outer;
+        } else {
+            if i > start {
+                used += gap;
+            }
+            used += outer;
+        }
+    }
+    lines.push((start, items.len()));
+    lines
+}
+
+/// `flex-wrap: wrap` and `wrap-reverse` on a row with a definite main size.
+/// Each line flexes against the container's inner main size. `align-content:
+/// stretch` gives leftover cross space to the lines; `flex-start` packs them
+/// at the cross start. `wrap-reverse` places the first line at the cross end.
+fn layout_wrapped(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    style: &Style,
+    metrics: &BoxMetrics,
+    items: &mut [Item],
+    inner_width: f32,
+    specified_height: Option<f32>,
+    inner_main: f32,
+    main_gap: f32,
+) -> Option<LayoutResult> {
+    let direction = style.flex_direction;
+    let row = row_axis(direction);
+    let reverse = reverse_axis(direction);
+    let wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
+    let [bt, br, bb, bl] = metrics.border;
+    let [pt, pr, pb, pl] = metrics.padding;
+    let cross_gap = (if row {
+        style.row_gap.unwrap_or(style.gap)
+    } else {
+        style.column_gap.unwrap_or(style.gap)
+    })
+    .max(0.0);
+    let lines = flex_line_ranges(items, inner_main, main_gap);
+    for &(start, end) in &lines {
+        let line = &mut items[start..end];
+        let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
+        if !line.is_empty() {
+            distribute(line, inner_main, gap_sum);
+            snap_to_inner(line, inner_main, gap_sum);
+        }
+    }
+    if row {
+        for item in items.iter_mut() {
+            if item.cross.is_some() {
+                continue;
+            }
+            let laid = layout_item(
+                flat,
+                item.index,
+                space,
+                inner_width,
+                specified_height,
+                true,
+                Some(item.content),
+                None,
+            )?;
+            item.cross = Some((laid.fragment.height - item.cross_edges).max(0.0));
+        }
+    }
+    let mut line_cross: Vec<f32> = lines
+        .iter()
+        .map(|&(start, end)| {
+            items[start..end]
+                .iter()
+                .map(|item| item.margin_box_cross())
+                .fold(0.0_f32, f32::max)
+        })
+        .collect();
+    if line_cross.is_empty() {
+        line_cross.push(0.0);
+    }
+    let cross_gap_sum = cross_gap * line_cross.len().saturating_sub(1) as f32;
+    let packed = line_cross.iter().copied().sum::<f32>() + cross_gap_sum;
+    let definite_cross = if row {
+        specified_height
+    } else {
+        Some(inner_width)
+    };
+    if style.align_content == AlignContent::Stretch
+        && let Some(definite) = definite_cross
+    {
+        let extra = definite - packed;
+        if extra > EPS && !line_cross.is_empty() {
+            let share = extra / line_cross.len() as f32;
+            for size in &mut line_cross {
+                *size += share;
+            }
+        }
+    }
+    for (line_index, &(start, end)) in lines.iter().enumerate() {
+        let line_inner = line_cross[line_index];
+        for item in &mut items[start..end] {
+            if item.align == AlignItems::Stretch && item.cross_auto {
+                let raw = (line_inner
+                    - item.margin_cross_start
+                    - item.margin_cross_end
+                    - item.cross_edges)
+                    .max(0.0);
+                let basis = if row {
+                    specified_height
+                } else {
+                    Some(inner_width)
+                };
+                item.cross = Some(
+                    clamp_cross(
+                        flat[item.index].style,
+                        row,
+                        item.cross_edges,
+                        raw,
+                        basis,
+                        space,
+                    )
+                    .why("flex:cross")?,
+                );
+            }
+        }
+    }
+    let mut fragments = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        fragments.push(Some(layout_item(
+            flat,
+            item.index,
+            space,
+            inner_width,
+            specified_height,
+            row,
+            Some(item.content),
+            item.cross,
+        )?));
+    }
+    let used_cross = if row {
+        specified_height.unwrap_or(packed)
+    } else {
+        inner_width
+    };
+    let mut children = Vec::with_capacity(items.len());
+    let mut oof_out = Vec::new();
+    let mut frag_at = 0;
+    let mut cross_cursor = if wrap_reverse { used_cross } else { 0.0 };
+    for (line_index, &(start, end)) in lines.iter().enumerate() {
+        let line_size = line_cross[line_index];
+        if wrap_reverse {
+            cross_cursor -= line_size;
+        }
+        let line = &mut items[start..end];
+        let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
+        let used_outer = line.iter().map(|item| item.outer_main()).sum::<f32>() + gap_sum;
+        let mut free = inner_main - used_outer;
+        let auto_margins = line
+            .iter()
+            .map(|item| usize::from(item.auto_main_start) + usize::from(item.auto_main_end))
+            .sum::<usize>();
+        if free > EPS && auto_margins > 0 {
+            let share = free / auto_margins as f32;
+            for item in line.iter_mut() {
+                if item.auto_main_start {
+                    item.margin_main_start += share;
+                }
+                if item.auto_main_end {
+                    item.margin_main_end += share;
+                }
+            }
+            free = 0.0;
+        }
+        let (mut lead, between) = justify(style.justify_content, free, line.len());
+        if reverse {
+            lead = inner_main - lead;
+        }
+        let mut cursor = lead;
+        for item in line.iter() {
+            let laid = fragments[frag_at].take();
+            frag_at += 1;
+            let Some(laid) = laid else {
+                return super::bail("flex:line");
+            };
+            let border_main = item.content + item.main_edges;
+            let main = if reverse {
+                cursor - item.margin_main_start - border_main
+            } else {
+                cursor + item.margin_main_start
+            };
+            let main = unit(main);
+            let margin_box = item.margin_box_cross();
+            let extra = (line_size - margin_box).max(0.0);
+            let cross_offset = match item.align {
+                AlignItems::FlexEnd => extra,
+                AlignItems::Center => extra / 2.0,
+                AlignItems::Stretch | AlignItems::FlexStart | AlignItems::Baseline => 0.0,
+            };
+            let cross = unit(item.margin_cross_start + cross_offset);
+            let (x, y) = if row {
+                (bl + pl + main, bt + pt + cross_cursor + cross)
+            } else {
+                (bl + pl + cross_cursor + cross, bt + pt + main)
+            };
+            let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
+            oof_out.extend(
+                laid.oof
+                    .iter()
+                    .map(|candidate| candidate.translated(x + dx, y + dy)),
+            );
+            children.push((x + dx, y + dy, laid.fragment));
+            let step = item.outer_main() + main_gap + between;
+            if reverse {
+                cursor -= step;
+            } else {
+                cursor += step;
+            }
+        }
+        if wrap_reverse {
+            cross_cursor -= cross_gap;
+        } else {
+            cross_cursor += line_size + cross_gap;
+        }
+    }
+    let content_main = if row {
+        inner_width
+    } else {
+        inner_main.max(0.0)
+    };
+    let content_cross = if row {
+        specified_height.unwrap_or(packed)
+    } else {
+        inner_width
+    };
+    let (width, mut height) = if row {
+        (content_main, content_cross)
+    } else {
+        (content_cross, content_main)
+    };
+    let to_content_h = |size: f32| to_content(style, bt + bb + pt + pb, size);
+    if let Some(max) = block::resolve_length(style.max_height, space.percentage_block, style, space)
+    {
+        let max = to_content_h(max);
+        if height > max + EPS {
+            return super::bail("flex:clamp");
+        }
+        height = height.min(max);
+    }
+    if let Some(min) = block::resolve_length(style.min_height, space.percentage_block, style, space)
+    {
+        if !matches!(style.min_height, Dimension::Auto) {
+            let min = to_content_h(min);
+            if height + EPS < min {
+                return super::bail("flex:clamp");
+            }
+            height = height.max(min);
+        }
+    }
+    let border_width = width + bl + br + pl + pr;
+    let border_height = height + bt + bb + pt + pb;
+    if style.position != w3cos_std::style::Position::Static && !oof_out.is_empty() {
+        let cb = oof::ContainingBlock {
+            x: bl,
+            y: bt,
+            width: border_width - bl - br,
+            height: border_height - bt - bb,
+            rtl: false,
+        };
+        let (placed, rest) = oof::resolve(
+            flat,
+            std::mem::take(&mut oof_out),
+            &cb,
+            false,
+            space.viewport_w,
+            space.viewport_h,
+        )
+        .why("flex:oof-resolve")?;
+        children.extend(placed);
+        oof_out = rest;
+    }
+    let mut start_strut = MarginStrut::default();
+    start_strut.append(metrics.margin[0]);
+    let mut end_strut = MarginStrut::default();
+    end_strut.append(metrics.margin[2]);
+    Some(LayoutResult {
+        fragment: BoxFragment {
+            index,
+            width: border_width,
+            height: border_height,
+            text_range: None,
+            children,
+        },
+        last_baseline: LastBaseline::NoLines,
+        start_strut,
+        end_strut,
+        self_collapsing: false,
+        oof: oof_out,
         bfc_dependent: false,
         float_overlap: false,
     })
@@ -1632,11 +1991,16 @@ mod tests {
     }
 
     #[test]
-    fn wrap_baseline_and_rtl_stay_on_legacy() {
+    fn wrap_reverse_column_wrap_baseline_and_rtl_stay_on_legacy() {
         for style in [
             Style {
-                flex_wrap: FlexWrap::Wrap,
+                flex_wrap: FlexWrap::WrapReverse,
                 ..flex_style(FlexDirection::Row, 100.0, None)
+            },
+            Style {
+                flex_wrap: FlexWrap::Wrap,
+                flex_direction: FlexDirection::Column,
+                ..flex_style(FlexDirection::Column, 100.0, Some(80.0))
             },
             Style {
                 align_items: AlignItems::Baseline,
@@ -1651,6 +2015,94 @@ mod tests {
             let flat = pre_flatten(&root);
             assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
         }
+    }
+
+    fn fixed_item(width: f32, height: f32) -> Style {
+        let mut style = block_box(Some(width), Some(height));
+        style.flex_grow = 0.0;
+        style.flex_shrink = 0.0;
+        style.flex_basis = Dimension::Px(width);
+        style
+    }
+
+    #[test]
+    fn definite_height_wrap_with_gap_and_auto_items_stays_on_legacy() {
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(100.0));
+        container.flex_wrap = FlexWrap::Wrap;
+        container.gap = 10.0;
+        container.row_gap = Some(10.0);
+        container.column_gap = Some(10.0);
+        let root = Component::boxed(
+            container,
+            vec![
+                leaf(block_box(Some(50.0), None)),
+                leaf(block_box(Some(40.0), None)),
+            ],
+        );
+        let flat = pre_flatten(&root);
+        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    }
+
+    #[test]
+    fn row_wrap_breaks_on_the_hypothetical_main_size() {
+        // 40 + 40 fits in 100; the third 40 starts a line. Shrink is 0, so
+        // leftover main space stays empty (flex-start). Headless Chrome
+        // border boxes, body margin 0: container 100×20, items at
+        // (0,0,40,10), (40,0,40,10), (0,10,40,10).
+        let mut container = flex_style(FlexDirection::Row, 100.0, None);
+        container.flex_wrap = FlexWrap::Wrap;
+        let root = Component::boxed(
+            container,
+            vec![
+                leaf(fixed_item(40.0, 10.0)),
+                leaf(fixed_item(40.0, 10.0)),
+                leaf(fixed_item(40.0, 10.0)),
+            ],
+        );
+        expect(
+            &root,
+            &[
+                (0, [0.0, 0.0, 100.0, 20.0]),
+                (1, [0.0, 0.0, 40.0, 10.0]),
+                (2, [40.0, 0.0, 40.0, 10.0]),
+                (3, [0.0, 10.0, 40.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_wrap_grows_each_line_and_honors_gaps() {
+        // Line 1 holds two bases of 40 in a 100px row (free 20, grow 1 → 50).
+        // Line 2's single item grows to 100. column-gap 0, row-gap 6.
+        // Headless Chrome: container 100×26, items (0,0,50,10),
+        // (50,0,50,10), (0,16,100,10).
+        let mut item = fixed_item(40.0, 10.0);
+        item.flex_grow = 1.0;
+        let mut container = flex_style(FlexDirection::Row, 100.0, None);
+        container.flex_wrap = FlexWrap::Wrap;
+        container.row_gap = Some(6.0);
+        expect(
+            &Component::boxed(
+                container,
+                vec![leaf(item.clone()), leaf(item.clone()), leaf(item)],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 26.0]),
+                (1, [0.0, 0.0, 50.0, 10.0]),
+                (2, [50.0, 0.0, 50.0, 10.0]),
+                (3, [0.0, 16.0, 100.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_wrap_that_fits_matches_a_single_line() {
+        let mut wrapped = flex_style(FlexDirection::Row, 100.0, None);
+        wrapped.flex_wrap = FlexWrap::Wrap;
+        let children = vec![leaf(fixed_item(30.0, 12.0)), leaf(fixed_item(30.0, 12.0))];
+        let expected = [(1, [0.0, 0.0, 30.0, 12.0]), (2, [30.0, 0.0, 30.0, 12.0])];
+        expect(&Component::boxed(wrapped, children.clone()), &expected);
+        expect(&row_of(100.0, None, children), &expected);
     }
 
     #[test]
