@@ -72,6 +72,33 @@ These are source and focused-test milestones. They do not close the physical
 Android/iOS device, full gesture, lifecycle, signing, or downstream-product
 gates in R3.
 
+## Performance
+
+Measured with `w3cos-runtime-bench` (`runtime-bench` profile, CPU raster).
+See `docs/performance.md`.
+
+Done:
+
+- Report-only CI job uploads a JSON timing report. It fails only when the
+  harness crashes or a one-node edit costs more than four times a full
+  style-plus-layout pass on that same run.
+- Matched-properties sharing no longer keys on the `id` attribute. On an
+  8201-node flex/grid tree, style recalc median dropped from 76.3 ms to
+  29.6 ms. Layout checksums stayed the same.
+- A one-node width edit still relayouts. A background edit patches the
+  retained tree. Inherited `color` still restyles descendants. `dir` still
+  changes computed direction when `id` differs.
+
+Pending:
+
+- Layout of that tree is still about 55 ms and is dominated by text
+  measurement and Taffy, which this pass does not rewrite.
+- Scroll-list paint and JS-to-DOM host-call medians did not move outside
+  run noise.
+- Cold startup is still dominated by the first fontconfig load.
+- Escape analysis and JIT stay deferred until correctness and Web API
+  conformance land.
+
 ---
 
 ## R0 — Restore a Trustworthy Main Branch
@@ -253,6 +280,18 @@ suite is red.
   AudioWorklet ports and deterministic OfflineAudioContext silent rendering.
   Real-time output, compressed decoding, sink selection and worklet processor
   execution remain explicit warning-backed native-adapter boundaries.
+- [x] Render connected Web Audio graphs: oscillator (built-in and
+  `PeriodicWave`), buffer-source (rate, detune, offset, duration, loop),
+  constant-source, gain, stereo-panner and `MediaStreamAudioSourceNode`
+  (live microphone PCM, linear resampling) nodes with speaker up/down-mixing,
+  shared by `OfflineAudioContext.startRendering()` and real-time
+  `AudioContext` output on the default device through cpal (macOS, Windows,
+  Linux desktop).
+- [ ] Render AudioParam automation timelines and AudioParam inputs, and the
+  remaining processing nodes (biquad/IIR, delay, convolver, compressor,
+  wave shaper, panner, analyser data, channel splitter/merger).
+- [ ] Add Android (AAudio) and iOS (AVAudioEngine) output adapters, output
+  device selection (`setSinkId`) and `decodeAudioData`.
 - [x] Implement `ImageDecoder`, `ImageTrack` and `ImageTrackList` over the
   existing native image codecs, including MIME capability queries, static
   PNG/JPEG-family decode, GIF/WebP/APNG frame extraction, repetition/frame
@@ -282,13 +321,38 @@ suite is red.
   command encoder/submission, while retaining explicit warnings for pending
   bind-group/pipeline/pass/canvas descriptor translation.
 - [x] Add WebGL 1/2 contexts, resource identities, shader/program lifecycle,
-  state queries and current Chrome method/constant surfaces. GLSL-to-wgpu
-  translation and draw/upload execution remain a warning-backed renderer
-  boundary.
+  state queries and current Chrome method/constant surfaces.
+- [x] Compile WebGL GLSL ES 1.00/3.00 against the native shader stack: the
+  dialect is rewritten line-preservingly to GLSL 450 and parsed/validated by
+  `naga` (same version as wgpu), so `COMPILE_STATUS`, info logs with original
+  line numbers, `linkProgram` varying/uniform checks, attribute locations,
+  active attribute/uniform introspection, uniform locations, `useProgram`
+  and `getError` are real (`webgl_shader.rs`, `webgl_program.rs`).
+- [x] Execute WebGL 1/2 draws on the wgpu compositor (`webgl_draw.rs`):
+  buffer upload, vertex attributes and VAOs, `uniform*`/`uniformMatrix*`
+  in std140, 2D `texImage2D`/`texSubImage2D`, framebuffer/renderbuffer
+  basics, viewport/scissor, clear, depth/blend/cull, `drawArrays`/
+  `drawElements` (including instanced draws), `readPixels` of real GPU
+  pixels, and publishing the drawing buffer into the canvas compositor.
+  Linked GLSL 450 is lowered to WGSL with naga. Pipelines are cached by
+  program generation and draw state. With no adapter, draw and
+  `readPixels` return `INVALID_OPERATION` and leave the destination
+  untouched. Transform feedback, uniform blocks, queries, sync, 3D and
+  compressed textures, and non-`sampler2D` samplers are rejected.
+- [ ] WebGL uniform-block introspection, unused-uniform elimination,
+  mipmap generation, `copyTexImage2D`, and extension objects.
 - [x] Brand the host-backed Web Bluetooth device/GATT server/service/
   characteristic graph with all Chrome identities, capability records,
   descriptor and notification facades, plus standard `BluetoothUUID`
   canonicalization. Host-unsupported enumeration/I/O rejects explicitly.
+- [x] Desktop `navigator.bluetooth` (`web-bluetooth`) uses `btleplug`
+  (CoreBluetooth, WinRT, BlueZ over D-Bus) for real adapter availability,
+  filtered `requestDevice` (explicit `bluetooth` grant or a chooser; no silent
+  grant), `getDevices`, GATT connect/disconnect, services, characteristics,
+  descriptors, reads, writes, and notifications. The Web Bluetooth GATT
+  blocklist applies. Linux CI installs `libdbus-1-dev`. macOS bundles need
+  `NSBluetoothAlwaysUsageDescription`. The Android host-module adapter is
+  unchanged.
 - [ ] Separate test labels for:
   - direct Rust engine API;
   - ESM/JavaScript Web surface;
@@ -490,9 +554,22 @@ precede ecosystem breadth or migration tooling.
   milestone and emit a compatibility warning.
 - [x] Expose Web Serial, WebHID and WebUSB compatibility bases with navigator
   manager identity, EventTarget behavior, standard device/event constructors,
-  truthful empty enumeration and Promise chooser rejection. Native discovery,
-  permission prompts and device I/O remain host-adapter work and emit one-time
-  warnings instead of reporting false success.
+  truthful empty enumeration and Promise chooser rejection.
+- [x] Wire `navigator.serial` on macOS, Windows and Linux desktop through the
+  `serialport` crate (`web-serial`): an explicit `serial` grant plus one
+  filter match or a host chooser, granted-port `getPorts`, open options, byte
+  streams on an I/O thread, signals, USB ids, `close`/`forget` and polled
+  hot-plug. Mobile and OHOS keep the unavailable rejection.
+- [x] Wire desktop WebHID and WebUSB to real devices. `navigator.hid` uses
+  hidapi (Linux hidraw via `linux-native-basic-udev`, macOS IOKit, Windows
+  hid.dll) for `getDevices`, filtered `requestDevice`, open/close, output and
+  feature reports, `inputreport` events from a reader thread, report-descriptor
+  collections, and connect/disconnect. `navigator.usb` uses nusb for
+  configuration and interface lifecycle, control and bulk/interrupt transfers
+  with `USBInTransferResult`/`USBOutTransferResult`, protected-interface
+  `SecurityError`, and isochronous `NotSupportedError`. `requestDevice` requires
+  an explicit `hid`/`usb` grant or a host chooser and never grants silently.
+  Android, iOS, and OHOS keep the truthful rejection path.
 - [x] Expose the Web NFC base with constructible `NDEFReader`, `NDEFMessage`,
   `NDEFRecord` and `NDEFReadingEvent`, usable message/record data, AbortSignal
   pre-abort handling and explicit Promise failures. Scanning, permissions and
@@ -514,19 +591,28 @@ precede ecosystem breadth or migration tooling.
   host-unavailable errors and host-injectable idle/screen state. Native idle
   sampling and screen-color picking emit one-time compatibility warnings.
 - [x] Expose Gamepad (`navigator.getGamepads()`, `Gamepad`, `GamepadButton`,
-  `GamepadEvent`) with stable indexed snapshots, axes/buttons, trusted
-  connect/disconnect events and a host update entry point. Physical controller
-  discovery requires a platform gamepad adapter and emits a warning.
+  `GamepadEvent`) with event-loop snapshots from a gilrs side thread on macOS,
+  Windows and Linux desktop (`web-gamepad`). Recognized controllers use the
+  W3C `standard` mapping (17 buttons, 4 axes); unrecognized controllers keep
+  mapping `""`. Trusted connect/disconnect events fire after a gamepad user
+  gesture. `dual-rumble` uses gilrs force feedback where the device supports
+  it and otherwise rejects `NotSupportedError` with a warning. Android, iOS
+  and OHOS keep host-injectable snapshots and the compatible haptic completion
+  warning. Linux links libudev.
 - [x] Expose Device Orientation and Motion (`DeviceOrientationEvent`,
   `DeviceMotionEvent`, acceleration and rotation-rate value identities) with
   standard fields/identity, permission-gated trusted window events, Permissions
   API synchronization and host sensor injection.
-  Platform sensor-consent and telemetry adapters remain pending with warning.
 - [x] Expose the Generic Sensor core (`Sensor`, `SensorErrorEvent`,
-  `Accelerometer`, `Gyroscope`, `Magnetometer`) with asynchronous
-  start/error/activate lifecycle, permission integration, reading events and
-  host vector injection. Live telemetry requires platform adapters and emits a
-  warning.
+  `Accelerometer`, `Gyroscope`, `Magnetometer`, plus gravity, linear
+  acceleration, absolute/relative orientation, and `AmbientLightSensor`) with
+  asynchronous start/error/activate lifecycle, permission integration, reading
+  events and host vector injection.
+- [x] Read Linux desktop Generic Sensor and device motion from Industrial I/O
+  (`/sys/bus/iio/devices`, optional `iio-sensor-proxy`) on a `web-sensors`
+  sampler thread. Missing hardware is `NotReadableError` or, for window
+  events, silence. macOS, Windows, and mobile do not invent samples. Host
+  injection still feeds unit tests unless `W3COS_SENSOR_DEVICE_TESTS=1`.
 - [x] Expose Media Capabilities (`navigator.mediaCapabilities`,
   `MediaCapabilities`) with validated decode/encode Promise queries backed by
   a host-registerable MIME codec table. Unknown formats report unsupported;
@@ -568,6 +654,15 @@ precede ecosystem breadth or migration tooling.
 - [x] Support `getCurrentPosition`, `watchPosition`, and `clearWatch`.
 - [x] Implement timeout, maximum age, accuracy fields, permission denial, and
   platform-disabled errors.
+- [x] Desktop providers behind `web-geolocation`: Linux GeoClue2 on the system
+  bus (zbus, desktop id `w3cos`, city vs exact accuracy; allow `[w3cos]` in
+  `geoclue.conf` when no agent is running), macOS Core Location when-in-use
+  (`NSLocationWhenInUseUsageDescription`, `NSLocationUsageDescription`, and
+  entitlement `com.apple.security.personal-information.location`), and Windows
+  `Windows.Devices.Geolocation` (honors the location privacy setting).
+  Acquisition runs on a dedicated thread and is delivered on the event loop.
+  Host `update_position` remains for tests. `W3COS_GEOLOCATION_DEVICE_TESTS=1`
+  opts into a hardware run. Coordinates are never synthesized.
 - [ ] Add iOS Core Location and Android location adapters with manifest/plist
   generation.
 
@@ -583,8 +678,44 @@ precede ecosystem breadth or migration tooling.
 - [x] Provide browser-shaped `MediaStream` and `MediaStreamTrack` lifecycle:
   track enumeration/filtering, add/remove events, clone, stop/ended, live
   `active`, constraints facades, and permission/not-found failures.
-- [ ] Connect host media payloads to preview and capture sinks; the current
-  adapter boundary exposes device/track lifecycle but not frame/audio data.
+- [x] Linux camera platform adapter (V4L2 ioctl, `camera_v4l2.rs`, no libv4l):
+  `enumerateDevices()` lists `/dev/video*` capture nodes (one anonymous entry
+  until the `camera` capability is granted, then labels and opaque stable
+  SHA-256 `deviceId`/`groupId`); `getUserMedia({video})` requires that grant,
+  opens a live track on a capture thread, and honours `deviceId`, `width`,
+  `height`, `frameRate`, and `facingMode` (`exact` that the device cannot meet
+  is `OverconstrainedError`). YUYV/MJPEG frames stream into `getSettings()`,
+  `getCapabilities()`, `ImageCapture`, and `MediaStreamTrackProcessor` /
+  `VideoFrame`. The last `stop()` releases the device. Host-registered devices
+  still take precedence. Physical capture is opt-in:
+  `W3COS_CAMERA_TESTS=1` (one-shot) and `W3COS_CAMERA_DEVICE_TESTS=1` (live).
+- [x] Continuous camera frames reach `MediaStreamTrackProcessor` / `VideoFrame`
+  on Linux, macOS, and Windows desktop.
+- [ ] `<video>` preview, camera `MediaRecorder` encoding, and `devicechange`
+  hot-plug events.
+- [x] Desktop microphone adapter (cpal, `audio_input.rs`, macOS / Windows /
+  Linux desktop, gated by `web-media-advanced`): `enumerateDevices()` lists
+  input devices (one anonymous `audioinput` until the `microphone` capability
+  is granted, then labels and opaque stable SHA-256 `deviceId`/`groupId`);
+  `getUserMedia({audio})` requires that grant, honours `deviceId`,
+  `sampleRate` and `channelCount`, and opens a live cpal input stream.
+  `MediaStreamAudioSourceNode` pulls those samples into an `AudioContext` or
+  `OfflineAudioContext` (linear resampling when the rates differ).
+  `echoCancellation`, `noiseSuppression` and `autoGainControl` with
+  `exact: true` reject `OverconstrainedError` because the adapter does not
+  apply them. Host-registered `audioinput` devices still take precedence and
+  carry no PCM. Android, iOS and OHOS have no input adapter. Physical capture
+  is verified only by the opt-in `W3COS_AUDIO_DEVICE_TESTS=1` test.
+- [x] macOS (AVFoundation) and Windows (Media Foundation) camera adapters,
+  gated by `web-media-advanced` through `nokhwa` (`input-avfoundation`,
+  `input-msmf`). macOS reads `AVAuthorizationStatus` and rejects
+  `NotAllowedError` when access is denied or restricted; the host `Info.plist`
+  must include `NSCameraUsageDescription` or the system will not grant the
+  camera. Linux keeps the ioctl adapter and does not compile or link nokhwa.
+- [ ] Android (Camera2) and iOS camera adapters.
+- [ ] Connect camera frames to `<video>` preview and `MediaRecorder`. Microphone
+  PCM reaches `MediaStreamAudioSourceNode` but not `MediaStreamTrackProcessor`
+  or an `<audio>` element.
 - [ ] Add photo/evidence capture without product-specific native modules.
 - [ ] Validate camera/microphone denial and interruption on physical devices.
 
@@ -854,6 +985,12 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
 - [x] Add `Crypto`/`SubtleCrypto` identities around secure random generation;
   preserve every SubtleCrypto Promise method with explicit warning and
   `NotSupportedError` rejection until a native cryptographic provider lands.
+- [x] Back SubtleCrypto with `ring` for SHA digests, HMAC, AES-GCM (raw/JWK
+  import/export, encrypt/decrypt, wrap/unwrap) and HKDF/PBKDF2 derivation,
+  with WebCrypto error semantics and published test vectors.
+- [ ] Add asymmetric WebCrypto (ECDSA/ECDH P-256/P-384, Ed25519/X25519,
+  RSA-PSS/OAEP) with `spki`/`pkcs8`/JWK formats, AES-CBC/CTR/KW and
+  `CryptoKey` structured cloning.
 - [x] Add the `DOMStringList` identity and list methods used by
   `Location.ancestorOrigins`.
 - [x] Add the read-only maplike `EventCounts` identity with Chromium's 36
@@ -975,7 +1112,15 @@ APIs. Work is ordered by common npm usage, not by number of Rust modules.
     copy clean tiles and rerasterize only dirty bounding boxes. Topology or
     geometry changes still take a full tiled raster. SMIL and Web Animations
     still do not write computed values into this raster path.
-  - [ ] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+  - [x] Optional direct GPU vector path for SVG (bypass CPU pixmap tiles).
+    When the wgpu/Vello backend is active, each SVG element is encoded as GPU
+    vector geometry (paths, solid and gradient fills and strokes, transforms,
+    clip paths, opacity, blend modes, and text glyph outlines) or, for a mask,
+    filter, pattern paint, miter-clip join, or non-outline glyphs, as a CPU
+    pixmap of that element only. The choice and the reason are logged per
+    element. `W3COS_SVG_CPU_TILES=1` keeps the full 32px tile upload. CPU and
+    Skia backends keep the tiled resvg raster. SMIL and Web Animations still
+    do not write computed values into this paint path.
 - [x] Define cookie behavior: real per-origin session store instead of inert
   assignment.
 
@@ -1174,6 +1319,11 @@ generic JavaScript/Web-platform coverage.
 - [x] Bootable ISO release workflow.
 - [x] AI Bridge DOM/a11y/query/click/type/screenshot foundation.
 - [x] File system, process, PTY, IPC, menu, and dialog engine modules.
+- [x] Desktop WebHID (hidapi) and WebUSB (nusb) device I/O, with explicit
+  permission, protected USB interface classes, and truthful mobile/OHOS
+  rejection.
+- [x] Linux desktop motion and ambient-light telemetry through Industrial I/O
+  (`web-sensors`). macOS, Windows, and mobile report the sensor as unavailable.
 
 ### Remaining
 
@@ -2873,9 +3023,17 @@ W3COS.
 
 ### Standalone iOS/Android model
 - [ ] Produce capability-driven runtime feature sets; applications link only the APIs and subsystems reachable from their manifest/build graph
-- [ ] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
-- [ ] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
-- [ ] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+- [x] Select exactly one primary render backend per mobile artifact; do not ship Skia, Vello/wgpu, and tiny-skia/softbuffer together
+  - Generated iOS, Android, and Harmony manifests enable `skia`, or `gpu` plus `web-graphics-advanced` when the application references WebGPU/WebGL/WebXR. `cpu-render` (tiny-skia and softbuffer) is not combined with that primary backend.
+  - `scripts/check-mobile-renderer-boundary.sh` rejects a Skia closure containing softbuffer, vello, wgpu, ravif, or rav1e, and a GPU closure containing skia-safe or softbuffer. resvg's transitive tiny-skia crate is not a second presenter.
+  - Linux x86_64 host linkage, rustc 1.99.1, `release-size`, stripped, same DOM/jsdom touch: 12,796,192 bytes with no renderer, and 16,057,800 bytes with Skia plus PNG/JPEG/WebP (+3,261,608 bytes). The Skia probe links libstdc++ and Skia objects and has no vello, wgpu, or softbuffer strings. This is not an Android ABI split or an iOS device slice.
+- [x] Use system fonts where possible; do not embed the 9.6 MB CJK font in every standalone application
+  - `assets/CJK-Subset.ttf` is 10,028,840 bytes and is `include_bytes!` only for tests and the explicit `embed-cjk-font` feature. Web codegen copies it only when `CompileOptions.embed_cjk_font` or `W3COS_EMBED_CJK_FONT` opts in.
+  - Production fallback uses fontconfig, then Android `AFontMatcher`, Apple Core Text, or the Windows `NONCLIENTMETRICS` UI face, then named families and a directory scan. A missing CJK face warns once and is not drawn. With no system font at all, `host_ui_font` still panics unless a non-test build enabled `embed-cjk-font`.
+  - The probes above do not enable `embed-cjk-font`, and neither binary contains that subset.
+- [x] Disable default image-codec features and enable only required formats (for example PNG/JPEG/WebP)
+  - The workspace `image` crate is `default-features = false`. Raster formats are explicit `w3cos-runtime` features. Generated iOS, Android, and Harmony manifests enable `image-png`, `image-jpeg`, and `image-webp` only.
+  - The runtime crate default, desktop generated apps, shell, demo, rn-compat, and the WPT runner still enable `image-gif`, `image-bmp`, and `image-ico` so existing desktop decode paths keep working.
   - [x] Remove the unused AVIF encoder (`ravif`/`rav1e`) from the ordinary
     raster closure and retain it as explicit `image-avif-encode` capability.
     AVIF decoding is a separate native-decoder boundary.
@@ -2905,9 +3063,29 @@ W3COS.
     parses HTML and executes SWC → W3IR → W3VM while retaining the network
     loader, WOFF/WOFF2 decoder and configurable persistent-cache/retry path, a
     1,065,632-byte (17.52%) dynamic increment.
-  - Product gates still need Android ABI-split and iOS App Store device-slice artifacts
-- [ ] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+  - [x] Linkage-probe reports now record executable text, file-backed data,
+    read-only data, bss, gzip level 9 of the stripped bytes, and an embedded
+    font/image scan. On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after
+    explicit image codecs and the SVG GPU path landed and with those codecs
+    off in these probes, the checked-in stripped sizes are 11,877,576 bytes
+    for ordinary AOT and 15,372,632 bytes for the dynamic browser probe
+    (gzip 5,095,951 and 6,693,042; embedded 0). The same-runner dynamic
+    increment is 3,495,056 bytes (29.43%). `web-bluetooth` and
+    `web-geolocation` are off in both probes.
+  - [x] The 2026-10-21 Linux x86_64 `release-size` probes (rustc 1.99.1,
+    stripped) measure 12,839,200 bytes for ordinary DOM/jsdom AOT at
+    `ff70045` and 12,796,192 bytes after moving raster codecs onto explicit
+    features (-43,008 bytes; LTO had already dropped unreferenced decoders).
+    The same DOM touch plus Skia and PNG/JPEG/WebP is 16,057,800 bytes.
+    CI builds that Skia probe and audits it with `--profile runtime`.
+  - Product gates still need native-library rows, Android ABI-split, and iOS App Store device-slice artifacts
+- [x] Add dependency/symbol attribution (`cargo bloat` or platform equivalents) and fail CI on unexplained size regressions above an agreed threshold
+  - `w3cos-size-audit` reads the unstripped symbol table and records crate totals, the largest symbols, and feature buckets in the uploaded JSON and markdown reports.
+  - CI fails when a probe's stripped size grows by more than 3% or more than 200 KiB versus the checked-in row for the same rustc host triple in `tools/size-audit/baselines/linkage-probes.json`. Other architectures are not compared. Update that row with `scripts/audit-linkage-sizes.sh --update-baseline --baseline-note "..."` and review the diff.
+  - `host-tray` and `host-keyring` are explicit features, on for the runtime default set and the desktop shell, off for ordinary AOT. On the same `x86_64-unknown-linux-gnu` toolchain, before the later codec split, ordinary AOT fell from 12,814,744 to 11,884,064 bytes (930,680 bytes, 7.26%) and the browser probe from 16,621,992 to 15,694,896 bytes (927,096 bytes, 5.58%).
 - [ ] Track the current full-runtime Monaco artifact as a baseline (about 172 MB unstripped / 120 MB fully stripped on arm64 macOS); replace it with reproducible per-feature baselines
+  - [x] The single arm64 macOS 172 MB / 120 MB figure is retired as a CI gate. It mixed application modules with every default feature and is not reproducible on the Linux runner.
+  - [x] The two checked-in linkage closures, plus per-feature symbol-byte buckets, are the reproducible baselines. A full default-feature Monaco product artifact (renderers, embedded fonts, application JS) is still not rebuilt here.
 - [ ] Verify that standalone W3COS applications remain materially smaller than shipping a complete Chromium stack; treat a regression toward Chromium-class size as an architecture issue, not something `strip` alone will fix
 
 ## Phase 4 — Operating System ✅ (core done)

@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libdbus-1-dev libudev-dev mesa-vulkan-drivers libvulkan1
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
         run: |
           rustup toolchain install --no-self-update
@@ -35,12 +35,22 @@ jobs:
       - name: Test required compiler suites
         run: cargo test -p w3cos-compiler --lib --tests
       - name: Test required runtime suites
-        run: cargo test -p w3cos-runtime --lib --tests
+        run: |
+          icd="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)"
+          if [ -n "$icd" ]; then
+            echo "Using lavapipe ICD $icd"
+            export VK_DRIVER_FILES="$icd"
+            export VK_ICD_FILENAMES="$icd"
+            export W3COS_GPU_TESTS=1
+          else
+            echo "lavapipe ICD not found; WebGL GPU tests stay gated"
+          fi
+          cargo test -p w3cos-runtime --lib --tests
       - name: Test optional dynamic JavaScript path
         run: |
-          cargo test -p w3cos-runtime --no-default-features --features dynamic-js dynamic_script::tests --lib
-          cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_realm::
-          cargo test -p w3cos-runtime --no-default-features --features dynamic-js --lib worker_web::tests
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico dynamic_script::tests --lib
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --lib worker_realm::
+          cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --lib worker_web::tests
       - name: Checkout pinned Web Platform Tests subset
         run: |
           wpt_dir="$RUNNER_TEMP/wpt"
@@ -70,37 +80,87 @@ jobs:
             target/wpt-smoke
             target/wpt-baseline
       - name: Test map-style dynamic SDK loading
-        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js --test map_sdk_compat
+        run: cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --test map_sdk_compat
       - name: Verify ordinary AOT dependency boundary
         run: scripts/check-aot-dependency-boundary.sh
       - name: Verify dynamic JavaScript execution boundary
         run: scripts/check-dynamic-js-boundary.sh
+      - name: Verify mobile renderer dependency boundary
+        run: scripts/check-mobile-renderer-boundary.sh
       - name: Test size audit policy
         run: cargo test -p w3cos-size-audit
-      - name: Build stripped AOT and dynamic-browser linkage probes
+      - name: Audit linkage-probe size, attribution, and baselines
+        run: scripts/audit-linkage-sizes.sh
+      - name: Build and budget the mobile Skia linkage probe
         run: |
-          cargo build -p w3cos-size-audit --profile release-size
-          cargo build -p w3cos-size-probes --bin w3cos-aot-size-probe --profile release-size
-          cargo build -p w3cos-size-probes --features browser --bin w3cos-browser-size-probe --profile release-size
-          test "$(target/release-size/w3cos-aot-size-probe)" = "ordinary-aot"
-          test "$(target/release-size/w3cos-browser-size-probe)" = "dynamic-w3vm"
-      - name: Enforce linkage-probe size budgets
-        run: |
+          cargo build -p w3cos-size-probes --features mobile-skia --bin w3cos-mobile-skia-size-probe --profile release-size
+          test "$(target/release-size/w3cos-mobile-skia-size-probe)" = "mobile-skia"
           target/release-size/w3cos-size-audit \
-            --profile aot \
-            --component executable=target/release-size/w3cos-aot-size-probe \
-            --output target/size-audit-aot.json
-          aot_bytes="$(stat -c%s target/release-size/w3cos-aot-size-probe)"
-          target/release-size/w3cos-size-audit \
-            --profile browser \
-            --component executable=target/release-size/w3cos-browser-size-probe \
-            --baseline-bytes "$aot_bytes" \
-            --max-regression-percent 50 \
-            --output target/size-audit-browser.json
+            --profile runtime \
+            --component executable=target/release-size/w3cos-mobile-skia-size-probe \
+            --output target/size-audit-mobile-skia.json
       - name: Upload linkage-probe size reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: size-audit-linkage-probes
           path: |
             target/size-audit-aot.json
+            target/size-audit-aot.md
             target/size-audit-browser.json
+            target/size-audit-browser.md
+            target/size-audit-mobile-skia.json
+
+  # Report-only runtime timings. Absolute microseconds are not a gate: the
+  # job fails only when the harness crashes or a same-run sanity check shows
+  # the incremental edit cost more than four times a full style+layout pass.
+  runtime-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libx11-dev libxss-dev pkg-config libclang-dev cmake g++ libasound2-dev libudev-dev libsqlite3-dev
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build runtime bench
+        run: cargo build --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --no-default-features --features cpu-render
+      - name: Run runtime bench
+        run: target/runtime-bench/w3cos-runtime-bench --output runtime-bench.json --samples 3
+      - name: Check harness sanity
+        run: |
+          python3 - <<'PY'
+          import json
+          with open("runtime-bench.json") as handle:
+              report = json.load(handle)
+          style = report["style_layout"]
+          width = report["incremental_width"]
+          background = report["incremental_background"]
+          paint = report["paint_scroll"]
+          host = report["host_calls"]
+          assert style["nodes"] >= 5000, style["nodes"]
+          assert style["median_us"] > 0
+          assert width["median_us"] > 0
+          assert background["median_us"] > 0
+          assert width["after_width"] != width["before_width"]
+          assert paint["rows"] >= 200
+          assert paint["first_us"] > 0
+          assert paint["checksum"] != 0
+          assert host["median_ns_per_call"] > 0
+          assert report["startup"]["wall_us"] > 0
+          # Same-runner relative check. A one-node edit that is several times
+          # slower than laying out the whole tree means the harness measured
+          # the wrong work, not a noisy clock.
+          limit = style["median_us"] * 4
+          assert width["median_us"] < limit, (width["median_us"], limit)
+          assert background["median_us"] < limit, (background["median_us"], limit)
+          print("runtime bench sanity ok")
+          PY
+      - name: Upload runtime bench report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-bench
+          path: runtime-bench.json

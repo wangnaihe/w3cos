@@ -5,18 +5,70 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "W3C OS native runtime — layout engine, renderer, window manager, and system bridge"
+autobins = false
 
 [features]
-default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced"]
+default = ["gpu", "cpu-render", "skia", "web-graphics-advanced", "web-media-advanced", "web-gamepad", "web-device-access", "web-sensors", "web-serial", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]
 gpu = ["dep:vello", "dep:skrifa", "dep:pollster", "dep:bytemuck"]
 cpu-render = ["dep:tiny-skia", "dep:softbuffer"]
 skia = ["dep:skia-safe", "skia-safe/svg", "dep:rustybuzz", "dep:unicode-ccc"]
-web-graphics-advanced = []
-web-media-advanced = []
+web-graphics-advanced = ["dep:naga"]
+# Includes real-time Web Audio output and microphone capture through cpal
+# on desktop targets, plus macOS AVFoundation and Windows Media Foundation
+# cameras through nokhwa. Linux V4L2 capture does not use this feature.
+web-media-advanced = ["dep:cpal", "dep:nokhwa", "dep:nokhwa-bindings-macos"]
+# Gamepad discovery and dual-rumble through gilrs on macOS, Windows and Linux
+# desktop. Linux links libudev; CI images install libudev-dev. Android, iOS
+# and OHOS do not enable the adapter.
+web-gamepad = ["dep:gilrs"]
+# Host serial ports for navigator.serial on macOS, Windows, and Linux desktop.
+# The serialport crate leaves libudev off; Linux USB ids come from sysfs.
+web-serial = ["dep:serialport"]
+# Desktop WebHID (hidapi hidraw) and WebUSB (nusb). The crates are desktop-only,
+# so Android, iOS, and OHOS keep the truthful rejection path.
+web-device-access = ["dep:hidapi", "dep:nusb"]
+# Linux desktop Generic Sensor / device motion telemetry via sysfs IIO and,
+# when a raw channel is missing, iio-sensor-proxy on the system bus.
+# macOS, Windows, and mobile builds that enable this feature report
+# NotReadableError instead of inventing samples. Host injection still works
+# when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
+web-sensors = []
+# Desktop `navigator.geolocation` on a dedicated thread. Linux uses GeoClue2
+# through zbus (no extra system libraries). macOS uses CoreLocation and Windows
+# uses Windows.Devices.Geolocation. iOS, Android, and OHOS stay unavailable.
+# Host `update_position` still works when the feature is off. Unit tests do not
+# open a real provider unless W3COS_GEOLOCATION_DEVICE_TESTS=1.
+web-geolocation = [
+    "dep:zbus",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-core-location",
+    "dep:windows",
+]
+# Desktop Web Bluetooth over btleplug (CoreBluetooth / WinRT / BlueZ).
+# Android keeps the host-module adapter and does not link this crate.
+# Linux links libdbus (BlueZ); CI installs libdbus-1-dev. Unit tests use the
+# in-memory radio unless W3COS_BLUETOOTH_DEVICE_TESTS=1.
+web-bluetooth = ["dep:btleplug", "dep:tokio", "dep:uuid", "dep:futures"]
+# System tray (`navigator.w3cos.tray`) and the OS secret store
+# (`navigator.w3cos.keyring`). Ordinary AOT linkage leaves both off. The
+# default feature set and the desktop shell turn them back on.
+host-tray = ["dep:tray-icon"]
+host-keyring = ["dep:keyring"]
 # `image/avif` is an encoder backed by ravif/rav1e; it does not provide AVIF
 # decoding. Keep it outside the ordinary browser/mobile raster closure until an
 # application exposes an actual AVIF encoding surface.
 image-avif-encode = ["image/avif"]
+# Required standalone raster set. Desktop defaults also opt into GIF/BMP/ICO.
+image-png = ["image/png"]
+image-jpeg = ["image/jpeg"]
+image-webp = ["image/webp"]
+image-gif = ["image/gif"]
+image-bmp = ["image/bmp"]
+image-ico = ["image/ico"]
+# Package assets/CJK-Subset.ttf (about 9.6 MiB). Leave this off so standalone
+# apps use the platform font API and warn when no CJK face is installed.
+embed-cjk-font = []
 devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
 # Compile the desktop into this cdylib so /usr/bin/w3cos-shell can dlopen one runtime.
@@ -43,6 +95,8 @@ w3cos-vm = { workspace = true, optional = true }
 url = { workspace = true }
 base64 = { version = "0.22", optional = true }
 ring = "0.17"
+# WebGL GLSL validation uses the same naga as wgpu (web-graphics-advanced).
+naga = { version = "28", features = ["glsl-in", "wgsl-out"], optional = true }
 psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
@@ -57,7 +111,7 @@ rustybuzz = { version = "=0.20.1", optional = true }
 unicode-ccc = { version = "=0.4.0", optional = true }
 fontdb = { version = "0.23", default-features = false, features = ["fs"] }
 anyhow = { workspace = true }
-image = { workspace = true }
+image = { workspace = true, default-features = false }
 flate2 = { workspace = true }
 encoding_rs = { workspace = true }
 wuff = { workspace = true, optional = true }
@@ -72,6 +126,9 @@ tempfile = { workspace = true }
 glob = { workspace = true }
 w3cos-ffi = { path = "../w3cos-ffi" }
 w3cos-a11y = { workspace = true }
+# In-memory mock used by tests. The desktop `keyring` crate (below) opens the
+# real Secret Service / Keychain / Credential Manager store.
+keyring-core = "1.0"
 
 # GPU rendering (default)
 vello = { workspace = true, optional = true }
@@ -95,6 +152,18 @@ libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 winit = { workspace = true }
 skia-safe = { version = "=0.93.1", optional = true, features = ["metal"] }
 security-framework = "3.7"
+
+# macOS location and camera. Core Location is objc2. `nokhwa` captures through
+# AVFoundation; the bindings crate exposes AVAuthorizationStatus. Camera crates
+# are target-gated, so Linux CI does not compile them or link new libraries.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.3", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSObject"] }
+objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-avfoundation", "decoding"] }
+nokhwa-bindings-macos = { version = "0.2.4", optional = true }
+# hidraw IOKit backend. No libusb.
+hidapi = { version = "2.6.7", optional = true, default-features = false }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.5.2"
@@ -127,9 +196,51 @@ tungstenite = { workspace = true }
 # rfd 0.15.4+ enables xdg-portal by default on Linux; that backend's build.rs
 # requires an async runtime feature even when we only call the sync FileDialog API.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+# Default `v1` feature: macOS Keychain, Windows Credential Manager, and the
+# Secret Service over D-Bus (the service libsecret talks to) on Linux.
+keyring = { version = "4.2", optional = true }
+# Web Audio output and microphone input (ALSA/CoreAudio/WASAPI); see audio_device.rs and audio_input.rs.
+cpal = { version = "0.15", optional = true }
+# Web Bluetooth (CoreBluetooth / WinRT / BlueZ). Optional so Android, iOS, and
+# OHOS builds that disable `web-bluetooth` do not link a desktop radio stack.
+btleplug = { version = "0.13", optional = true }
+tokio = { version = "1", optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+uuid = { version = "1", optional = true, default-features = false, features = ["std"] }
+futures = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+# Web Serial. The serialport crate leaves libudev off; USB
+# vendor and product ids still come from sysfs on Linux.
+serialport = { version = "4.10", default-features = false, optional = true }
+# Pure Rust USB. No libusb.
+nusb = { version = "0.2.8", optional = true }
+# System tray. `ksni` is the Linux StatusNotifierItem backend (the protocol
+# Ayatana AppIndicator implements) and does not need GTK. macOS uses
+# NSStatusItem and Windows uses Shell_NotifyIcon inside the same crate.
+# The default `libappindicator` feature links GTK and is intentionally off.
+tray-icon = { version = "0.26", optional = true, default-features = false, features = ["ksni"] }
+# Gamepad input and rumble (evdev / XInput / IOKit). Linux needs libudev.
+gilrs = { version = "0.11", optional = true }
+
+# GeoClue2 over the system bus. Pure Rust; Linux CI does not need libdbus.
+# hidraw without libusb: `linux-native-basic-udev` talks to hidraw through
+# sysfs and does not link libudev or libusb.
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
+zbus = { version = "5", optional = true, default-features = false, features = ["blocking-api"] }
+hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["linux-native-basic-udev"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", optional = true, features = ["Devices_Geolocation", "Foundation"] }
+nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-msmf", "decoding"] }
+hidapi = { version = "2.6.7", optional = true, default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
+
+[[bin]]
+name = "w3cos-runtime-bench"
+path = "src/bin/w3cos-runtime-bench.rs"
+# `headless` exists only with a raster backend. Feature-gated package tests
+# such as `dynamic-js` must not compile this bin.
+required-features = ["cpu-render"]
 
 [[example]]
 name = "native_gaps"

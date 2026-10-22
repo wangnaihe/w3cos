@@ -48,16 +48,9 @@ w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 w3cos-mobile = { path = "crates/w3cos-mobile" }
 w3cos-abi = { path = "crates/w3cos-abi" }
 png = "0.17"
-# Chromium-facing raster formats. Avoid linking scientific/authoring codecs
-# (DDS/EXR/HDR/PNM/QOI/TGA/TIFF) into every standalone application.
-image = { version = "0.25", default-features = false, features = [
-    "bmp",
-    "gif",
-    "ico",
-    "jpeg",
-    "png",
-    "webp",
-] }
+# No raster formats here. w3cos-runtime enables PNG/JPEG/WebP and the
+# optional GIF/BMP/ICO/AVIF features explicitly.
+image = { version = "0.25", default-features = false }
 flate2 = "1.1"
 wuff = "0.2.8"
 encoding_rs = "0.8"
@@ -139,6 +132,15 @@ panic = "unwind"
 inherits = "release"
 opt-level = "z"
 lto = "fat"
+
+# Wall-clock harness profile. opt-level 3 without fat/thin LTO so the
+# report-only CI job stays within a GitHub runner and repeated local runs
+# share one codegen setting. Absolute times are not a merge gate.
+[profile.runtime-bench]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = "none"
 
 # libp2p-quic 0.14 disables QUIC connection migration. The patched copy enables it.
 [patch.crates-io]

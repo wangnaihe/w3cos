@@ -7,7 +7,8 @@
 //! Paint-only mutations of an unchanged document topology (typical of SVG
 //! presentation animation) reuse 32px tiles whose dirty bounding boxes do
 //! not overlap. Topology or geometry changes still take a full tiled raster.
-//! Direct GPU vector tessellation is not implemented.
+//! The wgpu/Vello backend can bypass these tiles and draw the same usvg tree
+//! as GPU vectors; this module remains the CPU pixmap path and the parse cache.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -246,6 +247,26 @@ pub(crate) fn get_or_render_image(source: &str, width: f32, height: f32) -> Opti
 pub fn get_or_render_inline(source: &str, width: u32, height: u32) -> Option<DecodedImage> {
     let source = inline_viewport_source(source, width, height)?;
     get_or_render(&source, width, height)
+}
+
+/// Borrow the viewport-resolved usvg tree for `source`.
+///
+/// The closure must not re-enter the SVG cache. GPU vector drawing uses this
+/// so a document is parsed once and then either tessellated or tile-rasterized.
+pub(crate) fn with_inline_tree<R>(
+    source: &str,
+    width: u32,
+    height: u32,
+    f: impl FnOnce(&resvg::usvg::Tree) -> R,
+) -> Option<R> {
+    let source = inline_viewport_source(source, width, height)?;
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.clock = cache.clock.wrapping_add(1);
+        let clock = cache.clock;
+        let (_, tree, _, _) = cache.get_or_parse(&source, clock)?;
+        Some(f(tree.as_ref()))
+    })
 }
 
 pub fn hit_test_inline(

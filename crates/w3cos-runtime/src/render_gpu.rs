@@ -494,6 +494,7 @@ pub fn render_frame(
             ),
             _ => None,
         };
+        crate::canvas2d::set_paint_client(idx);
         let is_focused = focused_index == Some(idx);
         if !is_focused
             && let Some(key) = glyph_cache.ensure_display_chunk(
@@ -954,12 +955,22 @@ fn render_node(
         }
         ComponentKind::SvgDocument { source, .. } => {
             let rect = crate::svg_renderer::content_box(rect, style);
-            if let Some(raster) = crate::svg_renderer::get_or_render_inline(
-                source,
-                rect.width.ceil().max(1.0) as u32,
-                rect.height.ceil().max(1.0) as u32,
-            ) {
-                draw_decoded_image(scene, rect, &raster);
+            crate::svg_gpu::draw_inline_svg(scene, source, rect, dpi);
+        }
+        ComponentKind::Canvas { .. } => {
+            if let Some(snapshot) =
+                crate::canvas2d::surface_snapshot(crate::canvas2d::paint_client())
+            {
+                let decoded = crate::image_loader::DecodedImage {
+                    width: snapshot.width,
+                    height: snapshot.height,
+                    intrinsic_width: snapshot.width,
+                    intrinsic_height: snapshot.height,
+                    svg_intrinsic_size: None,
+                    svg_source: None,
+                    data: snapshot.pixels,
+                };
+                draw_decoded_image(scene, rect, &decoded);
             }
         }
         _ => {}
@@ -1839,6 +1850,7 @@ pub fn record_layer_scene(
             ),
             _ => None,
         };
+        crate::canvas2d::set_paint_client(idx);
         render_node(
             &mut scene,
             rect,

@@ -1,8 +1,11 @@
-//! Stateful WebGL 1/2 compatibility contexts.
+//! Stateful WebGL 1/2 contexts.
 //!
-//! Resource identity, shader/program lifecycle, state queries and standard
-//! constants are available. Draw/upload calls preserve state and warn because
-//! GLSL-to-wgpu translation is not yet connected to the compositor.
+//! Resource identity, state queries and standard constants are available.
+//! Shader compilation and program linking run through [`crate::webgl_program`]
+//! (GLSL ES → naga). Buffer, texture, uniform and draw calls run through
+//! [`crate::webgl_draw`] on the wgpu compositor when an adapter is available.
+//! Transform feedback, uniform blocks, compressed textures and several WebGL 2
+//! extensions are rejected with an explicit warning.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -191,12 +194,68 @@ fn warn_once() {
     WARNING_EMITTED.with(|warned| {
         if !warned.replace(true) {
             eprintln!(
-                "[w3cos] warning: WebGL preserves resources, shader/program state, queries and \
-                 constants; GLSL translation and draw/upload execution on the native wgpu \
-                 compositor are pending"
+                "[w3cos] warning: WebGL draw/upload runs on the wgpu compositor when an \
+                 adapter is available; this call is outside that path"
             );
         }
     });
+}
+
+fn unsupported_method(name: &str) -> bool {
+    matches!(
+        name,
+        "beginTransformFeedback"
+            | "endTransformFeedback"
+            | "pauseTransformFeedback"
+            | "resumeTransformFeedback"
+            | "transformFeedbackVaryings"
+            | "getTransformFeedbackVarying"
+            | "bindTransformFeedback"
+            | "createTransformFeedback"
+            | "bindBufferBase"
+            | "bindBufferRange"
+            | "getUniformBlockIndex"
+            | "getActiveUniformBlockName"
+            | "getActiveUniformBlockParameter"
+            | "uniformBlockBinding"
+            | "beginQuery"
+            | "endQuery"
+            | "createQuery"
+            | "getQueryParameter"
+            | "fenceSync"
+            | "clientWaitSync"
+            | "waitSync"
+            | "getSyncParameter"
+            | "compressedTexImage2D"
+            | "compressedTexImage3D"
+            | "compressedTexSubImage2D"
+            | "compressedTexSubImage3D"
+            | "texImage3D"
+            | "texSubImage3D"
+            | "texStorage3D"
+            | "blitFramebuffer"
+            | "drawBuffers"
+            | "readBuffer"
+            | "framebufferTextureLayer"
+            | "renderbufferStorageMultisample"
+            | "invalidateFramebuffer"
+            | "invalidateSubFramebuffer"
+            | "getInternalformatParameter"
+            | "getFragDataLocation"
+    )
+}
+
+fn warn_unsupported(name: &str) {
+    thread_local! {
+        static SEEN: RefCell<std::collections::HashSet<String>> =
+            RefCell::new(std::collections::HashSet::new());
+    }
+    let fresh = SEEN.with(|seen| seen.borrow_mut().insert(name.to_string()));
+    if fresh {
+        eprintln!(
+            "[w3cos] warning: WebGL {name}() is not executed on the wgpu compositor and was rejected"
+        );
+    }
 }
 
 fn illegal(name: &str) -> ! {
@@ -210,7 +269,7 @@ fn constant(name: &str) -> f64 {
     crate::webgl_constants_generated::value(name).unwrap_or(0.0)
 }
 
-fn object_value(name: &'static str) -> Value {
+pub(crate) fn object_value(name: &'static str) -> Value {
     let value = Value::object(HashMap::from([(
         "__w3cos_deleted".into(),
         Value::Bool(false),
@@ -285,7 +344,6 @@ pub fn class_for(name: &'static str) -> Value {
 }
 
 pub fn context_value(canvas: Value, webgl2: bool) -> Value {
-    warn_once();
     let state = Rc::new(RefCell::new(HashMap::<String, Value>::from([
         (
             "clearColor".into(),
@@ -299,6 +357,7 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
         ("drawingBufferFormat".into(), Value::string("rgba8")),
         ("unpackColorSpace".into(), Value::string("srgb")),
     ]));
+    let canvas_for_draw = canvas.clone();
     let width_canvas = canvas.clone();
     value.set_property(
         "__w3cos_getter_drawingBufferWidth",
@@ -312,16 +371,13 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     for (method, class_name) in [
         ("createBuffer", "WebGLBuffer"),
         ("createFramebuffer", "WebGLFramebuffer"),
-        ("createProgram", "WebGLProgram"),
         ("createQuery", "WebGLQuery"),
         ("createRenderbuffer", "WebGLRenderbuffer"),
         ("createSampler", "WebGLSampler"),
-        ("createShader", "WebGLShader"),
         ("createTexture", "WebGLTexture"),
         ("createTransformFeedback", "WebGLTransformFeedback"),
         ("createVertexArray", "WebGLVertexArrayObject"),
         ("fenceSync", "WebGLSync"),
-        ("getUniformLocation", "WebGLUniformLocation"),
     ] {
         value.set_property(
             method,
@@ -412,6 +468,11 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
             move |_, args| match args.first().map(Value::to_u32).unwrap_or(0) {
                 3106 => state_for_parameter.borrow()["clearColor"].clone(),
                 2978 => state_for_parameter.borrow()["viewport"].clone(),
+                35725 => state_for_parameter
+                    .borrow()
+                    .get("currentProgram")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 7936 => Value::string("w3cos"),
                 7937 => Value::string("w3cos wgpu compatibility renderer"),
                 7938 => Value::string(if webgl2 { "WebGL 2.0" } else { "WebGL 1.0" }),
@@ -424,7 +485,6 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
             },
         ),
     );
-    value.set_property("getError", realm_webgl_function(|_, _| Value::Number(0.0)));
     value.set_property(
         "isContextLost",
         realm_webgl_function(|_, _| Value::Bool(false)),
@@ -434,7 +494,16 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
         "getSupportedExtensions",
         realm_webgl_function(|_, _| Value::array(Vec::new())),
     );
-    value.set_property("getExtension", realm_webgl_function(|_, _| Value::Null));
+    value.set_property(
+        "getExtension",
+        realm_webgl_function(|_, args| {
+            let name = args.first().map(Value::to_js_string).unwrap_or_default();
+            if !name.is_empty() {
+                warn_unsupported("getExtension");
+            }
+            Value::Null
+        }),
+    );
     value.set_property(
         "getContextAttributes",
         realm_webgl_function(|_, _| {
@@ -451,18 +520,6 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     value.set_property(
         "checkFramebufferStatus",
         realm_webgl_function(|_, _| Value::Number(36053.0)),
-    );
-    value.set_property(
-        "getAttribLocation",
-        realm_webgl_function(|_, _| Value::Number(0.0)),
-    );
-    value.set_property(
-        "getProgramInfoLog",
-        realm_webgl_function(|_, _| Value::string("")),
-    );
-    value.set_property(
-        "getShaderInfoLog",
-        realm_webgl_function(|_, _| Value::string("")),
     );
     value.set_property(
         "getShaderPrecisionFormat",
@@ -501,19 +558,22 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
         }),
     );
     value.set_property(
-        "getShaderParameter",
-        realm_webgl_function(|_, _| Value::Bool(true)),
-    );
-    value.set_property(
-        "getProgramParameter",
-        realm_webgl_function(|_, _| Value::Bool(true)),
-    );
-    value.set_property(
         "makeXRCompatible",
         realm_webgl_function(|_, _| {
             warn_once();
             w3cos_core::promise::resolve(vec![Value::Undefined])
         }),
+    );
+    let error = Rc::new(Cell::new(0u32));
+    let gpu_programs = Rc::new(RefCell::new(
+        HashMap::<u64, crate::webgl_shader::LinkedGpu>::new(),
+    ));
+    crate::webgl_program::install(
+        &value,
+        webgl2,
+        state.clone(),
+        error.clone(),
+        gpu_programs.clone(),
     );
     let all_methods = if webgl2 {
         WEBGL2_METHODS
@@ -522,23 +582,29 @@ pub fn context_value(canvas: Value, webgl2: bool) -> Value {
     };
     for method in all_methods.split_whitespace() {
         if value.get_property(method).is_undefined() {
+            let error_for_method = error.clone();
             value.set_property(
                 method,
                 realm_webgl_function(move |_, _| {
-                    if matches!(
-                        method,
-                        "drawArrays"
-                            | "drawElements"
-                            | "drawArraysInstanced"
-                            | "drawElementsInstanced"
-                    ) {
-                        warn_once();
+                    if unsupported_method(method) {
+                        warn_unsupported(method);
+                        if error_for_method.get() == 0 {
+                            error_for_method.set(0x0502);
+                        }
                     }
                     Value::Undefined
                 }),
             );
         }
     }
+    crate::webgl_draw::install(
+        &value,
+        webgl2,
+        canvas_for_draw,
+        state.clone(),
+        error,
+        gpu_programs,
+    );
     for name in WEBGL1_CONSTANTS.split_whitespace().chain(
         webgl2
             .then_some(WEBGL2_EXTRA_CONSTANTS)

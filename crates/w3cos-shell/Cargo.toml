@@ -28,5 +28,5 @@ sha2 = "0.10"
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets"] }
 w3cos-ai-bridge = { workspace = true, features = ["l1"] }
 w3cos-ime = { path = "../w3cos-ime" }
-w3cos-runtime = { workspace = true, default-features = false }
+w3cos-runtime = { workspace = true, default-features = false, features = ["web-sensors", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"] }
 w3cos-std = { workspace = true }

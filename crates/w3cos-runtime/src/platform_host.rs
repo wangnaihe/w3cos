@@ -33,6 +33,27 @@ pub struct CapturedImage {
     pub png: Vec<u8>,
 }
 
+/// A video-capture device reported by the host camera adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraInfo {
+    pub label: String,
+    /// Stable host identity; `mediaDevices` hashes it into `deviceId`.
+    pub device_key: String,
+    /// Shared by devices on the same physical unit; hashed into `groupId`.
+    pub group_key: String,
+    pub path: PathBuf,
+}
+
+/// One captured camera frame, PNG-encoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraFrame {
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+}
+
+pub use crate::camera::CameraError;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdleSample {
     pub idle_ms: u64,
@@ -55,6 +76,74 @@ pub fn reset_overrides() {
     IDLE.with(|slot| *slot.borrow_mut() = None);
     WAKE_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAKE_HELD.with(|slot| *slot.borrow_mut() = false);
+    crate::camera::reset_overrides();
+}
+
+/// Replaces host camera enumeration (`Some(vec![])` means "no cameras").
+pub fn set_camera_override(cameras: Option<Vec<CameraInfo>>) {
+    crate::camera::set_host_override(cameras.map(|cameras| {
+        cameras
+            .into_iter()
+            .map(|camera| crate::camera::HostCamera {
+                label: camera.label,
+                device_key: camera.device_key,
+                group_key: camera.group_key,
+                path: camera.path,
+            })
+            .collect()
+    }));
+}
+
+/// Replaces host camera capture for overridden cameras.
+pub fn set_camera_frame_override(frame: Option<CameraFrame>) {
+    crate::camera::set_still_override(frame.map(|frame| crate::camera::Still {
+        width: frame.width,
+        height: frame.height,
+        png: frame.png,
+    }));
+}
+
+/// Video-capture devices exposed by the platform adapter.
+pub fn list_cameras() -> Vec<CameraInfo> {
+    crate::camera::list_devices()
+        .into_iter()
+        .map(|camera| CameraInfo {
+            label: camera.label,
+            device_key: camera.device_key,
+            group_key: camera.group_key,
+            path: camera.path,
+        })
+        .collect()
+}
+
+/// Captures one frame from `camera`, preferring `width`×`height`.
+/// Live tracks use [`crate::camera::open_camera`] instead.
+pub fn capture_camera(
+    camera: &CameraInfo,
+    width: u32,
+    height: u32,
+) -> Result<CameraFrame, CameraError> {
+    if crate::camera::has_device_override() {
+        return match crate::camera::still_override() {
+            Some(frame) if frame.width > 0 && frame.height > 0 && !frame.png.is_empty() => {
+                Ok(CameraFrame {
+                    width: frame.width,
+                    height: frame.height,
+                    png: frame.png,
+                })
+            }
+            _ => Err(CameraError::named(
+                "NotReadableError",
+                format!("camera override for {} has no frame", camera.label),
+            )),
+        };
+    }
+    let frame = crate::camera::capture_still(&camera.path, width, height)?;
+    Ok(CameraFrame {
+        width: frame.width,
+        height: frame.height,
+        png: frame.png,
+    })
 }
 
 pub fn set_battery_sysfs_root(path: Option<PathBuf>) {
@@ -541,12 +630,7 @@ mod x11 {
             XDestroyImage(ximage);
         }
         check_error(&display, "XGetImage")?;
-        let mut png = Vec::new();
-        let encoder = image::codecs::png::PngEncoder::new(&mut png);
-        use image::ImageEncoder;
-        encoder
-            .write_image(&rgba, out_w, out_h, image::ExtendedColorType::Rgba8)
-            .map_err(|err| format!("PNG encode failed: {err}"))?;
+        let png = crate::frame_cache::encode_rgba_png(out_w, out_h, &rgba)?;
         Ok(CapturedImage {
             width: out_w,
             height: out_h,

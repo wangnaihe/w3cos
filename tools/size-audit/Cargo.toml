@@ -5,9 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Reproducible W3COS linkage size, attribution, and regression reports"
 publish = false
 
 [dependencies]
+flate2.workspace = true
 object.workspace = true
+rustc-demangle = "0.1.27"
 serde.workspace = true
 serde_json.workspace = true
