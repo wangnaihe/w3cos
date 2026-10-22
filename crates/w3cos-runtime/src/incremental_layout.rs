@@ -58,6 +58,34 @@ struct Cache {
 
 thread_local! {
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
+    static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
+        const { std::cell::Cell::new(("none", 0, 0)) };
+}
+
+/// What the most recent [`flush`] solved. `solved_nodes` is the subtree that
+/// was laid out; `shifted_nodes` only had a translation applied.
+pub struct IncrementalFlushStats {
+    pub kind: &'static str,
+    pub solved_nodes: u32,
+    pub shifted_nodes: u32,
+}
+
+pub fn last_flush_stats() -> IncrementalFlushStats {
+    let (kind, solved_nodes, shifted_nodes) = LAST_FLUSH.with(std::cell::Cell::get);
+    IncrementalFlushStats {
+        kind,
+        solved_nodes,
+        shifted_nodes,
+    }
+}
+
+fn note_flush(kind: &'static str, solved_nodes: u32, shifted_nodes: u32) {
+    LAST_FLUSH.with(|slot| slot.set((kind, solved_nodes, shifted_nodes)));
+}
+
+fn phase_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_LAYOUT_PHASES").is_some())
 }
 
 pub fn invalidate() {
@@ -191,6 +219,13 @@ pub fn flush() -> bool {
             viewport_h,
             drain_after,
         );
+        if ok {
+            let solved = slot
+                .as_ref()
+                .map(|cache| cache.node_ids.len() as u32)
+                .unwrap_or(0);
+            note_flush("rebuild", solved, 0);
+        }
     });
     if ok {
         crate::dom::clear_document_dirty();
@@ -274,6 +309,9 @@ fn patch_and_compute(
     }
     let mut styles = Vec::with_capacity(dirty.len());
     let mut paint_only = true;
+    let previous = (dirty.len() == 1)
+        .then(|| component_style(&cache.component, dirty[0].as_u32()).cloned())
+        .flatten();
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
         if !style_patch_is_safe(&style) {
@@ -318,15 +356,35 @@ fn patch_and_compute(
         && cache.viewport_w_bits == viewport_w.to_bits()
         && cache.viewport_h_bits == viewport_h.to_bits()
     {
+        note_flush("paint", 0, 0);
         return true;
     }
     if let Some(rects) = memo_hit {
         restore_rects(&rects);
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
+        note_flush("memo", 0, 0);
         return true;
     }
+    if styles.len() == 1
+        && let Some(old) = previous.as_ref()
+        && splice::try_style_subtree(
+            cache,
+            styles[0].0,
+            old,
+            &styles[0].1,
+            viewport_w,
+            viewport_h,
+        )
+    {
+        cache.viewport_w_bits = viewport_w.to_bits();
+        cache.viewport_h_bits = viewport_h.to_bits();
+        return true;
+    }
+    let phase = phase_log_enabled();
+    let flatten_started = std::time::Instant::now();
     let flat = pre_flatten(&cache.component);
+    let flatten_us = flatten_started.elapsed().as_micros();
     if cache.node_ids_stale {
         cache.node_ids = flat.iter().map(flat_host_id).collect();
         cache.engine.invalidate();
@@ -347,13 +405,25 @@ fn patch_and_compute(
             return false;
         }
     }
+    let compute_started = std::time::Instant::now();
     let Ok(results) = cache
         .engine
         .compute(&cache.component, &flat, viewport_w, viewport_h)
     else {
         return false;
     };
+    let compute_us = compute_started.elapsed().as_micros();
+    let write_started = std::time::Instant::now();
     let snaps = write_rects(&flat, &results.layout_cache);
+    let write_us = write_started.elapsed().as_micros();
+    if phase {
+        eprintln!(
+            "[layout-phase] retained nodes {} flatten_us {flatten_us} compute_us {compute_us} write_us {write_us} passes {}",
+            flat.len(),
+            cache.engine.last_compute_layout_passes
+        );
+    }
+    note_flush("retained", flat.len() as u32, 0);
     cache.viewport_w_bits = viewport_w.to_bits();
     cache.viewport_h_bits = viewport_h.to_bits();
     if let Some((node, bits)) = single_px_width(&styles) {

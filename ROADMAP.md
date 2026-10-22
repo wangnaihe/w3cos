@@ -85,14 +85,20 @@ Done:
 - Matched-properties sharing no longer keys on the `id` attribute. On an
   8201-node flex/grid tree, style recalc median dropped from 76.3 ms to
   29.6 ms. Layout checksums stayed the same.
-- A one-node width edit still relayouts. A background edit patches the
-  retained tree. Inherited `color` still restyles descendants. `dir` still
-  changes computed direction when `id` differs.
+- A one-node width edit, a geometry class toggle, a text edit, and a child
+  insert or remove lay out the affected subtree. On the 8201-node bench,
+  five samples: width 4.02 ms to 0.254 ms (2 nodes solved), text 50.5 ms
+  to 0.220 ms, class toggle 4.44 ms to 0.231 ms, insert 52.4 ms to
+  0.385 ms (43 nodes), remove 53.0 ms to 0.362 ms. A background edit still
+  patches paint fields only. Inherited `color` still restyles descendants.
+  `dir` still changes computed direction when `id` differs.
 
 Pending:
 
-- Layout of that tree is still about 55 ms and is dominated by text
-  measurement and Taffy, which this pass does not rewrite.
+- Layout of that tree is still about 49 ms on the machine that measured the
+  subtree pass (about 55 ms on the earlier style-recalc machine) and is
+  dominated by text measurement and Taffy, which the subtree pass does not
+  rewrite.
 - Scroll-list paint and JS-to-DOM host-call medians did not move outside
   run noise.
 - Cold startup is still dominated by the first fontconfig load.
