@@ -95,10 +95,13 @@ Done:
 
 Pending:
 
-- Layout of that tree is still about 49 ms on the machine that measured the
-  subtree pass (about 55 ms on the earlier style-recalc machine) and is
-  dominated by text measurement and Taffy, which the subtree pass does not
-  rewrite.
+- Layout of that tree is about 24–25 ms on the machine that measured
+  48.9 ms before the cold-layout pass (7 samples, two processes, checksum
+  unchanged). What remains is the Taffy solve, Taffy tree build, and
+  soft-line placement for ordinary blocks of inline text. A flex or grid
+  container above 512 nodes, a wrapping or gapped column, and any tree
+  with a float, absolute, fixed, or sticky box still takes the full
+  rebuild path. See `docs/performance.md`.
 - Scroll-list paint and JS-to-DOM host-call medians did not move outside
   run noise.
 - Cold startup is still dominated by the first fontconfig load.
