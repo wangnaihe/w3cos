@@ -837,6 +837,11 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static SYNC_VIEW_DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
@@ -854,6 +859,8 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
                 let start = view.offset + index * view.kind.bytes();
                 let end = start + view.kind.bytes();
                 if end <= bytes.len() {
+                    #[cfg(test)]
+                    SYNC_VIEW_DECODE_COUNT.with(|count| count.set(count.get() + 1));
                     decoded.push(view.kind.decode(&bytes[start..end]));
                 }
             }
@@ -941,12 +948,7 @@ fn construct_typed_array(kind: Kind, args: &[Value]) -> Value {
         return new_view(new_buffer(vec![0; length * kind.bytes()]), 0, length, kind);
     }
     let values: Vec<Value> = first.iter().collect();
-    let buffer = new_buffer(vec![0; values.len() * kind.bytes()]);
-    let value = new_view(buffer, 0, values.len(), kind);
-    for (index, item) in values.into_iter().enumerate() {
-        set_typed_array_index(&value, index, item);
-    }
-    value
+    typed_array_from_values(kind, values)
 }
 
 fn build_typed_array_classes() -> HashMap<String, Value> {
@@ -1000,12 +1002,16 @@ fn typed_array_values(value: &Value) -> Option<Vec<Value>> {
 }
 
 fn typed_array_from_values(kind: Kind, values: Vec<Value>) -> Value {
-    let buffer = new_buffer(vec![0; values.len() * kind.bytes()]);
-    let target = new_view(buffer, 0, values.len(), kind);
-    for (index, value) in values.into_iter().enumerate() {
-        set_typed_array_index(&target, index, value);
+    let length = values.len();
+    let mut bytes = Vec::with_capacity(length * kind.bytes());
+    // This backing store is private until new_view registers its first alias.
+    // Encode in input order, then decode once instead of synchronizing all N
+    // elements after each of N writes. Existing shared-view mutations still use
+    // set_typed_array_index and sync_views.
+    for value in values {
+        bytes.extend_from_slice(&kind.encode(&value));
     }
-    target
+    new_view(new_buffer(bytes), 0, length, kind)
 }
 
 #[derive(Clone, Copy)]
@@ -1698,6 +1704,90 @@ pub fn data_view_class() -> Value {
 mod tests {
     use super::*;
     use crate::PanicValue;
+
+    #[test]
+    fn fresh_typed_array_construction_does_not_resynchronize_each_element() {
+        let mut measurements = Vec::new();
+        for length in [32, 64, 128, 65_537] {
+            SYNC_VIEW_DECODE_COUNT.with(|count| count.set(0));
+            let started = std::time::Instant::now();
+            let array = typed_array_value(vec![Value::Number(7.0); length]);
+            let decoded = SYNC_VIEW_DECODE_COUNT.with(|count| count.get());
+            eprintln!(
+                "construction length={length}, synchronized_elements={decoded}, elapsed={:?}",
+                started.elapsed()
+            );
+            assert_eq!(bytes_of(&array).unwrap(), vec![7; length]);
+            measurements.push(decoded);
+        }
+        assert_eq!(
+            measurements,
+            vec![0, 0, 0, 0],
+            "fresh backing stores have no existing aliases"
+        );
+    }
+
+    #[test]
+    fn fresh_typed_array_copies_do_not_resynchronize_each_element() {
+        let source = typed_array_value(vec![Value::Number(3.0); 128]);
+        SYNC_VIEW_DECODE_COUNT.with(|count| count.set(0));
+        let copy = source.call_method("slice", vec![]);
+        assert_eq!(SYNC_VIEW_DECODE_COUNT.with(|count| count.get()), 0);
+        assert_eq!(bytes_of(&copy).unwrap(), vec![3; 128]);
+        assert!(
+            !copy
+                .get_property("buffer")
+                .strict_eq(&source.get_property("buffer"))
+        );
+        copy.set_property("0", Value::Number(9.0));
+        assert_eq!(source.get_property("0"), Value::Number(3.0));
+    }
+
+    #[test]
+    fn bulk_typed_array_construction_preserves_kind_encoding() {
+        for name in TYPED_ARRAY_NAMES {
+            let kind = Kind::from_name(name);
+            let values = if matches!(kind, Kind::BigInt64 | Kind::BigUint64) {
+                vec![crate::bigint::parse("-2"), crate::bigint::parse("17")]
+            } else {
+                vec![
+                    Value::Number(-2.5),
+                    Value::Number(300.25),
+                    Value::Number(f64::NAN),
+                ]
+            };
+            let expected: Vec<u8> = values.iter().flat_map(|value| kind.encode(value)).collect();
+            let array =
+                crate::class::construct(&typed_array_class(name), vec![Value::array(values)]);
+            assert_eq!(bytes_of(&array).unwrap(), expected, "{name}");
+            assert_eq!(
+                array.get_property("length").to_number() as usize,
+                expected.len() / kind.bytes()
+            );
+            let stored = array.as_array().unwrap().borrow().to_vec();
+            for (index, bytes) in expected.chunks_exact(kind.bytes()).enumerate() {
+                assert_eq!(
+                    stored[index].to_js_string(),
+                    kind.decode(bytes).to_js_string(),
+                    "{name} element {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_typed_array_conversion_errors_leave_source_unchanged() {
+        let source = Value::array(vec![crate::bigint::parse("7"), Value::Undefined]);
+        let error = crate::catch_js(|| {
+            crate::class::construct(&typed_array_class("BigInt64Array"), vec![source.clone()])
+        })
+        .expect_err("invalid BigInt conversion must throw");
+        assert_eq!(error.get_property("name").to_js_string(), "TypeError");
+        assert_eq!(source.get_property("0").to_js_string(), "7");
+        assert!(source.get_property("1").is_undefined());
+        let empty = typed_array_value(Vec::new());
+        assert_eq!(bytes_of(&empty).unwrap(), Vec::<u8>::new());
+    }
 
     #[test]
     fn typed_arrays_and_data_view_share_array_buffer_storage() {
