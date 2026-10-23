@@ -1,0 +1,2 @@
+mode,views,iterations,baseline_median_ns,candidate_median_ns,speedup,baseline_min_ns,baseline_max_ns,candidate_min_ns,candidate_max_ns,paired_speedup_median,paired_speedup_min,paired_speedup_max,candidate_faster_pairs,pairs
+construct,1024,8192,99093961,94400098,1.0497230733807077,92181009,104588833,90041548,102797763,1.0598309542097493,0.8967219354763586,1.1065382838598021,8,11

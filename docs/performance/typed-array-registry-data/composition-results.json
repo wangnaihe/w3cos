@@ -1,0 +1,70 @@
+{
+  "jsdom": {
+    "baseline": {
+      "failures": [
+        "jsdom::tests::canvas_2d_context"
+      ],
+      "result": "test result: FAILED. 221 passed; 1 failed; 1 ignored; 0 measured; 1641 filtered out; finished in 1.05s"
+    },
+    "final": {
+      "failures": [
+        "jsdom::tests::canvas_2d_context"
+      ],
+      "result": "test result: FAILED. 221 passed; 1 failed; 1 ignored; 0 measured; 1641 filtered out; finished in 1.08s"
+    }
+  },
+  "layout-ng": {
+    "baseline": {
+      "failures": [
+        "layout_ng::inline_tests::atomic_inlines_align_to_the_line_box",
+        "layout_ng::inline_tests::bidi_visual_order_fragments_keep_their_order",
+        "layout_ng::inline_tests::forced_breaks_end_lines",
+        "layout_ng::inline_tests::generated_inline_ext_trees_match_chrome",
+        "layout_ng::inline_tests::generated_inline_trees_match_chrome",
+        "layout_ng::inline_tests::generated_inline_wrap_trees_match_chrome",
+        "layout_ng::inline_tests::inline_blocks_are_atomic_items",
+        "layout_ng::inline_tests::inline_blocks_shrink_to_fit",
+        "layout_ng::inline_tests::inline_box_edges_take_advance_not_line_height",
+        "layout_ng::inline_tests::line_relative_vertical_align_places_subtrees",
+        "layout_ng::inline_tests::lines_avoid_floats",
+        "layout_ng::inline_tests::middle_aligned_items_shift_their_baseline",
+        "layout_ng::inline_tests::nested_inline_boxes_share_the_baseline",
+        "layout_ng::inline_tests::pre_wrap_spaces_at_block_end_hang_conditionally",
+        "layout_ng::inline_tests::quirks_mode_drops_the_root_strut",
+        "layout_ng::inline_tests::rtl_blocks_and_lines_start_on_the_right",
+        "layout_ng::inline_tests::rtl_items_are_reordered_by_bidi_level",
+        "layout_ng::inline_tests::rtl_pre_and_pre_line_are_reordered",
+        "layout_ng::inline_tests::text_items_break_inside_at_uax14_opportunities",
+        "layout_ng::inline_tests::text_top_and_bottom_align_to_the_parent_content_area",
+        "layout_ng::inline_tests::vertical_align_lengths_shift_the_baseline"
+      ],
+      "result": "test result: FAILED. 68 passed; 21 failed; 0 ignored; 0 measured; 1775 filtered out; finished in 11.89s"
+    },
+    "final": {
+      "failures": [
+        "layout_ng::inline_tests::atomic_inlines_align_to_the_line_box",
+        "layout_ng::inline_tests::bidi_visual_order_fragments_keep_their_order",
+        "layout_ng::inline_tests::forced_breaks_end_lines",
+        "layout_ng::inline_tests::generated_inline_ext_trees_match_chrome",
+        "layout_ng::inline_tests::generated_inline_trees_match_chrome",
+        "layout_ng::inline_tests::generated_inline_wrap_trees_match_chrome",
+        "layout_ng::inline_tests::inline_blocks_are_atomic_items",
+        "layout_ng::inline_tests::inline_blocks_shrink_to_fit",
+        "layout_ng::inline_tests::inline_box_edges_take_advance_not_line_height",
+        "layout_ng::inline_tests::line_relative_vertical_align_places_subtrees",
+        "layout_ng::inline_tests::lines_avoid_floats",
+        "layout_ng::inline_tests::middle_aligned_items_shift_their_baseline",
+        "layout_ng::inline_tests::nested_inline_boxes_share_the_baseline",
+        "layout_ng::inline_tests::pre_wrap_spaces_at_block_end_hang_conditionally",
+        "layout_ng::inline_tests::quirks_mode_drops_the_root_strut",
+        "layout_ng::inline_tests::rtl_blocks_and_lines_start_on_the_right",
+        "layout_ng::inline_tests::rtl_items_are_reordered_by_bidi_level",
+        "layout_ng::inline_tests::rtl_pre_and_pre_line_are_reordered",
+        "layout_ng::inline_tests::text_items_break_inside_at_uax14_opportunities",
+        "layout_ng::inline_tests::text_top_and_bottom_align_to_the_parent_content_area",
+        "layout_ng::inline_tests::vertical_align_lengths_shift_the_baseline"
+      ],
+      "result": "test result: FAILED. 68 passed; 21 failed; 0 ignored; 0 measured; 1775 filtered out; finished in 11.38s"
+    }
+  }
+}
