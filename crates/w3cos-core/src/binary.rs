@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::Value;
+use crate::fxhash::FxHashMap;
 use crate::value::{ValueIterator, WeakJsArray};
 
 const BUFFER_STATE_KEY: &str = "__w3cos_array_buffer_id";
@@ -250,10 +251,59 @@ struct View {
     kind: Kind,
 }
 
+/// Keep traversal order for alias synchronization, with an identity index for
+/// classification. Keys are hints only: lookup must validate the weak reference.
+#[derive(Default)]
+struct ViewRegistry {
+    entries: Vec<View>,
+    indices: FxHashMap<usize, usize>,
+    until_cleanup: usize,
+    epoch: u32,
+}
+
+impl ViewRegistry {
+    fn retain_live(&mut self) {
+        let old_len = self.entries.len();
+        self.entries.retain(|view| {
+            #[cfg(test)]
+            VIEW_LOOKUP_VISITS.with(|count| count.set(count.get() + 1));
+            view.storage.upgrade().is_some()
+        });
+        if self.entries.len() != old_len {
+            self.indices.clear();
+            for (index, view) in self.entries.iter().enumerate() {
+                if let Some(storage) = view.storage.upgrade() {
+                    self.indices.insert(storage.identity(), index);
+                }
+            }
+            // Release excess registry capacity after teardown, not just keys.
+            if self.entries.capacity() > self.entries.len().max(64) * 4 {
+                self.entries.shrink_to(self.entries.len().max(64));
+                self.indices.shrink_to(self.entries.len().max(64));
+            }
+        }
+        self.until_cleanup = self.entries.len().max(64);
+        self.epoch = crate::page_arena::current_epoch();
+    }
+
+    fn maintain(&mut self) {
+        if self.until_cleanup == 0 || self.epoch != crate::page_arena::current_epoch() {
+            self.retain_live();
+        }
+        self.until_cleanup -= 1;
+    }
+
+    fn insert(&mut self, identity: usize, view: View) {
+        self.maintain();
+        self.indices.insert(identity, self.entries.len());
+        self.entries.push(view);
+    }
+}
+
 thread_local! {
     static NEXT_BUFFER_ID: RefCell<u64> = const { RefCell::new(1) };
     static BUFFERS: RefCell<HashMap<u64, Rc<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
-    static VIEWS: RefCell<Vec<View>> = const { RefCell::new(Vec::new()) };
+    static VIEWS: RefCell<ViewRegistry> = RefCell::new(ViewRegistry::default());
     static CLASSES: RefCell<Option<HashMap<String, Value>>> = const { RefCell::new(None) };
     static ARRAY_BUFFER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
     static SHARED_ARRAY_BUFFER_CLASS: RefCell<Option<Value>> = const { RefCell::new(None) };
@@ -677,7 +727,7 @@ pub(crate) fn detach_array_buffer(value: &Value) {
     state.borrow_mut().clear();
     value.set_property(DETACHED_BUFFER_KEY, Value::Bool(true));
     VIEWS.with(|views| {
-        for view in views.borrow_mut().iter_mut() {
+        for view in views.borrow_mut().entries.iter_mut() {
             if !Rc::ptr_eq(&view.bytes, &state) {
                 continue;
             }
@@ -809,45 +859,60 @@ pub fn shared_array_buffer_class() -> Value {
 /// Whether `value` is the storage of a live typed-array view. Cheap when no
 /// typed array exists in the realm.
 pub(crate) fn is_typed_array_view(value: &Value) -> bool {
-    if VIEWS.with(|views| views.borrow().is_empty()) {
-        return false;
-    }
     view_for(value).is_some()
 }
 
+/// Keep the ordinary-array path independent of indexed lookup's larger frame.
+/// An empty registry needs neither array-handle resolution nor maintenance.
+#[inline]
 fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, Value)> {
+    if VIEWS.with(|views| views.borrow().entries.is_empty()) {
+        return None;
+    }
+    view_for_registered(value)
+}
+
+fn view_for_registered(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, Value)> {
     let Some(candidate) = value.as_array() else {
         return None;
     };
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
-        views.iter().find_map(|view| {
-            let storage = view.storage.upgrade()?;
-            storage.ptr_eq(&candidate).then(|| {
-                (
-                    view.bytes.clone(),
-                    view.offset,
-                    view.length,
-                    view.kind,
-                    view.buffer.clone(),
-                )
-            })
-        })
+        views.maintain();
+        let identity = candidate.identity();
+        let index = *views.indices.get(&identity)?;
+        let view = &views.entries[index];
+        // Address reuse (including across arena epochs) must not inherit a view.
+        let matches = view
+            .storage
+            .upgrade()
+            .is_some_and(|storage| storage.ptr_eq(&candidate));
+        if !matches {
+            views.indices.remove(&identity);
+            return None;
+        }
+        Some((
+            view.bytes.clone(),
+            view.offset,
+            view.length,
+            view.kind,
+            view.buffer.clone(),
+        ))
     })
 }
 
 #[cfg(test)]
 thread_local! {
+    static VIEW_LOOKUP_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SYNC_VIEW_DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
+        views.retain_live();
         let bytes = changed.borrow();
-        for view in views.iter() {
+        for view in views.entries.iter() {
             if !Rc::ptr_eq(&view.bytes, changed) {
                 continue;
             }
@@ -877,9 +942,9 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
 fn sync_views_range(changed: &Rc<RefCell<Vec<u8>>>, start: usize, end: usize) {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
+        views.retain_live();
         let bytes = changed.borrow();
-        for view in views.iter() {
+        for view in views.entries.iter() {
             if !Rc::ptr_eq(&view.bytes, changed) {
                 continue;
             }
@@ -940,14 +1005,17 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     let value = Value::array(values);
     let storage = value.as_array().expect("typed array storage");
     VIEWS.with(|views| {
-        views.borrow_mut().push(View {
-            storage: storage.downgrade(),
-            buffer,
-            bytes,
-            offset,
-            length,
-            kind,
-        })
+        views.borrow_mut().insert(
+            storage.identity(),
+            View {
+                storage: storage.downgrade(),
+                buffer,
+                bytes,
+                offset,
+                length,
+                kind,
+            },
+        )
     });
     value
 }
@@ -1759,6 +1827,189 @@ pub fn data_view_class() -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    fn host_registry_view() -> (Value, View) {
+        let value = Value::Array(Rc::new(RefCell::new(crate::value::ArrayStorage::new(
+            vec![Value::Number(3.0)],
+        ))));
+        let view = View {
+            storage: value.as_array().unwrap().downgrade(),
+            buffer: Value::Undefined,
+            bytes: Rc::new(RefCell::new(vec![3])),
+            offset: 0,
+            length: 1,
+            kind: Kind::Uint8,
+        };
+        (value, view)
+    }
+
+    #[test]
+    fn registry_epoch_cleanup_preserves_live_host_storage() {
+        std::thread::spawn(|| {
+            let mut registry = ViewRegistry::default();
+            let (host, host_view) = host_registry_view();
+            registry.insert(host.as_array().unwrap().identity(), host_view);
+            let arena_value = Value::array(vec![Value::Number(3.0)]);
+            let (_, mut arena_view) = host_registry_view();
+            arena_view.storage = arena_value.as_array().unwrap().downgrade();
+            registry.insert(arena_value.as_array().unwrap().identity(), arena_view);
+            drop(arena_value);
+            crate::page_arena::reset();
+            registry.maintain();
+            assert_eq!(registry.entries.len(), 1);
+            let storage = host.as_array().unwrap();
+            assert_eq!(registry.indices[&storage.identity()], 0);
+            assert!(
+                registry.entries[0]
+                    .storage
+                    .upgrade()
+                    .unwrap()
+                    .ptr_eq(&storage)
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn registry_compaction_rebuilds_surviving_indices() {
+        let mut registry = ViewRegistry::default();
+        let (first, first_view) = host_registry_view();
+        let (middle, middle_view) = host_registry_view();
+        let (last, last_view) = host_registry_view();
+        for (value, view) in [
+            (&first, first_view),
+            (&middle, middle_view),
+            (&last, last_view),
+        ] {
+            registry.insert(value.as_array().unwrap().identity(), view);
+        }
+        drop(middle);
+        registry.retain_live();
+        assert_eq!(registry.entries.len(), 2);
+        for (expected, value) in [&first, &last].into_iter().enumerate() {
+            let storage = value.as_array().unwrap();
+            let index = registry.indices[&storage.identity()];
+            assert_eq!(index, expected);
+            assert!(
+                registry.entries[index]
+                    .storage
+                    .upgrade()
+                    .unwrap()
+                    .ptr_eq(&storage)
+            );
+        }
+    }
+
+    #[test]
+    fn registry_registration_cleanup_is_amortized() {
+        let mut registry = ViewRegistry::default();
+        let mut kept = Vec::new();
+        VIEW_LOOKUP_VISITS.with(|count| count.set(0));
+        for _ in 0..4096 {
+            let (value, view) = host_registry_view();
+            registry.insert(value.as_array().unwrap().identity(), view);
+            kept.push(value);
+        }
+        let visits = VIEW_LOOKUP_VISITS.with(|count| count.get());
+        assert!(visits < 8192, "4096 registrations scanned {visits} entries");
+        std::hint::black_box(kept);
+    }
+
+    #[test]
+    fn registry_churn_reclaims_dead_views_and_excess_capacity() {
+        let mut registry = ViewRegistry::default();
+        let (live, view) = host_registry_view();
+        registry.insert(live.as_array().unwrap().identity(), view);
+        for _ in 0..4096 {
+            let (temporary, view) = host_registry_view();
+            registry.insert(temporary.as_array().unwrap().identity(), view);
+        }
+        for _ in 0..registry.entries.len().max(64) + 1 {
+            registry.maintain();
+        }
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.indices.len(), 1);
+        assert!(registry.entries.capacity() <= 256);
+        assert!(registry.indices.capacity() <= 448);
+        assert!(
+            registry
+                .indices
+                .contains_key(&live.as_array().unwrap().identity())
+        );
+    }
+
+    #[test]
+    fn registry_teardown_releases_large_live_set_on_read_maintenance() {
+        let mut registry = ViewRegistry::default();
+        let mut kept = Vec::new();
+        for _ in 0..4096 {
+            let (value, view) = host_registry_view();
+            registry.insert(value.as_array().unwrap().identity(), view);
+            kept.push(value);
+        }
+        assert_eq!(registry.entries.len(), 4096);
+        drop(kept);
+        for _ in 0..4097 {
+            registry.maintain();
+        }
+        assert!(registry.entries.is_empty());
+        assert!(registry.indices.is_empty());
+        assert!(registry.entries.capacity() <= 256);
+        assert!(registry.indices.capacity() <= 448);
+    }
+
+    #[test]
+    fn indexed_lookup_rejects_stale_or_mismatched_identity_hints() {
+        let plain = Value::array(vec![Value::Number(9.0)]);
+        let identity = plain.as_array().unwrap().identity();
+        let (other, view) = host_registry_view();
+        VIEWS.with(|views| views.borrow_mut().insert(identity, view));
+        assert!(view_for(&plain).is_none());
+        assert!(!VIEWS.with(|views| views.borrow().indices.contains_key(&identity)));
+        drop(other);
+        let (dead, view) = host_registry_view();
+        VIEWS.with(|views| views.borrow_mut().insert(identity, view));
+        drop(dead);
+        assert!(view_for(&plain).is_none());
+        assert!(!VIEWS.with(|views| views.borrow().indices.contains_key(&identity)));
+    }
+
+    #[test]
+    fn indexed_lookup_cleans_old_arena_epoch_before_handle_reuse() {
+        std::thread::spawn(|| {
+            let old = typed_array_value(vec![Value::Number(5.0)]);
+            assert!(view_for(&old).is_some());
+            drop(old);
+            crate::page_arena::reset();
+            let plain = Value::array(vec![Value::Number(17.0)]);
+            assert!(view_for(&plain).is_none());
+            assert!(VIEWS.with(|views| views.borrow().entries.is_empty()));
+            let fresh = typed_array_value(vec![Value::Number(11.0)]);
+            assert!(view_for(&fresh.clone()).is_some());
+            assert_eq!(fresh.get_property("0").to_number(), 11.0);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn ordinary_array_lookups_do_not_scan_all_typed_views_each_time() {
+        let kept: Vec<_> = (0..128)
+            .map(|_| super::typed_array_value(vec![crate::Value::Number(1.0)]))
+            .collect();
+        let plain = crate::Value::array(vec![crate::Value::Number(7.0)]);
+        super::VIEW_LOOKUP_VISITS.with(|count| count.set(0));
+        for _ in 0..128 {
+            assert_eq!(plain.get_property("0").to_number(), 7.0);
+        }
+        let visits = super::VIEW_LOOKUP_VISITS.with(|count| count.get());
+        assert!(
+            visits <= 512,
+            "128 ordinary reads visited {visits} typed views"
+        );
+        std::hint::black_box(kept);
+    }
     use super::*;
     use crate::PanicValue;
 
@@ -1926,6 +2177,7 @@ mod tests {
         assert!(VIEWS.with(|views| {
             views
                 .borrow()
+                .entries
                 .iter()
                 .all(|view| view.storage.upgrade().is_some())
         }));

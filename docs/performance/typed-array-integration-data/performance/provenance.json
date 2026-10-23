@@ -1,0 +1,33 @@
+{
+  "baseline_commit": "09d981226c7373d8ae5100274a8878d28da60655",
+  "candidate_core_sha256": "deba0e631cf39c534d4e061362cd188799cca65eec5b1c1f569eddbfcfe8fe15",
+  "patch_sha256": "12513eb03a5dc01bc5fe6937793f510975d96354fd4ae21410259c061f8cd7ec",
+  "reused_baseline_evidence": "evidence/typed-array-registry/finalaudit.json: main-baseline isolated rebuild byte-identical; baseline harness differs only SAFETY comment",
+  "files": {
+    "tooling/registry-bench-baseline/main.rs": "9d99679dbcd6aed5a4f2373d288aa67f20db7e1f111faff62c53a3f768269526",
+    "tooling/registry-bench-baseline/Cargo.lock": "c7a34e89154cf9be64671c4bcac9751ed600e2ed4c10bf6180a4d97ef91f1025",
+    "w3cos-integration/scripts/perf/typed-array-registry/main.rs": "e9821c9ff41d346fff25ce103f51237f164b03a5632376e7c0316c9bcd8eedf5",
+    "w3cos-integration/scripts/perf/typed-array-registry/Cargo.lock": "c7a34e89154cf9be64671c4bcac9751ed600e2ed4c10bf6180a4d97ef91f1025",
+    "tooling/bench/Cargo.lock": "6236436810b8f8244c4ed720f6d7fb6e3bfe01d9ca7821635e8033a541ec57dc",
+    "w3cos-integration/scripts/perf/typed-array-alias-sync/Cargo.lock": "6236436810b8f8244c4ed720f6d7fb6e3bfe01d9ca7821635e8033a541ec57dc",
+    "evidence/typed-array-registry/finalaudit.json": "06f2dba155efa2b9dea6c0716d3dfcdfbf498e25b7e3c1128127bf8c9c1e3ad9",
+    "evidence/alias-sync-baseline": "00cd78fe7123f42b5b7302be76fe05bc0976f00dd581b60f418931f55945f0a9"
+  },
+  "environment": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_BUILD_TARGET": null
+  },
+  "method": "Fresh candidate binaries in dedicated targets, baseline audited binaries reused. Alternating fresh-process paired runs; accepted timing only after builds and tests stop. Engine API microbenchmarks, not browser or application gains.",
+  "binaries": {
+    "evidence/typed-array-integration/bin/alias-sync-candidate": "fd33c019ba9a0bff0f7180435172f5419c52a25de77db8281cba76468ba4865c",
+    "evidence/typed-array-integration/bin/memory-candidate": "1afb38eb5ae43186f01abe0ab20ac189efed649c0a2a0215ec119c821406843e",
+    "evidence/typed-array-integration/bin/registry-candidate": "b0b05ee8ea67d88e9189b785af9691226324d80293f72479a71489f83e301591",
+    "evidence/typed-array-integration/bin/memory-baseline": "3085348aae32efd3f4d17941975dec2656126e62d4b0cdd13eecb7fdc9766b19",
+    "evidence/typed-array-integration/bin/registry-baseline": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84"
+  },
+  "alias_baseline_policy": "Rebuild fresh isolated target from identical candidate harness plus same lockfile on clean main; do not use prior alias binary",
+  "alias_baseline_fresh_sha256": "e3ba08375eb81e13d4b4b7aea6f523a874f08abe6f0e82859261849d26cdcd59",
+  "alias_candidate_sha256": "fd33c019ba9a0bff0f7180435172f5419c52a25de77db8281cba76468ba4865c",
+  "alias_scope": "Eight alternating pairs per indexed/fill 2048-elements 1/3aliases, constructor and ordinary push8192; eight rounds/process discardfirst3 as existing harness. Baseline deliberately quadratic. Fresh independent main and candidate builds from same harness and lock."
+}
