@@ -22,8 +22,8 @@ use super::{BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStru
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::style::used_box_spacing;
 use w3cos_std::style::{
-    AlignContent, AlignItems, AlignSelf, BoxSizing, Dimension, FlexDirection, FlexWrap, Float,
-    JustifyContent, Spacing, Style, TextDirection,
+    AlignContent, AlignItems, AlignSelf, BoxSizing, Dimension, Display, FlexDirection, FlexWrap,
+    Float, JustifyContent, Spacing, Style, TextDirection,
 };
 
 const EPS: f32 = 1.0 / 128.0;
@@ -303,6 +303,20 @@ fn used_align(container: AlignItems, item: AlignSelf) -> AlignItems {
 /// descendants, so an empty sized box would otherwise contribute 0.
 fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) -> Option<MinMax> {
     let info = &flat[index];
+    if matches!(info.style.display, Display::Table | Display::InlineTable) {
+        // The specified width is the flex base, not the content minimum.
+        let border =
+            super::table::content_intrinsic_border_box(flat, index, space).why("flex:intrinsic")?;
+        let style = info.style;
+        let side = |spacing| spacing_px(style, spacing, 0.0, space);
+        let edges = if style.border_collapse {
+            0.0
+        } else {
+            let border = block::border_widths(style);
+            border[1] + border[3] + side(style.padding.left) + side(style.padding.right)
+        };
+        return Some(border.map(|width| (width - edges).max(0.0)));
+    }
     if block::size_contained(info.style) {
         return Some(MinMax::exact(block::contain_intrinsic_size(info.style).0));
     }
@@ -350,6 +364,23 @@ fn inline_contribution(
 /// Definite heights sum; auto heights recurse into their content.
 fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) -> Option<f32> {
     let info = &flat[index];
+    if matches!(info.style.display, Display::Table | Display::InlineTable) {
+        // Row heights, not the sum of the cells in one row.
+        let sizes = block::intrinsic_sizes(flat, index, space).why("flex:intrinsic")?;
+        let laid = super::table::layout_with_block_size(
+            flat,
+            index,
+            space,
+            Some((sizes.max.max(0.0), None)),
+            false,
+        )
+        .why("flex:table")?;
+        let border = block::border_widths(info.style);
+        let pad = |spacing| spacing_px(info.style, spacing, 0.0, space);
+        let edges =
+            border[0] + border[2] + pad(info.style.padding.top) + pad(info.style.padding.bottom);
+        return Some((laid.fragment.height - edges).max(0.0));
+    }
     if block::size_contained(info.style) {
         return Some(block::contain_intrinsic_size(info.style).1);
     }
@@ -1046,6 +1077,7 @@ pub(super) fn layout(
             children,
         },
         last_baseline: LastBaseline::NoLines,
+        first_baseline: LastBaseline::NoLines,
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -1361,6 +1393,7 @@ fn layout_wrapped(
             children,
         },
         last_baseline: LastBaseline::NoLines,
+        first_baseline: LastBaseline::NoLines,
         start_strut,
         end_strut,
         self_collapsing: false,

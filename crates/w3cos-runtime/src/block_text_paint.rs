@@ -32,6 +32,21 @@ pub(crate) fn replay<'a>(
             if piece_style.white_space == w3cos_std::style::WhiteSpace::Normal {
                 piece_style.white_space = w3cos_std::style::WhiteSpace::NoWrap;
             }
+            if matches!(
+                piece_style.display,
+                Display::TableCell | Display::TableCaption
+            ) {
+                // The fragment is already the font content box. Leaving the
+                // cell's display and padding would center and inset the
+                // glyphs inside that box a second time.
+                piece_style.display = Display::Inline;
+                piece_style.padding = w3cos_std::style::Edges::ZERO;
+                piece_style.border_width = 0.0;
+                piece_style.border_top_width = None;
+                piece_style.border_right_width = None;
+                piece_style.border_bottom_width = None;
+                piece_style.border_left_width = None;
+            }
             if let Some(properties) = piece_style.custom_properties.as_mut() {
                 properties.remove("--w3cos-internal-float-line-bands");
             }

@@ -2160,6 +2160,7 @@ pub(super) fn layout(
             children,
         },
         last_baseline: LastBaseline::NoLines,
+        first_baseline: LastBaseline::NoLines,
         start_strut,
         end_strut,
         self_collapsing: false,

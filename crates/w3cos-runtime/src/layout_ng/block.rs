@@ -314,7 +314,10 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if inline::is_atomic_inline(flat, index) || style.display == Display::Inline {
         return Some("float:inline");
     }
-    if !matches!(style.display, Display::Block | Display::FlowRoot) {
+    if !matches!(
+        style.display,
+        Display::Block | Display::FlowRoot | Display::Table
+    ) {
         return Some("float:display");
     }
     let Some(parent) = info.parent else {
@@ -435,11 +438,30 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     }
 }
 
+/// Inline text whose parent is a block container but not an inline
+/// formatting context. CSS 2.1 9.2.1.1 wraps it in an anonymous block.
+fn anonymous_block_text(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let Some(parent) = flat[index].parent else {
+        return false;
+    };
+    if inline::is_inline_container(flat, parent) || inline::is_inline_box(flat, parent) {
+        return false;
+    }
+    matches!(
+        flat[parent].style.display,
+        Display::Block
+            | Display::FlowRoot
+            | Display::InlineBlock
+            | Display::ListItem
+            | Display::TableCell
+            | Display::TableCaption
+    )
+}
+
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
-    // Table, row, and cell boxes. The grid is the legacy table formatter
-    // transplanted into this fragment; other `display` values stay
-    // `display:other`.
+    // Table, row, and cell boxes. The grid is laid out here; other
+    // `display` values stay `display:other`.
     if super::table::is_table_display(info.style.display) {
         return super::table::reason(flat, index);
     }
@@ -557,10 +579,18 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             )
             .or_else(|| inline::block_text_reason(content, info.style))
         }
-        ComponentKind::Text { .. } => {
-            // Validated with its container (container_reason).
+        ComponentKind::Text { content } => {
+            // Validated with its container (container_reason). A block
+            // container that also has a block-level sibling wraps this
+            // inline run in an anonymous block (CSS 2.1 9.2.1.1). Laying
+            // the text out as block text keeps the page on NG; bailing
+            // here would send only this page back to the legacy engine.
             if !inline::in_inline_container(flat, index) {
-                Some("ifc:mixed")
+                if anonymous_block_text(flat, index) {
+                    inline::block_text_reason(content, info.style)
+                } else {
+                    Some("ifc:mixed")
+                }
             } else {
                 unsupported_marker(
                     info.style,
@@ -1049,6 +1079,24 @@ pub(super) fn intrinsic_sizes(
     let info = &flat[index];
     let subtree = &flat[index + 1..info.subtree_end.max(index + 1)];
     let rendered = |node: &&FlatNodeInfo| node.style.display != Display::None;
+    // A table resolves percentage columns itself. The caller's border and
+    // padding are added back onto this content box.
+    if matches!(info.style.display, Display::Table | Display::InlineTable) {
+        let border_box =
+            super::table::intrinsic_border_box(flat, index, space).why("table:intrinsic")?;
+        let style = info.style;
+        let side = |s: Spacing| match s {
+            Spacing::Auto => 0.0,
+            s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
+        };
+        let edges = if style.border_collapse {
+            0.0
+        } else {
+            let b = border(style);
+            b[1] + b[3] + side(style.padding.left) + side(style.padding.right)
+        };
+        return Some(border_box.map(|width| (width - edges).max(0.0)));
+    }
     if subtree
         .iter()
         .filter(rendered)
@@ -1229,6 +1277,7 @@ fn is_bfc_root(style: &Style) -> bool {
     // context (CSS Flexbox §3, CSS Grid §1). Non-visible overflow does
     // too, on the boxes CSS 2.1 11.1.1 clips (CSS2 9.4.1).
     style.display == Display::FlowRoot
+        || style.display == Display::Table
         || is_author_flex(style)
         || is_author_grid(style)
         || (non_visible_overflow(style) && style.display.establishes_overflow_clip())
@@ -1260,7 +1309,32 @@ pub(super) fn layout_root(
         return super::bail("float-overlap");
     }
     let metrics = resolve_inline(flat[0].style, &space);
-    let (x, y) = (metrics.margin[3], metrics.margin[0]);
+    let style = flat[0].style;
+    let (mut x, y) = (metrics.margin[3], metrics.margin[0]);
+    if matches!(style.display, Display::Table | Display::InlineTable)
+        && (style.margin.left == Spacing::Auto || style.margin.right == Spacing::Auto)
+    {
+        let auto_left = style.margin.left == Spacing::Auto;
+        let auto_right = style.margin.right == Spacing::Auto;
+        let specified_left = if auto_left { 0.0 } else { metrics.margin[3] };
+        let specified_right = if auto_right { 0.0 } else { metrics.margin[1] };
+        let extra = viewport_w - result.fragment.width - specified_left - specified_right;
+        x = if space.rtl {
+            match (auto_right, auto_left) {
+                (true, true) => layout_unit((extra / 2.0).max(0.0)),
+                (true, false) => specified_left,
+                (false, true) => (specified_left + extra).max(0.0),
+                (false, false) => metrics.margin[3],
+            }
+        } else {
+            match (auto_left, auto_right) {
+                (true, true) => layout_unit((extra / 2.0).max(0.0)),
+                (true, false) => extra.max(0.0),
+                (false, true) => specified_left,
+                (false, false) => metrics.margin[3],
+            }
+        };
+    }
     let mut fragment = result.fragment;
     // The initial containing block (CSS2 10.1): the viewport-sized
     // rectangle at the canvas origin; it also contains fixed boxes.
@@ -1331,8 +1405,8 @@ fn layout_block_in(
     if is_author_grid(style) {
         return super::grid::layout(flat, index, space, sized);
     }
-    if style.display == Display::Table {
-        return super::table::layout(flat, index, space);
+    if matches!(style.display, Display::Table | Display::InlineTable) {
+        return super::table::layout(flat, index, space, sized);
     }
     // CSS 2.1 10.3.2 / 10.3.4: a replaced width is the intrinsic (or
     // specified) content size, then auto margins are solved as for a
@@ -1459,6 +1533,7 @@ fn layout_block_in(
     // Offset of the content box from the border box.
     let content_top = bt + pt;
     let mut last_baseline = LastBaseline::NoLines;
+    let mut first_baseline = LastBaseline::NoLines;
     let mut oof_candidates: Vec<OofCandidate> = Vec::new();
 
     if let Some((_, height)) = image_size {
@@ -1471,6 +1546,7 @@ fn layout_block_in(
         let (height, baseline) = inline::block_text_layout(content, metrics.content_width, style);
         cursor = height;
         last_baseline = baseline.offset(content_top);
+        first_baseline = last_baseline;
         at_top = false;
     } else if inline::is_inline_container(flat, index) {
         // NGLineLayoutOpportunity: line boxes avoid the BFC's floats.
@@ -1482,6 +1558,7 @@ fn layout_block_in(
         let result = inline::layout_inline_beside(flat, index, &child_space, floats).why("ifc")?;
         cursor = result.height;
         last_baseline = result.last_baseline.offset(content_top);
+        first_baseline = result.first_baseline.offset(content_top);
         at_top = result.children.is_empty();
         children.extend(
             result
@@ -1821,6 +1898,12 @@ fn layout_block_in(
                         exclusions,
                     )
                     .why("bfc-root-fit")?;
+                    // A table can refuse the opportunity width when its
+                    // min-content is wider. The border box must not overlap
+                    // the float, so try the next band.
+                    if narrowed && start + fitted.fragment.width > end + 1.0 / 128.0 {
+                        break;
+                    }
                     if (fitted.fragment.height - height).abs() <= 1.0 / 128.0 {
                         found = Some((start, fitted));
                         break 'opportunities;
@@ -1928,6 +2011,55 @@ fn layout_block_in(
         }
         if result.last_baseline != LastBaseline::NoLines {
             last_baseline = result.last_baseline.offset(bt + pt + y);
+        }
+        if !matches!(first_baseline, LastBaseline::At(_)) {
+            let candidate = match result.first_baseline {
+                LastBaseline::At(_) => result.first_baseline,
+                _ => result.last_baseline,
+            };
+            if matches!(candidate, LastBaseline::At(_)) {
+                first_baseline = candidate.offset(bt + pt + y);
+            }
+        }
+        // A shrink-to-fit table solves auto horizontal margins after its
+        // used border box is known (CSS 2.1 10.3.3). `resolve_inline`
+        // treats width:auto as filling the containing block.
+        if matches!(
+            child_info.style.display,
+            Display::Table | Display::InlineTable
+        ) && (child_info.style.margin.left == Spacing::Auto
+            || child_info.style.margin.right == Spacing::Auto)
+        {
+            let auto_left = child_info.style.margin.left == Spacing::Auto;
+            let auto_right = child_info.style.margin.right == Spacing::Auto;
+            let used = result.fragment.width;
+            let specified_left = if auto_left {
+                0.0
+            } else {
+                child_metrics.margin[3]
+            };
+            let specified_right = if auto_right {
+                0.0
+            } else {
+                child_metrics.margin[1]
+            };
+            let extra = child_space.available_inline - used - specified_left - specified_right;
+            let left = if child_space.rtl {
+                match (auto_right, auto_left) {
+                    (true, true) => layout_unit((extra / 2.0).max(0.0)),
+                    (true, false) => specified_left,
+                    (false, true) => (specified_left + extra).max(0.0),
+                    (false, false) => child_metrics.margin[3],
+                }
+            } else {
+                match (auto_left, auto_right) {
+                    (true, true) => layout_unit((extra / 2.0).max(0.0)),
+                    (true, false) => extra.max(0.0),
+                    (false, true) => specified_left,
+                    (false, false) => child_metrics.margin[3],
+                }
+            };
+            x = bl + pl + left;
         }
         // CSS2 9.4.3: a relative offset moves the fragment (and what it
         // carries), not the flow.
@@ -2041,8 +2173,14 @@ fn layout_block_in(
         children.extend(placed);
         oof_candidates = rest;
     }
+    if !matches!(first_baseline, LastBaseline::At(_))
+        && matches!(last_baseline, LastBaseline::At(_))
+    {
+        first_baseline = last_baseline;
+    }
     Some(LayoutResult {
         last_baseline,
+        first_baseline,
         fragment: BoxFragment {
             index,
             text_range: None,

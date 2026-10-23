@@ -1711,12 +1711,35 @@ fn overflow_hidden_is_a_bfc_like_legacy() {
     assert_eq!(rect(&out, 1), (0.0, 10.0, 40.0, 30.0));
 }
 
-/// A block table's border boxes match the legacy formatter, including the
-/// 2px border-spacing around and between the cells.
+fn ng_rects(root: &Component) -> Vec<(LayoutRect, usize)> {
+    let flat = pre_flatten(root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let mut ng = layout_tree(root, &flat, 800.0, 600.0).expect("ng layout");
+    ng.sort_by_key(|(_, index)| *index);
+    ng
+}
+
+fn close(actual: (f32, f32, f32, f32), expected: (f32, f32, f32, f32)) {
+    let delta = [actual.0, actual.1, actual.2, actual.3]
+        .into_iter()
+        .zip([expected.0, expected.1, expected.2, expected.3])
+        .map(|(got, want)| (got - want).abs())
+        .fold(0.0f32, f32::max);
+    assert!(delta < 0.05, "{actual:?} vs {expected:?}");
+}
+
+/// Border boxes measured in headless Chrome (body margin 0). The table's
+/// own grid produces them; they are not copied from the legacy formatter.
 #[test]
-fn table_border_boxes_match_legacy() {
-    use w3cos_std::style::Display;
-    let cell = |width, height| {
+fn table_border_boxes_match_chrome() {
+    use w3cos_std::style::{
+        AlignSelf, BorderLineStyle, CustomProperties, Display, FlexDirection, Float, TextDirection,
+    };
+    let cell = |width: f32, height: f32| {
         node(
             Style {
                 display: Display::TableCell,
@@ -1727,7 +1750,17 @@ fn table_border_boxes_match_legacy() {
             vec![],
         )
     };
-    let row = |cells| {
+    let auto_cell = |height: f32| {
+        node(
+            Style {
+                display: Display::TableCell,
+                height: Dimension::Px(height),
+                ..Style::default()
+            },
+            vec![],
+        )
+    };
+    let row = |cells: Vec<Component>| {
         node(
             Style {
                 display: Display::TableRow,
@@ -1736,7 +1769,40 @@ fn table_border_boxes_match_legacy() {
             cells,
         )
     };
-    let table = node(
+    let wrap = |table: Component| {
+        node(
+            Style {
+                display: Display::Block,
+                width: Dimension::Px(400.0),
+                ..block()
+            },
+            vec![table],
+        )
+    };
+    let span = |width: f32, height: f32, columns: usize, rows: usize| {
+        node(
+            Style {
+                display: Display::TableCell,
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                custom_properties: Some(CustomProperties::from_iter([
+                    (
+                        "--w3cos-internal-table-column-span".to_string(),
+                        columns.to_string(),
+                    ),
+                    (
+                        "--w3cos-internal-table-row-span".to_string(),
+                        rows.to_string(),
+                    ),
+                ])),
+                ..Style::default()
+            },
+            vec![],
+        )
+    };
+
+    // Separated. The short cell stretches to the row.
+    let spaced = wrap(node(
         Style {
             display: Display::Table,
             border_spacing_x: 2.0,
@@ -1747,22 +1813,488 @@ fn table_border_boxes_match_legacy() {
             row(vec![cell(40.0, 20.0), cell(60.0, 20.0)]),
             row(vec![cell(40.0, 30.0), cell(60.0, 10.0)]),
         ],
-    );
-    let root = node(
+    ));
+    let out = ng_rects(&spaced);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 106.0, 56.0));
+    assert_eq!(rect(&out, 3), (2.0, 2.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 4), (44.0, 2.0, 60.0, 20.0));
+    assert_eq!(rect(&out, 6), (2.0, 24.0, 40.0, 30.0));
+    assert_eq!(rect(&out, 7), (44.0, 24.0, 60.0, 30.0));
+
+    // Fixed: specified columns keep their size; the auto column takes the rest.
+    let fixed = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(200.0),
+            table_layout_fixed: true,
+            ..Style::default()
+        },
+        vec![
+            node(
+                Style {
+                    display: Display::TableColumn,
+                    width: Dimension::Px(50.0),
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            row(vec![auto_cell(10.0), cell(80.0, 10.0), auto_cell(10.0)]),
+        ],
+    ));
+    let out = ng_rects(&fixed);
+    assert_eq!(rect(&out, 1).2, 200.0);
+    assert_eq!(rect(&out, 4), (0.0, 0.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 5), (50.0, 0.0, 80.0, 10.0));
+    assert_eq!(rect(&out, 6), (130.0, 0.0, 70.0, 10.0));
+
+    // Fixed, three unspecified columns share the table.
+    let equal = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(90.0),
+            table_layout_fixed: true,
+            ..Style::default()
+        },
+        vec![row(vec![auto_cell(8.0), auto_cell(8.0), auto_cell(8.0)])],
+    ));
+    let out = ng_rects(&equal);
+    assert_eq!(rect(&out, 1).2, 90.0);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 30.0, 8.0));
+    assert_eq!(rect(&out, 4), (30.0, 0.0, 30.0, 8.0));
+    assert_eq!(rect(&out, 5), (60.0, 0.0, 30.0, 8.0));
+
+    // Fixed and narrower than the specified columns: the table grows, auto is 0.
+    let narrow = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(100.0),
+            table_layout_fixed: true,
+            ..Style::default()
+        },
+        vec![row(vec![cell(50.0, 8.0), cell(80.0, 8.0), auto_cell(8.0)])],
+    ));
+    let out = ng_rects(&narrow);
+    assert_eq!(rect(&out, 1).2, 130.0);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 50.0, 8.0));
+    assert_eq!(rect(&out, 4), (50.0, 0.0, 80.0, 8.0));
+    assert_eq!(rect(&out, 5), (130.0, 0.0, 0.0, 8.0));
+
+    // Fixed, every column specified: extra width is proportional. LayoutUnit
+    // truncates 51.42857 to 51.421875.
+    let proportional = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(120.0),
+            table_layout_fixed: true,
+            ..Style::default()
+        },
+        vec![row(vec![cell(30.0, 8.0), cell(20.0, 8.0), cell(20.0, 8.0)])],
+    ));
+    let out = ng_rects(&proportional);
+    close(rect(&out, 3), (0.0, 0.0, 51.421875, 8.0));
+    close(rect(&out, 4), (51.421875, 0.0, 34.28125, 8.0));
+    close(rect(&out, 5), (85.703125, 0.0, 34.296875, 8.0));
+
+    // Percent of a definite table, then a length, then auto.
+    let percent = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(200.0),
+            ..Style::default()
+        },
+        vec![row(vec![
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Percent(50.0),
+                    height: Dimension::Px(10.0),
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            cell(40.0, 10.0),
+            auto_cell(10.0),
+        ])],
+    ));
+    let out = ng_rects(&percent);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 100.0, 10.0));
+    assert_eq!(rect(&out, 4), (100.0, 0.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 5), (140.0, 0.0, 60.0, 10.0));
+
+    // Percent of an auto table: 40 / (1 - 0.5) = 80.
+    let auto_percent = wrap(node(
+        Style {
+            display: Display::Table,
+            ..Style::default()
+        },
+        vec![row(vec![
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Percent(50.0),
+                    height: Dimension::Px(10.0),
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            cell(40.0, 10.0),
+        ])],
+    ));
+    let out = ng_rects(&auto_percent);
+    assert_eq!(rect(&out, 1).2, 80.0);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 4), (40.0, 0.0, 40.0, 10.0));
+
+    // Colspan width includes the internal spacing. 100 - 2 distributed over two 40s.
+    let colspan = wrap(node(
+        Style {
+            display: Display::Table,
+            border_spacing_x: 2.0,
+            border_spacing_y: 2.0,
+            ..Style::default()
+        },
+        vec![
+            row(vec![span(100.0, 12.0, 2, 1), cell(20.0, 12.0)]),
+            row(vec![cell(40.0, 8.0), cell(40.0, 8.0), auto_cell(8.0)]),
+        ],
+    ));
+    let out = ng_rects(&colspan);
+    assert_eq!(rect(&out, 3), (2.0, 2.0, 100.0, 12.0));
+    assert_eq!(rect(&out, 4), (104.0, 2.0, 20.0, 12.0));
+    assert_eq!(rect(&out, 6), (2.0, 16.0, 49.0, 8.0));
+    assert_eq!(rect(&out, 7), (53.0, 16.0, 49.0, 8.0));
+    assert_eq!(rect(&out, 8), (104.0, 16.0, 20.0, 8.0));
+
+    // Rowspan extra height is split equally.
+    let rowspan = wrap(node(
+        Style {
+            display: Display::Table,
+            ..Style::default()
+        },
+        vec![
+            row(vec![span(20.0, 40.0, 1, 2), cell(30.0, 10.0)]),
+            row(vec![cell(30.0, 10.0)]),
+        ],
+    ));
+    let out = ng_rects(&rowspan);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 20.0, 40.0));
+    assert_eq!(rect(&out, 4), (20.0, 0.0, 30.0, 20.0));
+    assert_eq!(rect(&out, 6), (20.0, 20.0, 30.0, 20.0));
+
+    // Collapsed grid lines: max width, cell boxes from center to center.
+    let collapsed = wrap(node(
+        Style {
+            display: Display::Table,
+            border_collapse: true,
+            border_width: 4.0,
+            ..Style::default()
+        },
+        vec![row(vec![
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Px(40.0),
+                    height: Dimension::Px(16.0),
+                    border_width: 2.0,
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Px(20.0),
+                    height: Dimension::Px(16.0),
+                    border_width: 6.0,
+                    ..Style::default()
+                },
+                vec![],
+            ),
+        ])],
+    ));
+    let out = ng_rects(&collapsed);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 76.0, 28.0));
+    assert_eq!(rect(&out, 3), (2.0, 3.0, 45.0, 22.0));
+    assert_eq!(rect(&out, 4), (47.0, 3.0, 26.0, 22.0));
+
+    // `hidden` wins over a wider border and zeros the shared line.
+    let mut hidden_border = [None; 4];
+    hidden_border[1] = Some(BorderLineStyle::Hidden);
+    let hidden = wrap(node(
+        Style {
+            display: Display::Table,
+            border_collapse: true,
+            border_width: 5.0,
+            ..Style::default()
+        },
+        vec![row(vec![
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Px(20.0),
+                    height: Dimension::Px(10.0),
+                    border_width: 4.0,
+                    border_styles: hidden_border,
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Px(20.0),
+                    height: Dimension::Px(10.0),
+                    border_width: 8.0,
+                    ..Style::default()
+                },
+                vec![],
+            ),
+        ])],
+    ));
+    let out = ng_rects(&hidden);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 53.0, 26.0));
+    assert_eq!(rect(&out, 3), (2.5, 4.0, 22.5, 18.0));
+    assert_eq!(rect(&out, 4), (25.0, 4.0, 24.0, 18.0));
+
+    // vertical-align. Baseline meets the content bottom of an empty div.
+    let aligned = |align: AlignSelf, height: f32| {
+        node(
+            Style {
+                display: Display::TableCell,
+                width: Dimension::Px(20.0),
+                align_self: align,
+                ..Style::default()
+            },
+            vec![node(
+                Style {
+                    height: Dimension::Px(height),
+                    ..block()
+                },
+                vec![],
+            )],
+        )
+    };
+    let valign = wrap(node(
+        Style {
+            display: Display::Table,
+            ..Style::default()
+        },
+        vec![row(vec![
+            aligned(AlignSelf::Baseline, 10.0),
+            aligned(AlignSelf::Baseline, 30.0),
+            aligned(AlignSelf::FlexEnd, 8.0),
+            aligned(AlignSelf::Center, 10.0),
+            aligned(AlignSelf::FlexStart, 12.0),
+        ])],
+    ));
+    let out = ng_rects(&valign);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 20.0, 30.0));
+    assert_eq!(rect(&out, 4), (0.0, 20.0, 20.0, 10.0));
+    assert_eq!(rect(&out, 5), (20.0, 0.0, 20.0, 30.0));
+    assert_eq!(rect(&out, 6), (20.0, 0.0, 20.0, 30.0));
+    assert_eq!(rect(&out, 7), (40.0, 0.0, 20.0, 30.0));
+    assert_eq!(rect(&out, 8), (40.0, 22.0, 20.0, 8.0));
+    assert_eq!(rect(&out, 9), (60.0, 0.0, 20.0, 30.0));
+    assert_eq!(rect(&out, 10), (60.0, 10.0, 20.0, 10.0));
+    assert_eq!(rect(&out, 11), (80.0, 0.0, 20.0, 30.0));
+    assert_eq!(rect(&out, 12), (80.0, 0.0, 20.0, 12.0));
+
+    // Caption is inside the table border box and outside the grid.
+    let caption = |bottom: bool| {
+        wrap(node(
+            Style {
+                display: Display::Table,
+                width: Dimension::Px(80.0),
+                ..Style::default()
+            },
+            vec![
+                node(
+                    Style {
+                        display: Display::TableCaption,
+                        height: Dimension::Px(20.0),
+                        caption_side_bottom: bottom,
+                        ..Style::default()
+                    },
+                    vec![],
+                ),
+                row(vec![cell(80.0, 14.0)]),
+            ],
+        ))
+    };
+    let out = ng_rects(&caption(false));
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 80.0, 34.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 80.0, 20.0));
+    assert_eq!(rect(&out, 4), (0.0, 20.0, 80.0, 14.0));
+    let out = ng_rects(&caption(true));
+    assert_eq!(rect(&out, 2), (0.0, 14.0, 80.0, 20.0));
+    assert_eq!(rect(&out, 4), (0.0, 0.0, 80.0, 14.0));
+
+    // Header, body, footer order, even when the footer is first in the tree.
+    let section = |display: Display, height: f32| {
+        node(
+            Style {
+                display,
+                ..Style::default()
+            },
+            vec![row(vec![cell(40.0, height)])],
+        )
+    };
+    let groups = wrap(node(
+        Style {
+            display: Display::Table,
+            ..Style::default()
+        },
+        vec![
+            section(Display::TableFooterGroup, 4.0),
+            section(Display::TableHeaderGroup, 6.0),
+            section(Display::TableRowGroup, 8.0),
+        ],
+    ));
+    let out = ng_rects(&groups);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 18.0));
+    assert_eq!(rect(&out, 2), (0.0, 14.0, 40.0, 4.0));
+    assert_eq!(rect(&out, 4), (0.0, 14.0, 40.0, 4.0));
+    assert_eq!(rect(&out, 5), (0.0, 0.0, 40.0, 6.0));
+    assert_eq!(rect(&out, 7), (0.0, 0.0, 40.0, 6.0));
+    assert_eq!(rect(&out, 8), (0.0, 6.0, 40.0, 8.0));
+    assert_eq!(rect(&out, 10), (0.0, 6.0, 40.0, 8.0));
+
+    // RTL mirrors columns inside the table border box. Extra width is proportional.
+    let rtl = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(100.0),
+            direction: TextDirection::Rtl,
+            ..Style::default()
+        },
+        vec![row(vec![cell(30.0, 10.0), cell(50.0, 10.0)])],
+    ));
+    let out = ng_rects(&rtl);
+    assert_eq!(rect(&out, 3), (62.5, 0.0, 37.5, 10.0));
+    assert_eq!(rect(&out, 4), (0.0, 0.0, 62.5, 10.0));
+
+    // max-width caps the used column; min-width does not raise it above the cap.
+    let capped = wrap(node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        },
+        vec![row(vec![
+            node(
+                Style {
+                    display: Display::TableCell,
+                    width: Dimension::Px(80.0),
+                    min_width: Dimension::Px(20.0),
+                    max_width: Dimension::Px(40.0),
+                    height: Dimension::Px(10.0),
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            auto_cell(10.0),
+        ])],
+    ));
+    let out = ng_rects(&capped);
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 4), (40.0, 0.0, 60.0, 10.0));
+
+    // Auto margins of a shrink-to-fit table are solved from the used width.
+    let centered = node(
         Style {
             display: Display::Block,
             width: Dimension::Px(400.0),
             ..block()
         },
-        vec![table],
+        vec![node(
+            Style {
+                display: Display::Table,
+                margin: Edges {
+                    top: px(0.0),
+                    right: Spacing::Auto,
+                    bottom: px(0.0),
+                    left: Spacing::Auto,
+                },
+                ..Style::default()
+            },
+            vec![row(vec![cell(40.0, 10.0), cell(60.0, 10.0)])],
+        )],
     );
-    let out = parity(&root);
-    // Wrapper is not in this tree. Table is index 1. Spacing is outside
-    // the cells and between them: 2 + 40 + 2 + 60 + 2 = 106.
-    assert_eq!(rect(&out, 1).2, 106.0);
-    assert_eq!(rect(&out, 3), (2.0, 2.0, 40.0, 20.0));
-    assert_eq!(rect(&out, 4), (44.0, 2.0, 60.0, 20.0));
+    let out = ng_rects(&centered);
+    assert_eq!(rect(&out, 1), (150.0, 0.0, 100.0, 10.0));
 
+    // A float beside the table: the table shrinks to fit in the opportunity.
+    let beside = node(
+        Style {
+            display: Display::Block,
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    display: Display::Block,
+                    width: Dimension::Px(40.0),
+                    height: Dimension::Px(30.0),
+                    float: Float::Left,
+                    ..Style::default()
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    display: Display::Table,
+                    ..Style::default()
+                },
+                vec![row(vec![cell(50.0, 10.0)])],
+            ),
+        ],
+    );
+    let out = ng_rects(&beside);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
+    assert_eq!(rect(&out, 2).0, 40.0);
+    assert_eq!(rect(&out, 2).2, 50.0);
+    assert_eq!(rect(&out, 4), (40.0, 0.0, 50.0, 10.0));
+
+    // inline-table is an atomic inline. flex items use the assigned size.
+    let inline_table = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::InlineTable,
+                ..Style::default()
+            },
+            vec![row(vec![cell(40.0, 10.0)])],
+        )],
+    );
+    let out = ng_rects(&inline_table);
+    assert_eq!(rect(&out, 1).2, 40.0);
+    assert_eq!(rect(&out, 3).2, 40.0);
+    assert_eq!(rect(&out, 3).3, 10.0);
+
+    let flex_item = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                width: Dimension::Px(200.0),
+                ..Style::default()
+            },
+            vec![node(
+                Style {
+                    display: Display::Table,
+                    ..Style::default()
+                },
+                vec![row(vec![cell(40.0, 10.0), cell(60.0, 10.0)])],
+            )],
+        )],
+    );
+    let out = ng_rects(&flex_item);
+    assert_eq!(rect(&out, 4), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 5), (40.0, 0.0, 60.0, 10.0));
+
+    // A text cell lays out. Its width follows this engine's font, not Chrome's.
     let text_cell = node(
         Style {
             display: Display::TableCell,
@@ -1781,15 +2313,10 @@ fn table_border_boxes_match_legacy() {
             display: Display::Table,
             ..block()
         },
-        vec![node(
-            Style {
-                display: Display::TableRow,
-                ..Style::default()
-            },
-            vec![text_cell],
-        )],
+        vec![row(vec![text_cell])],
     );
-    let _ = parity(&text_table);
+    let out = ng_rects(&text_table);
+    assert!(rect(&out, 1).2 > 0.0);
 }
 
 /// `inline-grid` stays `display: flex` for legacy and is a grid container
@@ -1943,4 +2470,273 @@ fn replaced_content_box_matches_legacy() {
     );
     let flat = pre_flatten(&inline_image);
     assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
+}
+
+#[test]
+fn colspan_percent_auto_matches_percent_pair() {
+    use w3cos_std::style::{CustomProperties, WhiteSpace};
+    let cell = |width: Dimension, children: Vec<Component>| {
+        node(
+            Style {
+                display: Display::TableCell,
+                width,
+                border_width: 1.0,
+                ..Style::default()
+            },
+            children,
+        )
+    };
+    let marker = node(
+        Style {
+            display: Display::Block,
+            width: Dimension::Percent(100.0),
+            height: Dimension::Px(20.0),
+            ..Style::default()
+        },
+        vec![],
+    );
+    let words = Component::text(
+        "Lorem ipsum dolor sit amet consectetuer adipiscing",
+        Style {
+            white_space: WhiteSpace::NoWrap,
+            ..Style::default()
+        },
+    );
+    let span_cell = node(
+        Style {
+            display: Display::TableCell,
+            white_space: WhiteSpace::NoWrap,
+            border_width: 1.0,
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-table-column-span".to_string(),
+                "2".to_string(),
+            )])),
+            ..Style::default()
+        },
+        vec![words],
+    );
+    let table = |second: Dimension| {
+        node(
+            Style {
+                display: Display::Block,
+                width: Dimension::Px(800.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    display: Display::Table,
+                    width: Dimension::Px(400.0),
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![
+                    node(
+                        Style {
+                            display: Display::TableRow,
+                            ..Style::default()
+                        },
+                        vec![
+                            cell(Dimension::Percent(90.0), vec![marker.clone()]),
+                            cell(second, vec![]),
+                        ],
+                    ),
+                    node(
+                        Style {
+                            display: Display::TableRow,
+                            ..Style::default()
+                        },
+                        vec![span_cell.clone()],
+                    ),
+                ],
+            )],
+        )
+    };
+    let auto = ng_rects(&table(Dimension::Auto));
+    let pair = ng_rects(&table(Dimension::Percent(10.0)));
+    let table_auto = rect(&auto, 1);
+    let table_pair = rect(&pair, 1);
+    let marker_auto = rect(&auto, 4);
+    let marker_pair = rect(&pair, 4);
+    assert!(
+        (table_auto.2 - table_pair.2).abs() < 1.0 && (marker_auto.2 - marker_pair.2).abs() < 1.0,
+        "auto table {table_auto:?} marker {marker_auto:?}\npair table {table_pair:?} marker {marker_pair:?}"
+    );
+}
+
+#[test]
+fn text_leaf_cell_contributes_its_inline_size() {
+    use w3cos_std::style::CustomProperties;
+    // HTML `td` padding is 1px and the UA marker adds another 1px on an
+    // auto width. The leaf and the boxed cell must still share a column.
+    let cell_style = Style {
+        display: Display::TableCell,
+        padding: margins(1.0, 1.0, 1.0, 1.0),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-table-cell-ua-padding".to_string(),
+            "1".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let leaf = |text: &str| Component::text(text, cell_style.clone());
+    let boxed = |text: &str| {
+        node(
+            cell_style.clone(),
+            vec![Component::text(
+                text,
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            )],
+        )
+    };
+    let table = |cells: Vec<Component>| {
+        node(
+            block(),
+            vec![node(
+                Style {
+                    display: Display::Table,
+                    border_collapse: true,
+                    ..Style::default()
+                },
+                vec![node(
+                    Style {
+                        display: Display::TableRow,
+                        ..Style::default()
+                    },
+                    cells,
+                )],
+            )],
+        )
+    };
+    let leaf_root = table(vec![leaf("X"), leaf("X"), leaf("X"), leaf("X")]);
+    let box_root = table(vec![boxed("X"), boxed("X"), boxed("X"), boxed("X")]);
+    let leaf_out = ng_rects(&leaf_root);
+    let box_out = ng_rects(&box_root);
+    let leaf_w = rect(&leaf_out, 1).2;
+    let box_w = rect(&box_out, 1).2;
+    assert!(
+        (leaf_w - box_w).abs() < 1.0,
+        "text-leaf table {leaf_w} boxed table {box_w}"
+    );
+    let flat = pre_flatten(&leaf_root);
+    let leaf_y = layout_tree_with_text(&leaf_root, &flat, 800.0, 600.0)
+        .expect("ng")
+        .1
+        .into_iter()
+        .filter(|piece| piece.text == "X")
+        .map(|piece| piece.rect.y)
+        .collect::<Vec<_>>();
+    let box_flat = pre_flatten(&box_root);
+    let box_y = box_out
+        .iter()
+        .filter(|(rect, index)| {
+            matches!(box_flat[*index].kind, w3cos_std::ComponentKind::Text { .. })
+                && rect.width > 0.0
+        })
+        .map(|(rect, _)| rect.y)
+        .collect::<Vec<_>>();
+    assert_eq!(leaf_y.len(), 4, "{leaf_y:?}");
+    assert_eq!(box_y.len(), 4, "{box_y:?}");
+    for (leaf, boxed) in leaf_y.iter().zip(&box_y) {
+        assert!(
+            (leaf - boxed).abs() < 0.05,
+            "text-leaf glyph y {leaf_y:?} boxed {box_y:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_block_leading_block_shares_the_line_baseline() {
+    use w3cos_std::style::AlignSelf;
+    let text = |content: &str| {
+        Component::text(
+            content,
+            Style {
+                display: Display::Inline,
+                ..Style::default()
+            },
+        )
+    };
+    let paragraph = |children: Vec<Component>| {
+        node(
+            Style {
+                margin: margins(16.0, 0.0, 16.0, 0.0),
+                ..block()
+            },
+            children,
+        )
+    };
+    let page = |children: Vec<Component>| {
+        node(
+            block(),
+            vec![node(
+                Style {
+                    display: Display::Table,
+                    height: Dimension::Px(200.0),
+                    box_sizing: BoxSizing::BorderBox,
+                    ..Style::default()
+                },
+                vec![node(
+                    Style {
+                        display: Display::TableRow,
+                        ..Style::default()
+                    },
+                    vec![node(
+                        Style {
+                            display: Display::TableCell,
+                            align_self: AlignSelf::FlexEnd,
+                            ..Style::default()
+                        },
+                        vec![paragraph(children)],
+                    )],
+                )],
+            )],
+        )
+    };
+    let simple = page(vec![text("a"), text("bcd"), text("e")]);
+    let mixed = page(vec![
+        text("a"),
+        node(
+            Style {
+                display: Display::InlineBlock,
+                ..Style::default()
+            },
+            vec![
+                Component::text(
+                    "x",
+                    Style {
+                        display: Display::Block,
+                        ..Style::default()
+                    },
+                ),
+                text("bcd"),
+            ],
+        ),
+        text("e"),
+    ]);
+    let simple_out = ng_rects(&simple);
+    let mixed_out = ng_rects(&mixed);
+    let y_of = |root: &Component, out: &[(LayoutRect, usize)], needle: &str| {
+        let flat = pre_flatten(root);
+        let index = flat
+            .iter()
+            .position(|node| {
+                matches!(&node.kind, w3cos_std::ComponentKind::Text { content } if content == needle)
+            })
+            .expect(needle);
+        rect(out, index).1
+    };
+    let simple_h = rect(&simple_out, 1).3;
+    let mixed_h = rect(&mixed_out, 1).3;
+    let simple_a = y_of(&simple, &simple_out, "a");
+    let mixed_a = y_of(&mixed, &mixed_out, "a");
+    assert!(
+        (simple_h - mixed_h).abs() < 1.0,
+        "table height {simple_h} vs {mixed_h}"
+    );
+    assert!(
+        (simple_a - mixed_a).abs() < 1.0,
+        "baseline y {simple_a} vs {mixed_a}"
+    );
 }

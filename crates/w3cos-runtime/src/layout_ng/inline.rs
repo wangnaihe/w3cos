@@ -672,7 +672,10 @@ pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
 /// A text leaf the cascade gives `display: inline-block` (an inline-block
 /// holding only text) is one too: a block text leaf as its own BFC.
 pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
-    let inline_block = flat[index].style.display == Display::InlineBlock;
+    let inline_block = matches!(
+        flat[index].style.display,
+        Display::InlineBlock | Display::InlineTable
+    );
     if matches!(flat[index].kind, ComponentKind::Image { .. }) {
         // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
         // sheet gives img `inline-block`; an author `inline` is the same
@@ -688,15 +691,33 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     ) && inline_block
 }
 
+fn inline_level_child(flat: &[FlatNodeInfo], child: usize) -> bool {
+    (matches!(flat[child].kind, ComponentKind::Text { .. })
+        && flat[child].style.display == Display::Inline)
+        || is_inline_box(flat, child)
+        || is_atomic_inline(flat, child)
+}
+
 /// True when the block container's rendered children are inline content.
 pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
-    !is_inline_box(flat, index)
-        && rendered_children(flat, index).next().is_some_and(|child| {
-            (matches!(flat[child].kind, ComponentKind::Text { .. })
-                && flat[child].style.display == Display::Inline)
-                || is_inline_box(flat, child)
-                || is_atomic_inline(flat, child)
-        })
+    if is_inline_box(flat, index) {
+        return false;
+    }
+    let mut children = rendered_children(flat, index);
+    let Some(first) = children.next() else {
+        return false;
+    };
+    if !inline_level_child(flat, first) {
+        return false;
+    }
+    // A table cell whose later child is a block (or a nested table) is a
+    // block container. The first-child check would call it an IFC, and the
+    // line breaker then bails `ifc:atomic-or-span`, sending the whole page
+    // back to the legacy engine. A reference without that cell stays on NG.
+    if flat[index].style.display == Display::TableCell {
+        return children.all(|child| inline_level_child(flat, child));
+    }
+    true
 }
 
 /// Why an inline-block (its box and content checked by the block gate)
@@ -1323,7 +1344,7 @@ struct Line {
 /// NGLineBoxFragmentBuilder alignment offset; `start` / `end` follow the
 /// container's direction, and an overflowing line is start-aligned (CSS
 /// Text 3 6.1), which in rtl puts it left of the content box.
-fn align_offset(style: &Style, free: f32) -> f32 {
+pub(super) fn align_offset(style: &Style, free: f32) -> f32 {
     let rtl = style.direction == TextDirection::Rtl;
     if free < 0.0 {
         return if rtl { free } else { 0.0 };
@@ -1356,6 +1377,8 @@ pub(super) struct InlineResult {
     pub children: Vec<(f32, f32, BoxFragment)>,
     /// The last line box's baseline from the content-box top.
     pub last_baseline: LastBaseline,
+    /// The first line box's baseline from the content-box top.
+    pub first_baseline: LastBaseline,
     /// The widest line's content width (hanging spaces excluded): the
     /// min-content / max-content size at available 0 / indefinite.
     pub max_line_width: f32,
@@ -1627,14 +1650,16 @@ pub(super) fn layout_inline_beside(
             // (Paint wraps the paragraph in one rect.)
             return super::bail("float-paint-paragraph");
         }
+        let baseline = if single {
+            LastBaseline::At(ascent)
+        } else {
+            LastBaseline::Unknown
+        };
         return Some(InlineResult {
             height,
             max_line_width: available,
-            last_baseline: if single {
-                LastBaseline::At(ascent)
-            } else {
-                LastBaseline::Unknown
-            },
+            last_baseline: baseline,
+            first_baseline: baseline,
             children: vec![(
                 0.0,
                 y,
@@ -1686,6 +1711,7 @@ pub(super) fn layout_inline_beside(
             height: single * lines,
             max_line_width: width,
             last_baseline: LastBaseline::Unknown,
+            first_baseline: LastBaseline::At(ascent),
             children: vec![(
                 align_offset(container, available - width),
                 ascent - inline_font_content_ascent(style),
@@ -2230,6 +2256,7 @@ pub(super) fn layout_inline_beside(
     }
 
     let mut top = 0.0f32;
+    let mut first_line_baseline = None;
     let mut last_line_baseline = None;
     let mut out = Vec::with_capacity(items.len() + entries.len() - children.len());
     // (line, inline offset, width, baseline) of each placed item.
@@ -2244,6 +2271,7 @@ pub(super) fn layout_inline_beside(
         let available = line.available;
         let offset = line.offset + align_offset(container, available - line.width);
         let baseline = top + line.ascent;
+        first_line_baseline.get_or_insert(baseline);
         last_line_baseline = Some(baseline);
         for (k, x, width) in line.items {
             let item = &items[k];
@@ -2353,6 +2381,7 @@ pub(super) fn layout_inline_beside(
         height: top,
         children: out,
         last_baseline: last_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
+        first_baseline: first_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
         max_line_width,
     })
 }

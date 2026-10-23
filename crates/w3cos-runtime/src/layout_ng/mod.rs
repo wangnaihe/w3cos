@@ -160,6 +160,9 @@ impl LastBaseline {
 pub(crate) struct LayoutResult {
     pub fragment: BoxFragment,
     pub last_baseline: LastBaseline,
+    /// First in-flow line box (CSS 2.1 17.5.3). Table cells align on this,
+    /// not on the last line. `NoLines` when the box has no line box.
+    pub first_baseline: LastBaseline,
     /// Collapsible margins adjoining the top border edge (own margin-top,
     /// plus first-child margins when nothing separates them).  The parent
     /// places the border box after this strut has been resolved.
@@ -303,9 +306,6 @@ pub(crate) fn layout_tree_with_text(
         return None;
     }
     RUNTIME_REASON.with(|r| r.set(""));
-    // Table layout clones a subtree of this component. The pointer is only
-    // read while `layout_root` runs.
-    let _table_root = table::bind_root(root);
     let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
         if trace() {
             let reason = RUNTIME_REASON.with(|r| r.get());
@@ -326,7 +326,16 @@ pub(crate) fn layout_tree_with_text(
         // Bidi paint reorders whole text clients; keep that on legacy too.
         if texts.iter().any(|t| {
             let style = flat[t.index].style;
-            style.display != w3cos_std::style::Display::Inline
+            // A table-cell text leaf (no child list) carries the cell's
+            // display. Its line box is one fragment so paint can place the
+            // glyphs where an inline child would sit.
+            let line_box = matches!(
+                style.display,
+                w3cos_std::style::Display::Inline
+                    | w3cos_std::style::Display::TableCell
+                    | w3cos_std::style::Display::TableCaption
+            );
+            !line_box
                 || style
                     .custom_properties
                     .as_ref()
