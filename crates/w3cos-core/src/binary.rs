@@ -564,7 +564,7 @@ pub fn fill_array_buffer_view(view: &Value, source: &[u8]) -> Option<Value> {
         None => source.len().min(byte_length),
     };
     bytes.borrow_mut()[offset..offset + written].copy_from_slice(&source[..written]);
-    sync_views(&bytes);
+    sync_views_range(&bytes, offset, offset + written);
     Some(slice_array_buffer_view(view, written).unwrap_or_else(|| view.clone()))
 }
 
@@ -864,7 +864,64 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
                     decoded.push(view.kind.decode(&bytes[start..end]));
                 }
             }
-            storage.borrow_mut().replace_values(decoded);
+            let mut storage = storage.borrow_mut();
+            storage.replace_values(decoded);
+            storage.mark_binary_cache_synced();
+        }
+    });
+}
+
+/// Refresh only elements whose bytes intersect a completed write. Synchronizing
+/// immediately (rather than batching writes) keeps alias observations and partial
+/// writes visible to subsequent coercions. Resize/grow still use full sync_views.
+fn sync_views_range(changed: &Rc<RefCell<Vec<u8>>>, start: usize, end: usize) {
+    VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        views.retain(|view| view.storage.upgrade().is_some());
+        let bytes = changed.borrow();
+        for view in views.iter() {
+            if !Rc::ptr_eq(&view.bytes, changed) {
+                continue;
+            }
+            let Some(storage) = view.storage.upgrade() else {
+                continue;
+            };
+            let width = view.kind.bytes();
+            let available = view
+                .length
+                .min(bytes.len().saturating_sub(view.offset) / width);
+            let mut storage = storage.borrow_mut();
+            // A structural operation may have changed the materialized storage.
+            // Preserve full synchronization's repair behavior in that rare case.
+            if storage.len() != available || storage.binary_cache_dirty() {
+                let decoded = (0..available)
+                    .map(|index| {
+                        let offset = view.offset + index * width;
+                        #[cfg(test)]
+                        SYNC_VIEW_DECODE_COUNT.with(|count| count.set(count.get() + 1));
+                        view.kind.decode(&bytes[offset..offset + width])
+                    })
+                    .collect();
+                storage.replace_values(decoded);
+                storage.mark_binary_cache_synced();
+                continue;
+            }
+            let view_end = view.offset + available * width;
+            let overlap_start = start.max(view.offset);
+            let overlap_end = end.min(view_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let first = (overlap_start - view.offset) / width;
+            let last = (overlap_end - view.offset).div_ceil(width);
+            for index in first..last {
+                let offset = view.offset + index * width;
+                #[cfg(test)]
+                SYNC_VIEW_DECODE_COUNT.with(|count| count.set(count.get() + 1));
+                *storage.get_mut(index).expect("in-bounds materialized view") =
+                    view.kind.decode(&bytes[offset..offset + width]);
+            }
+            storage.mark_binary_cache_synced();
         }
     });
 }
@@ -1309,7 +1366,7 @@ pub fn set_typed_array_index(value: &Value, index: usize, item: Value) -> bool {
         return true;
     }
     bytes.borrow_mut()[start..start + kind.bytes()].copy_from_slice(&encoded);
-    sync_views(&bytes);
+    sync_views_range(&bytes, start, start + kind.bytes());
     true
 }
 
@@ -1400,7 +1457,7 @@ fn atomic_store(args: Vec<Value>) -> Value {
     {
         bytes.borrow_mut()[start..start + kind.bytes()].copy_from_slice(&encoded);
     }
-    sync_views(&bytes);
+    sync_views_range(&bytes, start, start + kind.bytes());
     kind.decode(&encoded)
 }
 
@@ -1435,7 +1492,7 @@ fn atomic_update(args: Vec<Value>, operation: AtomicUpdate) -> Value {
     {
         bytes.borrow_mut()[start..start + kind.bytes()].copy_from_slice(&replacement);
     }
-    sync_views(&bytes);
+    sync_views_range(&bytes, start, start + kind.bytes());
     kind.decode(&old)
 }
 
@@ -1451,7 +1508,7 @@ fn atomic_compare_exchange(args: Vec<Value>) -> Value {
         }
         old
     };
-    sync_views(&bytes);
+    sync_views_range(&bytes, start, start + kind.bytes());
     kind.decode(&old)
 }
 
@@ -1584,7 +1641,7 @@ fn write_data(
         encoded.reverse();
     }
     bytes.borrow_mut()[offset..offset + encoded.len()].copy_from_slice(&encoded);
-    sync_views(bytes);
+    sync_views_range(bytes, offset, offset + encoded.len());
 }
 
 pub fn data_view_class() -> Value {
@@ -1704,6 +1761,220 @@ pub fn data_view_class() -> Value {
 mod tests {
     use super::*;
     use crate::PanicValue;
+
+    #[test]
+    fn indexed_writes_synchronize_only_intersecting_alias_elements() {
+        for length in [32, 64, 128] {
+            let array = typed_array_value(vec![Value::Number(0.0); length]);
+            SYNC_VIEW_DECODE_COUNT.with(|count| count.set(0));
+            for index in 0..length {
+                set_typed_array_index(&array, index, Value::Number(7.0));
+            }
+            let decoded = SYNC_VIEW_DECODE_COUNT.with(|count| count.get());
+            eprintln!("indexed writes length={length}, synchronized_elements={decoded}");
+            assert_eq!(bytes_of(&array).unwrap(), vec![7; length]);
+            assert_eq!(
+                decoded, length,
+                "each write changes one element, not the whole view"
+            );
+        }
+    }
+
+    fn assert_materialized_view_matches_bytes(view: &Value) {
+        let (bytes, offset, length, kind, _) = view_for(view).unwrap();
+        let bytes = bytes.borrow();
+        let expected: Vec<_> = (0..length)
+            .filter_map(|index| {
+                let start = offset + index * kind.bytes();
+                bytes
+                    .get(start..start + kind.bytes())
+                    .map(|raw| kind.decode(raw).to_js_string())
+            })
+            .collect();
+        let actual: Vec<_> = view
+            .as_array()
+            .unwrap()
+            .borrow()
+            .iter()
+            .map(Value::to_js_string)
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ranged_sync_covers_mixed_width_offset_and_unaligned_data_view_writes() {
+        let buffer = new_buffer(vec![0; 32]);
+        let bytes = new_view(buffer.clone(), 0, 32, Kind::Uint8);
+        let words = new_view(buffer.clone(), 2, 8, Kind::Uint16);
+        let doubles = new_view(buffer.clone(), 0, 4, Kind::Float64);
+        let unrelated = typed_array_value(vec![Value::Number(9.0); 32]);
+        let disjoint = new_view(buffer.clone(), 24, 8, Kind::Uint8);
+        let data = crate::class::construct(&data_view_class(), vec![buffer.clone()]);
+        // [3, 7) intersects three Uint16 elements and one Float64 element.
+        SYNC_VIEW_DECODE_COUNT.with(|count| count.set(0));
+        data.call_method(
+            "setUint32",
+            vec![Value::from(3), Value::from(0x12345678), Value::Bool(false)],
+        );
+        assert_eq!(SYNC_VIEW_DECODE_COUNT.with(|count| count.get()), 4 + 3 + 1);
+        for view in [&bytes, &words, &doubles, &disjoint, &unrelated] {
+            assert_materialized_view_matches_bytes(view);
+        }
+        assert_eq!(bytes_of(&unrelated).unwrap(), vec![9; 32]);
+        // Updating the last byte must include the wider element which contains it.
+        bytes.set_property("31", Value::from(42));
+        for view in [&bytes, &words, &doubles, &disjoint] {
+            assert_materialized_view_matches_bytes(view);
+        }
+        let before = bytes_of(&bytes).unwrap();
+        bytes.set_property("32", Value::from(99));
+        assert_eq!(bytes_of(&bytes).unwrap(), before);
+    }
+
+    #[test]
+    fn ranged_sync_preserves_partial_bigint_writes_on_conversion_error() {
+        let buffer = new_buffer(vec![0; 24]);
+        let big = new_view(buffer.clone(), 0, 3, Kind::BigInt64);
+        let alias = new_view(buffer, 0, 24, Kind::Uint8);
+        let source = Value::array(vec![crate::bigint::parse("7"), Value::Undefined]);
+        let error = crate::catch_js(|| big.call_method("set", vec![source])).unwrap_err();
+        assert_eq!(error.get_property("name").to_js_string(), "TypeError");
+        assert_eq!(big.get_property("0").to_js_string(), "7");
+        assert_eq!(big.get_property("1").to_js_string(), "0");
+        assert_materialized_view_matches_bytes(&big);
+        assert_materialized_view_matches_bytes(&alias);
+        assert_eq!(alias.as_array().unwrap().borrow()[0], Value::from(7));
+    }
+
+    #[test]
+    fn ranged_sync_preserves_reentrant_comparator_alias_observation() {
+        let array = typed_array_value(vec![Value::from(3), Value::from(2), Value::from(1)]);
+        let alias = array.call_method("subarray", vec![]);
+        let target = array.clone();
+        let observed = alias.clone();
+        let comparator = Value::function(move |_, args| {
+            target.set_property("0", Value::from(11));
+            assert_eq!(observed.as_array().unwrap().borrow()[0], Value::from(11));
+            assert_materialized_view_matches_bytes(&observed);
+            Value::Number(args[0].to_number() - args[1].to_number())
+        });
+        array.call_method("sort", vec![comparator]);
+        assert_eq!(bytes_of(&array).unwrap(), vec![1, 2, 3]);
+        assert_materialized_view_matches_bytes(&alias);
+    }
+
+    #[test]
+    fn ranged_sync_repairs_same_length_generic_mutations() {
+        for operation in ["splice", "delete", "pop_push", "empty_fill"] {
+            let array = typed_array_value(vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+            ]);
+            match operation {
+                "delete" => {
+                    array.delete_property("0");
+                }
+                "pop_push" => {
+                    array.call_method("pop", vec![]);
+                    array.call_method("push", vec![Value::Number(99.0)]);
+                }
+                _ => {
+                    array.call_method(
+                        "splice",
+                        vec![Value::Number(0.0), Value::Number(1.0), Value::Number(99.0)],
+                    );
+                }
+            }
+            if operation == "empty_fill" {
+                fill_array_buffer_view(&array, &[]);
+            } else {
+                set_typed_array_index(&array, 1, Value::Number(4.0));
+            }
+            assert_materialized_view_matches_bytes(&array);
+            assert!(!array.as_array().unwrap().borrow().binary_cache_dirty());
+            SYNC_VIEW_DECODE_COUNT.with(|count| count.set(0));
+            set_typed_array_index(&array, 1, Value::Number(5.0));
+            SYNC_VIEW_DECODE_COUNT.with(|count| assert_eq!(count.get(), 1));
+        }
+    }
+
+    #[test]
+    fn ranged_sync_retains_full_resize_repair_and_prunes_dead_views() {
+        let buffer = new_buffer(vec![0; 8]);
+        let array = new_view(buffer.clone(), 0, 8, Kind::Uint8);
+        let state = buffer_state(&buffer).unwrap();
+        let dead = new_view(buffer.clone(), 2, 4, Kind::Uint8);
+        drop(dead);
+        // Internal storage repair remains compatible with the previous full sync.
+        array.as_array().unwrap().borrow_mut().clear();
+        array.set_property("3", Value::from(8));
+        assert_materialized_view_matches_bytes(&array);
+        state.borrow_mut().resize(4, 0);
+        sync_views(&state);
+        assert_eq!(array.as_array().unwrap().borrow().len(), 4);
+        array.set_property("2", Value::from(5));
+        assert_materialized_view_matches_bytes(&array);
+        state.borrow_mut().resize(8, 0);
+        sync_views(&state);
+        assert_materialized_view_matches_bytes(&array);
+        state.borrow_mut().clear();
+        sync_views(&state);
+        assert!(array.as_array().unwrap().borrow().is_empty());
+        array.set_property("0", Value::from(9));
+        assert!(array.as_array().unwrap().borrow().is_empty());
+        assert!(VIEWS.with(|views| {
+            views
+                .borrow()
+                .iter()
+                .all(|view| view.storage.upgrade().is_some())
+        }));
+    }
+
+    #[test]
+    fn ranged_sync_bulk_methods_and_atomics_keep_aliases_current() {
+        let buffer = shared_array_buffer_value(vec![0; 64]);
+        let array = new_view(buffer.clone(), 0, 16, Kind::Int32);
+        let alias = new_view(buffer, 4, 24, Kind::Uint8);
+        for (method, args) in [
+            ("fill", vec![Value::from(7)]),
+            (
+                "set",
+                vec![Value::array(vec![
+                    Value::from(1),
+                    Value::from(2),
+                    Value::from(3),
+                ])],
+            ),
+            (
+                "copyWithin",
+                vec![Value::from(1), Value::from(0), Value::from(3)],
+            ),
+            ("reverse", vec![]),
+            ("sort", vec![]),
+        ] {
+            array.call_method(method, args);
+            assert_materialized_view_matches_bytes(&array);
+            assert_materialized_view_matches_bytes(&alias);
+        }
+        atomic_store(vec![array.clone(), Value::from(2), Value::from(17)]);
+        atomic_update(
+            vec![array.clone(), Value::from(2), Value::from(4)],
+            AtomicUpdate::Add,
+        );
+        assert_eq!(array.get_property("2"), Value::from(21));
+        atomic_compare_exchange(vec![
+            array.clone(),
+            Value::from(2),
+            Value::from(21),
+            Value::from(22),
+        ]);
+        assert_materialized_view_matches_bytes(&array);
+        assert_materialized_view_matches_bytes(&alias);
+        fill_array_buffer_view(&alias, &[1, 2, 3]).unwrap();
+        assert_materialized_view_matches_bytes(&array);
+        assert_materialized_view_matches_bytes(&alias);
+    }
 
     #[test]
     fn fresh_typed_array_construction_does_not_resynchronize_each_element() {
