@@ -123,9 +123,9 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
         && marker(style, inline::IFC_MARKER).is_some();
     let author_flex = style.display == Display::Flex && !lowered_ifc;
     // `display:grid` is a grid container when `grid::container_reason` accepts
-    // the template. `inline-grid` is not a `Display::Grid` (it stays a flex
-    // box plus the unrecognized-display marker).
-    let author_grid = style.display == Display::Grid;
+    // the template. `inline-grid` keeps `display: flex` for legacy and is a
+    // grid here (`is_author_grid`).
+    let author_grid = style.display == Display::Grid || is_inline_grid(style);
     if !atomic
         && !matches!(style.display, Display::Block | Display::FlowRoot)
         && !lowered_ifc
@@ -486,10 +486,42 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 // Validated with its IFC container (container_reason).
                 (!inline::in_inline_container(flat, index)).then_some("display:inline")
             } else if is_author_flex(info.style) {
-                unsupported_style(info.style, &[inline::VALIGN_MARKER])
-                    .or_else(|| super::flex::container_reason(flat, index))
+                // `run-in` and `-webkit-box` compute to `display: flex` for
+                // legacy. A `run-in` box whose flex line this stage can lay
+                // out uses that flex box (the applies-to squares). A run-in
+                // the flex algorithm rejects keeps the unrecognized marker,
+                // so the page stays on legacy instead of changing only the
+                // trace reason. `-webkit-box` stays on the marker: line-clamp
+                // references still match only on legacy.
+                let flex_reason = super::flex::container_reason(flat, index);
+                let allowed: &[&str] = if is_run_in(info.style) && flex_reason.is_none() {
+                    &[
+                        inline::VALIGN_MARKER,
+                        "--w3cos-internal-unrecognized-display",
+                    ]
+                } else {
+                    &[inline::VALIGN_MARKER]
+                };
+                unsupported_style(info.style, allowed).or_else(|| flex_reason)
             } else if is_author_grid(info.style) {
-                unsupported_style(info.style, &[inline::VALIGN_MARKER])
+                // CSS Flexbox §4 / Grid §6.1 blockify `inline-grid` on a
+                // flex or grid item. A top-level `inline-grid` stays on
+                // legacy: those boxes are the references of tests that
+                // still fall back, and switching only the reference
+                // splits the reftest.
+                let blockified = is_inline_grid(info.style)
+                    && info.parent.is_some_and(|parent| {
+                        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+                    });
+                let allowed: &[&str] = if blockified {
+                    &[
+                        inline::VALIGN_MARKER,
+                        "--w3cos-internal-unrecognized-display",
+                    ]
+                } else {
+                    &[inline::VALIGN_MARKER]
+                };
+                unsupported_style(info.style, allowed)
                     .or_else(|| super::grid::container_reason(flat, index))
             } else if inline::is_inline_container(flat, index) {
                 unsupported_style(
@@ -1168,15 +1200,28 @@ fn is_grid_lanes(style: &Style) -> bool {
     marker(style, "--w3cos-internal-grid-lanes").is_some()
 }
 
+fn unrecognized_display(style: &Style) -> Option<&str> {
+    marker(style, "--w3cos-internal-unrecognized-display")
+}
+
+fn is_inline_grid(style: &Style) -> bool {
+    unrecognized_display(style).is_some_and(|value| value == "inline-grid")
+}
+
+fn is_run_in(style: &Style) -> bool {
+    unrecognized_display(style).is_some_and(|value| value == "run-in")
+}
+
 pub(super) fn is_author_flex(style: &Style) -> bool {
     style.display == Display::Flex
         && marker(style, inline::IFC_MARKER).is_none()
         && !is_float_group(style)
         && !is_grid_lanes(style)
+        && !is_inline_grid(style)
 }
 
 pub(super) fn is_author_grid(style: &Style) -> bool {
-    style.display == Display::Grid || is_grid_lanes(style)
+    style.display == Display::Grid || is_grid_lanes(style) || is_inline_grid(style)
 }
 
 fn is_bfc_root(style: &Style) -> bool {

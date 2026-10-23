@@ -1792,6 +1792,111 @@ fn table_border_boxes_match_legacy() {
     let _ = parity(&text_table);
 }
 
+/// `inline-grid` stays `display: flex` for legacy and is a grid container
+/// on NG. `-webkit-box` still keeps the page on legacy.
+#[test]
+fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
+    use w3cos_std::style::CustomProperties;
+    let mut grid = Style {
+        display: Display::Flex,
+        width: Dimension::Px(100.0),
+        grid_template_columns: Some("40px 60px".to_string()),
+        ..Style::default()
+    };
+    grid.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-unrecognized-display".to_string(),
+        "inline-grid".to_string(),
+    )]));
+    let cell = |w| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                height: Dimension::Px(10.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    // Blockified only as a flex item. A block parent keeps the marker,
+    // so a reference that is a lone inline-grid stays on legacy.
+    let lone_root = node(block(), vec![node(grid.clone(), vec![])]);
+    let lone = pre_flatten(&lone_root);
+    assert!(
+        !block::supports_tree(&lone),
+        "{:?}",
+        block::unsupported_reasons(&lone)
+    );
+    let flex = Style {
+        display: Display::Flex,
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![node(grid, vec![cell(40.0), cell(60.0)])])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    // Preorder: 0 root, 1 flex, 2 inline-grid, 3 first cell, 4 second cell.
+    assert_eq!(at(3), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(at(4), (40.0, 0.0, 60.0, 10.0));
+
+    let mut webkit = Style {
+        display: Display::Flex,
+        ..block()
+    };
+    webkit.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-unrecognized-display".to_string(),
+        "-webkit-box".to_string(),
+    )]));
+    let webkit_root = node(webkit, vec![]);
+    let web = pre_flatten(&webkit_root);
+    assert!(
+        block::unsupported_reasons(&web)
+            .iter()
+            .any(|r| r == "unrecognized-display")
+    );
+
+    // `display: run-in` stays `flex` for legacy. A definite box is that
+    // flex box on NG, which is what the applies-to references paint.
+    let mut run_in = Style {
+        display: Display::Flex,
+        width: Dimension::Px(96.0),
+        height: Dimension::Px(96.0),
+        ..block()
+    };
+    run_in.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-unrecognized-display".to_string(),
+        "run-in".to_string(),
+    )]));
+    let run_root = node(block(), vec![node(run_in, vec![])]);
+    let run_flat = pre_flatten(&run_root);
+    assert!(
+        block::supports_tree(&run_flat),
+        "{:?}",
+        block::unsupported_reasons(&run_flat)
+    );
+    let run_out = layout_tree(&run_root, &run_flat, 800.0, 600.0).expect("run-in");
+    let run_rect = run_out
+        .iter()
+        .find(|(_, i)| *i == 1)
+        .expect("run-in rect")
+        .0;
+    assert_eq!(
+        (run_rect.x, run_rect.y, run_rect.width, run_rect.height),
+        (0.0, 0.0, 96.0, 96.0)
+    );
+}
+
 /// CSS 2.1 10.3.2 / 10.3.4: an explicit content-box size wins over the
 /// missing-image intrinsic size, a block replaced element does not stretch,
 /// and auto margins center that border box.
