@@ -1,0 +1,86 @@
+[
+  {
+    "variant": "baseline",
+    "views": 0,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 0,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "baseline",
+    "views": 1,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 1,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "baseline",
+    "views": 4,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 4,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "baseline",
+    "views": 16,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 16,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "baseline",
+    "views": 64,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 64,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "baseline",
+    "views": 1024,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 1024,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "baseline",
+    "views": 16384,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  },
+  {
+    "variant": "candidate",
+    "views": 16384,
+    "held_delta_equal": true,
+    "after_reset_delta_equal": true
+  }
+]
