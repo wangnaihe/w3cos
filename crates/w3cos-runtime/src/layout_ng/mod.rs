@@ -29,6 +29,7 @@ mod flex;
 mod grid;
 mod inline;
 mod oof;
+mod table;
 
 use crate::layout::{FlatNodeInfo, LayoutRect};
 use std::sync::OnceLock;
@@ -254,7 +255,6 @@ pub(crate) fn layout_tree_with_text(
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
-    let _ = root;
     let reason = if flat.is_empty() {
         Some("empty")
     } else {
@@ -303,6 +303,9 @@ pub(crate) fn layout_tree_with_text(
         return None;
     }
     RUNTIME_REASON.with(|r| r.set(""));
+    // Table layout clones a subtree of this component. The pointer is only
+    // read while `layout_root` runs.
+    let _table_root = table::bind_root(root);
     let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
         if trace() {
             let reason = RUNTIME_REASON.with(|r| r.get());

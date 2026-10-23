@@ -5260,6 +5260,23 @@ impl LayoutEngine {
 // Public API (backward compatible — used by tests and simple callers)
 // ---------------------------------------------------------------------------
 
+/// One legacy layout of `root`, ignoring `W3COS_LAYOUT_NG`. LayoutNG uses
+/// this for a table subtree: the table formatting context stays the legacy
+/// one (the same projections), and the fragment tree is the resulting
+/// border boxes.
+pub(crate) fn legacy_layout_rects(
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<Vec<(LayoutRect, usize)>> {
+    let flat = pre_flatten(root);
+    let mut engine = LayoutEngine::new();
+    engine
+        .compute_legacy(root, &flat, viewport_w, viewport_h)
+        .ok()
+        .map(|results| results.layout_cache)
+}
+
 pub fn compute(
     root: &Component,
     viewport_w: f32,

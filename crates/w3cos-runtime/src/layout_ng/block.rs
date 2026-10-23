@@ -437,6 +437,12 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
 
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
+    // Table, row, and cell boxes. The grid is the legacy table formatter
+    // transplanted into this fragment; other `display` values stay
+    // `display:other`.
+    if super::table::is_table_display(info.style.display) {
+        return super::table::reason(flat, index);
+    }
     if let Some(reason) = overflow_reason(flat, index) {
         return Some(reason);
     }
@@ -1162,14 +1168,14 @@ fn is_grid_lanes(style: &Style) -> bool {
     marker(style, "--w3cos-internal-grid-lanes").is_some()
 }
 
-fn is_author_flex(style: &Style) -> bool {
+pub(super) fn is_author_flex(style: &Style) -> bool {
     style.display == Display::Flex
         && marker(style, inline::IFC_MARKER).is_none()
         && !is_float_group(style)
         && !is_grid_lanes(style)
 }
 
-fn is_author_grid(style: &Style) -> bool {
+pub(super) fn is_author_grid(style: &Style) -> bool {
     style.display == Display::Grid || is_grid_lanes(style)
 }
 
@@ -1279,6 +1285,9 @@ fn layout_block_in(
     }
     if is_author_grid(style) {
         return super::grid::layout(flat, index, space, sized);
+    }
+    if style.display == Display::Table {
+        return super::table::layout(flat, index, space);
     }
     // CSS 2.1 10.3.2 / 10.3.4: a replaced width is the intrinsic (or
     // specified) content size, then auto margins are solved as for a

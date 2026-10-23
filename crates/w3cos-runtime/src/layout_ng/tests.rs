@@ -1711,6 +1711,87 @@ fn overflow_hidden_is_a_bfc_like_legacy() {
     assert_eq!(rect(&out, 1), (0.0, 10.0, 40.0, 30.0));
 }
 
+/// A block table's border boxes match the legacy formatter, including the
+/// 2px border-spacing around and between the cells.
+#[test]
+fn table_border_boxes_match_legacy() {
+    use w3cos_std::style::Display;
+    let cell = |width, height| {
+        node(
+            Style {
+                display: Display::TableCell,
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                ..Style::default()
+            },
+            vec![],
+        )
+    };
+    let row = |cells| {
+        node(
+            Style {
+                display: Display::TableRow,
+                ..Style::default()
+            },
+            cells,
+        )
+    };
+    let table = node(
+        Style {
+            display: Display::Table,
+            border_spacing_x: 2.0,
+            border_spacing_y: 2.0,
+            ..Style::default()
+        },
+        vec![
+            row(vec![cell(40.0, 20.0), cell(60.0, 20.0)]),
+            row(vec![cell(40.0, 30.0), cell(60.0, 10.0)]),
+        ],
+    );
+    let root = node(
+        Style {
+            display: Display::Block,
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![table],
+    );
+    let out = parity(&root);
+    // Wrapper is not in this tree. Table is index 1. Spacing is outside
+    // the cells and between them: 2 + 40 + 2 + 60 + 2 = 106.
+    assert_eq!(rect(&out, 1).2, 106.0);
+    assert_eq!(rect(&out, 3), (2.0, 2.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 4), (44.0, 2.0, 60.0, 20.0));
+
+    let text_cell = node(
+        Style {
+            display: Display::TableCell,
+            ..Style::default()
+        },
+        vec![w3cos_std::Component::text(
+            "hi",
+            Style {
+                display: Display::Inline,
+                ..Style::default()
+            },
+        )],
+    );
+    let text_table = node(
+        Style {
+            display: Display::Table,
+            ..block()
+        },
+        vec![node(
+            Style {
+                display: Display::TableRow,
+                ..Style::default()
+            },
+            vec![text_cell],
+        )],
+    );
+    let _ = parity(&text_table);
+}
+
 /// CSS 2.1 10.3.2 / 10.3.4: an explicit content-box size wins over the
 /// missing-image intrinsic size, a block replaced element does not stretch,
 /// and auto margins center that border box.
