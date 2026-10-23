@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "baseline",
+    "sha256": "9da328d07f9fec9ba2d166f4194260c06aed88966ae61fc9d4407a5940cf3524"
+  },
+  "candidate": {
+    "path": "candidate",
+    "sha256": "dcecb8b8503389d2353dba3bbf983b62ceaaa326e68ac51f82edf460867034d3"
+  }
+}

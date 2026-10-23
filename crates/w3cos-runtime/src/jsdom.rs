@@ -4250,6 +4250,14 @@ fn normalized_attribute_name(node: u32, name: &str) -> String {
     }
 }
 
+fn with_normalized_attribute_name<R>(node: u32, name: &str, body: impl FnOnce(&str) -> R) -> R {
+    if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return body(name);
+    }
+    let normalized = normalized_attribute_name(node, name);
+    body(&normalized)
+}
+
 fn valid_processing_instruction_attribute_name(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|character| {
@@ -4622,13 +4630,11 @@ fn shared_attribute_method(node: u32, key: &str) -> Option<Value> {
                 return element_computed_get(receiver, name).call(this, args);
             }
             match slot {
-                0 => {
-                    let name = normalized_attribute_name(receiver, &arg(&args, 0).to_js_string());
-                    match dom::get_attribute(receiver, &name) {
-                        Some(value) => Value::from(value),
-                        None => Value::Null,
-                    }
-                }
+                0 => with_value_text(&arg(&args, 0), |name| {
+                    with_normalized_attribute_name(receiver, name, |name| {
+                        dom::get_attribute(receiver, name).map_or(Value::Null, Value::from)
+                    })
+                }),
                 1 => {
                     let requested_name = arg(&args, 0).to_js_string();
                     if !valid_attribute_name(&requested_name) {
@@ -5852,14 +5858,20 @@ fn parsed_document_value(
                 _ => Some(""),
             };
             move |document, args| {
-                let mut tag = arg(&args, 0).to_js_string();
-                if !valid_element_name(&tag) {
-                    dom_exception("The element name is not valid", "InvalidCharacterError");
-                }
-                if is_html {
-                    tag.make_ascii_lowercase();
-                }
-                let node = dom::create_element(&tag);
+                let tag_value = arg(&args, 0);
+                let node = with_value_text(&tag_value, |tag| {
+                    if !valid_element_name(tag) {
+                        dom_exception("The element name is not valid", "InvalidCharacterError");
+                    }
+                    let lowered;
+                    let tag = if is_html && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                        lowered = tag.to_ascii_lowercase();
+                        lowered.as_str()
+                    } else {
+                        tag
+                    };
+                    dom::create_element(tag)
+                });
                 if let Some(namespace) = element_namespace {
                     dom::set_html_element(
                         node,
@@ -6387,11 +6399,13 @@ pub(crate) fn empty_document_value(content_type: &str, prototype_name: &str) -> 
     props.insert(
         "createElement".to_string(),
         func_slice(|document, args| {
-            let tag = arg(&args, 0).to_js_string();
-            if !valid_element_name(&tag) {
-                dom_exception("The element name is not valid", "InvalidCharacterError");
-            }
-            let node = dom::create_element(&tag);
+            let tag_value = arg(&args, 0);
+            let node = with_value_text(&tag_value, |tag| {
+                if !valid_element_name(tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                dom::create_element(tag)
+            });
             dom::set_html_element(node, false);
             set_expando(node, "ownerDocument", document);
             set_expando(node, "namespaceURI", Value::Null);
@@ -10516,11 +10530,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }))
         }),
         "getAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            match dom::get_attribute(node, &name) {
-                Some(v) => Value::from(v),
-                None => Value::Null,
-            }
+            let name = arg(&args, 0);
+            with_value_text(&name, |name| {
+                with_normalized_attribute_name(node, name, |name| {
+                    dom::get_attribute(node, name).map_or(Value::Null, Value::from)
+                })
+            })
         }),
         "getAttributeNS" => func(move |_, args| {
             let namespace = normalized_namespace_argument(&arg(&args, 0));
@@ -11738,12 +11753,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
     }
 }
 
-fn with_value_text(value: &Value, body: impl FnOnce(&str)) {
+fn with_value_text<R>(value: &Value, body: impl FnOnce(&str) -> R) -> R {
     if let Some(text) = value.as_js_string() {
-        body(text.as_str());
+        body(text.as_str())
     } else {
         let owned = value.to_js_string();
-        body(&owned);
+        body(&owned)
     }
 }
 
@@ -18412,14 +18427,26 @@ fn build_document_value() -> Value {
     props.insert(
         "createElement".to_string(),
         func_slice(|_, args| {
-            let mut tag = arg(&args, 0).to_js_string();
-            if !valid_element_name(&tag) {
-                dom_exception("The element name is not valid", "InvalidCharacterError");
-            }
-            if document_value().get_property("contentType").to_js_string() == "text/html" {
-                tag.make_ascii_lowercase();
-            }
-            let id = dom::create_element(&tag);
+            let tag_value = arg(&args, 0);
+            let id = with_value_text(&tag_value, |tag| {
+                if !valid_element_name(tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                let lowered;
+                let tag = if document_value().get_property("contentType").to_js_string()
+                    == "text/html"
+                    && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+                {
+                    lowered = tag.to_ascii_lowercase();
+                    lowered.as_str()
+                } else {
+                    tag
+                };
+                dom::create_element(tag)
+            });
+            // End the page-arena borrow before a custom-element constructor can
+            // re-enter JavaScript. DOM atoms have process-lifetime storage.
+            let tag = dom::tag_static(id);
             let element = dom_handle(id);
             if tag == "template" {
                 ensure_template_content(id);
@@ -18429,7 +18456,7 @@ fn build_document_value() -> Value {
                 // explicitly clears it and joins the ordered dynamic queue.
                 set_expando(id, "__w3cos_force_async", Value::Bool(true));
             }
-            crate::custom_elements_web::upgrade_created_element(&tag, element)
+            crate::custom_elements_web::upgrade_created_element(tag, element)
         }),
     );
     props.insert(
@@ -23044,6 +23071,94 @@ mod tests {
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn borrowed_create_element_string_preserves_conversion_and_validation() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("DiV")]);
+        assert_eq!(element.get_property("localName").to_js_string(), "div");
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_for_to_string = std::rc::Rc::clone(&calls);
+        let tag = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(move |_, _| {
+                calls_for_to_string.set(calls_for_to_string.get() + 1);
+                Value::string("SpAn")
+            }),
+        )]));
+        let element = document.call_method("createElement", vec![tag]);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(element.get_property("localName").to_js_string(), "span");
+
+        let throwing_tag = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(|_, _| panic!("createElement conversion marker")),
+        )]));
+        let conversion_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.call_method("createElement", vec![throwing_tag])
+        }));
+        assert!(conversion_error.is_err());
+
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.call_method("createElement", vec![Value::string("bad\0tag")])
+        }));
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn borrowed_get_attribute_preserves_case_unicode_and_object_to_string() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("data-x"), Value::string("ascii")],
+        );
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("é"), Value::string("unicode")],
+        );
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("DATA-X")])
+                .to_js_string(),
+            "ascii"
+        );
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("é")])
+                .to_js_string(),
+            "unicode"
+        );
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_for_to_string = std::rc::Rc::clone(&calls);
+        let name = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(move |_, _| {
+                calls_for_to_string.set(calls_for_to_string.get() + 1);
+                Value::string("DATA-X")
+            }),
+        )]));
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![name])
+                .to_js_string(),
+            "ascii"
+        );
+        assert_eq!(calls.get(), 1);
+
+        let throwing_name = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(|_, _| panic!("getAttribute conversion marker")),
+        )]));
+        let conversion_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            element.call_method("getAttribute", vec![throwing_name])
+        }));
+        assert!(conversion_error.is_err());
     }
 
     #[test]
