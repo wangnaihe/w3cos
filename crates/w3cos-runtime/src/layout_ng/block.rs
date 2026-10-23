@@ -152,10 +152,10 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if atomic && style.clear != Clear::None {
         return Some("clear");
     }
-    if style.overflow != Overflow::Visible
-        || style.overflow_x.is_some_and(|o| o != Overflow::Visible)
-        || style.overflow_y.is_some_and(|o| o != Overflow::Visible)
-    {
+    // CSS 2.1 9.4.1 / 11.1.1: a non-visible overflow on a block container
+    // establishes a BFC. Paint already clips that padding box. Inline boxes
+    // and non-cell internal table boxes do not clip; those stay on legacy.
+    if non_visible_overflow(style) && !style.display.establishes_overflow_clip() {
         return Some("overflow");
     }
     if style.column_count.is_some() || style.column_width != Dimension::Auto {
@@ -437,6 +437,12 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
 
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
+    if let Some(reason) = overflow_reason(flat, index) {
+        return Some(reason);
+    }
+    if matches!(info.kind, ComponentKind::Image { .. }) {
+        return image_box_reason(flat, index);
+    }
     if inline::is_atomic_inline(flat, index) {
         if !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
@@ -531,9 +537,177 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 )
             }
         }
-        ComponentKind::Image { .. } => Some("image"),
         _ => Some("kind:other"),
     }
+}
+
+/// Replaced boxes this stage lays out (CSS 2.1 10.3.2 inline, 10.3.4 block).
+/// Floats, abspos, border-box, and flex/grid items stay on legacy: their
+/// used size is not the content-box intrinsic size this path resolves.
+fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if style.box_sizing == BoxSizing::BorderBox {
+        return Some("image");
+    }
+    // min/max recompute the intrinsic ratio (CSS 2.1 10.4). That path does
+    // not match the legacy used size yet.
+    if !matches!(style.min_width, Dimension::Auto)
+        || !matches!(style.max_width, Dimension::Auto)
+        || !matches!(style.min_height, Dimension::Auto)
+        || !matches!(style.max_height, Dimension::Auto)
+    {
+        return Some("image");
+    }
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some("image");
+    }
+    if info.parent.is_some_and(|parent| {
+        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+    }) {
+        return Some("image");
+    }
+    // A block replaced box must not overlap a float in the same BFC
+    // (CSS 2.1 9.5). Placement beside a float is still the legacy path.
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("image");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => {
+            unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
+        }
+        // An inline replaced box sits on the font strut. Legacy then runs
+        // `project_single_baseline_replaced_image` and
+        // `align_inline_block_last_line_baselines`. That line box is still
+        // taller than the NG line, so inline images stay on legacy.
+        Display::Inline | Display::InlineBlock => Some("image"),
+        _ => Some("image"),
+    }
+}
+
+/// Either axis computes to something other than visible (CSS2 11.1.1).
+fn non_visible_overflow(style: &Style) -> bool {
+    style.resolved_overflow_x() != Overflow::Visible
+        || style.resolved_overflow_y() != Overflow::Visible
+}
+
+/// Overflow shapes that still disagree with the legacy engine: scrollports
+/// (`scroll` / `auto`), a flex or grid item (automatic minimum), a negative
+/// margin, or a float/clear inside the box. `hidden` on a block that only
+/// establishes a BFC stays here.
+fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let style = flat[index].style;
+    if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
+        return None;
+    }
+    if flat[index].parent.is_some_and(|parent| {
+        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+    }) {
+        return Some("overflow");
+    }
+    let scrollish = |overflow: Overflow| matches!(overflow, Overflow::Scroll | Overflow::Auto);
+    if scrollish(style.resolved_overflow_x()) || scrollish(style.resolved_overflow_y()) {
+        return Some("overflow");
+    }
+    let negative = |spacing: Spacing| match spacing {
+        Spacing::Px(v)
+        | Spacing::Percent(v)
+        | Spacing::Rem(v)
+        | Spacing::Em(v)
+        | Spacing::Ch(v)
+        | Spacing::Vw(v)
+        | Spacing::Vh(v) => v < 0.0,
+        _ => false,
+    };
+    if negative(style.margin.top)
+        || negative(style.margin.right)
+        || negative(style.margin.bottom)
+        || negative(style.margin.left)
+    {
+        return Some("overflow");
+    }
+    // A float alone inside the box matches legacy (the BFC contains it).
+    // A float together with in-flow content, or a `clear`, still takes the
+    // legacy adjoining-float path.
+    let mut saw_float = false;
+    let mut saw_inflow = false;
+    let mut saw_clear = false;
+    for node in &flat[index + 1..flat[index].subtree_end] {
+        if node.style.display == Display::None || oof::is_out_of_flow(node.style) {
+            continue;
+        }
+        if node.style.clear != Clear::None {
+            saw_clear = true;
+        }
+        if node.style.float != Float::None {
+            saw_float = true;
+        } else {
+            saw_inflow = true;
+        }
+    }
+    if saw_clear || (saw_float && saw_inflow) {
+        return Some("overflow");
+    }
+    None
+}
+
+/// CSS 2.1 10.3.2 / 10.3.4 content-box size. Percent, vw, and vh are
+/// resolved against this constraint space; em/rem/ch and the intrinsic
+/// ratio stay in `image_intrinsic_size` so the two engines share one
+/// replaced-size function. `None` when a percentage has no basis.
+fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> Option<(f32, f32)> {
+    if style.box_sizing == BoxSizing::BorderBox {
+        return super::bail("image");
+    }
+    let mut definite = style.clone();
+    let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
+        match dim {
+            Dimension::Percent(_) | Dimension::Vw(_) | Dimension::Vh(_) => {
+                resolve_dim(dim, basis, style, space).map(Dimension::Px)
+            }
+            other => Some(other),
+        }
+    };
+    definite.width = sub(style.width, Some(space.available_inline))?;
+    definite.height = sub(style.height, space.percentage_block)?;
+    definite.min_width = sub(style.min_width, Some(space.available_inline))?;
+    definite.max_width = sub(style.max_width, Some(space.available_inline))?;
+    definite.min_height = sub(style.min_height, space.percentage_block)?;
+    definite.max_height = sub(style.max_height, space.percentage_block)?;
+    // Legacy passes the content-box available width only for a block
+    // replaced element with an auto width (the SVG ratio branch).
+    let containing = if style.display == Display::Block && style.width == Dimension::Auto {
+        let spacing = |s: Spacing| {
+            resolve_spacing_for_layout(
+                s,
+                space.available_inline,
+                style,
+                space.viewport_w,
+                space.viewport_h,
+            )
+        };
+        let b = border(style);
+        let edges = b[1] + b[3] + spacing(style.padding.left) + spacing(style.padding.right);
+        Some((space.available_inline - edges).max(0.0))
+    } else {
+        Some(space.available_inline)
+    };
+    Some(crate::layout::image_intrinsic_size(
+        src, &definite, containing,
+    ))
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either
@@ -853,6 +1027,10 @@ pub(super) fn intrinsic_sizes(
     if let ComponentKind::Text { content } = info.kind {
         return Some(inline::text_min_max(content, info.style));
     }
+    if let ComponentKind::Image { src } = info.kind {
+        let (width, _) = replaced_content_size(src, info.style, space).why("image-intrinsic")?;
+        return Some(MinMax::exact(width));
+    }
     if size_contained(info.style) {
         // Size containment: intrinsic sizes ignore the contents.
         return Some(MinMax::exact(contain_intrinsic_size(info.style).0));
@@ -997,8 +1175,12 @@ fn is_author_grid(style: &Style) -> bool {
 
 fn is_bfc_root(style: &Style) -> bool {
     // A flex or grid container establishes an independent formatting
-    // context (CSS Flexbox §3, CSS Grid §1).
-    style.display == Display::FlowRoot || is_author_flex(style) || is_author_grid(style)
+    // context (CSS Flexbox §3, CSS Grid §1). Non-visible overflow does
+    // too, on the boxes CSS 2.1 11.1.1 clips (CSS2 9.4.1).
+    style.display == Display::FlowRoot
+        || is_author_flex(style)
+        || is_author_grid(style)
+        || (non_visible_overflow(style) && style.display.establishes_overflow_clip())
 }
 
 /// Lay out the root box inside the initial containing block.  Root margins
@@ -1098,11 +1280,33 @@ fn layout_block_in(
     if is_author_grid(style) {
         return super::grid::layout(flat, index, space, sized);
     }
-    let mut metrics = resolve_inline(style, space);
-    if let Some((width, _)) = sized {
-        metrics.content_width = width;
-    } else if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
-        metrics.content_width = shrink_to_fit(flat, index, space, &metrics).why("shrink-to-fit")?;
+    // CSS 2.1 10.3.2 / 10.3.4: a replaced width is the intrinsic (or
+    // specified) content size, then auto margins are solved as for a
+    // definite width. `sized` is a shrink-to-fit override for floats and
+    // new formatting contexts; a replaced box keeps its own width and the
+    // overlap check sends a float collision back to legacy.
+    let image_size = if let ComponentKind::Image { src } = info.kind {
+        Some(replaced_content_size(src, style, space).why("image")?)
+    } else {
+        None
+    };
+    let mut metrics = if let Some((width, _)) = image_size {
+        let mut definite = style.clone();
+        definite.width = Dimension::Px(width);
+        definite.min_width = Dimension::Auto;
+        definite.max_width = Dimension::Auto;
+        definite.box_sizing = BoxSizing::ContentBox;
+        resolve_inline(&definite, space)
+    } else {
+        resolve_inline(style, space)
+    };
+    if image_size.is_none() {
+        if let Some((width, _)) = sized {
+            metrics.content_width = width;
+        } else if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
+            metrics.content_width =
+                shrink_to_fit(flat, index, space, &metrics).why("shrink-to-fit")?;
+        }
     }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
@@ -1203,7 +1407,12 @@ fn layout_block_in(
     let mut last_baseline = LastBaseline::NoLines;
     let mut oof_candidates: Vec<OofCandidate> = Vec::new();
 
-    if let ComponentKind::Text { content } = info.kind {
+    if let Some((_, height)) = image_size {
+        // The replaced content is the in-flow block size. No line box, so
+        // the baseline stays the bottom margin edge (CSS 2.1 10.8.1).
+        cursor = height;
+        at_top = false;
+    } else if let ComponentKind::Text { content } = info.kind {
         // Block-level text leaf: in-flow content of its own.
         let (height, baseline) = inline::block_text_layout(content, metrics.content_width, style);
         cursor = height;
@@ -1227,7 +1436,7 @@ fn layout_block_in(
                 .map(|(x, y, fragment)| (bl + pl + x, bt + pt + y, fragment)),
         );
     }
-    let mut child = if inline::is_inline_container(flat, index) {
+    let mut child = if image_size.is_some() || inline::is_inline_container(flat, index) {
         info.subtree_end
     } else {
         index + 1
@@ -1345,7 +1554,20 @@ fn layout_block_in(
             child = next;
             continue;
         }
-        let child_metrics = resolve_inline(child_info.style, &child_space);
+        // A replaced child has a definite content width (10.3.4) even when
+        // its CSS width is auto, so auto margins center against that width.
+        let child_metrics = if let ComponentKind::Image { src } = child_info.kind {
+            let (width, _) =
+                replaced_content_size(src, child_info.style, &child_space).why("image")?;
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
+        } else {
+            resolve_inline(child_info.style, &child_space)
+        };
         let x = bl + pl + child_metrics.margin[3];
         // CSS2 9.5.2: clearance places the border box at the clear offset
         // when the hypothetical position is above it; the cleared box's
@@ -1478,6 +1700,22 @@ fn layout_block_in(
             // root's border box goes into the first layout opportunity at
             // or below its position where it fits for its whole height.
             let style = child_info.style;
+            // A non-zero margin on an overflow BFC beside a float still
+            // disagrees with legacy (the margin must not clear the float,
+            // and an adjoining margin must separate like clearance).
+            let zero_margin =
+                |spacing: Spacing| matches!(spacing, Spacing::Px(0.0) | Spacing::Auto);
+            if non_visible_overflow(style)
+                && style.display != Display::FlowRoot
+                && !is_author_flex(style)
+                && !is_author_grid(style)
+                && !(zero_margin(style.margin.top)
+                    && zero_margin(style.margin.right)
+                    && zero_margin(style.margin.bottom)
+                    && zero_margin(style.margin.left))
+            {
+                return super::bail("overflow-bfc-margin");
+            }
             if child_space.rtl
                 || matches!(style.margin.left, Spacing::Auto)
                 || matches!(style.margin.right, Spacing::Auto)
@@ -1680,6 +1918,17 @@ fn layout_block_in(
         auto_content
     };
     let content_height = clamp_h(specified_height.unwrap_or(auto_content));
+    // A definite block size that clips overflowing content is a scrollport.
+    // Scroll offsets stay on the legacy engine. An auto-height BFC does not.
+    if non_visible_overflow(style)
+        && !is_author_flex(style)
+        && !is_author_grid(style)
+        && style.display != Display::FlowRoot
+        && specified_height.is_some()
+        && auto_content > content_height + 1.0 / 128.0
+    {
+        return super::bail("overflow-scroll");
+    }
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
     // computed height is auto, whatever max-height does to the used height
     // (margin-collapse-038; Blink's FinishLayout drops the strut whenever

@@ -1655,3 +1655,106 @@ fn size_containment_uses_contain_intrinsic_size() {
     let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
 }
+
+/// CSS2 9.4.1: overflow other than visible is a BFC. The box sits beside
+/// a float instead of overlapping it, and a float inside it contributes
+/// to the auto height (10.6.7) without its margin escaping.
+#[test]
+fn overflow_hidden_is_a_bfc_like_legacy() {
+    use w3cos_std::style::{Dimension as D, Display, Float, Overflow};
+    let float = Style {
+        display: Display::Block,
+        width: D::Px(40.0),
+        height: D::Px(30.0),
+        float: Float::Left,
+        ..Style::default()
+    };
+    let beside = Style {
+        display: Display::Block,
+        height: D::Px(20.0),
+        overflow: Overflow::Hidden,
+        ..Style::default()
+    };
+    let root = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(100.0),
+            ..Style::default()
+        },
+        vec![node(float, vec![]), node(beside.clone(), vec![])],
+    );
+    let out = parity(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
+    assert_eq!(rect(&out, 2), (40.0, 0.0, 60.0, 20.0));
+    // The float's margin stays inside the overflow box.
+    let contained = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(100.0),
+            overflow: Overflow::Hidden,
+            ..Style::default()
+        },
+        vec![node(
+            Style {
+                display: Display::Block,
+                width: D::Px(40.0),
+                height: D::Px(30.0),
+                float: Float::Left,
+                margin: margins(10.0, 0.0, 0.0, 0.0),
+                ..Style::default()
+            },
+            vec![],
+        )],
+    );
+    let out = parity(&contained);
+    assert_eq!(rect(&out, 0), (0.0, 0.0, 100.0, 40.0));
+    assert_eq!(rect(&out, 1), (0.0, 10.0, 40.0, 30.0));
+}
+
+/// CSS 2.1 10.3.2 / 10.3.4: an explicit content-box size wins over the
+/// missing-image intrinsic size, a block replaced element does not stretch,
+/// and auto margins center that border box.
+#[test]
+fn replaced_content_box_matches_legacy() {
+    use w3cos_std::style::{Dimension as D, Display, Spacing};
+    let image = |display, margin_left, margin_right| {
+        Component::image(
+            "missing.png",
+            Style {
+                display,
+                width: D::Px(80.0),
+                height: D::Px(40.0),
+                margin: Edges {
+                    top: Spacing::Px(0.0),
+                    right: margin_right,
+                    bottom: Spacing::Px(0.0),
+                    left: margin_left,
+                },
+                ..Style::default()
+            },
+        )
+    };
+    let block_image = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(200.0),
+            ..Style::default()
+        },
+        vec![image(Display::Block, Spacing::Auto, Spacing::Auto)],
+    );
+    let out = parity(&block_image);
+    assert_eq!(rect(&out, 1), (60.0, 0.0, 80.0, 40.0));
+    let inline_image = node(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![image(
+            Display::InlineBlock,
+            Spacing::Px(0.0),
+            Spacing::Px(0.0),
+        )],
+    );
+    let flat = pre_flatten(&inline_image);
+    assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
+}

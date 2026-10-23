@@ -672,13 +672,20 @@ pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
 /// A text leaf the cascade gives `display: inline-block` (an inline-block
 /// holding only text) is one too: a block text leaf as its own BFC.
 pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let inline_block = flat[index].style.display == Display::InlineBlock;
+    if matches!(flat[index].kind, ComponentKind::Image { .. }) {
+        // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
+        // sheet gives img `inline-block`; an author `inline` is the same
+        // kind of item.
+        return inline_block || flat[index].style.display == Display::Inline;
+    }
     matches!(
         flat[index].kind,
         ComponentKind::Box
             | ComponentKind::Column
             | ComponentKind::Row
             | ComponentKind::Text { .. }
-    ) && flat[index].style.display == Display::InlineBlock
+    ) && inline_block
 }
 
 /// True when the block container's rendered children are inline content.

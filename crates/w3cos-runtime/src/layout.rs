@@ -1298,7 +1298,7 @@ impl Drop for SubtreeSizeScope<'_> {
 }
 
 /// Leaf intrinsic size used by Taffy (must stay in sync with `build_taffy_tree`).
-fn image_intrinsic_ratio(src: &str) -> Option<f32> {
+pub(crate) fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     use crate::image_loader::SvgIntrinsicLength;
 
     if let Some(size) = crate::image_loader::svg_intrinsic_size(src) {
@@ -1320,7 +1320,7 @@ fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     })
 }
 
-fn image_intrinsic_size(
+pub(crate) fn image_intrinsic_size(
     src: &str,
     style: &w3cos_std::style::Style,
     containing_width: Option<f32>,
