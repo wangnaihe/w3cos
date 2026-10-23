@@ -40,6 +40,20 @@ subtree (`solved_nodes * 4 < nodes`) rather than the whole tree.
 The job uploads `runtime-bench.json` as the `runtime-bench` artifact. Absolute
 microseconds are not a gate.
 
+The same sanity gate can be run locally with
+`python3 scripts/check-runtime-bench.py runtime-bench.json`. It rejects missing
+or malformed evidence, duplicate JSON keys, boolean/nonfinite timings, negative
+or fractional node counts, and a background edit that moves a sibling. Geometry
+must be finite, nonnegative, and actually change. These checks do not establish
+browser parity or a speedup over a different build.
+
+The validator's synthetic regression tests run without Rust or rendering
+libraries:
+
+```sh
+python3 -m unittest discover -s tests/scripts -p 'test_runtime_bench.py' -v
+```
+
 ## Profile
 
 A flat `perf` sample of the harness (999 Hz, `runtime-bench` profile) put

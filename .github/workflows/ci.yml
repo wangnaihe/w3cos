@@ -131,51 +131,8 @@ jobs:
         run: target/runtime-bench/w3cos-runtime-bench --output runtime-bench.json --samples 3
       - name: Check harness sanity
         run: |
-          python3 - <<'PY'
-          import json
-          with open("runtime-bench.json") as handle:
-              report = json.load(handle)
-          style = report["style_layout"]
-          width = report["incremental_width"]
-          background = report["incremental_background"]
-          text = report["incremental_text"]
-          klass = report["incremental_class"]
-          insert = report["incremental_insert"]
-          remove = report["incremental_remove"]
-          paint = report["paint_scroll"]
-          host = report["host_calls"]
-          assert style["nodes"] >= 5000, style["nodes"]
-          assert style["median_us"] > 0
-          assert width["median_us"] > 0
-          assert background["median_us"] > 0
-          assert text["median_us"] > 0
-          assert klass["median_us"] > 0
-          assert insert["median_us"] > 0
-          assert remove["median_us"] > 0
-          assert width["after_width"] != width["before_width"]
-          assert text["after_height"] != text["before_height"]
-          assert klass["after_width"] != klass["before_width"]
-          assert insert["children_after"] == insert["children_before"] + 1
-          assert remove["children_after"] == remove["children_before"] - 1
-          assert paint["rows"] >= 200
-          assert paint["first_us"] > 0
-          assert paint["checksum"] != 0
-          assert host["median_ns_per_call"] > 0
-          assert report["startup"]["wall_us"] > 0
-          # Same-runner relative check. A one-node edit that is several times
-          # slower than laying out the whole tree means the harness measured
-          # the wrong work, not a noisy clock.
-          limit = style["median_us"] * 4
-          for edit in (width, background, text, klass, insert, remove):
-              assert edit["median_us"] < limit, (edit["median_us"], limit)
-          # The width, text, and child-list edits must lay out a subtree.
-          # solved_nodes * 4 >= nodes means the harness still walked the tree.
-          nodes = style["nodes"]
-          for edit in (width, text, klass, insert, remove):
-              assert edit["kind"] in ("style-subtree", "splice"), edit["kind"]
-              assert edit["solved_nodes"] * 4 < nodes, (edit["kind"], edit["solved_nodes"], nodes)
-          print("runtime bench sanity ok")
-          PY
+          python3 -m unittest discover -s tests/scripts -p 'test_runtime_bench.py' -v
+          python3 scripts/check-runtime-bench.py runtime-bench.json
       - name: Upload runtime bench report
         if: always()
         uses: actions/upload-artifact@v4

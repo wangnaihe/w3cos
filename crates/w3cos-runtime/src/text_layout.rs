@@ -825,9 +825,33 @@ pub fn estimated_char_width(ch: char, font_size: f32) -> f32 {
     }
 }
 
+/// Content identity plus all parsing settings, not a recyclable Font address.
+/// Reading the precomputed file hash keeps the hot-path key allocation-free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GlyphMetricKey {
+    file_hash: usize,
+    collection_index: u32,
+    geometry_scale: u32,
+    load_substitutions: bool,
+    font_size: u32,
+}
+
+impl GlyphMetricKey {
+    fn new(font: &fontdue::Font, font_size: f32) -> Self {
+        let settings = font.settings();
+        Self {
+            file_hash: font.file_hash(),
+            collection_index: settings.collection_index,
+            geometry_scale: settings.scale.to_bits(),
+            load_substitutions: settings.load_substitutions,
+            font_size: font_size.to_bits(),
+        }
+    }
+}
+
 thread_local! {
-    static ASCII_ADVANCE: RefCell<(usize, u32, u32, [f32; 128])> =
-        const { RefCell::new((0, 0, 0, [0.0; 128])) };
+    static ASCII_ADVANCE: RefCell<(Option<GlyphMetricKey>, [f32; 128])> =
+        const { RefCell::new((None, [0.0; 128])) };
 }
 
 pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
@@ -845,14 +869,12 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
         return estimated_char_width(ch, font_size);
     }
     let ascii = (ch as u32) < 128;
-    let font_id = font as *const fontdue::Font as usize;
-    let em = font.units_per_em().to_bits();
-    let size_bits = font_size.to_bits();
+    let key = GlyphMetricKey::new(font, font_size);
     if ascii {
         let cached = ASCII_ADVANCE.with(|slot| {
             let slot = slot.borrow();
-            (slot.0 == font_id && slot.1 == em && slot.2 == size_bits)
-                .then(|| slot.3[ch as usize])
+            (slot.0 == Some(key))
+                .then(|| slot.1[ch as usize])
                 .filter(|advance| *advance > 0.0)
         });
         if let Some(advance) = cached {
@@ -869,10 +891,10 @@ pub fn char_advance(ch: char, font_size: f32, font: &fontdue::Font) -> f32 {
     if ascii && advance > 0.0 {
         ASCII_ADVANCE.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot.0 != font_id || slot.1 != em || slot.2 != size_bits {
-                *slot = (font_id, em, size_bits, [0.0; 128]);
+            if slot.0 != Some(key) {
+                *slot = (Some(key), [0.0; 128]);
             }
-            slot.3[ch as usize] = advance;
+            slot.1[ch as usize] = advance;
         });
     }
     advance
@@ -1178,10 +1200,10 @@ pub fn single_line_vertical_metrics(
 }
 
 thread_local! {
-    /// Per-ASCII vertical extents for one (font, em, size). `tag` 0 is empty,
+    /// Per-ASCII vertical extents for one font metric key. `tag` 0 is empty,
     /// 1 is a zero-ink glyph that does not contribute, 2 is a real extent.
-    static ASCII_VERTICAL: RefCell<(usize, u32, u32, [(u8, f32, f32); 128])> =
-        const { RefCell::new((0, 0, 0, [(0, 0.0, 0.0); 128])) };
+    static ASCII_VERTICAL: RefCell<(Option<GlyphMetricKey>, [(u8, f32, f32); 128])> =
+        const { RefCell::new((None, [(0, 0.0, 0.0); 128])) };
 }
 
 fn glyph_vertical_extent(
@@ -1194,12 +1216,10 @@ fn glyph_vertical_extent(
     }
     let ch = font_glyph_character(character);
     if (ch as u32) < 128 {
-        let font_id = font as *const fontdue::Font as usize;
-        let em = font.units_per_em().to_bits();
-        let size_bits = font_size.to_bits();
+        let key = GlyphMetricKey::new(font, font_size);
         let cached = ASCII_VERTICAL.with(|slot| {
             let slot = slot.borrow();
-            (slot.0 == font_id && slot.1 == em && slot.2 == size_bits).then(|| slot.3[ch as usize])
+            (slot.0 == Some(key)).then(|| slot.1[ch as usize])
         });
         if let Some(entry) = cached {
             return match entry.0 {
@@ -1207,31 +1227,25 @@ fn glyph_vertical_extent(
                 2 => Some((entry.1, entry.2)),
                 _ => {
                     let extent = uncached_glyph_vertical_extent(ch, font_size, font);
-                    store_ascii_vertical(font_id, em, size_bits, ch, extent);
+                    store_ascii_vertical(key, ch, extent);
                     extent
                 }
             };
         }
         let extent = uncached_glyph_vertical_extent(ch, font_size, font);
-        store_ascii_vertical(font_id, em, size_bits, ch, extent);
+        store_ascii_vertical(key, ch, extent);
         return extent;
     }
     uncached_glyph_vertical_extent(ch, font_size, font)
 }
 
-fn store_ascii_vertical(
-    font_id: usize,
-    em: u32,
-    size_bits: u32,
-    ch: char,
-    extent: Option<(f32, f32)>,
-) {
+fn store_ascii_vertical(key: GlyphMetricKey, ch: char, extent: Option<(f32, f32)>) {
     ASCII_VERTICAL.with(|slot| {
         let mut slot = slot.borrow_mut();
-        if slot.0 != font_id || slot.1 != em || slot.2 != size_bits {
-            *slot = (font_id, em, size_bits, [(0, 0.0, 0.0); 128]);
+        if slot.0 != Some(key) {
+            *slot = (Some(key), [(0, 0.0, 0.0); 128]);
         }
-        slot.3[ch as usize] = match extent {
+        slot.1[ch as usize] = match extent {
             None => (1, 0.0, 0.0),
             Some((top, bottom)) => (2, top, bottom),
         };
@@ -2852,6 +2866,62 @@ mod tests {
     fn assert_same_size(left: (f32, f32), right: (f32, f32)) {
         assert_eq!(left.0.to_bits(), right.0.to_bits(), "width");
         assert_eq!(left.1.to_bits(), right.1.to_bits(), "height");
+    }
+
+    #[test]
+    fn ascii_metrics_follow_font_replacement_at_the_same_address() {
+        let parse = |bytes: &[u8]| {
+            fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).unwrap()
+        };
+        let mut font = Box::new(parse(include_bytes!(
+            "../assets/test-fonts/Arimo-Regular.ttf"
+        )));
+        let replacement = parse(include_bytes!("../assets/test-fonts/Cousine-Regular.ttf"));
+        assert_eq!(font.units_per_em(), replacement.units_per_em());
+        let size = 32.0;
+        let old_address = font.as_ref() as *const fontdue::Font;
+        let old_advance = char_advance('A', size, &font);
+        let old_vertical = glyph_vertical_extent('A', size, &font);
+        let expected_advance = replacement.metrics('A', size).advance_width;
+        let expected_vertical = uncached_glyph_vertical_extent('A', size, &replacement);
+        assert_ne!(old_advance, expected_advance);
+        assert_ne!(old_vertical, expected_vertical);
+
+        *font = replacement;
+        assert_eq!(old_address, font.as_ref() as *const fontdue::Font);
+        assert_eq!(char_advance('A', size, &font), expected_advance);
+        assert_eq!(glyph_vertical_extent('A', size, &font), expected_vertical);
+        // A warm repeat must retain the same metrics too.
+        assert_eq!(char_advance('A', size, &font), expected_advance);
+        assert_eq!(glyph_vertical_extent('A', size, &font), expected_vertical);
+    }
+
+    #[test]
+    fn glyph_metric_keys_include_font_settings_and_size() {
+        let font = inter_font();
+        let clone = font.clone();
+        let key = GlyphMetricKey::new(&font, 16.0);
+        assert_eq!(key, GlyphMetricKey::new(&clone, 16.0));
+        assert_ne!(key, GlyphMetricKey::new(&font, 24.0));
+        for settings in [
+            fontdue::FontSettings {
+                scale: 80.0,
+                ..fontdue::FontSettings::default()
+            },
+            fontdue::FontSettings {
+                load_substitutions: false,
+                ..fontdue::FontSettings::default()
+            },
+        ] {
+            let variant = fontdue::Font::from_bytes(
+                include_bytes!("../assets/Inter-Regular.ttf") as &[u8],
+                settings,
+            )
+            .unwrap();
+            assert_eq!(font.file_hash(), variant.file_hash());
+            assert_eq!(variant.settings(), settings);
+            assert_ne!(key, GlyphMetricKey::new(&variant, 16.0));
+        }
     }
 
     #[test]
