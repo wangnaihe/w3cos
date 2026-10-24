@@ -477,6 +477,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if matches!(info.kind, ComponentKind::Image { .. }) {
         return image_box_reason(flat, index);
     }
+    if matches!(info.kind, ComponentKind::Canvas { .. }) {
+        return canvas_box_reason(flat, index);
+    }
     if inline::is_atomic_inline(flat, index) {
         if !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
@@ -671,6 +674,183 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
         Display::Inline | Display::InlineBlock => Some("image"),
         _ => Some("image"),
     }
+}
+
+/// A definite `<canvas>` is a replaced box (CSS 2.1 10.3.2 / 10.4).
+/// The width and height attributes are the intrinsic size. A specified
+/// `aspect-ratio` replaces that ratio. SVG and form controls stay
+/// `kind:other`.
+fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if style.box_sizing == BoxSizing::BorderBox || size_contained(style) {
+        return Some("kind:other");
+    }
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some("kind:other");
+    }
+    if info.parent.is_some_and(|parent| {
+        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+    }) {
+        return Some("kind:other");
+    }
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("kind:other");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => {
+            unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
+        }
+        // The UA display is `inline-block`. The line box under this font
+        // is 24.1875px for a 20px canvas; Chrome's is 24px. A block
+        // reference of the same border box would be one-sided, so inline
+        // canvases stay `kind:other`.
+        Display::Inline | Display::InlineBlock => Some("kind:other"),
+        _ => Some("kind:other"),
+    }
+}
+
+/// Content-box size of a canvas. `None` when a percentage has no basis
+/// or `box-sizing` is `border-box` (that used size stays on legacy).
+fn canvas_content_size(
+    attr_width: u32,
+    attr_height: u32,
+    style: &Style,
+    space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    if style.box_sizing == BoxSizing::BorderBox {
+        return super::bail("kind:other");
+    }
+    let unresolved = |dim: Dimension| matches!(dim, Dimension::Ch(_));
+    if unresolved(style.width)
+        || unresolved(style.height)
+        || unresolved(style.min_width)
+        || unresolved(style.max_width)
+        || unresolved(style.min_height)
+        || unresolved(style.max_height)
+    {
+        return super::bail("kind:other");
+    }
+    let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
+        match dim {
+            Dimension::Percent(_) | Dimension::Vw(_) | Dimension::Vh(_) => {
+                resolve_dim(dim, basis, style, space).map(Dimension::Px)
+            }
+            other => Some(other),
+        }
+    };
+    let mut definite = style.clone();
+    definite.width = sub(style.width, Some(space.available_inline))?;
+    definite.height = sub(style.height, space.percentage_block)?;
+    definite.min_width = sub(style.min_width, Some(space.available_inline))?;
+    definite.max_width = sub(style.max_width, Some(space.available_inline))?;
+    definite.min_height = sub(style.min_height, space.percentage_block)?;
+    definite.max_height = sub(style.max_height, space.percentage_block)?;
+    Some(canvas_used_size(
+        attr_width as f32,
+        attr_height as f32,
+        &definite,
+    ))
+}
+
+fn canvas_axis_px(dim: Dimension, style: &Style) -> Option<f32> {
+    match dim {
+        Dimension::Px(value) => Some(value),
+        Dimension::Em(value) => Some(value * style.font_size),
+        Dimension::Rem(value) => Some(value * crate::layout::ROOT_FONT_SIZE),
+        _ => None,
+    }
+}
+
+/// CSS 2.1 10.3.2 / 10.4 / 10.6.2 for a canvas with a known intrinsic
+/// size. A positive `--w3cos-internal-aspect-ratio` replaces the
+/// attribute ratio (width / height).
+fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f32) {
+    let ratio = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get("--w3cos-internal-aspect-ratio"))
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .or_else(|| (attr_width > 0.0 && attr_height > 0.0).then_some(attr_width / attr_height));
+    let width = canvas_axis_px(style.width, style);
+    let height = canvas_axis_px(style.height, style);
+    let (mut used_width, mut used_height) = match (width, height, ratio) {
+        (Some(width), Some(height), _) => (width, height),
+        (Some(width), None, Some(ratio)) if ratio > 0.0 => (width, width / ratio),
+        (None, Some(height), Some(ratio)) if ratio > 0.0 => (height * ratio, height),
+        (Some(width), None, _) => (width, attr_height),
+        (None, Some(height), _) => (attr_width, height),
+        (None, None, _) => (attr_width, attr_height),
+    };
+    let min_width = canvas_axis_px(style.min_width, style).map(|value| value.max(0.0));
+    let min_height = canvas_axis_px(style.min_height, style).map(|value| value.max(0.0));
+    let max_width = canvas_axis_px(style.max_width, style).map(|value| value.max(0.0));
+    let max_height = canvas_axis_px(style.max_height, style).map(|value| value.max(0.0));
+    if width.is_none()
+        && height.is_none()
+        && let Some(ratio) = ratio
+        && ratio > 0.0
+        && used_width > 0.0
+        && used_height > 0.0
+    {
+        let mut scale_min = 0.0_f32;
+        let mut scale_max = f32::INFINITY;
+        if let Some(value) = min_width {
+            scale_min = scale_min.max(value / used_width);
+        }
+        if let Some(value) = min_height {
+            scale_min = scale_min.max(value / used_height);
+        }
+        if let Some(value) = max_width {
+            scale_max = scale_max.min(value / used_width);
+        }
+        if let Some(value) = max_height {
+            scale_max = scale_max.min(value / used_height);
+        }
+        let scale = 1.0_f32.max(scale_min).min(scale_max);
+        used_width *= scale;
+        used_height *= scale;
+    } else {
+        if let Some(value) = min_width {
+            used_width = used_width.max(value);
+        }
+        if let Some(value) = max_width {
+            used_width = used_width.min(value);
+        }
+        if width.is_some()
+            && height.is_none()
+            && let Some(ratio) = ratio.filter(|ratio| *ratio > 0.0)
+        {
+            used_height = used_width / ratio;
+        }
+        if let Some(value) = min_height {
+            used_height = used_height.max(value);
+        }
+        if let Some(value) = max_height {
+            used_height = used_height.min(value);
+        }
+        if height.is_some()
+            && width.is_none()
+            && let Some(ratio) = ratio.filter(|ratio| *ratio > 0.0)
+        {
+            used_width = used_height * ratio;
+        }
+    }
+    (used_width.max(0.0), used_height.max(0.0))
 }
 
 /// Either axis computes to something other than visible (CSS2 11.1.1).
@@ -1124,6 +1304,11 @@ pub(super) fn intrinsic_sizes(
         let (width, _) = replaced_content_size(src, info.style, space).why("image-intrinsic")?;
         return Some(MinMax::exact(width));
     }
+    if let ComponentKind::Canvas { width, height } = info.kind {
+        let (width, _) =
+            canvas_content_size(*width, *height, info.style, space).why("kind:other")?;
+        return Some(MinMax::exact(width));
+    }
     if size_contained(info.style) {
         // Size containment: intrinsic sizes ignore the contents.
         return Some(MinMax::exact(contain_intrinsic_size(info.style).0));
@@ -1455,6 +1640,8 @@ fn layout_block_in(
     // overlap check sends a float collision back to legacy.
     let image_size = if let ComponentKind::Image { src } = info.kind {
         Some(replaced_content_size(src, style, space).why("image")?)
+    } else if let ComponentKind::Canvas { width, height } = info.kind {
+        Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
     } else {
         None
     };
@@ -1809,6 +1996,15 @@ fn layout_block_in(
         let child_metrics = if let ComponentKind::Image { src } = child_info.kind {
             let (width, _) =
                 replaced_content_size(src, child_info.style, &child_space).why("image")?;
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
+        } else if let ComponentKind::Canvas { width, height } = child_info.kind {
+            let (width, _) = canvas_content_size(*width, *height, child_info.style, &child_space)
+                .why("kind:other")?;
             let mut definite = child_info.style.clone();
             definite.width = Dimension::Px(width);
             definite.min_width = Dimension::Auto;

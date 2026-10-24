@@ -2813,6 +2813,166 @@ fn replaced_content_box_matches_legacy() {
     assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
 }
 
+/// Headless Chrome, body margin 0. A canvas is a replaced box: attributes
+/// are the intrinsic size, a specified aspect-ratio replaces that ratio,
+/// and min/max scale both axes when width and height are auto.
+#[test]
+fn definite_canvas_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let canvas = |w: u32, h: u32, style: Style| Component::canvas(w, h, style);
+    let block_canvas = |w: u32, h: u32, extra: Style| {
+        canvas(
+            w,
+            h,
+            Style {
+                display: Display::Block,
+                ..extra
+            },
+        )
+    };
+    let lay = |child: Component| {
+        let root = node(block(), vec![child]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        layout_tree(&root, &flat, 800.0, 600.0).expect("canvas")
+    };
+    let at = |out: &[(crate::layout::LayoutRect, usize)], index: usize| rect(out, index);
+
+    // width/height attributes, display:block.
+    let out = lay(block_canvas(40, 20, Style::default()));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 20.0));
+
+    // Missing attributes are the HTML default 300×150.
+    let out = lay(block_canvas(300, 150, Style::default()));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 300.0, 150.0));
+
+    // width 40px on a 100×50 canvas: height follows the intrinsic ratio.
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            width: Dimension::Px(40.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 20.0));
+
+    // height 20px: width follows the ratio.
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            height: Dimension::Px(20.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 20.0));
+
+    // Both axes specified. The ratio does not override them.
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            width: Dimension::Px(40.0),
+            height: Dimension::Px(40.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 40.0));
+
+    // min-width 200 scales 100×50 to 200×100. max-width 40 and max-height
+    // 20 each scale it to 40×20.
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            min_width: Dimension::Px(200.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 200.0, 100.0));
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            max_width: Dimension::Px(40.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 20.0));
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            max_height: Dimension::Px(20.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 20.0));
+
+    // A specified width plus min-height grows only the height.
+    let out = lay(block_canvas(
+        100,
+        50,
+        Style {
+            width: Dimension::Px(40.0),
+            min_height: Dimension::Px(30.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 40.0, 30.0));
+
+    // aspect-ratio 5/1 replaces the 100×50 attribute ratio.
+    let mut ratio = Style {
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    ratio.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-aspect-ratio".to_string(),
+        "5".to_string(),
+    )]));
+    let out = lay(block_canvas(100, 50, ratio));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 100.0, 20.0));
+
+    // Content-box padding 3 and border 2 around an 80×40 canvas.
+    let out = lay(block_canvas(
+        80,
+        40,
+        Style {
+            padding: margins(3.0, 3.0, 3.0, 3.0),
+            border_top_width: Some(2.0),
+            border_right_width: Some(2.0),
+            border_bottom_width: Some(2.0),
+            border_left_width: Some(2.0),
+            ..Style::default()
+        },
+    ));
+    assert_eq!(at(&out, 1), (0.0, 0.0, 90.0, 50.0));
+
+    // Inline-block stays on legacy: the NG line is 24.1875px and Chrome's
+    // is 24px, so a block reference of the same border box would be one-sided.
+    let inline = node(
+        block(),
+        vec![canvas(
+            40,
+            20,
+            Style {
+                display: Display::InlineBlock,
+                ..Style::default()
+            },
+        )],
+    );
+    let flat = pre_flatten(&inline);
+    assert_eq!(
+        block::unsupported_reasons(&flat),
+        vec!["kind:other".to_string()]
+    );
+}
+
 #[test]
 fn colspan_percent_auto_matches_percent_pair() {
     use w3cos_std::style::{CustomProperties, WhiteSpace};
