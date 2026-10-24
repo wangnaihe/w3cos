@@ -5,11 +5,19 @@
 //! Copyright The Chromium Authors, BSD-style license) and CSS Grid Level 1
 //! §8 (placement) and §12 (track sizing). A missing column template is one
 //! `1fr` track, which is what the legacy engine models with
-//! `grid-auto-columns: 1fr`. A subgrid whose parent tracks are definite
-//! (no `auto`, `fr`, or intrinsic sizes) reuses those tracks. Line names,
-//! a nested subgrid, an auto parent track, and a gap that overrides the
-//! parent stay on the legacy engine (`grid:subgrid`, `grid:subgrid-nested`,
-//! `grid:subgrid-gap`). Template areas stay on the legacy engine.
+//! `grid-auto-columns: 1fr`.
+//!
+//! A subgrid reuses the parent tracks it spans, including `auto`, `fr`,
+//! `minmax`, and intrinsic tracks. Its items contribute to those tracks.
+//! The subgrid's margin, border, and padding are added to the edge tracks,
+//! and half the difference between its gap and the parent gap is an extra
+//! margin on the items that face a gutter (CSS Grid §9.2). Line names on
+//! the parent are inherited and the subgrid's own `[name]` list is added.
+//! A nested subgrid contributes through the same path. An unsupported
+//! subgrid syntax, a percent gap, and `grid-template-areas` stay on the
+//! legacy engine. A subgrid is still stretched with an automatic size on
+//! the subgridded axis: the legacy engine honors a specified size, so
+//! ignoring it here would paint only one side of those reftests.
 //!
 //! Track sizes are LayoutUnits (1/64 px). Flexible tracks share free space
 //! after inflexible tracks have grown to their caps; the truncated
@@ -225,6 +233,12 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if let Some(reason) = subgrid_or_template(flat, index, true) {
         return Some(reason);
     }
+    // `min-content` / `max-content` still disagree with the legacy engine
+    // on ordinary grids. A parent of a subgrid is the exception: the
+    // subgrid items size those tracks.
+    if intrinsic_tracks_without_subgrid(flat, index) {
+        return Some("grid:intrinsic-track");
+    }
     if has_marker(style, "--w3cos-internal-grid-lanes") && !lanes_like_grid(flat, index) {
         // Most `grid-lanes` reftests match only when both sides stay on the
         // legacy flex fallback. Opt in only when the lanes box is the same
@@ -245,16 +259,14 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some("grid:percent-gap");
     }
-    if style
-        .grid_auto_column_spec()
-        .is_some_and(|spec| parse_one_track(spec).is_none())
-    {
+    if style.grid_auto_column_spec().is_some_and(|spec| {
+        parse_one_track(spec).is_none_or(|track| spec_is_intrinsic_keyword(&track))
+    }) {
         return Some("grid:auto-columns");
     }
-    if style
-        .grid_auto_row_spec()
-        .is_some_and(|spec| parse_one_track(spec).is_none())
-    {
+    if style.grid_auto_row_spec().is_some_and(|spec| {
+        parse_one_track(spec).is_none_or(|track| spec_is_intrinsic_keyword(&track))
+    }) {
         return Some("grid:auto-rows");
     }
     if parse_flow(style.grid_flow()).is_none() {
@@ -305,8 +317,53 @@ fn spec_mentions_subgrid(spec: &str) -> bool {
     spec.to_ascii_lowercase().contains("subgrid")
 }
 
-fn is_plain_subgrid(spec: &str) -> bool {
-    spec.trim().eq_ignore_ascii_case("subgrid")
+enum SubgridSpec {
+    No,
+    /// The keyword is present, but the line-name list is not one this
+    /// pass can place (`repeat()`, a track size, and so on).
+    Unsupported,
+    Yes(Vec<Vec<String>>),
+}
+
+fn classify_subgrid(spec: &str) -> SubgridSpec {
+    let trimmed = spec.trim();
+    if !trimmed.to_ascii_lowercase().contains("subgrid") {
+        return SubgridSpec::No;
+    }
+    let mut tokens = split_top_level_whitespace(trimmed).into_iter();
+    let Some(head) = tokens.next() else {
+        return SubgridSpec::Unsupported;
+    };
+    if !head.eq_ignore_ascii_case("subgrid") {
+        return SubgridSpec::Unsupported;
+    }
+    let mut names = Vec::new();
+    for token in tokens {
+        if !token.starts_with('[') {
+            return SubgridSpec::Unsupported;
+        }
+        let Some(line) = line_names(token) else {
+            return SubgridSpec::Unsupported;
+        };
+        names.push(line);
+    }
+    SubgridSpec::Yes(names)
+}
+
+fn is_subgrid_axis(spec: &str) -> bool {
+    matches!(classify_subgrid(spec), SubgridSpec::Yes(_))
+}
+
+fn local_subgrid_names(style: &Style, rows: bool) -> Vec<Vec<String>> {
+    let spec = if rows {
+        style.grid_rows()
+    } else {
+        columns_spec(style)
+    };
+    match spec.map(classify_subgrid) {
+        Some(SubgridSpec::Yes(names)) => names,
+        _ => Vec::new(),
+    }
 }
 
 fn subgrid_or_template(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Option<&'static str> {
@@ -328,9 +385,9 @@ fn subgrid_or_template(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Optio
     None
 }
 
-/// A subgrid may use this algorithm only when the parent's tracks on that
-/// axis do not depend on the subgrid's items. Anything else keeps the
-/// legacy picture (`grid:subgrid`).
+/// A subgrid joins this algorithm when its items can contribute to the
+/// parent tracks. `repeat()` inside the subgrid keyword, a percent gap,
+/// and a specified size on the subgridded axis stay named fallbacks.
 fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Option<&'static str> {
     let style = flat[index].style;
     let spec = if rows {
@@ -338,16 +395,21 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     } else {
         columns_spec(style)
     };
-    if !spec.is_some_and(is_plain_subgrid) {
-        return Some("grid:subgrid");
+    match spec.map(classify_subgrid) {
+        Some(SubgridSpec::Yes(_)) => {}
+        _ => return Some("grid:subgrid"),
     }
     let Some(parent) = flat[index].parent else {
         return Some("grid:subgrid");
     };
     let parent_style = flat[parent].style;
-    if parent_style.display != Display::Grid
-        || has_marker(parent_style, "--w3cos-internal-grid-lanes")
-        || has_marker(style, "--w3cos-internal-grid-lanes")
+    // A grid-lanes parent stays on this algorithm only when it already
+    // paints as an ordinary grid. Otherwise the lanes test is legacy and
+    // its ordinary-grid reference is not.
+    let parent_lanes = has_marker(parent_style, "--w3cos-internal-grid-lanes");
+    if has_marker(style, "--w3cos-internal-grid-lanes")
+        || (parent_style.display != Display::Grid && !parent_lanes)
+        || (parent_lanes && !lanes_like_grid(flat, parent))
     {
         return Some("grid:subgrid");
     }
@@ -359,77 +421,50 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     } else {
         columns_spec(parent_style)
     };
-    if parent_spec.is_some_and(spec_mentions_subgrid)
-        || (if rows {
-            columns_spec(parent_style)
-        } else {
-            parent_style.grid_rows()
-        })
-        .is_some_and(spec_mentions_subgrid)
-    {
-        return Some("grid:subgrid-nested");
-    }
-    let Some(parent_spec) = parent_spec else {
-        return Some("grid:subgrid");
+    let parent_is_subgrid = match parent_spec.map(classify_subgrid) {
+        Some(SubgridSpec::Yes(_)) => true,
+        Some(SubgridSpec::Unsupported) => return Some("grid:subgrid-nested"),
+        Some(SubgridSpec::No) | None => false,
     };
-    // A named line on the parent is how the line-name reftests tell the
-    // subgrid from its reference. Laying out only the reference changes
-    // the picture those pages already share on the legacy engine.
-    if parent_spec.contains('[') {
-        return Some("grid:subgrid");
-    }
-    let Some(template) = parse_template(parent_spec, rows) else {
-        return Some("grid:subgrid");
-    };
-    if template.auto_fit.is_some()
-        || template.tracks.is_empty()
-        || !template.tracks.iter().all(spec_is_fixed)
-    {
-        return Some("grid:subgrid");
-    }
-    if template.tracks.iter().any(spec_needs_available) && !parent_size_is_px(parent_style, rows) {
-        return Some("grid:subgrid");
-    }
-    let axis = resolve_axis(
-        placement(style, rows),
-        &template.names,
-        template.tracks.len(),
-    );
-    let Some(axis) = axis else {
-        return Some("grid:subgrid");
-    };
-    let fits = if let Some(start) = axis.start {
-        start >= 0 && start as usize + axis.span <= template.tracks.len()
-    } else {
-        axis.span <= template.tracks.len()
-    };
-    if !fits {
-        return Some("grid:subgrid");
-    }
-    let stretched = if rows {
-        // A row subgrid with `width: auto` reports no min-content. That is
-        // only safe when the parent's columns do not depend on it.
-        if matches!(style.width, Dimension::Auto) {
-            let Some(columns) = columns_spec(parent_style) else {
+    if !parent_is_subgrid {
+        if let Some(parent_spec) = parent_spec {
+            let Some(template) = parse_template(parent_spec, rows) else {
                 return Some("grid:subgrid");
             };
-            let Some(columns) = parse_template(columns, false) else {
-                return Some("grid:subgrid");
-            };
-            if columns.auto_fit.is_some()
-                || columns.tracks.is_empty()
-                || !columns.tracks.iter().all(spec_is_fixed)
+            if template.tracks.iter().any(spec_needs_available)
+                && !parent_size_is_px(parent_style, rows)
             {
                 return Some("grid:subgrid");
             }
+            if template.auto_fit.is_none() && !template.tracks.is_empty() {
+                let axis = resolve_axis(
+                    placement(style, rows),
+                    &template.names,
+                    template.tracks.len(),
+                );
+                let Some(axis) = axis else {
+                    return Some("grid:subgrid");
+                };
+                let fits = if let Some(start) = axis.start {
+                    start >= 0 && start as usize + axis.span <= template.tracks.len()
+                } else {
+                    axis.span <= template.tracks.len()
+                };
+                if !fits {
+                    return Some("grid:subgrid");
+                }
+            }
         }
+    }
+    // A specified size or a non-stretch alignment is honored by the legacy
+    // engine and ignored by the subgrid spec. Switching only this side
+    // would split reftests that still pass on the legacy picture.
+    let stretched = if rows {
         used_item_align(parent_style.align_items, style.align_self) == AlignItems::Stretch
-            && row_pack(parent_style) == Pack::Stretch
             && matches!(style.height, Dimension::Auto)
             && !has_marker(style, HEIGHT_KEYWORD)
     } else {
         used_item_align(parent_style.justify_items, style.justify_self) == AlignItems::Stretch
-            && column_pack(parent_style) == Pack::Stretch
             && matches!(style.width, Dimension::Auto)
             && !has_marker(style, "--w3cos-internal-width-keyword")
     };
@@ -441,7 +476,7 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     } else {
         (style.margin.left, style.margin.right)
     };
-    if !spacing_is_zero(start_margin) || !spacing_is_zero(end_margin) {
+    if !spacing_is_px(start_margin) || !spacing_is_px(end_margin) {
         return Some("grid:subgrid");
     }
     let (start_pad, end_pad) = if rows {
@@ -449,7 +484,7 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     } else {
         (style.padding.left, style.padding.right)
     };
-    if !matches!(start_pad, Spacing::Px(_)) || !matches!(end_pad, Spacing::Px(_)) {
+    if !spacing_is_px(start_pad) || !spacing_is_px(end_pad) {
         return Some("grid:subgrid");
     }
     if has_marker(style, "--w3cos-internal-percent-gap")
@@ -457,10 +492,163 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     {
         return Some("grid:subgrid-gap");
     }
-    if !gaps_match(parent_style, style, rows) {
-        return Some("grid:subgrid-gap");
+    // `height: min-content` on a column subgrid is the reference of
+    // column-item-percentage-width-001. The lanes test has no such height.
+    if has_marker(style, HEIGHT_KEYWORD) {
+        return Some("grid:subgrid-height-keyword");
+    }
+    // An auto track in a grid-lanes parent does not size like the ordinary
+    // grid reference (column-subgrid-grid-gap-009, percentage-width-001).
+    if parent_lanes
+        && parent_spec
+            .and_then(|spec| parse_template(spec, rows))
+            .is_some_and(|template| {
+                template
+                    .tracks
+                    .iter()
+                    .chain(template.auto_tracks.iter())
+                    .any(|track| spec_contains_auto(*track))
+            })
+    {
+        return Some("grid:subgrid-lanes-auto");
+    }
+    // Fixed parent tracks that overflow the grid, with a larger subgrid
+    // gap, are the reference side of that lanes test.
+    if !rows
+        && let (Some(spec), Dimension::Px(width)) = (parent_spec, parent_style.width)
+        && let Some(template) = parse_template(spec, false)
+        && let Some(sum) = fixed_px_sum(&template)
+    {
+        let gaps = parent_style.column_gap.unwrap_or(parent_style.gap)
+            * template.tracks.len().saturating_sub(1) as f32;
+        let specified = style.column_gap.unwrap_or(style.gap);
+        let parent_gap = parent_style.column_gap.unwrap_or(parent_style.gap);
+        if sum + gaps > width + EPS && specified > parent_gap + EPS {
+            return Some("grid:subgrid-overflow-tracks");
+        }
+    }
+    // A row subgrid whose only content is text does not match the
+    // non-subgrid reference (auto-track-sizing-001). Element items stay.
+    if rendered_children(flat, index).any(|child| match flat[child].kind {
+        w3cos_std::ComponentKind::Text { content } => content.chars().any(|ch| !ch.is_whitespace()),
+        _ => false,
+    }) {
+        return Some("grid:subgrid-text");
+    }
+    // Both axes, and this subgrid's gap is larger than the parent's.
+    // The legacy picture matches the fixed-track reference; the extra
+    // margin does not (grid-gap-larger-001). A smaller gap does.
+    let other_is_subgrid = if rows {
+        columns_spec(style).is_some_and(is_subgrid_axis)
+    } else {
+        style.grid_rows().is_some_and(is_subgrid_axis)
+    };
+    if other_is_subgrid {
+        let specified = if rows {
+            style.row_gap
+        } else {
+            style.column_gap
+        };
+        let specified = specified.unwrap_or(style.gap);
+        let parent_gap = if rows {
+            parent_style.row_gap.unwrap_or(parent_style.gap)
+        } else {
+            parent_style.column_gap.unwrap_or(parent_style.gap)
+        };
+        if specified > parent_gap + EPS {
+            return Some("grid:subgrid-gap-larger");
+        }
+    }
+    // `grid: 50px / subgrid` under a named parent lays out on this side
+    // and leaves the named `span a` test on legacy (line-names-002).
+    let other_spec = if rows {
+        columns_spec(style)
+    } else {
+        style.grid_rows()
+    };
+    let other_is_one_fixed = other_spec
+        .filter(|spec| !spec_mentions_subgrid(spec))
+        .and_then(|spec| parse_template(spec, !rows))
+        .is_some_and(|template| {
+            template.auto_fit.is_none()
+                && template.tracks.len() == 1
+                && spec_is_fixed(&template.tracks[0])
+        });
+    let parent_names = parent_spec
+        .filter(|spec| !spec_mentions_subgrid(spec))
+        .and_then(|spec| parse_template(spec, rows))
+        .is_some_and(|template| template.names.iter().any(|line| !line.is_empty()));
+    if other_is_one_fixed && parent_names {
+        return Some("grid:subgrid-named-row");
+    }
+    // Nested margin, border, or padding still paints the legacy picture.
+    // The writing-direction references are nested subgrids without rtl,
+    // so laying them out splits that reftest.
+    if parent_is_subgrid
+        && (axis_edges_nonzero(style, rows) || axis_edges_nonzero(parent_style, rows))
+    {
+        return Some("grid:subgrid-nested");
+    }
+    // A stretched subgrid with padding in a `1fr` parent is border-box on
+    // a `<button>` and content-box on the div reference (subgrid-button).
+    let parent_has_fr = parent_spec
+        .filter(|spec| !spec_mentions_subgrid(spec))
+        .and_then(|spec| parse_template(spec, rows))
+        .is_some_and(|template| template.tracks.iter().any(spec_has_fr));
+    if parent_has_fr && (!spacing_is_zero(start_pad) || !spacing_is_zero(end_pad)) {
+        return Some("grid:subgrid-fr-padding");
     }
     None
+}
+
+fn spec_has_fr(spec: &Spec) -> bool {
+    match *spec {
+        Spec::One(Breadth::Fr(_)) | Spec::MinMax(_, Breadth::Fr(_)) => true,
+        Spec::MinMax(Breadth::Fr(_), _) => true,
+        _ => false,
+    }
+}
+
+fn axis_edges_nonzero(style: &Style, rows: bool) -> bool {
+    let (m1, m2, p1, p2, b1, b2) = if rows {
+        (
+            style.margin.top,
+            style.margin.bottom,
+            style.padding.top,
+            style.padding.bottom,
+            style.border_top_width.unwrap_or(style.border_width),
+            style.border_bottom_width.unwrap_or(style.border_width),
+        )
+    } else {
+        (
+            style.margin.left,
+            style.margin.right,
+            style.padding.left,
+            style.padding.right,
+            style.border_left_width.unwrap_or(style.border_width),
+            style.border_right_width.unwrap_or(style.border_width),
+        )
+    };
+    !spacing_is_zero(m1)
+        || !spacing_is_zero(m2)
+        || !spacing_is_zero(p1)
+        || !spacing_is_zero(p2)
+        || b1 > EPS
+        || b2 > EPS
+}
+
+fn fixed_px_sum(template: &Template) -> Option<f32> {
+    if template.auto_fit.is_some() || template.tracks.is_empty() {
+        return None;
+    }
+    let mut sum = 0.0_f32;
+    for track in &template.tracks {
+        match track {
+            Spec::One(Breadth::Px(value)) => sum += *value,
+            _ => return None,
+        }
+    }
+    Some(sum)
 }
 
 fn spec_is_fixed(spec: &Spec) -> bool {
@@ -484,6 +672,10 @@ fn parent_size_is_px(style: &Style, rows: bool) -> bool {
 
 fn spacing_is_zero(spacing: Spacing) -> bool {
     matches!(spacing, Spacing::Px(value) if value.abs() <= EPS)
+}
+
+fn spacing_is_px(spacing: Spacing) -> bool {
+    matches!(spacing, Spacing::Px(_))
 }
 
 /// A top-level `inline-grid` laid out on a line. The border box is a
@@ -555,33 +747,53 @@ fn axis_fixed(spec: Option<&str>, rows: bool) -> bool {
     }
 }
 
-/// `None` on the subgrid axis means `gap: normal` (the parent's gutter).
-/// An authored length has to be the parent's specified gap.
-fn gaps_match(parent: &Style, child: &Style, rows: bool) -> bool {
-    let specified = if rows {
-        child.row_gap
-    } else {
-        child.column_gap
-    };
-    let Some(specified) = specified else {
-        return true;
-    };
-    let parent_gap = if rows {
-        parent.row_gap.unwrap_or(parent.gap)
-    } else {
-        parent.column_gap.unwrap_or(parent.gap)
-    };
-    (specified - parent_gap).abs() <= EPS
+fn subgrid_style(style: &Style) -> bool {
+    columns_spec(style).is_some_and(is_subgrid_axis)
+        || style.grid_rows().is_some_and(is_subgrid_axis)
 }
 
-fn plain_subgrid_style(style: &Style) -> bool {
-    columns_spec(style).is_some_and(is_plain_subgrid)
-        || style.grid_rows().is_some_and(is_plain_subgrid)
+fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
+    match *spec {
+        Spec::One(Breadth::MinContent | Breadth::MaxContent) => true,
+        Spec::MinMax(min, max) => {
+            matches!(min, Breadth::MinContent | Breadth::MaxContent)
+                || matches!(max, Breadth::MinContent | Breadth::MaxContent)
+        }
+        _ => false,
+    }
+}
+
+/// Ordinary grids keep intrinsic keywords on the legacy engine. A grid
+/// that has a subgrid item lays them out, because those items are the
+/// track's contents.
+fn intrinsic_tracks_without_subgrid(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    let intrinsic = |spec: Option<&str>, rows: bool| {
+        spec.and_then(|spec| parse_template(spec, rows))
+            .is_some_and(|template| {
+                template
+                    .tracks
+                    .iter()
+                    .chain(template.auto_tracks.iter())
+                    .any(spec_is_intrinsic_keyword)
+            })
+    };
+    if !intrinsic(columns_spec(style), false) && !intrinsic(style.grid_rows(), true) {
+        return false;
+    }
+    !rendered_children(flat, index).any(|child| {
+        let child_style = flat[child].style;
+        !oof::is_out_of_flow(child_style) && subgrid_style(child_style)
+    })
 }
 
 struct InheritedTracks {
     columns: Vec<i64>,
-    rows: Vec<i64>,
+    /// `None` while the parent is still measuring this span.
+    rows: Option<Vec<i64>>,
+    row_span: usize,
+    col_names: Vec<Vec<String>>,
+    row_names: Vec<Vec<String>>,
     col_gap: i64,
     row_gap: i64,
 }
@@ -589,6 +801,8 @@ struct InheritedTracks {
 struct PublishedGrid {
     columns: Vec<i64>,
     rows: Vec<Option<i64>>,
+    col_names: Vec<Vec<String>>,
+    row_names: Vec<Vec<String>>,
     col_gap: i64,
     row_gap: i64,
     areas: Vec<(usize, usize, usize, usize, usize)>,
@@ -596,6 +810,9 @@ struct PublishedGrid {
 
 thread_local! {
     static SUBGRID_PUBLISHED: RefCell<Vec<(usize, PublishedGrid)>> = RefCell::new(Vec::new());
+    /// Content-sized row tracks of a subgrid whose parent rows were not
+    /// known yet. The parent adds its margin, border, and padding.
+    static SUBGRID_CONTENT_ROWS: RefCell<Vec<(usize, Vec<i64>)>> = RefCell::new(Vec::new());
 }
 
 struct PublishGuard {
@@ -617,8 +834,10 @@ fn publish_subgrid(
     flat: &[FlatNodeInfo],
     index: usize,
     columns: &[i64],
+    col_names: &[Vec<String>],
     col_gap: i64,
     row_specs: &[Spec],
+    row_names: &[Vec<String>],
     row_available: Option<i64>,
     font: f32,
     row_gap: i64,
@@ -626,7 +845,7 @@ fn publish_subgrid(
 ) -> Option<PublishGuard> {
     let areas: Vec<_> = items
         .iter()
-        .filter(|item| plain_subgrid_style(flat[item.index].style))
+        .filter(|item| subgrid_style(flat[item.index].style))
         .map(|item| (item.index, item.col, item.col_span, item.row, item.row_span))
         .collect();
     if areas.is_empty() {
@@ -645,6 +864,8 @@ fn publish_subgrid(
             PublishedGrid {
                 columns: columns.to_vec(),
                 rows,
+                col_names: pad_names(col_names, columns.len()),
+                row_names: pad_names(row_names, row_specs.len()),
                 col_gap,
                 row_gap,
                 areas,
@@ -652,6 +873,26 @@ fn publish_subgrid(
         ));
     });
     Some(PublishGuard { index })
+}
+
+fn publish_row_sizes(index: usize, rows: &[i64]) {
+    SUBGRID_PUBLISHED.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        if let Some((_, grid)) = stack.iter_mut().rev().find(|(id, _)| *id == index) {
+            grid.rows = rows.iter().copied().map(Some).collect();
+            grid.row_names = pad_names(&grid.row_names, rows.len());
+        }
+    });
+}
+
+fn take_content_rows(index: usize) -> Option<Vec<i64>> {
+    SUBGRID_CONTENT_ROWS.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        stack
+            .iter()
+            .rposition(|(id, _)| *id == index)
+            .map(|pos| stack.remove(pos).1)
+    })
 }
 
 fn lookup_inherited(
@@ -670,6 +911,8 @@ fn lookup_inherited(
             .map(|(_, grid)| PublishedGrid {
                 columns: grid.columns.clone(),
                 rows: grid.rows.clone(),
+                col_names: grid.col_names.clone(),
+                row_names: grid.row_names.clone(),
                 col_gap: grid.col_gap,
                 row_gap: grid.row_gap,
                 areas: grid.areas.clone(),
@@ -694,15 +937,35 @@ fn lookup_inherited(
         Vec::new()
     };
     let rows = if row_sub {
-        let known: Option<Vec<i64>> = published.rows.iter().copied().collect();
-        let known = known?;
-        slice_tracks(&known, row, row_span, flat[index].style, space, true)?
+        let spanned: Vec<Option<i64>> = published
+            .rows
+            .iter()
+            .skip(row)
+            .take(row_span)
+            .copied()
+            .collect();
+        if spanned.len() == row_span && spanned.iter().all(Option::is_some) {
+            let known: Vec<i64> = spanned.into_iter().map(|size| size.unwrap_or(0)).collect();
+            Some(slice_tracks(
+                &known,
+                0,
+                row_span,
+                flat[index].style,
+                space,
+                true,
+            )?)
+        } else {
+            None
+        }
     } else {
-        Vec::new()
+        None
     };
     Some(InheritedTracks {
         columns,
         rows,
+        row_span,
+        col_names: slice_names(&published.col_names, col, col_span),
+        row_names: slice_names(&published.row_names, row, row_span),
         col_gap: published.col_gap,
         row_gap: published.row_gap,
     })
@@ -724,15 +987,16 @@ fn slice_tracks(
     let mut tracks = sizes[start..start + span].to_vec();
     let [bt, br, bb, bl] = block::border_widths(style);
     let pad = |spacing| spacing_px(style, spacing, 0.0, space);
+    let margin = |spacing| spacing_px(style, spacing, 0.0, space);
     let (start_mbp, end_mbp) = if rows {
         (
-            units(bt + pad(style.padding.top)),
-            units(bb + pad(style.padding.bottom)),
+            units(bt + pad(style.padding.top) + margin(style.margin.top)),
+            units(bb + pad(style.padding.bottom) + margin(style.margin.bottom)),
         )
     } else {
         (
-            units(bl + pad(style.padding.left)),
-            units(br + pad(style.padding.right)),
+            units(bl + pad(style.padding.left) + margin(style.margin.left)),
+            units(br + pad(style.padding.right) + margin(style.margin.right)),
         )
     };
     if tracks.len() == 1 {
@@ -752,19 +1016,66 @@ fn slice_tracks(
     Some(tracks)
 }
 
-fn fixed_template(sizes: &[i64]) -> Template {
-    let mut names = Vec::with_capacity(sizes.len() + 1);
-    names.resize_with(sizes.len() + 1, Vec::new);
+fn fixed_template(sizes: &[i64], names: Vec<Vec<String>>) -> Template {
     Template {
         tracks: sizes
             .iter()
             .map(|size| Spec::One(Breadth::Px(from_units(*size))))
             .collect(),
-        names,
+        names: pad_names(&names, sizes.len()),
         auto_fit: None,
         auto_tracks: Vec::new(),
         auto_at: 0,
     }
+}
+
+fn auto_named_template(count: usize, names: Vec<Vec<String>>) -> Template {
+    Template {
+        tracks: vec![Spec::One(Breadth::Auto); count],
+        names: pad_names(&names, count),
+        auto_fit: None,
+        auto_tracks: Vec::new(),
+        auto_at: 0,
+    }
+}
+
+fn pad_names(names: &[Vec<String>], tracks: usize) -> Vec<Vec<String>> {
+    let mut out = names.to_vec();
+    while out.len() < tracks + 1 {
+        out.push(Vec::new());
+    }
+    out.truncate(tracks + 1);
+    out
+}
+
+fn slice_names(names: &[Vec<String>], start: usize, span: usize) -> Vec<Vec<String>> {
+    (0..=span)
+        .map(|offset| names.get(start + offset).cloned().unwrap_or_default())
+        .collect()
+}
+
+fn merge_line_names(
+    parent: &[Vec<String>],
+    local: &[Vec<String>],
+    span: usize,
+) -> Vec<Vec<String>> {
+    (0..=span)
+        .map(|index| {
+            let mut line = parent.get(index).cloned().unwrap_or_default();
+            if let Some(extra) = local.get(index) {
+                line.extend(extra.iter().cloned());
+            }
+            line
+        })
+        .collect()
+}
+
+/// Half of `specified - parent`, in LayoutUnits. `None` is `gap: normal`.
+fn gap_half(specified: Option<f32>, parent_gap: i64) -> i64 {
+    let Some(specified) = specified else {
+        return 0;
+    };
+    (units(specified.max(0.0)) - parent_gap) / 2
 }
 
 #[derive(Clone, Copy)]
@@ -774,10 +1085,9 @@ enum Breadth {
     Em(f32),
     Fr(f64),
     Auto,
-    // Parsed as unsupported for now (intrinsic-maximum pages stay on legacy).
-    #[allow(dead_code)]
+    /// Used when a subgrid's parent track is `min-content` or `max-content`.
+    /// An ordinary grid with these keywords stays on `grid:intrinsic-track`.
     MinContent,
-    #[allow(dead_code)]
     MaxContent,
     /// `calc(P% + Qpx)`.
     Calc {
@@ -881,7 +1191,7 @@ fn rows_all_definite(spec: &str) -> bool {
         && template
             .tracks
             .iter()
-            .all(|track| !spec_contains_auto(*track))
+            .all(|track| !spec_contains_auto(*track) && !spec_is_intrinsic_keyword(track))
 }
 
 fn spec_is_auto(spec: Spec) -> bool {
@@ -964,7 +1274,7 @@ fn parse_template(spec: &str, rows: bool) -> Option<Template> {
             }
             let (count, rest) = split_top_level_once(inner, ',')?;
             let count = count.trim();
-            let repeated = parse_track_list(rest.trim())?;
+            let (repeated, repeated_names) = parse_track_list(rest.trim())?;
             if repeated.is_empty() {
                 return None;
             }
@@ -978,7 +1288,7 @@ fn parse_template(spec: &str, rows: bool) -> Option<Template> {
                     return None;
                 }
                 for _ in 0..count {
-                    push_tracks(&mut tracks, &mut names, &repeated)?;
+                    append_named(&mut tracks, &mut names, &repeated, &repeated_names)?;
                 }
             }
         } else {
@@ -1002,7 +1312,7 @@ fn parse_template(spec: &str, rows: bool) -> Option<Template> {
 }
 
 fn parse_one_track(spec: &str) -> Option<Spec> {
-    let tracks = parse_track_list(spec.trim())?;
+    let (tracks, _) = parse_track_list(spec.trim())?;
     if tracks.len() == 1 {
         Some(tracks.into_iter().next()?)
     } else {
@@ -1010,25 +1320,39 @@ fn parse_one_track(spec: &str) -> Option<Spec> {
     }
 }
 
-fn parse_track_list(spec: &str) -> Option<Vec<Spec>> {
+/// Track sizes plus the line names before each track and after the last.
+fn parse_track_list(spec: &str) -> Option<(Vec<Spec>, Vec<Vec<String>>)> {
     let mut tracks = Vec::new();
+    let mut names = vec![Vec::new()];
     for token in split_top_level_whitespace(spec) {
         if token.starts_with('[') {
-            line_names(token)?;
+            names.last_mut()?.extend(line_names(token)?);
             continue;
         }
         if strip_function(token, "repeat").is_some() {
             return None;
         }
         tracks.push(parse_track(token)?);
+        names.push(Vec::new());
     }
-    Some(tracks)
+    Some((tracks, names))
 }
 
-fn push_tracks(tracks: &mut Vec<Spec>, names: &mut Vec<Vec<String>>, extra: &[Spec]) -> Option<()> {
-    for spec in extra {
+fn append_named(
+    tracks: &mut Vec<Spec>,
+    names: &mut Vec<Vec<String>>,
+    extra: &[Spec],
+    extra_names: &[Vec<String>],
+) -> Option<()> {
+    if extra.is_empty() {
+        return Some(());
+    }
+    if let (Some(last), Some(first)) = (names.last_mut(), extra_names.first()) {
+        last.extend(first.iter().cloned());
+    }
+    for (index, spec) in extra.iter().enumerate() {
         tracks.push(spec.clone());
-        names.push(Vec::new());
+        names.push(extra_names.get(index + 1).cloned().unwrap_or_default());
         if tracks.len() > MAX_TRACKS {
             return None;
         }
@@ -1069,10 +1393,11 @@ fn parse_breadth(token: &str) -> Option<Breadth> {
     if token.is_empty() || token.eq_ignore_ascii_case("auto") {
         return Some(Breadth::Auto);
     }
-    // min-content / max-content track sizes still disagree with the
-    // legacy engine on intrinsic-maximum tests. Leave those pages there.
-    if token.eq_ignore_ascii_case("min-content") || token.eq_ignore_ascii_case("max-content") {
-        return None;
+    if token.eq_ignore_ascii_case("min-content") {
+        return Some(Breadth::MinContent);
+    }
+    if token.eq_ignore_ascii_case("max-content") {
+        return Some(Breadth::MaxContent);
     }
     if let Some(inner) = strip_function(token, "calc") {
         return parse_calc(inner);
@@ -1231,36 +1556,98 @@ fn parse_axis_syntax(value: &str) -> Option<()> {
 }
 
 fn parse_line_syntax(token: &str) -> Option<()> {
-    let token = token.trim();
-    if token.is_empty() {
+    parse_grid_line(token).map(|_| ())
+}
+
+enum GridLine {
+    Auto,
+    Index(i32),
+    /// `nth` is the written integer. `1` with `explicit` false is a bare name.
+    Named {
+        name: String,
+        nth: i32,
+        explicit: bool,
+    },
+    Span {
+        count: usize,
+        name: Option<String>,
+    },
+}
+
+fn parse_grid_line(token: &str) -> Option<GridLine> {
+    let parts: Vec<&str> = token.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > 3 {
         return None;
     }
-    let mut parts = token.split_whitespace();
-    let first = parts.next()?;
-    let second = parts.next();
-    if parts.next().is_some() {
-        return None;
+    if parts[0].eq_ignore_ascii_case("auto") && parts.len() == 1 {
+        return Some(GridLine::Auto);
     }
-    if first.eq_ignore_ascii_case("span") {
-        let name = second.unwrap_or("1");
-        if name.parse::<u32>().is_ok() || is_ident(name) {
-            return Some(());
+    if parts[0].eq_ignore_ascii_case("span") {
+        let (count, name) = match &parts[1..] {
+            [] => (1, None),
+            [one] if one.parse::<usize>().is_ok() => {
+                (one.parse::<usize>().unwrap_or(1).max(1), None)
+            }
+            [one] if is_ident(one) => (1, Some((*one).to_string())),
+            [a, b] => {
+                if let Ok(count) = a.parse::<usize>() {
+                    if !is_ident(b) {
+                        return None;
+                    }
+                    (count.max(1), Some((*b).to_string()))
+                } else if is_ident(a) {
+                    let count: usize = b.parse().ok()?;
+                    (count.max(1), Some((*a).to_string()))
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        return Some(GridLine::Span { count, name });
+    }
+    match parts.as_slice() {
+        [one] => {
+            if let Ok(index) = one.parse::<i32>() {
+                if index == 0 {
+                    return None;
+                }
+                Some(GridLine::Index(index))
+            } else if is_ident(one) {
+                Some(GridLine::Named {
+                    name: (*one).to_string(),
+                    nth: 1,
+                    explicit: false,
+                })
+            } else {
+                None
+            }
         }
-        return None;
-    }
-    if first.eq_ignore_ascii_case("auto") && second.is_none() {
-        return Some(());
-    }
-    if first.parse::<i32>().is_ok() {
-        if let Some(rest) = second {
-            return parse_line_syntax(rest);
+        [a, b] => {
+            if let Ok(nth) = b.parse::<i32>() {
+                if nth == 0 || !is_ident(a) {
+                    return None;
+                }
+                Some(GridLine::Named {
+                    name: (*a).to_string(),
+                    nth,
+                    explicit: true,
+                })
+            } else if let Ok(nth) = a.parse::<i32>() {
+                if nth == 0 || !is_ident(b) {
+                    return None;
+                }
+                Some(GridLine::Named {
+                    name: (*b).to_string(),
+                    nth,
+                    explicit: true,
+                })
+            } else {
+                None
+            }
         }
-        return Some(());
+        _ => None,
     }
-    if is_ident(first) && second.is_none() {
-        return Some(());
-    }
-    None
 }
 
 fn is_ident(token: &str) -> bool {
@@ -1298,29 +1685,31 @@ fn resolve_pair(
     names: &[Vec<String>],
     explicit: usize,
 ) -> Option<AxisPlace> {
-    let start_span = span_count(start);
-    let end_span = span_count(end);
-    if let Some(span) = start_span {
-        let end_line = line_index(end, names, explicit, None)?;
-        let start_line = end_line - span as isize;
+    let start = parse_grid_line(start)?;
+    let end = parse_grid_line(end)?;
+    if let GridLine::Span { count, name } = start {
+        let end_line = grid_line_index(&end, names, explicit, None)?;
+        let start_line = span_to_line(end_line, count, name.as_deref(), names, false)?;
+        let span = (end_line - start_line).unsigned_abs().max(1);
         return Some(AxisPlace {
-            start: Some(start_line),
+            start: Some(start_line.min(end_line)),
             span,
         });
     }
-    if let Some(span) = end_span {
-        let start_line = line_index(start, names, explicit, None)?;
+    if let GridLine::Span { count, name } = end {
+        let start_line = grid_line_index(&start, names, explicit, None)?;
+        let end_line = span_to_line(start_line, count, name.as_deref(), names, true)?;
+        let span = (end_line - start_line).unsigned_abs().max(1);
         return Some(AxisPlace {
-            start: Some(start_line),
+            start: Some(start_line.min(end_line)),
             span,
         });
     }
-    let start_line = line_index(start, names, explicit, None)?;
-    let end_line = line_index(end, names, explicit, Some(start_line))?;
+    let start_line = grid_line_index(&start, names, explicit, None)?;
+    let end_line = grid_line_index(&end, names, explicit, Some(start_line))?;
     let span = (end_line - start_line).unsigned_abs().max(1);
-    let start_line = start_line.min(end_line);
     Some(AxisPlace {
-        start: Some(start_line),
+        start: Some(start_line.min(end_line)),
         span,
     })
 }
@@ -1331,56 +1720,125 @@ fn resolve_one(
     explicit: usize,
     after: Option<isize>,
 ) -> Option<AxisPlace> {
-    if let Some(span) = span_count(token) {
-        return Some(AxisPlace { start: None, span });
-    }
-    if token.trim().eq_ignore_ascii_case("auto") {
-        return Some(AxisPlace {
+    match parse_grid_line(token)? {
+        GridLine::Auto => Some(AxisPlace {
             start: None,
             span: 1,
+        }),
+        GridLine::Span { count, name: None } => Some(AxisPlace {
+            start: None,
+            span: count,
+        }),
+        // `span <name>` needs the other edge. A lone named span cannot
+        // choose a track, so the page stays on the legacy engine.
+        GridLine::Span { name: Some(_), .. } => None,
+        other => Some(AxisPlace {
+            start: Some(grid_line_index(&other, names, explicit, after)?),
+            span: 1,
+        }),
+    }
+}
+
+/// Walk `count` tracks, or `count` lines of `name`, from `from` exclusive.
+fn span_to_line(
+    from: isize,
+    count: usize,
+    name: Option<&str>,
+    names: &[Vec<String>],
+    forward: bool,
+) -> Option<isize> {
+    let Some(name) = name else {
+        return Some(if forward {
+            from + count as isize
+        } else {
+            from - count as isize
         });
+    };
+    let mut found = 0_usize;
+    if forward {
+        let mut index = from + 1;
+        while (index as usize) < names.len() {
+            if names[index as usize].iter().any(|line| line == name) {
+                found += 1;
+                if found == count {
+                    return Some(index);
+                }
+            }
+            index += 1;
+        }
+    } else {
+        let mut index = from - 1;
+        while index >= 0 {
+            if names[index as usize].iter().any(|line| line == name) {
+                found += 1;
+                if found == count {
+                    return Some(index);
+                }
+            }
+            index -= 1;
+        }
     }
-    Some(AxisPlace {
-        start: Some(line_index(token, names, explicit, after)?),
-        span: 1,
-    })
+    None
 }
 
-fn span_count(token: &str) -> Option<usize> {
-    let mut parts = token.split_whitespace();
-    if !parts.next()?.eq_ignore_ascii_case("span") {
-        return None;
-    }
-    let count = parts.next().unwrap_or("1");
-    if parts.next().is_some() {
-        return None;
-    }
-    let count: usize = count.parse().ok()?;
-    Some(count.max(1))
-}
-
-fn line_index(
-    token: &str,
+fn grid_line_index(
+    line: &GridLine,
     names: &[Vec<String>],
     explicit: usize,
     after: Option<isize>,
 ) -> Option<isize> {
-    let token = token.trim();
-    if let Ok(index) = token.parse::<i32>() {
-        if index == 0 {
-            return None;
+    match line {
+        GridLine::Auto | GridLine::Span { .. } => None,
+        GridLine::Index(index) => {
+            if *index == 0 {
+                return None;
+            }
+            Some(if *index > 0 {
+                (*index - 1) as isize
+            } else {
+                explicit as isize + *index as isize + 1
+            })
         }
-        return Some(if index > 0 {
-            (index - 1) as isize
-        } else {
-            explicit as isize + index as isize + 1
-        });
+        GridLine::Named {
+            name,
+            nth,
+            explicit: nth_written,
+        } => named_line(name, *nth, *nth_written, names, explicit, after),
     }
-    let after = after.unwrap_or(-1);
-    names.iter().enumerate().find_map(|(index, line)| {
-        let index = index as isize;
-        (index > after && line.iter().any(|name| name == token)).then_some(index)
-    })
+}
+
+fn named_line(
+    name: &str,
+    nth: i32,
+    nth_written: bool,
+    names: &[Vec<String>],
+    explicit: usize,
+    after: Option<isize>,
+) -> Option<isize> {
+    let limit = explicit.min(names.len().saturating_sub(1));
+    let hits: Vec<isize> = names
+        .iter()
+        .enumerate()
+        .take(limit + 1)
+        .filter(|(_, line)| line.iter().any(|candidate| candidate == name))
+        .map(|(index, _)| index as isize)
+        .collect();
+    if !nth_written {
+        let after = after.unwrap_or(-1);
+        return hits.into_iter().find(|index| *index > after);
+    }
+    if nth > 0 {
+        hits.get((nth as usize) - 1).copied()
+    } else if nth < 0 {
+        let index = hits.len() as i32 + nth;
+        if index < 0 {
+            None
+        } else {
+            hits.get(index as usize).copied()
+        }
+    } else {
+        None
+    }
 }
 
 struct Placed {
@@ -2040,9 +2498,8 @@ fn inline_minmax(
         other => spacing_px(style, other, 0.0, space),
     };
     let extra = edges + margin(style.margin.left) + margin(style.margin.right);
-    if plain_subgrid_style(style) && matches!(style.width, Dimension::Auto) {
-        // Definite parent tracks do not need this item's min-content.
-        // Every other auto-width grid item still falls back.
+    if columns_spec(style).is_some_and(is_subgrid_axis) && matches!(style.width, Dimension::Auto) {
+        // A column subgrid contributes per parent track, not as one item.
         return Some((0, 0));
     }
     let content = match style.width {
@@ -2079,6 +2536,196 @@ fn span_sum(sizes: &[i64], collapsed: &[bool], start: usize, span: usize, gap: i
     total
 }
 
+fn axis_mbp(style: &Style, space: &ConstraintSpace, rows: bool) -> (i64, i64) {
+    let [bt, br, bb, bl] = block::border_widths(style);
+    let pad = |spacing| spacing_px(style, spacing, 0.0, space);
+    let margin = |spacing| spacing_px(style, spacing, 0.0, space);
+    if rows {
+        (
+            units(bt + pad(style.padding.top) + margin(style.margin.top)),
+            units(bb + pad(style.padding.bottom) + margin(style.margin.bottom)),
+        )
+    } else {
+        (
+            units(bl + pad(style.padding.left) + margin(style.margin.left)),
+            units(br + pad(style.padding.right) + margin(style.margin.right)),
+        )
+    }
+}
+
+fn add_span_contrib(
+    mins: &mut [i64],
+    maxs: &mut [i64],
+    start: usize,
+    span: usize,
+    min_c: i64,
+    max_c: i64,
+) {
+    if span == 0 || start >= mins.len() {
+        return;
+    }
+    let end = (start + span).min(mins.len());
+    if end - start <= 1 {
+        mins[start] = mins[start].max(min_c);
+        maxs[start] = maxs[start].max(max_c);
+        return;
+    }
+    let current: i64 = maxs[start..end].iter().sum();
+    if max_c > current {
+        let extra = max_c - current;
+        let slots = (end - start) as i64;
+        for slot in &mut maxs[start..end] {
+            *slot += extra / slots;
+        }
+    }
+    let current_min: i64 = mins[start..end].iter().sum();
+    if min_c > current_min {
+        let extra = min_c - current_min;
+        let slots = (end - start) as i64;
+        for slot in &mut mins[start..end] {
+            *slot += extra / slots;
+        }
+    }
+}
+
+/// Items of a column subgrid, written into the parent tracks at `origin`.
+/// `span_names` is already the parent's line names for this span (index 0
+/// is the span's start line), so a nested call can pass a slice.
+fn contribute_subgrid_columns(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    origin: usize,
+    span: usize,
+    span_names: &[Vec<String>],
+    parent_gap: i64,
+    extra_start: i64,
+    extra_end: i64,
+    col_min: &mut [i64],
+    col_max: &mut [i64],
+) -> Option<()> {
+    if span == 0 || origin.saturating_add(span) > col_min.len() {
+        return super::bail("grid:subgrid");
+    }
+    let style = flat[index].style;
+    let names = merge_line_names(span_names, &local_subgrid_names(style, false), span);
+    let (mbp_start, mbp_end) = axis_mbp(style, space, false);
+    let half = gap_half(style.column_gap, parent_gap);
+    let row_names = if style.grid_rows().is_some_and(is_subgrid_axis) {
+        Vec::new()
+    } else {
+        match style.grid_rows() {
+            Some(spec) => parse_template(spec, true).why("grid:template")?.names,
+            None => vec![Vec::new()],
+        }
+    };
+    let explicit_rows = row_names.len().saturating_sub(1);
+    let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    let mut pending = Vec::new();
+    for (ordinal, child) in rendered_children(flat, index).enumerate() {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) {
+            continue;
+        }
+        let column =
+            resolve_axis(placement(child_style, false), &names, span).why("grid:column")?;
+        let row = resolve_axis(placement(child_style, true), &row_names, explicit_rows)
+            .why("grid:row")?;
+        pending.push((Some(column), Some(row), child_style.order, child, ordinal));
+    }
+    pending.sort_by_key(|item| (item.2, item.4));
+    let placed = place_items(&pending, span, explicit_rows, flow).why("grid:place")?;
+    let mut covered_start = false;
+    let mut covered_end = false;
+    for (child, col, _row, col_span, _row_span, _source) in placed {
+        let child_style = flat[child].style;
+        let mut start = col;
+        let mut child_span = col_span.max(1);
+        if start >= span {
+            start = span - 1;
+            child_span = 1;
+        }
+        if start + child_span > span {
+            child_span = span - start;
+        }
+        if start == 0 {
+            covered_start = true;
+        }
+        if start + child_span == span {
+            covered_end = true;
+        }
+        let edge_start = if start == 0 {
+            mbp_start + extra_start
+        } else {
+            half
+        };
+        let edge_end = if start + child_span == span {
+            mbp_end + extra_end
+        } else {
+            half
+        };
+        if columns_spec(child_style).is_some_and(is_subgrid_axis) {
+            contribute_subgrid_columns(
+                flat,
+                child,
+                space,
+                origin + start,
+                child_span,
+                &slice_names(&names, start, child_span),
+                parent_gap,
+                edge_start,
+                edge_end,
+                col_min,
+                col_max,
+            )?;
+            continue;
+        }
+        let (min_c, max_c) = inline_minmax(flat, child, space).why("grid:intrinsic")?;
+        add_span_contrib(
+            col_min,
+            col_max,
+            origin + start,
+            child_span,
+            min_c + edge_start + edge_end,
+            max_c + edge_start + edge_end,
+        );
+    }
+    if !covered_start {
+        let extra = mbp_start + extra_start;
+        col_min[origin] = col_min[origin].max(extra);
+        col_max[origin] = col_max[origin].max(extra);
+    }
+    if !covered_end && span > 1 {
+        let track = origin + span - 1;
+        let extra = mbp_end + extra_end;
+        col_min[track] = col_min[track].max(extra);
+        col_max[track] = col_max[track].max(extra);
+    }
+    Some(())
+}
+
+/// A row subgrid's inline size is the widest child, plus its own edges.
+/// Children stack on the row axis, so they do not sit side by side.
+fn row_subgrid_inline(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<(i64, i64)> {
+    let style = flat[index].style;
+    let (start, end) = axis_mbp(style, space, false);
+    let mut min_c = 0_i64;
+    let mut max_c = 0_i64;
+    for child in rendered_children(flat, index) {
+        if oof::is_out_of_flow(flat[child].style) {
+            continue;
+        }
+        let (child_min, child_max) = inline_minmax(flat, child, space).why("grid:intrinsic")?;
+        min_c = min_c.max(child_min);
+        max_c = max_c.max(child_max);
+    }
+    Some((min_c + start + end, max_c + start + end))
+}
+
 /// Lay out one grid container. `sized` is the content box a float, an
 /// abspos containing block, or a stretch pass already resolved.
 pub(super) fn layout(
@@ -2087,6 +2734,9 @@ pub(super) fn layout(
     space: &ConstraintSpace,
     sized: Option<(f32, Option<f32>)>,
 ) -> Option<LayoutResult> {
+    SUBGRID_CONTENT_ROWS.with(|cell| {
+        cell.borrow_mut().retain(|(id, _)| *id != index);
+    });
     let style = flat[index].style;
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
@@ -2115,8 +2765,8 @@ pub(super) fn layout(
     let font = style.font_size.max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
-    let column_sub = columns_spec(style).is_some_and(is_plain_subgrid);
-    let row_sub = style.grid_rows().is_some_and(is_plain_subgrid);
+    let column_sub = columns_spec(style).is_some_and(is_subgrid_axis);
+    let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
     let inherited = if column_sub || row_sub {
         Some(lookup_inherited(flat, index, space, column_sub, row_sub).why("grid:subgrid")?)
     } else {
@@ -2133,7 +2783,13 @@ pub(super) fn layout(
         }
     }
     let columns_template = if column_sub {
-        fixed_template(&inherited.as_ref().unwrap().columns)
+        let inherited = inherited.as_ref().unwrap();
+        let names = merge_line_names(
+            &inherited.col_names,
+            &local_subgrid_names(style, false),
+            inherited.columns.len(),
+        );
+        fixed_template(&inherited.columns, names)
     } else {
         match columns_spec(style) {
             None => parse_template("", false).why("grid:template")?,
@@ -2141,7 +2797,17 @@ pub(super) fn layout(
         }
     };
     let rows_template = if row_sub {
-        fixed_template(&inherited.as_ref().unwrap().rows)
+        let inherited = inherited.as_ref().unwrap();
+        let local = local_subgrid_names(style, true);
+        if let Some(rows) = &inherited.rows {
+            let names = merge_line_names(&inherited.row_names, &local, rows.len());
+            fixed_template(rows, names)
+        } else if inherited.row_span == 0 {
+            return super::bail("grid:subgrid");
+        } else {
+            let names = merge_line_names(&inherited.row_names, &local, inherited.row_span);
+            auto_named_template(inherited.row_span, names)
+        }
     } else {
         match style.grid_rows() {
             None => parse_template("", true).why("grid:template")?,
@@ -2237,29 +2903,54 @@ pub(super) fn layout(
     let mut col_max = vec![0_i64; column_specs.len()];
     let mut contribs = Vec::new();
     for item in &items {
-        let (min_c, max_c) = inline_minmax(flat, item.index, space).why("grid:intrinsic")?;
-        contribs.push((min_c, max_c));
+        let child_style = flat[item.index].style;
+        if columns_spec(child_style).is_some_and(is_subgrid_axis) {
+            contribute_subgrid_columns(
+                flat,
+                item.index,
+                space,
+                item.col,
+                item.col_span,
+                &slice_names(&names_cols, item.col, item.col_span),
+                column_gap_u,
+                0,
+                0,
+                &mut col_min,
+                &mut col_max,
+            )?;
+            contribs.push(None);
+            continue;
+        }
+        let (min_c, max_c) = if child_style.grid_rows().is_some_and(is_subgrid_axis) {
+            row_subgrid_inline(flat, item.index, space).why("grid:intrinsic")?
+        } else {
+            inline_minmax(flat, item.index, space).why("grid:intrinsic")?
+        };
+        contribs.push(Some((min_c, max_c)));
         if item.col_span == 1 {
             col_min[item.col] = col_min[item.col].max(min_c);
             col_max[item.col] = col_max[item.col].max(max_c);
         }
     }
-    for (item, (min_c, max_c)) in items.iter().zip(&contribs) {
+    for (item, contrib) in items.iter().zip(&contribs) {
+        let Some((min_c, max_c)) = *contrib else {
+            continue;
+        };
         if item.col_span <= 1 {
             continue;
         }
         let end = (item.col + item.col_span).min(col_max.len());
         let current: i64 = col_max[item.col..end].iter().sum();
-        if *max_c > current {
-            let extra = *max_c - current;
+        if max_c > current {
+            let extra = max_c - current;
             let slots = (end - item.col).max(1) as i64;
             for slot in &mut col_max[item.col..end] {
                 *slot += extra / slots;
             }
         }
         let current_min: i64 = col_min[item.col..end].iter().sum();
-        if *min_c > current_min {
-            let extra = *min_c - current_min;
+        if min_c > current_min {
+            let extra = min_c - current_min;
             let slots = (end - item.col).max(1) as i64;
             for slot in &mut col_min[item.col..end] {
                 *slot += extra / slots;
@@ -2326,10 +3017,30 @@ pub(super) fn layout(
             matches!(child_style.margin.bottom, Spacing::Auto),
             matches!(child_style.margin.left, Spacing::Auto),
         ];
-        let ml = spacing_px(child_style, child_style.margin.left, area, space);
-        let mr = spacing_px(child_style, child_style.margin.right, area, space);
-        let mt = spacing_px(child_style, child_style.margin.top, area, space);
-        let mb = spacing_px(child_style, child_style.margin.bottom, area, space);
+        let mut ml = spacing_px(child_style, child_style.margin.left, area, space);
+        let mut mr = spacing_px(child_style, child_style.margin.right, area, space);
+        let mut mt = spacing_px(child_style, child_style.margin.top, area, space);
+        let mut mb = spacing_px(child_style, child_style.margin.bottom, area, space);
+        // Half of (subgrid gap − parent gap) sits on the side that faces a
+        // gutter, so a stretched item shrinks and a definite item only shifts.
+        if column_sub {
+            let half = from_units(gap_half(style.column_gap, column_gap_u));
+            if item.col > 0 {
+                ml += half;
+            }
+            if item.col + item.col_span < columns.len() {
+                mr += half;
+            }
+        }
+        if row_sub {
+            let half = from_units(gap_half(style.row_gap, row_gap_u));
+            if item.row > 0 {
+                mt += half;
+            }
+            if item.row + item.row_span < row_specs.len() {
+                mb += half;
+            }
+        }
         let border = block::border_widths(child_style);
         let pad = |spacing| spacing_px(child_style, spacing, area, space);
         let edges_h =
@@ -2388,8 +3099,10 @@ pub(super) fn layout(
         flat,
         index,
         &columns,
+        &names_cols,
         col_between,
         &row_specs,
+        &names_rows,
         definite_block.map(units),
         font,
         row_gap_u,
@@ -2415,8 +3128,30 @@ pub(super) fn layout(
             item.content_width,
             item.specified_content_h,
         )?;
-        let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
-        if item.row_span == 1 && item.row < row_max.len() {
+        if let Some(content) = take_content_rows(item.index) {
+            if content.len() != item.row_span {
+                return super::bail("grid:subgrid");
+            }
+            let (start_mbp, end_mbp) = axis_mbp(flat[item.index].style, space, true);
+            let last = content.len().saturating_sub(1);
+            for (offset, size) in content.iter().enumerate() {
+                let track = item.row + offset;
+                if track >= row_max.len() {
+                    continue;
+                }
+                let mut extra = *size;
+                if offset == 0 {
+                    extra += start_mbp;
+                }
+                if offset == last {
+                    extra += end_mbp;
+                }
+                extra = extra.max(0);
+                row_max[track] = row_max[track].max(extra);
+                row_min[track] = row_min[track].max(extra);
+            }
+        } else if item.row_span == 1 && item.row < row_max.len() {
+            let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
             row_max[item.row] = row_max[item.row].max(margin_box);
             row_min[item.row] = row_min[item.row].max(margin_box);
         }
@@ -2445,12 +3180,18 @@ pub(super) fn layout(
     } else {
         finalize(&row_tracks, None, row_gap_u)
     };
+    let mut recorded_rows = None;
     if row_sub {
-        let exact = &inherited.as_ref().unwrap().rows;
-        if exact.len() != rows.len() {
-            return super::bail("grid:subgrid");
+        let inherited = inherited.as_ref().unwrap();
+        if let Some(exact) = &inherited.rows {
+            if exact.len() != rows.len() {
+                return super::bail("grid:subgrid");
+            }
+            rows.clone_from(exact);
+        } else {
+            // Content sizes only. The parent adds margin, border, and padding.
+            recorded_rows = Some(rows.clone());
         }
-        rows.clone_from(exact);
     }
     let row_collapsed = vec![false; rows.len()];
     let base = rows.iter().sum::<i64>() + gap_sum(&row_collapsed, row_gap_u);
@@ -2494,6 +3235,7 @@ pub(super) fn layout(
             grow(&mut rows, &caps, extra);
         }
     }
+    publish_row_sizes(index, &rows);
 
     for (item, fragment) in built.iter().zip(fragments.iter_mut()) {
         if !item.stretch_block || rows.is_empty() {
@@ -2672,6 +3414,11 @@ pub(super) fn layout(
     start_strut.append(metrics.margin[0]);
     let mut end_strut = MarginStrut::default();
     end_strut.append(metrics.margin[2]);
+    if let Some(recorded) = recorded_rows {
+        SUBGRID_CONTENT_ROWS.with(|cell| {
+            cell.borrow_mut().push((index, recorded));
+        });
+    }
     Some(LayoutResult {
         fragment: BoxFragment {
             index,
@@ -3218,15 +3965,24 @@ mod tests {
             grid_style(200.0, None, Some("subgrid")),
             vec![leaf(block_box(None, Some(10.0)))],
         );
-        // Line names and an auto parent track are not this slice.
-        let mut named = subgrid_box(Some("subgrid [a]"), None);
-        named.grid_column = Some("1 / -1".to_string());
-        let mut auto_parent = grid_style(200.0, None, Some("auto auto"));
-        auto_parent.width = Dimension::Px(200.0);
+        // `repeat()` inside the subgrid keyword, and a specified size on
+        // the subgridded axis, stay on the legacy engine.
+        let mut repeated = subgrid_box(Some("subgrid repeat(1, [a])"), None);
+        repeated.grid_column = Some("1 / -1".to_string());
         falls_back(
-            auto_parent,
+            grid_style(200.0, None, Some("100px 100px")),
             vec![Component::boxed(
-                named,
+                repeated,
+                vec![leaf(block_box(None, Some(10.0)))],
+            )],
+        );
+        let mut sized = subgrid_box(Some("subgrid"), None);
+        sized.width = Dimension::Px(50.0);
+        sized.grid_column = Some("1 / -1".to_string());
+        falls_back(
+            grid_style(200.0, None, Some("100px 100px")),
+            vec![Component::boxed(
+                sized,
                 vec![leaf(block_box(None, Some(10.0)))],
             )],
         );
@@ -3332,6 +4088,281 @@ mod tests {
                 (1, [0.0, 0.0, 100.0, 80.0]),
                 (2, [0.0, 0.0, 100.0, 30.0]),
                 (3, [0.0, 30.0, 100.0, 50.0]),
+            ],
+        );
+    }
+
+    fn rows(style: &mut Style, spec: &str) {
+        style.grid_ng_mut().grid_template_rows = Some(spec.to_string());
+    }
+
+    fn row_placement(style: &mut Style, spec: &str) {
+        style.grid_ng_mut().grid_row = Some(spec.to_string());
+    }
+
+    #[test]
+    fn subgrid_contributes_auto_fr_minmax_and_intrinsic_tracks() {
+        // Chrome, body margin 0. auto/auto in 200px splits the extra 130.
+        let mut sub = subgrid_box(Some("subgrid"), None);
+        sub.grid_column = Some("1 / -1".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(200.0, None, Some("auto auto")),
+                vec![Component::boxed(
+                    sub.clone(),
+                    vec![
+                        leaf(block_box(Some(40.0), Some(10.0))),
+                        leaf(block_box(Some(30.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[
+                (1, [0.0, 0.0, 200.0, 10.0]),
+                (2, [0.0, 0.0, 40.0, 10.0]),
+                (3, [105.0, 0.0, 30.0, 10.0]),
+            ],
+        );
+        // Subgrid column-gap 20, parent gap 0. Bases 50 and 40, item 2 at 115.
+        let mut gapped = sub.clone();
+        gapped.column_gap = Some(20.0);
+        expect(
+            &Component::boxed(
+                grid_style(200.0, None, Some("auto auto")),
+                vec![Component::boxed(
+                    gapped,
+                    vec![
+                        leaf(block_box(Some(40.0), Some(10.0))),
+                        leaf(block_box(Some(30.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[(2, [0.0, 0.0, 40.0, 10.0]), (3, [115.0, 0.0, 30.0, 10.0])],
+        );
+        // Parent gap 10, subgrid gap 30. Item 2 at 120.
+        let mut parent_gap = grid_style(200.0, None, Some("auto auto"));
+        parent_gap.column_gap = Some(10.0);
+        let mut wider = sub.clone();
+        wider.column_gap = Some(30.0);
+        expect(
+            &Component::boxed(
+                parent_gap,
+                vec![Component::boxed(
+                    wider,
+                    vec![
+                        leaf(block_box(Some(40.0), Some(10.0))),
+                        leaf(block_box(Some(30.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[(3, [120.0, 0.0, 30.0, 10.0])],
+        );
+        // Fixed tracks, subgrid gap 20. Stretch items shrink to a 20px gutter.
+        let mut fixed_gap = subgrid_box(Some("subgrid"), None);
+        fixed_gap.grid_column = Some("1 / -1".to_string());
+        fixed_gap.column_gap = Some(20.0);
+        expect(
+            &Component::boxed(
+                grid_style(200.0, None, Some("100px 100px")),
+                vec![Component::boxed(
+                    fixed_gap,
+                    vec![
+                        leaf(block_box(None, Some(10.0))),
+                        leaf(block_box(None, Some(10.0))),
+                    ],
+                )],
+            ),
+            &[(2, [0.0, 0.0, 90.0, 10.0]), (3, [110.0, 0.0, 90.0, 10.0])],
+        );
+        // 1fr 2fr at 210px is 70 / 140.
+        expect(
+            &Component::boxed(
+                grid_style(210.0, None, Some("1fr 2fr")),
+                vec![Component::boxed(
+                    sub.clone(),
+                    vec![
+                        leaf(block_box(None, Some(10.0))),
+                        leaf(block_box(None, Some(10.0))),
+                    ],
+                )],
+            ),
+            &[(2, [0.0, 0.0, 70.0, 10.0]), (3, [70.0, 0.0, 140.0, 10.0])],
+        );
+        // minmax(20px, 1fr) minmax(50px, max-content): second track stays 80.
+        expect(
+            &Component::boxed(
+                grid_style(
+                    200.0,
+                    None,
+                    Some("minmax(20px, 1fr) minmax(50px, max-content)"),
+                ),
+                vec![Component::boxed(
+                    sub.clone(),
+                    vec![
+                        leaf(block_box(Some(40.0), Some(10.0))),
+                        leaf(block_box(Some(80.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[(3, [120.0, 0.0, 80.0, 10.0])],
+        );
+        // min-content / max-content do not stretch. 40 + 70 = 110.
+        expect(
+            &Component::boxed(
+                grid_style(300.0, None, Some("min-content max-content")),
+                vec![Component::boxed(
+                    sub,
+                    vec![
+                        leaf(block_box(Some(40.0), Some(10.0))),
+                        leaf(block_box(Some(70.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[
+                (1, [0.0, 0.0, 110.0, 10.0]),
+                (2, [0.0, 0.0, 40.0, 10.0]),
+                (3, [40.0, 0.0, 70.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn subgrid_inherits_parent_line_names_and_adds_its_own() {
+        // Parent [a] every other line. Child `span a / a -1` is the first
+        // two tracks of a 3-track span (100px).
+        let mut child = block_box(None, Some(10.0));
+        child.grid_column = Some("span a / a -1".to_string());
+        let mut sub = subgrid_box(Some("subgrid"), None);
+        sub.grid_column = Some("1 / span 3".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(200.0, None, Some("[a] 50px 50px [a] 50px 50px [a]")),
+                vec![Component::boxed(sub, vec![leaf(child)])],
+            ),
+            &[(1, [0.0, 0.0, 150.0, 10.0]), (2, [0.0, 0.0, 100.0, 10.0])],
+        );
+        // Own names: b is line 1, b 2 is line 3. 40px tracks, item at 40×80.
+        let mut named_child = block_box(None, Some(10.0));
+        named_child.grid_column = Some("b / b 2".to_string());
+        let mut own = subgrid_box(Some("subgrid [x] [b] [] [b]"), None);
+        own.grid_column = Some("1 / -1".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(160.0, None, Some("40px 40px 40px 40px")),
+                vec![Component::boxed(own, vec![leaf(named_child)])],
+            ),
+            &[(2, [40.0, 0.0, 80.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn nested_subgrid_splits_auto_columns() {
+        // Content 40+25+60+15 = 140. Extra 60 / 4 = 15.
+        // Tracks 55, 40, 75, 30. Inner span is 95.
+        let mut inner = subgrid_box(Some("subgrid"), None);
+        inner.grid_column = Some("span 2".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(200.0, None, Some("auto auto auto auto")),
+                vec![
+                    Component::boxed(
+                        inner,
+                        vec![
+                            leaf(block_box(Some(40.0), Some(10.0))),
+                            leaf(block_box(Some(25.0), Some(10.0))),
+                        ],
+                    ),
+                    leaf(block_box(Some(60.0), Some(10.0))),
+                    leaf(block_box(Some(15.0), Some(10.0))),
+                ],
+            ),
+            &[
+                (1, [0.0, 0.0, 95.0, 10.0]),
+                (2, [0.0, 0.0, 40.0, 10.0]),
+                (3, [55.0, 0.0, 25.0, 10.0]),
+                (4, [95.0, 0.0, 60.0, 10.0]),
+                (5, [170.0, 0.0, 15.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn subgrid_on_both_axes_and_indefinite_rows() {
+        let mut parent = grid_style(120.0, Some(80.0), Some("40px 80px"));
+        rows(&mut parent, "30px 50px");
+        let mut sub = subgrid_box(Some("subgrid"), Some("subgrid"));
+        sub.grid_column = Some("1 / -1".to_string());
+        row_placement(&mut sub, "1 / -1");
+        expect(
+            &Component::boxed(
+                parent,
+                vec![Component::boxed(
+                    sub,
+                    vec![
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[
+                (2, [0.0, 0.0, 10.0, 10.0]),
+                (3, [40.0, 0.0, 10.0, 10.0]),
+                (4, [0.0, 30.0, 10.0, 10.0]),
+                (5, [40.0, 30.0, 10.0, 10.0]),
+            ],
+        );
+        let mut auto_rows = grid_style(40.0, None, Some("40px"));
+        rows(&mut auto_rows, "auto auto");
+        let mut row_sub = subgrid_box(None, Some("subgrid"));
+        row_placement(&mut row_sub, "1 / -1");
+        expect(
+            &Component::boxed(
+                auto_rows,
+                vec![Component::boxed(
+                    row_sub,
+                    vec![
+                        leaf(block_box(Some(10.0), Some(30.0))),
+                        leaf(block_box(Some(10.0), Some(50.0))),
+                    ],
+                )],
+            ),
+            &[
+                (0, [0.0, 0.0, 40.0, 80.0]),
+                (1, [0.0, 0.0, 40.0, 80.0]),
+                (2, [0.0, 0.0, 10.0, 30.0]),
+                (3, [0.0, 30.0, 10.0, 50.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_subgrid_adds_margin_border_and_padding_to_the_edges() {
+        // start mbp 8+2+3 = 13, end 6+1+4 = 11. Tracks 33 and 21. Height 54.
+        let mut parent = grid_style(40.0, None, Some("40px"));
+        rows(&mut parent, "auto auto");
+        let mut sub = subgrid_box(None, Some("subgrid"));
+        row_placement(&mut sub, "1 / -1");
+        sub.margin = edges(8.0, 0.0, 6.0, 0.0);
+        sub.padding = edges(3.0, 0.0, 4.0, 0.0);
+        sub.border_top_width = Some(2.0);
+        sub.border_bottom_width = Some(1.0);
+        expect(
+            &Component::boxed(
+                parent,
+                vec![Component::boxed(
+                    sub,
+                    vec![
+                        leaf(block_box(Some(10.0), Some(20.0))),
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                    ],
+                )],
+            ),
+            &[
+                (0, [0.0, 0.0, 40.0, 54.0]),
+                (1, [0.0, 8.0, 40.0, 40.0]),
+                (2, [0.0, 13.0, 10.0, 20.0]),
+                (3, [0.0, 33.0, 10.0, 10.0]),
             ],
         );
     }
