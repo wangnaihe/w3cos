@@ -7,14 +7,18 @@
 //! lengths, alignment, line breaking). Baseline alignment, inline-flex,
 //! and an indefinite percentage basis stay on the legacy engine.
 //! `wrap-reverse` swaps the cross-start (Flexbox §5.2) and packs lines
-//! from that edge. Column wrap uses that same line breaking when the
-//! container's block size and every item's inline size are definite.
-//! An auto column height (`flex:wrap-column`, including max-height and
-//! aspect-ratio) and an auto item width (`flex:wrap-column-auto-cross`,
-//! the fit-content cross size) stay on the legacy engine. A definite-height
+//! from that edge. Column wrap breaks lines against a definite block size,
+//! a `max-height`, or an `aspect-ratio` transferred from a definite width.
+//! An automatic block size with none of those is one flex line (Flexbox
+//! §9.2); `wrap-reverse` packs that line at the cross end. An automatic
+//! item inline size is the fit-content size against the container's inner
+//! width. A column wrap whose block size is still automatic and that has
+//! a gap stays on legacy (`flex:wrap-column`): its reference uses logical
+//! margins and a writing mode this engine does not store. A definite-height
 //! row wrap with a gap and auto-height items stays there too
 //! (`flex-wrap: balance` is unrecognized, and its wrap reference must
-//! use the same engine).
+//! use the same engine). An item whose fit-content size cannot be measured
+//! stays on legacy (`flex:wrap-column-auto-cross`).
 //!
 //! A flex row the DOM lowered from an inline formatting context carries the
 //! IFC marker and is not a flex container; the block algorithm lays it out
@@ -71,22 +75,23 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-width-keyword") {
         return Some("flex:width-keyword");
     }
-    // Column wrap with a definite block size and definite item widths is
-    // laid out below. An auto height does not wrap (Flexbox §9.2);
-    // max-height and aspect-ratio are not a definite main size here.
-    // `width: auto` is the fit-content cross size and stays on legacy.
-    if style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction) {
-        if matches!(style.height, Dimension::Auto) {
-            return Some("flex:wrap-column");
-        }
-        if rendered_children(flat, index)
-            .any(|child| matches!(flat[child].style.width, Dimension::Auto))
-        {
-            return Some("flex:wrap-column-auto-cross");
-        }
+    // An automatic column block size is one flex line, except when a gap
+    // is present. gap-003's reference spaces items with logical margins
+    // under `writing-mode`, neither of which is stored; both sides of
+    // that reftest have to stay on legacy. `max-height` and `aspect-ratio`
+    // make the main size definite enough to wrap here.
+    let column_wrap = style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction);
+    if column_wrap
+        && matches!(style.height, Dimension::Auto)
+        && matches!(style.max_height, Dimension::Auto)
+        && !has_marker(style, "--w3cos-internal-aspect-ratio")
+        && (style.gap > 0.0
+            || style.row_gap.unwrap_or(0.0) > 0.0
+            || style.column_gap.unwrap_or(0.0) > 0.0)
+    {
+        return Some("flex:wrap-column");
     }
-    let definite_column_wrap =
-        style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction);
+    let definite_column_wrap = column_wrap;
     // `flex-wrap: balance` stays on legacy (the keyword is unrecognized).
     // Its reference is an ordinary wrap with a gap and a definite height,
     // and legacy leaves those auto-height items at 0 while NG would
@@ -367,6 +372,39 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
         return Some(MinMax::exact(0.0));
     }
     Some(sizes)
+}
+
+/// Fit-content inline size of a column item (CSS Sizing 3 §5.2.1):
+/// `clamp(min-content, available, max-content)`. `available` is the
+/// container's inner width minus this item's cross margins and edges.
+fn fit_content_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    available: f32,
+) -> Option<f32> {
+    let sizes = block::intrinsic_sizes(flat, index, space).why("flex:wrap-column-auto-cross")?;
+    let min = sizes.min.unwrap_or(sizes.max).max(0.0);
+    let max = sizes.max.max(min);
+    Some(max.min(min.max(available.max(0.0))))
+}
+
+/// `aspect-ratio` transferred through a definite width, as a content-box
+/// block size. The marker is a width/height ratio. Legacy layout ignores it.
+fn column_aspect_main(style: &Style, content_width: f32) -> Option<f32> {
+    if !matches!(style.height, Dimension::Auto) || matches!(style.width, Dimension::Auto) {
+        return None;
+    }
+    let ratio = style
+        .custom_properties
+        .as_ref()?
+        .get("--w3cos-internal-aspect-ratio")?
+        .parse::<f32>()
+        .ok()?;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    Some((content_width / ratio).max(0.0))
 }
 
 /// Margin-box inline contribution of one in-flow child.
@@ -728,7 +766,7 @@ pub(super) fn layout(
     let [pt, pr, pb, pl] = metrics.padding;
     let inner_width = metrics.content_width.max(0.0);
     let to_content_h = |size: f32| to_content(style, bt + bb + pt + pb, size);
-    let specified_height = if let Some((_, Some(height))) = sized {
+    let mut specified_height = if let Some((_, Some(height))) = sized {
         Some(height)
     } else {
         match definite(style.height, space.percentage_block, style, space).why("flex:percent")? {
@@ -736,10 +774,30 @@ pub(super) fn layout(
             None => None,
         }
     };
-    let inner_main = if row {
-        Some(inner_width)
+    // `max-height` is the line-breaking limit when the block size is auto,
+    // but the used block size is the flexed line (Chrome). `aspect-ratio`
+    // transfers a definite width into a definite block size.
+    let column_wrap = !row && style.flex_wrap != FlexWrap::NoWrap;
+    let max_main = if column_wrap {
+        block::resolve_length(style.max_height, space.percentage_block, style, space)
+            .map(|size| to_content_h(size))
     } else {
-        specified_height
+        None
+    };
+    if specified_height.is_none()
+        && column_wrap
+        && let Some(aspect) = column_aspect_main(style, inner_width)
+    {
+        specified_height = Some(max_main.map(|max| aspect.min(max)).unwrap_or(aspect));
+    }
+    let (inner_main, main_is_max) = if row {
+        (Some(inner_width), false)
+    } else if let Some(height) = specified_height {
+        (Some(height), false)
+    } else if let Some(max) = max_main {
+        (Some(max), true)
+    } else {
+        (None, false)
     };
     let gap = if row {
         style.column_gap.unwrap_or(style.gap)
@@ -795,12 +853,19 @@ pub(super) fn layout(
                 Some(size) => Some(to_content(child_style, cross_edges, size)),
                 None => None,
             };
-        // A column item's cross size is its width, which is definite before
-        // an auto height is measured.
+        // A column item's cross size is its width. Nowrap stretch uses the
+        // container's inner width. A wrap line's hypothetical cross size is
+        // fit-content; `cross_auto` stays set so the line can still stretch
+        // the item after align-content grows the line.
         if !row && cross.is_none() {
             let align = used_align(style.align_items, child_style.align_self);
-            let raw = if align == AlignItems::Stretch {
-                (inner_width - margin_cross_start - margin_cross_end - cross_edges).max(0.0)
+            let available =
+                (inner_width - margin_cross_start - margin_cross_end - cross_edges).max(0.0);
+            let raw = if column_wrap {
+                fit_content_size(flat, child, space, available)
+                    .why("flex:wrap-column-auto-cross")?
+            } else if align == AlignItems::Stretch {
+                available
             } else {
                 content_minmax(flat, child, space)
                     .why("flex:intrinsic")?
@@ -873,9 +938,9 @@ pub(super) fn layout(
     }
     items.sort_by(|a, b| a.order.cmp(&b.order).then(a.index.cmp(&b.index)));
 
-    // A definite main size is what makes a flex line wrap (Flexbox §9.2).
-    // An auto column height is rejected in container_reason and never
-    // reaches this single-line path.
+    // A definite main size, or a max-height used as that limit, is what
+    // makes a column wrap (Flexbox §9.2). An automatic block size with
+    // neither is one line and stays on the single-line path below.
     if style.flex_wrap != FlexWrap::NoWrap
         && let Some(inner) = inner_main
     {
@@ -889,6 +954,7 @@ pub(super) fn layout(
             inner_width,
             specified_height,
             inner,
+            main_is_max,
             gap,
         );
     }
@@ -965,6 +1031,16 @@ pub(super) fn layout(
         }
     }
 
+    // `wrap-reverse` on an automatic column packs the single line at the
+    // cross end (the right). A safe overflow stays at the cross start.
+    let column_wrap_reverse = !row && style.flex_wrap == FlexWrap::WrapReverse;
+    let safe_cross = has_marker(style, "--w3cos-internal-safe-align-content");
+    let reverse_cross = column_wrap_reverse && !(safe_cross && max_margin_box > inner_width + EPS);
+    let line_origin = if reverse_cross {
+        (inner_width - line_inner).max(0.0)
+    } else {
+        0.0
+    };
     let mut fragments = Vec::with_capacity(items.len());
     for item in &items {
         fragments.push(layout_item(
@@ -1018,12 +1094,18 @@ pub(super) fn layout(
         let margin_box = item.margin_box_cross();
         let extra = (line_inner - margin_box).max(0.0);
         // A definite cross size does not stretch; it aligns as flex-start.
-        let cross_offset = match item.align {
+        let from_start = match item.align {
             AlignItems::FlexEnd => extra,
             AlignItems::Center => extra / 2.0,
             AlignItems::Stretch | AlignItems::FlexStart | AlignItems::Baseline => 0.0,
         };
-        let cross = unit(item.margin_cross_start + cross_offset);
+        let cross = if reverse_cross {
+            let border_cross = item.cross.unwrap_or(0.0) + item.cross_edges;
+            line_origin + line_inner - from_start - item.margin_cross_start - border_cross
+        } else {
+            item.margin_cross_start + from_start
+        };
+        let cross = unit(cross);
         let (x, y) = if row {
             (bl + pl + main, bt + pt + cross)
         } else {
@@ -1164,6 +1246,7 @@ fn layout_wrapped(
     inner_width: f32,
     specified_height: Option<f32>,
     inner_main: f32,
+    main_is_max: bool,
     main_gap: f32,
 ) -> Option<LayoutResult> {
     let direction = style.flex_direction;
@@ -1376,8 +1459,19 @@ fn layout_wrapped(
             cross_cursor += line_size + cross_gap;
         }
     }
+    // A max-height limit flexes each line but does not force the used
+    // block size: the container is as tall as its tallest flexed line.
     let content_main = if row {
         inner_width
+    } else if main_is_max {
+        lines
+            .iter()
+            .map(|&(start, end)| {
+                let line = &items[start..end];
+                let gaps = main_gap * line.len().saturating_sub(1) as f32;
+                line.iter().map(|item| item.outer_main()).sum::<f32>() + gaps
+            })
+            .fold(0.0_f32, f32::max)
     } else {
         inner_main.max(0.0)
     };
@@ -2079,22 +2173,17 @@ mod tests {
     }
 
     #[test]
-    fn indefinite_column_wrap_and_auto_cross_stay_on_legacy() {
-        let auto_height = Style {
-            flex_wrap: FlexWrap::Wrap,
-            ..flex_style(FlexDirection::Column, 100.0, None)
-        };
-        let auto_cross = Style {
-            flex_wrap: FlexWrap::WrapReverse,
-            ..flex_style(FlexDirection::Column, 100.0, Some(80.0))
-        };
-        let auto_height_root =
-            Component::boxed(auto_height, vec![leaf(block_box(Some(10.0), Some(10.0)))]);
-        let auto_cross_root = Component::boxed(auto_cross, vec![leaf(block_box(None, Some(10.0)))]);
-        for root in [&auto_height_root, &auto_cross_root] {
-            let flat = pre_flatten(root);
-            assert!(super::super::layout_tree(root, &flat, 800.0, 600.0).is_none());
-        }
+    fn indefinite_column_wrap_with_a_gap_stays_on_legacy() {
+        // gap-003's reference uses logical margins and writing-mode, which
+        // are not stored. An automatic column with a gap stays on legacy
+        // so both sides of that reftest use the same engine.
+        let mut gapped = flex_style(FlexDirection::Column, 100.0, None);
+        gapped.flex_wrap = FlexWrap::Wrap;
+        gapped.gap = 20.0;
+        gapped.row_gap = Some(20.0);
+        let root = Component::boxed(gapped, vec![leaf(block_box(Some(40.0), Some(40.0)))]);
+        let flat = pre_flatten(&root);
+        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
     }
 
     fn column_wrap_baseline_and_rtl_stay_on_legacy() {
@@ -2610,6 +2699,188 @@ mod tests {
                 (1, [0.0, 0.0, 40.0, 50.0]),
                 (2, [0.0, 50.0, 40.0, 50.0]),
             ],
+        );
+    }
+
+    fn auto_column(width: f32) -> Style {
+        let mut style = flex_style(FlexDirection::Column, width, None);
+        style.flex_wrap = FlexWrap::Wrap;
+        style
+    }
+
+    #[test]
+    fn automatic_column_wrap_is_one_line_and_wrap_reverse_packs_at_the_end() {
+        // Headless Chrome, body margin 0. Height auto collects every item
+        // into one column. wrap-reverse puts that column at x=80 in a
+        // 120px container. Items are 40×30.
+        let items = || {
+            vec![
+                leaf(column_box(40.0, 30.0)),
+                leaf(column_box(40.0, 30.0)),
+                leaf(column_box(40.0, 30.0)),
+            ]
+        };
+        expect(
+            &Component::boxed(auto_column(120.0), items()),
+            &[
+                (0, [0.0, 0.0, 120.0, 90.0]),
+                (1, [0.0, 0.0, 40.0, 30.0]),
+                (2, [0.0, 30.0, 40.0, 30.0]),
+                (3, [0.0, 60.0, 40.0, 30.0]),
+            ],
+        );
+        let mut reverse = auto_column(120.0);
+        reverse.flex_wrap = FlexWrap::WrapReverse;
+        expect(
+            &Component::boxed(reverse, items()),
+            &[
+                (0, [0.0, 0.0, 120.0, 90.0]),
+                (1, [80.0, 0.0, 40.0, 30.0]),
+                (2, [80.0, 30.0, 40.0, 30.0]),
+                (3, [80.0, 60.0, 40.0, 30.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn column_wrap_max_height_uses_the_flexed_line_not_the_limit() {
+        // Headless Chrome. max-height 50 wraps 40px items into their own
+        // columns, and the used height is 40, not 50. wrap-reverse packs
+        // the first column at the right. flex-grow fills the limit, so
+        // that container is 100×100.
+        let mut limited = auto_column(120.0);
+        limited.max_height = Dimension::Px(50.0);
+        let items = vec![
+            leaf(column_box(40.0, 40.0)),
+            leaf(column_box(40.0, 40.0)),
+            leaf(column_box(40.0, 40.0)),
+        ];
+        expect(
+            &Component::boxed(limited, items.clone()),
+            &[
+                (0, [0.0, 0.0, 120.0, 40.0]),
+                (1, [0.0, 0.0, 40.0, 40.0]),
+                (2, [40.0, 0.0, 40.0, 40.0]),
+                (3, [80.0, 0.0, 40.0, 40.0]),
+            ],
+        );
+        let mut reverse = auto_column(120.0);
+        reverse.flex_wrap = FlexWrap::WrapReverse;
+        reverse.max_height = Dimension::Px(50.0);
+        expect(
+            &Component::boxed(reverse, items),
+            &[
+                (0, [0.0, 0.0, 120.0, 40.0]),
+                (1, [80.0, 0.0, 40.0, 40.0]),
+                (2, [40.0, 0.0, 40.0, 40.0]),
+                (3, [0.0, 0.0, 40.0, 40.0]),
+            ],
+        );
+
+        let mut grow = column_box(50.0, 50.0);
+        grow.flex_grow = 1.0;
+        let mut filled = auto_column(100.0);
+        filled.max_height = Dimension::Px(100.0);
+        expect(
+            &Component::boxed(filled, vec![leaf(grow), leaf(column_box(50.0, 100.0))]),
+            &[
+                (0, [0.0, 0.0, 100.0, 100.0]),
+                (1, [0.0, 0.0, 50.0, 100.0]),
+                (2, [50.0, 0.0, 50.0, 100.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn column_wrap_aspect_ratio_is_a_definite_block_size() {
+        // Headless Chrome. width 100 and aspect-ratio 1/1 wrap two 50×100
+        // items into a 100×100 square.
+        let mut container = auto_column(100.0);
+        container.min_height = Dimension::Px(0.0);
+        container.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+            "--w3cos-internal-aspect-ratio".to_string(),
+            "1".to_string(),
+        )]));
+        expect(
+            &Component::boxed(
+                container,
+                vec![leaf(column_box(50.0, 100.0)), leaf(column_box(50.0, 100.0))],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 100.0]),
+                (1, [0.0, 0.0, 50.0, 100.0]),
+                (2, [50.0, 0.0, 50.0, 100.0]),
+            ],
+        );
+    }
+
+    fn width_content(width: f32, height: f32) -> Component {
+        let mut item = block_box(None, Some(height));
+        item.flex_grow = 0.0;
+        item.flex_shrink = 0.0;
+        item.flex_basis = Dimension::Px(height);
+        Component::boxed(item, vec![leaf(block_box(Some(width), Some(10.0)))])
+    }
+
+    #[test]
+    fn column_wrap_auto_cross_is_fit_content_against_the_inner_width() {
+        // Headless Chrome. Two items, content widths 80 and 30, in a
+        // 100×100 column: each is its own line at that content width.
+        // Five 25px inline-blocks in a 50px-wide container clamp to 50.
+        // margin-right 25 in a 125px container leaves a 100px item.
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 100.0, 100.0),
+                vec![width_content(80.0, 60.0), width_content(30.0, 60.0)],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 100.0]),
+                (1, [0.0, 0.0, 80.0, 60.0]),
+                (3, [80.0, 0.0, 30.0, 60.0]),
+            ],
+        );
+
+        let inline_blocks = |item_height: f32, piece: f32| {
+            let mut item = block_box(None, Some(item_height));
+            item.flex_grow = 0.0;
+            item.flex_shrink = 0.0;
+            item.flex_basis = Dimension::Px(item_height);
+            let piece = Style {
+                display: Display::InlineBlock,
+                width: Dimension::Px(piece),
+                height: Dimension::Px(0.0),
+                ..Style::default()
+            };
+            Component::boxed(item, vec![leaf(piece); 5])
+        };
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 50.0, 100.0),
+                vec![inline_blocks(100.0, 25.0), inline_blocks(100.0, 25.0)],
+            ),
+            &[
+                (0, [0.0, 0.0, 50.0, 100.0]),
+                (1, [0.0, 0.0, 50.0, 100.0]),
+                (7, [50.0, 0.0, 50.0, 100.0]),
+            ],
+        );
+        let mut margined = block_box(None, Some(100.0));
+        margined.flex_grow = 0.0;
+        margined.flex_shrink = 0.0;
+        margined.flex_basis = Dimension::Px(100.0);
+        margined.margin.right = px(25.0);
+        let piece = Style {
+            display: Display::InlineBlock,
+            width: Dimension::Px(50.0),
+            height: Dimension::Px(0.0),
+            ..Style::default()
+        };
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 125.0, 100.0),
+                vec![Component::boxed(margined, vec![leaf(piece); 5])],
+            ),
+            &[(0, [0.0, 0.0, 125.0, 100.0]), (1, [0.0, 0.0, 100.0, 100.0])],
         );
     }
 }

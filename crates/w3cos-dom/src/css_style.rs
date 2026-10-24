@@ -35,6 +35,10 @@ pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
 /// `flex-wrap` keyword this engine does not model (`balance`, …). The used
 /// value falls through to `nowrap`.
 pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
+/// `aspect-ratio` as a width/height number. The dimension fields stay
+/// untouched, so legacy layout never consults it. LayoutNG reads it only
+/// as a column flex container's definite block size.
+pub const ASPECT_RATIO_PROPERTY: &str = "--w3cos-internal-aspect-ratio";
 
 fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>) {
     let current = style
@@ -58,6 +62,37 @@ fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>
         (false, false) => None,
     };
     set_marker(style, PERCENT_GAP_PROPERTY, value);
+}
+
+/// `None` drops an invalid declaration. `Some(None)` is `auto` (no ratio).
+/// `Some(Some(w/h))` is a positive ratio. `0` and a zero denominator are
+/// invalid. `auto && <ratio>` is the ratio.
+fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if matches!(
+        value.as_str(),
+        "auto" | "initial" | "unset" | "revert" | "inherit"
+    ) {
+        return Some(None);
+    }
+    let value = value.strip_prefix("auto").unwrap_or(&value).trim();
+    if value.is_empty() {
+        return Some(None);
+    }
+    let ratio = if let Some((width, height)) = value.split_once('/') {
+        let width = width.trim().parse::<f32>().ok()?;
+        let height = height.trim().parse::<f32>().ok()?;
+        if height == 0.0 {
+            return None;
+        }
+        width / height
+    } else {
+        value.parse::<f32>().ok()?
+    };
+    (ratio.is_finite() && ratio > 0.0).then_some(Some(ratio))
 }
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
@@ -643,6 +678,15 @@ impl CSSStyleDeclaration {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.max_height = value;
+                }
+            }
+            "aspect-ratio" | "aspectRatio" => {
+                if let Some(ratio) = parse_aspect_ratio(value) {
+                    set_marker(
+                        &mut self.inner,
+                        ASPECT_RATIO_PROPERTY,
+                        ratio.map(|ratio| ratio.to_string()),
+                    );
                 }
             }
 
@@ -6273,6 +6317,27 @@ mod tests {
         assert_eq!(declaration.get_property("width"), "10ch");
     }
 }
+#[test]
+fn aspect_ratio_is_stored_as_a_width_over_height_marker() {
+    let ratio = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(ASPECT_RATIO_PROPERTY))
+            .cloned()
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("aspect-ratio", "1 / 1");
+    assert_eq!(ratio(&declaration).as_deref(), Some("1"));
+    declaration.set_property("aspect-ratio", "auto 2 / 1");
+    assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    declaration.set_property("aspect-ratio", "1/0");
+    assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    declaration.set_property("aspect-ratio", "auto");
+    assert_eq!(ratio(&declaration), None);
+}
+
 #[test]
 fn max_size_none_overrides_an_earlier_constraint() {
     let mut declaration = CSSStyleDeclaration::new();
