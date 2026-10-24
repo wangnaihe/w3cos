@@ -1,15 +1,20 @@
-//! Flex formatting context, stage S5: one flex line, or several row lines.
+//! Flex formatting context, stage S5: one flex line, or several lines.
 //!
 //! Structure follows Blink's NGFlexLayoutAlgorithm
 //! (third_party/blink/renderer/core/layout/flex/flex_layout_algorithm.cc,
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
 //! lengths, alignment, line breaking). Baseline alignment, inline-flex,
-//! column wrap, and an indefinite percentage basis stay on
-//! the legacy engine. Row `wrap-reverse` swaps the cross-start (Flexbox
-//! §5.2) and packs lines from that edge. A definite-height row wrap with a gap and
-//! auto-height items stays there too (`flex-wrap: balance` is
-//! unrecognized, and its wrap reference must use the same engine).
+//! and an indefinite percentage basis stay on the legacy engine.
+//! `wrap-reverse` swaps the cross-start (Flexbox §5.2) and packs lines
+//! from that edge. Column wrap uses that same line breaking when the
+//! container's block size and every item's inline size are definite.
+//! An auto column height (`flex:wrap-column`, including max-height and
+//! aspect-ratio) and an auto item width (`flex:wrap-column-auto-cross`,
+//! the fit-content cross size) stay on the legacy engine. A definite-height
+//! row wrap with a gap and auto-height items stays there too
+//! (`flex-wrap: balance` is unrecognized, and its wrap reference must
+//! use the same engine).
 //!
 //! A flex row the DOM lowered from an inline formatting context carries the
 //! IFC marker and is not a flex container; the block algorithm lays it out
@@ -66,13 +71,22 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-width-keyword") {
         return Some("flex:width-keyword");
     }
-    // Column wrap sizes each line's cross size on the horizontal axis and
-    // stays on the legacy engine, including column `wrap-reverse`. An
-    // indefinite main size does not wrap (Flexbox §9.2). Row `wrap-reverse`
-    // swaps the cross-start and is laid out below.
+    // Column wrap with a definite block size and definite item widths is
+    // laid out below. An auto height does not wrap (Flexbox §9.2);
+    // max-height and aspect-ratio are not a definite main size here.
+    // `width: auto` is the fit-content cross size and stays on legacy.
     if style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction) {
-        return Some("flex:wrap-column");
+        if matches!(style.height, Dimension::Auto) {
+            return Some("flex:wrap-column");
+        }
+        if rendered_children(flat, index)
+            .any(|child| matches!(flat[child].style.width, Dimension::Auto))
+        {
+            return Some("flex:wrap-column-auto-cross");
+        }
     }
+    let definite_column_wrap =
+        style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction);
     // `flex-wrap: balance` stays on legacy (the keyword is unrecognized).
     // Its reference is an ordinary wrap with a gap and a definite height,
     // and legacy leaves those auto-height items at 0 while NG would
@@ -104,8 +118,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     let row = row_axis(style.flex_direction);
     // Column cross alignment other than stretch (fit-content width) is
-    // still the legacy engine's. Stretch is the definite cross size.
-    if !row && style.align_items != AlignItems::Stretch {
+    // still the legacy engine's for a single line. A definite column wrap
+    // already has a used cross size, so center and flex-end apply below.
+    if !row && style.align_items != AlignItems::Stretch && !definite_column_wrap {
         return Some("flex:column-align");
     }
     for child in rendered_children(flat, index) {
@@ -129,8 +144,12 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             return Some("flex:float-descendant");
         }
         // Column cross alignment other than stretch, including align-self,
-        // is still legacy (fit-content width and inline content offsets).
-        if !row && used_align(style.align_items, child_style.align_self) != AlignItems::Stretch {
+        // is still legacy for a single line (fit-content width and inline
+        // content offsets). Definite column wrap aligns in `layout_wrapped`.
+        if !row
+            && !definite_column_wrap
+            && used_align(style.align_items, child_style.align_self) != AlignItems::Stretch
+        {
             return Some("flex:column-align-self");
         }
         // Percentage main sizes and percentage block descendants cycle
@@ -855,8 +874,8 @@ pub(super) fn layout(
     items.sort_by(|a, b| a.order.cmp(&b.order).then(a.index.cmp(&b.index)));
 
     // A definite main size is what makes a flex line wrap (Flexbox §9.2).
-    // Column wrap is rejected in container_reason; an auto column height
-    // has no definite main size and stays on the single-line path.
+    // An auto column height is rejected in container_reason and never
+    // reaches this single-line path.
     if style.flex_wrap != FlexWrap::NoWrap
         && let Some(inner) = inner_main
     {
@@ -1129,11 +1148,12 @@ fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)>
     lines
 }
 
-/// `flex-wrap: wrap` and `wrap-reverse` on a row with a definite main size.
+/// `flex-wrap: wrap` and `wrap-reverse` with a definite main size.
 /// Each line flexes against the container's inner main size. `align-content:
 /// stretch` gives leftover cross space to the lines; `flex-start` packs them
 /// at the cross start. `wrap-reverse` has already swapped cross-start to the
 /// far cross edge, so the first line and `flex-start` items sit there.
+/// A column's cross axis is horizontal: lines are columns.
 fn layout_wrapped(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -2059,18 +2079,26 @@ mod tests {
     }
 
     #[test]
+    fn indefinite_column_wrap_and_auto_cross_stay_on_legacy() {
+        let auto_height = Style {
+            flex_wrap: FlexWrap::Wrap,
+            ..flex_style(FlexDirection::Column, 100.0, None)
+        };
+        let auto_cross = Style {
+            flex_wrap: FlexWrap::WrapReverse,
+            ..flex_style(FlexDirection::Column, 100.0, Some(80.0))
+        };
+        let auto_height_root =
+            Component::boxed(auto_height, vec![leaf(block_box(Some(10.0), Some(10.0)))]);
+        let auto_cross_root = Component::boxed(auto_cross, vec![leaf(block_box(None, Some(10.0)))]);
+        for root in [&auto_height_root, &auto_cross_root] {
+            let flat = pre_flatten(root);
+            assert!(super::super::layout_tree(root, &flat, 800.0, 600.0).is_none());
+        }
+    }
+
     fn column_wrap_baseline_and_rtl_stay_on_legacy() {
         for style in [
-            Style {
-                flex_wrap: FlexWrap::WrapReverse,
-                flex_direction: FlexDirection::Column,
-                ..flex_style(FlexDirection::Column, 100.0, Some(80.0))
-            },
-            Style {
-                flex_wrap: FlexWrap::Wrap,
-                flex_direction: FlexDirection::Column,
-                ..flex_style(FlexDirection::Column, 100.0, Some(80.0))
-            },
             Style {
                 align_items: AlignItems::Baseline,
                 ..flex_style(FlexDirection::Row, 100.0, None)
@@ -2352,5 +2380,236 @@ mod tests {
         let root = Component::boxed(marked, children);
         let flat = pre_flatten(&root);
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    }
+
+    fn column_box(width: f32, height: f32) -> Style {
+        let mut style = block_box(Some(width), Some(height));
+        style.flex_grow = 0.0;
+        style.flex_shrink = 0.0;
+        style.flex_basis = Dimension::Px(height);
+        style
+    }
+
+    fn column_flow(direction: FlexDirection, wrap: FlexWrap, width: f32, height: f32) -> Style {
+        let mut style = flex_style(direction, width, Some(height));
+        style.flex_wrap = wrap;
+        style
+    }
+
+    #[test]
+    fn column_wrap_fills_columns_from_the_cross_start() {
+        // Headless Chrome, body margin 0. Nine 40px border boxes in a
+        // 120px column wrap: three columns, source order down each column.
+        let items = vec![leaf(column_box(40.0, 40.0)); 9];
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 120.0, 120.0),
+                items,
+            ),
+            &[
+                (0, [0.0, 0.0, 120.0, 120.0]),
+                (1, [0.0, 0.0, 40.0, 40.0]),
+                (2, [0.0, 40.0, 40.0, 40.0]),
+                (3, [0.0, 80.0, 40.0, 40.0]),
+                (4, [40.0, 0.0, 40.0, 40.0]),
+                (5, [40.0, 40.0, 40.0, 40.0]),
+                (6, [40.0, 80.0, 40.0, 40.0]),
+                (7, [80.0, 0.0, 40.0, 40.0]),
+                (8, [80.0, 40.0, 40.0, 40.0]),
+                (9, [80.0, 80.0, 40.0, 40.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn column_wrap_reverse_packs_the_first_column_at_the_end() {
+        let items = vec![leaf(column_box(40.0, 40.0)); 9];
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::WrapReverse, 120.0, 120.0),
+                items,
+            ),
+            &[
+                (1, [80.0, 0.0, 40.0, 40.0]),
+                (2, [80.0, 40.0, 40.0, 40.0]),
+                (3, [80.0, 80.0, 40.0, 40.0]),
+                (4, [40.0, 0.0, 40.0, 40.0]),
+                (7, [0.0, 0.0, 40.0, 40.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn column_reverse_wrap_packs_from_the_main_start() {
+        // column-reverse: the first item in each column sits on the bottom.
+        // wrap-reverse also moves the first column to the right.
+        let down = vec![leaf(column_box(40.0, 40.0)); 9];
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::ColumnReverse, FlexWrap::Wrap, 120.0, 120.0),
+                down.clone(),
+            ),
+            &[
+                (1, [0.0, 80.0, 40.0, 40.0]),
+                (2, [0.0, 40.0, 40.0, 40.0]),
+                (3, [0.0, 0.0, 40.0, 40.0]),
+                (4, [40.0, 80.0, 40.0, 40.0]),
+            ],
+        );
+        expect(
+            &Component::boxed(
+                column_flow(
+                    FlexDirection::ColumnReverse,
+                    FlexWrap::WrapReverse,
+                    120.0,
+                    120.0,
+                ),
+                down,
+            ),
+            &[
+                (1, [80.0, 80.0, 40.0, 40.0]),
+                (2, [80.0, 40.0, 40.0, 40.0]),
+                (3, [80.0, 0.0, 40.0, 40.0]),
+                (4, [40.0, 80.0, 40.0, 40.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn column_wrap_stretch_and_flex_start_and_center() {
+        // Four 40px items in a 200×120 column. flex-start keeps 40px
+        // columns. stretch grows each column to 100 and leaves the
+        // definite items on the cross-start. center uses the midpoint.
+        let items = || vec![leaf(column_box(40.0, 40.0)); 4];
+        let mut start = column_flow(FlexDirection::Column, FlexWrap::Wrap, 200.0, 120.0);
+        start.align_content = AlignContent::FlexStart;
+        expect(
+            &Component::boxed(start, items()),
+            &[
+                (1, [0.0, 0.0, 40.0, 40.0]),
+                (2, [0.0, 40.0, 40.0, 40.0]),
+                (3, [0.0, 80.0, 40.0, 40.0]),
+                (4, [40.0, 0.0, 40.0, 40.0]),
+            ],
+        );
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 200.0, 120.0),
+                items(),
+            ),
+            &[(1, [0.0, 0.0, 40.0, 40.0]), (4, [100.0, 0.0, 40.0, 40.0])],
+        );
+        let mut center = column_flow(FlexDirection::Column, FlexWrap::Wrap, 200.0, 120.0);
+        center.align_items = AlignItems::Center;
+        expect(
+            &Component::boxed(center, items()),
+            &[(1, [30.0, 0.0, 40.0, 40.0]), (4, [130.0, 0.0, 40.0, 40.0])],
+        );
+        let mut reverse = column_flow(FlexDirection::Column, FlexWrap::WrapReverse, 200.0, 120.0);
+        reverse.align_content = AlignContent::FlexStart;
+        expect(
+            &Component::boxed(reverse, items()),
+            &[(1, [160.0, 0.0, 40.0, 40.0]), (4, [120.0, 0.0, 40.0, 40.0])],
+        );
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::WrapReverse, 200.0, 120.0),
+                items(),
+            ),
+            &[(1, [160.0, 0.0, 40.0, 40.0]), (4, [60.0, 0.0, 40.0, 40.0])],
+        );
+    }
+
+    #[test]
+    fn column_wrap_gap_safe_overflow_margins_and_borders() {
+        // row-gap is the main gap, column-gap the cross gap. Stretch adds
+        // 5px to each 40px column; the second column starts after the gap
+        // at x=55. Headless Chrome.
+        let mut gapped = column_flow(FlexDirection::Column, FlexWrap::Wrap, 100.0, 100.0);
+        gapped.row_gap = Some(10.0);
+        gapped.column_gap = Some(10.0);
+        expect(
+            &Component::boxed(
+                gapped,
+                vec![
+                    leaf(column_box(40.0, 40.0)),
+                    leaf(column_box(40.0, 40.0)),
+                    leaf(column_box(40.0, 40.0)),
+                ],
+            ),
+            &[
+                (1, [0.0, 0.0, 40.0, 40.0]),
+                (2, [0.0, 50.0, 40.0, 40.0]),
+                (3, [55.0, 0.0, 40.0, 40.0]),
+            ],
+        );
+
+        let mut safe = column_flow(FlexDirection::Column, FlexWrap::WrapReverse, 90.0, 90.0);
+        safe.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+            "--w3cos-internal-safe-align-content".to_string(),
+            "1".to_string(),
+        )]));
+        expect(
+            &Component::boxed(safe, vec![leaf(column_box(100.0, 100.0))]),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+
+        // wrap-reverse swaps cross margins, so the 8px end margin sits on
+        // the right (the cross-start). The border box is at x=52.
+        let mut margined = column_box(40.0, 40.0);
+        margined.margin = edges(0.0, 8.0, 0.0, 2.0);
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::WrapReverse, 100.0, 40.0),
+                vec![leaf(margined.clone())],
+            ),
+            &[(1, [52.0, 0.0, 40.0, 40.0])],
+        );
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 100.0, 40.0),
+                vec![leaf(margined)],
+            ),
+            &[(1, [2.0, 0.0, 40.0, 40.0])],
+        );
+
+        // 38px content + 1px border is a 40px border box. Same grid as
+        // the content-box 40px items (flexbox-flex-direction-column).
+        let mut bordered = column_box(38.0, 38.0);
+        bordered.border_top_width = Some(1.0);
+        bordered.border_right_width = Some(1.0);
+        bordered.border_bottom_width = Some(1.0);
+        bordered.border_left_width = Some(1.0);
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 120.0, 120.0),
+                vec![leaf(bordered); 9],
+            ),
+            &[
+                (1, [0.0, 0.0, 40.0, 40.0]),
+                (2, [0.0, 40.0, 40.0, 40.0]),
+                (4, [40.0, 0.0, 40.0, 40.0]),
+                (7, [80.0, 0.0, 40.0, 40.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn column_wrap_grows_items_on_each_line() {
+        // Two flex:1 1 30px items fit on one column and grow to 50.
+        let mut item = column_box(40.0, 30.0);
+        item.flex_grow = 1.0;
+        item.flex_shrink = 1.0;
+        expect(
+            &Component::boxed(
+                column_flow(FlexDirection::Column, FlexWrap::Wrap, 80.0, 100.0),
+                vec![leaf(item.clone()), leaf(item)],
+            ),
+            &[
+                (0, [0.0, 0.0, 80.0, 100.0]),
+                (1, [0.0, 0.0, 40.0, 50.0]),
+                (2, [0.0, 50.0, 40.0, 50.0]),
+            ],
+        );
     }
 }
