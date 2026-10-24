@@ -692,6 +692,13 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
 }
 
 fn inline_level_child(flat: &[FlatNodeInfo], child: usize) -> bool {
+    // A floated inline-block is a block box (CSS 2.1 §9.7). Counting it
+    // as an atomic inline would make its block parent an IFC and send
+    // the float back to `float:inline`. Replaced floats stay atomic so
+    // their reason does not move from `float:inline` to `image`.
+    if super::block::is_blockified_float(flat, child) {
+        return false;
+    }
     (matches!(flat[child].kind, ComponentKind::Text { .. })
         && flat[child].style.display == Display::Inline)
         || is_inline_box(flat, child)

@@ -132,7 +132,14 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     // the template. `inline-grid` keeps `display: flex` for legacy and is a
     // grid here (`is_author_grid`).
     let author_grid = style.display == Display::Grid || is_inline_grid(style);
+    // CSS 2.1 §9.7 blockifies inline-block. A floated list-item keeps a
+    // block principal box. The marker is not painted; a page that needs
+    // it stays on a named fallback from the gate, not from this check.
+    let blockified_float = style.float != Float::None
+        && !oof::is_out_of_flow(style)
+        && matches!(style.display, Display::InlineBlock | Display::ListItem);
     if !atomic
+        && !blockified_float
         && !matches!(style.display, Display::Block | Display::FlowRoot)
         && !lowered_ifc
         && !author_flex
@@ -308,6 +315,22 @@ fn node_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         .or_else(|| node_box_reason(flat, index))
 }
 
+/// CSS 2.1 §9.7: a non-none float blockifies `inline-block`. `list-item`
+/// is already a block-level principal box, and the float lays that box
+/// out as a block. Replaced boxes stay on their own reasons. Floated
+/// flex and grid stay `float:display`.
+pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let info = &flat[index];
+    let style = info.style;
+    style.float != Float::None
+        && !oof::is_out_of_flow(style)
+        && matches!(style.display, Display::InlineBlock | Display::ListItem)
+        && !matches!(
+            info.kind,
+            ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+        )
+}
+
 /// Floats of block-level boxes in a block container (S3b).  Floats among
 /// inline content (NGInlineLayoutAlgorithm's float handling) and text
 /// that would have to wrap around a float stay on legacy.
@@ -317,13 +340,18 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if style.float == Float::None || oof::is_out_of_flow(style) {
         return None;
     }
-    if inline::is_atomic_inline(flat, index) || style.display == Display::Inline {
+    // An inline-block or list-item float is a block box (§9.7). An
+    // inline-block that is still inside an IFC hits `float:inline` below.
+    let blockified = is_blockified_float(flat, index);
+    if !blockified && (inline::is_atomic_inline(flat, index) || style.display == Display::Inline) {
         return Some("float:inline");
     }
-    if !matches!(
-        style.display,
-        Display::Block | Display::FlowRoot | Display::Table
-    ) {
+    if !blockified
+        && !matches!(
+            style.display,
+            Display::Block | Display::FlowRoot | Display::Table
+        )
+    {
         return Some("float:display");
     }
     let Some(parent) = info.parent else {
@@ -480,7 +508,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if matches!(info.kind, ComponentKind::Canvas { .. }) {
         return canvas_box_reason(flat, index);
     }
-    if inline::is_atomic_inline(flat, index) {
+    if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
         if !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
         }

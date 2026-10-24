@@ -919,6 +919,130 @@ fn floats_and_clearance_match_chrome() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+/// CSS 2.1 §9.7 blockifies a floated inline-block. A floated list-item
+/// keeps a block principal box. Headless Chrome, body margin 0: the
+/// 200px container is 100px tall; the 40×20 inline-block, block, and
+/// two list-items stack at y=0/20/40/60; the shrink-to-fit inline-block
+/// is 30×10 at y=80; the cleared block is 200×10 at y=90.
+#[test]
+fn floated_inline_block_and_list_item_match_chrome() {
+    use w3cos_std::style::{Clear, Float};
+    let float = |display: Display, w: f32, h: f32, clear: Clear| Style {
+        display,
+        width: Dimension::Px(w),
+        height: Dimension::Px(h),
+        float: Float::Left,
+        clear,
+        ..Style::default()
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![
+            node(float(Display::InlineBlock, 40.0, 20.0, Clear::None), vec![]),
+            node(float(Display::Block, 40.0, 20.0, Clear::Left), vec![]),
+            node(float(Display::ListItem, 40.0, 20.0, Clear::Left), vec![]),
+            node(float(Display::ListItem, 40.0, 20.0, Clear::Left), vec![]),
+            node(
+                Style {
+                    display: Display::InlineBlock,
+                    float: Float::Left,
+                    clear: Clear::Left,
+                    ..Style::default()
+                },
+                vec![node(
+                    Style {
+                        width: Dimension::Px(30.0),
+                        height: Dimension::Px(10.0),
+                        ..block()
+                    },
+                    vec![],
+                )],
+            ),
+            node(
+                Style {
+                    height: Dimension::Px(10.0),
+                    clear: Clear::Both,
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("float");
+    assert_eq!(rect(&out, 0), (0.0, 0.0, 200.0, 100.0));
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 2), (0.0, 20.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 3), (0.0, 40.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 4), (0.0, 60.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 5), (0.0, 80.0, 30.0, 10.0));
+    assert_eq!(rect(&out, 6), (0.0, 80.0, 30.0, 10.0));
+    assert_eq!(rect(&out, 7), (0.0, 90.0, 200.0, 10.0));
+
+    let flex = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Flex,
+                float: Float::Left,
+                width: Dimension::Px(40.0),
+                height: Dimension::Px(20.0),
+                ..Style::default()
+            },
+            vec![],
+        )],
+    );
+    assert!(
+        block::unsupported_reasons(&pre_flatten(&flex))
+            .iter()
+            .any(|reason| reason == "float:display")
+    );
+    let grid = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Grid,
+                float: Float::Left,
+                width: Dimension::Px(40.0),
+                height: Dimension::Px(20.0),
+                ..Style::default()
+            },
+            vec![],
+        )],
+    );
+    assert!(
+        block::unsupported_reasons(&pre_flatten(&grid))
+            .iter()
+            .any(|reason| reason == "float:display")
+    );
+    let inline_parent = node(
+        block(),
+        vec![
+            Component::text(
+                "hi",
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            ),
+            node(float(Display::InlineBlock, 40.0, 20.0, Clear::None), vec![]),
+        ],
+    );
+    assert!(
+        block::unsupported_reasons(&pre_flatten(&inline_parent))
+            .iter()
+            .any(|reason| reason == "float:inline")
+    );
+}
+
 /// CSS2 9.5.1 rule 3 bounds a float by opposite floats even outside its
 /// containing block (floats-rule3-outside-left-001), and the hypothetical
 /// position of a cleared box includes margins collapsing through its
