@@ -24,8 +24,8 @@ use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use w3cos_std::style::{
-    AlignContent, AlignItems, AlignSelf, BoxSizing, Dimension, Display, Float, JustifyContent,
-    Position, Spacing, Style, TextDirection,
+    AlignContent, AlignItems, AlignSelf, BoxSizing, Clear, Dimension, Display, Float,
+    JustifyContent, Position, Spacing, Style, TextDirection,
 };
 
 const EPS: f32 = 1.0 / 128.0;
@@ -484,6 +484,75 @@ fn parent_size_is_px(style: &Style, rows: bool) -> bool {
 
 fn spacing_is_zero(spacing: Spacing) -> bool {
     matches!(spacing, Spacing::Px(value) if value.abs() <= EPS)
+}
+
+/// A top-level `inline-grid` laid out on a line. The border box is a
+/// definite px size, the tracks are fixed lengths (or there is no
+/// template), and alignment is the initial value. A flex or grid item is
+/// blockified separately. Everything else keeps the unrecognized-display
+/// marker: those boxes are the references of pages that still fall back,
+/// and laying out only the reference splits the reftest.
+pub(super) fn definite_inline_grid(style: &Style) -> bool {
+    if style.direction == TextDirection::Rtl
+        || style.float != Float::None
+        || style.clear != Clear::None
+        || style.position != Position::Static
+    {
+        return false;
+    }
+    if !matches!(style.width, Dimension::Px(w) if w.is_finite() && w >= 0.0) {
+        return false;
+    }
+    if !matches!(style.height, Dimension::Px(h) if h.is_finite() && h >= 0.0) {
+        return false;
+    }
+    if !spacing_is_zero(style.margin.top)
+        || !spacing_is_zero(style.margin.right)
+        || !spacing_is_zero(style.margin.bottom)
+        || !spacing_is_zero(style.margin.left)
+    {
+        return false;
+    }
+    if style.align_items != AlignItems::Stretch
+        || style.justify_items != AlignItems::Stretch
+        || style.align_content != AlignContent::Stretch
+    {
+        return false;
+    }
+    if let Some(keyword) = marker(style, JUSTIFY_KEYWORD) {
+        if !matches!(keyword, "stretch" | "normal") {
+            return false;
+        }
+    } else if style.justify_content != JustifyContent::FlexStart {
+        return false;
+    }
+    if has_marker(style, "--w3cos-internal-grid-lanes")
+        || has_marker(style, "--w3cos-internal-percent-gap")
+        || has_marker(style, "--w3cos-internal-document-element")
+        || has_marker(style, "--w3cos-internal-width-keyword")
+        || has_marker(style, "--w3cos-internal-size-containment")
+        || has_marker(style, HEIGHT_KEYWORD)
+    {
+        return false;
+    }
+    axis_fixed(columns_spec(style), false) && axis_fixed(style.grid_rows(), true)
+}
+
+fn axis_fixed(spec: Option<&str>, rows: bool) -> bool {
+    let Some(spec) = spec else {
+        return true;
+    };
+    if spec_mentions_subgrid(spec) {
+        return false;
+    }
+    match parse_template(spec, rows) {
+        Some(template)
+            if template.auto_fit.is_none() && template.tracks.iter().all(spec_is_fixed) =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `None` on the subgrid axis means `gap: normal` (the parent's gutter).

@@ -2424,6 +2424,98 @@ fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
     );
 }
 
+/// A definite top-level `inline-grid` is a line box, not a stretched block.
+/// Chrome (body margin 0): a 100×20 grid with `40px 60px` columns places
+/// its items at x=0 and x=40; two 50×100 grids sit at x=0 and x=50 on the
+/// line after a 15px block. An auto width stays on the legacy marker.
+#[test]
+fn top_level_definite_inline_grid_shares_a_line() {
+    use w3cos_std::style::CustomProperties;
+    let mark = |mut style: Style| {
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )]));
+        style
+    };
+    let grid = mark(Style {
+        display: Display::Flex,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(20.0),
+        grid_template_columns: Some("40px 60px".to_string()),
+        ..Style::default()
+    });
+    let cell = |w| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                height: Dimension::Px(10.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let lone = node(block(), vec![node(grid, vec![cell(40.0), cell(60.0)])]);
+    let flat = pre_flatten(&lone);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&lone, &flat, 800.0, 600.0).expect("ng");
+    let at = |out: &[(LayoutRect, usize)], index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    // Preorder: 0 root, 1 inline-grid, 2 first cell, 3 second cell.
+    assert_eq!(at(&out, 1), (0.0, 0.0, 100.0, 20.0));
+    assert_eq!(at(&out, 2), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(at(&out, 3), (40.0, 0.0, 60.0, 10.0));
+
+    let square = || {
+        node(
+            mark(Style {
+                display: Display::Flex,
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(100.0),
+                ..Style::default()
+            }),
+            vec![],
+        )
+    };
+    let row = node(block(), vec![node(sized(15.0), vec![]), square(), square()]);
+    let row_flat = pre_flatten(&row);
+    assert!(
+        block::supports_tree(&row_flat),
+        "{:?}",
+        block::unsupported_reasons(&row_flat)
+    );
+    let row_out = layout_tree(&row, &row_flat, 800.0, 600.0).expect("line");
+    // 0 root, 1 spacer, 2 first square, 3 second square.
+    assert_eq!(at(&row_out, 2), (0.0, 15.0, 50.0, 100.0));
+    assert_eq!(at(&row_out, 3), (50.0, 15.0, 50.0, 100.0));
+
+    let auto = node(
+        block(),
+        vec![node(
+            mark(Style {
+                display: Display::Flex,
+                width: Dimension::Auto,
+                height: Dimension::Px(20.0),
+                grid_template_columns: Some("40px 60px".to_string()),
+                ..Style::default()
+            }),
+            vec![],
+        )],
+    );
+    let auto_flat = pre_flatten(&auto);
+    assert!(
+        !block::supports_tree(&auto_flat),
+        "{:?}",
+        block::unsupported_reasons(&auto_flat)
+    );
+}
+
 /// CSS 2.1 10.3.2 / 10.3.4: an explicit content-box size wins over the
 /// missing-image intrinsic size, a block replaced element does not stretch,
 /// and auto margins center that border box.

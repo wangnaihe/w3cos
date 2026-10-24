@@ -530,15 +530,12 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 unsupported_style(info.style, allowed).or_else(|| flex_reason)
             } else if is_author_grid(info.style) {
                 // CSS Flexbox §4 / Grid §6.1 blockify `inline-grid` on a
-                // flex or grid item. A top-level `inline-grid` stays on
-                // legacy: those boxes are the references of tests that
-                // still fall back, and switching only the reference
-                // splits the reftest.
-                let blockified = is_inline_grid(info.style)
-                    && info.parent.is_some_and(|parent| {
-                        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-                    });
-                let allowed: &[&str] = if blockified {
+                // flex or grid item. A top-level `inline-grid` joins the
+                // grid only for a definite px box (`is_inline_grid_line`);
+                // the other boxes stay on the marker so a reference that
+                // still falls back does not switch engines alone.
+                let blockified = is_blockified_inline_grid(flat, index);
+                let allowed: &[&str] = if blockified || is_inline_grid_line(flat, index) {
                     &[
                         inline::VALIGN_MARKER,
                         "--w3cos-internal-unrecognized-display",
@@ -1259,6 +1256,21 @@ fn is_inline_grid(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "inline-grid")
 }
 
+fn is_blockified_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
+    is_inline_grid(flat[index].style)
+        && flat[index].parent.is_some_and(|parent| {
+            is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+        })
+}
+
+/// Top-level `inline-grid` that shares a line with its siblings. A flex or
+/// grid item is blockified and is not one of these.
+fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
+    is_inline_grid(flat[index].style)
+        && !is_blockified_inline_grid(flat, index)
+        && super::grid::definite_inline_grid(flat[index].style)
+}
+
 fn is_run_in(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "run-in")
 }
@@ -1686,6 +1698,67 @@ fn layout_block_in(
                 children.extend(placed);
             }
             child = next;
+            continue;
+        }
+        // A definite top-level inline-grid is an atomic inline (CSS Grid
+        // §3). Consecutive ones share a line; a flex or grid item is
+        // blockified and takes the grid path above instead.
+        if is_inline_grid_line(flat, child) {
+            if !exclusions.is_empty() || child_space.rtl {
+                return super::bail("grid:inline");
+            }
+            let mut run = vec![child];
+            let mut scan = next;
+            while scan < info.subtree_end {
+                let scan_info = &flat[scan];
+                let scan_next = scan_info.subtree_end.max(scan + 1);
+                if scan_info.style.display == Display::None {
+                    scan = scan_next;
+                    continue;
+                }
+                if !is_inline_grid_line(flat, scan) {
+                    break;
+                }
+                run.push(scan);
+                scan = scan_next;
+            }
+            let y = if at_top && can_escape_top {
+                start_strut.merge(pending);
+                pending = MarginStrut::default();
+                0.0
+            } else {
+                let y = cursor + pending.sum();
+                pending = MarginStrut::default();
+                y
+            };
+            let available = metrics.content_width;
+            let mut line_x = 0.0f32;
+            let mut line_y = y;
+            let mut line_h = 0.0f32;
+            for &item in &run {
+                let result = layout_block_in(flat, item, &child_space, false, None, exclusions)
+                    .why("inline-grid")?;
+                float_overlap |= result.float_overlap;
+                let width = result.fragment.width;
+                let height = result.fragment.height;
+                if line_x > 0.0 && line_x + width > available + 1.0 / 128.0 {
+                    line_y += line_h;
+                    line_x = 0.0;
+                    line_h = 0.0;
+                }
+                let (dx, dy) = oof::relative_offset(flat[item].style, &child_space);
+                let (fx, fy) = (bl + pl + line_x + dx, bt + pt + line_y + dy);
+                oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
+                if result.last_baseline != LastBaseline::NoLines {
+                    last_baseline = result.last_baseline.offset(bt + pt + line_y);
+                }
+                children.push((fx, fy, result.fragment));
+                line_x += width;
+                line_h = line_h.max(height);
+            }
+            cursor = line_y + line_h;
+            at_top = false;
+            child = scan;
             continue;
         }
         // A replaced child has a definite content width (10.3.4) even when

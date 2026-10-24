@@ -2337,9 +2337,10 @@ fn parse_display(value: &str) -> Display {
         // Legacy stays `flex`, matching NG-off. The grid-lanes marker tells
         // LayoutNG to lay the box out as a grid when that matches the
         // reference. `inline-grid`, `run-in`, and `-webkit-box` stay
-        // unrecognized flex boxes. NG blockifies `inline-grid` only as a
-        // flex or grid item, and lays a definite `run-in` out as that flex
-        // box. `-webkit-box` stays on legacy so line-clamp references do
+        // unrecognized flex boxes. NG blockifies `inline-grid` as a flex
+        // or grid item, and also lays a definite top-level `inline-grid`
+        // out on a line. A definite `run-in` is that flex box.
+        // `-webkit-box` stays on legacy so line-clamp references do
         // not switch engines alone.
         "grid-lanes" => Display::Flex,
         "block" => Display::Block,
