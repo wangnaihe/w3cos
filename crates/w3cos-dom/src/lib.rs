@@ -3786,6 +3786,146 @@ mod tests {
     }
 
     #[test]
+    fn data_attributes_do_not_prevent_safe_matched_property_sharing() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("height", "4px")]);
+        crate::stylesheet::register_rule("[data-state='hot']", &[("height", "9px")]);
+
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let parent_style = doc.computed_style_shared(parent.id, None);
+
+        let first = doc.create_element("div");
+        first.set_class_name(&mut doc, "cell");
+        // HTML attribute names are ASCII case-insensitive; the key filter must
+        // stay safe even if a caller supplies non-canonical casing.
+        first.set_attribute(&mut doc, "DATA-INDEX", "1");
+        parent.append_child(&mut doc, first);
+        let second = doc.create_element("div");
+        second.set_class_name(&mut doc, "cell");
+        second.set_attribute(&mut doc, "data-index", "2");
+        parent.append_child(&mut doc, second);
+
+        let entries_before = doc.matched_properties_cache_entries();
+        let first_style = doc.computed_style_shared(first.id, Some(&parent_style));
+        let entries_after_first = doc.matched_properties_cache_entries();
+        let second_style = doc.computed_style_shared(second.id, Some(&parent_style));
+        let entries_after_second = doc.matched_properties_cache_entries();
+        assert!(std::rc::Rc::ptr_eq(&first_style, &second_style));
+        assert_eq!(entries_after_first, entries_before + 1);
+        assert_eq!(entries_after_second, entries_after_first);
+
+        // Mirror the 200 x 20 fixture's unique application-data values. Once
+        // the first style is inserted, the remaining 3999 cells must reuse it
+        // without growing the MPC.
+        for index in 3..=4000 {
+            let cell = doc.create_element("div");
+            cell.set_class_name(&mut doc, "cell");
+            cell.set_attribute(&mut doc, "data-index", &index.to_string());
+            parent.append_child(&mut doc, cell);
+            let style = doc.computed_style_shared(cell.id, Some(&parent_style));
+            assert!(std::rc::Rc::ptr_eq(&first_style, &style));
+        }
+        assert_eq!(doc.matched_properties_cache_entries(), entries_after_first);
+
+        // A data attribute that changes selector matching still produces a
+        // distinct matched-rule list and therefore a distinct computed style.
+        second.set_attribute(&mut doc, "data-state", "hot");
+        let hot_style = doc.computed_style_shared(second.id, Some(&parent_style));
+        assert_eq!(hot_style.height, w3cos_std::style::Dimension::Px(9.0));
+        assert!(!std::rc::Rc::ptr_eq(&first_style, &hot_style));
+
+        second.remove_attribute(&mut doc, "data-state");
+        let restored_style = doc.computed_style_shared(second.id, Some(&parent_style));
+        assert_eq!(restored_style.height, w3cos_std::style::Dimension::Px(4.0));
+        assert!(std::rc::Rc::ptr_eq(&first_style, &restored_style));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn namespaced_data_attributes_remain_outside_matched_property_sharing() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("height", "4px")]);
+
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let parent_style = doc.computed_style_shared(parent.id, None);
+
+        let first = doc.create_element("div");
+        first.set_class_name(&mut doc, "cell");
+        first.set_attribute_ns(
+            &mut doc,
+            Some("urn:example"),
+            "x:data-index",
+            Some("x"),
+            "data-index",
+            "1",
+        );
+        parent.append_child(&mut doc, first);
+        let second = doc.create_element("div");
+        second.set_class_name(&mut doc, "cell");
+        second.set_attribute_ns(
+            &mut doc,
+            Some("urn:example"),
+            "x:data-index",
+            Some("x"),
+            "data-index",
+            "2",
+        );
+        parent.append_child(&mut doc, second);
+
+        let first_style = doc.computed_style_shared(first.id, Some(&parent_style));
+        let second_style = doc.computed_style_shared(second.id, Some(&parent_style));
+        assert_eq!(first_style.height, w3cos_std::style::Dimension::Px(4.0));
+        assert_eq!(second_style.height, w3cos_std::style::Dimension::Px(4.0));
+        // Any namespaced attribute conservatively disables this cache path.
+        assert!(!std::rc::Rc::ptr_eq(&first_style, &second_style));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn shared_principal_style_keeps_data_attr_generated_content_per_element() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".item", &[("color", "green")]);
+        crate::stylesheet::register_rule(".item::before", &[("content", "attr(data-label)")]);
+
+        let mut doc = Document::new();
+        let mut items = Vec::new();
+        for label in ["first", "second"] {
+            let item = doc.create_element("div");
+            item.set_class_name(&mut doc, "item");
+            item.set_attribute(&mut doc, "data-label", label);
+            doc.body().append_child(&mut doc, item);
+            items.push(item);
+        }
+
+        fn text(component: &w3cos_std::Component, out: &mut Vec<String>) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                out.push(content.clone());
+            }
+            for child in &component.children {
+                text(child, out);
+            }
+        }
+        let tree = doc.to_component_tree();
+        let mut actual = Vec::new();
+        text(&tree, &mut actual);
+        assert_eq!(actual, ["first", "second"]);
+
+        // Changing application data invalidates the node as usual, while the
+        // pseudo content continues to read the live value rather than the
+        // principal style shared by both elements.
+        items[1].set_attribute(&mut doc, "data-label", "changed");
+        let tree = doc.to_component_tree();
+        actual.clear();
+        text(&tree, &mut actual);
+        assert_eq!(actual, ["first", "changed"]);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_child_list_log_replays_to_live_children() {
         use crate::document::{ChildListChange, replay_child_changes_since, structure_tick};
         let mut doc = Document::new();

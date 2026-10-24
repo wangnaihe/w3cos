@@ -5182,10 +5182,21 @@ impl Document {
             // `id` is not a presentational hint. Rules that match on it are
             // already part of `matched`, so keeping the unique value in the
             // key stops otherwise identical elements from sharing a style.
+            // The same is true for `data-*`: this engine only consumes those
+            // values through selector matching (captured by `matched`) and
+            // generated-content attr(), which is resolved separately when
+            // pseudo boxes are built. Keeping per-node application data here
+            // defeats style sharing for otherwise identical table/list rows.
             attributes: node
                 .attributes
                 .iter()
-                .filter(|(name, _)| !name.as_static().eq_ignore_ascii_case("id"))
+                .filter(|(name, _)| {
+                    let name = name.as_static();
+                    !name.eq_ignore_ascii_case("id")
+                        && !name
+                            .get(..5)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data-"))
+                })
                 .map(|(name, value)| (name.as_u32(), value.as_str()))
                 .collect(),
             matched: matched.to_vec(),
@@ -5203,6 +5214,11 @@ impl Document {
             self.computed_style_cache_hits.get(),
             self.computed_style_cache_misses.get(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matched_properties_cache_entries(&self) -> usize {
+        self.matched_properties_cache.borrow().entries
     }
 
     #[cfg(test)]
