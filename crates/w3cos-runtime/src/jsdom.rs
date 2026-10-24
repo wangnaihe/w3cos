@@ -1372,21 +1372,25 @@ fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Optio
         if depth > 4096 {
             return None;
         }
-        let (proxy, getter, data, accessor, next) = {
+        let (proxy, getter, data, setter, next) = {
             let object = object.borrow();
-            // One combined probe (data, getter or setter slot) decides the
-            // level; the separate getter/data reads run only on a hit.
-            let accessor = object.has_own_property(key);
-            let (getter, data) = if accessor {
-                (object.own_getter(key), object.own_data(key))
+            // Read the descriptor components directly. The previous boolean
+            // probe checked data/getter/setter and then repeated the getter
+            // and data lookups on a hit. Getter still wins if authored state
+            // contains both representations; setter-only remains an
+            // authoritative undefined result.
+            let getter = object.own_getter(key);
+            let data = object.own_data(key);
+            let setter = if getter.is_none() && data.is_none() {
+                object.own_setter(key)
             } else {
-                (None, None)
+                None
             };
             (
                 object.has_get_trap(),
                 getter,
                 data,
-                accessor,
+                setter,
                 object.get_prototype_of(),
             )
         };
@@ -1401,7 +1405,7 @@ fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Optio
             // bridge computes those properties after a descriptor miss.
             return (!data.is_undefined()).then_some(data);
         }
-        if accessor {
+        if setter.is_some() {
             return Some(Value::Undefined); // setter-only descriptor
         }
         current = next;
@@ -23342,6 +23346,39 @@ mod tests {
         );
         let thrown = w3cos_core::catch_js(|| element.get_property("throwProbe")).unwrap_err();
         assert_eq!(thrown, Value::string("prototype-token"));
+    }
+
+    #[test]
+    fn immediate_prototype_descriptor_probe_preserves_setter_and_getter_precedence() {
+        setup();
+        let element = document_value().call_method("createElement", vec![Value::string("div")]);
+        let prototype = window_value()
+            .get_property("Element")
+            .get_property("prototype");
+
+        w3cos_core::class::define_property(
+            &prototype,
+            "nodeType",
+            &Value::object(HashMap::from([(
+                "set".into(),
+                Value::function(|_, _| Value::Undefined),
+            )])),
+        );
+        assert!(
+            element.get_property("nodeType").is_undefined(),
+            "a setter-only descriptor must shadow the computed DOM property"
+        );
+
+        prototype.set_property(
+            "__w3cos_getter_nodeType",
+            Value::function(|_, _| Value::Number(17.0)),
+        );
+        prototype.set_property("nodeType", Value::Number(23.0));
+        assert_eq!(
+            element.get_property("nodeType"),
+            Value::Number(17.0),
+            "the existing getter-before-data precedence must be preserved"
+        );
     }
 
     #[test]

@@ -200,6 +200,13 @@ impl JsObject {
         self.properties.get(&getter_key).cloned()
     }
 
+    /// Read an own setter without invoking it or traversing the prototype.
+    pub fn own_setter(&self, key: &str) -> Option<Value> {
+        let mut buf = [0u8; 96];
+        let setter_key = crate::value::accessor_key(&mut buf, "__w3cos_setter_", key);
+        self.properties.get(&setter_key).cloned()
+    }
+
     /// Own data only, without invoking accessors, traps, or prototype lookup.
     pub fn own_data(&self, key: &str) -> Option<Value> {
         self.properties.get(key).cloned()
