@@ -2320,7 +2320,8 @@ fn table_border_boxes_match_chrome() {
 }
 
 /// `inline-grid` stays `display: flex` for legacy and is a grid container
-/// on NG. `-webkit-box` still keeps the page on legacy.
+/// on NG. A `-webkit-box` whose flex line is rejected (a text item) keeps
+/// the unrecognized marker.
 #[test]
 fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
     use w3cos_std::style::CustomProperties;
@@ -2379,18 +2380,27 @@ fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
 
     let mut webkit = Style {
         display: Display::Flex,
+        width: Dimension::Px(100.0),
         ..block()
     };
     webkit.custom_properties = Some(CustomProperties::from_iter([(
         "--w3cos-internal-unrecognized-display".to_string(),
         "-webkit-box".to_string(),
     )]));
-    let webkit_root = node(webkit, vec![]);
+    let webkit_root = node(
+        block(),
+        vec![node(
+            webkit,
+            vec![Component::text("line", Style::default())],
+        )],
+    );
     let web = pre_flatten(&webkit_root);
     assert!(
         block::unsupported_reasons(&web)
             .iter()
-            .any(|r| r == "unrecognized-display")
+            .any(|r| r == "unrecognized-display"),
+        "{:?}",
+        block::unsupported_reasons(&web)
     );
 
     // `display: run-in` stays `flex` for legacy. A definite box is that
@@ -2514,6 +2524,61 @@ fn top_level_definite_inline_grid_shares_a_line() {
         "{:?}",
         block::unsupported_reasons(&auto_flat)
     );
+}
+
+/// `-webkit-box` is the legacy flex box. Headless Chrome, body margin 0:
+/// a 100px horizontal box places 40px and 60px children at x=0 and x=40.
+/// `-webkit-inline-box` uses that same block flex box (the used display
+/// stays `flex`). `-webkit-box-orient` is not stored.
+#[test]
+fn legacy_webkit_box_matches_a_horizontal_flex_row() {
+    use w3cos_std::style::{CustomProperties, FlexDirection};
+    // The UA sheet sets `flex-direction: row`. `Style::default()` is column,
+    // which is not the used value of an element.
+    let mark = |value: &str| {
+        let mut style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        };
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            value.to_string(),
+        )]));
+        style
+    };
+    let child = |w| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                height: Dimension::Px(10.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    for value in ["-webkit-box", "-webkit-inline-box"] {
+        let root = node(
+            block(),
+            vec![node(mark(value), vec![child(40.0), child(60.0)])],
+        );
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{value} {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect(value);
+        let at = |index| {
+            let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+            (r.x, r.y, r.width, r.height)
+        };
+        // 0 root, 1 box, 2 first child, 3 second child.
+        assert_eq!(at(1), (0.0, 0.0, 100.0, 10.0), "{value}");
+        assert_eq!(at(2), (0.0, 0.0, 40.0, 10.0), "{value}");
+        assert_eq!(at(3), (40.0, 0.0, 60.0, 10.0), "{value}");
+    }
 }
 
 /// CSS 2.1 10.3.2 / 10.3.4: an explicit content-box size wins over the

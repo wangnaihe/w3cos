@@ -2340,8 +2340,10 @@ fn parse_display(value: &str) -> Display {
         // unrecognized flex boxes. NG blockifies `inline-grid` as a flex
         // or grid item, and also lays a definite top-level `inline-grid`
         // out on a line. A definite `run-in` is that flex box.
-        // `-webkit-box` stays on legacy so line-clamp references do
-        // not switch engines alone.
+        // `-webkit-box` and `-webkit-inline-box` use that flex box when
+        // the flex line accepts the tree. A text item keeps the marker
+        // so a line-clamp reference does not switch engines alone.
+        // `-webkit-box-orient` is not stored.
         "grid-lanes" => Display::Flex,
         "block" => Display::Block,
         "inline" => Display::Inline,

@@ -511,15 +511,18 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 // Validated with its IFC container (container_reason).
                 (!inline::in_inline_container(flat, index)).then_some("display:inline")
             } else if is_author_flex(info.style) {
-                // `run-in` and `-webkit-box` compute to `display: flex` for
-                // legacy. A `run-in` box whose flex line this stage can lay
-                // out uses that flex box (the applies-to squares). A run-in
-                // the flex algorithm rejects keeps the unrecognized marker,
-                // so the page stays on legacy instead of changing only the
-                // trace reason. `-webkit-box` stays on the marker: line-clamp
-                // references still match only on legacy.
+                // `run-in`, `-webkit-box`, and `-webkit-inline-box` compute
+                // to `display: flex` for legacy. When this stage can lay
+                // out that flex line, NG uses the same box. A rejection
+                // (a text item, baseline, rtl, …) keeps the unrecognized
+                // marker, so a line-clamp reference does not switch engines
+                // alone. `-webkit-box-orient` is not stored, so a vertical
+                // box stays the row the legacy engine already paints.
                 let flex_reason = super::flex::container_reason(flat, index);
-                let allowed: &[&str] = if is_run_in(info.style) && flex_reason.is_none() {
+                let allowed: &[&str] = if (is_run_in(info.style)
+                    || is_legacy_webkit_box(info.style))
+                    && flex_reason.is_none()
+                {
                     &[
                         inline::VALIGN_MARKER,
                         "--w3cos-internal-unrecognized-display",
@@ -1273,6 +1276,15 @@ fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
 
 fn is_run_in(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "run-in")
+}
+
+/// Legacy `display: -webkit-box` and `-webkit-inline-box`. Both parse as
+/// `display: flex` plus the unrecognized marker, so NG off is unchanged.
+/// `-webkit-inline-box` is not an inline-flex: the used value is the
+/// block flex box the legacy engine already paints.
+fn is_legacy_webkit_box(style: &Style) -> bool {
+    unrecognized_display(style)
+        .is_some_and(|value| matches!(value, "-webkit-box" | "-webkit-inline-box"))
 }
 
 pub(super) fn is_author_flex(style: &Style) -> bool {
