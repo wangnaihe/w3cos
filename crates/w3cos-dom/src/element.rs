@@ -3,7 +3,7 @@ use crate::css_style::CSSStyleDeclaration;
 use crate::document::Document;
 use crate::dom_rect::DOMRect;
 use crate::events::{Event, EventHandler, EventType};
-use crate::node::{NodeId, NodeType};
+use crate::node::{ClassList, NodeId, NodeType};
 use crate::stylesheet;
 
 fn cached_attr_name(name: &str) -> Atom {
@@ -330,8 +330,28 @@ impl Element {
     }
 
     pub fn set_class_name(&self, doc: &mut Document, name: &str) {
-        let node = doc.get_node_mut(self.id);
         let class_attr = cached_attr_name("class");
+        // One intern of the attribute text. A single token reuses that atom
+        // for the class list so "row" is not hashed twice per element.
+        let whole = Atom::intern(name);
+        let mut new_classes = ClassList::new();
+        let mut reused_whole = false;
+        for class in name
+            .split([' ', '\t', '\n', '\r', '\x0c'])
+            .filter(|class| !class.is_empty())
+        {
+            let atom = if !reused_whole && class.len() == name.len() {
+                reused_whole = true;
+                whole
+            } else {
+                Atom::intern(class)
+            };
+            if !new_classes.contains(&atom) {
+                new_classes.push(atom);
+            }
+        }
+
+        let node = doc.get_node_mut(self.id);
         if let Some(index) = node
             .attributes
             .iter()
@@ -339,23 +359,20 @@ impl Element {
         {
             node.clear_attribute_namespace(index);
         }
-        let old_classes = std::mem::take(&mut node.class_list);
-        for class in old_classes {
-            doc.remove_from_class_index(self.id, &class);
+        let old_classes = std::mem::replace(&mut node.class_list, new_classes);
+        let current_classes = doc.get_node(self.id).class_list.clone();
+        // Preserve entries shared by the old and new values. Class-name
+        // updates commonly replace one state token while retaining structural
+        // tokens, so removing and re-adding every entry needlessly churns the
+        // selector index.
+        for class in &old_classes {
+            if !current_classes.contains(class) {
+                doc.remove_from_class_index(self.id, class);
+            }
         }
-        // One intern of the attribute text. A single token reuses that atom
-        // for the class list so "row" is not hashed twice per element.
-        let whole = Atom::intern(name);
-        let mut reused_whole = false;
-        for class in name
-            .split([' ', '\t', '\n', '\r', '\x0c'])
-            .filter(|class| !class.is_empty())
-        {
-            if !reused_whole && class.len() == name.len() {
-                self.class_list_add_atom(doc, whole);
-                reused_whole = true;
-            } else {
-                self.class_list_add(doc, class);
+        for class in &current_classes {
+            if !old_classes.contains(class) {
+                doc.add_to_class_index(self.id, class);
             }
         }
         let node = doc.get_node_mut(self.id);
