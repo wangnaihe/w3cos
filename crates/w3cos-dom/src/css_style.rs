@@ -1401,7 +1401,17 @@ impl CSSStyleDeclaration {
                 }
             }
             "align-content" | "alignContent" => {
-                self.inner.align_content = parse_align_content(value)
+                self.inner.align_content = parse_align_content(value);
+                // `safe` changes overflow alignment (CSS Align §4.4). The
+                // used keyword stays the legacy parse; NG reads the marker.
+                let safe = value
+                    .split_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("safe"));
+                set_marker(
+                    &mut self.inner,
+                    "--w3cos-internal-safe-align-content",
+                    safe.then(|| "1".to_string()),
+                );
             }
             "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
             "justify-items" | "justifyItems" => self.inner.justify_items = parse_align_items(value),

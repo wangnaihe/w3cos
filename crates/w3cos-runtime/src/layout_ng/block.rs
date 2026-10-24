@@ -97,6 +97,9 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stays the enum flex already uses.
             | "height-keyword"
             | "justify-content"
+            // Flex reads this for `align-content: safe …` overflow.
+            // The used align-content enum stays the legacy parse.
+            | "safe-align-content"
             // Grid-lanes stays `display: flex` for legacy. NG reads the
             // marker and lays the box out as a grid. Percent gaps are not
             // stored; only a grid container consults the marker.

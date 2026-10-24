@@ -5,8 +5,9 @@
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
 //! lengths, alignment, line breaking). Baseline alignment, inline-flex,
-//! wrap-reverse, column wrap, and an indefinite percentage basis stay on
-//! the legacy engine. A definite-height row wrap with a gap and
+//! column wrap, and an indefinite percentage basis stay on
+//! the legacy engine. Row `wrap-reverse` swaps the cross-start (Flexbox
+//! §5.2) and packs lines from that edge. A definite-height row wrap with a gap and
 //! auto-height items stays there too (`flex-wrap: balance` is
 //! unrecognized, and its wrap reference must use the same engine).
 //!
@@ -65,13 +66,10 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-width-keyword") {
         return Some("flex:width-keyword");
     }
-    // wrap-reverse flips the cross-start of each line (Flexbox §5.2). That
-    // alignment stays on the legacy engine. Column wrap sizes each line's
-    // cross size before stretch and stays there too. An indefinite main
-    // size does not wrap (Flexbox §9.2).
-    if style.flex_wrap == FlexWrap::WrapReverse {
-        return Some("flex:wrap-reverse");
-    }
+    // Column wrap sizes each line's cross size on the horizontal axis and
+    // stays on the legacy engine, including column `wrap-reverse`. An
+    // indefinite main size does not wrap (Flexbox §9.2). Row `wrap-reverse`
+    // swaps the cross-start and is laid out below.
     if style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction) {
         return Some("flex:wrap-column");
     }
@@ -140,7 +138,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if !row && column_percent_size(flat, child) {
             return Some("flex:column-percent");
         }
-        let (cross_start, cross_end) = cross_margin_sides(child_style, style.flex_direction);
+        let (cross_start, cross_end) = cross_margin_sides(
+            child_style,
+            style.flex_direction,
+            style.flex_wrap == FlexWrap::WrapReverse,
+        );
         if matches!(cross_start, Spacing::Auto) || matches!(cross_end, Spacing::Auto) {
             return Some("flex:auto-cross-margin");
         }
@@ -278,11 +280,21 @@ fn main_margin_sides(style: &Style, direction: FlexDirection) -> (Spacing, Spaci
     }
 }
 
-fn cross_margin_sides(style: &Style, direction: FlexDirection) -> (Spacing, Spacing) {
-    if row_axis(direction) {
+fn cross_margin_sides(
+    style: &Style,
+    direction: FlexDirection,
+    wrap_reverse: bool,
+) -> (Spacing, Spacing) {
+    // `wrap-reverse` swaps cross-start and cross-end (Flexbox §5.2).
+    let (start, end) = if row_axis(direction) {
         (style.margin.top, style.margin.bottom)
     } else {
         (style.margin.left, style.margin.right)
+    };
+    if wrap_reverse {
+        (end, start)
+    } else {
+        (start, end)
     }
 }
 
@@ -732,7 +744,11 @@ pub(super) fn layout(
             resolve_main_limits(child_style, row, main_edges, inner_main, space, flat, child)
                 .why("flex:min")?;
         let (main_start, main_end) = main_margin_sides(child_style, direction);
-        let (cross_start, cross_end) = cross_margin_sides(child_style, direction);
+        let (cross_start, cross_end) = cross_margin_sides(
+            child_style,
+            direction,
+            style.flex_wrap == FlexWrap::WrapReverse,
+        );
         let (auto_main_start, auto_main_end) = (
             matches!(main_start, Spacing::Auto),
             matches!(main_end, Spacing::Auto),
@@ -1116,7 +1132,8 @@ fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)>
 /// `flex-wrap: wrap` and `wrap-reverse` on a row with a definite main size.
 /// Each line flexes against the container's inner main size. `align-content:
 /// stretch` gives leftover cross space to the lines; `flex-start` packs them
-/// at the cross start. `wrap-reverse` places the first line at the cross end.
+/// at the cross start. `wrap-reverse` has already swapped cross-start to the
+/// far cross edge, so the first line and `flex-start` items sit there.
 fn layout_wrapped(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -1244,13 +1261,19 @@ fn layout_wrapped(
     } else {
         inner_width
     };
+    // `safe` overflow alignment uses `start` instead of the flex cross-start
+    // (CSS Align §4.4). For a row that is the physical top, so an overflowing
+    // wrap-reverse line stays at y=0 and overflows downward.
+    let safe_cross = has_marker(style, "--w3cos-internal-safe-align-content");
+    let cross_overflows = definite_cross.is_some_and(|size| packed > size + EPS);
+    let reverse_cross = wrap_reverse && !(safe_cross && cross_overflows);
     let mut children = Vec::with_capacity(items.len());
     let mut oof_out = Vec::new();
     let mut frag_at = 0;
-    let mut cross_cursor = if wrap_reverse { used_cross } else { 0.0 };
+    let mut cross_cursor = if reverse_cross { used_cross } else { 0.0 };
     for (line_index, &(start, end)) in lines.iter().enumerate() {
         let line_size = line_cross[line_index];
-        if wrap_reverse {
+        if reverse_cross {
             cross_cursor -= line_size;
         }
         let line = &mut items[start..end];
@@ -1293,12 +1316,21 @@ fn layout_wrapped(
             let main = unit(main);
             let margin_box = item.margin_box_cross();
             let extra = (line_size - margin_box).max(0.0);
-            let cross_offset = match item.align {
+            let from_cross_start = match item.align {
                 AlignItems::FlexEnd => extra,
                 AlignItems::Center => extra / 2.0,
                 AlignItems::Stretch | AlignItems::FlexStart | AlignItems::Baseline => 0.0,
             };
-            let cross = unit(item.margin_cross_start + cross_offset);
+            let border_cross = item.cross_edges + item.cross.unwrap_or(0.0);
+            // Cross-start is the top of the line, unless `wrap-reverse` put
+            // it at the bottom. The offset is the border box from the line's
+            // physical top.
+            let cross = if reverse_cross {
+                line_size - from_cross_start - item.margin_cross_start - border_cross
+            } else {
+                from_cross_start + item.margin_cross_start
+            };
+            let cross = unit(cross);
             let (x, y) = if row {
                 (bl + pl + main, bt + pt + cross_cursor + cross)
             } else {
@@ -1318,7 +1350,7 @@ fn layout_wrapped(
                 cursor += step;
             }
         }
-        if wrap_reverse {
+        if reverse_cross {
             cross_cursor -= cross_gap;
         } else {
             cross_cursor += line_size + cross_gap;
@@ -2027,11 +2059,12 @@ mod tests {
     }
 
     #[test]
-    fn wrap_reverse_column_wrap_baseline_and_rtl_stay_on_legacy() {
+    fn column_wrap_baseline_and_rtl_stay_on_legacy() {
         for style in [
             Style {
                 flex_wrap: FlexWrap::WrapReverse,
-                ..flex_style(FlexDirection::Row, 100.0, None)
+                flex_direction: FlexDirection::Column,
+                ..flex_style(FlexDirection::Column, 100.0, Some(80.0))
             },
             Style {
                 flex_wrap: FlexWrap::Wrap,
@@ -2077,6 +2110,161 @@ mod tests {
         );
         let flat = pre_flatten(&root);
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    }
+
+    #[test]
+    fn row_wrap_reverse_places_the_first_line_on_the_cross_start() {
+        // Headless Chrome, body margin 0. `flex: 0 0 40px`, height 10.
+        // Auto height: container 100×20, first line at the bottom
+        // (0,10), (40,10), second line (0,0).
+        let mut container = flex_style(FlexDirection::Row, 100.0, None);
+        container.flex_wrap = FlexWrap::WrapReverse;
+        expect(
+            &Component::boxed(
+                container,
+                vec![
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 20.0]),
+                (1, [0.0, 10.0, 40.0, 10.0]),
+                (2, [40.0, 10.0, 40.0, 10.0]),
+                (3, [0.0, 0.0, 40.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_wrap_reverse_flex_start_packs_lines_at_the_end() {
+        // align-content: flex-start, height 50. Lines stay 10px and sit
+        // at the bottom: (0,40), (40,40), (0,30).
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(50.0));
+        container.flex_wrap = FlexWrap::WrapReverse;
+        container.align_content = AlignContent::FlexStart;
+        expect(
+            &Component::boxed(
+                container,
+                vec![
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 50.0]),
+                (1, [0.0, 40.0, 40.0, 10.0]),
+                (2, [40.0, 40.0, 40.0, 10.0]),
+                (3, [0.0, 30.0, 40.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_wrap_reverse_stretch_keeps_definite_items_on_the_cross_start() {
+        // Default align-content: stretch grows each line by 15px in a
+        // 50px height. Definite 10px items stay on the cross-start
+        // (the bottom of each line): (0,40), (40,40), (0,15).
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(50.0));
+        container.flex_wrap = FlexWrap::WrapReverse;
+        expect(
+            &Component::boxed(
+                container,
+                vec![
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 50.0]),
+                (1, [0.0, 40.0, 40.0, 10.0]),
+                (2, [40.0, 40.0, 40.0, 10.0]),
+                (3, [0.0, 15.0, 40.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_wrap_reverse_flex_end_uses_the_cross_end() {
+        // Height 40, two lines (60px items). Stretch adds 3px to each
+        // line (13 and 27). align-items: flex-end is the cross-end, the
+        // top of the line: (0,27,60,10) and (0,0,60,24).
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(40.0));
+        container.flex_wrap = FlexWrap::WrapReverse;
+        container.align_items = AlignItems::FlexEnd;
+        expect(
+            &Component::boxed(
+                container,
+                vec![leaf(fixed_item(60.0, 10.0)), leaf(fixed_item(60.0, 24.0))],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 40.0]),
+                (1, [0.0, 27.0, 60.0, 10.0]),
+                (2, [0.0, 0.0, 60.0, 24.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn row_wrap_reverse_keeps_asymmetric_cross_margins_on_the_start_edge() {
+        // One item, margin-top 2, margin-bottom 8, height 10, container
+        // height 40, align-content stretch. The margin box is 20px and
+        // the line grows to 40. Cross-start is the bottom, so the 8px
+        // margin sits there and the border box is at y=22.
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(40.0));
+        container.flex_wrap = FlexWrap::WrapReverse;
+        let mut item = fixed_item(40.0, 10.0);
+        item.margin = edges(2.0, 0.0, 8.0, 0.0);
+        expect(
+            &Component::boxed(container, vec![leaf(item)]),
+            &[(0, [0.0, 0.0, 100.0, 40.0]), (1, [0.0, 22.0, 40.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn row_wrap_reverse_safe_overflow_stays_at_the_start_edge() {
+        // `align-content: safe flex-start`. The 100px item overflows a 90px
+        // wrap-reverse container, so CSS Align §4.4 aligns it as `start`:
+        // border box (0,0,100,100), overflowing the end edges. Headless
+        // Chrome matches that for flexbox-safe-overflow-position-002.
+        let mut container = flex_style(FlexDirection::Row, 90.0, Some(90.0));
+        container.flex_wrap = FlexWrap::WrapReverse;
+        container.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+            "--w3cos-internal-safe-align-content".to_string(),
+            "1".to_string(),
+        )]));
+        expect(
+            &Component::boxed(container, vec![leaf(fixed_item(100.0, 100.0))]),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn row_reverse_wrap_reverse_packs_main_and_cross_starts() {
+        // row-reverse wrap-reverse. First line of two 40px items sits at
+        // the bottom, packed to the right: (60,10), (20,10). The single
+        // item on the next line is (60,0).
+        let mut container = flex_style(FlexDirection::RowReverse, 100.0, None);
+        container.flex_wrap = FlexWrap::WrapReverse;
+        expect(
+            &Component::boxed(
+                container,
+                vec![
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                    leaf(fixed_item(40.0, 10.0)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 100.0, 20.0]),
+                (1, [60.0, 10.0, 40.0, 10.0]),
+                (2, [20.0, 10.0, 40.0, 10.0]),
+                (3, [60.0, 0.0, 40.0, 10.0]),
+            ],
+        );
     }
 
     #[test]
