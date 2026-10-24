@@ -10,11 +10,11 @@
       "features": [],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 11877576,
-          "text_bytes": 7726552,
-          "data_bytes": 3338845,
-          "readonly_data_bytes": 2703813,
-          "gzip_bytes": 5095951,
+          "total_bytes": 12132480,
+          "text_bytes": 7890712,
+          "data_bytes": 3424585,
+          "readonly_data_bytes": 2784625,
+          "gzip_bytes": 5214358,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -31,7 +31,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "x86_64-unknown-linux-gnu release-size rows after merging explicit image codecs and the SVG GPU path. Ordinary AOT and dynamic-browser probes leave image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring off. Rust 1.99.1."
+          "note": "LayoutNG stays in the runtime binary: W3COS_LAYOUT_NG selects it at run time, so release-size LTO keeps the S1-S5 block, inline, float, and nowrap-flex code. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12132480 bytes (+254904, 2.15%) and the dynamic-browser probe is 15618448 bytes (+245816, 1.60%), past the 200 KiB absolute gate and under the 3% gate. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
         }
       }
     },
@@ -42,15 +42,15 @@
       ],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 15372632,
-          "text_bytes": 9963144,
-          "data_bytes": 4399109,
-          "readonly_data_bytes": 3586561,
-          "gzip_bytes": 6693042,
+          "total_bytes": 15618448,
+          "text_bytes": 10116616,
+          "data_bytes": 4483261,
+          "readonly_data_bytes": 3664897,
+          "gzip_bytes": 6802713,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
-            "dynamic-js": 686785,
+            "dynamic-js": 687346,
             "gpu": 0,
             "host-keyring": 0,
             "host-tray": 0,
@@ -63,7 +63,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "x86_64-unknown-linux-gnu release-size rows after merging explicit image codecs and the SVG GPU path. Ordinary AOT and dynamic-browser probes leave image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring off. Rust 1.99.1."
+          "note": "LayoutNG stays in the runtime binary: W3COS_LAYOUT_NG selects it at run time, so release-size LTO keeps the S1-S5 block, inline, float, and nowrap-flex code. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12132480 bytes (+254904, 2.15%) and the dynamic-browser probe is 15618448 bytes (+245816, 1.60%), past the 200 KiB absolute gate and under the 3% gate. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
         }
       }
     }
