@@ -2526,6 +2526,190 @@ fn top_level_definite_inline_grid_shares_a_line() {
     );
 }
 
+/// Non-fixed tracks on a definite top-level `inline-grid`, and baseline
+/// alignment of the line. Headless Chrome, body margin 0: a 40×20 grid and
+/// a 40×60 grid after a 15px block sit at (0,55) and (40,15) (the baseline
+/// is the bottom margin edge). A 40×40 grid whose first item is 10px tall
+/// sits 30px below an empty 40×40 sibling, because the item's bottom is
+/// the baseline. `auto auto` in 200px places a 30px item at x=105. `1fr 2fr`
+/// in 210px is 70/140. `minmax(20px,1fr) minmax(50px,max-content)` places
+/// an 80px item at x=120. `min-content max-content` in 300px keeps the
+/// items at x=0 and x=40.
+#[test]
+fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
+    use w3cos_std::style::CustomProperties;
+    let mark = |mut style: Style| {
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )]));
+        style
+    };
+    let grid = |w, h, columns: Option<&str>| {
+        mark(Style {
+            display: Display::Flex,
+            width: Dimension::Px(w),
+            height: Dimension::Px(h),
+            grid_template_columns: columns.map(str::to_string),
+            ..Style::default()
+        })
+    };
+    let at = |out: &[(LayoutRect, usize)], index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    let box10 = |w| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                height: Dimension::Px(10.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+
+    let bases = node(
+        block(),
+        vec![
+            node(sized(15.0), vec![]),
+            node(grid(40.0, 20.0, None), vec![]),
+            node(grid(40.0, 60.0, None), vec![]),
+        ],
+    );
+    let bases_flat = pre_flatten(&bases);
+    assert!(
+        block::supports_tree(&bases_flat),
+        "{:?}",
+        block::unsupported_reasons(&bases_flat)
+    );
+    let bases_out = layout_tree(&bases, &bases_flat, 800.0, 600.0).expect("baselines");
+    assert_eq!(at(&bases_out, 2), (0.0, 55.0, 40.0, 20.0));
+    assert_eq!(at(&bases_out, 3), (40.0, 15.0, 40.0, 60.0));
+
+    let item_base = node(
+        block(),
+        vec![
+            node(grid(40.0, 40.0, None), vec![box10(10.0)]),
+            node(grid(40.0, 40.0, None), vec![]),
+        ],
+    );
+    let item_flat = pre_flatten(&item_base);
+    assert!(
+        block::supports_tree(&item_flat),
+        "{:?}",
+        block::unsupported_reasons(&item_flat)
+    );
+    let item_out = layout_tree(&item_base, &item_flat, 800.0, 600.0).expect("item baseline");
+    // 0 root, 1 first grid, 2 its item, 3 empty grid.
+    assert_eq!(at(&item_out, 1), (0.0, 30.0, 40.0, 40.0));
+    assert_eq!(at(&item_out, 2), (0.0, 30.0, 10.0, 10.0));
+    assert_eq!(at(&item_out, 3), (40.0, 0.0, 40.0, 40.0));
+
+    let auto = node(
+        block(),
+        vec![node(
+            grid(200.0, 30.0, Some("auto auto")),
+            vec![box10(40.0), box10(30.0)],
+        )],
+    );
+    let auto_flat = pre_flatten(&auto);
+    assert!(
+        block::supports_tree(&auto_flat),
+        "{:?}",
+        block::unsupported_reasons(&auto_flat)
+    );
+    let auto_out = layout_tree(&auto, &auto_flat, 800.0, 600.0).expect("auto");
+    assert_eq!(at(&auto_out, 1), (0.0, 0.0, 200.0, 30.0));
+    assert_eq!(at(&auto_out, 2), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(at(&auto_out, 3), (105.0, 0.0, 30.0, 10.0));
+
+    let bar = node(
+        Style {
+            height: Dimension::Px(10.0),
+            ..block()
+        },
+        vec![],
+    );
+    let fr = node(
+        block(),
+        vec![node(
+            grid(210.0, 20.0, Some("1fr 2fr")),
+            vec![bar.clone(), bar],
+        )],
+    );
+    let fr_flat = pre_flatten(&fr);
+    assert!(
+        block::supports_tree(&fr_flat),
+        "{:?}",
+        block::unsupported_reasons(&fr_flat)
+    );
+    let fr_out = layout_tree(&fr, &fr_flat, 800.0, 600.0).expect("fr");
+    assert_eq!(at(&fr_out, 2), (0.0, 0.0, 70.0, 10.0));
+    assert_eq!(at(&fr_out, 3), (70.0, 0.0, 140.0, 10.0));
+
+    let minmax = node(
+        block(),
+        vec![node(
+            grid(
+                200.0,
+                20.0,
+                Some("minmax(20px,1fr) minmax(50px,max-content)"),
+            ),
+            vec![box10(40.0), box10(80.0)],
+        )],
+    );
+    let minmax_flat = pre_flatten(&minmax);
+    assert!(
+        block::supports_tree(&minmax_flat),
+        "{:?}",
+        block::unsupported_reasons(&minmax_flat)
+    );
+    let minmax_out = layout_tree(&minmax, &minmax_flat, 800.0, 600.0).expect("minmax");
+    assert_eq!(at(&minmax_out, 2), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(at(&minmax_out, 3), (120.0, 0.0, 80.0, 10.0));
+
+    let intrinsic = node(
+        block(),
+        vec![node(
+            grid(300.0, 20.0, Some("min-content max-content")),
+            vec![box10(40.0), box10(70.0)],
+        )],
+    );
+    let intrinsic_flat = pre_flatten(&intrinsic);
+    assert!(
+        block::supports_tree(&intrinsic_flat),
+        "{:?}",
+        block::unsupported_reasons(&intrinsic_flat)
+    );
+    let intrinsic_out = layout_tree(&intrinsic, &intrinsic_flat, 800.0, 600.0).expect("intrinsic");
+    assert_eq!(at(&intrinsic_out, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(at(&intrinsic_out, 2), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(at(&intrinsic_out, 3), (40.0, 0.0, 70.0, 10.0));
+
+    let ordinary = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Grid,
+                width: Dimension::Px(300.0),
+                height: Dimension::Px(20.0),
+                grid_template_columns: Some("min-content max-content".to_string()),
+                ..Style::default()
+            },
+            vec![box10(40.0)],
+        )],
+    );
+    let ordinary_flat = pre_flatten(&ordinary);
+    assert!(
+        block::unsupported_reasons(&ordinary_flat)
+            .iter()
+            .any(|reason| *reason == "grid:intrinsic-track"),
+        "{:?}",
+        block::unsupported_reasons(&ordinary_flat)
+    );
+}
+
 /// `-webkit-box` is the legacy flex box. Headless Chrome, body margin 0:
 /// a 100px horizontal box places 40px and 60px children at x=0 and x=40.
 /// `-webkit-inline-box` uses that same block flex box (the used display

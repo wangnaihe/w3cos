@@ -537,9 +537,10 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             } else if is_author_grid(info.style) {
                 // CSS Flexbox §4 / Grid §6.1 blockify `inline-grid` on a
                 // flex or grid item. A top-level `inline-grid` joins the
-                // grid only for a definite px box (`is_inline_grid_line`);
-                // the other boxes stay on the marker so a reference that
-                // still falls back does not switch engines alone.
+                // grid for a definite px box whose tracks are fixed, auto,
+                // fr, minmax, or intrinsic (`is_inline_grid_line`); the
+                // other boxes stay on the marker so a reference that still
+                // falls back does not switch engines alone.
                 let blockified = is_blockified_inline_grid(flat, index);
                 let allowed: &[&str] = if blockified || is_inline_grid_line(flat, index) {
                     &[
@@ -1277,6 +1278,15 @@ fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
         && super::grid::definite_inline_grid(flat[index].style)
 }
 
+/// Ascent of an inline-grid on a line. `NoLines` is the bottom border
+/// edge: an empty grid synthesizes its baseline there.
+fn inline_grid_line_ascent(result: &LayoutResult) -> f32 {
+    match result.first_baseline {
+        LastBaseline::At(baseline) => baseline,
+        LastBaseline::NoLines | LastBaseline::Unknown => result.fragment.height,
+    }
+}
+
 fn is_run_in(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "run-in")
 }
@@ -1747,31 +1757,49 @@ fn layout_block_in(
                 y
             };
             let available = metrics.content_width;
-            let mut line_x = 0.0f32;
             let mut line_y = y;
-            let mut line_h = 0.0f32;
-            for &item in &run {
-                let result = layout_block_in(flat, item, &child_space, false, None, exclusions)
-                    .why("inline-grid")?;
-                float_overlap |= result.float_overlap;
-                let width = result.fragment.width;
-                let height = result.fragment.height;
-                if line_x > 0.0 && line_x + width > available + 1.0 / 128.0 {
-                    line_y += line_h;
-                    line_x = 0.0;
-                    line_h = 0.0;
+            let mut index = 0;
+            while index < run.len() {
+                let mut line = Vec::new();
+                let mut line_x = 0.0f32;
+                while index < run.len() {
+                    let item = run[index];
+                    let result = layout_block_in(flat, item, &child_space, false, None, exclusions)
+                        .why("inline-grid")?;
+                    let width = result.fragment.width;
+                    if line_x > 0.0 && line_x + width > available + 1.0 / 128.0 {
+                        break;
+                    }
+                    float_overlap |= result.float_overlap;
+                    line_x += width;
+                    line.push(result);
+                    index += 1;
                 }
-                let (dx, dy) = oof::relative_offset(flat[item].style, &child_space);
-                let (fx, fy) = (bl + pl + line_x + dx, bt + pt + line_y + dy);
-                oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
-                if result.last_baseline != LastBaseline::NoLines {
-                    last_baseline = result.last_baseline.offset(bt + pt + line_y);
+                // `vertical-align: baseline` (the initial value). The
+                // ascent is the grid's first baseline, or the bottom
+                // margin edge when the grid has no items (CSS Grid §10,
+                // CSS 2.1 10.8.1).
+                let ascent = line.iter().map(inline_grid_line_ascent).fold(0.0, f32::max);
+                let mut placed_x = 0.0f32;
+                let mut line_h = 0.0f32;
+                for result in line {
+                    let shift = (ascent - inline_grid_line_ascent(&result)).max(0.0);
+                    let width = result.fragment.width;
+                    let height = result.fragment.height;
+                    let (dx, dy) =
+                        oof::relative_offset(flat[result.fragment.index].style, &child_space);
+                    let (fx, fy) = (bl + pl + placed_x + dx, bt + pt + line_y + shift + dy);
+                    oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
+                    if result.last_baseline != LastBaseline::NoLines {
+                        last_baseline = result.last_baseline.offset(bt + pt + line_y + shift);
+                    }
+                    children.push((fx, fy, result.fragment));
+                    placed_x += width;
+                    line_h = line_h.max(shift + height);
                 }
-                children.push((fx, fy, result.fragment));
-                line_x += width;
-                line_h = line_h.max(height);
+                line_y += line_h;
             }
-            cursor = line_y + line_h;
+            cursor = line_y;
             at_top = false;
             child = scan;
             continue;

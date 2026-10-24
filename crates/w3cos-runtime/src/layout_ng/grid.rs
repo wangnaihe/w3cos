@@ -235,8 +235,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     // `min-content` / `max-content` still disagree with the legacy engine
     // on ordinary grids. A parent of a subgrid is the exception: the
-    // subgrid items size those tracks.
-    if intrinsic_tracks_without_subgrid(flat, index) {
+    // subgrid items size those tracks. A top-level inline-grid with a
+    // definite border box is the other: those tracks are the line box.
+    if intrinsic_tracks_without_subgrid(flat, index) && !inline_grid_line_lays_out(flat, index) {
         return Some("grid:intrinsic-track");
     }
     if has_marker(style, "--w3cos-internal-grid-lanes") && !lanes_like_grid(flat, index) {
@@ -679,11 +680,13 @@ fn spacing_is_px(spacing: Spacing) -> bool {
 }
 
 /// A top-level `inline-grid` laid out on a line. The border box is a
-/// definite px size, the tracks are fixed lengths (or there is no
-/// template), and alignment is the initial value. A flex or grid item is
-/// blockified separately. Everything else keeps the unrecognized-display
-/// marker: those boxes are the references of pages that still fall back,
-/// and laying out only the reference splits the reftest.
+/// definite px size and alignment is the initial value. Tracks may be
+/// fixed lengths, `auto`, `fr`, `minmax`, `fit-content`, `min-content`,
+/// or `max-content` (or there is no template). Auto-repeat and `subgrid`
+/// stay out. A flex or grid item is blockified separately. Everything
+/// else keeps the unrecognized-display marker: those boxes are the
+/// references of pages that still fall back, and laying out only the
+/// reference splits the reftest.
 pub(super) fn definite_inline_grid(style: &Style) -> bool {
     if style.direction == TextDirection::Rtl
         || style.float != Float::None
@@ -727,10 +730,49 @@ pub(super) fn definite_inline_grid(style: &Style) -> bool {
     {
         return false;
     }
-    axis_fixed(columns_spec(style), false) && axis_fixed(style.grid_rows(), true)
+    axis_line(columns_spec(style), false) && axis_line(style.grid_rows(), true)
 }
 
-fn axis_fixed(spec: Option<&str>, rows: bool) -> bool {
+/// The same definite box, and not a flex or grid item. Intrinsic tracks
+/// on this box are laid out here; a blockified inline-grid keeps
+/// `grid:intrinsic-track` so an ordinary-grid reference stays on legacy.
+fn inline_grid_line_lays_out(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    if marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid") {
+        return false;
+    }
+    if flat[index].parent.is_some_and(|parent| {
+        let parent_style = flat[parent].style;
+        block::is_author_flex(parent_style) || block::is_author_grid(parent_style)
+    }) {
+        return false;
+    }
+    definite_inline_grid(style)
+}
+
+fn breadth_is_line(breadth: Breadth) -> bool {
+    matches!(
+        breadth,
+        Breadth::Px(_)
+            | Breadth::Em(_)
+            | Breadth::Percent(_)
+            | Breadth::Calc { .. }
+            | Breadth::Auto
+            | Breadth::Fr(_)
+            | Breadth::MinContent
+            | Breadth::MaxContent
+    )
+}
+
+fn spec_is_line_track(spec: &Spec) -> bool {
+    match *spec {
+        Spec::One(breadth) => breadth_is_line(breadth),
+        Spec::MinMax(min, max) => breadth_is_line(min) && breadth_is_line(max),
+        Spec::Fit(argument) => breadth_is_line(argument),
+    }
+}
+
+fn axis_line(spec: Option<&str>, rows: bool) -> bool {
     let Some(spec) = spec else {
         return true;
     };
@@ -739,7 +781,7 @@ fn axis_fixed(spec: Option<&str>, rows: bool) -> bool {
     }
     match parse_template(spec, rows) {
         Some(template)
-            if template.auto_fit.is_none() && template.tracks.iter().all(spec_is_fixed) =>
+            if template.auto_fit.is_none() && template.tracks.iter().all(spec_is_line_track) =>
         {
             true
         }
@@ -3278,6 +3320,9 @@ pub(super) fn layout(
     let rtl = style.direction == TextDirection::Rtl;
     let mut children = Vec::with_capacity(built.len());
     let mut pending_oof = Vec::new();
+    let inline_grid = marker(style, "--w3cos-internal-unrecognized-display") == Some("inline-grid");
+    // First baseline of the first row (CSS Grid §10). Column, then source.
+    let mut first_row_baseline: Option<(usize, usize, f32)> = None;
     let mut ordered: Vec<usize> = (0..built.len()).collect();
     ordered.sort_by_key(|&index| built[index].source);
     for index in ordered {
@@ -3311,6 +3356,18 @@ pub(super) fn layout(
         }
         let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
         let laid = &fragments[index];
+        if inline_grid && item.row == 0 {
+            let item_base = match laid.first_baseline {
+                LastBaseline::At(value) => value,
+                LastBaseline::NoLines | LastBaseline::Unknown => fragment.height,
+            };
+            let offset = y + dy + item_base;
+            let replace = first_row_baseline
+                .is_none_or(|(col, source, _)| (item.col, item.source) < (col, source));
+            if replace {
+                first_row_baseline = Some((item.col, item.source, offset));
+            }
+        }
         pending_oof.extend(
             laid.oof
                 .iter()
@@ -3428,7 +3485,15 @@ pub(super) fn layout(
             children,
         },
         last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        first_baseline: if inline_grid {
+            LastBaseline::At(
+                first_row_baseline
+                    .map(|(_, _, offset)| offset)
+                    .unwrap_or(border_height),
+            )
+        } else {
+            LastBaseline::NoLines
+        },
         start_strut,
         end_strut,
         self_collapsing: false,
