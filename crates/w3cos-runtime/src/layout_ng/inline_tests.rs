@@ -2588,3 +2588,81 @@ fn text_items_break_inside_at_uax14_opportunities() {
         ]
     );
 }
+
+/// NGLineBreaker::HandleOverflow rewinds to the latest opportunity, which
+/// may lie inside an earlier item on the line (after its `-`), later than
+/// the boundary before that item.  Expected leaf rects are Chrome's for
+/// `<div style="width:W;font:20px/1 Ahem"><span>..</span>..</div>`.
+#[test]
+fn overflow_rewinds_inside_an_earlier_item() {
+    let _ahem = AhemGuard::new();
+    let layout = |width: f32, texts: &[&str]| {
+        let mut container = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            ..Style::default()
+        };
+        font(&mut container, 20.0, LineHeight::Number(1.0));
+        container
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let children = texts
+            .iter()
+            .map(|content| {
+                let mut style = Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                };
+                font(&mut style, 20.0, LineHeight::Number(1.0));
+                Component::text(*content, style)
+            })
+            .collect();
+        let root = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, children)],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let (_, _, fragment) = block::layout_root(&flat, 800.0, 600.0).expect("ng");
+        fn leaves(
+            f: &BoxFragment,
+            x: f32,
+            y: f32,
+            out: &mut Vec<(usize, Option<(usize, usize)>, [f32; 4])>,
+        ) {
+            if f.children.is_empty() {
+                out.push((f.index, f.text_range, [x, y, f.width, f.height]));
+            }
+            for (dx, dy, c) in &f.children {
+                leaves(c, x + dx, y + dy, out);
+            }
+        }
+        let mut got = Vec::new();
+        leaves(&fragment, 0.0, 0.0, &mut got);
+        got.retain(|(i, _, _)| *i >= 2);
+        got
+    };
+    // No opportunity before "XX": the line ends after "XX-".
+    assert_eq!(
+        layout(120.0, &["XX-XX", "XX"]),
+        vec![
+            (2, Some((0, 3)), [0.0, 0.0, 60.0, 20.0]),
+            (2, Some((3, 5)), [0.0, 20.0, 40.0, 20.0]),
+            (3, None, [40.0, 20.0, 40.0, 20.0]),
+        ]
+    );
+    // The opportunity after "XX-" comes later than the one after "X ".
+    assert_eq!(
+        layout(160.0, &["X ", "XX-XX", "XXX"]),
+        vec![
+            (2, None, [0.0, 0.0, 40.0, 20.0]),
+            (3, Some((0, 3)), [40.0, 0.0, 60.0, 20.0]),
+            (3, Some((3, 5)), [0.0, 20.0, 40.0, 20.0]),
+            (4, None, [40.0, 20.0, 60.0, 20.0]),
+        ]
+    );
+}

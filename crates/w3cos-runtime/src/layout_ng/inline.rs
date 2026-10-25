@@ -1978,8 +1978,7 @@ pub(super) fn layout_inline_beside(
         if !fits && can_wrap && item.internal_break {
             // NGLineBreaker breaks inside the item at its latest opportunity
             // that fits; on an otherwise empty line, at its first one.
-            // (An earlier item's internal opportunity, or preserved spaces,
-            // stay on legacy.)
+            // (Preserved spaces stay on legacy.)
             if preserve {
                 return super::bail("internal-break-preserve");
             }
@@ -2003,10 +2002,11 @@ pub(super) fn layout_inline_beside(
                 return super::bail("internal-break");
             }
             // No prefix fits after the line's content: NGLineBreaker
-            // rewinds to the last opportunity before this item and retries
-            // it on the next line (the soft-wrap path below). An overflow
-            // that would need an earlier item's internal opportunity still
-            // falls back after line building ("internal-break-earlier").
+            // rewinds to the last opportunity before this item (a boundary
+            // or one inside an earlier item) and retries it on the next line
+            // (the soft-wrap path below). A line that overflows with an
+            // internal opportunity still falls back after line building
+            // ("internal-break-earlier").
         }
         if !fits && current.is_empty() && opportunity.1 < space.available_inline - EPSILON {
             // Not even the first piece fits beside the floats: the line
@@ -2027,10 +2027,13 @@ pub(super) fn layout_inline_beside(
             // The opportunity lies after this item's leading space.
             return super::bail("leading-space");
         }
-        // Last soft-wrap opportunity: after an item ending in a space, at the
-        // end of a space run (preserved spaces in pre-wrap do not break
-        // between each other).
-        let break_at = (1..=current.len()).rev().find(|&j| {
+        // NGLineBreaker::HandleOverflow walks the line's items backwards and
+        // rewinds to the latest opportunity: the boundary before an item
+        // (after an item ending in a space, at the end of a space run;
+        // preserved spaces in pre-wrap do not break between each other), or
+        // one inside the item before that boundary (BreakText with the width
+        // left to it).
+        let boundary = |j: usize| {
             let next = current.get(j).copied().unwrap_or(i);
             let prev = current[j - 1];
             // Atomic inlines break before and after (UAX #14 CB, LB20).
@@ -2042,13 +2045,58 @@ pub(super) fn layout_inline_beside(
                 || (!items[prev].ends_space
                     && !items[next].starts_space
                     && text_boundary_opportunity(flat, &items[prev], &items[next]))
-        });
-        // NGLineBreaker rewinds to the latest opportunity: one inside an
-        // item after `break_at` would come later (not modelled yet).
-        if let Some(j) = break_at
-            && current[j..].iter().any(|&k| items[k].internal_break)
-        {
-            return super::bail("internal-break-earlier");
+        };
+        let mut break_at = None;
+        let mut inside = None;
+        for j in (1..=current.len()).rev() {
+            if boundary(j) {
+                break_at = Some(j);
+                break;
+            }
+            let k = current[j - 1];
+            if !items[k].internal_break {
+                continue;
+            }
+            if preserve {
+                return super::bail("internal-break-preserve");
+            }
+            if items[k].atomic.is_some() || !zero_edges(flat[items[k].index].style) {
+                return super::bail("internal-break-edges");
+            }
+            let head = &current[..j - 1];
+            let split = split_text_item(flat, &items[k], false, |a| {
+                let mut probe: Vec<&InlineItem> = head.iter().map(|&h| &items[h]).collect();
+                probe.push(a);
+                line_width_of(&probe) <= available + EPSILON
+            });
+            match split {
+                Some(pieces) => {
+                    inside = Some((j - 1, pieces));
+                    break;
+                }
+                None => return super::bail("internal-break-earlier"),
+            }
+        }
+        if let Some((p, (a, b))) = inside {
+            // The line ends inside current[p]; its rest and the items after
+            // it start the next line, which retries the overflowing item.
+            let k = current[p];
+            items[k] = a;
+            items.insert(k + 1, b);
+            let rest: Vec<usize> = std::iter::once(k + 1)
+                .chain(current[p + 1..].iter().map(|&r| r + 1))
+                .collect();
+            current.truncate(p + 1);
+            lines.push(std::mem::take(&mut current));
+            if rest
+                .iter()
+                .any(|&r| items[r].starts_space && !items[r].whitespace_only)
+            {
+                return super::bail("leading-space");
+            }
+            current = rest;
+            i += 1;
+            continue;
         }
         match break_at {
             Some(j) if j == current.len() => lines.push(std::mem::take(&mut current)),
