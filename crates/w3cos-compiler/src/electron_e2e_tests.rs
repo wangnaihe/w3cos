@@ -445,7 +445,7 @@ const MAIN_SERVICES: &[(&str, &str)] = &[
     ),
     (
         "main.js",
-        r#"const { app, powerMonitor, powerSaveBlocker, systemPreferences, globalShortcut, clipboard, nativeImage, Notification, contentTracing, desktopCapturer } = require('electron')
+        r#"const { app, BrowserWindow, powerMonitor, powerSaveBlocker, systemPreferences, globalShortcut, clipboard, nativeImage, Notification, contentTracing, desktopCapturer } = require('electron')
 app.whenReady().then(async () => {
   let resumed = 0
   powerMonitor.on('resume', () => resumed++)
@@ -469,6 +469,9 @@ app.whenReady().then(async () => {
   console.log('image', nativeImage.createEmpty().isEmpty(), image.isEmpty(), image.toPNG().length, image.toDataURL())
   console.log('notification', Notification.isSupported(), new Notification({ title: 't' }).title)
   console.log('tracing', JSON.stringify(await contentTracing.getCategories()), JSON.stringify(await desktopCapturer.getSources({ types: ['screen'] })))
+  const win = new BrowserWindow({ show: false })
+  const handle = win.getNativeWindowHandle()
+  console.log('window', Buffer.isBuffer(handle), handle.length, handle.buffer instanceof ArrayBuffer, handle.readUInt32LE(0) === win.id, win.getMediaSourceId() === 'window:' + win.id + ':0')
   app.quit()
 })
 "#,
@@ -495,6 +498,7 @@ fn electron_main_process_service_modules() {
             "image true false 8 data:image/png;base64,iVBORw0KGgo=",
             "notification false t",
             "tracing [] []",
+            "window true 8 true true true",
         ],
         "{lines:#?}"
     );
