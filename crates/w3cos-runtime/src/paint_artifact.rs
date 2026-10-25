@@ -289,6 +289,12 @@ pub struct PaintArtifact {
     pub sticky_owner: Vec<Option<usize>>,
     pub rect_by_index: Vec<Option<LayoutRect>>,
     pub column_fragments: Vec<Vec<ColumnFragment>>,
+    /// Per node: the line pieces of a LayoutNG text node broken inside its
+    /// content (NGPhysicalTextFragment rect + text slice), in fragment
+    /// order. Empty for every node when nothing was broken. Paint draws the
+    /// pieces in place of the node's single rect, at the node's own position
+    /// in paint order.
+    pub text_fragments: Vec<Vec<(LayoutRect, String)>>,
     pub generation: u64,
 }
 
@@ -313,6 +319,7 @@ impl Default for PaintArtifact {
             sticky_owner: Vec::new(),
             rect_by_index: Vec::new(),
             column_fragments: Vec::new(),
+            text_fragments: Vec::new(),
             generation: 0,
         }
     }
@@ -2153,7 +2160,32 @@ impl PaintArtifact {
 
     /// The paragraph's available line geometry is distinct from the inline
     /// owner's intrinsic decoration box and its own bidi direction.
+    /// Install LayoutNG's text pieces (see `text_fragments`).
+    pub(crate) fn set_text_fragments(&mut self, fragments: &[crate::layout_ng::TextFragment]) {
+        self.text_fragments.clear();
+        if fragments.is_empty() {
+            return;
+        }
+        self.text_fragments = vec![Vec::new(); self.nodes.len()];
+        for fragment in fragments {
+            if let Some(slot) = self.text_fragments.get_mut(fragment.index) {
+                slot.push((fragment.rect, fragment.text.clone()));
+            }
+        }
+    }
+
+    pub(crate) fn text_fragments_of(&self, index: usize) -> &[(LayoutRect, String)] {
+        self.text_fragments
+            .get(index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub(crate) fn inline_line_context(&self, index: usize) -> Option<InlineLineContext> {
+        if !self.text_fragments_of(index).is_empty() {
+            // Each piece is already one positioned line box run.
+            return None;
+        }
         let node = self.nodes.get(index)?;
         let ComponentKind::Text { content } = &node.kind else {
             return None;

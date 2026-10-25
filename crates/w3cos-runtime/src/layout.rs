@@ -104,6 +104,9 @@ struct TextMeasureKey {
     min_width: Option<u32>,
     white_space: u8,
     word_break: u8,
+    line_break: u8,
+    break_spaces: bool,
+    hanging_punctuation_last: bool,
 }
 
 struct WrappedTextMeasure {
@@ -738,11 +741,12 @@ pub(crate) fn resolve_float_text_layouts(
             continue;
         }
         let widths: Vec<_> = bands.iter().map(|band| band.width).collect();
-        let lines = text_layout::wrap_text_with_run_width_and_line_widths(
+        let lines = text_layout::wrap_text_with_run_width_and_line_widths_in(
             text,
             content.width,
             &widths,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             |run| text_intrinsic_size(run, style).0,
         );
         let bottom_edge = spacing(parent_style.padding.bottom, &parent_style)
@@ -1294,7 +1298,7 @@ impl Drop for SubtreeSizeScope<'_> {
 }
 
 /// Leaf intrinsic size used by Taffy (must stay in sync with `build_taffy_tree`).
-fn image_intrinsic_ratio(src: &str) -> Option<f32> {
+pub(crate) fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     use crate::image_loader::SvgIntrinsicLength;
 
     if let Some(size) = crate::image_loader::svg_intrinsic_size(src) {
@@ -1316,7 +1320,7 @@ fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     })
 }
 
-fn image_intrinsic_size(
+pub(crate) fn image_intrinsic_size(
     src: &str,
     style: &w3cos_std::style::Style,
     containing_width: Option<f32>,
@@ -4407,6 +4411,9 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WWordBreak::BreakWord => 2,
             WWordBreak::KeepAll => 3,
         },
+        line_break: style.line_break as u8,
+        break_spaces: style.break_spaces,
+        hanging_punctuation_last: style.hanging_punctuation_last,
     }
 }
 
@@ -4721,6 +4728,10 @@ pub struct LayoutResults {
     pub scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     pub clip_only_nodes: Vec<(usize, LayoutRect)>,
     pub scroll_ancestor: Vec<Option<usize>>,
+    /// LayoutNG text nodes broken inside their content: one piece per line
+    /// (NGPhysicalTextFragment), in fragment order. `layout_cache` holds the
+    /// union rect for such a node; paint draws the pieces instead.
+    pub text_fragments: Vec<crate::layout_ng::TextFragment>,
 }
 
 impl LayoutResults {
@@ -4730,6 +4741,7 @@ impl LayoutResults {
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_ancestor: Vec::new(),
+            text_fragments: Vec::new(),
         }
     }
 }
@@ -4797,6 +4809,43 @@ impl LayoutEngine {
     }
 
     pub fn compute(
+        &mut self,
+        root: &Component,
+        flat: &[FlatNodeInfo],
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Result<LayoutResults> {
+        match crate::layout_ng::mode() {
+            crate::layout_ng::Mode::Off => self.compute_legacy(root, flat, viewport_w, viewport_h),
+            crate::layout_ng::Mode::On => {
+                match crate::layout_ng::layout_tree_with_text(root, flat, viewport_w, viewport_h) {
+                    Some((layout_cache, text_fragments)) => {
+                        // The legacy Taffy tree no longer matches this output.
+                        self.tree_valid = false;
+                        Ok(LayoutResults {
+                            layout_cache,
+                            scrollable_nodes: Vec::new(),
+                            clip_only_nodes: Vec::new(),
+                            scroll_ancestor: vec![None; flat.len()],
+                            text_fragments,
+                        })
+                    }
+                    None => self.compute_legacy(root, flat, viewport_w, viewport_h),
+                }
+            }
+            crate::layout_ng::Mode::Verify => {
+                let legacy = self.compute_legacy(root, flat, viewport_w, viewport_h)?;
+                if let Some((ng, _)) =
+                    crate::layout_ng::layout_tree_with_text(root, flat, viewport_w, viewport_h)
+                {
+                    crate::layout_ng::verify(flat, &legacy.layout_cache, &ng);
+                }
+                Ok(legacy)
+            }
+        }
+    }
+
+    fn compute_legacy(
         &mut self,
         root: &Component,
         flat: &[FlatNodeInfo],
@@ -4929,6 +4978,7 @@ impl LayoutEngine {
                 scrollable_nodes: scrollable,
                 clip_only_nodes: clip_only,
                 scroll_ancestor,
+                text_fragments: Vec::new(),
             });
         }
 
@@ -5201,6 +5251,7 @@ impl LayoutEngine {
             scrollable_nodes: scrollable,
             clip_only_nodes: clip_only,
             scroll_ancestor,
+            text_fragments: Vec::new(),
         })
     }
 }
@@ -5208,6 +5259,23 @@ impl LayoutEngine {
 // ---------------------------------------------------------------------------
 // Public API (backward compatible — used by tests and simple callers)
 // ---------------------------------------------------------------------------
+
+/// One legacy layout of `root`, ignoring `W3COS_LAYOUT_NG`. LayoutNG uses
+/// this for a table subtree: the table formatting context stays the legacy
+/// one (the same projections), and the fragment tree is the resulting
+/// border boxes.
+pub(crate) fn legacy_layout_rects(
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<Vec<(LayoutRect, usize)>> {
+    let flat = pre_flatten(root);
+    let mut engine = LayoutEngine::new();
+    engine
+        .compute_legacy(root, &flat, viewport_w, viewport_h)
+        .ok()
+        .map(|results| results.layout_cache)
+}
 
 pub fn compute(
     root: &Component,
@@ -5914,6 +5982,7 @@ pub fn compute_with_scroll_details(
         scrollable_nodes: scrollable,
         clip_only_nodes: clip_only,
         scroll_ancestor,
+        text_fragments: Vec::new(),
     })
 }
 

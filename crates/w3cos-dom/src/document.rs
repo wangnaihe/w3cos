@@ -382,6 +382,15 @@ struct CachedComputedStyle {
     style: SharedStyle,
 }
 
+/// Set on the document element's component in quirks mode (BackCompat).
+pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
+/// Set on the document element itself. A value carrier: it does not fall
+/// the page back, and flex layout uses it to leave `display:flex` on the
+/// root element to the legacy engine.
+pub const DOCUMENT_ELEMENT_MARKER: &str = "--w3cos-internal-document-element";
+/// Set on a block whose first line is styled by `::first-line`.
+pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
+
 struct SelectorContextCache {
     style_clock: u64,
     stylesheet_generation: u64,
@@ -2648,6 +2657,18 @@ impl Document {
             // changes pixels, so always retain the document element.
             let mut tree = self.to_component_subtree(document_element);
             self.collapse_document_body_first_child_margin(&mut tree);
+            tree.style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(DOCUMENT_ELEMENT_MARKER.to_string(), "1".to_string());
+            if self.quirks_mode {
+                // Quirks "line height calculation quirk": layout needs the
+                // document mode to drop a root inline box's strut.
+                tree.style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(QUIRKS_MODE_MARKER.to_string(), "1".to_string());
+            }
             return tree;
         }
         // Keep the browser UA body margin on both the body fast path and the
@@ -9032,6 +9053,13 @@ impl Document {
                         style.font_size * style.line_height,
                         available_width,
                     );
+                    // The first line box's root inline box takes the
+                    // ::first-line style (its strut); layout engines that do
+                    // not model that must know the block has one.
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(FIRST_LINE_STYLE_MARKER.into(), "1".into());
                     // Styling a first line inside a block descendant does
                     // not turn that descendant into an inline-level child.
                     let inline_flow = children
@@ -12625,9 +12653,16 @@ fn inherit_text_style(
     }
     if !declares("white-space") {
         style.white_space = parent.white_space;
+        style.break_spaces = parent.break_spaces;
     }
     if !declares("word-break") && !declares("overflow-wrap") && !declares("word-wrap") {
         style.word_break = parent.word_break;
+    }
+    if !declares("line-break") {
+        style.line_break = parent.line_break;
+    }
+    if !declares("hanging-punctuation") {
+        style.hanging_punctuation_last = parent.hanging_punctuation_last;
     }
     if !declares("direction") {
         style.direction = parent.direction;
@@ -13894,6 +13929,7 @@ fn equivalent_text_paint_style(
         && left.font_style == right.font_style
         && left.font_variant == right.font_variant
         && left.white_space == right.white_space
+        && left.break_spaces == right.break_spaces
         && left.line_height == right.line_height
         && left.line_height_is_normal == right.line_height_is_normal
         && left.line_height_computed_px == right.line_height_computed_px
@@ -13904,6 +13940,7 @@ fn equivalent_text_paint_style(
         && left.text_decoration == right.text_decoration
         && left.text_overflow == right.text_overflow
         && left.word_break == right.word_break
+        && left.line_break == right.line_break
         && left.direction == right.direction
         && left.unicode_bidi == right.unicode_bidi
         && left.visibility == right.visibility
@@ -16419,6 +16456,9 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             w3cos_std::inline_text::append_source_fragment_ends(&mut ends, previous_content.len(), content, &fragment.style, &mut previous_source);
             previous_content.push_str(content);
             w3cos_std::inline_text::set_fragment_ends(&mut previous.style, previous_content, &ends);
+            // hanging-punctuation: last concerns the paragraph's final
+            // character, which now comes from this fragment.
+            previous.style.hanging_punctuation_last = fragment.style.hanging_punctuation_last;
             previous.on_click = w3cos_std::EventAction::None;
             true
         });

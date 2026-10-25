@@ -1619,6 +1619,8 @@ struct App {
     hit_nodes: Vec<HitNode>,
     focusable_indices: Vec<usize>,
     layout_cache: Vec<(LayoutRect, usize)>,
+    /// LayoutNG text pieces of the current layout (LayoutResults).
+    layout_text_fragments: Vec<crate::layout_ng::TextFragment>,
     scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     clip_only_nodes: Vec<(usize, LayoutRect)>,
     scroll_offsets: HashMap<usize, (f32, f32)>,
@@ -1783,6 +1785,7 @@ impl App {
             hit_nodes: Vec::new(),
             focusable_indices: Vec::new(),
             layout_cache: Vec::new(),
+            layout_text_fragments: Vec::new(),
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_offsets: HashMap::new(),
@@ -3009,6 +3012,7 @@ impl App {
             .unwrap_or_else(|_| layout::LayoutResults::empty());
 
         self.layout_cache = results.layout_cache;
+        self.layout_text_fragments = results.text_fragments;
         self.scrollable_nodes = results.scrollable_nodes;
         for (idx, _, extent) in &self.scrollable_nodes {
             if let Some((x, y)) = self.scroll_offsets.get_mut(idx) {
@@ -3311,6 +3315,8 @@ impl App {
             canvas_body_index,
             Some((w, layout_h)),
         );
+        self.paint_artifact
+            .set_text_fragments(&self.layout_text_fragments);
         if had_column_fragments
             || self
                 .paint_artifact
