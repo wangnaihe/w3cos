@@ -923,8 +923,15 @@ fn non_visible_overflow(style: &Style) -> bool {
         || style.resolved_overflow_y() != Overflow::Visible
 }
 
+/// `hidden`, `scroll` or `auto` on a box that clips: a scroll container in
+/// css-overflow-3 terms (ComputedStyle::IsScrollContainer). This engine has
+/// no `overflow: clip`, so every non-visible value counts.
+pub(super) fn is_overflow_scroll_container(style: &Style) -> bool {
+    non_visible_overflow(style) && style.display.establishes_overflow_clip()
+}
+
 /// Overflow shapes that still disagree with the legacy engine: scrollports
-/// (`scroll` / `auto`), a flex or grid item (automatic minimum), a negative
+/// (`scroll` / `auto`), a negative
 /// margin, or a float/clear inside the box. `hidden` on a block that only
 /// establishes a BFC stays here.
 fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -932,11 +939,8 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
         return None;
     }
-    if flat[index].parent.is_some_and(|parent| {
-        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-    }) {
-        return Some("overflow:item");
-    }
+    // A flex or grid item that is a scroll container has no automatic
+    // minimum: flex::resolve_main_limits and grid::inline_minimum.
     let negative = |spacing: Spacing| match spacing {
         Spacing::Px(v)
         | Spacing::Percent(v)

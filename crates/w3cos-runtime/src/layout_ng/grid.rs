@@ -2014,8 +2014,11 @@ fn fixed_track(size: i64) -> Track {
     }
 }
 
+/// `minimum` is the minimum contribution (auto minimums and flexible
+/// tracks), `min_c` the min-content contribution.
 fn track_from_spec(
     spec: &Spec,
+    minimum: i64,
     min_c: i64,
     max_c: i64,
     available: Option<i64>,
@@ -2024,7 +2027,7 @@ fn track_from_spec(
 ) -> Track {
     let mut track = match spec {
         Spec::One(Breadth::Fr(factor)) => Track {
-            base: min_c.max(0),
+            base: minimum.max(0),
             cap: INF,
             flex: *factor,
             stretchy: false,
@@ -2054,7 +2057,7 @@ fn track_from_spec(
             fixed_track(max_c.min(limit.max(min_c)))
         }
         Spec::MinMax(min, max) => {
-            let base = breadth_floor(*min, min_c, max_c, available, font);
+            let base = breadth_floor(*min, minimum, min_c, max_c, available, font);
             let (cap, flex) = breadth_ceiling(*max, min_c, max_c, available, font);
             Track {
                 base,
@@ -2074,13 +2077,15 @@ fn track_from_spec(
 
 fn breadth_floor(
     breadth: Breadth,
+    minimum: i64,
     min_c: i64,
     max_c: i64,
     available: Option<i64>,
     font: f32,
 ) -> i64 {
     match breadth {
-        Breadth::Auto | Breadth::MinContent => min_c.max(0),
+        Breadth::Auto => minimum.max(0),
+        Breadth::MinContent => min_c.max(0),
         Breadth::MaxContent => max_c.max(0),
         Breadth::Fr(_) => 0,
         other => definite_breadth(other, available, font).unwrap_or(min_c.max(0)),
@@ -2561,6 +2566,30 @@ fn inline_minmax(
     Some((units(min + extra), units(max.max(min) + extra)))
 }
 
+/// CSS Grid §6.6: a scroll container has no automatic minimum, so with
+/// `min-width: auto` its minimum contribution is only its margin, border and
+/// padding (Blink `GridLayoutAlgorithm::ContributionSizeForGridItem`,
+/// kForIntrinsicMinimums). Others contribute their content-based minimum.
+fn inline_minimum(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) -> Option<i64> {
+    let style = flat[index].style;
+    if !block::is_overflow_scroll_container(style) || !matches!(style.min_width, Dimension::Auto) {
+        return None;
+    }
+    let border = block::border_widths(style);
+    let pad = |spacing| spacing_px(style, spacing, 0.0, space);
+    let margin = |spacing| match spacing {
+        Spacing::Auto => 0.0,
+        other => spacing_px(style, other, 0.0, space),
+    };
+    let outer = border[1]
+        + border[3]
+        + pad(style.padding.left)
+        + pad(style.padding.right)
+        + margin(style.margin.left)
+        + margin(style.margin.right);
+    Some(units(outer.max(0.0)))
+}
+
 fn span_sum(sizes: &[i64], collapsed: &[bool], start: usize, span: usize, gap: i64) -> i64 {
     let mut total = 0;
     let mut seen = false;
@@ -2941,7 +2970,10 @@ pub(super) fn layout(
         }
     }
     let stretch_columns = column_pack(style) == Pack::Stretch;
+    // `col_min` holds minimum contributions, `col_min_content` min-content
+    // contributions; they differ only for scroll containers.
     let mut col_min = vec![0_i64; column_specs.len()];
+    let mut col_min_content = vec![0_i64; column_specs.len()];
     let mut col_max = vec![0_i64; column_specs.len()];
     let mut contribs = Vec::new();
     for item in &items {
@@ -2968,36 +3000,41 @@ pub(super) fn layout(
         } else {
             inline_minmax(flat, item.index, space).why("grid:intrinsic")?
         };
-        contribs.push(Some((min_c, max_c)));
+        let minimum = inline_minimum(flat, item.index, space)
+            .unwrap_or(min_c)
+            .min(min_c);
+        contribs.push(Some((minimum, min_c, max_c)));
         if item.col_span == 1 {
-            col_min[item.col] = col_min[item.col].max(min_c);
+            col_min[item.col] = col_min[item.col].max(minimum);
+            col_min_content[item.col] = col_min_content[item.col].max(min_c);
             col_max[item.col] = col_max[item.col].max(max_c);
         }
     }
+    // Subgrid columns wrote only `col_min`; they are min-content too.
+    for (min_content, minimum) in col_min_content.iter_mut().zip(&col_min) {
+        *min_content = (*min_content).max(*minimum);
+    }
+    let spread = |slots: &mut [i64], size: i64| {
+        let current: i64 = slots.iter().sum();
+        if size > current {
+            let extra = size - current;
+            let count = slots.len().max(1) as i64;
+            for slot in slots {
+                *slot += extra / count;
+            }
+        }
+    };
     for (item, contrib) in items.iter().zip(&contribs) {
-        let Some((min_c, max_c)) = *contrib else {
+        let Some((minimum, min_c, max_c)) = *contrib else {
             continue;
         };
         if item.col_span <= 1 {
             continue;
         }
         let end = (item.col + item.col_span).min(col_max.len());
-        let current: i64 = col_max[item.col..end].iter().sum();
-        if max_c > current {
-            let extra = max_c - current;
-            let slots = (end - item.col).max(1) as i64;
-            for slot in &mut col_max[item.col..end] {
-                *slot += extra / slots;
-            }
-        }
-        let current_min: i64 = col_min[item.col..end].iter().sum();
-        if min_c > current_min {
-            let extra = min_c - current_min;
-            let slots = (end - item.col).max(1) as i64;
-            for slot in &mut col_min[item.col..end] {
-                *slot += extra / slots;
-            }
-        }
+        spread(&mut col_max[item.col..end], max_c);
+        spread(&mut col_min[item.col..end], minimum);
+        spread(&mut col_min_content[item.col..end], min_c);
     }
     let column_tracks: Vec<Track> = column_specs
         .iter()
@@ -3006,6 +3043,7 @@ pub(super) fn layout(
             let mut track = track_from_spec(
                 spec,
                 col_min[index],
+                col_min_content[index],
                 col_max[index],
                 Some(inner_u),
                 font,
@@ -3152,6 +3190,8 @@ pub(super) fn layout(
     );
 
     let mut fragments = Vec::with_capacity(built.len());
+    // `row_floor` holds minimum contributions, `row_min` min-content ones.
+    let mut row_floor = vec![0_i64; row_specs.len()];
     let mut row_min = vec![0_i64; row_specs.len()];
     let mut row_max = vec![0_i64; row_specs.len()];
     for item in &built {
@@ -3191,11 +3231,22 @@ pub(super) fn layout(
                 extra = extra.max(0);
                 row_max[track] = row_max[track].max(extra);
                 row_min[track] = row_min[track].max(extra);
+                row_floor[track] = row_floor[track].max(extra);
             }
         } else if item.row_span == 1 && item.row < row_max.len() {
             let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
             row_max[item.row] = row_max[item.row].max(margin_box);
             row_min[item.row] = row_min[item.row].max(margin_box);
+            // §6.6: no automatic minimum for a scroll container.
+            let child_style = flat[item.index].style;
+            let minimum = if block::is_overflow_scroll_container(child_style)
+                && matches!(child_style.min_height, Dimension::Auto)
+            {
+                units(item.edges_v) + item.margin_u[0] + item.margin_u[2]
+            } else {
+                margin_box
+            };
+            row_floor[item.row] = row_floor[item.row].max(minimum.min(margin_box));
         }
         fragments.push(laid);
     }
@@ -3207,6 +3258,7 @@ pub(super) fn layout(
         .map(|(index, spec)| {
             track_from_spec(
                 spec,
+                row_floor.get(index).copied().unwrap_or(0),
                 row_min.get(index).copied().unwrap_or(0),
                 row_max.get(index).copied().unwrap_or(0),
                 row_available,
@@ -4831,6 +4883,42 @@ mod tests {
                 (1, [0.0, 0.0, 30.0, 30.0]),
                 (2, [0.0, 0.0, 200.0, 10.0]),
             ],
+        );
+    }
+
+    /// CSS Grid §6.6: a scroll container's minimum contribution drops its
+    /// content (it keeps its padding). Chrome: 1fr tracks 20 / 80, and
+    /// `minmax(auto, 10px)` 6px (the 3px padding on each side).
+    #[test]
+    fn scroll_container_grid_item_has_no_automatic_minimum() {
+        use w3cos_std::style::Overflow;
+        let scroller = |padding: f32, width: f32| {
+            Component::boxed(
+                Style {
+                    overflow: Overflow::Hidden,
+                    padding: edges(0.0, padding, 0.0, padding),
+                    ..block_box(None, None)
+                },
+                vec![leaf(block_box(Some(width), Some(10.0)))],
+            )
+        };
+        let plain = Component::boxed(
+            block_box(None, None),
+            vec![leaf(block_box(Some(80.0), Some(10.0)))],
+        );
+        expect(
+            &Component::boxed(
+                grid_style(100.0, Some(20.0), Some("1fr 1fr")),
+                vec![scroller(0.0, 150.0), plain],
+            ),
+            &[(1, [0.0, 0.0, 20.0, 20.0]), (3, [20.0, 0.0, 80.0, 20.0])],
+        );
+        expect(
+            &Component::boxed(
+                grid_style(30.0, Some(20.0), Some("minmax(auto, 10px) 50px")),
+                vec![scroller(3.0, 40.0), leaf(block_box(None, None))],
+            ),
+            &[(1, [0.0, 0.0, 6.0, 20.0]), (3, [6.0, 0.0, 50.0, 20.0])],
         );
     }
 }

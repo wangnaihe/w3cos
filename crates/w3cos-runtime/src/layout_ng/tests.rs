@@ -3486,3 +3486,50 @@ fn centered_flex_item_overflows_its_line_unsafely() {
     assert_eq!(rect(&out, 2), (0.0, -20.0, 53.5, 110.0));
     assert_eq!(rect(&out, 3), (53.5, 25.0, 16.5, 20.0));
 }
+
+/// CSS Flexbox §4.5: a scroll-container item has no automatic minimum, so
+/// it shrinks below its content while its sibling keeps its min-content.
+/// Chrome: (0,0,70,40) and (70,0,30,40). (A block-axis scroller that
+/// shrinks gets a scroll range and stays on legacy at run time.)
+#[test]
+fn scroll_container_flex_item_has_no_automatic_minimum() {
+    use w3cos_std::style::{FlexDirection, Overflow};
+    let sized = |width: f32, height: f32| {
+        node(
+            Style {
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let clipped = node(
+        Style {
+            overflow: Overflow::Hidden,
+            ..block()
+        },
+        vec![sized(150.0, 10.0)],
+    );
+    let plain = node(block(), vec![sized(30.0, 10.0)]);
+    let row = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(40.0),
+            ..Style::default()
+        },
+        vec![clipped, plain],
+    );
+    let root = node(block(), vec![row]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("scroll container flex items");
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 70.0, 40.0));
+    assert_eq!(rect(&out, 4), (70.0, 0.0, 30.0, 40.0));
+}

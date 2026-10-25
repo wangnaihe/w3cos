@@ -636,7 +636,12 @@ fn resolve_main_limits(
     } else {
         (style.min_height, style.max_height, style.height)
     };
-    let min = if matches!(min_dim, Dimension::Auto) {
+    let min = if matches!(min_dim, Dimension::Auto) && block::is_overflow_scroll_container(style) {
+        // CSS Flexbox §4.5: the automatic minimum size applies only to items
+        // that are not scroll containers; for those `min-*: auto` is 0
+        // (FlexLayoutAlgorithm::ShouldApplyMinSizeAutoForChild).
+        0.0
+    } else if matches!(min_dim, Dimension::Auto) {
         let content_min = if row {
             let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
             content.min.unwrap_or(content.max)
