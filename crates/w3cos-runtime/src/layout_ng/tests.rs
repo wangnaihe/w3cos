@@ -3700,6 +3700,114 @@ fn flex_row_baseline_alignment_matches_chrome() {
     assert_eq!(rect(&out, 9), (80.0, 100.0, 40.0, 30.0));
 }
 
+/// A text run is an anonymous flex item laid out as block text (CSS
+/// Flexbox §4). Row: the flex base size is its max-content width and the
+/// automatic minimum its min-content width (§4.5); it stretches to the
+/// line. Column: its height at the used width is both, so a short
+/// definite column does not shrink it. A white-space-only run stays on
+/// legacy (the DOM is expected to drop it).
+#[test]
+fn flex_text_item_is_an_anonymous_block() {
+    use w3cos_std::style::FlexDirection;
+    let words = "Several short words wrap here";
+    let text_style = Style {
+        display: Display::Inline,
+        ..Style::default()
+    };
+    let sizes = inline::text_min_max(words, &text_style);
+    let min = sizes.min.expect("min-content");
+    assert!(min + 1.0 < sizes.max, "{min} {}", sizes.max);
+    let one_line = inline::block_text_layout(words, sizes.max, &text_style).0;
+    let flex = |width: f32, direction: FlexDirection, height: Dimension, items: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: direction,
+                width: Dimension::Px(width),
+                height,
+                ..block()
+            },
+            items,
+        )
+    };
+    let text = || Component::text(words, text_style.clone());
+    // The run's node takes the rect paint reads for a paragraph leaf, its
+    // line box (the item) starting at the item's top.
+    let painted = |width: f32| {
+        let (_, _, _, y, height) =
+            inline::paragraph_box(words, width, &text_style, &Style::default(), false);
+        (0.0, y, width, height)
+    };
+    let fixed = node(
+        Style {
+            width: Dimension::Px(30.0),
+            height: Dimension::Px(10.0),
+            ..block()
+        },
+        vec![],
+    );
+    // Preorder: 0 root, 1 flex, 2 text, 3 box.
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(
+            400.0,
+            FlexDirection::Row,
+            Dimension::Auto,
+            vec![text(), fixed],
+        )],
+    ));
+    close(rect(&out, 2), painted(sizes.max));
+    close(rect(&out, 3), (sizes.max, 0.0, 30.0, 10.0));
+    close(rect(&out, 1), (0.0, 0.0, 400.0, one_line.max(10.0)));
+
+    // Shrinks to the container, wrapping; never below min-content.
+    let mid = (min + sizes.max) / 2.0;
+    let wrapped = inline::block_text_layout(words, mid, &text_style).0;
+    assert!(wrapped > one_line + 1.0, "{wrapped} {one_line}");
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(mid, FlexDirection::Row, Dimension::Auto, vec![text()])],
+    ));
+    close(rect(&out, 2), painted(mid));
+    let narrow = inline::block_text_layout(words, min, &text_style).0;
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(1.0, FlexDirection::Row, Dimension::Auto, vec![text()])],
+    ));
+    close(rect(&out, 2), painted(min));
+    assert!(narrow > wrapped, "{narrow} {wrapped}");
+
+    // Column: stretched to the width; the 5px box does not shrink it.
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(
+            mid,
+            FlexDirection::Column,
+            Dimension::Px(5.0),
+            vec![text()],
+        )],
+    ));
+    close(rect(&out, 2), painted(mid));
+
+    let space_root = node(
+        block(),
+        vec![flex(
+            100.0,
+            FlexDirection::Row,
+            Dimension::Auto,
+            vec![Component::text("  ", text_style.clone())],
+        )],
+    );
+    let space = pre_flatten(&space_root);
+    assert!(
+        block::unsupported_reasons(&space)
+            .iter()
+            .any(|r| r == "flex:text-space"),
+        "{:?}",
+        block::unsupported_reasons(&space)
+    );
+}
+
 /// Rects from headless Chrome (ngtools/fbw-probe.html, fbw-probe2.html).
 /// Per-line baseline groups (FlexLayoutAlgorithm::BuildFlexLines), the
 /// flipped minor group under `wrap-reverse`, and the exported first

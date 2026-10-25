@@ -25,6 +25,12 @@
 //! use the same engine). An item whose fit-content size cannot be measured
 //! stays on legacy (`flex:wrap-column-auto-cross`).
 //!
+//! A text run is an anonymous flex item laid out as block text: its flex
+//! base size is its max-content width in a row, its automatic minimum
+//! the min-content width; in a column both are its height at the used
+//! width. Its baseline is the first line's, so a wrapped baseline item
+//! (several lines) bails `flex:baseline-unknown`.
+//!
 //! A flex row the DOM lowered from an inline formatting context carries the
 //! IFC marker and is not a flex container; the block algorithm lays it out
 //! as an IFC. Synthetic float groups are not flex containers either.
@@ -151,11 +157,14 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some(reason);
         }
-        // A text run is an anonymous flex item. Its line breaking and
-        // white-space handling stay on the legacy engine (a real flex
-        // reference next to a fallen-back test must use the same engine).
-        if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. }) {
-            return Some("flex:text-item");
+        // A text run is an anonymous flex item (CSS Flexbox §4), laid out
+        // as block text (`block::node_box_reason` validates its content). A
+        // run of only white space is not rendered; the DOM is expected to
+        // drop it, so one that reaches layout stays on the legacy engine.
+        if let w3cos_std::ComponentKind::Text { content } = flat[child].kind
+            && content.chars().all(char::is_whitespace)
+        {
+            return Some("flex:text-space");
         }
         if subtree_has_float(flat, child) {
             return Some("flex:float-descendant");
@@ -434,6 +443,13 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     }
     if let w3cos_std::ComponentKind::Text { content } = info.kind {
         return Some(super::inline::text_min_max(content, info.style));
+    }
+    // A nested flex container's min/max-content sizes are its own flex
+    // algorithm's (FlexLayoutAlgorithm::ComputeMinMaxSizes): a row sums
+    // its items, it does not take the widest one. `block::intrinsic_sizes`
+    // routes the same way.
+    if block::is_author_flex(info.style) {
+        return container_min_max(flat, index, space);
     }
     let mut sizes = MinMax::exact(0.0);
     let mut any = false;
@@ -842,6 +858,35 @@ fn justify(kind: JustifyContent, free: f32, count: usize) -> (f32, f32) {
     }
 }
 
+/// A text run is an anonymous block flex item (CSS Flexbox §4) whose line
+/// box sits at its top, however far the item stretches or flexes. The run
+/// has no box of its own, so the node takes the rect paint reads for a
+/// paragraph leaf (`inline::paragraph_box`): the font content box of a
+/// single line, else its lines from the upper leading.
+fn text_item_paint_box(
+    flat: &[FlatNodeInfo],
+    item: usize,
+    container: usize,
+    fragment: BoxFragment,
+) -> (f32, BoxFragment) {
+    let style = flat[item].style;
+    let w3cos_std::ComponentKind::Text { content } = flat[item].kind else {
+        return (0.0, fragment);
+    };
+    if style.display != Display::Inline {
+        // An element lowered to a text leaf keeps its own box.
+        return (0.0, fragment);
+    }
+    let (_, _, _, y, height) = super::inline::paragraph_box(
+        content,
+        fragment.width,
+        style,
+        flat[container].style,
+        super::inline::quirks_mode(flat),
+    );
+    (y, BoxFragment { height, ..fragment })
+}
+
 fn layout_item(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -1021,6 +1066,17 @@ pub(super) fn layout(
             Some((laid.fragment.height - main_edges).max(0.0))
         } else {
             None
+        };
+        // A column text item's min-content block size is its laid-out
+        // height at its used width, not one line (the anonymous block's
+        // content size, FlexLayoutAlgorithm::ComputeMinMainSize).
+        let min = match (flat[child].kind, measured) {
+            (w3cos_std::ComponentKind::Text { .. }, Some(height))
+                if !row && matches!(child_style.min_height, Dimension::Auto) =>
+            {
+                min.max(height)
+            }
+            _ => min,
         };
         let base = flex_base(
             child_style,
@@ -1289,7 +1345,8 @@ pub(super) fn layout(
         } else {
             fallback_baseline.get_or_insert(item_baseline);
         }
-        children.push((x + dx, y + dy, laid.fragment));
+        let (paint_dy, fragment) = text_item_paint_box(flat, item.index, index, laid.fragment);
+        children.push((x + dx, y + dy + paint_dy, fragment));
         let step = item.outer_main() + gap + between;
         if reverse {
             cursor -= step;
@@ -1702,7 +1759,8 @@ fn layout_wrapped(
                     .iter()
                     .map(|candidate| candidate.translated(x + dx, y + dy)),
             );
-            children.push((x + dx, y + dy, laid.fragment));
+            let (paint_dy, fragment) = text_item_paint_box(flat, item.index, index, laid.fragment);
+            children.push((x + dx, y + dy + paint_dy, fragment));
             let step = item.outer_main() + main_gap + between;
             if reverse {
                 cursor -= step;

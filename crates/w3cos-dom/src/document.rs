@@ -8119,6 +8119,26 @@ impl Document {
                 style.border_spacing_y = values.get(1).copied().unwrap_or(x);
             }
         }
+        // HTML §15.3.13: a fieldset's rendered legend is its first legend
+        // element child.  Layout keeps it out of the content box's
+        // baseline (Blink FieldsetLayoutAlgorithm), so mark it.
+        if tag.as_str() == "legend"
+            && let Some(parent) = node.parent
+            && local_tag_name(&self.get_node(parent).tag.as_str()) == "fieldset"
+            && self
+                .element_siblings_through(id)
+                .iter()
+                .find(|sibling| local_tag_name(&self.get_node(**sibling).tag.as_str()) == "legend")
+                == Some(&id)
+        {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    "--w3cos-internal-rendered-legend".to_string(),
+                    "1".to_string(),
+                );
+        }
         if tag.as_str() == "table" {
             style
                 .custom_properties
@@ -29825,4 +29845,9 @@ mod extent_cache_tests {
         // box is ordinary overflow of that ancestor's scrollers.
         assert_eq!(fixed_child_scroll_width(true), (1568.0, 1200.0));
     }
+}
+
+/// The local name of a possibly prefixed tag (`svg:a` → `a`).
+fn local_tag_name(tag: &str) -> &str {
+    tag.rsplit_once(':').map_or(tag, |(_, local)| local)
 }

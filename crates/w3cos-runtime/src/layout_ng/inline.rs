@@ -1527,6 +1527,48 @@ pub(super) struct InlineResult {
 /// line.  The line count is the paint wrapper's (it wraps the leaf), via its
 /// height; a single line then uses the line-box model (LayoutUnit line
 /// height, strut), several lines keep the wrapper's height.
+/// Quirks mode (the DOM marks the root).
+pub(super) fn quirks_mode(flat: &[FlatNodeInfo]) -> bool {
+    has_marker(flat[0].style, QUIRKS_MARKER)
+}
+
+/// A paragraph leaf's line-box height, whether it is one line, that line's
+/// baseline, and the rect paint reads (y offset and height): the font
+/// content box of a single line, else the lines from the upper leading.
+pub(super) fn paragraph_box(
+    content: &str,
+    available: f32,
+    style: &Style,
+    container: &Style,
+    quirks: bool,
+) -> (f32, bool, f32, f32, f32) {
+    let (height, single, ascent) = paragraph_height(content, available, style, container, quirks);
+    let font_height = inline_font_height(style);
+    let (y, rect_height) = if single {
+        (ascent - inline_font_content_ascent(style), font_height)
+    } else {
+        let line = inline_used_line_height(inline_style_line_height(style));
+        // Paint steps forced (U+2028, a coalesced <br>) lines itself
+        // from the first line's content box; soft-wrapped paragraphs
+        // cover all their lines.
+        let soft_wrapped = || {
+            content
+                .split(['\u{2028}', '\u{2029}', '\n'])
+                .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
+        };
+        // (Legacy covers all lines when the content box overflows the
+        // line box, or when line-height: normal lines also soft-wrap.)
+        let forced = has_forced_break(content, style)
+            && font_height <= line + EPSILON
+            && !(style.line_height_is_normal && soft_wrapped());
+        (
+            crate::layout::inline_upper_leading(line, font_height),
+            if forced { font_height } else { height },
+        )
+    };
+    (height, single, ascent, y, rect_height)
+}
+
 fn paragraph_height(
     content: &str,
     width: f32,
@@ -1685,7 +1727,7 @@ pub(super) fn layout_inline_beside(
 ) -> Option<InlineResult> {
     let available = space.available_inline;
     let container = flat[index].style;
-    let quirks = has_marker(flat[0].style, QUIRKS_MARKER);
+    let quirks = quirks_mode(flat);
     let entries = collect_inlines(flat, index);
     let children: Vec<usize> = entries
         .iter()
@@ -1757,31 +1799,8 @@ pub(super) fn layout_inline_beside(
         let ComponentKind::Text { content } = flat[child].kind else {
             return super::bail("line-width-text");
         };
-        let (height, single, ascent) =
-            paragraph_height(content, available, style, container, quirks);
-        let font_height = inline_font_height(style);
-        let (y, rect_height) = if single {
-            (ascent - inline_font_content_ascent(style), font_height)
-        } else {
-            let line = inline_used_line_height(inline_style_line_height(style));
-            // Paint steps forced (U+2028, a coalesced <br>) lines itself
-            // from the first line's content box; soft-wrapped paragraphs
-            // cover all their lines.
-            let soft_wrapped = || {
-                content
-                    .split(['\u{2028}', '\u{2029}', '\n'])
-                    .any(|line| text_intrinsic_size(line, style).0 > available + EPSILON)
-            };
-            // (Legacy covers all lines when the content box overflows the
-            // line box, or when line-height: normal lines also soft-wrap.)
-            let forced = has_forced_break(content, style)
-                && font_height <= line + EPSILON
-                && !(style.line_height_is_normal && soft_wrapped());
-            (
-                crate::layout::inline_upper_leading(line, font_height),
-                if forced { font_height } else { height },
-            )
-        };
+        let (height, single, ascent, y, rect_height) =
+            paragraph_box(content, available, style, container, quirks);
         if floats.is_some_and(|f| {
             f.exclusions
                 .overlaps(f.x, f.y, f.x + available, f.y + height)

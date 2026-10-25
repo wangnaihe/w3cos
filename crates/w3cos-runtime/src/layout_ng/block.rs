@@ -89,6 +89,7 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "text-source-run"
             | "text-fragment-ends"
             | "quirks-mode"
+            | "rendered-legend"
             | "document-element"
             | "size-containment"
             | "contain-intrinsic-size"
@@ -226,6 +227,14 @@ pub(super) fn block_unicode_bidi_ok(style: &Style) -> bool {
 
 /// Internal markers mean a legacy projection owns this box, except value
 /// carriers and the markers the current stage interprets (`allowed`).
+/// The DOM's mark on a fieldset's first legend child (HTML §15.3.13).
+fn is_rendered_legend(style: &Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key("--w3cos-internal-rendered-legend"))
+}
+
 pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'static str> {
     style
         .custom_properties
@@ -574,14 +583,19 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 // `run-in`, `-webkit-box`, and `-webkit-inline-box` compute
                 // to `display: flex` for legacy. When this stage can lay
                 // out that flex line, NG uses the same box. A rejection
-                // (a text item, baseline, rtl, …) keeps the unrecognized
-                // marker, so a line-clamp reference does not switch engines
-                // alone. `-webkit-box-orient` is not stored, so a vertical
-                // box stays the row the legacy engine already paints.
+                // (baseline, rtl, …) keeps the unrecognized marker, so a
+                // line-clamp reference does not switch engines alone. A
+                // text item keeps it too: `-webkit-line-clamp` clamps that
+                // text's lines, which this stage does not do. And
+                // `-webkit-box-orient` is not stored, so a vertical box
+                // stays the row the legacy engine already paints.
                 let flex_reason = super::flex::container_reason(flat, index);
+                let text_item = inline::rendered_children(flat, index)
+                    .any(|child| matches!(flat[child].kind, ComponentKind::Text { .. }));
                 let allowed: &[&str] = if (is_run_in(info.style)
                     || is_legacy_webkit_box(info.style))
                     && flex_reason.is_none()
+                    && !text_item
                 {
                     &[
                         inline::VALIGN_MARKER,
@@ -625,12 +639,14 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         }
         ComponentKind::Text { content }
             if info.style.display != Display::Inline
-                || info
-                    .parent
-                    .is_some_and(|parent| is_author_grid(flat[parent].style)) =>
+                || info.parent.is_some_and(|parent| {
+                    is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
+                }) =>
         {
-            // A text grid item is an anonymous block. Its display stays
-            // inline in the cascade; the grid lays it out as block text.
+            // A text grid or flex item is an anonymous block (CSS Grid §6,
+            // CSS Flexbox §4: each contiguous text run is wrapped in an
+            // anonymous block container). Its display stays inline in the
+            // cascade; the grid or flex algorithm lays it out as block text.
             unsupported_box_style(
                 info.style,
                 &[
@@ -2486,7 +2502,10 @@ fn layout_block_in(
         if result.last_baseline != LastBaseline::NoLines {
             last_baseline = result.last_baseline.offset(bt + pt + y);
         }
-        if !matches!(first_baseline, LastBaseline::At(_)) {
+        // A fieldset's rendered legend sits outside its anonymous content
+        // box, whose baseline is the fieldset's (Blink
+        // FieldsetLayoutAlgorithm).
+        if !matches!(first_baseline, LastBaseline::At(_)) && !is_rendered_legend(child_info.style) {
             let candidate = match result.first_baseline {
                 LastBaseline::At(_) => result.first_baseline,
                 _ => result.last_baseline,
