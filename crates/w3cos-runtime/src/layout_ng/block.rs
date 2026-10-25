@@ -1021,8 +1021,53 @@ pub(super) fn unsupported_tree(flat: &[FlatNodeInfo]) -> Option<&'static str> {
     reason
 }
 
+/// Trace token for one box whose fallback is the unrecognized-display
+/// marker. Spaces in the authored value become `+` so the coverage line
+/// stays one whitespace field. The context is the box's formatting
+/// parent, not a second layout.
+fn unrecognized_display_label(flat: &[FlatNodeInfo], index: usize) -> String {
+    let value = unrecognized_display(flat[index].style).unwrap_or("");
+    let mut token = String::from("unrecognized-display:");
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            token.push('+');
+        } else if ch == ',' || ch == '|' {
+            token.push('_');
+        } else {
+            token.push(ch);
+        }
+    }
+    token.push('|');
+    token.push_str(unrecognized_display_context(flat, index));
+    token
+}
+
+fn unrecognized_display_context(flat: &[FlatNodeInfo], index: usize) -> &'static str {
+    let style = flat[index].style;
+    if matches!(style.position, Position::Absolute | Position::Fixed) {
+        return "out-of-flow";
+    }
+    if style.float != Float::None {
+        return "float";
+    }
+    if let Some(parent) = flat[index].parent {
+        let parent_style = flat[parent].style;
+        if is_author_flex(parent_style) {
+            return "flex-item";
+        }
+        if is_author_grid(parent_style) {
+            return "grid-item";
+        }
+        if inline::in_inline_container(flat, index) {
+            return "inline";
+        }
+    }
+    "block"
+}
+
 /// Every distinct reason in the tree (trace mode only); internal markers
-/// are reported by name.
+/// are reported by name. `unrecognized-display` includes the authored
+/// value and formatting context (`unrecognized-display:<value>|<context>`).
 pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
     let mut reasons = Vec::new();
     walk_rendered(flat, |index| {
@@ -1042,7 +1087,13 @@ pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
                         && key.as_str() != inline::ANONYMOUS_BLOCK_MARKER
                         && key.as_str() != inline::LINE_WIDTH_MARKER
                 })
-                .map(|key| key.trim_start_matches("--w3cos-internal-").to_string())
+                .map(|key| {
+                    if key.as_str() == "--w3cos-internal-unrecognized-display" {
+                        unrecognized_display_label(flat, index)
+                    } else {
+                        key.trim_start_matches("--w3cos-internal-").to_string()
+                    }
+                })
                 .collect()
         } else {
             vec![reason.to_string()]

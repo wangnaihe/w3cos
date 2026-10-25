@@ -2522,7 +2522,7 @@ fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
     assert!(
         block::unsupported_reasons(&web)
             .iter()
-            .any(|r| r == "unrecognized-display"),
+            .any(|r| { r.starts_with("unrecognized-display:-webkit-box|") }),
         "{:?}",
         block::unsupported_reasons(&web)
     );
