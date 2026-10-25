@@ -249,7 +249,10 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.hanging_punctuation_last && !content.chars().all(|c| c.is_ascii()) {
         return Some("text:hanging-punctuation");
     }
-    if !matches!(style.line_break, LineBreak::Auto | LineBreak::Normal) {
+    // line-break: loose / strict reach the breaker through
+    // crate::line_break::BreakMode (Blink LazyLineBreakIterator strictness,
+    // LayoutLocale::LocaleWithBreakKeyword). `anywhere` is not applied yet.
+    if style.line_break == LineBreak::Anywhere {
         return Some("text:line-break");
     }
     if style.break_spaces {
