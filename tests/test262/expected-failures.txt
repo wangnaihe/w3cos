@@ -4776,3 +4776,8 @@ test/language/statements/try/tco-catch.js
 test/language/statements/try/tco-finally.js
 # Previously false passes: `undefined.x` read as undefined before member reads threw
 # (GetValue on a nullish base); Symbol.prototype / the Error.prototype.stack accessor are not modelled yet.
+test/built-ins/Error/prototype/stack/getter-error-prototype.js  # false pass before checked GetValue
+test/built-ins/Error/prototype/stack/getter-no-error-data.js  # false pass before checked GetValue
+test/built-ins/Error/prototype/stack/getter-receiver-is-proxy.js  # false pass before checked GetValue
+test/built-ins/Symbol/prototype/valueOf/this-val-obj-symbol.js  # false pass before checked GetValue
+test/built-ins/Symbol/prototype/valueOf/this-val-symbol.js  # false pass before checked GetValue
