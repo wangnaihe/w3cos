@@ -275,6 +275,34 @@ function renderPage(contents, page) {
 
 // --- webContents -------------------------------------------------------------
 
+// Electron WebFrameMain: w3cos renders one top-level frame per webContents,
+// so the main frame has no parent (ipcMain senders are main frames).
+class WebFrameMain {
+  constructor(contents) {
+    this._contents = contents;
+    this.processId = 1;
+    this.routingId = 1;
+    this.frameTreeNodeId = contents.id;
+    this.name = '';
+    this.parent = null;
+    this.frames = [];
+    this.detached = false;
+  }
+  get url() { return this._contents.getURL(); }
+  get origin() {
+    try { return new URL(this.url).origin; } catch { return ''; }
+  }
+  get top() { return this; }
+  get framesInSubtree() { return [this]; }
+  get osProcessId() { return process.pid; }
+  get visibilityState() { return this._contents._win && this._contents._win.isVisible() ? 'visible' : 'hidden'; }
+  executeJavaScript(code) { return this._contents.executeJavaScript(code); }
+  send(channel, ...args) { this._contents.send(channel, ...args); }
+  postMessage(channel, message, transfer) { this._contents.postMessage(channel, message, transfer); }
+  reload() { this._contents.reload(); return true; }
+  isDestroyed() { return this._contents.isDestroyed(); }
+}
+
 class WebContents extends EventEmitter {
   constructor(win, preferences) {
     super();
@@ -286,8 +314,11 @@ class WebContents extends EventEmitter {
     this._destroyed = false;
     this._windowOpenHandler = null;
     this.session = session.defaultSession;
+    this.mainFrame = new WebFrameMain(this);
   }
   getURL() { return this._url; }
+  getProcessId() { return 1; }
+  getOSProcessId() { return process.pid; }
   getTitle() {
     if (this === hostContents && hasDom()) return document.title;
     return this._win ? this._win._title : '';
@@ -540,7 +571,7 @@ const ipcMain = new IpcMain();
 function mainEvent(contents) {
   return makeEvent({
     sender: contents,
-    senderFrame: { url: contents ? contents.getURL() : '', processId: 1, routingId: 1 },
+    senderFrame: contents ? contents.mainFrame : null,
     frameId: 1,
     processId: 1,
     ports: [],
