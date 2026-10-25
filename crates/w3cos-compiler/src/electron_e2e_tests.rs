@@ -511,3 +511,119 @@ fn electron_main_process_service_modules() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Code-OSS's window boot: the main process passes the window-config IPC
+/// channel through `webPreferences.additionalArguments`; the (classic)
+/// preload reads it from the renderer's `process.argv` and `invoke()`s it;
+/// the workbench module script (placed after `</body>`) awaits that
+/// configuration in an async IIFE before painting its splash.
+const WINDOW_CONFIG: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-window-config", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain } = require('electron')
+const path = require('node:path')
+const argc = process.argv.length
+let win
+ipcMain.handle('vscode:windowConfig', () => ({ zoomLevel: 0, windowId: 7 }))
+ipcMain.on('vscode:line', (_event, line) => { console.log(line); setTimeout(() => win.close(), 0) })
+app.whenReady().then(() => {
+  win = new BrowserWindow({ show: false, webPreferences: {
+    preload: path.join(__dirname, 'preload.js'),
+    additionalArguments: ['--vscode-window-config=vscode:windowConfig'],
+  } })
+  win.webContents.on('did-finish-load', () => {
+    console.log('did-finish-load main-argv-unchanged', process.argv.length === argc)
+  })
+  win.loadFile('workbench.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "preload.js",
+        r#"(function () {
+  const { ipcRenderer, contextBridge } = require('electron')
+  function parseArgv(key) {
+    for (const arg of process.argv) {
+      if (arg.indexOf(`--${key}=`) === 0) return arg.split('=')[1]
+    }
+    return undefined
+  }
+  const resolveConfiguration = (async () => {
+    const channel = parseArgv('vscode-window-config')
+    if (!channel) throw new Error('Preload: did not find expected vscode-window-config in renderer process arguments list.')
+    return ipcRenderer.invoke(channel)
+  })()
+  contextBridge.exposeInMainWorld('vscode', {
+    ipcRenderer: { send: (channel, ...args) => ipcRenderer.send(channel, ...args) },
+    context: { async resolveConfiguration() { return resolveConfiguration } },
+  })
+})()
+"#,
+    ),
+    (
+        "workbench.js",
+        r#"import { splashText } from './splash.js'
+(async function () {
+  const preloadGlobals = window.vscode
+  try {
+    const configuration = await preloadGlobals.context.resolveConfiguration()
+    const splash = document.createElement('div')
+    splash.textContent = splashText(configuration)
+    document.body.appendChild(splash)
+    preloadGlobals.ipcRenderer.send('vscode:line', 'workbench ' + document.body.textContent.trim())
+  } catch (error) {
+    preloadGlobals.ipcRenderer.send('vscode:line', 'error ' + error.message)
+  }
+})()
+"#,
+    ),
+    (
+        "splash.js",
+        r#"export function splashText(configuration) { return 'splash ' + configuration.windowId }
+"#,
+    ),
+    (
+        "workbench.html",
+        r#"<!DOCTYPE html>
+<html>
+	<head><meta charset="utf-8" /></head>
+	<body aria-label="">
+	</body>
+	<!-- Startup (do not modify order of script tags!) -->
+	<script src="./workbench.js" type="module"></script>
+</html>
+"#,
+    ),
+];
+
+#[test]
+fn electron_additional_arguments_reach_the_preload_process_argv() {
+    let root = write_fixture("w3cos_electron_window_config", WINDOW_CONFIG);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_window_config",
+        &[],
+    );
+    // Renderer→main IPC lines arrive asynchronously: compare sorted.
+    let mut sorted: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !line.starts_with("[electron]"))
+        .collect();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        [
+            "did-finish-load main-argv-unchanged true",
+            "workbench splash 7"
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

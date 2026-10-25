@@ -229,7 +229,28 @@ function moduleKey(file) {
   return relative;
 }
 
-function runRendererScript(file, label) {
+// Chromium starts each renderer with its own command line; Electron appends
+// `webPreferences.additionalArguments` there, and preloads read them from
+// `process.argv` (Code-OSS passes its window-config IPC channel this way).
+// The renderer shares this process, so `process.argv` is swapped for the
+// renderer's argv while a renderer script evaluates and restored after,
+// leaving the main process's argv untouched.
+function rendererArgv(contents) {
+  const extra = contents && contents._preferences.additionalArguments;
+  return [process.argv[0], '--type=renderer'].concat(Array.isArray(extra) ? extra.map(String) : []);
+}
+
+function withRendererArgv(contents, run) {
+  const saved = process.argv;
+  process.argv = rendererArgv(contents);
+  try {
+    return run();
+  } finally {
+    process.argv = saved;
+  }
+}
+
+function runRendererScript(file, label, contents) {
   const key = moduleKey(file);
   if (assets.modules.indexOf(key) < 0) {
     console.error('Unable to load ' + label + ' ' + file + ': not compiled into this app');
@@ -244,7 +265,7 @@ function runRendererScript(file, label) {
   try {
     // ES module scripts (`<script type="module">`, ESM preloads) are linked
     // as lazily evaluated modules: `load` returns their `import()` promise.
-    const result = assets.load(key);
+    const result = withRendererArgv(contents, () => assets.load(key));
     if (result && typeof result.then === 'function') return result.then(undefined, report);
   } catch (error) {
     report(error);
@@ -259,11 +280,11 @@ function renderPage(contents, page) {
   document.body.innerHTML = page.body;
   document.title = page.title;
   const preload = contents._preferences.preload;
-  let pending = preload ? runRendererScript(preload, 'preload') : undefined;
+  let pending = preload ? runRendererScript(preload, 'preload', contents) : undefined;
   for (const script of page.scripts) {
     pending = pending
-      ? pending.then(() => runRendererScript(script, 'script'))
-      : runRendererScript(script, 'script');
+      ? pending.then(() => runRendererScript(script, 'script', contents))
+      : runRendererScript(script, 'script', contents);
   }
   const contentLoaded = () => {
     document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
