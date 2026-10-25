@@ -450,6 +450,13 @@ out("fd-read", fs.readSync(fd, buf, 0, 4, 0), buf.toString(), fs.fstatSync(fd).s
 fs.ftruncateSync(fd, 3);
 fs.closeSync(fd);
 out("fd-closed", fs.readFileSync(path.join(tmp, "fd.txt"), "utf8"), err(() => fs.closeSync(fd)).split("/")[0]);
+const nfd = fs.openSync(path.join(tmp, "fd.txt"), fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+const nbuf = Buffer.alloc(3);
+out("numeric-open", fs.readSync(nfd, nbuf, 0, 3, 0), nbuf.toString(), typeof fs.constants.O_NONBLOCK);
+fs.closeSync(nfd);
+const wfd = fs.openSync(path.join(tmp, "fd2.txt"), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, 0o644);
+fs.writeSync(wfd, "num"); fs.fdatasyncSync(wfd); fs.closeSync(wfd);
+out("stdout-fd", fs.writeSync(1, ""), fs.readFileSync(path.join(tmp, "fd2.txt"), "utf8"));
 fs.chmodSync(path.join(tmp, "c.txt"), 0o600);
 out("chmod", (fs.statSync(path.join(tmp, "c.txt")).mode & 0o777).toString(8), err(() => fs.accessSync(path.join(tmp, "c.txt"), fs.constants.R_OK)));
 fs.utimesSync(path.join(tmp, "c.txt"), 1000, 2000);
@@ -506,6 +513,8 @@ symlink true true <tmp>/c.txt true
 fd-write 6 2
 fd-read 4 aXYd 6
 fd-closed aXY EBADF
+numeric-open 3 aXY number
+stdout-fd 0 num
 chmod 600 ok
 utimes 2000000
 truncate 2
