@@ -101,6 +101,9 @@ psl = { workspace = true }
 w3cos-ai-bridge = { workspace = true, optional = true }
 taffy = { workspace = true }
 parley = { workspace = true }
+icu_segmenter = { workspace = true }
+icu_locale_core = { workspace = true }
+icu_properties = { workspace = true }
 unicode-bidi = { workspace = true }
 unicode-bidi-mirroring = { workspace = true }
 fontdue = { workspace = true }
