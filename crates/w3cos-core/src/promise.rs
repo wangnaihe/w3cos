@@ -120,8 +120,23 @@ fn report_unhandled_rejections() {
         } else {
             Value::Undefined
         };
+        let message = if reason.is_object() {
+            reason.get_property("message")
+        } else {
+            Value::Undefined
+        };
         let detail = if stack.is_string() {
             stack.to_js_string()
+        } else if !message.is_undefined() {
+            message.to_js_string()
+        } else if reason.is_object() && !reason.is_function() {
+            // A plain object reason (`reject({ code })`): show its fields,
+            // not "[object Object]".
+            let json = crate::value::catch_js(|| crate::json::stringify(vec![reason.clone()]));
+            match json {
+                Ok(json) if json.is_string() => json.to_js_string(),
+                _ => reason.to_js_string(),
+            }
         } else {
             reason.to_js_string()
         };
@@ -671,10 +686,26 @@ mod tests {
                 crate::throw_value(Value::string("thrown"))
             })],
         );
+        // Objects without a stack show their message, or else their JSON.
+        let with_message = Value::object(HashMap::new());
+        with_message.set_property("message", Value::string("has message"));
+        let _message = reject(vec![with_message]);
+        let plain = Value::object(HashMap::new());
+        plain.set_property("code", Value::string("E1"));
+        let _plain = reject(vec![plain]);
         drain_microtasks();
         let mut reported = REPORTED_REJECTIONS.with(|reported| reported.take());
         reported.sort();
-        assert_eq!(reported, ["lost", "passed on", "thrown"]);
+        assert_eq!(
+            reported,
+            [
+                "has message",
+                "lost",
+                "passed on",
+                "thrown",
+                r#"{"code":"E1"}"#
+            ]
+        );
         TRACK_REJECTIONS.with(|flag| flag.set(None));
     }
 

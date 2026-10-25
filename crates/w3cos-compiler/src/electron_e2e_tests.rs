@@ -627,3 +627,41 @@ fn electron_additional_arguments_reach_the_preload_process_argv() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn electron_renderer_trace_logs_scripts_and_ipc() {
+    let root = write_fixture("w3cos_electron_renderer_trace", WINDOW_CONFIG);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_renderer_trace",
+        &[("W3COS_ELECTRON_TRACE", "2")],
+    );
+    let traced: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.contains("-start ") || line.contains("-done ") || line.contains("ipc-"))
+        .collect();
+    let position = |needle: &str| {
+        traced
+            .iter()
+            .position(|line| line.ends_with(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in {lines:#?}"))
+    };
+    // The preload evaluates first and asks for the window config; the
+    // page script runs after it and reports back over ipc.
+    let preload_start = position("preload-start preload.js");
+    let invoke = position("ipc-invoke vscode:windowConfig");
+    let invoke_done = position("ipc-invoke-done vscode:windowConfig");
+    let script_start = position("script-start workbench.js");
+    let send = position("ipc-send vscode:line");
+    assert!(
+        preload_start < invoke && invoke < invoke_done,
+        "{traced:#?}"
+    );
+    assert!(
+        preload_start < script_start && invoke_done < send,
+        "{traced:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
