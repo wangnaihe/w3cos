@@ -314,7 +314,7 @@ struct StyleForMemo {
 /// Immutable, reference-counted computed style (Blink's scoped_refptr<const
 /// ComputedStyle>): the per-node cache, the matched-properties cache and the
 /// layout walk share one allocation instead of deep-cloning `Style`.
-pub type SharedStyle = std::rc::Rc<w3cos_std::style::Style>;
+pub type SharedStyle = std::sync::Arc<w3cos_std::style::Style>;
 
 /// Properties that are not inherited (CSS property index "Inherited: no").
 /// Conservative: anything unlisted is treated as possibly inherited.
@@ -5606,7 +5606,10 @@ impl Document {
             // Promoting it to an atomic inline-block invents a line strut.
             return Some(w3cos_std::Component::boxed(style, Vec::new()));
         }
-        normalize_css_table_internal_used_style(&mut style);
+        let needs_table_normalization = needs_css_table_internal_used_style_normalization(&style);
+        if needs_table_normalization {
+            normalize_css_table_internal_used_style(&mut style);
+        }
         let (_, content) = selected_content?;
         if style.display == w3cos_std::style::Display::ListItem {
             // A list-item pseudo has a principal box and a marker, exactly
@@ -7624,7 +7627,7 @@ impl Document {
                 if !same_text_style || !component.children.is_empty() {
                     return false;
                 }
-                first_style.get_or_insert_with(|| component.style.clone());
+                first_style.get_or_insert_with(|| (*component.style).clone());
                 append_rendered_text(output, content, &component.style, ends, previous_source);
                 return true;
             }
@@ -7671,7 +7674,7 @@ impl Document {
                     {
                         return None;
                     }
-                    text_style.get_or_insert_with(|| component.style.clone());
+                    text_style.get_or_insert_with(|| (*component.style).clone());
                     append_rendered_text(
                         &mut content,
                         text,
@@ -7812,7 +7815,7 @@ impl Document {
         let mut style = text_style?;
         w3cos_std::inline_text::set_fragment_ends(&mut style, &content, &ends);
         style.white_space = parent_style.white_space;
-        Some(w3cos_std::Component::text(content, style))
+        Some(w3cos_std::Component::text_shared(content, style))
     }
 
     fn passive_generated_inline_subtree(&self, id: NodeId) -> bool {
@@ -7909,7 +7912,9 @@ impl Document {
         inherited: Option<&w3cos_std::style::Style>,
     ) -> w3cos_std::Component {
         let node = self.get_node(id);
-        let mut style = self.computed_style(id, ancestors, inherited);
+        let mut style = w3cos_std::component::ComponentStyle::shared(
+            self.computed_style_impl(id, inherited, None),
+        );
         if matches!(style.height, w3cos_std::style::Dimension::Percent(_)) {
             if self.quirks_mode {
                 style
@@ -7965,9 +7970,14 @@ impl Document {
         // Native UA controls belong to the media host, not to its fallback
         // children. Internal paint metadata must not follow CSS inheritance.
         const VIDEO_CONTROLS: &str = "--w3cos-internal-video-controls";
-        if let Some(properties) = style.custom_properties.as_mut() {
-            properties.remove(VIDEO_CONTROLS);
-            properties.remove("--w3cos-internal-media-controls-layer");
+        if style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key(VIDEO_CONTROLS)
+                || properties.contains_key("--w3cos-internal-media-controls-layer")
+        }) {
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove(VIDEO_CONTROLS);
+                properties.remove("--w3cos-internal-media-controls-layer");
+            }
         }
         if tag == "video"
             && node
@@ -8039,7 +8049,23 @@ impl Document {
                 }
             }
         }
-        self.apply_svg_presentation_style(id, &tag, &mut style);
+        if matches!(
+            tag.as_str(),
+            "svg"
+                | "g"
+                | "defs"
+                | "rect"
+                | "circle"
+                | "ellipse"
+                | "line"
+                | "polyline"
+                | "polygon"
+                | "path"
+                | "text"
+                | "use"
+        ) {
+            self.apply_svg_presentation_style(id, &tag, &mut style);
+        }
         if let Some(source) = style
             .custom_properties
             .as_ref()
@@ -8196,7 +8222,11 @@ impl Document {
                 // anonymous inline box used by the component IR. Normalize
                 // after assigning the text node's used display so inherited
                 // `caption-side`/`empty-cells` do not split a text run.
-                normalize_css_table_internal_used_style(&mut style);
+                let needs_table_normalization =
+                    needs_css_table_internal_used_style_normalization(&style);
+                if needs_table_normalization {
+                    normalize_css_table_internal_used_style(&mut style);
+                }
                 style
                     .custom_properties
                     .get_or_insert_with(Default::default)
@@ -8205,10 +8235,10 @@ impl Document {
                         format!("text:{}", id.as_u32()),
                     );
                 let text = preserved_authored_text(text, style.white_space);
-                w3cos_std::Component::text(text.as_ref(), style)
+                w3cos_std::Component::text_shared(text.as_ref(), style)
             }
             NodeType::Comment | NodeType::DocumentType => {
-                return w3cos_std::Component::column(style, vec![]);
+                return w3cos_std::Component::column_shared(style, vec![]);
             }
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
                 let loaded_object = tag == "object" && self.embedded_document_hosts.contains(&id);
@@ -8231,8 +8261,10 @@ impl Document {
                             .get_or_insert_with(Default::default)
                             .insert("--w3cos-internal-clearing-line-break".into(), "1".into());
                     }
-                    return self
-                        .attach_native_host(id, w3cos_std::Component::text("\u{2028}", style));
+                    return self.attach_native_host(
+                        id,
+                        w3cos_std::Component::text_shared("\u{2028}", style),
+                    );
                 }
                 if tag == "svg" {
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
@@ -8263,7 +8295,7 @@ impl Document {
                     let source = source
                         .replace("currentColor", &current_color)
                         .replace("currentcolor", &current_color);
-                    let component = w3cos_std::Component::svg_document_with_targets(
+                    let component = w3cos_std::Component::svg_document_with_targets_shared(
                         source,
                         width,
                         height,
@@ -8388,8 +8420,10 @@ impl Document {
                         style.letter_spacing = generated_style.letter_spacing;
                         style.word_spacing = generated_style.word_spacing;
                         w3cos_std::inline_text::copy_used_decoration(&mut style, &generated_style);
-                        return self
-                            .attach_native_host(id, w3cos_std::Component::text(content, style));
+                        return self.attach_native_host(
+                            id,
+                            w3cos_std::Component::text_shared(content, style),
+                        );
                     }
                 }
                 if matches!(
@@ -8474,8 +8508,8 @@ impl Document {
                                 );
                         }
                         let component = match tag.as_str() {
-                            "button" => w3cos_std::Component::button(text, style),
-                            _ => w3cos_std::Component::text(text, style),
+                            "button" => w3cos_std::Component::button_shared(text, style),
+                            _ => w3cos_std::Component::text_shared(text, style),
                         };
                         return self.attach_native_host(id, component);
                     }
@@ -9065,7 +9099,25 @@ impl Document {
                             });
                     }
                 }
-                promote_passive_vertical_align_extension(&mut style, &children);
+                let promote_vertical_align = !children.is_empty()
+                    && matches!(
+                        style.display,
+                        w3cos_std::style::Display::Inline
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::InlineFlex
+                    )
+                    && style.background.a == 0
+                    && style
+                        .background_image
+                        .as_deref()
+                        .is_none_or(|image| image.eq_ignore_ascii_case("none"))
+                    && style.border_width == 0.0
+                    && style.custom_properties.as_ref().is_some_and(|properties| {
+                        properties.contains_key("--w3cos-internal-vertical-align-length")
+                    });
+                if promote_vertical_align {
+                    promote_passive_vertical_align_extension(&mut style, &children);
+                }
                 annotate_inline_line_extra_ascent(&mut children);
                 if matches!(
                     style.display,
@@ -9300,7 +9352,7 @@ impl Document {
                     text_style.user_select = style.user_select;
                     return self.attach_native_host(
                         id,
-                        w3cos_std::Component::text(content.clone(), text_style),
+                        w3cos_std::Component::text_shared(content.clone(), text_style),
                     );
                 }
                 if nowrap_inline_formatting_context
@@ -9407,7 +9459,8 @@ impl Document {
                             _ => None,
                         })
                         .collect::<String>();
-                    return self.attach_native_host(id, w3cos_std::Component::text(content, style));
+                    return self
+                        .attach_native_host(id, w3cos_std::Component::text_shared(content, style));
                 }
 
                 if style.display == w3cos_std::style::Display::Inline
@@ -9443,9 +9496,12 @@ impl Document {
                             "--w3cos-internal-full-width-atomic-line-break".into(),
                             "1".into(),
                         );
-                    children.insert(1, w3cos_std::Component::text("\u{2028}", break_style));
+                    children.insert(
+                        1,
+                        w3cos_std::Component::text_shared("\u{2028}", break_style),
+                    );
                     style.display = w3cos_std::style::Display::Contents;
-                    return w3cos_std::Component::boxed(style, children);
+                    return w3cos_std::Component::boxed_shared(style, children);
                 }
 
                 if style.display == w3cos_std::style::Display::Inline
@@ -9487,7 +9543,7 @@ impl Document {
                     }
                     return self.attach_native_host(
                         id,
-                        w3cos_std::Component::text(content.clone(), style),
+                        w3cos_std::Component::text_shared(content.clone(), style),
                     );
                 }
 
@@ -9513,7 +9569,8 @@ impl Document {
                     // has no such descendant and can move its offset to the
                     // split in-flow fragments instead.
                     style.display = w3cos_std::style::Display::Inline;
-                    return self.attach_native_host(id, w3cos_std::Component::row(style, children));
+                    return self
+                        .attach_native_host(id, w3cos_std::Component::row_shared(style, children));
                 }
 
                 if style.display == w3cos_std::style::Display::InlineBlock
@@ -9609,8 +9666,8 @@ impl Document {
                 if let Some(text) = &node.text_content {
                     if children.is_empty() {
                         let component = match tag.as_str() {
-                            "button" => w3cos_std::Component::button(text, style),
-                            _ => w3cos_std::Component::text(text, style),
+                            "button" => w3cos_std::Component::button_shared(text, style),
+                            _ => w3cos_std::Component::text_shared(text, style),
                         };
                         return self.attach_native_host(id, component);
                     }
@@ -9894,7 +9951,7 @@ impl Document {
                                 "--w3cos-internal-inline-formatting-context".into(),
                                 "1".into(),
                             );
-                        let mut split_row = w3cos_std::Component::row(split_style, children);
+                        let mut split_row = w3cos_std::Component::row_shared(split_style, children);
                         split_padded_inline_text_fragments(&mut split_row);
                         children = split_row.children;
                         children = children
@@ -10278,7 +10335,11 @@ impl Document {
                     };
                 }
 
-                normalize_css_table_internal_used_style(&mut style);
+                let needs_table_normalization =
+                    needs_css_table_internal_used_style_normalization(&style);
+                if needs_table_normalization {
+                    normalize_css_table_internal_used_style(&mut style);
+                }
                 if style.display == w3cos_std::style::Display::TableRow {
                     // CSS `direction` on a table row does not itself reorder
                     // columns. Column order follows the containing table (or
@@ -10484,7 +10545,7 @@ impl Document {
                         fragment.border_bottom_width = Some(bottom);
                         fragment.border_left_width = Some(if retain_left { left } else { 0.0 });
                         fragment.border_right_width = Some(if retain_right { right } else { 0.0 });
-                        w3cos_std::Component::row(fragment, Vec::new())
+                        w3cos_std::Component::row_shared(fragment, Vec::new())
                     };
                     let inline_start_is_left =
                         style.direction == w3cos_std::style::TextDirection::Ltr;
@@ -10672,7 +10733,7 @@ impl Document {
                                 text.style = fragment;
                                 text
                             } else {
-                                w3cos_std::Component::row(fragment, fragment_children)
+                                w3cos_std::Component::row_shared(fragment, fragment_children)
                             }
                         };
                     let inline_start_is_left =
@@ -10818,8 +10879,8 @@ impl Document {
                     let mut children = children.into_iter();
                     let block = children.next().expect("split inline block child");
                     let trailing = children.collect::<Vec<_>>();
-                    let start = w3cos_std::Component::row(fragment_style(true), Vec::new());
-                    let end = w3cos_std::Component::row(fragment_style(false), trailing);
+                    let start = w3cos_std::Component::row_shared(fragment_style(true), Vec::new());
+                    let end = w3cos_std::Component::row_shared(fragment_style(false), trailing);
                     return boxed_split_inline_group(&style, vec![start, block, end]);
                 }
 
@@ -10876,7 +10937,7 @@ impl Document {
                         fragment.border_bottom_width = Some(bottom);
                         fragment.border_left_width = Some(if left { side } else { 0.0 });
                         fragment.border_right_width = Some(if left { 0.0 } else { side });
-                        w3cos_std::Component::row(fragment, Vec::new())
+                        w3cos_std::Component::row_shared(fragment, Vec::new())
                     };
                     let has_left_fragment = style.padding.left
                         != w3cos_std::style::Spacing::Px(0.0)
@@ -10974,25 +11035,25 @@ impl Document {
                                 "--w3cos-internal-replaced-element".to_string(),
                                 "1".to_string(),
                             );
-                        w3cos_std::Component::boxed(style, vec![])
+                        w3cos_std::Component::boxed_shared(style, vec![])
                     }
-                    "svg" | "g" | "defs" => w3cos_std::Component::boxed(style, children),
+                    "svg" | "g" | "defs" => w3cos_std::Component::boxed_shared(style, children),
                     "rect" | "circle" | "ellipse" | "line" | "use" => {
-                        w3cos_std::Component::boxed(style, children)
+                        w3cos_std::Component::boxed_shared(style, children)
                     }
                     "polyline" | "polygon" | "path" => self
-                        .svg_path_component(id, &tag, style.clone())
-                        .unwrap_or_else(|| w3cos_std::Component::boxed(style, children)),
+                        .svg_path_component(id, &tag, (*style).clone())
+                        .unwrap_or_else(|| w3cos_std::Component::boxed_shared(style, children)),
                     "text" => {
                         let text = self.descendant_text_content(id);
-                        w3cos_std::Component::text(text, style)
+                        w3cos_std::Component::text_shared(text, style)
                     }
                     "body" | "div" | "section" | "main" | "article" | "nav" | "header"
                     | "footer" | "aside" | "form" | "fieldset" | "ul" | "ol" | "dl" => {
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(style, children)
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(style, children)
                         }
                     }
                     "span" | "label" | "em" | "strong" | "code" | "small" | "li" | "dd" | "dt" => {
@@ -11000,14 +11061,14 @@ impl Document {
                             if children.is_empty() {
                                 return self.attach_native_host(
                                     id,
-                                    w3cos_std::Component::text(text, style),
+                                    w3cos_std::Component::text_shared(text, style),
                                 );
                             }
                         }
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(style, children)
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(style, children)
                         }
                     }
                     "p" => {
@@ -11015,14 +11076,14 @@ impl Document {
                             if children.is_empty() {
                                 return self.attach_native_host(
                                     id,
-                                    w3cos_std::Component::text(text, style),
+                                    w3cos_std::Component::text_shared(text, style),
                                 );
                             }
                         }
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(style, children)
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(style, children)
                         }
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -11030,9 +11091,9 @@ impl Document {
                             // UA heading defaults already participate in the
                             // cascade. Lower the computed style without
                             // overriding author normal weight or 16px size.
-                            w3cos_std::Component::text(text, style)
+                            w3cos_std::Component::text_shared(text, style)
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(style, children)
                         }
                     }
                     "button" => {
@@ -11048,7 +11109,7 @@ impl Document {
                         // A non-leaf DOM button paints through its child nodes.
                         // Keeping the descendant text in Button::label would
                         // make every renderer paint it a second time.
-                        let mut button = w3cos_std::Component::button(paint_label, style);
+                        let mut button = w3cos_std::Component::button_shared(paint_label, style);
                         button.children = children;
                         button
                     }
@@ -11084,7 +11145,7 @@ impl Document {
                         let label = selected
                             .map(|option_id| self.descendant_text_content(option_id))
                             .unwrap_or_default();
-                        w3cos_std::Component::button(&label, style)
+                        w3cos_std::Component::button_shared(&label, style)
                     }
                     "img" | "object"
                         if tag.as_str() == "img"
@@ -11140,7 +11201,7 @@ impl Document {
                         {
                             image_style.height = height;
                         }
-                        w3cos_std::Component::image(src, image_style)
+                        w3cos_std::Component::image_shared(src, image_style)
                     }
                     "input" | "textarea" => {
                         if tag.as_str() == "input" {
@@ -11161,7 +11222,7 @@ impl Document {
                             .map(|(_, value)| value.as_str())
                             .unwrap_or("text");
                         if tag.as_str() == "input" && input_type.eq_ignore_ascii_case("file") {
-                            let mut component = w3cos_std::Component::boxed(style, children);
+                            let mut component = w3cos_std::Component::boxed_shared(style, children);
                             component.on_click = w3cos_std::EventAction::NativeHost {
                                 id: id.as_u32() as u64,
                                 click: true,
@@ -11191,9 +11252,13 @@ impl Document {
                         let secure =
                             tag.as_str() == "input" && input_type.eq_ignore_ascii_case("password");
                         let mut component = if secure {
-                            w3cos_std::Component::secure_text_input(value, placeholder, style)
+                            w3cos_std::Component::secure_text_input_shared(
+                                value,
+                                placeholder,
+                                style,
+                            )
                         } else {
-                            w3cos_std::Component::text_input(value, placeholder, style)
+                            w3cos_std::Component::text_input_shared(value, placeholder, style)
                         };
                         component.on_click = w3cos_std::EventAction::NativeHost {
                             id: id.as_u32() as u64,
@@ -11221,13 +11286,13 @@ impl Document {
                             .find(|(k, _)| k.as_str() == "height")
                             .and_then(|(_, v)| v.parse::<u32>().ok())
                             .unwrap_or(150);
-                        w3cos_std::Component::canvas(width, height, style)
+                        w3cos_std::Component::canvas_shared(width, height, style)
                     }
                     _ => {
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(style, children)
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(style, children)
                         }
                     }
                 };
@@ -13144,7 +13209,7 @@ mod inline_line_extra_ascent_tests {
             kind: w3cos_std::component::ComponentKind::Image {
                 src: "swatch.png".to_string(),
             },
-            style: image_style,
+            style: image_style.into(),
             ..passive_fragment()
         };
         // The image establishes the baseline from its own height, and the runtime
@@ -13177,7 +13242,7 @@ mod inline_line_extra_ascent_tests {
 fn cloned_text_fragment(
     source: &w3cos_std::Component,
     content: String,
-    style: w3cos_std::style::Style,
+    style: w3cos_std::component::ComponentStyle,
 ) -> w3cos_std::Component {
     let mut fragment = source.clone();
     fragment.kind = w3cos_std::ComponentKind::Text { content };
@@ -13373,7 +13438,7 @@ fn apply_first_letter_style_inner(
             fragments.push(cloned_text_fragment(
                 &source,
                 content[range.clone()].to_string(),
-                pseudo_style,
+                pseudo_style.into(),
             ));
             if range.end < content.len() {
                 fragments.push(cloned_text_fragment(
@@ -13466,7 +13531,7 @@ fn apply_first_line_style_inner(
                         cloned_text_fragment(
                             &source,
                             content[..break_at].to_string(),
-                            pseudo_style,
+                            pseudo_style.into(),
                         ),
                         cloned_text_fragment(&source, content[break_at..].to_string(), base_style),
                     ];
@@ -13478,7 +13543,8 @@ fn apply_first_line_style_inner(
             if !content.is_empty() {
                 let advance = first_line_text_advance(content, &components[index].style);
                 components[index].style =
-                    first_line_text_style(&components[index].style, declarations, fragment_height);
+                    first_line_text_style(&components[index].style, declarations, fragment_height)
+                        .into();
                 changed = true;
                 *used_width += advance;
                 if available_width.is_some_and(|width| *used_width >= width) {
@@ -15258,7 +15324,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     struct InlineUnit {
         content: String,
         component: w3cos_std::Component,
-        wrapper: Option<(w3cos_std::Component, w3cos_std::style::Style)>,
+        wrapper: Option<(w3cos_std::Component, w3cos_std::component::ComponentStyle)>,
         leading_ahem_wrapper: bool,
     }
 
@@ -15820,7 +15886,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             let mut break_style = anonymous_space
                 .as_ref()
                 .map(|space| space.style.clone())
-                .unwrap_or_else(w3cos_std::style::Style::default);
+                .unwrap_or_default();
             break_style.display = Display::Inline;
             break_style.width = Dimension::Px(0.0);
             break_style.height = Dimension::Px(break_style.font_size * break_style.line_height);
@@ -15837,7 +15903,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             break_style.border_left_width = None;
             break_style.background = w3cos_std::Color::TRANSPARENT;
             break_style.background_image = None;
-            normalized.push(w3cos_std::Component::text("\u{2028}", break_style));
+            normalized.push(w3cos_std::Component::text_shared("\u{2028}", break_style));
         } else if starts_new_line
             && fragment.line_index > 0
             && logical
@@ -15946,7 +16012,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         {
             let mut wrapper = wrapper_source.clone();
             wrapper.style = fragment.component.style.clone();
-            wrapper.children = vec![w3cos_std::Component::text(
+            wrapper.children = vec![w3cos_std::Component::text_shared(
                 content.clone(),
                 inner_style.clone(),
             )];
@@ -16072,7 +16138,7 @@ fn plain_anonymous_inline_table_text(
                     return false;
                 }
             }
-            text_style.get_or_insert_with(|| component.style.clone());
+            text_style.get_or_insert_with(|| (*component.style).clone());
             w3cos_std::inline_text::append_fragment_ends(
                 ends,
                 content.len(),
@@ -16408,6 +16474,42 @@ fn relative_border_length_px(value: &str, style: &w3cos_std::style::Style) -> Op
     })
 }
 
+fn needs_css_table_internal_used_style_normalization(style: &w3cos_std::style::Style) -> bool {
+    use w3cos_std::style::Display;
+
+    let ignores_margin = matches!(
+        style.display,
+        Display::TableRowGroup
+            | Display::TableHeaderGroup
+            | Display::TableFooterGroup
+            | Display::TableRow
+            | Display::TableColumnGroup
+            | Display::TableColumn
+            | Display::TableCell
+    );
+    let ignores_padding_and_border = matches!(
+        style.display,
+        Display::TableRowGroup
+            | Display::TableHeaderGroup
+            | Display::TableFooterGroup
+            | Display::TableRow
+            | Display::TableColumnGroup
+            | Display::TableColumn
+    );
+    (!matches!(style.display, Display::Table | Display::InlineTable) && style.table_layout_fixed)
+        || (style.display != Display::TableCell && style.empty_cells_hide)
+        || (style.display != Display::TableCaption && style.caption_side_bottom)
+        || (ignores_margin && style.margin != w3cos_std::style::Edges::ZERO)
+        || (ignores_padding_and_border
+            && !style.border_collapse
+            && (style.padding != w3cos_std::style::Edges::ZERO
+                || style.border_width != 0.0
+                || style.border_top_width.is_some()
+                || style.border_right_width.is_some()
+                || style.border_bottom_width.is_some()
+                || style.border_left_width.is_some()))
+}
+
 fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) {
     use w3cos_std::style::Display;
 
@@ -16466,8 +16568,72 @@ fn normalize_css_table_internal_used_style(style: &mut w3cos_std::style::Style) 
 
 #[cfg(test)]
 mod collapsed_table_border_tests {
-    use super::normalize_css_table_internal_used_style;
+    use super::{
+        needs_css_table_internal_used_style_normalization, normalize_css_table_internal_used_style,
+    };
     use w3cos_std::style::{Display, Style};
+
+    #[test]
+    fn ordinary_style_does_not_request_same_value_normalization() {
+        assert!(!needs_css_table_internal_used_style_normalization(
+            &Style::default()
+        ));
+    }
+
+    #[test]
+    fn inherited_table_only_flags_request_and_receive_normalization() {
+        let mut style = Style {
+            table_layout_fixed: true,
+            empty_cells_hide: true,
+            caption_side_bottom: true,
+            ..Style::default()
+        };
+        assert!(needs_css_table_internal_used_style_normalization(&style));
+        normalize_css_table_internal_used_style(&mut style);
+        assert!(!style.table_layout_fixed);
+        assert!(!style.empty_cells_hide);
+        assert!(!style.caption_side_bottom);
+        assert!(!needs_css_table_internal_used_style_normalization(&style));
+    }
+
+    #[test]
+    fn applicable_table_and_caption_values_are_preserved() {
+        let table = Style {
+            display: Display::Table,
+            table_layout_fixed: true,
+            ..Style::default()
+        };
+        let cell = Style {
+            display: Display::TableCell,
+            empty_cells_hide: true,
+            ..Style::default()
+        };
+        let caption = Style {
+            display: Display::TableCaption,
+            caption_side_bottom: true,
+            ..Style::default()
+        };
+        assert!(!needs_css_table_internal_used_style_normalization(&table));
+        assert!(!needs_css_table_internal_used_style_normalization(&cell));
+        assert!(!needs_css_table_internal_used_style_normalization(&caption));
+    }
+
+    #[test]
+    fn internal_table_box_edges_request_normalization() {
+        let mut row = Style {
+            display: Display::TableRow,
+            margin: w3cos_std::style::Edges::all(3.0),
+            padding: w3cos_std::style::Edges::all(2.0),
+            border_width: 1.0,
+            ..Style::default()
+        };
+        assert!(needs_css_table_internal_used_style_normalization(&row));
+        normalize_css_table_internal_used_style(&mut row);
+        assert_eq!(row.margin, w3cos_std::style::Edges::ZERO);
+        assert_eq!(row.padding, w3cos_std::style::Edges::ZERO);
+        assert_eq!(row.border_width, 0.0);
+        assert!(!needs_css_table_internal_used_style_normalization(&row));
+    }
 
     #[test]
     fn collapsed_table_row_group_retains_its_border() {
@@ -16781,7 +16947,7 @@ fn hoist_floats_into_block_formatting_context(
                         .as_ref()
                         .is_none_or(|style| equivalent_text_style(style, &component.style))
                 {
-                    text_style.get_or_insert_with(|| component.style.clone());
+                    text_style.get_or_insert_with(|| (*component.style).clone());
                     content.push_str(text);
                     return true;
                 }
@@ -21793,7 +21959,7 @@ mod image_component_tests {
             runs: &mut Vec<(String, w3cos_std::style::Style)>,
         ) {
             if let ComponentKind::Text { content } = &component.kind {
-                runs.push((content.clone(), component.style.clone()));
+                runs.push((content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 collect(child, runs);
@@ -22196,7 +22362,7 @@ mod image_component_tests {
         let normal = w3cos_std::Component::text("SS", w3cos_std::style::Style::default());
         let mut floating = normal.style.clone();
         floating.float = Float::Left;
-        let floating = w3cos_std::Component::text("PA", floating);
+        let floating = w3cos_std::Component::text_shared("PA", floating);
         for children in [
             vec![floating.clone(), normal.clone()],
             vec![normal.clone(), floating.clone()],
@@ -22216,7 +22382,7 @@ mod image_component_tests {
             w3cos_std::Component::text("This test has: ", w3cos_std::style::Style::default());
         let mut bordered_style = plain.style.clone();
         bordered_style.border_top_width = Some(3.0);
-        let bordered = w3cos_std::Component::text("PASSED", bordered_style);
+        let bordered = w3cos_std::Component::text_shared("PASSED", bordered_style);
         assert!(
             document
                 .coalesced_generated_text_run(&[plain.clone(), bordered], &plain.style)
@@ -24694,7 +24860,7 @@ mod image_component_tests {
             ..Default::default()
         };
         let mut row = w3cos_std::Component::row(
-            Default::default(),
+            w3cos_std::Style::default(),
             vec![
                 w3cos_std::Component::text("Before ", style.clone()),
                 w3cos_std::Component::text("gen", style),
@@ -26426,14 +26592,14 @@ mod image_component_tests {
             style.line_height = 3.0;
             style.padding.left = w3cos_std::style::Spacing::Px(16.0);
             style.padding.right = w3cos_std::style::Spacing::Px(16.0);
-            w3cos_std::Component::row(style, vec![plain(content)])
+            w3cos_std::Component::row_shared(style, vec![plain(content)])
         };
         let mut style = plain("").style;
         style.display = Display::Block;
         style.width = w3cos_std::style::Dimension::Em(28.0);
         style.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
         style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
-        let mut line = w3cos_std::Component::row(
+        let mut line = w3cos_std::Component::row_shared(
             style,
             vec![
                 decorated("pppp pppX ppXp \u{202e} ppXp XXpp XppX "),
@@ -26859,9 +27025,9 @@ mod image_component_tests {
         let mut line = w3cos_std::Component::row(
             parent,
             vec![
-                w3cos_std::Component::text("א", empty.style.clone()),
+                w3cos_std::Component::text_shared("א", empty.style.clone()),
                 empty.clone(),
-                w3cos_std::Component::text("בג", empty.style.clone()),
+                w3cos_std::Component::text_shared("בג", empty.style.clone()),
             ],
         );
         reorder_explicit_bidi_inline_rows(&mut line);

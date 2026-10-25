@@ -11134,7 +11134,7 @@ mod scroll_physics_tests {
         card_style.display = w3cos_std::style::Display::None;
         card_style.transition = transition;
         let root = Component::column(
-            Default::default(),
+            w3cos_std::Style::default(),
             vec![
                 Component::row(compact_style, vec![]),
                 Component::column(card_style, vec![]),
@@ -11204,7 +11204,7 @@ mod scroll_physics_tests {
         let mut sticky_style = w3cos_std::Style::default();
         sticky_style.position = Position::Sticky;
         let root = Component::column(
-            Default::default(),
+            w3cos_std::Style::default(),
             vec![Component::column(
                 sticky_style,
                 vec![
@@ -11379,11 +11379,11 @@ mod scroll_physics_tests {
 
     #[test]
     fn sticky_markers_accumulate_after_crossing_scrollport_top() {
-        let mut first = Component::column(Default::default(), vec![]);
+        let mut first = Component::column(w3cos_std::Style::default(), vec![]);
         first.sticky_counter_signal = Some(7);
-        let mut second = Component::column(Default::default(), vec![]);
+        let mut second = Component::column(w3cos_std::Style::default(), vec![]);
         second.sticky_counter_signal = Some(7);
-        let root = Component::column(Default::default(), vec![first, second]);
+        let root = Component::column(w3cos_std::Style::default(), vec![first, second]);
         let flat = layout::pre_flatten(&root);
         let layout_cache = vec![
             (
