@@ -568,10 +568,11 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             } else if is_author_grid(info.style) {
                 // CSS Flexbox §4 / Grid §6.1 blockify `inline-grid` on a
                 // flex or grid item. A top-level `inline-grid` joins the
-                // grid for a definite px box whose tracks are fixed, auto,
-                // fr, minmax, or intrinsic (`is_inline_grid_line`); the
-                // other boxes stay on the marker so a reference that still
-                // falls back does not switch engines alone.
+                // grid for a definite px box, and for an auto box whose
+                // columns and rows are definite px tracks
+                // (`is_inline_grid_line`). The other boxes stay on the
+                // marker so a reference that still falls back does not
+                // switch engines alone.
                 let blockified = is_blockified_inline_grid(flat, index);
                 let allowed: &[&str] = if blockified || is_inline_grid_line(flat, index) {
                     &[
@@ -1539,7 +1540,8 @@ fn is_blockified_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
 fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
     is_inline_grid(flat[index].style)
         && !is_blockified_inline_grid(flat, index)
-        && super::grid::definite_inline_grid(flat[index].style)
+        && (super::grid::definite_inline_grid(flat[index].style)
+            || super::grid::fixed_track_inline_grid(flat, index))
 }
 
 /// Ascent of an inline-grid on a line. `NoLines` is the bottom border

@@ -683,10 +683,12 @@ fn spacing_is_px(spacing: Spacing) -> bool {
 /// definite px size and alignment is the initial value. Tracks may be
 /// fixed lengths, `auto`, `fr`, `minmax`, `fit-content`, `min-content`,
 /// or `max-content` (or there is no template). Auto-repeat and `subgrid`
-/// stay out. A flex or grid item is blockified separately. Everything
-/// else keeps the unrecognized-display marker: those boxes are the
-/// references of pages that still fall back, and laying out only the
-/// reference splits the reftest.
+/// stay out. A flex or grid item is blockified separately. An auto size
+/// whose columns and rows are both definite px tracks is
+/// `fixed_track_inline_grid` (the border box is the sum of those tracks).
+/// Everything else keeps the unrecognized-display marker: those boxes
+/// are the references of pages that still fall back, and laying out only
+/// the reference splits the reftest.
 pub(super) fn definite_inline_grid(style: &Style) -> bool {
     if style.direction == TextDirection::Rtl
         || style.float != Float::None
@@ -731,6 +733,100 @@ pub(super) fn definite_inline_grid(style: &Style) -> bool {
         return false;
     }
     axis_line(columns_spec(style), false) && axis_line(style.grid_rows(), true)
+}
+
+fn axis_is_auto_or_px(dim: Dimension) -> bool {
+    match dim {
+        Dimension::Auto => true,
+        Dimension::Px(value) if value.is_finite() && value >= 0.0 => true,
+        _ => false,
+    }
+}
+
+fn zero_box_edges(style: &Style) -> bool {
+    spacing_is_zero(style.margin.top)
+        && spacing_is_zero(style.margin.right)
+        && spacing_is_zero(style.margin.bottom)
+        && spacing_is_zero(style.margin.left)
+        && spacing_is_zero(style.padding.top)
+        && spacing_is_zero(style.padding.right)
+        && spacing_is_zero(style.padding.bottom)
+        && spacing_is_zero(style.padding.left)
+        && block::border_widths(style)
+            .iter()
+            .all(|value| value.abs() <= EPS)
+}
+
+/// Top-level `inline-grid` whose column and row templates are definite px
+/// tracks. CSS Grid sizes an automatic inline-level box to the sum of
+/// those tracks, so the border box is that sum (plus gaps) rather than
+/// the containing block. `position: relative` offsets that border box.
+/// A margin, padding, border, out-of-flow child, or flex/grid item stays
+/// on the marker: those are the references that still fall back.
+pub(super) fn fixed_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    if marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid") {
+        return false;
+    }
+    if flat[index].parent.is_some_and(|parent| {
+        let parent_style = flat[parent].style;
+        block::is_author_flex(parent_style) || block::is_author_grid(parent_style)
+    }) {
+        return false;
+    }
+    if !matches!(style.position, Position::Static | Position::Relative) {
+        return false;
+    }
+    if style.direction == TextDirection::Rtl
+        || style.float != Float::None
+        || style.clear != Clear::None
+    {
+        return false;
+    }
+    if !axis_is_auto_or_px(style.width) || !axis_is_auto_or_px(style.height) {
+        return false;
+    }
+    if !matches!(style.min_width, Dimension::Auto)
+        || !matches!(style.max_width, Dimension::Auto)
+        || !matches!(style.min_height, Dimension::Auto)
+        || !matches!(style.max_height, Dimension::Auto)
+    {
+        return false;
+    }
+    if !zero_box_edges(style) {
+        return false;
+    }
+    if is_baseline(style.align_items) || is_baseline(style.justify_items) {
+        return false;
+    }
+    if has_marker(style, "--w3cos-internal-grid-lanes")
+        || has_marker(style, "--w3cos-internal-percent-gap")
+        || has_marker(style, "--w3cos-internal-document-element")
+        || has_marker(style, "--w3cos-internal-width-keyword")
+        || has_marker(style, "--w3cos-internal-size-containment")
+        || has_marker(style, HEIGHT_KEYWORD)
+        || style.grid_auto_column_spec().is_some()
+        || style.grid_auto_row_spec().is_some()
+        || style.grid_areas().is_some()
+    {
+        return false;
+    }
+    if rendered_children(flat, index).any(|child| {
+        let child_style = flat[child].style;
+        oof::is_out_of_flow(child_style) || child_style.float != Float::None
+    }) {
+        return false;
+    }
+    let Some(columns) = columns_spec(style).and_then(|spec| parse_template(spec, false)) else {
+        return false;
+    };
+    let Some(rows) = style
+        .grid_rows()
+        .and_then(|spec| parse_template(spec, true))
+    else {
+        return false;
+    };
+    fixed_px_sum(&columns).is_some() && fixed_px_sum(&rows).is_some()
 }
 
 /// The same definite box, and not a flex or grid item. Intrinsic tracks
@@ -2786,7 +2882,7 @@ pub(super) fn layout(
     }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
-    let inner_width = metrics.content_width.max(0.0);
+    let mut inner_width = metrics.content_width.max(0.0);
     let edges_v = bt + bb + pt + pb;
     let specified_height = if let Some((_, Some(height))) = sized {
         Some(height)
@@ -2857,6 +2953,16 @@ pub(super) fn layout(
         }
     };
     let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    // An automatic inline-grid shrinks to its fixed px tracks (CSS Grid
+    // §6). Stretching it to the containing block would grow those tracks
+    // under the initial `justify-content: normal` (stretch).
+    let inline_fixed = fixed_track_inline_grid(flat, index);
+    if inline_fixed && sized.is_none() && matches!(style.width, Dimension::Auto) {
+        if let Some(sum) = fixed_px_sum(&columns_template) {
+            let gaps = column_gap * columns_template.tracks.len().saturating_sub(1) as f32;
+            inner_width = sum + gaps;
+        }
+    }
     let inner_u = units(inner_width);
     let inflow = rendered_children(flat, index)
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
@@ -2899,6 +3005,17 @@ pub(super) fn layout(
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
             oof_children.push(child);
+            continue;
+        }
+        // Whitespace-only text does not generate a grid item when
+        // white-space collapses (CSS Grid §4.1). Only the inline-grid
+        // line path skips it; an ordinary grid keeps its current items.
+        if inline_fixed
+            && matches!(
+                flat[child].kind,
+                w3cos_std::ComponentKind::Text { content } if content.chars().all(|ch| ch.is_whitespace())
+            )
+        {
             continue;
         }
         let column = resolve_axis(placement(child_style, false), &names_cols, explicit_cols)

@@ -2383,7 +2383,8 @@ fn parse_display(value: &str) -> Display {
         // reference. `inline-grid`, `run-in`, and `-webkit-box` stay
         // unrecognized flex boxes. NG blockifies `inline-grid` as a flex
         // or grid item, and also lays a definite top-level `inline-grid`
-        // out on a line. A definite `run-in` is that flex box.
+        // out on a line, including an auto-sized box whose tracks are
+        // definite px lengths. A definite `run-in` is that flex box.
         // `-webkit-box` and `-webkit-inline-box` use that flex box when
         // the flex line accepts the tree. A text item keeps the marker
         // so a line-clamp reference does not switch engines alone.

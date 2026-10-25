@@ -2650,6 +2650,146 @@ fn top_level_definite_inline_grid_shares_a_line() {
     );
 }
 
+/// An auto-sized top-level `inline-grid` with definite px tracks shrinks
+/// to those tracks. Headless Chrome, body margin 0, no inter-element
+/// whitespace: `100px / 200px` is a 100×200 border box and a stretched
+/// item fills it; `align-items: start` keeps a 20×10 item at the start;
+/// `100px 150px` with a 10px column gap is 260×40; `left: 8px; top: 4px`
+/// offsets that border box. Two empty grids after a 15px block share the
+/// bottom-margin baseline. An out-of-flow child and a margin stay on the
+/// legacy marker.
+#[test]
+fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
+    use w3cos_std::style::{AlignItems, CustomProperties, Position};
+    let mark = |mut style: Style| {
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )]));
+        style
+    };
+    let grid = |columns: &str, rows: &str, align| {
+        let mut style = mark(Style {
+            display: Display::Flex,
+            position: Position::Relative,
+            align_items: align,
+            grid_template_columns: Some(columns.to_string()),
+            ..Style::default()
+        });
+        style.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        style
+    };
+    let at = |out: &[(LayoutRect, usize)], index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    let stretched = node(
+        block(),
+        vec![node(
+            grid("100px", "200px", AlignItems::Stretch),
+            vec![node(block(), vec![])],
+        )],
+    );
+    let stretched_flat = pre_flatten(&stretched);
+    assert!(
+        block::supports_tree(&stretched_flat),
+        "{:?}",
+        block::unsupported_reasons(&stretched_flat)
+    );
+    let stretched_out = layout_tree(&stretched, &stretched_flat, 800.0, 600.0).expect("stretch");
+    // 0 root, 1 grid, 2 item.
+    assert_eq!(at(&stretched_out, 1), (0.0, 0.0, 100.0, 200.0));
+    assert_eq!(at(&stretched_out, 2), (0.0, 0.0, 100.0, 200.0));
+
+    let started = node(
+        block(),
+        vec![node(
+            grid("100px", "200px", AlignItems::FlexStart),
+            vec![node(
+                Style {
+                    width: Dimension::Px(20.0),
+                    height: Dimension::Px(10.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        )],
+    );
+    let started_flat = pre_flatten(&started);
+    assert!(
+        block::supports_tree(&started_flat),
+        "{:?}",
+        block::unsupported_reasons(&started_flat)
+    );
+    let started_out = layout_tree(&started, &started_flat, 800.0, 600.0).expect("start");
+    assert_eq!(at(&started_out, 1), (0.0, 0.0, 100.0, 200.0));
+    assert_eq!(at(&started_out, 2), (0.0, 0.0, 20.0, 10.0));
+
+    let mut gapped = grid("100px 150px", "40px", AlignItems::Stretch);
+    gapped.column_gap = Some(10.0);
+    let gap_root = node(block(), vec![node(gapped, vec![])]);
+    let gap_flat = pre_flatten(&gap_root);
+    assert!(
+        block::supports_tree(&gap_flat),
+        "{:?}",
+        block::unsupported_reasons(&gap_flat)
+    );
+    let gap_out = layout_tree(&gap_root, &gap_flat, 800.0, 600.0).expect("gap");
+    assert_eq!(at(&gap_out, 1), (0.0, 0.0, 260.0, 40.0));
+
+    let mut shifted = grid("100px", "40px", AlignItems::Stretch);
+    shifted.left = Dimension::Px(8.0);
+    shifted.top = Dimension::Px(4.0);
+    let shift_root = node(block(), vec![node(shifted, vec![])]);
+    let shift_flat = pre_flatten(&shift_root);
+    let shift_out = layout_tree(&shift_root, &shift_flat, 800.0, 600.0).expect("relative");
+    assert_eq!(at(&shift_out, 1), (8.0, 4.0, 100.0, 40.0));
+
+    let row = node(
+        block(),
+        vec![
+            node(sized(15.0), vec![]),
+            node(grid("40px", "20px", AlignItems::Stretch), vec![]),
+            node(grid("40px", "60px", AlignItems::Stretch), vec![]),
+        ],
+    );
+    let row_flat = pre_flatten(&row);
+    assert!(
+        block::supports_tree(&row_flat),
+        "{:?}",
+        block::unsupported_reasons(&row_flat)
+    );
+    let row_out = layout_tree(&row, &row_flat, 800.0, 600.0).expect("baseline");
+    assert_eq!(at(&row_out, 2), (0.0, 55.0, 40.0, 20.0));
+    assert_eq!(at(&row_out, 3), (40.0, 15.0, 40.0, 60.0));
+
+    let mut absolute_child = block();
+    absolute_child.position = Position::Absolute;
+    let oof = node(
+        block(),
+        vec![node(
+            grid("100px", "100px", AlignItems::Stretch),
+            vec![node(absolute_child, vec![])],
+        )],
+    );
+    let oof_flat = pre_flatten(&oof);
+    assert!(
+        !block::supports_tree(&oof_flat),
+        "{:?}",
+        block::unsupported_reasons(&oof_flat)
+    );
+
+    let mut margined = grid("100px", "40px", AlignItems::Stretch);
+    margined.margin = margins(10.0, 0.0, 0.0, 0.0);
+    let margin_root = node(block(), vec![node(margined, vec![])]);
+    let margin_flat = pre_flatten(&margin_root);
+    assert!(
+        !block::supports_tree(&margin_flat),
+        "{:?}",
+        block::unsupported_reasons(&margin_flat)
+    );
+}
+
 /// Non-fixed tracks on a definite top-level `inline-grid`, and baseline
 /// alignment of the line. Headless Chrome, body margin 0: a 40×20 grid and
 /// a 40×60 grid after a 15px block sit at (0,55) and (40,15) (the baseline
