@@ -3002,8 +3002,83 @@ fn replaced_content_box_matches_legacy() {
             Spacing::Px(0.0),
         )],
     );
+    // An inline-block image in a block is an atomic inline on the root
+    // line (Chrome: image 0,0 80×40). The line box height depends on the
+    // strut font, so it is checked against legacy only.
     let flat = pre_flatten(&inline_image);
-    assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = parity(&inline_image);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 80.0, 40.0));
+}
+
+/// Headless Chrome, body margin 0, a 100×50 image with display:block
+/// (Blink ComputeReplacedSizeInternal). With width and height auto the
+/// clamped width transfers to the height, then back; a min wins over a
+/// max, and em limits resolve against the font size.
+#[test]
+fn replaced_min_max_matches_chrome() {
+    use w3cos_std::style::Dimension as D;
+    let source = "w3cos-ng-replaced-min-max-100x50.png";
+    let image = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let cases = [
+        // min-width 150px beats max-width 80px.
+        (
+            Style {
+                min_width: D::Px(150.0),
+                max_width: D::Px(80.0),
+                ..Style::default()
+            },
+            (0.0, 0.0, 150.0, 75.0),
+        ),
+        // max-width 2.5em at font-size 20px.
+        (
+            Style {
+                max_width: D::Em(2.5),
+                font_size: 20.0,
+                ..Style::default()
+            },
+            (0.0, 0.0, 50.0, 25.0),
+        ),
+        // max-height 20px transfers 40px, then min-width 60px wins.
+        (
+            Style {
+                max_height: D::Px(20.0),
+                min_width: D::Px(60.0),
+                ..Style::default()
+            },
+            (0.0, 0.0, 60.0, 20.0),
+        ),
+    ];
+    for (extra, expected) in cases {
+        let root = node(
+            block(),
+            vec![Component::image(
+                source,
+                Style {
+                    display: Display::Block,
+                    ..extra
+                },
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("image");
+        assert_eq!(rect(&out, 1), expected);
+    }
+    crate::image_loader::invalidate(source);
 }
 
 /// Headless Chrome, body margin 0. A canvas is a replaced box: attributes

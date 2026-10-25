@@ -680,29 +680,22 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
     let info = &flat[index];
     let style = info.style;
     if style.box_sizing == BoxSizing::BorderBox {
-        return Some("image");
+        return Some("image:border-box");
     }
-    // min/max recompute the intrinsic ratio (CSS 2.1 10.4). That path does
-    // not match the legacy used size yet.
-    if !matches!(style.min_width, Dimension::Auto)
-        || !matches!(style.max_width, Dimension::Auto)
-        || !matches!(style.min_height, Dimension::Auto)
-        || !matches!(style.max_height, Dimension::Auto)
-    {
-        return Some("image");
-    }
+    // min/max constraints: `constrained_replaced_size` (Blink
+    // ComputeReplacedSizeInternal).
     if style.float != Float::None
         || matches!(
             style.position,
             Position::Absolute | Position::Fixed | Position::Sticky
         )
     {
-        return Some("image");
+        return Some("image:float-or-oof");
     }
     if info.parent.is_some_and(|parent| {
         is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
     }) {
-        return Some("image");
+        return Some("image:flex-grid-item");
     }
     // A block replaced box must not overlap a float in the same BFC
     // (CSS 2.1 9.5). Placement beside a float is still the legacy path.
@@ -715,18 +708,24 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
             })
         })
     {
-        return Some("image");
+        return Some("image:beside-float");
     }
     match style.display {
         Display::Block | Display::FlowRoot => {
             unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
         }
-        // An inline replaced box sits on the font strut. Legacy then runs
-        // `project_single_baseline_replaced_image` and
-        // `align_inline_block_last_line_baselines`. That line box is still
-        // taller than the NG line, so inline images stay on legacy.
-        Display::Inline | Display::InlineBlock => Some("image"),
-        _ => Some("image"),
+        // An inline replaced box in an inline formatting context is an
+        // atomic inline (CSS 2.1 10.8.1). Outside one it stays on legacy.
+        Display::Inline | Display::InlineBlock if inline::in_inline_container(flat, index) => {
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
+        Display::Inline | Display::InlineBlock => Some("image:inline"),
+        _ => Some("image:display"),
     }
 }
 
@@ -1007,10 +1006,19 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     };
     definite.width = sub(style.width, Some(space.available_inline))?;
     definite.height = sub(style.height, space.percentage_block)?;
-    definite.min_width = sub(style.min_width, Some(space.available_inline))?;
-    definite.max_width = sub(style.max_width, Some(space.available_inline))?;
-    definite.min_height = sub(style.min_height, space.percentage_block)?;
-    definite.max_height = sub(style.max_height, space.percentage_block)?;
+    // Every min/max length (em, rem, ch, %, vw, vh) resolves here.
+    let limit = |dim: Dimension, basis: Option<f32>| -> Option<Option<f32>> {
+        match dim {
+            Dimension::Auto => Some(None),
+            other => resolve_dim(other, basis, style, space).map(Some),
+        }
+    };
+    let limits = [
+        limit(style.min_width, Some(space.available_inline))?,
+        limit(style.max_width, Some(space.available_inline))?,
+        limit(style.min_height, space.percentage_block)?,
+        limit(style.max_height, space.percentage_block)?,
+    ];
     // Legacy passes the content-box available width only for a block
     // replaced element with an auto width (the SVG ratio branch).
     let containing = if style.display == Display::Block && style.width == Dimension::Auto {
@@ -1029,9 +1037,63 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     } else {
         Some(space.available_inline)
     };
-    Some(crate::layout::image_intrinsic_size(
-        src, &definite, containing,
+    if limits.iter().all(Option::is_none) {
+        return Some(crate::layout::image_intrinsic_size(
+            src, &definite, containing,
+        ));
+    }
+    Some(constrained_replaced_size(
+        src, &definite, containing, limits,
     ))
+}
+
+/// Replaced size under min/max constraints.
+///
+/// Follows Blink `ComputeReplacedSizeInternal` (kNormal) in
+/// third_party/blink/renderer/core/layout/length_utils.cc:
+/// Copyright 2016 The Chromium Authors. Use of this source code is
+/// governed by a BSD-style license (Chromium LICENSE file).
+///
+/// With an aspect ratio the auto axis is transferred from the clamped
+/// axis, then clamped on its own axis. A min always wins over a max.
+fn constrained_replaced_size(
+    src: &str,
+    definite: &Style,
+    containing: Option<f32>,
+    [min_w, max_w, min_h, max_h]: [Option<f32>; 4],
+) -> (f32, f32) {
+    let clamp = |v: f32, min: Option<f32>, max: Option<f32>| {
+        let min = min.unwrap_or(0.0).max(0.0);
+        let max = max.map_or(f32::INFINITY, |m| m.max(min));
+        v.min(max).max(min)
+    };
+    let clamp_i = |v: f32| clamp(v, min_w, max_w);
+    let clamp_b = |v: f32| clamp(v, min_h, max_h);
+    let mut auto = definite.clone();
+    auto.min_width = Dimension::Auto;
+    auto.max_width = Dimension::Auto;
+    auto.min_height = Dimension::Auto;
+    auto.max_height = Dimension::Auto;
+    let width_given = definite.width != Dimension::Auto;
+    let height_given = definite.height != Dimension::Auto;
+    // Used size before min/max, with the specified width/height applied.
+    let (w0, h0) = crate::layout::image_intrinsic_size(src, &auto, containing);
+    let ratio = crate::layout::image_intrinsic_ratio(src).filter(|r| *r > 0.0);
+    match ratio {
+        Some(ratio) if !(width_given && height_given) => {
+            if width_given {
+                let w = clamp_i(w0);
+                (w, clamp_b(layout_unit(w / ratio)))
+            } else if height_given {
+                let h = clamp_b(h0);
+                (clamp_i(layout_unit(h * ratio)), h)
+            } else {
+                let h = clamp_b(layout_unit(clamp_i(w0) / ratio));
+                (clamp_i(layout_unit(h * ratio)), h)
+            }
+        }
+        _ => (clamp_i(w0), clamp_b(h0)),
+    }
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either
