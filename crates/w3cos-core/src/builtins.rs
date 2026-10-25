@@ -753,7 +753,7 @@ pub(crate) fn native_function(
 }
 
 /// `String.prototype` methods dispatched to the primitive string methods.
-const STRING_METHODS: &[(&str, u32)] = &[
+pub(crate) const STRING_METHODS: &[(&str, u32)] = &[
     ("at", 1),
     ("charAt", 1),
     ("charCodeAt", 1),
@@ -849,6 +849,41 @@ pub(crate) fn string_wrapper(arguments: &[Value]) -> Value {
     wrapper
 }
 
+thread_local! {
+    /// The `String.prototype` builtin currently forwarding to the primitive
+    /// `call_method` dispatch (see [`take_string_dispatch`]).
+    static STRING_DISPATCH: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Marks a `String.prototype.{name}` builtin forwarding to `call_method`.
+pub(crate) struct StringDispatch(Option<&'static str>);
+
+impl StringDispatch {
+    pub(crate) fn enter(name: &'static str) -> Self {
+        StringDispatch(STRING_DISPATCH.with(|slot| slot.replace(Some(name))))
+    }
+}
+
+impl Drop for StringDispatch {
+    fn drop(&mut self) {
+        STRING_DISPATCH.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Whether `call_method(key)` on a primitive string came straight from the
+/// `String.prototype.{key}` builtin without a native implementation; the
+/// generic prototype lookup would find that builtin again and recurse.
+pub(crate) fn take_string_dispatch(key: &str) -> bool {
+    STRING_DISPATCH.with(|slot| {
+        if slot.get() == Some(key) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// The `String` constructor (one per realm, shared by AOT code and the
 /// jsdom window so `String.prototype` has a single identity).
 pub fn string_value() -> Value {
@@ -878,6 +913,7 @@ fn build_string_value() -> Value {
             } else {
                 Value::from(this.to_js_string())
             };
+            let _dispatch = StringDispatch::enter(name);
             receiver.call_method(name, arguments)
         });
         define_builtin(&prototype, name, method);

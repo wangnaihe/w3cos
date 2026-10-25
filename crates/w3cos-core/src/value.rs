@@ -3513,6 +3513,92 @@ impl Value {
                 let value = this.as_js_string().expect("string");
                 return Value::from(value.trim().to_string());
             }
+            (this, "trimStart") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                return Value::from(value.trim_start_matches(is_js_whitespace).to_string());
+            }
+            (this, "trimEnd") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                return Value::from(value.trim_end_matches(is_js_whitespace).to_string());
+            }
+            (this, "toLocaleUpperCase") if this.is_string() => {
+                return Value::from(this.as_js_string().expect("string").to_uppercase());
+            }
+            (this, "toLocaleLowerCase") if this.is_string() => {
+                return Value::from(this.as_js_string().expect("string").to_lowercase());
+            }
+            (this, "normalize") if this.is_string() => {
+                // NFC is assumed for compiled sources; other forms are
+                // validated per spec but return the string unchanged.
+                let form = match args.first() {
+                    None => "NFC".to_string(),
+                    Some(value) if value.is_undefined() => "NFC".to_string(),
+                    Some(value) => value.to_js_string(),
+                };
+                if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                    crate::throw_value(range_error(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD.",
+                    ));
+                }
+                return this.clone();
+            }
+            // Rust strings hold no lone surrogates.
+            (this, "isWellFormed") if this.is_string() => return Value::Bool(true),
+            (this, "toWellFormed") if this.is_string() => return this.clone(),
+            (this, "at") if this.is_string() => {
+                let units: Vec<u16> = this
+                    .as_js_string()
+                    .expect("string")
+                    .encode_utf16()
+                    .collect();
+                let len = units.len() as f64;
+                let relative = args.first().map(Value::to_number).unwrap_or(0.0);
+                let relative = if relative.is_nan() {
+                    0.0
+                } else {
+                    relative.trunc()
+                };
+                let index = if relative < 0.0 {
+                    len + relative
+                } else {
+                    relative
+                };
+                if index < 0.0 || index >= len {
+                    return Value::Undefined;
+                }
+                return Value::from(String::from_utf16_lossy(
+                    &units[index as usize..index as usize + 1],
+                ));
+            }
+            (this, "concat") if this.is_string() => {
+                let mut out = this.to_js_string();
+                for arg in &args {
+                    out.push_str(&arg.to_js_string());
+                }
+                return Value::from(out);
+            }
+            (this, "replaceAll") if this.is_string() => {
+                let value = this.as_js_string().expect("string");
+                let pattern = args.first().cloned().unwrap_or(Value::Undefined);
+                let replacement = args.get(1).cloned().unwrap_or(Value::Undefined);
+                if let Some((_, flags)) = crate::regexp::parts(&pattern) {
+                    if !flags.contains('g') {
+                        crate::throw_value(type_error(
+                            "replaceAll must be called with a global RegExp",
+                        ));
+                    }
+                    if let Some(result) =
+                        crate::regexp::string_replace(&value, &pattern, &replacement)
+                    {
+                        return result;
+                    }
+                }
+                return Value::from(string_replace_all(
+                    &value,
+                    &pattern.to_js_string(),
+                    &replacement,
+                ));
+            }
             (this, "split") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
                 let Some(separator) = args.first() else {
@@ -3699,6 +3785,13 @@ impl Value {
             if let Some(result) = crate::number_proto::boolean_method(flag, key) {
                 return result;
             }
+        }
+        if self.is_string() && crate::builtins::take_string_dispatch(key) {
+            // A `String.prototype` builtin forwarded here and no native
+            // implementation exists: looking it up again would recurse.
+            crate::throw_value(type_error(&format!(
+                "String.prototype.{key} is not supported"
+            )));
         }
         self.get_property(key).call(self.clone(), args)
     }
@@ -4927,6 +5020,81 @@ pub fn catch_js_result<T, F: FnOnce() -> Result<T, Value>>(f: F) -> Result<T, Va
     }
 }
 
+/// ECMAScript WhiteSpace and LineTerminator code points (String.prototype.trim*).
+fn is_js_whitespace(c: char) -> bool {
+    c.is_whitespace() || c == '\u{FEFF}'
+}
+
+/// `String.prototype.replaceAll` with a string search value
+/// (StringIndexOf over UTF-16 positions, GetSubstitution for `$` patterns).
+fn string_replace_all(input: &str, search: &str, replacement: &Value) -> String {
+    let mut positions = Vec::new();
+    if search.is_empty() {
+        positions.extend(input.char_indices().map(|(byte, _)| byte));
+        positions.push(input.len());
+    } else {
+        let mut from = 0;
+        while let Some(found) = input[from..].find(search) {
+            positions.push(from + found);
+            from += found + search.len();
+        }
+    }
+    if positions.is_empty() {
+        return input.to_string();
+    }
+    let template = (!replacement.is_callable()).then(|| replacement.to_js_string());
+    let mut out = String::with_capacity(input.len());
+    let mut end = 0;
+    for byte in positions {
+        out.push_str(&input[end..byte]);
+        let matched_end = byte + search.len();
+        match &template {
+            None => {
+                let result = replacement.call(
+                    Value::Undefined,
+                    vec![
+                        Value::from(search),
+                        Value::Number(input[..byte].encode_utf16().count() as f64),
+                        Value::from(input),
+                    ],
+                );
+                out.push_str(&result.to_js_string());
+            }
+            Some(template) => {
+                let mut chars = template.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c != '$' {
+                        out.push(c);
+                        continue;
+                    }
+                    match chars.peek() {
+                        Some('$') => {
+                            out.push('$');
+                            chars.next();
+                        }
+                        Some('&') => {
+                            out.push_str(search);
+                            chars.next();
+                        }
+                        Some('`') => {
+                            out.push_str(&input[..byte]);
+                            chars.next();
+                        }
+                        Some('\'') => {
+                            out.push_str(&input[matched_end..]);
+                            chars.next();
+                        }
+                        _ => out.push('$'),
+                    }
+                }
+            }
+        }
+        end = matched_end;
+    }
+    out.push_str(&input[end..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5437,6 +5605,74 @@ mod tests {
             crate::builtins::object_keys(&exports).to_js_string(),
             "plain,g"
         );
+    }
+
+    #[test]
+    fn every_string_prototype_builtin_dispatches_without_recursion() {
+        let proto = crate::builtins::string_value().get_property("prototype");
+        let receiver = Value::from(" aXa ");
+        for &(name, _) in crate::builtins::STRING_METHODS {
+            let method = proto.get_property(name);
+            assert!(method.is_callable(), "{name}");
+            let args = match name {
+                "replace" | "replaceAll" => vec![Value::from("a"), Value::from("b")],
+                "match" | "matchAll" | "search" | "split" => vec![Value::from("a")],
+                _ => vec![Value::from("a")],
+            };
+            // Must return or throw a JS error, never overflow the stack.
+            let _ = catch_js(|| method.call(receiver.clone(), args));
+        }
+        let call = |name: &str, args: Vec<Value>| {
+            proto
+                .get_property(name)
+                .call(Value::from(" aXa "), args)
+                .to_js_string()
+        };
+        assert_eq!(call("trimStart", vec![]), "aXa ");
+        assert_eq!(call("trimEnd", vec![]), " aXa");
+        assert_eq!(call("toLocaleUpperCase", vec![]), " AXA ");
+        assert_eq!(call("toLocaleLowerCase", vec![]), " axa ");
+        assert_eq!(call("normalize", vec![]), " aXa ");
+        assert_eq!(call("isWellFormed", vec![]), "true");
+        assert_eq!(call("toWellFormed", vec![]), " aXa ");
+        assert_eq!(call("at", vec![Value::Number(-2.0)]), "a");
+        assert_eq!(call("at", vec![Value::Number(9.0)]), "undefined");
+        assert_eq!(
+            call("concat", vec![Value::from(1.0), Value::from("!")]),
+            " aXa 1!"
+        );
+        assert_eq!(
+            call("replaceAll", vec![Value::from("a"), Value::from("[$&]")]),
+            " [a]X[a] "
+        );
+        assert_eq!(
+            call("replaceAll", vec![Value::from(""), Value::from("-")]),
+            "- -a-X-a- -"
+        );
+        let thrown = catch_js(|| {
+            proto
+                .get_property("normalize")
+                .call(Value::from("x"), vec![Value::from("bogus")])
+        });
+        assert!(thrown.is_err());
+    }
+
+    #[test]
+    fn string_dispatch_guard_throws_instead_of_recursing() {
+        let proto = crate::builtins::string_value().get_property("prototype");
+        // Mimic a String.prototype builtin without a native arm: it forwards
+        // to call_method, whose generic lookup finds the builtin again.
+        proto.set_property(
+            "noNativeArm",
+            Value::function(|this, args| {
+                let _dispatch = crate::builtins::StringDispatch::enter("noNativeArm");
+                this.call_method("noNativeArm", args)
+            }),
+        );
+        let thrown = catch_js(|| Value::from("abc").call_method("noNativeArm", vec![]));
+        proto.delete_property("noNativeArm");
+        let error = thrown.expect_err("guard must throw");
+        assert!(error.to_js_string().contains("not supported"), "{error:?}");
     }
 
     #[test]
