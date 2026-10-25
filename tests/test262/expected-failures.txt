@@ -131,7 +131,6 @@ test/built-ins/Array/prototype/every/15.4.4.16-4-9.js
 test/built-ins/Array/prototype/every/15.4.4.16-5-1-s.js
 test/built-ins/Array/prototype/every/15.4.4.16-5-1.js
 test/built-ins/Array/prototype/every/15.4.4.16-5-17.js
-test/built-ins/Array/prototype/every/15.4.4.16-5-24.js
 test/built-ins/Array/prototype/every/15.4.4.16-5-3.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-1.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-2.js
@@ -165,7 +164,6 @@ test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-10.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-11.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-12.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-13.js
-test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-18.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-19.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-23.js
 test/built-ins/Array/prototype/every/15.4.4.16-7-c-ii-3.js
@@ -226,7 +224,6 @@ test/built-ins/Array/prototype/filter/15.4.4.20-4-9.js
 test/built-ins/Array/prototype/filter/15.4.4.20-5-1-s.js
 test/built-ins/Array/prototype/filter/15.4.4.20-5-1.js
 test/built-ins/Array/prototype/filter/15.4.4.20-5-17.js
-test/built-ins/Array/prototype/filter/15.4.4.20-5-24.js
 test/built-ins/Array/prototype/filter/15.4.4.20-5-28.js
 test/built-ins/Array/prototype/filter/15.4.4.20-5-3.js
 test/built-ins/Array/prototype/filter/15.4.4.20-5-30.js
@@ -262,7 +259,6 @@ test/built-ins/Array/prototype/filter/15.4.4.20-9-c-i-22.js
 test/built-ins/Array/prototype/filter/15.4.4.20-9-c-i-28.js
 test/built-ins/Array/prototype/filter/15.4.4.20-9-c-i-31.js
 test/built-ins/Array/prototype/filter/15.4.4.20-9-c-i-8.js
-test/built-ins/Array/prototype/filter/15.4.4.20-9-c-ii-18.js
 test/built-ins/Array/prototype/filter/15.4.4.20-9-c-ii-4.js
 test/built-ins/Array/prototype/filter/15.4.4.20-9-c-ii-5.js
 test/built-ins/Array/prototype/filter/15.4.4.20-9-c-ii-7.js
@@ -352,7 +348,6 @@ test/built-ins/Array/prototype/forEach/15.4.4.18-4-9.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-5-1-s.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-5-1.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-5-17.js
-test/built-ins/Array/prototype/forEach/15.4.4.18-5-24.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-5-25.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-5-3.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-1.js
@@ -383,7 +378,6 @@ test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-22.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-28.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-31.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-i-8.js
-test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-ii-18.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-ii-4.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-ii-8.js
 test/built-ins/Array/prototype/forEach/15.4.4.18-7-c-ii-9.js
@@ -533,7 +527,6 @@ test/built-ins/Array/prototype/map/15.4.4.19-4-9.js
 test/built-ins/Array/prototype/map/15.4.4.19-5-1-s.js
 test/built-ins/Array/prototype/map/15.4.4.19-5-1.js
 test/built-ins/Array/prototype/map/15.4.4.19-5-17.js
-test/built-ins/Array/prototype/map/15.4.4.19-5-24.js
 test/built-ins/Array/prototype/map/15.4.4.19-5-3.js
 test/built-ins/Array/prototype/map/15.4.4.19-6-2.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-2.js
@@ -560,7 +553,6 @@ test/built-ins/Array/prototype/map/15.4.4.19-8-c-i-22.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-c-i-28.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-c-i-31.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-c-i-8.js
-test/built-ins/Array/prototype/map/15.4.4.19-8-c-ii-18.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-c-ii-19.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-c-ii-4.js
 test/built-ins/Array/prototype/map/15.4.4.19-8-c-iii-1.js
@@ -831,7 +823,6 @@ test/built-ins/Array/prototype/some/15.4.4.17-4-9.js
 test/built-ins/Array/prototype/some/15.4.4.17-5-1-s.js
 test/built-ins/Array/prototype/some/15.4.4.17-5-1.js
 test/built-ins/Array/prototype/some/15.4.4.17-5-17.js
-test/built-ins/Array/prototype/some/15.4.4.17-5-24.js
 test/built-ins/Array/prototype/some/15.4.4.17-5-25.js
 test/built-ins/Array/prototype/some/15.4.4.17-5-3.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-2.js
@@ -856,7 +847,6 @@ test/built-ins/Array/prototype/some/15.4.4.17-7-c-i-22.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-c-i-28.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-c-i-31.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-c-i-8.js
-test/built-ins/Array/prototype/some/15.4.4.17-7-c-ii-18.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-c-ii-19.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-c-ii-23.js
 test/built-ins/Array/prototype/some/15.4.4.17-7-c-ii-3.js
@@ -2816,7 +2806,6 @@ test/built-ins/String/prototype/endsWith/return-abrupt-from-searchstring-regexp-
 test/built-ins/String/prototype/endsWith/searchstring-found-with-position.js
 test/built-ins/String/prototype/endsWith/searchstring-is-regexp-throws.js
 test/built-ins/String/prototype/endsWith/searchstring-not-found-with-position.js
-test/built-ins/String/prototype/includes/String.prototype.includes_lengthProp.js
 test/built-ins/String/prototype/includes/length.js
 test/built-ins/String/prototype/includes/name.js
 test/built-ins/String/prototype/includes/not-a-constructor.js
@@ -3037,7 +3026,6 @@ test/built-ins/String/prototype/toLowerCase/S15.5.4.16_A1_T9.js
 test/built-ins/String/prototype/toLowerCase/name.js
 test/built-ins/String/prototype/toLowerCase/not-a-constructor.js
 test/built-ins/String/prototype/toLowerCase/this-value-tostring-throws-toprimitive.js
-test/built-ins/String/prototype/trim/15.5.4.20-1-8.js
 test/built-ins/String/prototype/trim/15.5.4.20-2-13.js
 test/built-ins/String/prototype/trim/15.5.4.20-2-14.js
 test/built-ins/String/prototype/trim/15.5.4.20-2-16.js
