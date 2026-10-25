@@ -611,7 +611,7 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
-        component.style = style.clone();
+        component.style = style.clone().into();
         return true;
     }
     component

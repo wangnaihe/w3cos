@@ -752,7 +752,7 @@ fn anchor_stand_in(source: &Component) -> Component {
             style.font_size = source.style.font_size;
             Component {
                 kind: ComponentKind::Box,
-                style,
+                style: style.into(),
                 children: Vec::new(),
                 on_click: source.on_click.clone(),
                 sticky_counter_signal: None,

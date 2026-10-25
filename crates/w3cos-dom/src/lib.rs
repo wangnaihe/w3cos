@@ -1667,15 +1667,11 @@ mod tests {
         doc.body().append_child(&mut doc, item);
 
         let tree = doc.to_component_tree();
-        assert!(matches!(tree.children[0].children.as_slice(),
-            [w3cos_std::Component {
-                kind: w3cos_std::ComponentKind::Box,
-                style: w3cos_std::style::Style {
-                    display: w3cos_std::style::Display::Inline, ..
-                },
-                children,
-                ..
-            }] if children.is_empty()));
+        assert_eq!(tree.children[0].children.len(), 1);
+        let generated = &tree.children[0].children[0];
+        assert!(matches!(generated.kind, w3cos_std::ComponentKind::Box));
+        assert_eq!(generated.style.display, w3cos_std::style::Display::Inline);
+        assert!(generated.children.is_empty());
         crate::stylesheet::clear_rules();
     }
 
@@ -3833,7 +3829,7 @@ mod tests {
         let entries_after_first = doc.matched_properties_cache_entries();
         let second_style = doc.computed_style_shared(second.id, Some(&parent_style));
         let entries_after_second = doc.matched_properties_cache_entries();
-        assert!(std::rc::Rc::ptr_eq(&first_style, &second_style));
+        assert!(std::sync::Arc::ptr_eq(&first_style, &second_style));
         assert_eq!(entries_after_first, entries_before + 1);
         assert_eq!(entries_after_second, entries_after_first);
 
@@ -3846,7 +3842,7 @@ mod tests {
             cell.set_attribute(&mut doc, "data-index", &index.to_string());
             parent.append_child(&mut doc, cell);
             let style = doc.computed_style_shared(cell.id, Some(&parent_style));
-            assert!(std::rc::Rc::ptr_eq(&first_style, &style));
+            assert!(std::sync::Arc::ptr_eq(&first_style, &style));
         }
         assert_eq!(doc.matched_properties_cache_entries(), entries_after_first);
 
@@ -3855,12 +3851,50 @@ mod tests {
         second.set_attribute(&mut doc, "data-state", "hot");
         let hot_style = doc.computed_style_shared(second.id, Some(&parent_style));
         assert_eq!(hot_style.height, w3cos_std::style::Dimension::Px(9.0));
-        assert!(!std::rc::Rc::ptr_eq(&first_style, &hot_style));
+        assert!(!std::sync::Arc::ptr_eq(&first_style, &hot_style));
 
         second.remove_attribute(&mut doc, "data-state");
         let restored_style = doc.computed_style_shared(second.id, Some(&parent_style));
         assert_eq!(restored_style.height, w3cos_std::style::Dimension::Px(4.0));
-        assert!(std::rc::Rc::ptr_eq(&first_style, &restored_style));
+        assert!(std::sync::Arc::ptr_eq(&first_style, &restored_style));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn repeated_component_trees_release_shared_style_references() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".cell", &[("height", "4px")]);
+
+        let mut doc = Document::new();
+        let parent = doc.create_element("div");
+        doc.body().append_child(&mut doc, parent);
+        let parent_style = doc.computed_style_shared(parent.id, None);
+        let mut first = None;
+        for index in 0..256 {
+            let cell = doc.create_element("div");
+            cell.set_class_name(&mut doc, "cell");
+            cell.set_attribute(&mut doc, "data-index", &index.to_string());
+            parent.append_child(&mut doc, cell);
+            let style = doc.computed_style_shared(cell.id, Some(&parent_style));
+            if let Some(first) = &first {
+                assert!(std::sync::Arc::ptr_eq(first, &style));
+            } else {
+                first = Some(style);
+            }
+        }
+        let first = first.expect("fixture has cells");
+
+        // Warm every document-side cache before choosing the reference-count
+        // baseline. Component trees are then the only temporary owners added
+        // by each iteration.
+        drop(doc.to_component_tree());
+        let retained = std::sync::Arc::strong_count(&first);
+        for _ in 0..64 {
+            let tree = doc.to_component_tree();
+            assert!(std::sync::Arc::strong_count(&first) > retained);
+            drop(tree);
+            assert_eq!(std::sync::Arc::strong_count(&first), retained);
+        }
         crate::stylesheet::clear_rules();
     }
 
@@ -3902,7 +3936,7 @@ mod tests {
         assert_eq!(first_style.height, w3cos_std::style::Dimension::Px(4.0));
         assert_eq!(second_style.height, w3cos_std::style::Dimension::Px(4.0));
         // Any namespaced attribute conservatively disables this cache path.
-        assert!(!std::rc::Rc::ptr_eq(&first_style, &second_style));
+        assert!(!std::sync::Arc::ptr_eq(&first_style, &second_style));
         crate::stylesheet::clear_rules();
     }
 
@@ -4027,8 +4061,8 @@ mod tests {
             .collect::<Vec<_>>();
         // Equal parent styles share one text style (Blink LayoutText reuses
         // its parent's ComputedStyle); a different parent does not.
-        assert!(std::rc::Rc::ptr_eq(&styles[0], &styles[1]));
-        assert!(!std::rc::Rc::ptr_eq(&styles[0], &styles[2]));
+        assert!(std::sync::Arc::ptr_eq(&styles[0], &styles[1]));
+        assert!(!std::sync::Arc::ptr_eq(&styles[0], &styles[2]));
         assert_eq!(styles[0].color, w3cos_std::Color::from_hex("#123456"));
         assert_eq!(styles[2].color, w3cos_std::Color::from_hex("#654321"));
         crate::stylesheet::clear_rules();

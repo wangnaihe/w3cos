@@ -10374,13 +10374,16 @@ fn project_simple_float_margin_boxes(
                                 viewport_h,
                             )
                         };
-                        for padding in [
-                            &mut constrained.style.padding.left,
-                            &mut constrained.style.padding.right,
-                            &mut constrained.style.padding.top,
-                            &mut constrained.style.padding.bottom,
-                        ] {
-                            *padding = w3cos_std::style::Spacing::Px(spacing(*padding));
+                        {
+                            let style = &mut *constrained.style;
+                            for padding in [
+                                &mut style.padding.left,
+                                &mut style.padding.right,
+                                &mut style.padding.top,
+                                &mut style.padding.bottom,
+                            ] {
+                                *padding = w3cos_std::style::Spacing::Px(spacing(*padding));
+                            }
                         }
                         let horizontal_inner = spacing(child.style.padding.left)
                             + spacing(child.style.padding.right)
@@ -10399,20 +10402,20 @@ fn project_simple_float_margin_boxes(
                         } else {
                             (available - horizontal_inner).max(0.0)
                         });
-                        for dimension in [
-                            &mut constrained.style.min_width,
-                            &mut constrained.style.max_width,
-                        ] {
-                            if matches!(*dimension, WDim::Percent(_)) {
-                                *dimension = dimension
-                                    .resolve(
-                                        containing.width,
-                                        ROOT_FONT_SIZE,
-                                        child.style.font_size,
-                                        viewport_w,
-                                        viewport_h,
-                                    )
-                                    .map_or(WDim::Auto, WDim::Px);
+                        {
+                            let style = &mut *constrained.style;
+                            for dimension in [&mut style.min_width, &mut style.max_width] {
+                                if matches!(*dimension, WDim::Percent(_)) {
+                                    *dimension = dimension
+                                        .resolve(
+                                            containing.width,
+                                            ROOT_FONT_SIZE,
+                                            child.style.font_size,
+                                            viewport_w,
+                                            viewport_h,
+                                        )
+                                        .map_or(WDim::Auto, WDim::Px);
+                                }
                             }
                         }
                         if matches!(child.style.height, WDim::Percent(_)) {
@@ -17300,7 +17303,7 @@ fn project_forced_break_lines_with_shared_tree(
         component: &mut Component,
         index: &mut usize,
         constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
-        saved: &mut Vec<(usize, w3cos_std::style::Style)>,
+        saved: &mut Vec<(usize, w3cos_std::component::ComponentStyle)>,
     ) {
         let own_index = *index;
         *index += 1;
@@ -17331,7 +17334,9 @@ fn project_forced_break_lines_with_shared_tree(
     fn restore(
         component: &mut Component,
         index: &mut usize,
-        saved: &mut std::iter::Peekable<std::vec::IntoIter<(usize, w3cos_std::style::Style)>>,
+        saved: &mut std::iter::Peekable<
+            std::vec::IntoIter<(usize, w3cos_std::component::ComponentStyle)>,
+        >,
     ) {
         if saved.peek().is_none() {
             return;
@@ -20888,7 +20893,7 @@ fn quote_word_fragment_advances(
         }
         ranges.push((start..flattened.len(), is_word));
     }
-    let virtual_line = Component::row(component.style.clone(), flattened);
+    let virtual_line = Component::row_shared(component.style.clone(), flattened);
     let mut advances = inline_fragment_shaped_advances_for_width(&virtual_line, available_width);
     // A generated source ends at a LayoutUnit boundary even when its last
     // word shares a no-break wrapper with a different quote source. Retain
@@ -34976,7 +34981,7 @@ mod tests {
             let own = *index;
             *index += 1;
             if let ComponentKind::Text { content } = &component.kind {
-                out.push((own, content.clone(), component.style.clone()));
+                out.push((own, content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 text_nodes(child, index, out);
