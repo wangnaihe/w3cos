@@ -1204,6 +1204,166 @@ class Screen extends EventEmitter {
 
 const screen = new Screen();
 
+// --- powerMonitor / powerSaveBlocker / systemPreferences ----------------------------
+//
+// No OS power or preference events are delivered yet; the objects report a
+// steady, mains-powered, active machine so Code-OSS main can subscribe.
+
+class PowerMonitor extends EventEmitter {
+  get onBatteryPower() { return false; }
+  isOnBatteryPower() { return false; }
+  getSystemIdleState(idleThreshold) { return 'active'; }
+  getSystemIdleTime() { return 0; }
+  getCurrentThermalState() { return 'unknown'; }
+}
+const powerMonitor = new PowerMonitor();
+
+const powerSaveBlockers = new Set();
+let nextPowerSaveBlockerId = 0;
+const powerSaveBlocker = {
+  start(type) {
+    if (type !== 'prevent-app-suspension' && type !== 'prevent-display-sleep') {
+      throw new TypeError('Invalid power save blocker type: ' + type);
+    }
+    const id = nextPowerSaveBlockerId++;
+    powerSaveBlockers.add(id);
+    return id;
+  },
+  stop(id) { return powerSaveBlockers.delete(id); },
+  isStarted(id) { return powerSaveBlockers.has(id); },
+};
+
+class SystemPreferences extends EventEmitter {
+  getAccentColor() { return '0078d7ff'; }
+  getColor(color) { return '#000000'; }
+  getAnimationSettings() { return { shouldRenderRichAnimations: true, scrollAnimationsEnabledBySystem: true, prefersReducedMotion: false }; }
+  getMediaAccessStatus(mediaType) { return 'granted'; }
+  askForMediaAccess(mediaType) { return Promise.resolve(true); }
+  getUserDefault() { return undefined; }
+  isAeroGlassEnabled() { return false; }
+  canPromptTouchID() { return false; }
+}
+const systemPreferences = new SystemPreferences();
+
+// --- globalShortcut ---------------------------------------------------------------------
+//
+// Accelerators are tracked but never fire: there is no OS-wide hook.
+
+const globalShortcuts = new Map();
+const globalShortcut = {
+  register(accelerator, callback) {
+    if (globalShortcuts.has(accelerator)) return false;
+    globalShortcuts.set(accelerator, callback);
+    return true;
+  },
+  registerAll(accelerators, callback) { for (const a of accelerators) globalShortcut.register(a, callback); },
+  isRegistered(accelerator) { return globalShortcuts.has(accelerator); },
+  unregister(accelerator) { globalShortcuts.delete(accelerator); },
+  unregisterAll() { globalShortcuts.clear(); },
+};
+
+// --- clipboard ----------------------------------------------------------------------------
+//
+// Process-local store (main and renderer share the process); not yet the OS
+// clipboard.
+
+const clipboardData = new Map();
+function clipboardKey(type) { return type === 'selection' ? 'selection' : 'clipboard'; }
+function clipboardSlot(type) {
+  const key = clipboardKey(type);
+  if (!clipboardData.has(key)) clipboardData.set(key, {});
+  return clipboardData.get(key);
+}
+const clipboard = {
+  readText(type) { return clipboardSlot(type).text || ''; },
+  writeText(text, type) { clipboardData.set(clipboardKey(type), { text: String(text) }); },
+  readHTML(type) { return clipboardSlot(type).html || ''; },
+  writeHTML(markup, type) { clipboardData.set(clipboardKey(type), { html: String(markup) }); },
+  readRTF(type) { return clipboardSlot(type).rtf || ''; },
+  writeRTF(text, type) { clipboardData.set(clipboardKey(type), { rtf: String(text) }); },
+  readBookmark() { return { title: '', url: '' }; },
+  readFindText() { return clipboardSlot('find').find || ''; },
+  writeFindText(text) { clipboardSlot('find').find = String(text); },
+  readImage() { return nativeImage.createEmpty(); },
+  writeImage() {},
+  readBuffer(format) { return Buffer.from(clipboardSlot().buffers?.[format] || []); },
+  writeBuffer(format, buffer) { const slot = clipboardSlot(); slot.buffers = { ...(slot.buffers || {}), [format]: Buffer.from(buffer) }; },
+  write(data, type) {
+    const slot = {};
+    if (data.text !== undefined) slot.text = String(data.text);
+    if (data.html !== undefined) slot.html = String(data.html);
+    if (data.rtf !== undefined) slot.rtf = String(data.rtf);
+    clipboardData.set(clipboardKey(type), slot);
+  },
+  availableFormats(type) {
+    const slot = clipboardSlot(type);
+    const formats = [];
+    if (slot.text !== undefined) formats.push('text/plain');
+    if (slot.html !== undefined) formats.push('text/html');
+    if (slot.rtf !== undefined) formats.push('text/rtf');
+    return formats;
+  },
+  has(format, type) { return clipboard.availableFormats(type).indexOf(format) >= 0; },
+  clear(type) { clipboardData.delete(clipboardKey(type)); },
+};
+
+// --- nativeImage ------------------------------------------------------------------------
+//
+// Images keep their encoded bytes; decoding and resizing are not provided.
+
+class NativeImage {
+  constructor(buffer) { this._buffer = buffer ? Buffer.from(buffer) : Buffer.alloc(0); }
+  isEmpty() { return this._buffer.length === 0; }
+  getSize() { return { width: 0, height: 0 }; }
+  toPNG() { return Buffer.from(this._buffer); }
+  toJPEG() { return Buffer.from(this._buffer); }
+  toBitmap() { return Buffer.alloc(0); }
+  getBitmap() { return Buffer.alloc(0); }
+  toDataURL() { return 'data:image/png;base64,' + this._buffer.toString('base64'); }
+  resize() { return this; }
+  crop() { return this; }
+  setTemplateImage() {}
+  isTemplateImage() { return false; }
+  getAspectRatio() { return 1; }
+  addRepresentation() {}
+}
+const nativeImage = {
+  createEmpty() { return new NativeImage(); },
+  createFromBuffer(buffer) { return new NativeImage(buffer); },
+  createFromPath(file) {
+    try { return new NativeImage(require('fs').readFileSync(String(file))); } catch (e) { return new NativeImage(); }
+  },
+  createFromDataURL(url) {
+    const match = /^data:[^;,]*(;base64)?,(.*)$/.exec(String(url));
+    if (!match) return new NativeImage();
+    return new NativeImage(match[1] ? Buffer.from(match[2], 'base64') : Buffer.from(decodeURIComponent(match[2])));
+  },
+  createFromNamedImage() { return new NativeImage(); },
+};
+
+// --- Notification / contentTracing / desktopCapturer ----------------------------------
+
+class Notification extends EventEmitter {
+  static isSupported() { return false; }
+  constructor(options) {
+    super();
+    Object.assign(this, { title: '', body: '', silent: false }, options || {});
+  }
+  show() {}
+  close() { this.emit('close', { sender: this }); }
+}
+
+const contentTracing = {
+  getCategories() { return Promise.resolve([]); },
+  startRecording() { return Promise.resolve(); },
+  stopRecording(resultFilePath) { return Promise.resolve(resultFilePath || ''); },
+  getTraceBufferUsage() { return Promise.resolve({ value: 0, percentage: 0 }); },
+};
+
+const desktopCapturer = {
+  getSources() { return Promise.resolve([]); },
+};
+
 // --- safeStorage ------------------------------------------------------------------
 //
 // Sealed with the runtime's local keyring (AES-256-GCM, see
@@ -1280,4 +1440,13 @@ module.exports = {
   MessageChannelMain,
   MessagePortMain,
   utilityProcess,
+  powerMonitor,
+  powerSaveBlocker,
+  systemPreferences,
+  globalShortcut,
+  clipboard,
+  nativeImage,
+  Notification,
+  contentTracing,
+  desktopCapturer,
 };

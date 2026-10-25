@@ -435,3 +435,68 @@ fn electron_web_frame_web_utils_and_file_protocol_handle() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Code-OSS main imports these modules at startup; on Linux they only need
+/// to exist and answer with Electron's shapes.
+const MAIN_SERVICES: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-main-services", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, powerMonitor, powerSaveBlocker, systemPreferences, globalShortcut, clipboard, nativeImage, Notification, contentTracing, desktopCapturer } = require('electron')
+app.whenReady().then(async () => {
+  let resumed = 0
+  powerMonitor.on('resume', () => resumed++)
+  powerMonitor.emit('resume')
+  console.log('power', resumed, powerMonitor.isOnBatteryPower(), powerMonitor.getSystemIdleState(60), powerMonitor.getSystemIdleTime())
+  const id = powerSaveBlocker.start('prevent-app-suspension')
+  const started = powerSaveBlocker.isStarted(id)
+  powerSaveBlocker.stop(id)
+  console.log('blocker', typeof id, started, powerSaveBlocker.isStarted(id))
+  console.log('prefs', typeof systemPreferences.on, typeof systemPreferences.getAccentColor())
+  const first = globalShortcut.register('CommandOrControl+X', () => {})
+  const again = globalShortcut.register('CommandOrControl+X', () => {})
+  const registered = globalShortcut.isRegistered('CommandOrControl+X')
+  globalShortcut.unregisterAll()
+  console.log('shortcut', first, again, registered, globalShortcut.isRegistered('CommandOrControl+X'))
+  clipboard.writeText('hello')
+  const text = clipboard.readText()
+  clipboard.write({ text: 'a', html: '<b>a</b>' })
+  console.log('clipboard', text, clipboard.readHTML(), clipboard.availableFormats().join(','), clipboard.readText('selection') === '')
+  const image = nativeImage.createFromDataURL('data:image/png;base64,iVBORw0KGgo=')
+  console.log('image', nativeImage.createEmpty().isEmpty(), image.isEmpty(), image.toPNG().length, image.toDataURL())
+  console.log('notification', Notification.isSupported(), new Notification({ title: 't' }).title)
+  console.log('tracing', JSON.stringify(await contentTracing.getCategories()), JSON.stringify(await desktopCapturer.getSources({ types: ['screen'] })))
+  app.quit()
+})
+"#,
+    ),
+];
+
+#[test]
+fn electron_main_process_service_modules() {
+    let root = write_fixture("w3cos_electron_main_services", MAIN_SERVICES);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_main_services",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        [
+            "power 1 false active 0",
+            "blocker number true false",
+            "prefs function string",
+            "shortcut true false true false",
+            "clipboard hello <b>a</b> text/plain,text/html true",
+            "image true false 8 data:image/png;base64,iVBORw0KGgo=",
+            "notification false t",
+            "tracing [] []",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
