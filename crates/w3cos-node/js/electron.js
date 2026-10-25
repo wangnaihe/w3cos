@@ -448,6 +448,14 @@ class BrowserWindow extends EventEmitter {
   getContentSize() { return this.getSize(); }
   setContentSize(width, height) { this.setSize(width, height); }
   getPosition() { return [this._bounds.x, this._bounds.y]; }
+  // Electron: the platform window handle as a Buffer (HWND / NSView* / XID);
+  // w3cos has no native handle, so expose the window id in a pointer-sized buffer.
+  getNativeWindowHandle() {
+    const handle = Buffer.alloc(8);
+    handle.writeUInt32LE(this.id, 0);
+    return handle;
+  }
+  getMediaSourceId() { return 'window:' + this.id + ':0'; }
   setPosition(x, y) { this._bounds.x = x; this._bounds.y = y; this.emit('move'); }
   center() {}
   setMinimumSize() {}

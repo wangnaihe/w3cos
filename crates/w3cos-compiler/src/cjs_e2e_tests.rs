@@ -588,3 +588,39 @@ console.log(S.name, N.name, Object.keys(A).length, Object.keys(Plain).length)
         ]
     );
 }
+
+#[test]
+/// A primitive string inherits `String.prototype` methods by value, so
+/// `s.startsWith` is a function and `s?.startsWith(x)` calls it (Code-OSS
+/// `validatedIpcMain` checks `channel?.startsWith("vscode:")`).
+fn string_methods_read_through_string_prototype() {
+    let root = write_fixture(
+        "w3cos_string_proto_read",
+        &[
+            ("package.json", r#"{"name":"sp","type":"module"}"#),
+            (
+                "main.mjs",
+                r#"const c = "vscode:x";
+const f = c.startsWith; console.log("1", typeof f);
+console.log("2", c?.startsWith("vscode:"), c.startsWith("vscode:"));
+console.log("3", typeof c?.startsWith, c?.length);
+const o = { m() { return 7; } }; console.log("4", o?.m());
+const n = 5; console.log("5", n?.toFixed(1));
+function g(ch) { return ch?.startsWith("vs"); } console.log("6", g("vsx"));
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_string_proto_read");
+    assert_eq!(
+        lines,
+        vec![
+            "1 function",
+            "2 true true",
+            "3 function 8",
+            "4 7",
+            "5 5.0",
+            "6 true",
+        ]
+    );
+}
