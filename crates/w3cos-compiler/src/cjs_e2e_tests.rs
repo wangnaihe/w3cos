@@ -488,3 +488,103 @@ fn real_world_commonjs_packages_match_node() {
     }
     assert!(failures.is_empty(), "real packages failing: {failures:?}");
 }
+
+/// Class elements are non-enumerable: Code-OSS's `ProxyChannel.fromService`
+/// walks a service with `for-in` and must not see prototype methods such as
+/// `onDynamicBrowserViewEvent` (Node 20 output).
+#[test]
+fn class_methods_accessors_and_constructor_are_not_enumerable() {
+    let root = write_fixture(
+        "w3cos_class_method_enumerability",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class Base { baseMethod() {} get g() { return 1 } static s() {} }
+class Svc extends Base { constructor() { super(); this.own = 1; this.onDidX = 2 } onDynamicFoo(a) { return this.own } }
+const keys = []; for (const k in new Svc()) keys.push(k)
+console.log(keys.join(','))
+console.log(JSON.stringify(Object.getOwnPropertyDescriptor(Svc.prototype, 'onDynamicFoo')))
+console.log(Object.keys(Svc.prototype).join(','), Object.keys(Svc).join(','))
+const o = { m() {}, get a() { return 1 } }; const ok = []; for (const k in o) ok.push(k); console.log(ok.join(','))
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_class_method_enumerability",
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "own,onDidX",
+            "{\"configurable\":true,\"enumerable\":false,\"writable\":true}",
+            " ",
+            "m,a",
+        ]
+    );
+}
+
+/// `super(message)` from a class extending a builtin error installs the
+/// error's own fields on the derived instance, and classes own their
+/// `name` (Node: validateString's ERR_INVALID_ARG_TYPE message).
+#[test]
+fn error_subclass_super_sets_message_and_classes_own_name() {
+    let root = write_fixture(
+        "w3cos_error_subclass_super",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class A extends Error { constructor(m) { super(m) } }
+class B extends Error { constructor(m) { const x = m + "!"; super(x) } }
+class C extends Error { constructor(m) { let msg = `a${m}`; super(msg) } }
+class D extends Error { constructor(n) { let d; if (n) { d = 1 } else { d = 2 } super("d" + d) } }
+class F extends Error { constructor(m) { let msg = "x"; msg += m; super(msg) } }
+class G extends Error { constructor(m, e) { e = e.replace(/^not /, ""); super(m + e) } }
+class H extends Error { constructor(m) { super(m); this.code = 1 } }
+for (const K of [A, B, C, D, F, G, H]) console.log(K.name, JSON.stringify(new K("m", "not y").message))
+class Plain {}
+const e = new A("boom");
+class K2 extends Error {}
+console.log(new K2("k", { cause: 7 }).cause, new K2("k").message)
+console.log(Plain.name, A.name, e instanceof A, e instanceof Error, String(e), e.stack.split("\n")[0], Object.keys(e).length)
+class T extends TypeError { constructor(m) { super(m); this.name = "T" } }
+console.log(String(new T("bad")), new T("x") instanceof TypeError, e.cause)
+function mk() { class Inner extends RangeError { constructor(m) { super(m) } } return Inner }
+const I = mk();
+console.log(I.name, new I("r").message, new I("r") instanceof RangeError)
+class S { static name = "custom" }
+class N { static get name() { return "getter" } }
+console.log(S.name, N.name, Object.keys(A).length, Object.keys(Plain).length)
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_error_subclass_super");
+    assert_eq!(
+        lines,
+        vec![
+            "A \"m\"",
+            "B \"m!\"",
+            "C \"am\"",
+            "D \"d1\"",
+            "F \"xm\"",
+            "G \"my\"",
+            "H \"m\"",
+            "7 k",
+            "Plain A true true Error: boom Error: boom 0",
+            "T: bad true undefined",
+            "Inner r true",
+            "custom getter 0 0",
+        ]
+    );
+}

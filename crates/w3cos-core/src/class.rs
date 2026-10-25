@@ -89,8 +89,19 @@ pub fn create_class_with_initializer(
         if result.is_object() { result } else { instance }
     });
     prototype.set_property("constructor", class.clone());
+    let prototype_for_marks = prototype.clone();
     class.set_property("prototype", prototype);
     class.set_property("__w3cos_ctor", raw_constructor);
+    // `C.prototype` and `C.prototype.constructor` are non-enumerable
+    // (ClassDefinitionEvaluation); the internal ctor slot is never visible.
+    if let Some(object) = prototype_for_marks.as_object() {
+        object.borrow_mut().mark_non_enumerable("constructor");
+    }
+    if let Some(object) = class.as_object() {
+        let mut object = object.borrow_mut();
+        object.mark_non_enumerable("prototype");
+        object.mark_non_enumerable("__w3cos_ctor");
+    }
     if let Some(parent) = super_class {
         set_prototype_of(&class, parent);
     }

@@ -180,6 +180,13 @@ pub enum Instruction {
         key: Register,
         value: Register,
     },
+    /// Installs a class method / accessor slot as a non-enumerable own
+    /// property (ECMAScript class elements are not enumerable).
+    DefineMethod {
+        object: Register,
+        key: Register,
+        value: Register,
+    },
     DefinePrivate {
         object: Register,
         brand: Register,
@@ -835,6 +842,7 @@ pub fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::RefreshBinding { .. }
         | Instruction::SetProperty { .. }
         | Instruction::DefineField { .. }
+        | Instruction::DefineMethod { .. }
         | Instruction::DefinePrivate { .. }
         | Instruction::SetPrivate { .. }
         | Instruction::DefinePrivateMethod { .. }
@@ -866,7 +874,8 @@ fn registers(instruction: &Instruction) -> Vec<Register> {
         Instruction::SetProperty {
             object, key, value, ..
         }
-        | Instruction::DefineField { object, key, value } => vec![*object, *key, *value],
+        | Instruction::DefineField { object, key, value }
+        | Instruction::DefineMethod { object, key, value } => vec![*object, *key, *value],
         Instruction::DefinePrivate {
             object,
             brand,

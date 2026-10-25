@@ -207,6 +207,23 @@ pub fn define_field(object: &Value, key: &Value, value: Value) -> Value {
     value
 }
 
+/// Install a class method, getter (`__w3cos_getter_{key}`) or setter
+/// (`__w3cos_setter_{key}`) on a class prototype or constructor. Class
+/// elements are non-enumerable (ECMAScript ClassDefinitionEvaluation /
+/// MakeMethod), so `for-in` and `Object.keys` skip them.
+pub fn define_method(object: &Value, key: &Value, value: Value) -> Value {
+    let key = key.to_js_string();
+    object.set_property(&key, value.clone());
+    let visible = key
+        .strip_prefix("__w3cos_getter_")
+        .or_else(|| key.strip_prefix("__w3cos_setter_"))
+        .unwrap_or(&key);
+    if let Some(object) = object.as_object() {
+        object.borrow_mut().mark_non_enumerable(visible);
+    }
+    value
+}
+
 pub fn define_private(object: &Value, brand: &Value, name: &Value, value: Value) -> Value {
     crate::class::define_private_field(object, brand, &name.to_js_string(), value.clone());
     value
@@ -1421,6 +1438,45 @@ mod tests {
             .collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn define_method_installs_non_enumerable_class_elements() {
+        let constructor = Value::function(|this, _| this);
+        let class = create_class_with_initializer(&constructor, None, &Value::Undefined);
+        let prototype = get_property(&class, &Value::string("prototype"));
+        define_method(
+            &prototype,
+            &Value::string("run"),
+            Value::function(|_, _| Value::Undefined),
+        );
+        define_method(
+            &prototype,
+            &Value::string("__w3cos_getter_size"),
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+        define_method(
+            &class,
+            &Value::string("create"),
+            Value::function(|_, _| Value::Undefined),
+        );
+        set_property(&class, &Value::string("count"), Value::Number(0.0));
+        let instance = crate::class::construct(&class, Vec::new());
+        set_property(&instance, &Value::string("own"), Value::Number(1.0));
+        let keys = |value: &Value| {
+            for_in_keys(value)
+                .iter()
+                .map(|value| value.to_js_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&instance), vec!["own"]);
+        assert!(keys(&prototype).is_empty());
+        // Static fields assigned after the class is built stay enumerable.
+        assert_eq!(keys(&class), vec!["count"]);
+        assert_eq!(
+            get_property(&instance, &Value::string("size")).to_js_string(),
+            "1"
+        );
     }
 
     #[test]
