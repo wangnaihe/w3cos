@@ -941,14 +941,18 @@ impl EsmResolver {
                 "`{specifier}` is a Node builtin module that w3cos-node does not provide yet"
             ));
         }
+        // Node: a core module wins over a same-named package (LOAD_CORE_MODULE
+        // runs before LOAD_NODE_MODULES). Code-OSS ships the browserify `util`,
+        // `events` and `buffer` polyfills in node_modules; resolving
+        // `import { promisify } from "util"` to them breaks pfs.realpath.
+        if is_node_builtin(specifier) && w3cos_node::is_available(specifier) {
+            return Ok(
+                node_builtin_module(specifier, &self.project_root)?.expect("available builtin")
+            );
+        }
         match self.resolve_package(specifier, from_dir, kind) {
             Ok(resolved) => Ok(resolved),
-            Err(_) if is_node_builtin(specifier) && w3cos_node::is_available(specifier) => {
-                Ok(node_builtin_module(specifier, &self.project_root)?.expect("available builtin"))
-            }
-            // A bare builtin name only resolves to the builtin when no
-            // package of that name is installed (`events`, `buffer`, ...
-            // polyfills are common in web dependency trees).
+            // Builtins w3cos-node lacks fall back to an installed package.
             Err(error) if is_node_builtin(specifier) => Err(error.context(format!(
                 "`{specifier}` is a Node builtin module that w3cos-node does not provide yet"
             ))),
@@ -3431,6 +3435,7 @@ export function main() {{ bump(); return value + plugin.value; }}"#
                     r#"{"main":"events.js"}"#,
                 ),
                 ("node_modules/events/events.js", ""),
+                ("src/deep/node_modules/dgram/index.js", ""),
             ],
         );
         let resolver = EsmResolver::new(&root);
@@ -3515,8 +3520,9 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             "src/dir/entry.js"
         );
 
-        // Builtins: `node:` always; bare names only when no package exists.
-        // w3cos-node provides some; the rest stay a coded resolution error.
+        // Builtins: `node:` always; bare names win over an installed
+        // package of the same name, as in Node. Builtins w3cos-node lacks
+        // fall back to the package, else a coded resolution error.
         let fs = resolver.resolve_with("dgram", &src, Require).unwrap_err();
         assert!(format!("{fs:#}").contains("Node builtin"), "{fs:#}");
         let events = resolver.resolve_with("node:events", &src, Require).unwrap();
@@ -3524,9 +3530,14 @@ export function main() {{ bump(); return value + plugin.value; }}"#
         assert!(events.path.ends_with("events.js"));
         let bare_path = resolver.resolve_with("path", &src, Require).unwrap();
         assert_eq!(bare_path.package_name.as_deref(), Some("node:path"));
+        let bare_events = resolver.resolve_with("events", &src, Require).unwrap();
+        assert_eq!(bare_events.package_name.as_deref(), Some("node:events"));
+        assert!(!bare_events.path.ends_with("node_modules/events/events.js"));
+        let bare_events = resolver.resolve_with("events", &src, Import).unwrap();
+        assert_eq!(bare_events.package_name.as_deref(), Some("node:events"));
         assert_eq!(
-            path("events", &src, Require),
-            "node_modules/events/events.js"
+            path("dgram", &src.join("deep/x"), Require),
+            "src/deep/node_modules/dgram/index.js"
         );
 
         assert!(!resolver.is_in_type_module_scope(&src.join("main.js")));
