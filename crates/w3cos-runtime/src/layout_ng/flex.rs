@@ -116,12 +116,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some("flex:wrap-gap");
     }
-    // A nowrap row of text-free, definite-cross-size items synthesizes
-    // baselines below. Anything else with `align-items: baseline` stays
-    // here, ahead of the later reasons, as it did before that slice.
-    let synthesized = synthesized_row_baseline(flat, index);
-    if style.align_items == AlignItems::Baseline && !synthesized {
-        return Some("flex:baseline");
+    // A nowrap row aligns first baselines below. Anything else with
+    // `align-items: baseline` stays here, ahead of the later reasons.
+    let baseline = baseline_reason(flat, index);
+    if style.align_items == AlignItems::Baseline
+        && let Some(reason) = baseline
+    {
+        return Some(reason);
     }
     if style.direction == TextDirection::Rtl {
         return Some("flex:rtl");
@@ -147,8 +148,10 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.float != Float::None {
             return Some("flex:float");
         }
-        if child_style.align_self == AlignSelf::Baseline && !synthesized {
-            return Some("flex:baseline");
+        if child_style.align_self == AlignSelf::Baseline
+            && let Some(reason) = baseline
+        {
+            return Some(reason);
         }
         // A text run is an anonymous flex item. Its line breaking and
         // white-space handling stay on the legacy engine (a real flex
@@ -193,86 +196,60 @@ fn baseline_participant(container: AlignItems, item: AlignSelf) -> bool {
     }
 }
 
-/// Definite cross size on a row: a length, or a percentage of a
-/// non-automatic container height. `height: auto` is not synthesized.
-fn row_cross_is_definite(item: &Style, container: &Style) -> bool {
-    match item.height {
-        Dimension::Auto => false,
-        Dimension::Percent(_) => !matches!(container.height, Dimension::Auto),
-        Dimension::Px(_)
-        | Dimension::Rem(_)
-        | Dimension::Em(_)
-        | Dimension::Ch(_)
-        | Dimension::Vw(_)
-        | Dimension::Vh(_) => true,
-    }
-}
-
-/// The item and every rendered descendant are block or flow-root boxes.
-/// That is the set whose synthesized baseline is the border-box under edge.
-fn block_border_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
+/// A baseline participant's subtree whose baseline NG does not export:
+/// a block-level grid container (only inline-grid reports one) or a
+/// multi-line flex container (`layout_wrapped` reports none).
+fn unexported_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
     let end = flat[index].subtree_end.max(index + 1);
     let mut child = index;
     while child < end {
-        if flat[child].style.display == Display::None {
+        let style = flat[child].style;
+        if style.display == Display::None {
             child = flat[child].subtree_end.max(child + 1);
             continue;
         }
-        if !matches!(flat[child].kind, w3cos_std::ComponentKind::Box) {
-            return false;
+        if style.display == Display::Grid {
+            return true;
         }
-        if !matches!(
-            flat[child].style.display,
-            Display::Block | Display::FlowRoot
-        ) {
-            return false;
+        if style.display == Display::Flex && style.flex_wrap != FlexWrap::NoWrap {
+            return true;
         }
         child += 1;
     }
-    true
+    false
 }
 
-fn synthesized_row_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
+/// Why baseline alignment stays on legacy, if it does. A nowrap row
+/// aligns first baselines (FlexLayoutAlgorithm::BaselineAscent). Column
+/// and multi-line baseline groups are not done here yet.
+fn baseline_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
-    if !row_axis(style.flex_direction) || style.flex_wrap != FlexWrap::NoWrap {
-        return false;
+    if !row_axis(style.flex_direction) {
+        return Some("flex:baseline-column");
+    }
+    if style.flex_wrap != FlexWrap::NoWrap {
+        return Some("flex:baseline-wrap");
     }
     for child in rendered_children(flat, index) {
-        let child_style = flat[child].style;
-        if !baseline_participant(style.align_items, child_style.align_self) {
-            continue;
-        }
-        if !row_cross_is_definite(child_style, style) || !block_border_baseline(flat, child) {
-            return false;
+        if baseline_participant(style.align_items, flat[child].style.align_self)
+            && unexported_baseline(flat, child)
+        {
+            return Some("flex:baseline-nested");
         }
     }
-    true
+    None
 }
 
-/// Shared border-box under edge of the baseline group, and the line's
-/// cross size contribution (that edge plus the largest hanging margin-end).
-/// `Err` when a baseline item has no definite cross size.
-fn baseline_group(items: &[Item]) -> Result<Option<(f32, f32)>, ()> {
-    let mut any = false;
-    let mut max_ascent = 0.0_f32;
-    let mut max_end = 0.0_f32;
-    for item in items {
-        if item.align != AlignItems::Baseline {
-            continue;
-        }
-        if item.cross_auto {
-            return Err(());
-        }
-        let Some(cross) = item.cross else {
-            return Err(());
-        };
-        any = true;
-        let border = cross + item.cross_edges;
-        let ascent = item.margin_cross_start + border;
-        max_ascent = max_ascent.max(ascent);
-        max_end = max_end.max(item.margin_cross_end);
-    }
-    Ok(any.then_some((max_ascent, max_ascent + max_end)))
+/// Item ascent for baseline alignment (Blink BaselineAscent): the cross
+/// start margin plus the first baseline, or the synthesized border-box
+/// under edge when the item has no line. `None` for an unknown baseline.
+fn baseline_ascent(item: &Item, laid: &LayoutResult) -> Option<f32> {
+    let baseline = match laid.first_baseline {
+        LastBaseline::At(baseline) => baseline,
+        LastBaseline::NoLines => laid.fragment.height,
+        LastBaseline::Unknown => return None,
+    };
+    Some(item.margin_cross_start + baseline)
 }
 
 fn subtree_has_float(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -1147,25 +1124,42 @@ pub(super) fn layout(
         .iter()
         .map(|item| item.margin_box_cross())
         .fold(0.0_f32, f32::max);
-    let mut line_inner = if style.align_content == AlignContent::Stretch {
-        content_cross_definite.unwrap_or(max_margin_box)
+    let definite_line = if style.align_content == AlignContent::Stretch {
+        content_cross_definite
     } else {
-        max_margin_box
+        None
     };
-    // Baseline participants share a border-box under edge. A shorter item's
-    // cross margin-end hangs below that edge and can make the line taller
-    // than any single margin box. A definite stretched line is not shrunk.
-    let max_ascent = match baseline_group(&items) {
-        Err(()) => return super::bail("flex:baseline"),
-        Ok(Some((ascent, extent))) => {
-            if !row {
-                return super::bail("flex:baseline");
-            }
-            line_inner = line_inner.max(extent);
-            ascent
+    // Baseline participants (FlexLayoutAlgorithm::BuildFlexLines): the
+    // line's baseline size is the largest ascent plus the largest descent,
+    // unless the single line has a definite cross size.
+    let mut ascents = vec![None; items.len()];
+    let mut max_ascent = None::<f32>;
+    let mut max_descent = 0.0_f32;
+    for (slot, item) in ascents.iter_mut().zip(&items) {
+        if item.align != AlignItems::Baseline {
+            continue;
         }
-        Ok(None) => 0.0,
-    };
+        if !row {
+            return super::bail("flex:baseline-column");
+        }
+        let laid = layout_item(
+            flat,
+            item.index,
+            space,
+            inner_width,
+            specified_height,
+            true,
+            Some(item.content),
+            item.cross,
+        )?;
+        let ascent = baseline_ascent(item, &laid).why("flex:baseline-unknown")?;
+        let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
+        *slot = Some(ascent);
+        max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
+        max_descent = max_descent.max(margin_box - ascent);
+    }
+    let baseline_extent = max_ascent.map_or(0.0, |ascent| ascent + max_descent);
+    let line_inner = definite_line.unwrap_or(max_margin_box.max(baseline_extent));
 
     for item in &mut items {
         if item.align == AlignItems::Stretch && item.cross_auto {
@@ -1243,7 +1237,8 @@ pub(super) fn layout(
     let mut cursor = lead;
     let mut children = Vec::with_capacity(items.len());
     let mut oof = Vec::new();
-    for (item, laid) in items.iter().zip(fragments) {
+    let mut fallback_baseline = None;
+    for ((item, laid), ascent) in items.iter().zip(fragments).zip(&ascents) {
         let border_main = item.content + item.main_edges;
         let main = if reverse {
             cursor - item.margin_main_start - border_main
@@ -1261,8 +1256,7 @@ pub(super) fn layout(
             AlignItems::FlexEnd => extra,
             AlignItems::Center => extra / 2.0,
             AlignItems::Baseline => {
-                let border = item.cross.unwrap_or(0.0) + item.cross_edges;
-                max_ascent - (item.margin_cross_start + border)
+                max_ascent.unwrap_or(0.0) - ascent.unwrap_or(item.margin_cross_start)
             }
             AlignItems::Stretch | AlignItems::FlexStart => 0.0,
         };
@@ -1284,6 +1278,19 @@ pub(super) fn layout(
                 .iter()
                 .map(|candidate| candidate.translated(x + dx, y + dy)),
         );
+        // BaselineAccumulator: the fallback is the first item of the line
+        // after ApplyReversals (the last in order for a reversed row),
+        // offset by its position without the relative offset.
+        let item_baseline = match laid.first_baseline {
+            LastBaseline::NoLines => LastBaseline::At(laid.fragment.height),
+            other => other,
+        }
+        .offset(y);
+        if reverse {
+            fallback_baseline = Some(item_baseline);
+        } else {
+            fallback_baseline.get_or_insert(item_baseline);
+        }
         children.push((x + dx, y + dy, laid.fragment));
         let step = item.outer_main() + gap + between;
         if reverse {
@@ -1293,6 +1300,14 @@ pub(super) fn layout(
         }
     }
 
+    // A row's major baseline is the line's largest ascent; otherwise the
+    // fallback item's baseline (FlexLayoutAlgorithm FirstBaseline). A
+    // column keeps reporting none, as before.
+    let container_baseline = match (row, max_ascent) {
+        (true, Some(ascent)) => LastBaseline::At(bt + pt + ascent),
+        (true, None) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
+        (false, _) => LastBaseline::NoLines,
+    };
     let content_main = if row {
         inner_width
     } else {
@@ -1360,8 +1375,8 @@ pub(super) fn layout(
             text_range: None,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        last_baseline: container_baseline,
+        first_baseline: container_baseline,
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -2510,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn column_wrap_text_and_nested_flex_baseline_stay_on_legacy() {
+    fn column_wrap_and_nested_grid_baseline_stay_on_legacy() {
         let mut column = flex_style(FlexDirection::Column, 100.0, Some(80.0));
         column.align_items = AlignItems::Baseline;
         stays_legacy(&Component::boxed(
@@ -2526,34 +2541,47 @@ mod tests {
             vec![leaf(block_box(Some(40.0), Some(10.0)))],
         ));
 
-        stays_legacy(&baseline_row(
-            200.0,
-            None,
-            vec![leaf(block_box(Some(40.0), None))],
-        ));
-
-        let mut text = block_box(Some(40.0), Some(30.0));
-        text.display = Display::Block;
+        // A block-level grid reports no baseline on NG yet.
+        let mut grid = block_box(Some(40.0), Some(50.0));
+        grid.display = Display::Grid;
         stays_legacy(&baseline_row(
             200.0,
             None,
             vec![Component::boxed(
-                text,
-                vec![Component::text("a", Style::default())],
+                grid,
+                vec![leaf(block_box(None, Some(10.0)))],
             )],
         ));
 
+        // An automatic cross size, a text line, and a nested nowrap flex
+        // all have a first baseline (or synthesize one) and stay on NG.
+        let mut text = block_box(Some(40.0), Some(30.0));
+        text.display = Display::Block;
         let mut nested = block_box(Some(40.0), Some(50.0));
         nested.display = Display::Flex;
         nested.flex_direction = FlexDirection::Row;
-        stays_legacy(&baseline_row(
-            200.0,
-            None,
-            vec![
-                Component::boxed(nested, vec![leaf(block_box(Some(40.0), Some(10.0)))]),
-                leaf(block_box(Some(40.0), Some(30.0))),
-            ],
-        ));
+        for root in [
+            baseline_row(200.0, None, vec![leaf(block_box(Some(40.0), None))]),
+            baseline_row(
+                200.0,
+                None,
+                vec![Component::boxed(
+                    text,
+                    vec![Component::text("a", Style::default())],
+                )],
+            ),
+            baseline_row(
+                200.0,
+                None,
+                vec![
+                    Component::boxed(nested, vec![leaf(block_box(Some(40.0), Some(10.0)))]),
+                    leaf(block_box(Some(40.0), Some(30.0))),
+                ],
+            ),
+        ] {
+            let flat = pre_flatten(&root);
+            assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
+        }
 
         let mut rtl = flex_style(FlexDirection::Row, 100.0, None);
         rtl.direction = TextDirection::Rtl;

@@ -3608,3 +3608,94 @@ fn scroll_container_flex_item_has_no_automatic_minimum() {
     assert_eq!(rect(&out, 2), (0.0, 0.0, 70.0, 40.0));
     assert_eq!(rect(&out, 4), (70.0, 0.0, 30.0, 40.0));
 }
+
+/// Row baseline alignment (FlexLayoutAlgorithm::BaselineAscent): text-free
+/// items synthesize the border-box under edge, the line is the largest
+/// ascent plus the largest descent, and a definite single line wins.
+/// Rects from Chrome.
+#[test]
+fn flex_row_baseline_alignment_matches_chrome() {
+    let flex = |height: Dimension| Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Row,
+        align_items: AlignItems::Baseline,
+        width: Dimension::Px(300.0),
+        height,
+        ..block()
+    };
+    use w3cos_std::style::{AlignItems, AlignSelf};
+    let item = |height: Dimension, margin: Edges, align_self: AlignSelf| Style {
+        width: Dimension::Px(40.0),
+        height,
+        margin,
+        align_self,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                flex(Dimension::Auto),
+                vec![
+                    node(
+                        item(
+                            Dimension::Auto,
+                            margins(7.0, 0.0, 0.0, 0.0),
+                            AlignSelf::Auto,
+                        ),
+                        vec![node(sized(40.0), vec![])],
+                    ),
+                    node(
+                        item(
+                            Dimension::Px(10.0),
+                            margins(0.0, 0.0, 9.0, 0.0),
+                            AlignSelf::Auto,
+                        ),
+                        vec![],
+                    ),
+                    node(
+                        item(Dimension::Px(100.0), Edges::default(), AlignSelf::FlexStart),
+                        vec![],
+                    ),
+                ],
+            ),
+            node(
+                flex(Dimension::Px(30.0)),
+                vec![
+                    node(
+                        item(
+                            Dimension::Px(40.0),
+                            margins(30.0, 0.0, 0.0, 0.0),
+                            AlignSelf::Auto,
+                        ),
+                        vec![],
+                    ),
+                    node(
+                        item(Dimension::Px(10.0), Edges::default(), AlignSelf::Auto),
+                        vec![],
+                    ),
+                    node(
+                        item(Dimension::Auto, Edges::default(), AlignSelf::Stretch),
+                        vec![],
+                    ),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root, 1 flex, 2 item, 3 its child, 4, 5, 6 flex, 7, 8, 9.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 300.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 7.0, 40.0, 40.0));
+    assert_eq!(rect(&out, 4), (40.0, 37.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 5), (80.0, 0.0, 40.0, 100.0));
+    assert_eq!(rect(&out, 6), (0.0, 100.0, 300.0, 30.0));
+    assert_eq!(rect(&out, 7), (0.0, 130.0, 40.0, 40.0));
+    assert_eq!(rect(&out, 8), (40.0, 160.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 9), (80.0, 100.0, 40.0, 30.0));
+}
