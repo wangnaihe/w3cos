@@ -2449,7 +2449,11 @@ impl Value {
                 } else if key == "length" {
                     Value::Number(s.encode_utf16().count() as f64)
                 } else {
-                    Value::Undefined
+                    // ToObject(string) inherits String.prototype: `s.startsWith`
+                    // and `s?.startsWith(...)` read the method by value.
+                    crate::builtins::string_value()
+                        .get_property("prototype")
+                        .get_property_with_receiver(key, self)
                 }
             }
             _ if self.as_number().is_some() || self.as_bool().is_some() => {
