@@ -3607,6 +3607,28 @@ fn emit_class(
         );
     }
     out.push_str("        let __proto = w3cos_core::intrinsics::get_property(&__class, &w3cos_core::Value::string(\"prototype\"));\n");
+    // `class A {}` owns a non-enumerable `name` ("A"); a static `name`
+    // member (method, accessor or field) replaces it.
+    let has_static_name = class.is_some_and(|class| {
+        class.body.iter().any(|member| {
+            let key = match member {
+                ClassMember::Method(method) if method.is_static => &method.key,
+                ClassMember::ClassProp(field) if field.is_static => &field.key,
+                _ => return false,
+            };
+            match key {
+                PropName::Ident(identifier) => identifier.sym == *"name",
+                PropName::Str(value) => value.value == *"name",
+                _ => true,
+            }
+        })
+    });
+    if !has_static_name && !sym.original_name.is_empty() {
+        out.push_str(&format!(
+            "        w3cos_core::intrinsics::define_method(&__class, &w3cos_core::Value::string(\"name\"), w3cos_core::Value::string({:?}));\n",
+            sym.original_name
+        ));
+    }
     for def in unique_methods
         .iter()
         .filter(|def| def.private.is_none() && def.install_on_proto)

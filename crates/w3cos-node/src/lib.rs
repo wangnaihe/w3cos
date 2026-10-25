@@ -16,6 +16,13 @@ pub const MODULES: &[(&str, &str)] = &[
     ("buffer", include_str!("../js/buffer.js")),
     ("child_process", include_str!("../js/child_process.js")),
     ("console", include_str!("../js/console.js")),
+    // Deprecated `constants`: the flat merge of os.constants (errno,
+    // priority, signals) and fs.constants, as Node's lib/constants.js
+    // (graceful-fs still requires it).
+    (
+        "constants",
+        "const os = require('os').constants;\nmodule.exports = Object.assign({}, os.errno, os.priority, os.signals, require('fs').constants);\n",
+    ),
     ("crypto", include_str!("../js/crypto.js")),
     (
         "diagnostics_channel",

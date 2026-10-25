@@ -231,6 +231,8 @@ assert.rejects(Promise.reject(new Error("r")), /r/)
   .then(() => { console.log("rejects ok"); return assert.rejects(Promise.resolve(1)); })
   .catch((e) => console.log("rejects missing", e.message, e.code));
 console.log("misc", Object.is(NaN, NaN), Object.is(0, -0), Object.keys(new Error("x")).length, new Error("x").hasOwnProperty("name"), JSON.stringify(new TypeError("t")), Promise.resolve(1) instanceof Promise, (async () => 1)() instanceof Promise);
+const nodeConstants = require("constants");
+console.log("constants", nodeConstants.O_RDONLY, nodeConstants.ENOENT, nodeConstants.SIGTERM, nodeConstants.S_IFMT, nodeConstants.PRIORITY_HIGH, nodeConstants === require("node:constants"));
 "##;
 
 /// `node main.cjs` (v20.19.2).
@@ -252,6 +254,7 @@ msg6 Missing expected exception (TypeError): need it
 match no-throw ERR_ASSERTION/AssertionError/true/match no-throw ERR_ASSERTION/AssertionError/true/ifError
 msg7 ifError got unwanted exception: e1
 misc true false 0 false {} true true
+constants 0 2 15 61440 -14 true
 rejects ok
 rejects missing Missing expected rejection. ERR_ASSERTION
 "##;

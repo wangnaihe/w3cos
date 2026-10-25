@@ -4752,6 +4752,31 @@ impl Builder {
             object: class_value,
             key: prototype_key,
         });
+        // `class A {}` owns a non-enumerable `name` ("A"); a static `name`
+        // member defined below replaces it.
+        let has_static_name = class.body.iter().any(|member| {
+            let key = match member {
+                ClassMember::Method(method) if method.is_static => &method.key,
+                ClassMember::ClassProp(field) if field.is_static => &field.key,
+                _ => return false,
+            };
+            match key {
+                PropName::Ident(identifier) => identifier.sym == *"name",
+                PropName::Str(value) => value.value == *"name",
+                _ => true,
+            }
+        });
+        if let Some(class_name) = name.as_deref()
+            && !has_static_name
+        {
+            let key = self.constant(Constant::String("name".into()));
+            let value = self.constant(Constant::String(class_name.into()));
+            self.emit(Instruction::DefineMethod {
+                object: class_value,
+                key,
+                value,
+            });
+        }
 
         for (member_index, member) in class.body.iter().enumerate() {
             match member {

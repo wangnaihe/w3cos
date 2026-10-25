@@ -1888,6 +1888,19 @@ fn build_error_classes() -> HashMap<String, Value> {
             error_instance(&constructor_name, arguments)
         });
         constructor.set_property("name", Value::string(name));
+        // `class E extends Error { constructor(m) { super(m) } }`: super()
+        // runs this on the derived instance (see `class::super_ctor`).
+        let init_name = error_name.clone();
+        constructor.set_property(
+            "__w3cos_ctor",
+            Value::function(move |this, arguments| {
+                init_error_fields(&this, &init_name, &arguments);
+                Value::Undefined
+            }),
+        );
+        if let Some(object) = constructor.as_object() {
+            object.borrow_mut().mark_non_enumerable("__w3cos_ctor");
+        }
         let prototype = Value::object(HashMap::from([
             ("name".to_string(), Value::string(name)),
             ("message".to_string(), Value::string("")),
@@ -1939,6 +1952,17 @@ pub fn error_class(name: &str) -> Value {
 }
 
 pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
+    let value = Value::object(HashMap::new());
+    init_error_fields(&value, name, &arguments);
+    crate::class::set_prototype_of(&value, &error_class(name).get_property("prototype"));
+    value
+}
+
+/// The own fields `new Error(message, { cause })` installs on its receiver
+/// (`message`, `stack`, `cause`, and `errors` for AggregateError). Shared by
+/// `new Error(...)` and `super(...)` from a class that extends a builtin
+/// error (the receiver is then the derived instance).
+fn init_error_fields(value: &Value, name: &str, arguments: &[Value]) {
     let (message_index, options_index) = if name == "AggregateError" {
         (1, 2)
     } else {
@@ -1955,12 +1979,11 @@ pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
     };
     // `message` / `stack` are own non-enumerable data properties; `name`
     // comes from the prototype (so Object.keys(new Error("x")) is empty).
-    let value = Value::object(HashMap::new());
     if !message_value.is_undefined() {
-        define_builtin(&value, "message", Value::string(&message));
+        define_builtin(value, "message", Value::string(&message));
     }
     define_builtin(
-        &value,
+        value,
         "stack",
         Value::from(if message.is_empty() {
             name.to_string()
@@ -1970,17 +1993,15 @@ pub fn error_instance(name: &str, arguments: Vec<Value>) -> Value {
     );
     if name == "AggregateError" {
         let errors = arguments.first().cloned().unwrap_or(Value::Undefined);
-        define_builtin(&value, "errors", Value::array(errors.iter().collect()));
+        define_builtin(value, "errors", Value::array(errors.iter().collect()));
     }
     let cause = arguments
         .get(options_index)
         .map(|options| options.get_property("cause"))
         .unwrap_or(Value::Undefined);
     if !cause.is_undefined() {
-        define_builtin(&value, "cause", cause);
+        define_builtin(value, "cause", cause);
     }
-    crate::class::set_prototype_of(&value, &error_class(name).get_property("prototype"));
-    value
 }
 
 pub struct Map;
