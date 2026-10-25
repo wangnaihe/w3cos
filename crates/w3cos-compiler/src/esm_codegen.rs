@@ -3612,7 +3612,7 @@ fn emit_class(
         .filter(|def| def.private.is_none() && def.install_on_proto)
     {
         out.push_str(&format!(
-            "        w3cos_core::intrinsics::set_property(&__proto, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
+            "        w3cos_core::intrinsics::define_method(&__proto, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
             def.install_key_arg, def.fn_name
         ));
     }
@@ -3621,7 +3621,7 @@ fn emit_class(
         .filter(|def| def.private.is_none() && !def.install_on_proto)
     {
         out.push_str(&format!(
-            "        w3cos_core::intrinsics::set_property(&__class, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
+            "        w3cos_core::intrinsics::define_method(&__class, &w3cos_core::Value::string({}), w3cos_core::Value::function({}));\n",
             def.install_key_arg, def.fn_name
         ));
     }
@@ -4458,7 +4458,7 @@ export function boot() {
             "constructor should lower through W3IR: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(&__proto")
+            code.contains("w3cos_core::intrinsics::define_method(&__proto")
                 && code.contains("Value::string(\"__w3cos_getter_label\")"),
             "getter install: {code}"
         );
@@ -4472,7 +4472,7 @@ export function boot() {
             "method install: {code}"
         );
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(&__class")
+            code.contains("w3cos_core::intrinsics::define_method(&__class")
                 && code.contains("Value::string(\"create\")"),
             "static method install: {code}"
         );

@@ -1875,6 +1875,9 @@ impl Vm {
             Instruction::DefineField { object, key, value } => {
                 w3cos_core::intrinsics::define_field(&read(*object), &read(*key), read(*value));
             }
+            Instruction::DefineMethod { object, key, value } => {
+                w3cos_core::intrinsics::define_method(&read(*object), &read(*key), read(*value));
+            }
             Instruction::DefinePrivate {
                 object,
                 brand,

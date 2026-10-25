@@ -4815,7 +4815,7 @@ impl Builder {
                         .get(&member_index)
                         .copied()
                         .ok_or_else(|| anyhow!("runtime W3IR class method key was not prepared"))?;
-                    self.emit(Instruction::SetProperty {
+                    self.emit(Instruction::DefineMethod {
                         object: if method.is_static {
                             class_value
                         } else {
@@ -4823,7 +4823,6 @@ impl Builder {
                         },
                         key,
                         value,
-                        strict: true,
                     });
                 }
                 ClassMember::PrivateMethod(method) => {

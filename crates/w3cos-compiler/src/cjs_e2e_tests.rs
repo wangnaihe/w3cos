@@ -488,3 +488,44 @@ fn real_world_commonjs_packages_match_node() {
     }
     assert!(failures.is_empty(), "real packages failing: {failures:?}");
 }
+
+/// Class elements are non-enumerable: Code-OSS's `ProxyChannel.fromService`
+/// walks a service with `for-in` and must not see prototype methods such as
+/// `onDynamicBrowserViewEvent` (Node 20 output).
+#[test]
+fn class_methods_accessors_and_constructor_are_not_enumerable() {
+    let root = write_fixture(
+        "w3cos_class_method_enumerability",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class Base { baseMethod() {} get g() { return 1 } static s() {} }
+class Svc extends Base { constructor() { super(); this.own = 1; this.onDidX = 2 } onDynamicFoo(a) { return this.own } }
+const keys = []; for (const k in new Svc()) keys.push(k)
+console.log(keys.join(','))
+console.log(JSON.stringify(Object.getOwnPropertyDescriptor(Svc.prototype, 'onDynamicFoo')))
+console.log(Object.keys(Svc.prototype).join(','), Object.keys(Svc).join(','))
+const o = { m() {}, get a() { return 1 } }; const ok = []; for (const k in o) ok.push(k); console.log(ok.join(','))
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_class_method_enumerability",
+    );
+    assert_eq!(
+        lines,
+        vec![
+            "own,onDidX",
+            "{\"configurable\":true,\"enumerable\":false,\"writable\":true}",
+            " ",
+            "m,a",
+        ]
+    );
+}

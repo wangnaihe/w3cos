@@ -2385,6 +2385,7 @@ fn written_register(instruction: &Instruction) -> Option<Register> {
         | Instruction::RefreshBinding { .. }
         | Instruction::SetProperty { .. }
         | Instruction::DefineField { .. }
+        | Instruction::DefineMethod { .. }
         | Instruction::DefinePrivate { .. }
         | Instruction::SetPrivate { .. }
         | Instruction::DefinePrivateMethod { .. }
@@ -2421,6 +2422,9 @@ pub(crate) fn read_registers(instruction: &Instruction) -> Vec<u32> {
             object, key, value, ..
         }
         | Instruction::DefineField {
+            object, key, value, ..
+        }
+        | Instruction::DefineMethod {
             object, key, value, ..
         } => vec![object.0, key.0, value.0],
         Instruction::DefinePrivate {
@@ -7866,6 +7870,18 @@ fn emit_instruction(
                 &hoisted,
                 format!(
                     "w3cos_core::intrinsics::define_field(&{}, &{}, {value_expr});",
+                    emit_boxed_ref(plan, object.0),
+                    emit_boxed_ref(plan, key.0),
+                ),
+            )
+        }
+        Instruction::DefineMethod { object, key, value } => {
+            let reads = [object.0, key.0, value.0];
+            let (hoisted, value_expr) = emit_owned_operand(plan, last_uses, &reads, value.0);
+            with_hoisted(
+                &hoisted,
+                format!(
+                    "w3cos_core::intrinsics::define_method(&{}, &{}, {value_expr});",
                     emit_boxed_ref(plan, object.0),
                     emit_boxed_ref(plan, key.0),
                 ),

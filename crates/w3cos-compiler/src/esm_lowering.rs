@@ -3322,7 +3322,7 @@ impl LowerCtx {
                     };
                     let key = self.key_arg(prefix, &method.key);
                     installs.push(format!(
-                        "w3cos_core::intrinsics::set_property(&{target}, &w3cos_core::Value::string({key}), {closure});"
+                        "w3cos_core::intrinsics::define_method(&{target}, &w3cos_core::Value::string({key}), {closure});"
                     ));
                 }
                 ClassMember::PrivateMethod(method) => {
@@ -6445,7 +6445,7 @@ function f(window) { return window.x; }"#,
         let mut ctx = LowerCtx::new_dynamic(vec![]);
         let code = ctx.lower_stmts(&statements);
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(&__proto")
+            code.contains("w3cos_core::intrinsics::define_method(&__proto")
                 && code.contains("Value::string(\"match\")")
                 && !code.contains("Value::string(\"match_\")"),
             "Rust identifier sanitization must not alter JS property keys: {code}"
@@ -6610,7 +6610,7 @@ function f(window) { return window.x; }"#,
         );
         // Static method installed on the class object; static block runs in place.
         assert!(
-            code.contains("w3cos_core::intrinsics::set_property(&__class")
+            code.contains("w3cos_core::intrinsics::define_method(&__class")
                 && code.contains("Value::string(\"make\")"),
             "static method: {code}"
         );

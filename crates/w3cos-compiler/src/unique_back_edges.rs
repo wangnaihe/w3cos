@@ -123,7 +123,8 @@ pub fn analyze_unique_back_edges(
                 Instruction::SetProperty {
                     object, key, value, ..
                 }
-                | Instruction::DefineField { object, key, value } => {
+                | Instruction::DefineField { object, key, value }
+                | Instruction::DefineMethod { object, key, value } => {
                     note_fresh_closure(&origins, &mut fresh_closures, *object, *value);
                     if proven.get(&key.0).is_none() {
                         saw_dynamic_assignment = true;
