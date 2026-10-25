@@ -2738,3 +2738,84 @@ fn folded_breaks_split_into_forced_break_items() {
         ]
     );
 }
+
+#[test]
+fn split_inline_box_gets_union_of_line_fragments() {
+    let _ahem = AhemGuard::new();
+    // Chrome (Ahem 20px, width 100): `<span>XX XX XX</span>X` has client
+    // rects (0,0,100,20) and (0,20,40,20), bounding box (0,0,100,40).
+    let layout = |before: Option<&str>, span_text: &str, after: Option<&str>, paint: bool| {
+        let mut container = Style {
+            display: Display::Block,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        };
+        font(&mut container, 20.0, LineHeight::Number(1.0));
+        container
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let text = |content: &str| {
+            let mut style = Style {
+                display: Display::Inline,
+                ..Style::default()
+            };
+            font(&mut style, 20.0, LineHeight::Number(1.0));
+            Component::text(content, style)
+        };
+        let mut span = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut span, 20.0, LineHeight::Number(1.0));
+        if paint {
+            span.background = w3cos_std::color::Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255,
+            };
+        }
+        let mut children = Vec::new();
+        children.extend(before.map(text));
+        children.push(Component::boxed(span, vec![text(span_text)]));
+        children.extend(after.map(text));
+        let root = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, children)],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let span_index = flat
+            .iter()
+            .position(|n| matches!(n.kind, w3cos_std::ComponentKind::Text { content } if content == span_text))
+            .expect("span text")
+            - 1;
+        block::layout_root(&flat, 800.0, 600.0).map(|(_, _, fragment)| {
+            fn find(f: &BoxFragment, x: f32, y: f32, index: usize) -> Option<[f32; 4]> {
+                if f.index == index && f.text_range.is_none() && x.is_finite() {
+                    return Some([x, y, f.width, f.height]);
+                }
+                f.children
+                    .iter()
+                    .find_map(|(dx, dy, c)| find(c, x + dx, y + dy, index))
+            }
+            fragment
+                .children
+                .iter()
+                .find_map(|(dx, dy, c)| find(c, *dx, *dy, span_index))
+                .expect("span fragment")
+        })
+    };
+    assert_eq!(
+        layout(None, "XX XX XX", Some("X"), false),
+        Some([0.0, 0.0, 100.0, 40.0])
+    );
+    // A painted box needs its per-line fragments.
+    assert_eq!(layout(None, "XX XX XX", Some("X"), true), None);
+    // Starting mid-line: offsetLeft (40) is not the union's left (0).
+    assert_eq!(layout(Some("X "), "XX XX", None, false), None);
+}

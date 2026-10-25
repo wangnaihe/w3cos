@@ -179,6 +179,23 @@ fn vertical_align_shift(style: &Style, ascent: f32, descent: f32, parent: &Style
     Some(half - (x_height / 2.0 * 64.0).round() / 64.0)
 }
 
+/// Whether an inline box draws nothing of its own (no edges, background,
+/// shadow, outline, decoration or effects): only then may its per-line
+/// fragments collapse into the one rect the engine keeps per node.
+fn paints_nothing(style: &Style) -> bool {
+    zero_edges(style)
+        && style.background.a == 0
+        && style.background_image.is_none()
+        && style.box_shadow.is_none()
+        && style.box_shadows.is_empty()
+        && (style.outline_style == w3cos_std::style::OutlineStyle::None
+            || style.outline_width == 0.0)
+        && style.opacity == 1.0
+        && style.filter.is_none()
+        && style.transform == w3cos_std::style::Transform2D::default()
+        && style.text_decoration == w3cos_std::style::TextDecoration::None
+}
+
 fn zero_edges(style: &Style) -> bool {
     let padding = style.padding_lengths();
     let margin = style.margin_lengths();
@@ -2435,6 +2452,9 @@ pub(super) fn layout_inline_beside(
     // boxes, the last one closes them.
     let mut placed: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
     let mut placed_last: Vec<Option<(usize, f32, f32, f32)>> = vec![None; opens.len()];
+    // Every placed piece as (leaf position, line, offset, width, baseline):
+    // a box split across lines spans the pieces of its leaves per line.
+    let mut placed_all: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
     for (line_index, line) in built.into_iter().enumerate() {
         if floats.is_some() {
             top = line.top;
@@ -2485,6 +2505,7 @@ pub(super) fn layout_inline_beside(
             let at = Some((line_index, offset + x, width, baseline));
             placed[item.pos] = placed[item.pos].or(at);
             placed_last[item.pos] = at;
+            placed_all.push((item.pos, line_index, offset + x, width, baseline));
             // The item's own baseline after its vertical-align shift (the
             // enclosing boxes stay on the unshifted one).
             let baseline = baseline + item.shift;
@@ -2516,27 +2537,60 @@ pub(super) fn layout_inline_beside(
     // Inline box fragments (NGInlineBoxState::CreateBoxFragment): the border
     // box from the first to the last item's edges, block-axis padding and
     // border around the box's font content area.  A box split across lines
-    // has several fragments; the engine keeps one rect, so legacy lays it out.
+    // has several fragments (one per line); the engine keeps one rect per
+    // node, so such a box gets their union (LayoutInline's bounding box)
+    // when it paints nothing of its own; otherwise legacy lays it out.
     if has_boxes {
-        let mut starts: std::collections::HashMap<usize, (usize, f32, f32)> =
+        let mut starts: std::collections::HashMap<usize, (usize, usize, f32, f32)> =
             std::collections::HashMap::new();
         for (k, boxes) in opens.iter().enumerate() {
             for (pos, &b) in boxes.iter().enumerate() {
                 let (line, x, _, baseline) = placed[k].why("inline-box-placement")?;
                 let start =
                     x + start_edges(&boxes[..pos]) + InlineEdges::of(flat[b].style).margin_start;
-                starts.insert(b, (line, start, baseline));
+                starts.insert(b, (k, line, start, baseline));
             }
         }
         for (k, boxes) in closes.iter().enumerate() {
             for (pos, &b) in boxes.iter().enumerate() {
                 let (line, x, width, _) = placed_last[k].why("inline-box-placement")?;
-                let (start_line, start, baseline) =
+                let (first, start_line, start, baseline) =
                     starts.get(&b).copied().why("inline-box-placement")?;
-                if start_line != line {
-                    return super::bail("split-box-line");
-                }
                 let style = flat[b].style;
+                if start_line != line {
+                    if !paints_nothing(style) {
+                        return super::bail("split-box-line");
+                    }
+                    let (mut x0, mut x1) = (f32::INFINITY, f32::NEG_INFINITY);
+                    let (mut top_baseline, mut bottom_baseline) = (baseline, baseline);
+                    for &(pos, _, px, pw, pb) in &placed_all {
+                        if (first..=k).contains(&pos) {
+                            x0 = x0.min(px);
+                            x1 = x1.max(px + pw);
+                            top_baseline = top_baseline.min(pb);
+                            bottom_baseline = bottom_baseline.max(pb);
+                        }
+                    }
+                    if start > x0 + EPSILON {
+                        // offsetLeft is the first fragment's start, not the
+                        // union's; one rect cannot carry both.
+                        return super::bail("split-box-line");
+                    }
+                    let ascent = inline_font_content_ascent(style);
+                    let y0 = top_baseline - ascent;
+                    out.push((
+                        x0,
+                        y0,
+                        BoxFragment {
+                            index: b,
+                            text_range: None,
+                            width: x1 - x0,
+                            height: bottom_baseline - ascent + inline_font_height(style) - y0,
+                            children: Vec::new(),
+                        },
+                    ));
+                    continue;
+                }
                 let e = InlineEdges::of(style);
                 let end = x + width - end_edges(&boxes[pos + 1..]) - e.margin_end;
                 out.push((
