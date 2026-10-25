@@ -1835,6 +1835,59 @@ fn overflow_hidden_is_a_bfc_like_legacy() {
     assert_eq!(rect(&out, 1), (0.0, 10.0, 40.0, 30.0));
 }
 
+/// css-overflow-3: `auto` / `scroll` make a scroll container, which is a
+/// BFC like `hidden` (scrollbars take no space here). One whose content
+/// overflows a max-height clamp has a scroll range and stays on legacy.
+#[test]
+fn scroll_container_is_a_bfc_and_overflowing_one_falls_back() {
+    use w3cos_std::style::{Dimension as D, Display, Float, Overflow};
+    let float = Style {
+        display: Display::Block,
+        width: D::Px(40.0),
+        height: D::Px(30.0),
+        float: Float::Left,
+        ..Style::default()
+    };
+    let beside = Style {
+        display: Display::Block,
+        height: D::Px(20.0),
+        overflow: Overflow::Auto,
+        ..Style::default()
+    };
+    let root = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(100.0),
+            ..Style::default()
+        },
+        vec![node(float, vec![]), node(beside, vec![])],
+    );
+    let out = parity(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
+    assert_eq!(rect(&out, 2), (40.0, 0.0, 60.0, 20.0));
+
+    let clamped = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(100.0),
+            max_height: D::Px(50.0),
+            overflow: Overflow::Scroll,
+            ..Style::default()
+        },
+        vec![node(
+            Style {
+                display: Display::Block,
+                height: D::Px(80.0),
+                ..Style::default()
+            },
+            vec![],
+        )],
+    );
+    let flat = pre_flatten(&clamped);
+    assert!(block::supports_tree(&flat));
+    assert!(layout_tree(&clamped, &flat, 800.0, 600.0).is_none());
+}
+
 fn ng_rects(root: &Component) -> Vec<(LayoutRect, usize)> {
     let flat = pre_flatten(root);
     assert!(

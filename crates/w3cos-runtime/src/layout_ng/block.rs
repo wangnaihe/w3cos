@@ -169,7 +169,7 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     // establishes a BFC. Paint already clips that padding box. Inline boxes
     // and non-cell internal table boxes do not clip; those stay on legacy.
     if non_visible_overflow(style) && !style.display.establishes_overflow_clip() {
-        return Some("overflow");
+        return Some("overflow:inline");
     }
     if style.column_count.is_some() || style.column_width != Dimension::Auto {
         return Some("columns");
@@ -881,6 +881,16 @@ fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f
     (used_width.max(0.0), used_height.max(0.0))
 }
 
+/// Either axis is `auto` or `scroll`: the box is a scroll container
+/// (css-overflow-3 3.1). Scrollbars take no layout space in this engine
+/// (no gutter, as with Blink overlay scrollbars), so until it scrolls its
+/// layout is that of an `overflow: hidden` BFC root.
+fn is_scroll_container(style: &Style) -> bool {
+    let scrollish = |overflow: Overflow| matches!(overflow, Overflow::Scroll | Overflow::Auto);
+    style.display.establishes_overflow_clip()
+        && (scrollish(style.resolved_overflow_x()) || scrollish(style.resolved_overflow_y()))
+}
+
 /// Either axis computes to something other than visible (CSS2 11.1.1).
 fn non_visible_overflow(style: &Style) -> bool {
     style.resolved_overflow_x() != Overflow::Visible
@@ -899,11 +909,7 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if flat[index].parent.is_some_and(|parent| {
         is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
     }) {
-        return Some("overflow");
-    }
-    let scrollish = |overflow: Overflow| matches!(overflow, Overflow::Scroll | Overflow::Auto);
-    if scrollish(style.resolved_overflow_x()) || scrollish(style.resolved_overflow_y()) {
-        return Some("overflow");
+        return Some("overflow:item");
     }
     let negative = |spacing: Spacing| match spacing {
         Spacing::Px(v)
@@ -920,7 +926,7 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         || negative(style.margin.bottom)
         || negative(style.margin.left)
     {
-        return Some("overflow");
+        return Some("overflow:negative-margin");
     }
     // A float alone inside the box matches legacy (the BFC contains it).
     // A float together with in-flow content, or a `clear`, still takes the
@@ -942,7 +948,7 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         }
     }
     if saw_clear || (saw_float && saw_inflow) {
-        return Some("overflow");
+        return Some("overflow:float");
     }
     None
 }
@@ -2456,6 +2462,12 @@ fn layout_block_in(
         && specified_height.is_some()
         && auto_content > content_height + 1.0 / 128.0
     {
+        return super::bail("overflow-scroll");
+    }
+    // A scroll container (`auto` / `scroll`) whose content overflows its
+    // block size, whatever clamps it (max-height too), has a scroll range;
+    // sticky descendants and scroll offsets stay on the legacy engine.
+    if is_scroll_container(style) && auto_content > content_height + 1.0 / 128.0 {
         return super::bail("overflow-scroll");
     }
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
