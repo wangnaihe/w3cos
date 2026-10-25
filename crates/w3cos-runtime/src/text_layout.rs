@@ -65,6 +65,7 @@ struct TextPaintSlot {
     font: u64,
     font_size: u32,
     white_space: u8,
+    break_mode: crate::line_break::BreakMode,
     layout: Rc<TextPaintLayout>,
 }
 
@@ -499,6 +500,7 @@ where
             text,
             1,
             false,
+            crate::line_break::BreakMode::default(),
             |index| {
                 if index == 0 {
                     first_line_width
@@ -581,6 +583,7 @@ fn wrap_greedy_with_run_width<F>(
     max_width: f32,
     first_line_width: f32,
     preserve_spaces: bool,
+    mode: crate::line_break::BreakMode,
     run_width: F,
 ) -> Vec<String>
 where
@@ -590,6 +593,7 @@ where
         text,
         1,
         preserve_spaces,
+        mode,
         |index| {
             if index == 0 {
                 first_line_width
@@ -633,6 +637,7 @@ fn wrap_greedy_with_line_width(
     text: &str,
     max_defer_lines: usize,
     preserve_spaces: bool,
+    mode: crate::line_break::BreakMode,
     mut line_width: impl FnMut(usize) -> f32,
     mut run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
@@ -653,13 +658,19 @@ fn wrap_greedy_with_line_width(
     }
     let mut lines = Vec::new();
     let mut current = String::new();
+    // `current` is always `text[current_start..]` up to the character being
+    // placed, so break opportunities of the whole text index into it.
+    let mut current_start = 0usize;
+    // UAX #14 opportunities (crate::line_break), computed on the first
+    // overflow only: most runs fit and never need them.
+    let mut opportunities: Option<Vec<usize>> = None;
     let flush = |lines: &mut Vec<String>, current: &mut String| {
         if !current.is_empty() {
             lines.push(std::mem::take(current));
         }
     };
 
-    for ch in text.chars() {
+    for (position, ch) in text.char_indices() {
         if matches!(ch, ' ' | '\n' | FORCED_LINE_BREAK) {
             defer_unbreakable_word_to_available_band(
                 &mut lines,
@@ -671,6 +682,7 @@ fn wrap_greedy_with_line_width(
         }
         if matches!(ch, '\n' | FORCED_LINE_BREAK) {
             lines.push(std::mem::take(&mut current));
+            current_start = position + ch.len_utf8();
             continue;
         }
 
@@ -682,25 +694,70 @@ fn wrap_greedy_with_line_width(
         // far below a 1/64px LayoutUnit, so genuinely narrower lines still wrap.
         let fitting_roundoff = available_width.max(1.0) * f32::EPSILON * 4.0;
         if current.chars().count() > 1 && run_width(&current) > available_width + fitting_roundoff {
-            if preserve_spaces && ch == ' ' {
+            if mode.hang_last_punctuation
+                && position + ch.len_utf8() == text.len()
+                && crate::line_break::is_hangable_last(ch)
+            {
+                // hanging-punctuation: last.
                 continue;
             }
-            // Explicit hyphens remain painted on the preceding line. Choose
-            // the latest opportunity, rather than always preferring an older
-            // space and moving the entire hyphenated word to the next line.
-            // U+2011 is deliberately not a break opportunity.
-            let soft_break = current.char_indices().rev().find_map(|(index, character)| {
-                if character == ' ' {
-                    Some((index + 1, if preserve_spaces { index + 1 } else { index }))
-                } else if let Some(end) = explicit_hyphen_break_end(&current, index) {
-                    Some((end, end))
-                } else {
-                    None
+            if ch == ' ' && mode.break_space == crate::line_break::BreakSpace::AfterSpaceRun {
+                if preserve_spaces {
+                    // Preserved spaces hang past the line end.
+                    continue;
                 }
-            });
-            if let Some((next_start, line_end)) = soft_break {
-                let remainder = current[next_start..].trim_start_matches(' ').to_string();
-                current.truncate(line_end);
+                // A collapsible space at the end of the line is removed;
+                // the next line starts after it.
+                current.pop();
+                while current.ends_with(' ') {
+                    current.pop();
+                }
+                flush(&mut lines, &mut current);
+                current_start = position + 1;
+                continue;
+            }
+            // NGLineBreaker: the latest break opportunity before the
+            // overflowing character (explicit hyphens stay on the preceding
+            // line), or, for overflow-wrap: anywhere / break-word, the latest
+            // grapheme boundary when the run has no opportunity.
+            let opportunities = opportunities
+                .get_or_insert_with(|| crate::line_break::break_opportunities(text, mode));
+            let latest = |boundaries: &[usize]| {
+                let k = boundaries.partition_point(|&o| o <= position);
+                (k > 0 && boundaries[k - 1] > current_start).then(|| boundaries[k - 1])
+            };
+            let split = latest(opportunities)
+                .or_else(|| {
+                    // CSS Text 3 5.2: with overflow-wrap: normal, keep-all
+                    // may relax to word-break: normal when the line has no
+                    // other opportunity.
+                    (mode.kind == crate::line_break::LineBreakType::KeepAll)
+                        .then(|| {
+                            let normal = crate::line_break::BreakMode {
+                                kind: crate::line_break::LineBreakType::Normal,
+                                ..mode
+                            };
+                            latest(&crate::line_break::break_opportunities(text, normal))
+                        })
+                        .flatten()
+                })
+                .or_else(|| {
+                    mode.break_anywhere_if_overflow
+                        .then(|| latest(&crate::line_break::grapheme_boundaries(text)))
+                        .flatten()
+                });
+            if let Some(split) = split {
+                let at = split - current_start;
+                let rest = &current[at..];
+                // break-spaces keeps the spaces that start the next line.
+                let trimmed = if mode.break_space == crate::line_break::BreakSpace::AfterSpaceRun {
+                    rest.trim_start_matches(' ')
+                } else {
+                    rest
+                };
+                let skipped = rest.len() - trimmed.len();
+                let remainder = trimmed.to_string();
+                current.truncate(at);
                 if !preserve_spaces {
                     while current.ends_with(' ') {
                         current.pop();
@@ -708,24 +765,7 @@ fn wrap_greedy_with_line_width(
                 }
                 flush(&mut lines, &mut current);
                 current = remainder;
-                continue;
-            }
-
-            let mut characters = current.chars();
-            let current_character = characters.next_back().unwrap_or(ch);
-            let previous_character = characters.next_back();
-            let cjk_break = previous_character.is_some_and(is_cjk_line_break_character)
-                || is_cjk_line_break_character(current_character);
-            if cjk_break && !may_not_start_line(current_character) {
-                current.pop();
-                if current.chars().last().is_some_and(may_not_end_line) {
-                    let opening = current.pop().unwrap();
-                    flush(&mut lines, &mut current);
-                    current.push(opening);
-                } else {
-                    flush(&mut lines, &mut current);
-                }
-                current.push(current_character);
+                current_start = split + skipped;
             }
         }
     }
@@ -1480,6 +1520,7 @@ pub fn wrap_text_with_char_width(
             &text,
             1,
             true,
+            crate::line_break::BreakMode::default(),
             |_| max_width,
             |run| run.chars().map(&mut char_width).sum(),
         );
@@ -1506,6 +1547,7 @@ pub fn wrap_text_with_char_width_and_first_line(
             &text,
             1,
             true,
+            crate::line_break::BreakMode::default(),
             |index| {
                 if index == 0 {
                     first_line_width
@@ -1525,6 +1567,22 @@ pub fn wrap_text_with_run_width(
     white_space: WhiteSpace,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
+    wrap_text_with_run_width_in(
+        text,
+        max_width,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        run_width,
+    )
+}
+
+pub(crate) fn wrap_text_with_run_width_in(
+    text: &str,
+    max_width: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
     if white_space == WhiteSpace::NoWrap {
         return text.split(FORCED_LINE_BREAK).map(str::to_string).collect();
@@ -1540,6 +1598,7 @@ pub fn wrap_text_with_run_width(
         max_width,
         max_width,
         white_space == WhiteSpace::PreWrap,
+        mode,
         run_width,
     )
 }
@@ -1549,6 +1608,24 @@ pub fn wrap_text_with_run_width_and_first_line(
     max_width: f32,
     first_line_width: f32,
     white_space: WhiteSpace,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    wrap_text_with_run_width_and_first_line_in(
+        text,
+        max_width,
+        first_line_width,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        run_width,
+    )
+}
+
+pub(crate) fn wrap_text_with_run_width_and_first_line_in(
+    text: &str,
+    max_width: f32,
+    first_line_width: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
@@ -1563,6 +1640,7 @@ pub fn wrap_text_with_run_width_and_first_line(
         max_width,
         first_line_width.max(1.0),
         white_space == WhiteSpace::PreWrap,
+        mode,
         run_width,
     )
 }
@@ -1577,6 +1655,24 @@ pub fn wrap_text_with_run_width_and_line_widths(
     white_space: WhiteSpace,
     run_width: impl FnMut(&str) -> f32,
 ) -> Vec<String> {
+    wrap_text_with_run_width_and_line_widths_in(
+        text,
+        max_width,
+        line_widths,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        run_width,
+    )
+}
+
+pub(crate) fn wrap_text_with_run_width_and_line_widths_in(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
+    run_width: impl FnMut(&str) -> f32,
+) -> Vec<String> {
     let text = prepare_text_for_white_space(text, white_space);
     if matches!(white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
         return text
@@ -1588,6 +1684,7 @@ pub fn wrap_text_with_run_width_and_line_widths(
         &text,
         line_widths.len().max(1),
         white_space == WhiteSpace::PreWrap,
+        mode,
         |index| line_widths.get(index).copied().unwrap_or(max_width),
         run_width,
     )
@@ -1628,6 +1725,7 @@ pub fn retained_text_paint_layout_with(
         &[max_width],
         font_size,
         white_space,
+        crate::line_break::BreakMode::default(),
         font_identity,
         || {
             let lines = wrap_text_with_char_width(text, max_width, white_space, char_width);
@@ -1653,6 +1751,7 @@ pub fn retained_text_paint_layout_with_first_line(
         &[first_line_width],
         font_size,
         white_space,
+        crate::line_break::BreakMode::default(),
         font_identity,
         || {
             let lines = wrap_text_with_char_width_and_first_line(
@@ -1683,6 +1782,7 @@ pub fn retained_text_paint_layout_with_run_width(
         &[max_width],
         font_size,
         white_space,
+        crate::line_break::BreakMode::default(),
         font_identity,
         || {
             let lines = wrap_text_with_run_width(text, max_width, white_space, run_width);
@@ -1724,6 +1824,30 @@ pub fn retained_text_paint_layout_with_run_width_and_line_widths(
     white_space: WhiteSpace,
     font_identity: u64,
     run_width: impl FnMut(&str) -> f32,
+    measure_ink: impl FnMut(&str) -> InkBounds,
+) -> Rc<TextPaintLayout> {
+    retained_text_paint_layout_with_run_width_and_line_widths_in(
+        text,
+        max_width,
+        line_widths,
+        font_size,
+        white_space,
+        crate::line_break::BreakMode::default(),
+        font_identity,
+        run_width,
+        measure_ink,
+    )
+}
+
+pub(crate) fn retained_text_paint_layout_with_run_width_and_line_widths_in(
+    text: &str,
+    max_width: f32,
+    line_widths: &[f32],
+    font_size: f32,
+    white_space: WhiteSpace,
+    mode: crate::line_break::BreakMode,
+    font_identity: u64,
+    run_width: impl FnMut(&str) -> f32,
     mut measure_ink: impl FnMut(&str) -> InkBounds,
 ) -> Rc<TextPaintLayout> {
     cached_text_paint_layout(
@@ -1732,13 +1856,15 @@ pub fn retained_text_paint_layout_with_run_width_and_line_widths(
         line_widths,
         font_size,
         white_space,
+        mode,
         font_identity,
         || {
-            let lines = wrap_text_with_run_width_and_line_widths(
+            let lines = wrap_text_with_run_width_and_line_widths_in(
                 text,
                 max_width,
                 line_widths,
                 white_space,
+                mode,
                 run_width,
             );
             let ink_bounds = lines.iter().map(|line| measure_ink(line)).collect();
@@ -1753,6 +1879,7 @@ fn cached_text_paint_layout(
     line_widths: &[f32],
     font_size: f32,
     white_space: WhiteSpace,
+    break_mode: crate::line_break::BreakMode,
     font_identity: u64,
     build: impl FnOnce() -> TextPaintLayout,
 ) -> Rc<TextPaintLayout> {
@@ -1768,6 +1895,7 @@ fn cached_text_paint_layout(
                         && slot.font == font_identity
                         && slot.font_size == font_size_bits
                         && slot.white_space == white_space
+                        && slot.break_mode == break_mode
                         && slot.line_widths.len() == line_widths.len()
                         && slot
                             .line_widths
@@ -1794,6 +1922,7 @@ fn cached_text_paint_layout(
             font: font_identity,
             font_size: font_size_bits,
             white_space,
+            break_mode,
             layout: layout.clone(),
         };
         if let Some(slots) = cache.entries.get_mut(text) {

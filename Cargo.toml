@@ -60,6 +60,9 @@ taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout",
 
 # Text layout: Parley — line-breaking, shaping, bidi, inline boxes
 parley = "0.7"
+icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_locale_core = { version = "2.3", default-features = false }
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 unicode-bidi = "0.3.18"
 unicode-bidi-mirroring = "0.4.0"
 fontdue = { path = "third_party/fontdue" }

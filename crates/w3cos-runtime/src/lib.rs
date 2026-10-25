@@ -125,6 +125,8 @@ pub mod ipc;
 pub mod jsdom;
 pub mod launch_handler_web;
 pub mod layout;
+pub(crate) mod layout_ng;
+pub(crate) mod line_break;
 mod list_marker;
 pub mod locks_web;
 pub mod manifest;
