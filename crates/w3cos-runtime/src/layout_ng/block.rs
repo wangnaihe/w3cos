@@ -346,7 +346,12 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if !blockified && (inline::is_atomic_inline(flat, index) || style.display == Display::Inline) {
         return Some("float:inline");
     }
+    // A floated flex or grid container is a BFC root whose inner display
+    // picks the algorithm (NGBlockNode::Layout); PositionFloat places its
+    // margin box like any other float. A floated `inline-grid` stays here.
+    let flex_or_grid = is_author_flex(style) || (is_author_grid(style) && !is_inline_grid(style));
     if !blockified
+        && !flex_or_grid
         && !matches!(
             style.display,
             Display::Block | Display::FlowRoot | Display::Table
@@ -357,6 +362,27 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let Some(parent) = info.parent else {
         return Some("float:root");
     };
+    // Legacy adds the float margins to the clearance of a cleared parent
+    // (overflow-area-003-ref rows 112px apart, Chrome and NG 96px). Its
+    // test still falls back for flex:column-align / flex:oof, so a flex or
+    // grid float in a cleared box stays on legacy with it.
+    if flex_or_grid && !blockified {
+        let mut box_parent = parent;
+        while is_float_group(flat[box_parent].style)
+            && let Some(up) = flat[box_parent].parent
+        {
+            box_parent = up;
+        }
+        if flat[box_parent].style.clear != Clear::None {
+            return Some("float:display");
+        }
+        // flexbox-overflow-horiz-001-ref sizes its floats with
+        // `calc(100% - 10px)`, which the style system drops to `auto`, so
+        // its test (scrolling flex floats) stays on legacy with it.
+        if is_scroll_container(style) {
+            return Some("float:display");
+        }
+    }
     if inline::is_inline_container(flat, parent)
         || matches!(flat[parent].kind, ComponentKind::Text { .. })
     {
@@ -938,6 +964,11 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         if node.style.display == Display::None || oof::is_out_of_flow(node.style) {
             continue;
         }
+        // The DOM's synthetic float rows are transparent (their floats
+        // belong to this BFC); they are not in-flow content themselves.
+        if is_float_group(node.style) && node.style.clear == Clear::None {
+            continue;
+        }
         if node.style.clear != Clear::None {
             saw_clear = true;
         }
@@ -1325,6 +1356,9 @@ pub(super) fn intrinsic_sizes(
     {
         return super::bail("intrinsic-percent");
     }
+    if is_author_flex(info.style) {
+        return super::flex::container_min_max(flat, index, space);
+    }
     if is_author_grid(info.style) {
         // A grid's min/max-content size is the sum of its tracks, not the
         // block-flow sum below. Shrink-to-fit of an auto-width grid stays
@@ -1434,6 +1468,31 @@ pub(super) fn intrinsic_sizes(
         }
     }
     Some(sizes)
+}
+
+/// ComputeMinAndMaxContentContribution of a child: its margin box, from a
+/// definite width or its own intrinsic sizes, clamped by min/max-width.
+pub(super) fn min_max_contribution(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    let style = flat[index].style;
+    let side = |s: Spacing| match s {
+        Spacing::Auto => 0.0,
+        s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
+    };
+    let b = border(style);
+    let edges = b[1] + b[3] + side(style.padding.left) + side(style.padding.right);
+    let margins = side(style.margin.left) + side(style.margin.right);
+    let content = match resolve_dim(style.width, None, style, space) {
+        Some(w) => MinMax::exact(match style.box_sizing {
+            BoxSizing::BorderBox => (w - edges).max(0.0),
+            BoxSizing::ContentBox => w,
+        }),
+        None => intrinsic_sizes(flat, index, space).why("intrinsic")?,
+    };
+    Some(content.map(|w| clamp_inline(style, space, edges, w) + edges + margins))
 }
 
 /// CSS2 10.3.9 shrink-to-fit width of an inline-block's content box:

@@ -475,6 +475,46 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     Some(sizes)
 }
 
+/// NGFlexLayoutAlgorithm::ComputeMinMaxSizes of the content box. A column
+/// encompasses its items' contributions. A row adds up their max-content
+/// contributions and the column gaps; its min-content size is the sum
+/// too on one line, the largest item when it wraps.
+pub(super) fn container_min_max(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    let style = flat[index].style;
+    let row = row_axis(style.flex_direction);
+    let multiline = style.flex_wrap != FlexWrap::NoWrap;
+    let mut sizes = MinMax::exact(0.0);
+    let mut count = 0usize;
+    for child in rendered_children(flat, index) {
+        if oof::is_out_of_flow(flat[child].style) {
+            continue;
+        }
+        let item = block::min_max_contribution(flat, child, space).why("flex:intrinsic")?;
+        count += 1;
+        if !row {
+            sizes.encompass(item);
+            continue;
+        }
+        sizes.max += item.max;
+        sizes.min = sizes
+            .min
+            .zip(item.min)
+            .map(|(a, b)| if multiline { a.max(b) } else { a + b });
+    }
+    if row && count > 1 {
+        let gaps = style.column_gap.unwrap_or(style.gap).max(0.0) * (count - 1) as f32;
+        sizes.max += gaps;
+        if !multiline {
+            sizes.min = sizes.min.map(|min| min + gaps);
+        }
+    }
+    Some(sizes)
+}
+
 /// Fit-content inline size of a column item (CSS Sizing 3 §5.2.1):
 /// `clamp(min-content, available, max-content)`. `available` is the
 /// container's inner width minus this item's cross margins and edges.
@@ -1207,8 +1247,11 @@ pub(super) fn layout(
         };
         let main = unit(main);
         let margin_box = item.margin_box_cross();
-        let extra = (line_inner - margin_box).max(0.0);
-        // A definite cross size does not stretch; it aligns as flex-start.
+        // Unsafe alignment (FlexItem::AlignmentOffset): an item larger than
+        // its line overflows both sides when centered, the start when
+        // flex-end. A definite cross size does not stretch; it aligns as
+        // flex-start.
+        let extra = line_inner - margin_box;
         let from_start = match item.align {
             AlignItems::FlexEnd => extra,
             AlignItems::Center => extra / 2.0,
@@ -1543,7 +1586,8 @@ fn layout_wrapped(
             };
             let main = unit(main);
             let margin_box = item.margin_box_cross();
-            let extra = (line_size - margin_box).max(0.0);
+            // Unsafe alignment, as in the single-line path.
+            let extra = line_size - margin_box;
             let from_cross_start = match item.align {
                 AlignItems::FlexEnd => extra,
                 AlignItems::Center => extra / 2.0,

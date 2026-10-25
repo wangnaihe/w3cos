@@ -987,42 +987,58 @@ fn floated_inline_block_and_list_item_match_chrome() {
     assert_eq!(rect(&out, 6), (0.0, 80.0, 30.0, 10.0));
     assert_eq!(rect(&out, 7), (0.0, 90.0, 200.0, 10.0));
 
-    let flex = node(
-        block(),
-        vec![node(
+    // A floated flex or grid container is a BFC root laid out by its own
+    // algorithm (NGBlockNode::Layout) and placed by PositionFloat. The
+    // auto-width flex float is its max-content width: 30 + 5 gap + 20.
+    let item = |w: f32, h: f32| {
+        node(
             Style {
-                display: Display::Flex,
-                float: Float::Left,
-                width: Dimension::Px(40.0),
-                height: Dimension::Px(20.0),
-                ..Style::default()
+                width: Dimension::Px(w),
+                height: Dimension::Px(h),
+                ..block()
             },
             vec![],
-        )],
+        )
+    };
+    let floats = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: w3cos_std::style::FlexDirection::Row,
+                    float: Float::Left,
+                    column_gap: Some(5.0),
+                    ..Style::default()
+                },
+                vec![item(30.0, 10.0), item(20.0, 15.0)],
+            ),
+            node(
+                Style {
+                    display: Display::Grid,
+                    float: Float::Left,
+                    width: Dimension::Px(40.0),
+                    height: Dimension::Px(20.0),
+                    ..Style::default()
+                },
+                vec![],
+            ),
+        ],
     );
+    let flat = pre_flatten(&floats);
     assert!(
-        block::unsupported_reasons(&pre_flatten(&flex))
-            .iter()
-            .any(|reason| reason == "float:display")
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
     );
-    let grid = node(
-        block(),
-        vec![node(
-            Style {
-                display: Display::Grid,
-                float: Float::Left,
-                width: Dimension::Px(40.0),
-                height: Dimension::Px(20.0),
-                ..Style::default()
-            },
-            vec![],
-        )],
-    );
-    assert!(
-        block::unsupported_reasons(&pre_flatten(&grid))
-            .iter()
-            .any(|reason| reason == "float:display")
-    );
+    let out = layout_tree(&floats, &flat, 800.0, 600.0).expect("flex and grid floats");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 55.0, 15.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 30.0, 10.0));
+    assert_eq!(rect(&out, 3), (35.0, 0.0, 20.0, 15.0));
+    assert_eq!(rect(&out, 4), (55.0, 0.0, 40.0, 20.0));
     let inline_parent = node(
         block(),
         vec![
@@ -3417,4 +3433,56 @@ fn inline_block_leading_block_shares_the_line_baseline() {
         (simple_a - mixed_a).abs() < 1.0,
         "baseline y {simple_a} vs {mixed_a}"
     );
+}
+
+/// flexbox-overflow-horiz-002: `align-items: center` is unsafe, so an
+/// item taller than its line overflows both sides (Chrome: big item at
+/// y=-20 in the 70px container, small item at y=25).
+#[test]
+fn centered_flex_item_overflows_its_line_unsafely() {
+    use w3cos_std::style::{AlignItems, FlexDirection, Float};
+    let big = node(
+        Style {
+            height: Dimension::Px(10.0),
+            border_width: 2.0,
+            border_top_width: Some(50.0),
+            border_bottom_width: Some(50.0),
+            flex_grow: 3.0,
+            flex_basis: Dimension::Px(0.0),
+            ..block()
+        },
+        vec![],
+    );
+    let small = node(
+        Style {
+            height: Dimension::Px(20.0),
+            flex_grow: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            ..block()
+        },
+        vec![],
+    );
+    let fc = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            width: Dimension::Px(70.0),
+            height: Dimension::Px(70.0),
+            float: Float::Left,
+            ..Style::default()
+        },
+        vec![big, small],
+    );
+    let root = node(block(), vec![fc]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("centered flex float");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 70.0, 70.0));
+    assert_eq!(rect(&out, 2), (0.0, -20.0, 53.5, 110.0));
+    assert_eq!(rect(&out, 3), (53.5, 25.0, 16.5, 20.0));
 }
