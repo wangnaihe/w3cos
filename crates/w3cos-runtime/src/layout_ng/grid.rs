@@ -774,7 +774,10 @@ pub(super) fn fixed_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bo
     }) {
         return false;
     }
-    if !matches!(style.position, Position::Static | Position::Relative) {
+    // Static boxes stay on the marker. A static `inline-grid` reference
+    // (fixed px tracks, no insets) is paired with tests that still fall
+    // back, and switching only the reference splits the reftest.
+    if style.position != Position::Relative {
         return false;
     }
     if style.direction == TextDirection::Rtl

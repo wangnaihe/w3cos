@@ -2788,6 +2788,17 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
         "{:?}",
         block::unsupported_reasons(&margin_flat)
     );
+
+    // A static box is the reference side of reftests that still fall back.
+    let mut static_grid = grid("100px", "40px", AlignItems::Stretch);
+    static_grid.position = Position::Static;
+    let static_root = node(block(), vec![node(static_grid, vec![])]);
+    let static_flat = pre_flatten(&static_root);
+    assert!(
+        !block::supports_tree(&static_flat),
+        "{:?}",
+        block::unsupported_reasons(&static_flat)
+    );
 }
 
 /// Non-fixed tracks on a definite top-level `inline-grid`, and baseline
