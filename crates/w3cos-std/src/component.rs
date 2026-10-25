@@ -624,6 +624,19 @@ mod tests {
     }
 
     #[test]
+    fn shared_row_constructor_accepts_component_style_without_eager_conversion() {
+        let shared = ComponentStyle::from(Style {
+            flex_direction: FlexDirection::Row,
+            ..Style::default()
+        });
+        let peer = shared.clone();
+        let row = Component::row_shared(shared, vec![]);
+
+        assert_eq!(row.style.flex_direction, FlexDirection::Row);
+        assert_eq!(peer.flex_direction, FlexDirection::Row);
+    }
+
+    #[test]
     fn component_style_explicit_access_and_owned_conversion_preserve_values() {
         let mut shared = ComponentStyle::from(Style::default());
         shared.make_mut().flex_direction = FlexDirection::RowReverse;

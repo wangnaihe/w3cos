@@ -20824,7 +20824,7 @@ fn quote_word_fragment_advances(
         }
         ranges.push((start..flattened.len(), is_word));
     }
-    let virtual_line = Component::row(component.style.clone(), flattened);
+    let virtual_line = Component::row_shared(component.style.clone(), flattened);
     let mut advances = inline_fragment_shaped_advances_for_width(&virtual_line, available_width);
     // A generated source ends at a LayoutUnit boundary even when its last
     // word shares a no-break wrapper with a different quote source. Retain
