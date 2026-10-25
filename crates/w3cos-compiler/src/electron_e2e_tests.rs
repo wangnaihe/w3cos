@@ -376,7 +376,13 @@ const WEB_FRAME: &[(&str, &str)] = &[
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 let win
-ipcMain.on('line', (_event, line) => { console.log(line); setTimeout(() => win.close(), 0) })
+ipcMain.on('line', (event, line) => {
+  console.log(line)
+  // Code-OSS validatedIpcMain only accepts main-frame senders.
+  const frame = event.senderFrame
+  console.log('sender-frame', frame === event.sender.mainFrame, frame.parent, frame.top === frame, frame.url === event.sender.getURL(), frame.framesInSubtree.length)
+  setTimeout(() => win.close(), 0)
+})
 app.whenReady().then(async () => {
   // Code-OSS's protocolMainService intercepts file: and refuses it.
   protocol.handle('file', () => new Response('refused', { status: 403 }))
@@ -429,7 +435,8 @@ fn electron_web_frame_web_utils_and_file_protocol_handle() {
             "double-handle throws",
             "file-handle 403 200 true",
             "file-unhandled 200",
-            r#"{"before":[0,1],"level":2,"factor":1.44,"reset":0,"utils":"function","frame":"function,function,function,function,function"}"#
+            r#"{"before":[0,1],"level":2,"factor":1.44,"reset":0,"utils":"function","frame":"function,function,function,function,function"}"#,
+            "sender-frame true null true true 1",
         ],
         "{lines:#?}"
     );
