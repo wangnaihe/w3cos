@@ -2666,3 +2666,75 @@ fn overflow_rewinds_inside_an_earlier_item() {
         ]
     );
 }
+
+#[test]
+fn folded_breaks_split_into_forced_break_items() {
+    let _ahem = AhemGuard::new();
+    let layout = |width: f32, texts: &[&str]| {
+        let mut container = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            ..Style::default()
+        };
+        font(&mut container, 20.0, LineHeight::Number(1.0));
+        container
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let children = texts
+            .iter()
+            .map(|content| {
+                let mut style = Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                };
+                font(&mut style, 20.0, LineHeight::Number(1.0));
+                Component::text(*content, style)
+            })
+            .collect();
+        let root = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, children)],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let (_, _, fragment) = block::layout_root(&flat, 800.0, 600.0).expect("ng");
+        fn leaves(
+            f: &BoxFragment,
+            x: f32,
+            y: f32,
+            out: &mut Vec<(usize, Option<(usize, usize)>, [f32; 4])>,
+        ) {
+            if f.children.is_empty() {
+                out.push((f.index, f.text_range, [x, y, f.width, f.height]));
+            }
+            for (dx, dy, c) in &f.children {
+                leaves(c, x + dx, y + dy, out);
+            }
+        }
+        let mut got = Vec::new();
+        leaves(&fragment, 0.0, 0.0, &mut got);
+        got.retain(|(i, _, _)| *i >= 2);
+        got
+    };
+    // "XX<br>X XXXX<br>" folded into one leaf, then "XX".
+    assert_eq!(
+        layout(120.0, &["XX\u{2028}X XXXX\u{2028}", "XX"]),
+        vec![
+            (2, Some((0, 2)), [0.0, 0.0, 40.0, 20.0]),
+            (2, Some((5, 11)), [0.0, 20.0, 120.0, 20.0]),
+            (3, None, [0.0, 40.0, 40.0, 20.0]),
+        ]
+    );
+    // The collapsible space after a break is removed at the line start.
+    assert_eq!(
+        layout(120.0, &["X\u{2028} XX"]),
+        vec![
+            (2, Some((0, 1)), [0.0, 0.0, 20.0, 20.0]),
+            (2, Some((5, 7)), [0.0, 20.0, 40.0, 20.0]),
+        ]
+    );
+}

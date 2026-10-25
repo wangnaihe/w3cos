@@ -631,8 +631,10 @@ fn inline_text_reason(
             return Some("text:break-spaces");
         }
         // Items may hold internal soft-wrap opportunities (the breaker falls
-        // back when it would need one), but no forced break.
-        if content.contains(['\u{2028}', '\u{2029}']) && content != FORCED_BREAK {
+        // back when it would need one).  A <br> folded into a text leaf
+        // (U+2028) becomes its own forced-break item (NGInlineItemsBuilder
+        // kControl); a paragraph separator stays on legacy.
+        if content.contains('\u{2029}') {
             return Some("text:internal-break");
         }
     }
@@ -974,6 +976,20 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if let Some(reason) = inline_text_reason(content, info.style, sole, style) {
             return Some(reason);
         }
+        if content != FORCED_BREAK && content.contains('\u{2028}') {
+            // Forced breaks folded into the leaf (split into kControl items
+            // at item building): the forced-break rules below, with the
+            // leaf's own font; visual-order and rtl paragraphs stay on legacy.
+            if !matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+                || has_marker(flat[0].style, QUIRKS_MARKER)
+                || !same_font(info.style, style)
+                || style.direction == TextDirection::Rtl
+                || bidi_fragment(info.style)
+                || !zero_edges(info.style)
+            {
+                return Some("text:internal-break");
+            }
+        }
         if content == FORCED_BREAK {
             // NGLineBreaker forced break: the item adds no metrics, so its
             // font must be the strut's (a <br> in a differently sized inline
@@ -1298,6 +1314,102 @@ fn split_text_item(
         }
     }
     best.or_else(|| overflow.then(|| piece(candidates[0])))
+}
+
+/// NGInlineItemsBuilder: a text leaf holding folded `<br>`s (U+2028) is
+/// emitted as text items around kControl forced-break items, all sharing the
+/// leaf (`range` selects each piece).  Leading collapsible spaces after a
+/// break get their own item so the breaker drops them at the line start;
+/// the enclosing boxes' edges stay on the first and last piece.
+fn split_forced_breaks(
+    content: &str,
+    whole: InlineItem,
+    style: &Style,
+    hang_preserved: bool,
+    items: &mut Vec<InlineItem>,
+) -> Option<()> {
+    let mut pieces: Vec<(usize, usize, bool)> = Vec::new();
+    let mut at = 0;
+    for (offset, _) in content.match_indices('\u{2028}') {
+        if offset > at {
+            pieces.push((at, offset, false));
+        }
+        let end = offset + '\u{2028}'.len_utf8();
+        pieces.push((offset, end, true));
+        at = end;
+    }
+    if at < content.len() {
+        pieces.push((at, content.len(), false));
+    }
+    // Split off leading spaces of text that follows a break.
+    let mut split: Vec<(usize, usize, bool)> = Vec::with_capacity(pieces.len());
+    for (n, &(a, b, forced)) in pieces.iter().enumerate() {
+        let lead = content[a..b].len() - content[a..b].trim_start_matches(' ').len();
+        if !forced && n > 0 && lead > 0 && lead < b - a {
+            split.push((a, a + lead, false));
+            split.push((a + lead, b, false));
+        } else {
+            split.push((a, b, forced));
+        }
+    }
+    let first_forced = split.first().is_some_and(|p| p.2);
+    let last_forced = split.last().is_some_and(|p| p.2);
+    if (first_forced && whole.box_start > 0.0) || (last_forced && whole.box_end > 0.0) {
+        // A break at a box edge: the <br> would carry the box's edge.
+        return super::bail("internal-break-edges");
+    }
+    let texts: Vec<&str> = split
+        .iter()
+        .filter(|p| !p.2)
+        .map(|&(a, b, _)| &content[a..b])
+        .collect();
+    let advances = run_advances(&texts, style);
+    let mut next = advances.into_iter();
+    let count = split.len();
+    // Metrics come from the pieces' own text (NGInlineItem shape results):
+    // the U+2028 itself is a control item, never shaped, so it must not
+    // pull in a fallback font.  A break takes the leaf's text metrics.
+    let unbroken = content.replace('\u{2028}', "");
+    let metrics = |text: &str| -> (f32, f32) {
+        let source = if text.is_empty() {
+            unbroken.as_str()
+        } else {
+            text
+        };
+        let (height, baseline) = text_line_metrics(source, style);
+        (baseline, height - baseline)
+    };
+    for (n, &(a, b, forced)) in split.iter().enumerate() {
+        let mut piece = whole.clone();
+        (piece.ascent, piece.descent) = metrics(if forced { "" } else { &content[a..b] });
+        piece.range = Some((a, b));
+        piece.box_start = if n == 0 { whole.box_start } else { 0.0 };
+        piece.box_end = if n + 1 == count { whole.box_end } else { 0.0 };
+        piece.forced = forced;
+        if forced {
+            piece.raw = 0.0;
+            piece.raw_hang = 0.0;
+            piece.starts_space = false;
+            piece.ends_space = false;
+            piece.whitespace_only = false;
+            piece.internal_break = false;
+        } else {
+            let text = &content[a..b];
+            let adv = next.next()?;
+            let edges = piece.box_start + piece.box_end;
+            piece.raw = adv + edges;
+            piece.raw_hang = hang_advance(text, adv, style) + edges;
+            piece.starts_space = text.starts_with(' ');
+            piece.ends_space = text.ends_with(' ');
+            piece.whitespace_only = text.trim_end_matches(' ').is_empty();
+            piece.internal_break = internal_opportunity(text, style)
+                || (hang_preserved
+                    && text.starts_with(' ')
+                    && !text.trim_start_matches(' ').is_empty());
+        }
+        items.push(piece);
+    }
+    Some(())
 }
 
 /// LayoutUnit width of a line holding `line` (item indices in order) for
@@ -1920,6 +2032,10 @@ pub(super) fn layout_inline_beside(
                 content_ascent: inline_font_content_ascent(style),
                 font_height: inline_font_height(style),
             });
+            if content != FORCED_BREAK && content.contains('\u{2028}') {
+                let whole = items.pop().expect("just pushed");
+                split_forced_breaks(content, whole, style, hang_preserved, &mut items)?;
+            }
         }
         run += 1;
         start = end;
@@ -2345,6 +2461,11 @@ pub(super) fn layout_inline_beside(
                     }
                 }
             };
+            if item.forced && item.range.is_some() {
+                // A break folded into a text leaf: the leaf's rect is the
+                // union of its text pieces (no <br> node of its own).
+                continue;
+            }
             if item.forced {
                 // The engine's <br> marker: a zero-height full-width rect at
                 // the line end, painting nothing.
