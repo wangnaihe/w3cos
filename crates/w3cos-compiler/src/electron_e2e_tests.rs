@@ -361,3 +361,77 @@ fn electron_module_page_script_evaluates_when_the_page_loads() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// The Code-OSS preload destructures `webFrame` and `webUtils` from
+/// `electron` and sets the zoom level from the window configuration; its
+/// main process intercepts `file:` with `protocol.handle`.
+const WEB_FRAME: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-web-frame", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain, protocol, net } = require('electron')
+const path = require('node:path')
+const { pathToFileURL } = require('node:url')
+let win
+ipcMain.on('line', (_event, line) => { console.log(line); setTimeout(() => win.close(), 0) })
+app.whenReady().then(async () => {
+  // Code-OSS's protocolMainService intercepts file: and refuses it.
+  protocol.handle('file', () => new Response('refused', { status: 403 }))
+  try { protocol.handle('file', () => null); console.log('double-handle ok') } catch (e) { console.log('double-handle throws') }
+  const href = pathToFileURL(path.join(__dirname, 'index.html')).href
+  const handled = await net.fetch(href)
+  const bypass = await net.fetch(href, { bypassCustomProtocolHandlers: true })
+  console.log('file-handle', handled.status, bypass.status, (await bypass.text()).startsWith('<!DOCTYPE html>'))
+  protocol.unhandle('file')
+  console.log('file-unhandled', (await net.fetch(href)).status)
+  win = new BrowserWindow({ show: false, webPreferences: { preload: path.join(__dirname, 'preload.js') } })
+  win.loadFile('index.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "preload.js",
+        r#"const { ipcRenderer, webFrame, webUtils } = require('electron')
+const before = [webFrame.getZoomLevel(), webFrame.getZoomFactor()]
+webFrame.setZoomLevel(2)
+const level = webFrame.getZoomLevel()
+const factor = Math.round(webFrame.getZoomFactor() * 100) / 100
+webFrame.setZoomFactor(1)
+ipcRenderer.send('line', JSON.stringify({
+  before, level, factor, reset: webFrame.getZoomLevel(),
+  utils: typeof webUtils.getPathForFile,
+  frame: ['setZoomLevel', 'getZoomLevel', 'setZoomFactor', 'getZoomFactor', 'setVisualZoomLevelLimits'].map((k) => typeof webFrame[k]).join(','),
+}))
+"#,
+    ),
+    (
+        "index.html",
+        r#"<!DOCTYPE html><html><head><title>webFrame</title></head><body></body></html>"#,
+    ),
+];
+
+#[test]
+fn electron_web_frame_web_utils_and_file_protocol_handle() {
+    let root = write_fixture("w3cos_electron_web_frame", WEB_FRAME);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_web_frame",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        [
+            "double-handle throws",
+            "file-handle 403 200 true",
+            "file-unhandled 200",
+            r#"{"before":[0,1],"level":2,"factor":1.44,"reset":0,"utils":"function","frame":"function,function,function,function,function"}"#
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

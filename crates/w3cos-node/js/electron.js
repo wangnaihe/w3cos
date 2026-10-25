@@ -622,6 +622,25 @@ const contextBridge = {
   },
 };
 
+// --- webFrame / webUtils (renderer) -------------------------------------------
+
+// One renderer with no page zoom: zoom calls are recorded so reads match.
+let zoomLevel = 0;
+const webFrame = {
+  setZoomLevel(level) { zoomLevel = Number(level) || 0; },
+  getZoomLevel() { return zoomLevel; },
+  setZoomFactor(factor) { zoomLevel = Math.log(Number(factor) || 1) / Math.log(1.2); },
+  getZoomFactor() { return Math.pow(1.2, zoomLevel); },
+  setVisualZoomLevelLimits() { return Promise.resolve(); },
+  getResourceUsage() { return {}; },
+  clearCache() {},
+};
+
+const webUtils = {
+  // `File` objects from the host's pickers carry their filesystem path.
+  getPathForFile(file) { return file && typeof file.path === 'string' ? file.path : ''; },
+};
+
 // --- dialog (File System Access pickers, alert/confirm) -----------------------
 
 function pickerFailed(error) {
@@ -970,7 +989,9 @@ const net = {
     const href = typeof input === 'string' ? input : String(input && input.url !== undefined ? input.url : input);
     const scheme = schemeOf(href);
     const bypass = init && init.bypassCustomProtocolHandlers;
-    const handler = bypass ? undefined : (scheme === 'file' ? fileInterceptors.get('file') : protocolHandlers.get(scheme));
+    const handler = bypass
+      ? undefined
+      : protocolHandlers.get(scheme) || (scheme === 'file' ? fileInterceptors.get('file') : undefined);
     if (handler) return runHandler(handler, href, init);
     if (scheme === 'file') return fetchFile(href);
     if (typeof originalFetch === 'function') return originalFetch(href, init);
@@ -1000,9 +1021,13 @@ if (originalFetch !== undefined) {
   };
 }
 
+// `protocol.handle()` also takes the built-in schemes (it intercepts them,
+// e.g. Code-OSS refuses `file:` loads); the legacy `register*Protocol` calls
+// do not.
 function registerHandler(map, scheme, handler, verb) {
   const name = String(scheme);
-  if (map.has(name) || (map === protocolHandlers && BUILTIN_SCHEMES.indexOf(name) >= 0)) {
+  const builtin = map === protocolHandlers && verb === 'boolean' && BUILTIN_SCHEMES.indexOf(name) >= 0;
+  if (map.has(name) || builtin) {
     if (verb === 'boolean') return false;
     throw new Error('Failed to register protocol: ' + name);
   }
@@ -1240,6 +1265,8 @@ module.exports = {
   ipcMain,
   ipcRenderer,
   contextBridge,
+  webFrame,
+  webUtils,
   dialog,
   shell,
   Menu,
