@@ -1,0 +1,12 @@
+{
+  "main": "09d981226c7373d8ae5100274a8878d28da60655",
+  "pr200": "bf3cf66d1b4e2988377fd9042a89558e55d5ad5e",
+  "pr201": "062b910d2622485d730c66188ae0488a9e7fc540",
+  "composition_patch_sha256": "12513eb03a5dc01bc5fe6937793f510975d96354fd4ae21410259c061f8cd7ec",
+  "recipe": [
+    "apply main..pr200 full diff",
+    "apply main..pr201 diff excluding binary.rs",
+    "apply archived pr200-composition-final.patch"
+  ],
+  "review_comments": "Only existing bot summaries (0 tests), no actionable comments on either PR at inspection. Bot status is not semantic correctness proof."
+}

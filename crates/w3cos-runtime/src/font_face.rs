@@ -448,6 +448,11 @@ pub(crate) fn pinned_font_mgr() -> skia_safe::FontMgr {
     skia_safe::FontMgr::default()
 }
 
+#[cfg(feature = "embed-cjk-font")]
+pub(crate) fn embedded_cjk_subset_len() -> usize {
+    system_fonts::embedded_cjk_subset_len()
+}
+
 pub(crate) fn host_ui_font() -> &'static HostUiFont {
     HOST_UI_FONT.get_or_init(|| {
         // Tests pin fontconfig at a bundled set whose symlink faces and
@@ -464,8 +469,17 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
                 families: &system_fonts::host_ui_families(),
                 ..fontdb::Query::default()
             })
-            .or_else(|| database.faces().next().map(|face| face.id))
-            .expect("host must provide at least one system font");
+            .or_else(|| database.faces().next().map(|face| face.id));
+        let Some(id) = id else {
+            #[cfg(all(not(test), feature = "embed-cjk-font"))]
+            if let Some(face) = system_fonts::bundled_cjk_face() {
+                eprintln!(
+                    "[W3C OS] no system font is installed; using the embedded CJK subset because embed-cjk-font is enabled"
+                );
+                return finish_host_font(face.family, face.data, face.collection_index.unwrap_or(0));
+            }
+            panic!("host must provide at least one system font");
+        };
         let family = database
             .face(id)
             .and_then(|face| face.families.first())

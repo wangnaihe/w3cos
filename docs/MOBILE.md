@@ -81,12 +81,25 @@ workflows that intentionally preserve the generated source directory. Without
 it, the build regenerates that directory from the application graph.
 
 Generated iOS and Android applications disable the runtime's default feature
-set. The normal mobile closure contains only the Skia presenter and its current
-window owner; Vello/WGPU and advanced graphics/media groups are restored only
-when the compiled application references those capabilities. Debug builds keep
-LTO off and incremental code generation on. `--release` uses the generated
-size-oriented profile (`opt-level=z`, fat LTO, one codegen unit and symbol
-stripping); do not use it for the daily edit loop.
+set and select exactly one primary renderer. The normal closure enables `skia`
+and presents with Skia Metal or Vulkan. `cpu-render` (tiny-skia and softbuffer)
+is not linked into that artifact; if the platform surface is unavailable the
+window warns that no software renderer is present. An application that
+references WebGPU, WebGL, or WebXR links `gpu` and `web-graphics-advanced`
+instead of Skia. Advanced media and devtools stay off unless requested.
+`scripts/check-mobile-renderer-boundary.sh` enforces those two closures in CI.
+Debug builds keep LTO off and incremental code generation on. `--release` uses
+the generated size-oriented profile (`opt-level=z`, fat LTO, one codegen unit
+and symbol stripping); do not use it for the daily edit loop.
+
+Raster formats are explicit `w3cos-runtime` features. Mobile manifests enable
+`image-png`, `image-jpeg`, and `image-webp` only. GIF, BMP, and ICO stay on
+the desktop/runtime defaults and are not part of the mobile closure. The
+`embed-cjk-font` feature and `W3COS_EMBED_CJK_FONT` are the only ways to
+package `assets/CJK-Subset.ttf` (10,028,840 bytes). Otherwise text uses the
+platform font API: Android `AFontMatcher`, iOS Core Text, and the desktop
+fontconfig / Core Text / `NONCLIENTMETRICS` paths. A missing CJK face warns
+once. Set `W3COS_EMBED_CJK_FONT=0` to force the subset off.
 
 The ordinary raster closure also excludes the AVIF encoder. In `image 0.25`,
 the `avif` feature is backed by `ravif`/`rav1e` and does not decode AVIF; W3COS

@@ -604,6 +604,7 @@ impl ArrayStorage {
     }
 
     pub(crate) fn refresh_heap_accounting(&self) {
+        self.allocation.cache_dirty.set(true);
         self.allocation.set_bytes(
             std::mem::size_of::<Self>().saturating_add(
                 self.values
@@ -611,6 +612,14 @@ impl ArrayStorage {
                     .saturating_mul(std::mem::size_of::<Value>()),
             ),
         );
+    }
+
+    pub(crate) fn binary_cache_dirty(&self) -> bool {
+        self.allocation.cache_dirty.get()
+    }
+
+    pub(crate) fn mark_binary_cache_synced(&self) {
+        self.allocation.cache_dirty.set(false);
     }
 
     pub fn replace_values(&mut self, values: Vec<Value>) {
@@ -633,31 +642,38 @@ impl ArrayStorage {
     }
 
     pub(crate) fn pop(&mut self) -> Option<Value> {
+        self.allocation.cache_dirty.set(true);
         self.values.pop()
     }
 
     pub(crate) fn remove(&mut self, index: usize) -> Value {
+        self.allocation.cache_dirty.set(true);
         self.values.remove(index)
     }
 
     pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
+        self.allocation.cache_dirty.set(true);
         self.values.split_off(at)
     }
 
     pub(crate) fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> Value) {
+        self.allocation.cache_dirty.set(true);
         self.values.resize_with(new_len, f);
         self.refresh_heap_accounting();
     }
 
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
+        self.allocation.cache_dirty.set(true);
         self.values.get_mut(index)
     }
 
     pub(crate) fn clear(&mut self) {
+        self.allocation.cache_dirty.set(true);
         self.values.clear();
     }
 
     pub(crate) fn reverse(&mut self) {
+        self.allocation.cache_dirty.set(true);
         self.values.reverse();
     }
 }
@@ -672,6 +688,7 @@ impl Deref for ArrayStorage {
 
 impl Extend<Value> for ArrayStorage {
     fn extend<T: IntoIterator<Item = Value>>(&mut self, iter: T) {
+        self.allocation.cache_dirty.set(true);
         self.values.extend(iter);
         self.refresh_heap_accounting();
     }
@@ -693,6 +710,7 @@ where
     I: SliceIndex<[Value]>,
 {
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        self.allocation.cache_dirty.set(true);
         &mut self.values[index]
     }
 }
@@ -1851,6 +1869,11 @@ fn dom_shape_method_key(key: &str) -> bool {
             | "createTextNode"
             | "push"
             | "__proto__"
+            // The detach fast path caches a negative scan of DOM prototype
+            // chains. Authored lifecycle state on any shared/custom
+            // prototype must invalidate that proof before the next removal.
+            | "__w3cos_custom_element_upgraded"
+            | "disconnectedCallback"
     )
 }
 

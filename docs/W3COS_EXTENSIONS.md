@@ -194,6 +194,14 @@ interface W3cosTrayHandle {
   Promise<undefined> remove();
 };
 
+[Exposed=Window]
+interface W3cosKeyring {
+  Promise<USVString?> get(USVString name);
+  Promise<undefined> set(USVString name, USVString secret);
+  Promise<undefined> delete(USVString name);
+  Promise<sequence<USVString>> list();
+};
+
 dictionary W3cosAgentOptions {
   USVString scope = "app"; // "system" | "cross-app" | "background" are refused
 };
@@ -205,10 +213,10 @@ interface W3cosAgent {
 };
 ```
 
-`windows`, `daemon`, `system`, and `keyring` expose their method names
+`windows`, `daemon`, and `system` expose their method names
 (`list`, `focus`, `setAlwaysOnTop`, `install`, `start`, `enableAutostart`,
-`get`, `set`, `power`, `delete`) so callers can feature-detect them. Each
-one rejects. `tray.show` and `tray.setMenu` are real.
+`get`, `set`, `power`) so callers can feature-detect them. Each one
+rejects. `tray.show`, `tray.setMenu`, and the `keyring` methods are real.
 
 ### Implemented slice
 
@@ -225,6 +233,16 @@ one rejects. `tray.show` and `tray.setMenu` are real.
   when a shortcut is registered, so an empty registry does not touch the
   input hot path. The OS thread queues accelerator strings;
   `flush_global_shortcuts()` delivers them on the JavaScript thread.
+- `navigator.w3cos.tray` and `navigator.w3cos.keyring` stay available as
+  explicit `w3cos-runtime` features. `host-tray` and `host-keyring` are in
+  the crate `default` set and in `w3cos-shell`
+  (`features = ["web-sensors", "web-geolocation", "web-bluetooth", "host-tray", "host-keyring", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]`).
+  Ordinary AOT, the size probes, and generated apps use
+  `default-features = false` and leave both off, so the call rejects
+  `NotSupportedError` and does not link `ksni`, `tray-icon`, or `keyring`.
+  Turn them back on for a generated app with
+  `W3COS_RUNTIME_FEATURES=host-tray,host-keyring`, or by adding those names
+  to the runtime `features` list.
 - `tray.show({ tooltip, title, menu, icon })` installs a status item and
   returns a handle. `update` changes that item. `setMenu` replaces its
   menu; the namespace method updates the most recently shown icon that is
@@ -249,13 +267,24 @@ one rejects. `tray.show` and `tray.setMenu` are real.
   messages; the shell loop does. `title` is ignored by the shell. Left
   click is the click callback; right click opens the menu. Tooltip text
   follows the 128-character limit above.
+- `keyring.get` / `keyring.set` / `keyring.delete` / `keyring.list` read
+  and write the current document origin's secrets. The service name is
+  derived from that origin. `list` returns names only, and only for items
+  whose stored service matches this origin exactly, so a prefix of another
+  origin is not enough. `get` resolves `null` when the name is absent.
+  `delete` of a missing name resolves. The desktop adapter is the `keyring`
+  crate: Linux talks to the Secret Service over D-Bus (the same service
+  libsecret uses), macOS uses Keychain Services, and Windows uses
+  Credential Manager. Android, iOS, and HarmonyOS have no adapter yet.
+  A missing session bus, a locked store, or any other failure to open the
+  backend rejects `NotSupportedError`. Nothing is written to a file
+  instead. Exception text does not include the secret.
 
 ### Refused until an adapter exists
 
 - `windows.list` / `windows.focus` / `windows.setAlwaysOnTop`
 - `daemon.install` / `daemon.start` / `daemon.enableAutostart`
 - `system.get` / `system.set` / `system.power`
-- `keyring.get` / `keyring.set` / `keyring.delete`
 - `agent.accessibilityTree({ scope: "cross-app" })` and
   `agent.captureScreen({ scope: "background" })`
 
@@ -282,8 +311,13 @@ display capture as `getDisplayMedia`.
 - The accessibility tree and the capture blob describe the current app
   only. Cross-app and unprompted background capture stay refused so this
   namespace cannot bypass the bridge's screenshot and DOM-read bits.
-- The keyring stub stores nothing. A later adapter must require the
-  `w3cos-keyring` grant per origin and must not echo secrets into logs.
+- The keyring requires `w3cos-keyring` before it touches the store. Items
+  are scoped to the document origin (`w3cos://files` and `w3cos://editor`
+  do not see each other). Hosts that leave every app on the default
+  `w3cos://app` origin share that one namespace. Secrets are not written
+  to logs or exception messages. There is no in-memory fallback when the
+  system store cannot be opened; headless CI without a Secret Service
+  session gets `NotSupportedError`.
 - System power and settings are refused. A later `power("shutdown")` needs
   its own confirmation, not only the capability bit.
 

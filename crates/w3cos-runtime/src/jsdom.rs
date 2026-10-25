@@ -686,6 +686,22 @@ thread_local! {
         .as_secs_f64() * 1000.0;
 }
 
+thread_local! {
+    /// Once authored lifecycle state has been stored directly on a DOM
+    /// immediate, subtree scans must inspect bridge expandos. This stays true
+    /// for the Realm after a delete; the conservative fallback is cheap and
+    /// avoids maintaining a second per-node lifetime index.
+    static LIFECYCLE_EXPANDO_AUTHORED: Cell<bool> = const { Cell::new(false) };
+    /// Negative prototype-chain checks are stable until an authored shape
+    /// mutation advances the core epoch. Cache them across pooled-node
+    /// removals instead of re-walking the same HTMLElement chain each time.
+    static LIFECYCLE_PROTOTYPE_CACHE: RefCell<(
+        u32,
+        u64,
+        w3cos_std::fxhash::FxHashMap<u64, bool>,
+    )> = RefCell::new((0, 0, w3cos_std::fxhash::FxHashMap::default()));
+}
+
 #[cfg(target_os = "ios")]
 thread_local! {
     static PENDING_FILE_INPUT: RefCell<Option<u32>> = const { RefCell::new(None) };
@@ -1066,6 +1082,12 @@ fn set_expando(node: u32, key: &str, value: Value) {
     if key == "ownerDocument" && is_default_document(&value) {
         return;
     }
+    if matches!(
+        key,
+        "__w3cos_custom_element_upgraded" | "disconnectedCallback"
+    ) {
+        LIFECYCLE_EXPANDO_AUTHORED.with(|authored| authored.set(true));
+    }
     if let Some(id) = known_expando(key) {
         KNOWN_EXPANDS.with(|props| props.borrow_mut().insert((node, id), value));
         return;
@@ -1350,21 +1372,25 @@ fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Optio
         if depth > 4096 {
             return None;
         }
-        let (proxy, getter, data, accessor, next) = {
+        let (proxy, getter, data, setter, next) = {
             let object = object.borrow();
-            // One combined probe (data, getter or setter slot) decides the
-            // level; the separate getter/data reads run only on a hit.
-            let accessor = object.has_own_property(key);
-            let (getter, data) = if accessor {
-                (object.own_getter(key), object.own_data(key))
+            // Read the descriptor components directly. The previous boolean
+            // probe checked data/getter/setter and then repeated the getter
+            // and data lookups on a hit. Getter still wins if authored state
+            // contains both representations; setter-only remains an
+            // authoritative undefined result.
+            let getter = object.own_getter(key);
+            let data = object.own_data(key);
+            let setter = if getter.is_none() && data.is_none() {
+                object.own_setter(key)
             } else {
-                (None, None)
+                None
             };
             (
                 object.has_get_trap(),
                 getter,
                 data,
-                accessor,
+                setter,
                 object.get_prototype_of(),
             )
         };
@@ -1379,7 +1405,7 @@ fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Optio
             // bridge computes those properties after a descriptor miss.
             return (!data.is_undefined()).then_some(data);
         }
-        if accessor {
+        if setter.is_some() {
             return Some(Value::Undefined); // setter-only descriptor
         }
         current = next;
@@ -4228,6 +4254,14 @@ fn normalized_attribute_name(node: u32, name: &str) -> String {
     }
 }
 
+fn with_normalized_attribute_name<R>(node: u32, name: &str, body: impl FnOnce(&str) -> R) -> R {
+    if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return body(name);
+    }
+    let normalized = normalized_attribute_name(node, name);
+    body(&normalized)
+}
+
 fn valid_processing_instruction_attribute_name(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|character| {
@@ -4600,13 +4634,11 @@ fn shared_attribute_method(node: u32, key: &str) -> Option<Value> {
                 return element_computed_get(receiver, name).call(this, args);
             }
             match slot {
-                0 => {
-                    let name = normalized_attribute_name(receiver, &arg(&args, 0).to_js_string());
-                    match dom::get_attribute(receiver, &name) {
-                        Some(value) => Value::from(value),
-                        None => Value::Null,
-                    }
-                }
+                0 => with_value_text(&arg(&args, 0), |name| {
+                    with_normalized_attribute_name(receiver, name, |name| {
+                        dom::get_attribute(receiver, name).map_or(Value::Null, Value::from)
+                    })
+                }),
                 1 => {
                     let requested_name = arg(&args, 0).to_js_string();
                     if !valid_attribute_name(&requested_name) {
@@ -5085,7 +5117,9 @@ fn prototype_chain_has_authored_lifecycle(mut prototype: Value) -> bool {
 
 fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
     let mut found = false;
-    let mut prototype_cache = w3cos_std::fxhash::FxHashMap::<u64, bool>::default();
+    let inspect_expandos = LIFECYCLE_EXPANDO_AUTHORED.with(Cell::get);
+    let generation = realm_generation();
+    let epoch = w3cos_core::intrinsics::dom_shape_epoch();
     // Reuse the probe keys instead of allocating two Strings per node.
     let mut upgraded = (0u32, "__w3cos_custom_element_upgraded".to_string());
     let mut disconnected = (0u32, "disconnectedCallback".to_string());
@@ -5095,19 +5129,29 @@ fn subtree_has_authored_lifecycle_state(root: u32) -> bool {
         }
         upgraded.0 = node;
         disconnected.0 = node;
-        let direct = ELEMENT_PROPS.with(|props| {
-            let props = props.borrow();
-            props.contains_key(&upgraded) || props.contains_key(&disconnected)
-        });
+        let direct = inspect_expandos
+            && ELEMENT_PROPS.with(|props| {
+                let props = props.borrow();
+                props.contains_key(&upgraded) || props.contains_key(&disconnected)
+            });
         if direct {
             found = true;
             return;
         }
         let prototype = element_prototype(node);
         let identity = prototype.identity_hash();
-        found = *prototype_cache
-            .entry(identity)
-            .or_insert_with(|| prototype_chain_has_authored_lifecycle(prototype));
+        found = LIFECYCLE_PROTOTYPE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.0 != generation || cache.1 != epoch {
+                cache.0 = generation;
+                cache.1 = epoch;
+                cache.2.clear();
+            }
+            *cache
+                .2
+                .entry(identity)
+                .or_insert_with(|| prototype_chain_has_authored_lifecycle(prototype))
+        });
     });
     found
 }
@@ -5818,14 +5862,20 @@ fn parsed_document_value(
                 _ => Some(""),
             };
             move |document, args| {
-                let mut tag = arg(&args, 0).to_js_string();
-                if !valid_element_name(&tag) {
-                    dom_exception("The element name is not valid", "InvalidCharacterError");
-                }
-                if is_html {
-                    tag.make_ascii_lowercase();
-                }
-                let node = dom::create_element(&tag);
+                let tag_value = arg(&args, 0);
+                let node = with_value_text(&tag_value, |tag| {
+                    if !valid_element_name(tag) {
+                        dom_exception("The element name is not valid", "InvalidCharacterError");
+                    }
+                    let lowered;
+                    let tag = if is_html && tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                        lowered = tag.to_ascii_lowercase();
+                        lowered.as_str()
+                    } else {
+                        tag
+                    };
+                    dom::create_element(tag)
+                });
                 if let Some(namespace) = element_namespace {
                     dom::set_html_element(
                         node,
@@ -6353,11 +6403,13 @@ pub(crate) fn empty_document_value(content_type: &str, prototype_name: &str) -> 
     props.insert(
         "createElement".to_string(),
         func_slice(|document, args| {
-            let tag = arg(&args, 0).to_js_string();
-            if !valid_element_name(&tag) {
-                dom_exception("The element name is not valid", "InvalidCharacterError");
-            }
-            let node = dom::create_element(&tag);
+            let tag_value = arg(&args, 0);
+            let node = with_value_text(&tag_value, |tag| {
+                if !valid_element_name(tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                dom::create_element(tag)
+            });
             dom::set_html_element(node, false);
             set_expando(node, "ownerDocument", document);
             set_expando(node, "namespaceURI", Value::Null);
@@ -10482,11 +10534,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             }))
         }),
         "getAttribute" => func(move |_, args| {
-            let name = normalized_attribute_name(node, &arg(&args, 0).to_js_string());
-            match dom::get_attribute(node, &name) {
-                Some(v) => Value::from(v),
-                None => Value::Null,
-            }
+            let name = arg(&args, 0);
+            with_value_text(&name, |name| {
+                with_normalized_attribute_name(node, name, |name| {
+                    dom::get_attribute(node, name).map_or(Value::Null, Value::from)
+                })
+            })
         }),
         "getAttributeNS" => func(move |_, args| {
             let namespace = normalized_namespace_argument(&arg(&args, 0));
@@ -11704,12 +11757,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
     }
 }
 
-fn with_value_text(value: &Value, body: impl FnOnce(&str)) {
+fn with_value_text<R>(value: &Value, body: impl FnOnce(&str) -> R) -> R {
     if let Some(text) = value.as_js_string() {
-        body(text.as_str());
+        body(text.as_str())
     } else {
         let owned = value.to_js_string();
-        body(&owned);
+        body(&owned)
     }
 }
 
@@ -14415,7 +14468,15 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
     });
     if added {
         ensure_native_registration(node, et);
+        note_window_motion_listener(node, type_name, true);
     }
+}
+
+fn note_window_motion_listener(node: u32, type_name: &str, added: bool) {
+    if node != 0 {
+        return;
+    }
+    crate::orientation_web::adjust_motion_listener(type_name, if added { 1 } else { -1 });
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -14472,9 +14533,10 @@ fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options:
         false
     };
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().remove_one(node, et, &handler, capture);
-    });
+    let removed = LISTENERS.with(|l| l.borrow_mut().remove_one(node, et, &handler, capture));
+    if removed {
+        note_window_motion_listener(node, type_name, false);
+    }
 }
 
 fn key_code_for(key: &str, code: &str) -> u32 {
@@ -16147,6 +16209,15 @@ fn image_data_value(data: &crate::canvas2d::ImageData) -> Value {
         )],
     );
     crate::canvas_web::image_data_value(bytes, data.width, data.height)
+}
+
+pub(crate) fn canvas_2d_rgba(node: u32) -> Option<(u32, u32, Vec<u8>)> {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        let context = contexts.get(&node)?;
+        let context = context.borrow();
+        Some((context.width, context.height, context.pixels().to_vec()))
+    })
 }
 
 fn canvas_context_value(node: u32) -> Value {
@@ -18360,14 +18431,26 @@ fn build_document_value() -> Value {
     props.insert(
         "createElement".to_string(),
         func_slice(|_, args| {
-            let mut tag = arg(&args, 0).to_js_string();
-            if !valid_element_name(&tag) {
-                dom_exception("The element name is not valid", "InvalidCharacterError");
-            }
-            if document_value().get_property("contentType").to_js_string() == "text/html" {
-                tag.make_ascii_lowercase();
-            }
-            let id = dom::create_element(&tag);
+            let tag_value = arg(&args, 0);
+            let id = with_value_text(&tag_value, |tag| {
+                if !valid_element_name(tag) {
+                    dom_exception("The element name is not valid", "InvalidCharacterError");
+                }
+                let lowered;
+                let tag = if document_value().get_property("contentType").to_js_string()
+                    == "text/html"
+                    && tag.bytes().any(|byte| byte.is_ascii_uppercase())
+                {
+                    lowered = tag.to_ascii_lowercase();
+                    lowered.as_str()
+                } else {
+                    tag
+                };
+                dom::create_element(tag)
+            });
+            // End the page-arena borrow before a custom-element constructor can
+            // re-enter JavaScript. DOM atoms have process-lifetime storage.
+            let tag = dom::tag_static(id);
             let element = dom_handle(id);
             if tag == "template" {
                 ensure_template_content(id);
@@ -18377,7 +18460,7 @@ fn build_document_value() -> Value {
                 // explicitly clears it and joins the ordered dynamic queue.
                 set_expando(id, "__w3cos_force_async", Value::Bool(true));
             }
-            crate::custom_elements_web::upgrade_created_element(&tag, element)
+            crate::custom_elements_web::upgrade_created_element(tag, element)
         }),
     );
     props.insert(
@@ -19663,6 +19746,7 @@ pub fn set_document_visibility(state: &str) -> bool {
         return true;
     }
     crate::observers_web::record_visibility_state(state, performance_now());
+    crate::gamepad_web::on_document_visibility(state);
     let event = w3cos_core::class::construct(
         &crate::web_events::event_class(),
         vec![Value::string("visibilitychange")],
@@ -20553,6 +20637,10 @@ fn build_window_value() -> Value {
         "HIDInputReportEvent".to_string(),
         crate::device_access_web::hid_input_report_event_class(),
     );
+    props.insert(
+        "HIDConnectionEvent".to_string(),
+        crate::device_access_web::hid_connection_event_class(),
+    );
     props.insert("USB".to_string(), crate::device_access_web::usb_class());
     props.insert(
         "USBDevice".to_string(),
@@ -20861,6 +20949,10 @@ fn build_window_value() -> Value {
     props.insert(
         "RelativeOrientationSensor".to_string(),
         crate::sensors_web::relative_orientation_sensor_class(),
+    );
+    props.insert(
+        "AmbientLightSensor".to_string(),
+        crate::sensors_web::ambient_light_sensor_class(),
     );
     props.insert(
         "ReadableStream".to_string(),
@@ -22694,6 +22786,12 @@ pub fn drain_microtasks() -> usize {
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
         ran += crate::audio_web::poll_live_outputs();
+        ran += crate::gamepad_web::poll();
+        ran += crate::serial_web::poll_serial_io();
+        ran += crate::device_access_web::poll_device_events();
+        ran += crate::sensors_web::poll_platform_samples();
+        ran += crate::geolocation_web::poll_platform_events();
+        ran += crate::bluetooth_web::poll_platform_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -22751,7 +22849,8 @@ pub fn has_pending_work() -> bool {
                 false
             }
         };
-    timers || raf || micro || events || native_io
+    let device_io = crate::device_access_web::has_pending_device_events();
+    timers || raf || micro || events || native_io || device_io
 }
 
 /// Earliest non-rendering deadline the bridge needs to be woken at: the
@@ -22777,6 +22876,9 @@ pub fn next_timer_deadline() -> Option<Instant> {
         socket_deadline,
         script_deadline,
         crate::speech::next_deadline(),
+        crate::device_access_web::next_device_deadline(),
+        crate::sensors_web::next_sample_deadline(),
+        crate::geolocation_web::next_deadline(),
     ]
     .into_iter()
     .flatten()
@@ -22799,6 +22901,13 @@ pub fn reset_bridge() {
     COLLECTION_ROOTS.with(|roots| roots.borrow_mut().clear());
     LENGTH_SHADOWS.with(|shadows| shadows.borrow_mut().clear());
     ELEMENT_PROPS.with(|c| c.borrow_mut().clear());
+    LIFECYCLE_EXPANDO_AUTHORED.with(|authored| authored.set(false));
+    LIFECYCLE_PROTOTYPE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.0 = 0;
+        cache.1 = 0;
+        cache.2.clear();
+    });
     KNOWN_EXPANDS.with(|c| c.borrow_mut().clear());
     OBJECT_DOCUMENT_READABLE.with(|origins| origins.borrow_mut().clear());
     PROCESSING_INSTRUCTION_ATTRIBUTES.with(|cache| cache.borrow_mut().clear());
@@ -22869,6 +22978,7 @@ pub fn reset_bridge() {
     crate::xpath_web::reset_realm();
     crate::sanitizer_web::reset_realm();
     crate::bluetooth_web::reset_realm();
+    crate::device_access_web::reset_realm();
     crate::speech_web::reset();
     crate::speech_synthesis_web::reset();
     crate::geolocation_web::reset();
@@ -22933,6 +23043,7 @@ pub fn reset_bridge() {
     crate::observers_web::reset_intersection_observers();
     crate::observers_web::reset_performance_timeline();
     crate::fetch::reset_realm();
+    crate::serial_web::reset_realm();
     crate::streams_web::reset_realm();
     crate::web_events::reset_realm();
     reset_realm_class_caches();
@@ -22964,6 +23075,94 @@ mod tests {
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")
+    }
+
+    #[test]
+    fn borrowed_create_element_string_preserves_conversion_and_validation() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("DiV")]);
+        assert_eq!(element.get_property("localName").to_js_string(), "div");
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_for_to_string = std::rc::Rc::clone(&calls);
+        let tag = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(move |_, _| {
+                calls_for_to_string.set(calls_for_to_string.get() + 1);
+                Value::string("SpAn")
+            }),
+        )]));
+        let element = document.call_method("createElement", vec![tag]);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(element.get_property("localName").to_js_string(), "span");
+
+        let throwing_tag = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(|_, _| panic!("createElement conversion marker")),
+        )]));
+        let conversion_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.call_method("createElement", vec![throwing_tag])
+        }));
+        assert!(conversion_error.is_err());
+
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            document.call_method("createElement", vec![Value::string("bad\0tag")])
+        }));
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn borrowed_get_attribute_preserves_case_unicode_and_object_to_string() {
+        setup();
+        let document = document_value();
+        let element = document.call_method("createElement", vec![Value::string("div")]);
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("data-x"), Value::string("ascii")],
+        );
+        element.call_method(
+            "setAttribute",
+            vec![Value::string("é"), Value::string("unicode")],
+        );
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("DATA-X")])
+                .to_js_string(),
+            "ascii"
+        );
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![Value::string("é")])
+                .to_js_string(),
+            "unicode"
+        );
+
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let calls_for_to_string = std::rc::Rc::clone(&calls);
+        let name = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(move |_, _| {
+                calls_for_to_string.set(calls_for_to_string.get() + 1);
+                Value::string("DATA-X")
+            }),
+        )]));
+        assert_eq!(
+            element
+                .call_method("getAttribute", vec![name])
+                .to_js_string(),
+            "ascii"
+        );
+        assert_eq!(calls.get(), 1);
+
+        let throwing_name = Value::object(std::collections::HashMap::from([(
+            "toString".to_string(),
+            Value::function(|_, _| panic!("getAttribute conversion marker")),
+        )]));
+        let conversion_error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            element.call_method("getAttribute", vec![throwing_name])
+        }));
+        assert!(conversion_error.is_err());
     }
 
     #[test]
@@ -23147,6 +23346,39 @@ mod tests {
         );
         let thrown = w3cos_core::catch_js(|| element.get_property("throwProbe")).unwrap_err();
         assert_eq!(thrown, Value::string("prototype-token"));
+    }
+
+    #[test]
+    fn immediate_prototype_descriptor_probe_preserves_setter_and_getter_precedence() {
+        setup();
+        let element = document_value().call_method("createElement", vec![Value::string("div")]);
+        let prototype = window_value()
+            .get_property("Element")
+            .get_property("prototype");
+
+        w3cos_core::class::define_property(
+            &prototype,
+            "nodeType",
+            &Value::object(HashMap::from([(
+                "set".into(),
+                Value::function(|_, _| Value::Undefined),
+            )])),
+        );
+        assert!(
+            element.get_property("nodeType").is_undefined(),
+            "a setter-only descriptor must shadow the computed DOM property"
+        );
+
+        prototype.set_property(
+            "__w3cos_getter_nodeType",
+            Value::function(|_, _| Value::Number(17.0)),
+        );
+        prototype.set_property("nodeType", Value::Number(23.0));
+        assert_eq!(
+            element.get_property("nodeType"),
+            Value::Number(17.0),
+            "the existing getter-before-data precedence must be preserved"
+        );
     }
 
     #[test]
@@ -23819,6 +24051,12 @@ mod tests {
     fn empty_registry_keeps_shared_prototype_disconnected_callback() {
         setup();
         assert!(!crate::custom_elements_web::has_definitions());
+        let probe = dom::create_element("div");
+        assert!(
+            !disconnected_lifecycle_may_be_observable(probe),
+            "the test must prime a negative shared-prototype cache entry"
+        );
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
         let calls = Rc::new(Cell::new(0u32));
         let calls_cb = Rc::clone(&calls);
         let prototype = crate::dom_constructors::prototype("HTMLElement");
@@ -23829,6 +24067,11 @@ mod tests {
                 calls_cb.set(calls_cb.get() + 1);
                 Value::Undefined
             }),
+        );
+        assert_ne!(
+            w3cos_core::intrinsics::dom_shape_epoch(),
+            shape_epoch,
+            "authoring lifecycle state must invalidate a cached negative scan"
         );
         let doc = document_value();
         let element = doc.call_method("createElement", vec![Value::string("div")]);
@@ -23848,6 +24091,160 @@ mod tests {
             calls.get(),
             1,
             "shared prototype callback must not be skipped"
+        );
+    }
+
+    #[test]
+    fn negative_lifecycle_cache_invalidates_when_delete_exposes_inherited_callback() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let probe = dom::create_element("div");
+        assert!(
+            !disconnected_lifecycle_may_be_observable(probe),
+            "the test must begin with a cached negative prototype scan"
+        );
+
+        let inherited_calls = Rc::new(Cell::new(0u32));
+        let inherited_calls_cb = Rc::clone(&inherited_calls);
+        let inherited = Value::object(HashMap::new());
+        inherited.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        inherited.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                inherited_calls_cb.set(inherited_calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+
+        let own_calls = Rc::new(Cell::new(0u32));
+        let own_calls_cb = Rc::clone(&own_calls);
+        let shared = crate::dom_constructors::prototype("HTMLElement");
+        let old_parent = w3cos_core::class::get_prototype_of(&shared);
+        w3cos_core::class::set_prototype_of(&shared, &inherited);
+        shared.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                own_calls_cb.set(own_calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        assert!(shared.delete_property("disconnectedCallback").to_bool());
+        assert_ne!(
+            w3cos_core::intrinsics::dom_shape_epoch(),
+            shape_epoch,
+            "deleting a lifecycle key must invalidate cached prototype proofs"
+        );
+
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        body.call_method("appendChild", vec![element.clone()]);
+        body.call_method("removeChild", vec![element]);
+        w3cos_core::class::set_prototype_of(&shared, &old_parent);
+
+        assert_eq!(own_calls.get(), 0, "the deleted callback must not run");
+        assert_eq!(
+            inherited_calls.get(),
+            1,
+            "deletion must expose and preserve the inherited callback"
+        );
+    }
+
+    #[test]
+    fn negative_lifecycle_cache_invalidates_for_define_property() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+        let probe = dom::create_element("div");
+        assert!(
+            !disconnected_lifecycle_may_be_observable(probe),
+            "the test must prime a negative shared-prototype cache entry"
+        );
+
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let prototype = crate::dom_constructors::prototype("HTMLElement");
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        w3cos_core::class::define_property(
+            &prototype,
+            "__w3cos_custom_element_upgraded",
+            &Value::object(HashMap::from([("value".into(), Value::Bool(true))])),
+        );
+        w3cos_core::class::define_property(
+            &prototype,
+            "disconnectedCallback",
+            &Value::object(HashMap::from([(
+                "value".into(),
+                Value::function(move |_, _| {
+                    calls_cb.set(calls_cb.get() + 1);
+                    Value::Undefined
+                }),
+            )])),
+        );
+        assert_ne!(
+            w3cos_core::intrinsics::dom_shape_epoch(),
+            shape_epoch,
+            "defineProperty must invalidate a cached negative prototype scan"
+        );
+
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        body.call_method("appendChild", vec![element.clone()]);
+        body.call_method("removeChild", vec![element]);
+        prototype.delete_property("disconnectedCallback");
+        prototype.delete_property("__w3cos_custom_element_upgraded");
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "defineProperty-authored lifecycle callback must not be skipped"
+        );
+    }
+
+    #[test]
+    fn negative_lifecycle_cache_invalidates_for_set_prototype_of_replacement_chain() {
+        setup();
+        assert!(!crate::custom_elements_web::has_definitions());
+
+        let calls = Rc::new(Cell::new(0u32));
+        let calls_cb = Rc::clone(&calls);
+        let replacement = Value::object(HashMap::new());
+        replacement.set_property("__w3cos_custom_element_upgraded", Value::Bool(true));
+        replacement.set_property(
+            "disconnectedCallback",
+            Value::function(move |_, _| {
+                calls_cb.set(calls_cb.get() + 1);
+                Value::Undefined
+            }),
+        );
+
+        let probe = dom::create_element("div");
+        assert!(
+            !disconnected_lifecycle_may_be_observable(probe),
+            "the replacement chain must be disconnected while the negative scan is cached"
+        );
+        let shared = crate::dom_constructors::prototype("HTMLElement");
+        let old_parent = w3cos_core::class::get_prototype_of(&shared);
+        let shape_epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        w3cos_core::class::set_prototype_of(&shared, &replacement);
+        assert_ne!(
+            w3cos_core::intrinsics::dom_shape_epoch(),
+            shape_epoch,
+            "setPrototypeOf must invalidate a cached negative prototype scan"
+        );
+
+        let doc = document_value();
+        let body = doc.get_property("body");
+        let element = doc.call_method("createElement", vec![Value::string("div")]);
+        body.call_method("appendChild", vec![element.clone()]);
+        body.call_method("removeChild", vec![element]);
+        w3cos_core::class::set_prototype_of(&shared, &old_parent);
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the replacement prototype chain callback must not be skipped"
         );
     }
 

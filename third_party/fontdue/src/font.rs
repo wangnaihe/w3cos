@@ -391,6 +391,14 @@ impl Font {
         &self.char_to_glyph
     }
 
+    /// Returns the immutable parsing and geometry settings used for this font.
+    ///
+    /// Metric caches must distinguish collection faces and geometry scales even
+    /// when their backing font file has the same hash.
+    pub fn settings(&self) -> FontSettings {
+        self.settings
+    }
+
     /// Returns a precomputed hash for the font file.
     pub fn file_hash(&self) -> usize {
         self.hash

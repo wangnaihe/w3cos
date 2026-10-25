@@ -148,6 +148,9 @@ impl Drop for HeapScope {
 /// Lifetime ticket embedded in a Core heap allocation.
 pub(crate) struct HeapAllocation {
     kind: HeapKind,
+    // Client-managed cache invalidation. Kept beside kind to use existing
+    // alignment space on the measured x86_64 target; not a layout guarantee.
+    pub(crate) cache_dirty: std::cell::Cell<bool>,
     bytes: std::cell::Cell<usize>,
     owner: Option<Rc<RefCell<HeapCounters>>>,
 }
@@ -161,6 +164,7 @@ impl HeapAllocation {
         }
         Self {
             kind,
+            cache_dirty: std::cell::Cell::new(false),
             bytes: std::cell::Cell::new(bytes),
             owner,
         }
@@ -193,6 +197,20 @@ mod tests {
     use super::*;
     use crate::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn cache_tracking_keeps_compact_allocation_headers() {
+        // Catch a header regression on each tested target instead of relying
+        // on unspecified Rust field layout or assuming x86_64 measurements.
+        assert_eq!(
+            std::mem::size_of::<HeapAllocation>(),
+            3 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::ArrayStorage>(),
+            std::mem::size_of::<Vec<Value>>() + std::mem::size_of::<HeapAllocation>()
+        );
+    }
 
     #[test]
     fn owner_and_global_snapshots_track_shared_core_allocations() {

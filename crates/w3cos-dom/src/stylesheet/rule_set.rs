@@ -19,6 +19,10 @@ pub(super) struct RuleSet {
     has_match_volatile_rules: bool,
     /// Some rule declares `transition*`.
     has_transition_rules: bool,
+    /// Bits of pseudo-elements that have at least one rule.
+    /// `::before` = 1, `::after` = 2, `::first-line` = 4,
+    /// `::first-letter` = 8, anything else = 16.
+    pseudo_kinds: u8,
 }
 
 enum RuleBucket<'a> {
@@ -79,6 +83,7 @@ impl RuleSet {
         self.has_structural_dependencies = false;
         self.has_match_volatile_rules = false;
         self.has_transition_rules = false;
+        self.pseudo_kinds = 0;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -110,6 +115,9 @@ impl RuleSet {
             .declarations
             .iter()
             .any(|(property, _)| property.starts_with("transition"));
+        if let Some(pseudo) = &self.rules[index].pseudo_element {
+            self.pseudo_kinds |= pseudo_kind_bit(pseudo);
+        }
         self.has_match_volatile_rules |= self.rules[index]
             .declarations
             .iter()
@@ -264,12 +272,27 @@ impl RuleSet {
             }
         }
         if !self.tag_rules.is_empty() {
-            let mut tag_candidates = Vec::new();
-            append_tag_candidates(&self.tag_rules, node.tag.as_static(), &mut tag_candidates);
-            if !tag_candidates.is_empty() {
-                visit(&tag_candidates);
+            let tag = node.tag.as_static();
+            let lowered;
+            let lookup = if tag.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                lowered = tag.to_ascii_lowercase();
+                lowered.as_str()
+            } else {
+                tag
+            };
+            if let Some(indices) = self.tag_rules.get(lookup) {
+                visit(indices);
+            }
+            if let Some((_, local_name)) = lookup.rsplit_once(':')
+                && let Some(indices) = self.tag_rules.get(local_name)
+            {
+                visit(indices);
             }
         }
+    }
+
+    pub(super) fn has_pseudo_kind(&self, pseudo_element: &str) -> bool {
+        self.pseudo_kinds & pseudo_kind_bit(pseudo_element) != 0
     }
 
     pub(super) fn has_sibling_dependencies(&self) -> bool {
@@ -372,6 +395,16 @@ fn rule_bucket(
         return RuleBucket::Tag(tag);
     }
     RuleBucket::Universal
+}
+
+fn pseudo_kind_bit(name: &str) -> u8 {
+    match name {
+        "::before" => 1,
+        "::after" => 2,
+        "::first-line" => 4,
+        "::first-letter" => 8,
+        _ => 16,
+    }
 }
 
 fn attribute_index_key(name: &str) -> String {

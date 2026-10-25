@@ -1,0 +1,33 @@
+{
+  "rounds": 11,
+  "binaries": {
+    "main": {
+      "path": "lifecycle-baseline",
+      "sha256": "4b4c2ea6d8c7e1fce861d68b7c12c5a1cb5bcaa103ac417fad32e891a7e9cf84"
+    },
+    "initial": {
+      "path": "lifecycle-candidate",
+      "sha256": "fa5c2b3ba93acbdc3b6d5277b77697ea6198cf2fa54f186e3effd8b12c652fe5"
+    },
+    "fastpath": {
+      "path": "fastpath-candidate",
+      "sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2"
+    }
+  },
+  "allowed_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "effective_cpus": [
+    0
+  ],
+  "variant_order": "rotate ABC, BCA, CAB, then reverse CBA, BAC, ACB; repeat",
+  "case_order": "construct/lifecycle on even rounds, reversed on odd rounds"
+}

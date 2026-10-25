@@ -1,0 +1,36 @@
+{
+  "jsdom": {
+    "main": {
+      "result": [
+        "test result: FAILED. 221 passed; 1 failed; 1 ignored; 0 measured; 1546 filtered out; finished in 1.03s"
+      ],
+      "failures": [
+        "jsdom::tests::canvas_2d_context"
+      ]
+    },
+    "combined": {
+      "result": [
+        "test result: FAILED. 221 passed; 1 failed; 1 ignored; 0 measured; 1546 filtered out; finished in 1.42s"
+      ],
+      "failures": [
+        "jsdom::tests::canvas_2d_context"
+      ]
+    },
+    "identical_failure_names": true
+  },
+  "layout-ng": {
+    "main": {
+      "result": [
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1769 filtered out; finished in 0.00s"
+      ],
+      "failures": []
+    },
+    "combined": {
+      "result": [
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1769 filtered out; finished in 0.00s"
+      ],
+      "failures": []
+    },
+    "identical_failure_names": true
+  }
+}
