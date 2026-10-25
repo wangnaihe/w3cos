@@ -3699,3 +3699,130 @@ fn flex_row_baseline_alignment_matches_chrome() {
     assert_eq!(rect(&out, 8), (40.0, 160.0, 40.0, 10.0));
     assert_eq!(rect(&out, 9), (80.0, 100.0, 40.0, 30.0));
 }
+
+/// Rects from headless Chrome (ngtools/fbw-probe.html, fbw-probe2.html).
+/// Per-line baseline groups (FlexLayoutAlgorithm::BuildFlexLines), the
+/// flipped minor group under `wrap-reverse`, and the exported first
+/// baseline of a multi-line container (BaselineAccumulator).
+#[test]
+fn flex_wrap_baseline_groups_match_chrome() {
+    use w3cos_std::style::{AlignItems, AlignSelf, FlexDirection, FlexWrap};
+    let wrap = |flex_wrap: FlexWrap, align_items: AlignItems, height: Dimension| Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap,
+        align_items,
+        width: Dimension::Px(100.0),
+        height,
+        ..block()
+    };
+    let outer = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Baseline,
+        width: Dimension::Px(300.0),
+        ..block()
+    };
+    let item = |width: f32, height: f32, margin: Edges, align_self: AlignSelf| {
+        node(
+            Style {
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                margin,
+                align_self,
+                flex_shrink: 0.0,
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let none = Edges::default;
+    let lines = |flex_wrap: FlexWrap, b2_bottom: f32| {
+        node(
+            wrap(flex_wrap, AlignItems::Baseline, Dimension::Auto),
+            vec![
+                item(40.0, 20.0, margins(5.0, 0.0, 0.0, 0.0), AlignSelf::Auto),
+                item(
+                    40.0,
+                    40.0,
+                    margins(0.0, 0.0, b2_bottom, 0.0),
+                    AlignSelf::Auto,
+                ),
+                item(40.0, 10.0, margins(0.0, 0.0, 3.0, 0.0), AlignSelf::Auto),
+                item(40.0, 50.0, none(), AlignSelf::FlexStart),
+            ],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            lines(FlexWrap::Wrap, 0.0),
+            lines(FlexWrap::WrapReverse, 4.0),
+            node(
+                outer.clone(),
+                vec![
+                    node(
+                        wrap(FlexWrap::Wrap, AlignItems::FlexStart, Dimension::Auto),
+                        vec![
+                            item(40.0, 10.0, none(), AlignSelf::Auto),
+                            item(40.0, 30.0, none(), AlignSelf::Auto),
+                            item(40.0, 5.0, none(), AlignSelf::Auto),
+                        ],
+                    ),
+                    item(5.0, 5.0, none(), AlignSelf::Auto),
+                ],
+            ),
+            node(
+                outer,
+                vec![
+                    node(
+                        wrap(
+                            FlexWrap::WrapReverse,
+                            AlignItems::Baseline,
+                            Dimension::Px(120.0),
+                        ),
+                        vec![
+                            item(40.0, 10.0, none(), AlignSelf::Auto),
+                            item(40.0, 30.0, margins(0.0, 0.0, 6.0, 0.0), AlignSelf::Auto),
+                            item(40.0, 5.0, none(), AlignSelf::FlexStart),
+                        ],
+                    ),
+                    item(5.0, 5.0, none(), AlignSelf::Auto),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root; 1 wrap, 2-5; 6 wrap-reverse, 7-10; 11 outer,
+    // 12 inner wrap, 13-15, 16; 17 outer, 18 inner wrap-reverse, 19-21, 22.
+    let expected = [
+        (1, (0.0, 0.0, 100.0, 90.0)),
+        (2, (0.0, 20.0, 40.0, 20.0)),
+        (3, (40.0, 0.0, 40.0, 40.0)),
+        (4, (0.0, 40.0, 40.0, 10.0)),
+        (5, (40.0, 40.0, 40.0, 50.0)),
+        (6, (0.0, 90.0, 100.0, 94.0)),
+        (7, (0.0, 160.0, 40.0, 20.0)),
+        (8, (40.0, 140.0, 40.0, 40.0)),
+        (9, (0.0, 127.0, 40.0, 10.0)),
+        (10, (40.0, 90.0, 40.0, 50.0)),
+        (11, (0.0, 184.0, 300.0, 35.0)),
+        (12, (0.0, 184.0, 100.0, 35.0)),
+        (16, (100.0, 189.0, 5.0, 5.0)),
+        (17, (0.0, 219.0, 300.0, 120.0)),
+        (18, (0.0, 219.0, 100.0, 120.0)),
+        (19, (0.0, 323.0, 40.0, 10.0)),
+        (20, (40.0, 303.0, 40.0, 30.0)),
+        (21, (0.0, 258.5, 40.0, 5.0)),
+        (22, (100.0, 258.5, 5.0, 5.0)),
+    ];
+    for (index, rect_expected) in expected {
+        assert_eq!(rect(&out, index), rect_expected, "node {index}");
+    }
+}

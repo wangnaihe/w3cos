@@ -4,15 +4,13 @@
 //! (third_party/blink/renderer/core/layout/flex/flex_layout_algorithm.cc,
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
-//! lengths, alignment, line breaking). Baseline alignment, inline-flex,
-//! and an indefinite percentage basis stay on the legacy engine.
-//! A single-line row aligns text-free items with a definite cross size by
-//! the border-box under edge (each item's cross margin-start plus its
-//! border box). The line grows by the largest cross margin-end hanging
-//! past that shared edge. Column baseline, wrapping baseline, automatic
-//! cross sizes, and any item that exports a real baseline (text, nested
-//! flex or grid, inline, or a replaced box) stay on legacy
-//! (`flex:baseline`).
+//! lengths, alignment, line breaking). An indefinite percentage basis
+//! stays on the legacy engine.
+//! A row aligns baseline items per line by their first baseline, or the
+//! synthesized border-box under edge (FlexLayoutAlgorithm::BaselineAscent),
+//! measured from the cross end under `wrap-reverse` (the minor group).
+//! Column baseline groups and items whose subtree NG reports no baseline
+//! for stay on legacy (`flex:baseline-column`, `flex:baseline-nested`).
 //! `wrap-reverse` swaps the cross-start (Flexbox §5.2) and packs lines
 //! from that edge. Column wrap breaks lines against a definite block size,
 //! a `max-height`, or an `aspect-ratio` transferred from a definite width.
@@ -198,7 +196,7 @@ fn baseline_participant(container: AlignItems, item: AlignSelf) -> bool {
 
 /// A baseline participant's subtree whose baseline NG does not export:
 /// a block-level grid container (only inline-grid reports one) or a
-/// multi-line flex container (`layout_wrapped` reports none).
+/// multi-line column flex container (`layout_wrapped` reports none).
 fn unexported_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
     let end = flat[index].subtree_end.max(index + 1);
     let mut child = index;
@@ -211,7 +209,10 @@ fn unexported_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
         if style.display == Display::Grid {
             return true;
         }
-        if style.display == Display::Flex && style.flex_wrap != FlexWrap::NoWrap {
+        if style.display == Display::Flex
+            && style.flex_wrap != FlexWrap::NoWrap
+            && !row_axis(style.flex_direction)
+        {
             return true;
         }
         child += 1;
@@ -219,16 +220,13 @@ fn unexported_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
     false
 }
 
-/// Why baseline alignment stays on legacy, if it does. A nowrap row
-/// aligns first baselines (FlexLayoutAlgorithm::BaselineAscent). Column
-/// and multi-line baseline groups are not done here yet.
+/// Why baseline alignment stays on legacy, if it does. A row aligns
+/// first baselines per line (FlexLayoutAlgorithm::BaselineAscent). Column
+/// baseline groups are not done here yet.
 fn baseline_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !row_axis(style.flex_direction) {
         return Some("flex:baseline-column");
-    }
-    if style.flex_wrap != FlexWrap::NoWrap {
-        return Some("flex:baseline-wrap");
     }
     for child in rendered_children(flat, index) {
         if baseline_participant(style.align_items, flat[child].style.align_self)
@@ -1431,14 +1429,14 @@ fn layout_wrapped(
     main_is_max: bool,
     main_gap: f32,
 ) -> Option<LayoutResult> {
-    // Per-line baseline groups stay on legacy. `container_reason` already
-    // rejects a wrapping baseline row; this keeps a later caller from
-    // painting those items at the cross start.
-    if items.iter().any(|item| item.align == AlignItems::Baseline) {
-        return super::bail("flex:baseline");
-    }
     let direction = style.flex_direction;
     let row = row_axis(direction);
+    // Column baseline groups stay on legacy. `container_reason` already
+    // rejects them; this keeps a later caller from painting those items
+    // at the cross start.
+    if !row && items.iter().any(|item| item.align == AlignItems::Baseline) {
+        return super::bail("flex:baseline-column");
+    }
     let reverse = reverse_axis(direction);
     let wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
     let [bt, br, bb, bl] = metrics.border;
@@ -1476,15 +1474,55 @@ fn layout_wrapped(
             item.cross = Some((laid.fragment.height - item.cross_edges).max(0.0));
         }
     }
-    let mut line_cross: Vec<f32> = lines
-        .iter()
-        .map(|&(start, end)| {
-            items[start..end]
-                .iter()
-                .map(|item| item.margin_box_cross())
-                .fold(0.0_f32, f32::max)
-        })
-        .collect();
+    // Per-line baseline groups (FlexLayoutAlgorithm::BuildFlexLines). Each
+    // line's baseline size is its largest ascent plus its largest descent.
+    // Under `wrap-reverse` the group is the minor one (DetermineBaselineGroup
+    // with is_flipped): BaselineAscent measures from the cross end, which is
+    // where `margin_cross_start` already sits here.
+    let mut ascents = vec![None::<f32>; items.len()];
+    let mut line_ascent = vec![None::<f32>; lines.len()];
+    let mut line_cross: Vec<f32> = Vec::with_capacity(lines.len());
+    for (line_index, &(start, end)) in lines.iter().enumerate() {
+        let mut size = 0.0_f32;
+        let mut max_ascent = None::<f32>;
+        let mut max_descent = 0.0_f32;
+        for (offset, item) in items[start..end].iter().enumerate() {
+            size = size.max(item.margin_box_cross());
+            if item.align != AlignItems::Baseline {
+                continue;
+            }
+            let laid = layout_item(
+                flat,
+                item.index,
+                space,
+                inner_width,
+                specified_height,
+                true,
+                Some(item.content),
+                item.cross,
+            )?;
+            let baseline = match laid.first_baseline {
+                LastBaseline::At(baseline) => baseline,
+                LastBaseline::NoLines => laid.fragment.height,
+                LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+            };
+            let from_cross_start = if wrap_reverse {
+                laid.fragment.height - baseline
+            } else {
+                baseline
+            };
+            let ascent = item.margin_cross_start + from_cross_start;
+            let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
+            ascents[start + offset] = Some(ascent);
+            max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
+            max_descent = max_descent.max(margin_box - ascent);
+        }
+        if let Some(ascent) = max_ascent {
+            size = size.max(ascent + max_descent);
+        }
+        line_ascent[line_index] = max_ascent;
+        line_cross.push(size);
+    }
     if line_cross.is_empty() {
         line_cross.push(0.0);
     }
@@ -1558,6 +1596,16 @@ fn layout_wrapped(
     let safe_cross = has_marker(style, "--w3cos-internal-safe-align-content");
     let cross_overflows = definite_cross.is_some_and(|size| packed > size + EPS);
     let reverse_cross = wrap_reverse && !(safe_cross && cross_overflows);
+    // A safe overflow keeps `wrap-reverse` lines on the physical start
+    // while the minor baseline group still measures from the cross end.
+    if wrap_reverse && !reverse_cross && ascents.iter().any(Option::is_some) {
+        return super::bail("flex:baseline-wrap-safe");
+    }
+    // BaselineAccumulator over the first line after ApplyReversals, which
+    // is the physically top line: with `wrap-reverse` that is the last
+    // line here. Its major (or, flipped, minor) baseline, else its first
+    // item after reversals (the last in order for a reversed row).
+    let mut container_baseline = None::<LastBaseline>;
     let mut children = Vec::with_capacity(items.len());
     let mut oof_out = Vec::new();
     let mut frag_at = 0;
@@ -1567,6 +1615,9 @@ fn layout_wrapped(
         if reverse_cross {
             cross_cursor -= line_size;
         }
+        let top_line = if reverse_cross { true } else { line_index == 0 };
+        let line_top = bt + pt + cross_cursor;
+        let mut fallback_baseline = None::<LastBaseline>;
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
         let used_outer = line.iter().map(|item| item.outer_main()).sum::<f32>() + gap_sum;
@@ -1592,7 +1643,8 @@ fn layout_wrapped(
             lead = inner_main - lead;
         }
         let mut cursor = lead;
-        for item in line.iter() {
+        for (offset, item) in line.iter().enumerate() {
+            let ascent = ascents[start + offset];
             let laid = fragments[frag_at].take();
             frag_at += 1;
             let Some(laid) = laid else {
@@ -1611,7 +1663,11 @@ fn layout_wrapped(
             let from_cross_start = match item.align {
                 AlignItems::FlexEnd => extra,
                 AlignItems::Center => extra / 2.0,
-                AlignItems::Stretch | AlignItems::FlexStart | AlignItems::Baseline => 0.0,
+                AlignItems::Baseline => match (line_ascent[line_index], ascent) {
+                    (Some(max), Some(ascent)) => max - ascent,
+                    _ => 0.0,
+                },
+                AlignItems::Stretch | AlignItems::FlexStart => 0.0,
             };
             let border_cross = item.cross_edges + item.cross.unwrap_or(0.0);
             // Cross-start is the top of the line, unless `wrap-reverse` put
@@ -1628,6 +1684,18 @@ fn layout_wrapped(
             } else {
                 (bl + pl + cross_cursor + cross, bt + pt + main)
             };
+            if row && top_line {
+                let item_baseline = match laid.first_baseline {
+                    LastBaseline::NoLines => LastBaseline::At(laid.fragment.height),
+                    other => other,
+                }
+                .offset(y);
+                if reverse {
+                    fallback_baseline = Some(item_baseline);
+                } else {
+                    fallback_baseline.get_or_insert(item_baseline);
+                }
+            }
             let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
             oof_out.extend(
                 laid.oof
@@ -1641,6 +1709,13 @@ fn layout_wrapped(
             } else {
                 cursor += step;
             }
+        }
+        if row && top_line {
+            container_baseline = match line_ascent.get(line_index).copied().flatten() {
+                Some(max) if wrap_reverse => Some(LastBaseline::At(line_top + line_size - max)),
+                Some(max) => Some(LastBaseline::At(line_top + max)),
+                None => fallback_baseline,
+            };
         }
         if reverse_cross {
             cross_cursor -= cross_gap;
@@ -1727,8 +1802,10 @@ fn layout_wrapped(
             text_range: None,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        // As in the single-line path, the first baseline is reported for
+        // both: an inline-flex uses its first baseline.
+        last_baseline: container_baseline.unwrap_or(LastBaseline::NoLines),
+        first_baseline: container_baseline.unwrap_or(LastBaseline::NoLines),
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -2525,7 +2602,7 @@ mod tests {
     }
 
     #[test]
-    fn column_wrap_and_nested_grid_baseline_stay_on_legacy() {
+    fn column_and_nested_grid_or_column_wrap_baseline_stay_on_legacy() {
         let mut column = flex_style(FlexDirection::Column, 100.0, Some(80.0));
         column.align_items = AlignItems::Baseline;
         stays_legacy(&Component::boxed(
@@ -2533,12 +2610,16 @@ mod tests {
             vec![leaf(block_box(Some(40.0), Some(10.0)))],
         ));
 
-        let mut wrapped = flex_style(FlexDirection::Row, 100.0, None);
-        wrapped.align_items = AlignItems::Baseline;
-        wrapped.flex_wrap = FlexWrap::Wrap;
-        stays_legacy(&Component::boxed(
-            wrapped,
-            vec![leaf(block_box(Some(40.0), Some(10.0)))],
+        // A multi-line column flex reports no baseline on NG yet.
+        let mut column_wrap = flex_style(FlexDirection::Column, 40.0, Some(50.0));
+        column_wrap.flex_wrap = FlexWrap::Wrap;
+        stays_legacy(&baseline_row(
+            200.0,
+            None,
+            vec![Component::boxed(
+                column_wrap,
+                vec![leaf(block_box(Some(40.0), Some(10.0)))],
+            )],
         ));
 
         // A block-level grid reports no baseline on NG yet.
@@ -2560,6 +2641,10 @@ mod tests {
         let mut nested = block_box(Some(40.0), Some(50.0));
         nested.display = Display::Flex;
         nested.flex_direction = FlexDirection::Row;
+        // A multi-line row aligns per line and exports its first baseline.
+        let mut row_wrap = flex_style(FlexDirection::Row, 100.0, None);
+        row_wrap.align_items = AlignItems::Baseline;
+        row_wrap.flex_wrap = FlexWrap::Wrap;
         for root in [
             baseline_row(200.0, None, vec![leaf(block_box(Some(40.0), None))]),
             baseline_row(
@@ -2577,6 +2662,21 @@ mod tests {
                     Component::boxed(nested, vec![leaf(block_box(Some(40.0), Some(10.0)))]),
                     leaf(block_box(Some(40.0), Some(30.0))),
                 ],
+            ),
+            Component::boxed(
+                row_wrap.clone(),
+                vec![
+                    leaf(block_box(Some(60.0), Some(10.0))),
+                    leaf(block_box(Some(60.0), Some(30.0))),
+                ],
+            ),
+            baseline_row(
+                200.0,
+                None,
+                vec![Component::boxed(
+                    row_wrap,
+                    vec![leaf(block_box(Some(40.0), Some(10.0)))],
+                )],
             ),
         ] {
             let flat = pre_flatten(&root);
