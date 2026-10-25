@@ -16,9 +16,13 @@
 //! (`new`'s executor, reaction handlers) catches such panics with
 //! `catch_unwind` and turns the payload back into a rejection.
 //!
-//! v1 limitations: unhandled rejections are tracked as a no-op (nothing
-//! reports them), and `finally` does not await a promise returned from its
-//! callback.
+//! Unhandled rejections follow HTML's HostPromiseRejectionTracker shape:
+//! a promise rejected with no reactions joins an "about to be notified"
+//! list, a later `then` removes it, and the microtask checkpoint reports
+//! what is left. Reporting is the `W3COS_JS_CONSOLE=1` debug channel
+//! (`[js.unhandledrejection] ...` on stderr, like `[js.throw]`); tracking
+//! is off (zero cost) otherwise. v1 limitation: `finally` does not await a
+//! promise returned from its callback.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -72,6 +76,59 @@ thread_local! {
     static PROMISE_STATES: RefCell<HashMap<u64, Weak<RefCell<PromiseState>>>> =
         RefCell::new(HashMap::new());
     static NEXT_PROMISE_ID: Cell<u64> = const { Cell::new(1) };
+    /// Rejected promises with no reaction yet, with their reasons
+    /// (HTML's "about to be notified rejected promises list").
+    static UNHANDLED_REJECTIONS: RefCell<Vec<(Weak<RefCell<PromiseState>>, Value)>> =
+        const { RefCell::new(Vec::new()) };
+    /// Whether rejection tracking is on: `W3COS_JS_CONSOLE` (read once).
+    static TRACK_REJECTIONS: Cell<Option<bool>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static REPORTED_REJECTIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+fn tracking_rejections() -> bool {
+    TRACK_REJECTIONS.with(|flag| match flag.get() {
+        Some(on) => on,
+        None => {
+            let on = std::env::var_os("W3COS_JS_CONSOLE").is_some();
+            flag.set(Some(on));
+            on
+        }
+    })
+}
+
+/// A reaction was added to `state`: it is no longer unhandled.
+fn mark_rejection_handled(state: &Rc<RefCell<PromiseState>>) {
+    if !tracking_rejections() {
+        return;
+    }
+    UNHANDLED_REJECTIONS.with(|list| {
+        list.borrow_mut()
+            .retain(|(tracked, _)| !std::ptr::eq(tracked.as_ptr(), Rc::as_ptr(state)))
+    });
+}
+
+/// Microtask checkpoint: report rejections that are still unhandled.
+fn report_unhandled_rejections() {
+    if !tracking_rejections() {
+        return;
+    }
+    let pending = UNHANDLED_REJECTIONS.with(|list| std::mem::take(&mut *list.borrow_mut()));
+    for (_, reason) in pending {
+        let stack = if reason.is_object() {
+            reason.get_property("stack")
+        } else {
+            Value::Undefined
+        };
+        let detail = if stack.is_string() {
+            stack.to_js_string()
+        } else {
+            reason.to_js_string()
+        };
+        eprintln!("[js.unhandledrejection] Uncaught (in promise) {detail}");
+        #[cfg(test)]
+        REPORTED_REJECTIONS.with(|reported| reported.borrow_mut().push(detail));
+    }
 }
 
 fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
@@ -203,6 +260,12 @@ fn settle(state: &Rc<RefCell<PromiseState>>, outcome: Result<Value, Value>) {
         Ok(value) => (true, value),
         Err(reason) => (false, reason),
     };
+    if !is_fulfilled && callbacks.is_empty() && tracking_rejections() {
+        UNHANDLED_REJECTIONS.with(|list| {
+            list.borrow_mut()
+                .push((Rc::downgrade(state), value.clone()))
+        });
+    }
     for reaction in callbacks {
         schedule_reaction(reaction, is_fulfilled, value.clone());
     }
@@ -278,7 +341,12 @@ fn subscribe(
         }
     };
     match settled {
-        Some((is_fulfilled, value)) => schedule_reaction(reaction, is_fulfilled, value),
+        Some((is_fulfilled, value)) => {
+            if !is_fulfilled {
+                mark_rejection_handled(state);
+            }
+            schedule_reaction(reaction, is_fulfilled, value)
+        }
         None => {
             if let PromiseState::Pending { callbacks } = &mut *state.borrow_mut() {
                 callbacks.push(reaction);
@@ -512,6 +580,7 @@ pub fn drain_microtasks() -> usize {
             // targets released so far, then drain whatever they queued.
             let finalized = crate::weak::run_pending_finalizers();
             if finalized == 0 {
+                report_unhandled_rejections();
                 break;
             }
             ran += finalized;
@@ -569,6 +638,46 @@ pub fn status(value: &Value) -> Option<PromiseStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unhandled_rejections_are_reported_at_the_microtask_checkpoint() {
+        TRACK_REJECTIONS.with(|flag| flag.set(Some(true)));
+        REPORTED_REJECTIONS.with(|reported| reported.borrow_mut().clear());
+        let call = |target: &Value, method: &str, args: Vec<Value>| {
+            crate::intrinsics::call_method(target, &Value::string(method), args)
+        };
+        // Unhandled: rejected and never observed.
+        let _lost = reject(vec![Value::string("lost")]);
+        // Handled before the checkpoint: no report.
+        let caught = reject(vec![Value::string("caught")]);
+        let _ = call(
+            &caught,
+            "catch",
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+        // `then` without a rejection handler hands the rejection on to the
+        // derived promise, which is the unhandled one.
+        let passed = reject(vec![Value::string("passed on")]);
+        let _derived = call(
+            &passed,
+            "then",
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+        // A handler throwing inside a reaction rejects its derived promise.
+        let thrown = resolve(vec![Value::Number(1.0)]);
+        let _thrown_derived = call(
+            &thrown,
+            "then",
+            vec![Value::function(|_, _| {
+                crate::throw_value(Value::string("thrown"))
+            })],
+        );
+        drain_microtasks();
+        let mut reported = REPORTED_REJECTIONS.with(|reported| reported.take());
+        reported.sort();
+        assert_eq!(reported, ["lost", "passed on", "thrown"]);
+        TRACK_REJECTIONS.with(|flag| flag.set(None));
+    }
+
     use super::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
