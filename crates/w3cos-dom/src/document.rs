@@ -11293,6 +11293,46 @@ impl Document {
                             .find(|(key, _)| key.as_str() == "type")
                             .map(|(_, value)| value.as_str())
                             .unwrap_or("text");
+                        if tag.as_str() == "input" {
+                            // HTML §4.10.5: the type attribute's state; an
+                            // invalid or missing value is the Text state.
+                            // Layout sizes only text fields from the size
+                            // attribute (Blink LayoutTextControlSingleLine).
+                            const TYPES: [&str; 22] = [
+                                "hidden",
+                                "text",
+                                "search",
+                                "tel",
+                                "url",
+                                "email",
+                                "password",
+                                "date",
+                                "month",
+                                "week",
+                                "time",
+                                "datetime-local",
+                                "number",
+                                "range",
+                                "color",
+                                "checkbox",
+                                "radio",
+                                "file",
+                                "submit",
+                                "image",
+                                "reset",
+                                "button",
+                            ];
+                            let state = input_type.to_ascii_lowercase();
+                            let state = if TYPES.contains(&state.as_str()) {
+                                state
+                            } else {
+                                "text".to_string()
+                            };
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(crate::user_agent::INPUT_TYPE_PROPERTY.into(), state);
+                        }
                         if tag.as_str() == "input" && input_type.eq_ignore_ascii_case("file") {
                             let mut component = w3cos_std::Component::boxed_shared(style, children);
                             component.on_click = w3cos_std::EventAction::NativeHost {

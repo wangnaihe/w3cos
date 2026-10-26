@@ -25,6 +25,9 @@ pub const CONTROL_APPEARANCE_PROPERTY: &str = "--w3cos-internal-html-control-app
 /// Textarea line metrics remain distinct from single-line inputs, even when
 /// an author disables automatic control painting.
 pub const TEXTAREA_PROPERTY: &str = "--w3cos-internal-html-textarea";
+/// The type state of an `<input>` (HTML §4.10.5), lowercased; `text` for an
+/// invalid or missing type attribute.
+pub const INPUT_TYPE_PROPERTY: &str = "--w3cos-internal-input-type";
 
 pub(crate) fn control_appearance<'a>(
     tag: &str,

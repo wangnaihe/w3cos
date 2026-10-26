@@ -4319,3 +4319,132 @@ fn flex_canvas_item_matches_chrome() {
         assert_eq!(rect(&out, index), rect_, "canvas {index}");
     }
 }
+
+/// Text fields (Blink LayoutTextControlSingleLine) against Chrome rects
+/// for /workspace/ngtools/ti/c1.html (body margin 0, divs 400px wide).
+#[cfg(feature = "skia")]
+#[test]
+fn text_field_matches_chrome() {
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "400px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    let input = |document: &mut w3cos_dom::Document,
+                 parent: w3cos_dom::Element,
+                 attrs: &[(&str, &str)],
+                 css: &[(&str, &str)]| {
+        let input = document.create_element("input");
+        for (k, v) in attrs {
+            input.set_attribute(document, k, v);
+        }
+        for (k, v) in css {
+            input.style_mut(document).set_property(k, v);
+        }
+        parent.append_child(document, input);
+        input
+    };
+    let text = |document: &mut w3cos_dom::Document, parent: w3cos_dom::Element, s: &str| {
+        let t = document.create_text_node(s);
+        parent.append_child(document, t);
+    };
+    let a = div(&mut document, &[]);
+    text(&mut document, a, "x");
+    input(&mut document, a, &[], &[]);
+    let b = div(&mut document, &[]);
+    text(&mut document, b, "x");
+    input(&mut document, b, &[], &[("height", "50px")]);
+    let c = div(&mut document, &[]);
+    input(&mut document, c, &[], &[("display", "block")]);
+    let d = div(
+        &mut document,
+        &[
+            ("display", "flex"),
+            ("flex-direction", "column"),
+            ("width", "300px"),
+        ],
+    );
+    input(&mut document, d, &[], &[]);
+    let f = div(&mut document, &[]);
+    text(&mut document, f, "x");
+    input(
+        &mut document,
+        f,
+        &[],
+        &[
+            ("width", "100px"),
+            ("padding", "5px"),
+            ("font-size", "20px"),
+        ],
+    );
+    input(&mut document, f, &[("type", "password")], &[]);
+    input(&mut document, f, &[("size", "5")], &[]);
+    let g = div(&mut document, &[]);
+    text(&mut document, g, "x");
+    input(
+        &mut document,
+        g,
+        &[],
+        &[
+            ("box-sizing", "border-box"),
+            ("width", "100px"),
+            ("height", "30px"),
+        ],
+    );
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let inputs: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::TextInput { .. }))
+        .collect();
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("text fields");
+    let legacy = crate::layout::compute(&tree, 800.0, 600.0).expect("legacy");
+    let legacy_rect = |index: usize| {
+        let r = legacy.iter().find(|(_, j)| *j == index).expect("legacy").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    let [i1, i2, i3, i4, i6, i7, i8, i9] = inputs[..] else {
+        panic!("eight inputs: {inputs:?}");
+    };
+    let size = |index: usize| {
+        let r = rect(&out, index);
+        (r.2, r.3)
+    };
+    // The intrinsic size is the legacy (Blink PreferredContentLogicalWidth)
+    // metric; the box metrics are font independent and match Chrome.
+    let (w1, h1) = size(i1);
+    assert_eq!((w1, h1), (legacy_rect(i1).2, legacy_rect(i1).3));
+    assert_eq!(
+        size(i2),
+        (w1, 56.0),
+        "height: 50px plus UA padding and border"
+    );
+    assert_eq!(size(i3), (w1, h1), "a block field fits its content");
+    assert_eq!(size(i4), (300.0, h1), "a column flex item stretches");
+    assert_eq!(size(i6).0, 114.0, "width: 100px plus padding and border");
+    assert_eq!(size(i7), (w1, h1), "password");
+    assert_eq!(size(i8), (legacy_rect(i8).2, h1), "size=5");
+    assert!(size(i8).0 < w1);
+    assert_eq!(size(i9), (100.0, 30.0), "border-box");
+    // The line box is the field's margin box (Chrome: the 50px field's div
+    // is 56px tall, the border-box one's 30px).
+    assert_eq!(rect(&out, i2 - 2).3, 56.0);
+    assert_eq!(rect(&out, i9 - 2).3, 30.0);
+    // The inner editor is centered: a taller content box moves the
+    // baseline (and the sibling text) down by half the extra height.
+    let text_offset = |input: usize| rect(&out, input - 1).1 - rect(&out, input).1;
+    assert_eq!(text_offset(i2) - text_offset(i1), (56.0 - h1) / 2.0);
+}

@@ -336,7 +336,9 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
         && matches!(style.display, Display::InlineBlock | Display::ListItem)
         && !matches!(
             info.kind,
-            ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+            ComponentKind::Image { .. }
+                | ComponentKind::Canvas { .. }
+                | ComponentKind::TextInput { .. }
         )
 }
 
@@ -550,6 +552,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if matches!(info.kind, ComponentKind::Canvas { .. }) {
         return canvas_box_reason(flat, index);
     }
+    if matches!(info.kind, ComponentKind::TextInput { .. }) {
+        return text_field_box_reason(flat, index);
+    }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
         if !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
@@ -693,7 +698,6 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             }
         }
         ComponentKind::Button { .. } => Some("kind:button"),
-        ComponentKind::TextInput { .. } => Some("kind:text-input"),
         ComponentKind::SvgPath { .. } | ComponentKind::SvgDocument { .. } => Some("kind:svg"),
         _ => Some("kind:other"),
     }
@@ -832,6 +836,185 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
 
 /// Content-box size of a canvas. `None` when a percentage has no basis
 /// or `box-sizing` is `border-box` (that used size stays on legacy).
+/// The `<input>` type states laid out as a single-line text field (Blink
+/// LayoutTextControlSingleLine without a decoration or picker: no search
+/// cancel button, number spin button, or date / color picker).
+const TEXT_FIELD_TYPES: [&str; 5] = ["text", "password", "email", "url", "tel"];
+const INPUT_SIZE_MARKER: &str = "--w3cos-internal-input-size";
+
+/// An `<input>` text field (Blink LayoutTextControlSingleLine). It is not
+/// replaced, but its box is a leaf here: the DOM keeps the inner editor
+/// out of the tree and the painter draws the value. Its content box has
+/// the intrinsic size of `size` characters by one line (no aspect ratio),
+/// and an auto width fits that size in any context, as Blink
+/// LayoutBox::AutoWidthShouldFitContent does for form controls.
+/// Textareas, other input types, percentage sizes and floated or
+/// positioned fields stay on legacy.
+fn text_field_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if marker(style, w3cos_dom::user_agent::TEXTAREA_PROPERTY).is_some() {
+        return Some("text-input:textarea");
+    }
+    if !marker(style, w3cos_dom::user_agent::INPUT_TYPE_PROPERTY)
+        .is_some_and(|state| TEXT_FIELD_TYPES.contains(&state))
+    {
+        return Some("text-input:type");
+    }
+    if !cfg!(feature = "skia") || marker(style, INPUT_SIZE_MARKER).is_none() {
+        return Some("text-input:size");
+    }
+    if !style.line_height_is_normal {
+        return Some("text-input:line-height");
+    }
+    let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_));
+    if [
+        style.width,
+        style.height,
+        style.min_width,
+        style.max_width,
+        style.min_height,
+        style.max_height,
+    ]
+    .into_iter()
+    .any(percent)
+    {
+        return Some("text-input:percent");
+    }
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some("text-input:float-or-oof");
+    }
+    // A block-level (or blockified) field ignores the vertical-align
+    // keyword marker only; lengths stay gated (see unsupported_box_style).
+    let allowed = [
+        inline::VALIGN_MARKER,
+        INPUT_SIZE_MARKER,
+        w3cos_dom::user_agent::INPUT_TYPE_PROPERTY,
+        // Paint only: a text field's `appearance` does not change its box
+        // (Blink LayoutTextControl sizes the same for `none` and `auto`).
+        w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY,
+        inline::VALIGN_LENGTH_MARKER,
+    ];
+    let block_allowed = &allowed[..allowed.len() - 1];
+    if info
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
+        return Some("text-input:grid-item");
+    }
+    if info
+        .parent
+        .is_some_and(|parent| is_author_flex(flat[parent].style))
+    {
+        // A flex item is blockified (CSS Display §2.7).
+        return unsupported_box_style(style, block_allowed, true);
+    }
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("text-input:beside-float");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => unsupported_box_style(style, block_allowed, false),
+        // An inline-level field is an atomic inline (CSS 2.1 10.8.1).
+        Display::Inline | Display::InlineBlock if inline::in_inline_container(flat, index) => {
+            unsupported_box_style(style, &allowed, true)
+                .or_else(|| inline::atomic_inline_reason(style))
+        }
+        Display::Inline | Display::InlineBlock => Some("text-input:inline"),
+        _ => Some("text-input:display"),
+    }
+}
+
+/// Intrinsic content size of a text field: Blink
+/// LayoutTextControlSingleLine::PreferredContentLogicalWidth (`size`
+/// average character widths plus the max-minus-average overhang) by the
+/// inner editor's line height (`line-height: normal`). The same metrics
+/// as the legacy engine (`render_skia::html_text_input_content_size`).
+fn text_field_intrinsic(style: &Style) -> Option<(f32, f32)> {
+    #[cfg(feature = "skia")]
+    {
+        let size = marker(style, INPUT_SIZE_MARKER)?.parse::<u32>().ok()?;
+        Some(crate::render_skia::html_text_input_content_size(
+            style, size,
+        ))
+    }
+    #[cfg(not(feature = "skia"))]
+    {
+        let _ = style;
+        None
+    }
+}
+
+/// Content-box size of a text field: a specified size (border-box sizing
+/// removes the border and padding), else the intrinsic size, then min/max
+/// with the min winning (CSS 2.1 10.4 / 10.7). The gate leaves no
+/// percentage, so the containing block does not enter.
+fn text_field_content_size(style: &Style, space: &ConstraintSpace) -> Option<(f32, f32)> {
+    let (natural_w, natural_h) = text_field_intrinsic(style).why("text-input:size")?;
+    let [bt, br, bb, bl] = border(style);
+    let pad =
+        |s: Spacing| resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h);
+    let edges_w = bl + br + pad(style.padding.left) + pad(style.padding.right);
+    let edges_h = bt + bb + pad(style.padding.top) + pad(style.padding.bottom);
+    let axis = |dim: Dimension, edges: f32| {
+        resolve_dim(dim, None, style, space).map(|v| match style.box_sizing {
+            BoxSizing::BorderBox => (v - edges).max(0.0),
+            BoxSizing::ContentBox => v,
+        })
+    };
+    let used = |size: Dimension, min: Dimension, max: Dimension, natural: f32, edges: f32| {
+        let mut v = axis(size, edges).unwrap_or(natural);
+        if let Some(max) = axis(max, edges) {
+            v = v.min(max);
+        }
+        if let Some(min) = axis(min, edges) {
+            v = v.max(min);
+        }
+        v
+    };
+    Some((
+        used(
+            style.width,
+            style.min_width,
+            style.max_width,
+            natural_w,
+            edges_w,
+        ),
+        used(
+            style.height,
+            style.min_height,
+            style.max_height,
+            natural_h,
+            edges_h,
+        ),
+    ))
+}
+
+/// Baseline of a text field from its content-box top: the inner editor's
+/// line is centered in the content box (Blink centers a single-line text
+/// field's inner editor block; checked in Chrome: a 50px-tall field moves
+/// its baseline down by (50 - 15) / 2), then the font baseline in that
+/// line.
+fn text_field_baseline(style: &Style, content_height: f32) -> Option<f32> {
+    let (_, line) = text_field_intrinsic(style)?;
+    Some(
+        layout_unit((content_height - line) / 2.0)
+            + crate::layout::inline_font_baseline_from_line_top(style, line),
+    )
+}
+
 fn canvas_content_size(
     attr_width: u32,
     attr_height: u32,
@@ -1121,11 +1304,15 @@ pub(super) fn replaced_inline_at_block(
     replaced_size(flat[index].kind, &definite, space).map(|(width, _)| width)
 }
 
-/// An `<img>` or `<canvas>`: a Blink LayoutReplaced.
+/// An `<img>` or `<canvas>` (a Blink LayoutReplaced), or a text field:
+/// a leaf whose content box has an intrinsic size (`replaced_size`). A
+/// text field has no aspect ratio, so no size transfers through it.
 pub(super) fn is_replaced(kind: &ComponentKind) -> bool {
     matches!(
         kind,
-        ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::TextInput { .. }
     )
 }
 
@@ -1141,6 +1328,7 @@ pub(super) fn replaced_size(
         ComponentKind::Canvas { width, height } => {
             canvas_content_size(*width, *height, style, space).why("canvas:size")
         }
+        ComponentKind::TextInput { .. } => text_field_content_size(style, space),
         _ => None,
     }
 }
@@ -1551,6 +1739,10 @@ pub(super) fn intrinsic_sizes_at(
     if let ComponentKind::Canvas { width, height } = info.kind {
         let (width, _) =
             canvas_content_size(*width, *height, info.style, space).why("canvas:size")?;
+        return Some(MinMax::exact(width));
+    }
+    if let ComponentKind::TextInput { .. } = info.kind {
+        let (width, _) = text_field_content_size(info.style, space)?;
         return Some(MinMax::exact(width));
     }
     if size_contained(info.style) {
@@ -2096,9 +2288,15 @@ fn layout_block_in(
 
     if let Some((_, height)) = image_size {
         // The replaced content is the in-flow block size. No line box, so
-        // the baseline stays the bottom margin edge (CSS 2.1 10.8.1).
+        // the baseline stays the bottom margin edge (CSS 2.1 10.8.1). A
+        // text field's baseline is its inner editor's line.
         cursor = height;
         at_top = false;
+        if let ComponentKind::TextInput { .. } = info.kind {
+            let baseline = text_field_baseline(style, height).why("text-input:size")?;
+            last_baseline = LastBaseline::At(content_top + baseline);
+            first_baseline = last_baseline;
+        }
     } else if let ComponentKind::Text { content } = info.kind {
         // Block-level text leaf: in-flow content of its own.
         let (height, baseline) = inline::block_text_layout(content, metrics.content_width, style);
@@ -2333,9 +2531,11 @@ fn layout_block_in(
             definite.max_width = Dimension::Auto;
             definite.box_sizing = BoxSizing::ContentBox;
             resolve_inline(&definite, &child_space)
-        } else if let ComponentKind::Canvas { width, height } = child_info.kind {
-            let (width, _) = canvas_content_size(*width, *height, child_info.style, &child_space)
-                .why("canvas:size")?;
+        } else if matches!(
+            child_info.kind,
+            ComponentKind::Canvas { .. } | ComponentKind::TextInput { .. }
+        ) {
+            let (width, _) = replaced_size(child_info.kind, child_info.style, &child_space)?;
             let mut definite = child_info.style.clone();
             definite.width = Dimension::Px(width);
             definite.min_width = Dimension::Auto;

@@ -700,11 +700,15 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     );
     if matches!(
         flat[index].kind,
-        ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::TextInput { .. }
     ) {
         // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
         // sheet gives img and canvas `inline-block`; an author `inline` is
         // the same kind of item (Blink LayoutReplaced is atomic either way).
+        // So is a text field (Blink LayoutTextControl is an inline-block
+        // whatever its inline display).
         return inline_block || flat[index].style.display == Display::Inline;
     }
     matches!(
