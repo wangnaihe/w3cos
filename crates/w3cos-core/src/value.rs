@@ -2344,7 +2344,9 @@ impl Value {
             return Value::Bool(o.borrow().has(&key));
         }
         if let Some(function) = obj.as_function() {
-            return Value::Bool(function.has_own_property(&key));
+            return Value::Bool(
+                function.has_own_property(&key) || crate::builtins::function_prototype_has(&key),
+            );
         }
         if let Some(arr) = obj.as_array() {
             return if key == "length" {
@@ -2488,7 +2490,11 @@ impl Value {
                         Value::Undefined
                     };
                 }
-                function.get_property(key)
+                let own = function.get_property(key);
+                if !own.is_undefined() || function.has_own_property(key) {
+                    return own;
+                }
+                crate::builtins::function_prototype_lookup(key, receiver)
             }
             _ => Value::Undefined,
         }
@@ -5841,6 +5847,34 @@ mod tests {
             Value::Number(9.0).js_pow(&Value::Number(0.5)).to_number(),
             3.0
         );
+    }
+
+    #[test]
+    fn functions_inherit_call_apply_bind_as_property_values() {
+        let function = Value::function(|this, args| {
+            Value::Number(this.get_property("base").to_number() + args[0].to_number())
+        });
+        let receiver = Value::object(HashMap::from([("base".to_string(), Value::Number(1.0))]));
+        let call = function.get_property("call");
+        assert!(call.is_callable());
+        assert!(Value::string("apply").js_in(&function).to_bool());
+        assert!(!Value::string("missing").js_in(&function).to_bool());
+        assert_eq!(
+            call.call(function.clone(), vec![receiver.clone(), Value::Number(2.0)])
+                .to_number(),
+            3.0
+        );
+        let apply = function.get_property("apply");
+        assert_eq!(
+            apply
+                .call(
+                    function.clone(),
+                    vec![receiver, Value::array(vec![Value::Number(4.0)])],
+                )
+                .to_number(),
+            5.0
+        );
+        assert!(function.get_property("bind").is_callable());
     }
 
     #[test]

@@ -671,6 +671,119 @@ thread_local! {
     static BUILDING_OBJECT_PROTOTYPE: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    static FUNCTION_PROTOTYPE: RefCell<Option<(u32, crate::value::JsObjectRef)>> =
+        const { RefCell::new(None) };
+    static FUNCTION_PROTOTYPE_NATIVES: RefCell<Option<[Value; 3]>> = const { RefCell::new(None) };
+}
+
+/// Record this realm's `Function.prototype` so ordinary functions inherit
+/// from it (`f.call`, `f.apply`, `f.bind`, polyfilled methods). The runtime
+/// calls this when it builds the global `Function`; a later page epoch
+/// replaces the entry.
+pub fn register_function_prototype(prototype: &Value) {
+    let Some(object) = prototype.as_object() else {
+        return;
+    };
+    let epoch = crate::page_arena::current_epoch();
+    let retired = FUNCTION_PROTOTYPE.with(|slot| slot.replace(Some((epoch, object))));
+    drop(retired);
+}
+
+fn registered_function_prototype() -> Option<Value> {
+    let epoch = crate::page_arena::current_epoch();
+    FUNCTION_PROTOTYPE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_epoch, proto)| *cached_epoch == epoch && proto.is_live())
+            .map(|(_, proto)| proto.as_value())
+    })
+}
+
+fn incompatible_function_receiver(method: &str, this: &Value) -> Value {
+    crate::throw_value(crate::intrinsics::type_error(&format!(
+        "Function.prototype.{method} called on incompatible {}",
+        this.to_js_string()
+    )))
+}
+
+/// `Function.prototype.{call,apply,bind}`, shared per thread so a read
+/// before the realm's `Function` exists (`const c = f.call`) and
+/// `Function.prototype.call` keep one identity.
+pub fn function_prototype_method(key: &str) -> Option<Value> {
+    let index = match key {
+        "call" => 0,
+        "apply" => 1,
+        "bind" => 2,
+        _ => return None,
+    };
+    Some(FUNCTION_PROTOTYPE_NATIVES.with(|slot| {
+        slot.borrow_mut().get_or_insert_with(|| {
+            [
+                Value::function(|this, args| {
+                    if !this.is_callable() {
+                        return incompatible_function_receiver("call", &this);
+                    }
+                    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                    this.call(this_arg, args.into_iter().skip(1).collect())
+                }),
+                Value::function(|this, args| {
+                    if !this.is_callable() {
+                        return incompatible_function_receiver("apply", &this);
+                    }
+                    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                    let list = args.get(1).cloned().unwrap_or(Value::Undefined);
+                    let applied = if list.is_nullish() {
+                        Vec::new()
+                    } else {
+                        let length = list.get_property("length").to_number();
+                        let length = if length.is_finite() && length > 0.0 {
+                            length as usize
+                        } else {
+                            0
+                        };
+                        (0..length)
+                            .map(|index| list.get_property(&index.to_string()))
+                            .collect()
+                    };
+                    this.call(this_arg, applied)
+                }),
+                Value::function(|this, args| {
+                    if !this.is_callable() {
+                        return incompatible_function_receiver("bind", &this);
+                    }
+                    let target = this;
+                    let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
+                    let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
+                    Value::function(move |_, call_args| {
+                        let mut combined = bound_args.clone();
+                        combined.extend(call_args);
+                        target.call(this_arg.clone(), combined)
+                    })
+                }),
+            ]
+        })[index]
+            .clone()
+    }))
+}
+
+/// Inherited property of a function object: the realm's
+/// `Function.prototype` when registered, else the built-in call/apply/bind.
+pub(crate) fn function_prototype_lookup(key: &str, receiver: &Value) -> Value {
+    if let Some(prototype) = registered_function_prototype() {
+        return prototype.get_property_with_receiver(key, receiver);
+    }
+    function_prototype_method(key).unwrap_or(Value::Undefined)
+}
+
+/// `key in fn` for a key the function does not own.
+pub(crate) fn function_prototype_has(key: &str) -> bool {
+    if let Some(prototype) = registered_function_prototype() {
+        return Value::string(key).js_in(&prototype).to_bool();
+    }
+    function_prototype_method(key).is_some()
+}
+
 /// `Object.prototype` if this page's `Object` already exists, without
 /// building it. Function `prototype` objects use this: creating a function
 /// must not allocate the whole `Object` realm.

@@ -4413,7 +4413,23 @@ impl Builder {
                     );
                 }
 
-                let callee = self.lower_expression(&call.callee)?;
+                // `super.method?.(...)` calls the parent's method with the
+                // current `this` as receiver, like `super.method(...)`.
+                let mut super_callee = call.callee.as_ref();
+                while let Expr::Paren(paren) = super_callee {
+                    super_callee = paren.expr.as_ref();
+                }
+                let super_receiver = if let Expr::SuperProp(property) = super_callee {
+                    let callee = self.lower_super_property(property)?;
+                    let this_binding = self.resolve_binding("*this*");
+                    Some((callee, self.load_binding(this_binding)))
+                } else {
+                    None
+                };
+                let callee = match super_receiver {
+                    Some((callee, _)) => callee,
+                    None => self.lower_expression(&call.callee)?,
+                };
                 let null = self.constant(Constant::Null);
                 let is_nullish = self.register();
                 self.emit(Instruction::Binary {
@@ -4427,7 +4443,10 @@ impl Builder {
                     |builder| Ok(builder.constant(Constant::Undefined)),
                     |builder| {
                         let arguments = builder.lower_arguments(&call.args, &[])?;
-                        let this_value = builder.constant(Constant::Undefined);
+                        let this_value = match super_receiver {
+                            Some((_, receiver)) => receiver,
+                            None => builder.constant(Constant::Undefined),
+                        };
                         let dst = builder.register();
                         builder.emit_call(dst, callee, this_value, arguments);
                         Ok(dst)
