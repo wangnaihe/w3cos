@@ -620,6 +620,40 @@ console.log(z instanceof ZodError, z instanceof Error, z.issues.length)
     std::fs::remove_dir_all(root).ok();
 }
 
+/// A destructuring assignment inside a closure writes the enclosing
+/// function's bindings (esbuild's lazy `init_*` bodies do
+/// `({ PNG } = require("./utilsBundle"))` on module-level `var`s), and
+/// rest parameters may be patterns (`registerSession(...[session, opts])`).
+#[test]
+fn closure_destructuring_assignment_writes_outer_bindings() {
+    let root = write_fixture(
+        "w3cos_closure_destructuring_assignment",
+        &[
+            ("package.json", r#"{ "name": "p", "version": "0.1.0" }"#),
+            (
+                "main.js",
+                r#"var PNG, rest, first, second;
+var init = function () { ({ PNG, ...rest } = { PNG: "png", a: 1, b: 2 }); };
+function arrays() { const swap = () => { [first, second] = [second, first]; }; first = 1; second = 2; swap(); }
+init();
+arrays();
+console.log(PNG, Object.keys(rest).join(","), first, second);
+function rp(...[a, b]) { return a + b; }
+const o = { m(head, ...{ length }) { return head + length; } };
+console.log(rp(1, 2, 3), rp.length, o.m("n", 1, 2));
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_closure_destructuring_assignment",
+    );
+    assert_eq!(lines, vec!["png a,b 2 1", "3 0 n2"]);
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 /// A primitive string inherits `String.prototype` methods by value, so
 /// `s.startsWith` is a function and `s?.startsWith(x)` calls it (Code-OSS
