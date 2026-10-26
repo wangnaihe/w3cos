@@ -2226,6 +2226,46 @@ pub fn collect_new_url_js_literals(source: &str) -> Vec<String> {
 }
 
 pub fn collect_static_imports(source: &str) -> Vec<String> {
+    // Parse first: minified packages put declarations mid-line with no
+    // spaces (tar's `...;import{win32 as Pn}from"node:path";`), which the
+    // line scanner below cannot see. The scanner stays as the fallback for
+    // sources the parser rejects, and still contributes its extra matches so
+    // the previous edges are kept.
+    let mut imports = parsed_static_imports(source).unwrap_or_default();
+    for spec in lexical_static_imports(source) {
+        if !imports.contains(&spec) {
+            imports.push(spec);
+        }
+    }
+    imports
+}
+
+/// `import ... from` / `import "..."` / `export ... from` specifiers, in
+/// source order, from the parsed module (`None` when it does not parse).
+fn parsed_static_imports(source: &str) -> Option<Vec<String>> {
+    if !source.contains("import") && !source.contains("export") {
+        return Some(Vec::new());
+    }
+    let module = parse_esm_module(source, Path::new("module.ts")).ok()?;
+    let mut imports: Vec<String> = Vec::new();
+    for item in &module.body {
+        let src = match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => &import.src,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => &export.src,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(NamedExport {
+                src: Some(src), ..
+            })) => src,
+            _ => continue,
+        };
+        let spec = atom_to_string(&src.value);
+        if !imports.contains(&spec) {
+            imports.push(spec);
+        }
+    }
+    Some(imports)
+}
+
+fn lexical_static_imports(source: &str) -> Vec<String> {
     let mut imports = Vec::new();
     let mut pending = String::new();
     for line in source.lines() {
@@ -2709,6 +2749,14 @@ export function main() { return 42; }"#,
             namespace_member_names(source, "fs"),
             ["existsSync", "promises", "readFileSync"]
         );
+    }
+
+    #[test]
+    fn collect_imports_from_minified_source() {
+        let imports = collect_static_imports(
+            r#"var a=1;import Qr from"events";import{win32 as Pn}from"node:path";export*from"./x.js";export{y}from'./y.js';const s="import z from 'nope'";"#,
+        );
+        assert_eq!(imports, ["events", "node:path", "./x.js", "./y.js"]);
     }
 
     #[test]

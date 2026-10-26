@@ -757,3 +757,27 @@ fn node_zlib_matches_node() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+/// tar's `dist/esm/index.min.js` declares its imports mid-line without
+/// spaces (`...;import{win32 as Pn}from"node:path";var{isAbsolute:zn}=Pn`).
+const MINIFIED_ESM_LIB: &str = r#"var a=1;import Qr from"events";import{win32 as Pn}from"node:path";var{isAbsolute:zn,parse:qs}=Pn;export*from"./more.js";export const t=typeof zn+" "+typeof qs+" "+typeof Qr+" "+a;"#;
+
+#[test]
+fn minified_esm_imports_of_builtins_resolve() {
+    let root = write_fixture(
+        "w3cos_node_minified_esm_e2e",
+        &[
+            ("package.json", r#"{"name":"minified-esm","type":"module"}"#),
+            ("lib.min.js", MINIFIED_ESM_LIB),
+            ("more.js", "export const more = 'more';\n"),
+            (
+                "main.js",
+                r#"import {t, more} from "./lib.min.js"; console.log(t, more);"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_node_minified_esm_e2e");
+    // `node main.js` (v24.18.0).
+    assert_eq!(lines, ["function function function 1 more"]);
+    std::fs::remove_dir_all(root).ok();
+}
