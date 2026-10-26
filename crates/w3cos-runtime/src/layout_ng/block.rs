@@ -1076,33 +1076,29 @@ pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
         let Some(reason) = node_reason(flat, index) else {
             return false;
         };
-        let names: Vec<String> = if reason == "internal-marker" {
-            info.style
-                .custom_properties
-                .iter()
-                .flat_map(|props| props.keys())
-                .filter(|key| {
-                    key.starts_with("--w3cos-internal")
-                        && !is_value_carrier_marker(key)
-                        && key.as_str() != inline::IFC_MARKER
-                        && key.as_str() != inline::ANONYMOUS_BLOCK_MARKER
-                        && key.as_str() != inline::LINE_WIDTH_MARKER
-                })
-                .map(|key| {
-                    if key.as_str() == "--w3cos-internal-unrecognized-display" {
+        if reason == "internal-marker" {
+            if let Some(properties) = &info.style.custom_properties {
+                for key in properties.keys() {
+                    if !key.starts_with("--w3cos-internal")
+                        || is_value_carrier_marker(key)
+                        || key == inline::IFC_MARKER
+                        || key == inline::ANONYMOUS_BLOCK_MARKER
+                        || key == inline::LINE_WIDTH_MARKER
+                    {
+                        continue;
+                    }
+                    let name = if key == "--w3cos-internal-unrecognized-display" {
                         unrecognized_display_label(flat, index)
                     } else {
                         key.trim_start_matches("--w3cos-internal-").to_string()
+                    };
+                    if !reasons.contains(&name) {
+                        reasons.push(name);
                     }
-                })
-                .collect()
-        } else {
-            vec![reason.to_string()]
-        };
-        for name in names {
-            if !reasons.contains(&name) {
-                reasons.push(name);
+                }
             }
+        } else if !reasons.iter().any(|name| name == reason) {
+            reasons.push(reason.to_string());
         }
         false
     });

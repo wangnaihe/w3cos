@@ -1839,6 +1839,12 @@ struct AxisPlace {
     span: usize,
 }
 
+// Share the stable-sort instantiation between ordinary grids and subgrids.
+// CSS order is primary; the original child ordinal breaks ties.
+fn sort_placement_order(items: &mut [(Option<AxisPlace>, Option<AxisPlace>, i32, usize, usize)]) {
+    items.sort_by_key(|item| (item.2, item.4));
+}
+
 fn resolve_axis(value: Option<&str>, names: &[Vec<String>], explicit: usize) -> Option<AxisPlace> {
     let Some(value) = value else {
         return Some(AxisPlace {
@@ -2257,17 +2263,17 @@ fn intrinsic_tracks(
 ) -> (i64, i64) {
     let mut min_sum = gap_sum(collapsed, gap);
     let mut max_sum = min_sum;
-    let tracks: Vec<Track> = specs
-        .iter()
-        .enumerate()
-        .map(|(i, spec)| track_from_spec(spec, minimum[i], maximum[i], None, font, false))
-        .collect();
-    let fraction = tracks
-        .iter()
-        .enumerate()
-        .filter(|(i, track)| !collapsed[*i] && track.flex > 0.0)
-        .map(|(i, track)| maximum[i].max(track.base) as f64 / track.flex.max(1.0))
-        .fold(0.0_f64, f64::max);
+    // Both passes derive the same small Track value; no scratch allocation
+    // is needed just to carry it from flex-fraction discovery to summation.
+    let mut fraction = 0.0_f64;
+    for (i, spec) in specs.iter().enumerate() {
+        if !collapsed[i] {
+            let track = track_from_spec(spec, minimum[i], maximum[i], None, font, false);
+            if track.flex > 0.0 {
+                fraction = fraction.max(maximum[i].max(track.base) as f64 / track.flex.max(1.0));
+            }
+        }
+    }
     for (i, spec) in specs.iter().enumerate() {
         if collapsed[i] {
             continue;
@@ -2279,7 +2285,7 @@ fn intrinsic_tracks(
             Spec::Fit(_) => minimum[i],
         };
         min_sum += min;
-        let track = &tracks[i];
+        let track = track_from_spec(spec, minimum[i], maximum[i], None, font, false);
         max_sum += if track.flex > 0.0 {
             track.base.max((fraction * track.flex).ceil() as i64)
         } else {
@@ -2297,15 +2303,15 @@ fn grow(used: &mut [i64], caps: &[i64], mut free: i64) {
         if free <= 0 {
             return;
         }
-        let growable: Vec<usize> = (0..used.len())
+        let growable = (0..used.len())
             .filter(|&index| caps[index] > used[index])
-            .collect();
-        if growable.is_empty() {
+            .count();
+        if growable == 0 {
             return;
         }
-        let share = free / growable.len() as i64;
+        let share = free / growable as i64;
         if share <= 0 {
-            for index in growable.into_iter().rev() {
+            for index in (0..used.len()).rev() {
                 if free <= 0 {
                     return;
                 }
@@ -2317,7 +2323,10 @@ fn grow(used: &mut [i64], caps: &[i64], mut free: i64) {
             return;
         }
         let mut consumed = 0;
-        for index in growable {
+        for index in 0..used.len() {
+            if caps[index] <= used[index] {
+                continue;
+            }
             let add = share.min(caps[index] - used[index]);
             used[index] += add;
             consumed += add;
@@ -2854,7 +2863,7 @@ fn contribute_subgrid_columns(
             .why("grid:row")?;
         pending.push((Some(column), Some(row), child_style.order, child, ordinal));
     }
-    pending.sort_by_key(|item| (item.2, item.4));
+    sort_placement_order(&mut pending);
     let placed = place_items(&pending, span, explicit_rows, flow).why("grid:place")?;
     let mut covered_start = false;
     let mut covered_end = false;
@@ -3108,7 +3117,7 @@ pub(super) fn layout(
             .why("grid:row")?;
         pending.push((Some(column), Some(row), child_style.order, child, ordinal));
     }
-    pending.sort_by_key(|item| (item.2, item.4));
+    sort_placement_order(&mut pending);
     let placed = place_items(&pending, explicit_cols, explicit_rows, flow).why("grid:place")?;
     let mut items = Vec::new();
     for (child, col, row, col_span, row_span, source) in placed {
@@ -3561,9 +3570,18 @@ pub(super) fn layout(
     let inline_grid = marker(style, "--w3cos-internal-unrecognized-display") == Some("inline-grid");
     // First baseline of the first row (CSS Grid §10). Column, then source.
     let mut first_row_baseline: Option<(usize, usize, f32)> = None;
-    let mut ordered: Vec<usize> = (0..built.len()).collect();
-    ordered.sort_by_key(|&index| built[index].source);
+    // Source ordinals are unique and bounded by the direct child count.
+    // Index them directly instead of instantiating another stable sort.
+    // Out-of-flow and skipped whitespace children leave holes.
+    let source_count = built.iter().map(|item| item.source + 1).max().unwrap_or(0);
+    let mut ordered = vec![usize::MAX; source_count];
+    for (index, item) in built.iter().enumerate() {
+        ordered[item.source] = index;
+    }
     for index in ordered {
+        if index == usize::MAX {
+            continue;
+        }
         let item = &built[index];
         let fragment = fragments[index].fragment.clone();
         let area = span_sum(&columns, &collapsed, item.col, item.col_span, col_between);
@@ -4764,6 +4782,30 @@ mod tests {
                 (1, [100.0, 0.0, 100.0, 10.0]),
                 (2, [0.0, 0.0, 100.0, 20.0]),
             ],
+        );
+        // Out-of-flow children leave gaps in the original source ordinals.
+        // Placement follows CSS order; returned in-flow fragments retain
+        // their original source order. Chrome border boxes: later x=100,
+        // earlier x=0, despite the two intervening absolute boxes.
+        let mut later = block_box(None, Some(10.0));
+        later.order = 1;
+        let mut earlier = block_box(None, Some(20.0));
+        earlier.order = -1;
+        let mut abs = block_box(Some(30.0), Some(30.0));
+        abs.position = Position::Absolute;
+        let root = Component::boxed(
+            grid_style(200.0, None, Some("100px 100px")),
+            vec![leaf(abs.clone()), leaf(later), leaf(abs), leaf(earlier)],
+        );
+        let out = lay(&root);
+        assert_eq!(rect(&out, 2), [100.0, 0.0, 100.0, 10.0]);
+        assert_eq!(rect(&out, 4), [0.0, 0.0, 100.0, 20.0]);
+        assert_eq!(
+            out.iter()
+                .map(|(_, index)| *index)
+                .filter(|i| matches!(i, 2 | 4))
+                .collect::<Vec<_>>(),
+            vec![2, 4],
         );
         let mut rows = grid_style(100.0, None, Some("100px"));
         rows.grid_ng_mut().grid_template_rows = Some("30px 30px".to_string());
