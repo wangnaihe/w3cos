@@ -969,19 +969,28 @@ const INPUT_SIZE_MARKER: &str = "--w3cos-internal-input-size";
 fn text_field_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     let style = info.style;
-    if marker(style, w3cos_dom::user_agent::TEXTAREA_PROPERTY).is_some() {
-        return Some("text-input:textarea");
-    }
-    if !marker(style, w3cos_dom::user_agent::INPUT_TYPE_PROPERTY)
-        .is_some_and(|state| TEXT_FIELD_TYPES.contains(&state))
-    {
-        return Some("text-input:type");
-    }
-    if !cfg!(feature = "skia") || marker(style, INPUT_SIZE_MARKER).is_none() {
-        return Some("text-input:size");
-    }
-    if !style.line_height_is_normal {
-        return Some("text-input:line-height");
+    let textarea = is_textarea(style);
+    if textarea {
+        if !cfg!(feature = "skia")
+            || marker(style, w3cos_dom::user_agent::TEXTAREA_COLS_PROPERTY).is_none()
+            || marker(style, w3cos_dom::user_agent::TEXTAREA_ROWS_PROPERTY).is_none()
+        {
+            return Some("text-input:textarea");
+        }
+    } else {
+        if !marker(style, w3cos_dom::user_agent::INPUT_TYPE_PROPERTY)
+            .is_some_and(|state| TEXT_FIELD_TYPES.contains(&state))
+        {
+            return Some("text-input:type");
+        }
+        if !cfg!(feature = "skia") || marker(style, INPUT_SIZE_MARKER).is_none() {
+            return Some("text-input:size");
+        }
+        // A textarea's rows take any used line height; a text field's
+        // inner editor centering is only checked for `normal`.
+        if !style.line_height_is_normal {
+            return Some("text-input:line-height");
+        }
     }
     let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_));
     if [
@@ -1014,6 +1023,11 @@ fn text_field_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static
         // Paint only: a text field's `appearance` does not change its box
         // (Blink LayoutTextControl sizes the same for `none` and `auto`).
         w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY,
+        w3cos_dom::user_agent::TEXTAREA_PROPERTY,
+        w3cos_dom::user_agent::TEXTAREA_COLS_PROPERTY,
+        w3cos_dom::user_agent::TEXTAREA_ROWS_PROPERTY,
+        // Paint / interaction only (CSS UI `resize` adds no box).
+        w3cos_dom::css_style::RESIZE_PROPERTY,
         inline::VALIGN_LENGTH_MARKER,
     ];
     let block_allowed = &allowed[..allowed.len() - 1];
@@ -1061,6 +1075,9 @@ fn text_field_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static
 fn text_field_intrinsic(style: &Style) -> Option<(f32, f32)> {
     #[cfg(feature = "skia")]
     {
+        if is_textarea(style) {
+            return textarea_intrinsic(style);
+        }
         let size = marker(style, INPUT_SIZE_MARKER)?.parse::<u32>().ok()?;
         Some(crate::render_skia::html_text_input_content_size(
             style, size,
@@ -1071,6 +1088,54 @@ fn text_field_intrinsic(style: &Style) -> Option<(f32, f32)> {
         let _ = style;
         None
     }
+}
+
+/// A `<textarea>` (Blink LayoutTextControlMultiLine's box): a leaf here
+/// as well, a scroll container (`overflow: auto` from the UA sheet) whose
+/// value the painter draws.
+fn is_textarea(style: &Style) -> bool {
+    marker(style, w3cos_dom::user_agent::TEXTAREA_PROPERTY).is_some()
+}
+
+/// The height of one textarea row: the used `line-height`, or the
+/// primary font's line spacing for `normal`.
+fn textarea_line_height(style: &Style) -> f32 {
+    if style.line_height_is_normal {
+        #[cfg(feature = "skia")]
+        return crate::render_skia::html_text_input_content_size(style, 1).1;
+        #[cfg(not(feature = "skia"))]
+        return crate::layout::inline_style_line_height(style);
+    } else {
+        crate::layout::inline_style_line_height(style)
+    }
+}
+
+/// Width of a classic scrollbar (Chrome on Linux: 15px). Scrollbars take
+/// no layout space in this engine (`is_scroll_container`), but HTML
+/// §15.5.15 counts one into a textarea's intrinsic size.
+const TEXTAREA_SCROLLBAR: f32 = 15.0;
+
+/// Intrinsic content size of a textarea, written from HTML §15.5.15: the
+/// textarea effective width is `cols` average character widths plus a
+/// scrollbar's width, the effective height `rows` lines plus a
+/// scrollbar's height. As in Chrome, the vertical scrollbar counts unless
+/// `overflow-y` is `hidden` (or `clip`), and the horizontal one only for
+/// `overflow-x: scroll`; a line is the used `line-height` (`normal`: the
+/// primary font's line spacing). `letter-spacing` does not enter.
+#[cfg(feature = "skia")]
+fn textarea_intrinsic(style: &Style) -> Option<(f32, f32)> {
+    let count = |name: &str| marker(style, name)?.parse::<u32>().ok().filter(|n| *n > 0);
+    let cols = count(w3cos_dom::user_agent::TEXTAREA_COLS_PROPERTY)?;
+    let rows = count(w3cos_dom::user_agent::TEXTAREA_ROWS_PROPERTY)?;
+    let line =
+        (!style.line_height_is_normal).then(|| crate::layout::inline_style_line_height(style));
+    let (width, height) = crate::render_skia::html_textarea_content_size(style, cols, rows, line);
+    let vertical = !matches!(style.resolved_overflow_y(), Overflow::Hidden);
+    let horizontal = matches!(style.resolved_overflow_x(), Overflow::Scroll);
+    Some((
+        width + if vertical { TEXTAREA_SCROLLBAR } else { 0.0 },
+        height + if horizontal { TEXTAREA_SCROLLBAR } else { 0.0 },
+    ))
 }
 
 /// Content-box size of a text field: a specified size (border-box sizing
@@ -2800,7 +2865,20 @@ fn layout_block_in(
         // text field's baseline is its inner editor's line.
         cursor = height;
         at_top = false;
-        if let ComponentKind::TextInput { .. } = info.kind {
+        if let ComponentKind::TextInput { .. } = info.kind
+            && is_textarea(style)
+        {
+            // A textarea's first baseline is its inner editor's first
+            // line, at the content-box top (Chrome: a flex item at
+            // border + padding + ascent, also when empty). As a scroll
+            // container its last baseline is synthesized from the margin
+            // box end (set below), so an inline textarea sits on its
+            // bottom margin edge, as do inline-blocks that end with one.
+            let line = textarea_line_height(style);
+            first_baseline = LastBaseline::At(
+                content_top + crate::layout::inline_font_baseline_from_line_top(style, line),
+            );
+        } else if let ComponentKind::TextInput { .. } = info.kind {
             let baseline = text_field_baseline(style, height).why("text-input:size")?;
             last_baseline = LastBaseline::At(content_top + baseline);
             first_baseline = last_baseline;
@@ -3564,6 +3642,9 @@ fn layout_block_in(
     }
     let width = metrics.content_width + bl + br + pl + pr;
     let height = content_height + bt + bb + pt + pb;
+    if matches!(info.kind, ComponentKind::TextInput { .. }) && is_textarea(style) {
+        last_baseline = LastBaseline::At(height + metrics.margin[2]);
+    }
     if style.position != Position::Static && !oof_candidates.is_empty() {
         // A positioned box is the containing block of its absolute
         // descendants: its padding box (CSS2 10.1 item 4).

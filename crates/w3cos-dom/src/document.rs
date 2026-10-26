@@ -11318,6 +11318,27 @@ impl Document {
                                 .get_or_insert_with(Default::default)
                                 .insert("--w3cos-internal-input-size".into(), size.to_string());
                         }
+                        if tag.as_str() == "textarea" {
+                            // HTML §4.10.11: `cols` / `rows` are limited to
+                            // numbers greater than zero with fallback (rules
+                            // for parsing non-negative integers, §2.3.4.1).
+                            let dimension = |name: &str, fallback: u32| {
+                                node.get_attribute_ns(None, name)
+                                    .and_then(|value| parse_html_non_negative_integer(&value))
+                                    .filter(|value| *value > 0)
+                                    .unwrap_or(fallback)
+                            };
+                            let properties =
+                                style.custom_properties.get_or_insert_with(Default::default);
+                            properties.insert(
+                                crate::user_agent::TEXTAREA_COLS_PROPERTY.into(),
+                                dimension("cols", 20).to_string(),
+                            );
+                            properties.insert(
+                                crate::user_agent::TEXTAREA_ROWS_PROPERTY.into(),
+                                dimension("rows", 2).to_string(),
+                            );
+                        }
                         let input_type = node
                             .attributes
                             .iter()
@@ -30029,4 +30050,17 @@ mod extent_cache_tests {
 /// The local name of a possibly prefixed tag (`svg:a` → `a`).
 fn local_tag_name(tag: &str) -> &str {
     tag.rsplit_once(':').map_or(tag, |(_, local)| local)
+}
+
+/// HTML §2.3.4.1 rules for parsing non-negative integers: skip ASCII
+/// whitespace, an optional `+`, then the leading ASCII digits (trailing
+/// garbage is ignored). `None` without a digit or on overflow.
+fn parse_html_non_negative_integer(input: &str) -> Option<u32> {
+    let rest = input.trim_start_matches(['\t', '\n', '\u{000c}', '\r', ' ']);
+    let rest = rest.strip_prefix('+').unwrap_or(rest);
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    rest[..digits].parse::<u32>().ok()
 }

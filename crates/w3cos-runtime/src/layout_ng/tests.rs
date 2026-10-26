@@ -4731,3 +4731,146 @@ fn button_matches_chrome() {
     assert_eq!(r(12).2, 400.0);
     assert_eq!(r(13).3, 80.0);
 }
+
+#[cfg(feature = "skia")]
+#[test]
+fn textarea_matches_chrome() {
+    // Chrome's model (HTML §15.5.15 plus a 15px scrollbar): width is
+    // ceil(cols x character) + scrollbar, height rows x line height, plus
+    // the 1px border and 2px padding; fit-content when block-level; the
+    // inline baseline is the bottom margin edge, the flex one the first
+    // line. Chrome's host monospace face is DejaVu Sans Mono (character 8.03,
+    // line 15, ascent 12 at 13.33px: 182x36); the engine's pinned monospace
+    // face is Cousine (character 8, line 15, ascent 11; at 16px character 10,
+    // line 18), so the expected numbers follow that face.
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "600px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    // Each line: a 10px inline-block probe, then a textarea.
+    let line = |document: &mut w3cos_dom::Document,
+                parent_css: &[(&str, &str)],
+                attrs: &[(&str, &str)],
+                css: &[(&str, &str)]| {
+        let parent = div(document, parent_css);
+        let probe = document.create_element("div");
+        for (k, v) in [
+            ("display", "inline-block"),
+            ("width", "10px"),
+            ("height", "10px"),
+        ] {
+            probe.style_mut(document).set_property(k, v);
+        }
+        parent.append_child(document, probe);
+        let textarea = document.create_element("textarea");
+        for (k, v) in attrs {
+            textarea.set_attribute(document, k, v);
+        }
+        textarea.style_mut(document).set_property("margin", "0");
+        for (k, v) in css {
+            textarea.style_mut(document).set_property(k, v);
+        }
+        let text = document.create_text_node("x");
+        textarea.append_child(document, text);
+        parent.append_child(document, textarea);
+    };
+    let inline = [("line-height", "0")];
+    let flex = [("display", "flex"), ("align-items", "baseline")];
+    line(&mut document, &inline, &[], &[]);
+    line(
+        &mut document,
+        &inline,
+        &[("cols", "10"), ("rows", "1")],
+        &[],
+    );
+    line(
+        &mut document,
+        &inline,
+        &[("cols", " 40"), ("rows", "5x")],
+        &[],
+    );
+    line(
+        &mut document,
+        &inline,
+        &[("cols", "0"), ("rows", "-3")],
+        &[],
+    );
+    line(&mut document, &inline, &[], &[("overflow", "hidden")]);
+    line(&mut document, &inline, &[], &[("overflow-x", "scroll")]);
+    line(&mut document, &inline, &[], &[("line-height", "20px")]);
+    line(&mut document, &inline, &[], &[("font", "16px monospace")]);
+    line(
+        &mut document,
+        &inline,
+        &[],
+        &[("width", "100px"), ("height", "50px")],
+    );
+    line(
+        &mut document,
+        &inline,
+        &[],
+        &[
+            ("box-sizing", "border-box"),
+            ("width", "100px"),
+            ("height", "50px"),
+        ],
+    );
+    line(&mut document, &inline, &[], &[("margin", "7px")]);
+    line(&mut document, &flex, &[], &[]);
+    line(&mut document, &flex, &[], &[("padding", "9px")]);
+    // Block-level: fit-content, not the container width.
+    let block = div(&mut document, &[]);
+    let textarea = document.create_element("textarea");
+    textarea
+        .style_mut(&mut document)
+        .set_property("display", "block");
+    block.append_child(&mut document, textarea);
+
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let areas: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::TextInput { .. }))
+        .collect();
+    assert_eq!(areas.len(), 14);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("textareas");
+    let r = |n: usize| rect(&out, areas[n]);
+    let size = |n: usize| (r(n).2, r(n).3);
+    // Probe bottom minus the textarea's border-box top.
+    let baseline = |n: usize| {
+        let probe = rect(&out, areas[n] - 1);
+        probe.1 + probe.3 - r(n).1
+    };
+    let near = |a: f32, b: f32| assert!((a - b).abs() < 0.01, "{a} != {b}");
+    assert_eq!(size(0), (181.0, 36.0));
+    assert_eq!(size(1), (101.0, 21.0));
+    assert_eq!(size(2), (341.0, 81.0));
+    assert_eq!(size(3), (181.0, 36.0)); // invalid cols / rows: 20 x 2
+    assert_eq!(size(4), (166.0, 36.0)); // no scrollbar width
+    assert_eq!(size(5), (181.0, 51.0)); // and a scrollbar height
+    assert_eq!(size(6), (181.0, 46.0));
+    assert_eq!(size(7), (221.0, 42.0));
+    assert_eq!(size(8), (106.0, 56.0));
+    assert_eq!(size(9), (100.0, 50.0));
+    // Inline: the bottom margin edge (a scroll container).
+    near(baseline(0), 36.0);
+    near(baseline(10), 43.0);
+    // Flex items: the first line's baseline (border + padding + ascent).
+    near(baseline(11), 14.0);
+    near(baseline(12), 21.0);
+    assert_eq!(size(13), (181.0, 36.0));
+}

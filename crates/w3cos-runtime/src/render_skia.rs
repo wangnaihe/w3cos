@@ -5724,6 +5724,33 @@ fn with_text_typeface<T>(text: &str, style: &Style, callback: impl FnOnce(&Typef
 /// HTML text field content size, before padding and borders. Mirrors the
 /// browser's character-count sizing rather than a fixed native control size.
 pub(crate) fn html_text_input_content_size(style: &Style, size: u32) -> (f32, f32) {
+    let (character, maximum, line) = html_text_control_metrics(style);
+    (
+        (character * size as f32 + (maximum - character).max(0.0)).ceil(),
+        line,
+    )
+}
+
+/// HTML §15.5.15 textarea effective width and height without the
+/// scrollbar terms: `cols` average character widths (rounded up to a
+/// whole pixel, as Chrome does) by `rows` lines of `line_height`.
+pub(crate) fn html_textarea_content_size(
+    style: &Style,
+    cols: u32,
+    rows: u32,
+    line_height: Option<f32>,
+) -> (f32, f32) {
+    let (character, _, line) = html_text_control_metrics(style);
+    (
+        (character * cols as f32).ceil(),
+        line_height.unwrap_or(line) * rows as f32,
+    )
+}
+
+/// The text control character width (the primary font's average
+/// character width when usable, else the width of "0"), the maximum
+/// character width, and the `line-height: normal` line spacing.
+fn html_text_control_metrics(style: &Style) -> (f32, f32, f32) {
     with_text_typeface("x0", style, |face| {
         let font = crate::skia_text_run::css_font(face, style.font_size);
         let (_, raw) = font.metrics();
@@ -5786,10 +5813,7 @@ pub(crate) fn html_text_input_content_size(style: &Style, size: u32) -> (f32, f3
         } else {
             raw.max_char_width.round()
         };
-        (
-            (character * size as f32 + (maximum - character).max(0.0)).ceil(),
-            geometry.line_spacing(),
-        )
+        (character, maximum, geometry.line_spacing())
     })
 }
 

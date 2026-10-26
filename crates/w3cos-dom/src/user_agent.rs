@@ -25,6 +25,11 @@ pub const CONTROL_APPEARANCE_PROPERTY: &str = "--w3cos-internal-html-control-app
 /// Textarea line metrics remain distinct from single-line inputs, even when
 /// an author disables automatic control painting.
 pub const TEXTAREA_PROPERTY: &str = "--w3cos-internal-html-textarea";
+/// A `<textarea>`'s character width and height (HTML §4.10.11: the `cols`
+/// and `rows` attributes, 20 and 2 when missing or not a valid integer
+/// greater than zero), for its intrinsic size (HTML §15.5.15).
+pub const TEXTAREA_COLS_PROPERTY: &str = "--w3cos-internal-textarea-cols";
+pub const TEXTAREA_ROWS_PROPERTY: &str = "--w3cos-internal-textarea-rows";
 /// The type state of an `<input>` (HTML §4.10.5), lowercased; `text` for an
 /// invalid or missing type attribute.
 pub const INPUT_TYPE_PROPERTY: &str = "--w3cos-internal-input-type";
