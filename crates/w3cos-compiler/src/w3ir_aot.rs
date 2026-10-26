@@ -8755,7 +8755,7 @@ fn sanitize_identifier(name: &str) -> String {
 /// is unambiguous for them. Any other name (minified `y` vs `Y`, `a_1` vs
 /// `a1`, `a__b` vs `a_u2_b`) gets a `U0<fnv64>` suffix, a sequence the plain
 /// form can never produce, so distinct symbols never share a frame type.
-fn upper_camel(name: &str) -> String {
+pub(crate) fn upper_camel(name: &str) -> String {
     let readable = readable_upper_camel(name);
     if is_plain_snake_ident(name) {
         return readable;
