@@ -1353,6 +1353,19 @@ pub(super) fn is_overflow_scroll_container(style: &Style) -> bool {
     non_visible_overflow(style) && style.display.establishes_overflow_clip()
 }
 
+/// A scroll container whose overflow in one axis is itself scrollable
+/// (`hidden`, `scroll` or `auto`). `overflow: clip` is stored as `visible`,
+/// so a box that only clips that axis does not count (CSS Grid §6.6:
+/// "a scrollable overflow value in that axis"). Horizontal writing mode.
+pub(super) fn scrolls_in_axis(style: &Style, inline: bool) -> bool {
+    let overflow = if inline {
+        style.resolved_overflow_x()
+    } else {
+        style.resolved_overflow_y()
+    };
+    overflow != Overflow::Visible && style.display.establishes_overflow_clip()
+}
+
 /// Overflow shapes that still disagree with the legacy engine: scrollports
 /// (`scroll` / `auto`), a negative
 /// margin, or a float/clear inside the box. `hidden` on a block that only
@@ -2280,9 +2293,8 @@ pub(super) fn intrinsic_sizes_at(
     }
     if is_author_grid(info.style) {
         // A grid's min/max-content size is the sum of its tracks, not the
-        // block-flow sum below. Shrink-to-fit of an auto-width grid stays
-        // on the legacy engine.
-        return super::bail("grid:intrinsic");
+        // block-flow sum below (Blink GridLayoutAlgorithm::ComputeMinMaxSizes).
+        return super::grid::min_max(flat, index, space);
     }
     if let ComponentKind::Text { content } = info.kind {
         return Some(inline::text_min_max(content, info.style));
