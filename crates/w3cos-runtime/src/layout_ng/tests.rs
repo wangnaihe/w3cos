@@ -4874,3 +4874,57 @@ fn textarea_matches_chrome() {
     near(baseline(12), 21.0);
     assert_eq!(size(13), (181.0, 36.0));
 }
+
+/// Blink's min/max-content contributions treat a percentage width as auto
+/// and ignore a percentage min-width, so a shrink-to-fit float is sized by
+/// the 30px grandchild and the 40px sibling (40). Layout then resolves the
+/// percentages against that width: 50% is 20 and min-width 200% is 80.
+#[test]
+fn percent_widths_do_not_size_a_shrink_to_fit_float() {
+    use w3cos_std::style::Float;
+    let fixed = |w: f32, h: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                height: Dimension::Px(h),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                float: Float::Left,
+                ..block()
+            },
+            vec![
+                node(
+                    Style {
+                        width: Dimension::Percent(50.0),
+                        ..block()
+                    },
+                    vec![fixed(30.0, 10.0)],
+                ),
+                node(
+                    Style {
+                        width: Dimension::Px(40.0),
+                        min_width: Dimension::Percent(200.0),
+                        height: Dimension::Px(10.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("percent float");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 20.0, 10.0));
+    assert_eq!(rect(&out, 4), (0.0, 10.0, 80.0, 10.0));
+}

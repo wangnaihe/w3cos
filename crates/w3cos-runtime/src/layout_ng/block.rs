@@ -2226,6 +2226,48 @@ fn percent_inline(style: &Style) -> bool {
         || spacing(style.padding.right)
 }
 
+/// Whether a descendant that feeds `index`'s min/max-content sizes has a
+/// percentage inline size, margin or padding. Out-of-flow and
+/// `display: none` subtrees contribute nothing to intrinsic sizes (CSS
+/// Sizing 3), so their percentages are skipped with them.
+fn contributing_percent_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let end = flat[index].subtree_end.max(index + 1);
+    let mut node = index + 1;
+    while node < end {
+        let info = &flat[node];
+        if info.style.display == Display::None || oof::is_out_of_flow(info.style) {
+            node = info.subtree_end.max(node + 1);
+            continue;
+        }
+        if percent_inline(info.style) {
+            return true;
+        }
+        node += 1;
+    }
+    false
+}
+
+/// [`clamp_inline`] with no containing block width: percentage
+/// min-width / max-width do not apply.
+fn clamp_inline_indefinite(
+    style: &Style,
+    space: &ConstraintSpace,
+    edges: f32,
+    mut width: f32,
+) -> f32 {
+    let to_content = |w: f32| match style.box_sizing {
+        BoxSizing::BorderBox => (w - edges).max(0.0),
+        BoxSizing::ContentBox => w,
+    };
+    if let Some(max) = resolve_dim(style.max_width, None, style, space).map(to_content) {
+        width = width.min(max);
+    }
+    if let Some(min) = resolve_dim(style.min_width, None, style, space).map(to_content) {
+        width = width.max(min);
+    }
+    width
+}
+
 /// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
 fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, mut width: f32) -> f32 {
     let cb = Some(space.available_inline);
@@ -2285,11 +2327,11 @@ pub(super) fn intrinsic_sizes_at(
         };
         return Some(border_box.map(|width| (width - edges).max(0.0)));
     }
-    if subtree
-        .iter()
-        .filter(rendered)
-        .any(|node| percent_inline(node.style))
-    {
+    // Flex, grid and inline content size their items' percentages their own
+    // way, so a percentage anywhere below them stays on legacy. The block
+    // children below handle theirs (BlockNode::ComputeMinMaxSizes).
+    let percent_below = || contributing_percent_inline(flat, index);
+    if (is_author_flex(info.style) || is_author_grid(info.style)) && percent_below() {
         return super::bail("intrinsic-percent");
     }
     if is_author_flex(info.style) {
@@ -2342,6 +2384,9 @@ pub(super) fn intrinsic_sizes_at(
     };
     let space = &child_space;
     if inline::is_inline_container(flat, index) {
+        if percent_below() {
+            return super::bail("intrinsic-percent");
+        }
         // Floats among inline content would take the float_left /
         // float_right inline sizes into InlineNode::ComputeMinMaxSizes.
         if subtree
@@ -2378,6 +2423,21 @@ pub(super) fn intrinsic_sizes_at(
                 float_right = 0.0;
             }
         }
+        // A replaced child sizes a percentage against its own containing
+        // block, and its min-content contribution would drop to zero
+        // (compressible replaced elements). A table with a percentage width
+        // has its own intrinsic rules. Neither is modelled yet.
+        let plain = matches!(
+            flat[child].kind,
+            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+        ) && !matches!(style.display, Display::Table | Display::InlineTable);
+        if !plain && percent_inline(style) {
+            return super::bail("intrinsic-percent");
+        }
+        // Percentages have nothing to resolve against here (Blink resolves
+        // percentage margins and padding against zero for min/max sizes):
+        // a percentage width acts as auto, percentage min/max-width as
+        // none, and percentage margins and padding as zero.
         let side = |s: Spacing| match s {
             Spacing::Auto => 0.0,
             s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
@@ -2392,7 +2452,7 @@ pub(super) fn intrinsic_sizes_at(
             }),
             None => intrinsic_sizes(flat, child, space).why("intrinsic")?,
         };
-        let border_box = content.map(|w| clamp_inline(style, space, edges, w) + edges);
+        let border_box = content.map(|w| clamp_inline_indefinite(style, space, edges, w) + edges);
         let max_contribution = if floating {
             // A float outside the content area (negative margins) adds
             // nothing.
