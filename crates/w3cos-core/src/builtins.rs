@@ -1687,7 +1687,11 @@ fn build_process_value() -> Value {
             std::process::exit(if code.is_finite() { code as i32 } else { 0 })
         }),
     );
-    Value::object(properties)
+    // An ordinary object, as in Node: `require('process')` mixes in the
+    // EventEmitter methods and calls `EventEmitter.init`, which reads
+    // `Object.getPrototypeOf(process)._events`; a null prototype made that
+    // throw in every fresh realm (e.g. Code-OSS's shared-process worker).
+    Value::object_literal(properties)
 }
 
 thread_local! {
@@ -2705,6 +2709,20 @@ mod monaco_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn process_is_an_ordinary_object_with_object_prototype() {
+        let process = process_value();
+        let prototype = crate::class::get_prototype_of(&process);
+        assert!(!prototype.is_null(), "process needs a prototype");
+        assert!(
+            crate::intrinsics::get_property(&prototype, &Value::string("_events")).is_undefined()
+        );
+        assert!(
+            process.get_property("hasOwnProperty").is_callable(),
+            "process inherits Object.prototype"
+        );
+    }
     use super::*;
 
     #[test]
