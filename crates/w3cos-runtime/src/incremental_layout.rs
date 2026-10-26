@@ -721,7 +721,26 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
+        let split_owner = component
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| {
+                properties
+                    .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+                    .cloned()
+            });
         component.style = style.clone().into();
+        if let Some(owner) = split_owner {
+            component
+                .style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(
+                    w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER.into(),
+                    owner,
+                );
+        }
         return true;
     }
     component

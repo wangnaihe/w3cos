@@ -33095,6 +33095,49 @@ try {
     }
 
     #[test]
+    fn block_in_inline_retained_child_geometry_keeps_fragment_owner() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block.clone()]);
+        let initial = host.call_method("getClientRects", vec![]);
+        assert_eq!(
+            initial.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+
+        style.set_property("width", Value::string("24px"));
+        style.set_property("height", Value::string("12px"));
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("420px"));
+        let changed = host.call_method("getClientRects", vec![]);
+        assert_eq!(changed.get_property("length").to_u32(), 3);
+        assert_eq!(
+            changed.get_property("1").get_property("width").to_number(),
+            420.0
+        );
+        assert_eq!(
+            changed.get_property("1").get_property("height").to_number(),
+            12.0
+        );
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 420.0);
+        assert_eq!(bounds.get_property("height").to_number(), 12.0);
+    }
+
+    #[test]
     fn focus_and_active_element() {
         setup();
         let doc = document_value();
