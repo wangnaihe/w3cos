@@ -2806,9 +2806,10 @@ fn direct_typed_callees(
         {
             continue;
         }
+        let lowered_name = w3ir_entry_binding_name(&symbol.original_name);
         let Some(binding) = entry.bindings.iter().find(|binding| {
             // Module-scope declarations lower to hoisted `var`-like cells.
-            binding.name == symbol.original_name
+            binding.name == lowered_name
                 && matches!(
                     binding.kind,
                     w3cos_ir::BindingKind::Function | w3cos_ir::BindingKind::Var
@@ -2891,6 +2892,18 @@ fn select_w3ir_function<'a>(
         })
 }
 
+/// Name of the W3IR module-entry binding that holds a codegen symbol.
+///
+/// Codegen records an anonymous `export default function () {}` / class as
+/// `__w3cos_default_export_N` (a Rust-safe symbol), while W3IR lowering binds
+/// the same item as `*default:N*`. Every other symbol keeps its source name.
+fn w3ir_entry_binding_name(name: &str) -> String {
+    name.strip_prefix("__w3cos_default_export_")
+        .filter(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|index| format!("*default:{index}*"))
+        .unwrap_or_else(|| name.to_string())
+}
+
 fn entry_bound_w3ir_function<'a>(
     module: &'a w3cos_ir::Module,
     name: &str,
@@ -2899,6 +2912,7 @@ fn entry_bound_w3ir_function<'a>(
         .functions
         .iter()
         .find(|candidate| candidate.id == module.entry)?;
+    let name = w3ir_entry_binding_name(name);
     let binding = entry
         .bindings
         .iter()
