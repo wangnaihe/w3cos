@@ -32924,6 +32924,30 @@ try {
         assert_eq!(bounds.get_property("width").to_number(), 400.0);
         assert!(bounds.get_property("height").to_number() > 10.0);
 
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("300px"));
+        let narrower = host.call_method("getClientRects", vec![]);
+        assert_eq!(narrower.get_property("length").to_u32(), 3);
+        assert_eq!(
+            narrower.get_property("1").get_property("width").to_number(),
+            300.0
+        );
+        assert_eq!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "retained"
+        );
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let restored = host.call_method("getClientRects", vec![]);
+        assert_eq!(restored.get_property("length").to_u32(), 3);
+        assert_eq!(
+            restored.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        assert_eq!(crate::incremental_layout::last_flush_stats().kind, "memo");
+
         host.call_method("removeChild", vec![block.clone()]);
         assert_eq!(
             host.call_method("getClientRects", vec![])
@@ -32937,6 +32961,12 @@ try {
                 .get_property("length")
                 .to_u32(),
             2
+        );
+        let old_host = node_id_of(&host).unwrap();
+        setup();
+        assert!(
+            crate::incremental_layout::client_rects(old_host).is_none(),
+            "document reset must clear sparse fragment geometry before NodeId reuse"
         );
     }
 
