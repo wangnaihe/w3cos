@@ -4,8 +4,7 @@
 //! (third_party/blink/renderer/core/layout/grid/grid_layout_algorithm.cc,
 //! Copyright The Chromium Authors, BSD-style license) and CSS Grid Level 1
 //! §8 (placement) and §12 (track sizing). A missing column template is one
-//! `1fr` track, which is what the legacy engine models with
-//! `grid-auto-columns: 1fr`.
+//! track sized by grid-auto-columns, as an implicit column would be.
 //!
 //! A subgrid reuses the parent tracks it spans, including `auto`, `fr`,
 //! `minmax`, and intrinsic tracks. Its items contribute to those tracks.
@@ -1813,8 +1812,27 @@ fn resolve_pair(
     names: &[Vec<String>],
     explicit: usize,
 ) -> Option<AxisPlace> {
+    let (start_text, end_text) = (start, end);
     let start = parse_grid_line(start)?;
     let end = parse_grid_line(end)?;
+    // An auto side contributes nothing: `x / auto` is `x`, `auto / span n`
+    // is `span n`, and `auto / line` is a span of 1 ending at that line.
+    if matches!(end, GridLine::Auto) {
+        return resolve_one(start_text, names, explicit, None);
+    }
+    if matches!(start, GridLine::Auto) {
+        if matches!(end, GridLine::Span { .. }) {
+            return resolve_one(end_text, names, explicit, None);
+        }
+        let end_line = grid_line_index(&end, names, explicit, None)?;
+        if end_line < 1 {
+            return None;
+        }
+        return Some(AxisPlace {
+            start: Some(end_line - 1),
+            span: 1,
+        });
+    }
     if let GridLine::Span { count, name } = start {
         let end_line = grid_line_index(&end, names, explicit, None)?;
         let start_line = span_to_line(end_line, count, name.as_deref(), names, false)?;
@@ -3585,8 +3603,10 @@ fn layout_impl(
         );
         fixed_template(&inherited.columns, names)
     } else {
+        // No column template: no explicit columns. The one column that
+        // row flow needs is added below as an implicit track.
         match columns_spec(style) {
-            None => parse_template("", false).why("grid:template")?,
+            None => parse_template("", true).why("grid:template")?,
             Some(spec) => parse_template(spec, false).why("grid:template")?,
         }
     };
@@ -3617,7 +3637,8 @@ fn layout_impl(
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
         .count();
     // Column flow with no explicit columns builds implicit auto tracks.
-    // A missing template on the row-flow axis stays one `1fr` column.
+    // A missing template on the row-flow axis stays one column, sized as
+    // an implicit (grid-auto-columns) track.
     let mut column_specs = if columns_spec(style).is_none() && flow.column {
         Vec::new()
     } else {
@@ -3641,7 +3662,20 @@ fn layout_impl(
         None => Spec::One(Breadth::Auto),
     };
     if column_specs.is_empty() && !flow.column {
-        column_specs.push(Spec::One(Breadth::Fr(1.0)));
+        // That column is implicit: grid-auto-columns sizes it, and the
+        // default `auto` only fills the grid when content distribution
+        // stretches it (place-content: start keeps it at max-content).
+        // With no in-flow items there is no implicit track, so a
+        // grid-auto-columns size must not give the empty grid a width;
+        // the old 1fr stand-in keeps its min-content width at zero. A
+        // grid-lanes box keeps the stand-in too: its percentage-width items
+        // match the column-flow references only against the 1fr track.
+        let lanes = has_marker(style, "--w3cos-internal-grid-lanes");
+        column_specs.push(if inflow > 0 && !lanes {
+            implicit_column.clone()
+        } else {
+            Spec::One(Breadth::Fr(1.0))
+        });
     }
     let explicit_cols = column_specs.len();
     let explicit_rows = row_specs.len();
@@ -4057,12 +4091,13 @@ fn layout_impl(
         font,
         row_gap_u,
     );
+    // Maximize tracks (CSS Grid 12.6) grows rows towards their growth
+    // limits in the free space, so minmax(20px, max-content) reaches
+    // max-content in a tall grid; an indefinite height has no free space.
     let mut rows = if row_tracks.is_empty() {
         Vec::new()
-    } else if row_tracks.iter().any(|track| track.flex > 0.0) {
-        finalize(&row_tracks, row_available, row_gap_u)
     } else {
-        finalize(&row_tracks, None, row_gap_u)
+        finalize(&row_tracks, row_available, row_gap_u)
     };
     let mut recorded_rows = None;
     if row_sub {
@@ -4245,6 +4280,10 @@ fn layout_impl(
     }
     let border_width = inner_width + bl + br + pl + pr;
     let border_height = height + bt + bb + pt + pb;
+    // The column that stands in for a missing template only exists once an
+    // in-flow item is placed in it; with none, the implicit grid has no
+    // columns and every column line of an abspos child is outside it.
+    let stand_in_column_only = columns_spec(style).is_none() && !flow.column && built.is_empty();
     for child in oof_children {
         let child_style = flat[child].style;
         let column = resolve_axis(placement(child_style, false), &names_cols, explicit_cols)
@@ -4253,17 +4292,28 @@ fn layout_impl(
             .why("grid:row")?;
         let col = column.start.unwrap_or(0).max(0) as usize;
         let row_index = row.start.unwrap_or(0).max(0) as usize;
-        // No in-flow rows: the static-position area is the content box,
-        // which is what a stretched auto row would occupy.
-        let area_w = if columns.is_empty() {
+        // When the grid is not the containing block, the static position
+        // is that of the sole item of an area spanning the content box
+        // (CSS Grid 9.2), so grid placement does not move it. No in-flow
+        // rows gives the same area: a stretched auto row fills the box.
+        let static_only = style.position == Position::Static;
+        let area_w = if columns.is_empty() || static_only {
             inner_u
         } else {
             span_sum(&columns, &collapsed, col, column.span, col_between)
         };
-        let area_h = if rows.is_empty() {
+        let area_h = if rows.is_empty() || static_only {
             used
         } else {
             span_sum(&rows, &row_collapsed, row_index, row.span, row_between)
+        };
+        let (col_at, row_at) = if static_only {
+            (0, 0)
+        } else {
+            (
+                column_x.get(col).copied().unwrap_or(0),
+                row_y.get(row_index).copied().unwrap_or(0),
+            )
         };
         let justify = align_pack(used_item_align(
             style.justify_items,
@@ -4290,8 +4340,8 @@ fn layout_impl(
         let block_off = border_h
             .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
             .unwrap_or(0);
-        let mut x = from_units(origin_x + column_x.get(col).copied().unwrap_or(0) + inline_off);
-        let y = from_units(origin_y + row_y.get(row_index).copied().unwrap_or(0) + block_off);
+        let mut x = from_units(origin_x + col_at + inline_off);
+        let y = from_units(origin_y + row_at + block_off);
         if rtl {
             x = from_units(origin_x + inner_u - (units(x) - origin_x));
         }
@@ -4310,7 +4360,7 @@ fn layout_impl(
         // grid are the padding edges (the augmented grid).
         let (start_auto, end_auto) = abspos_auto_lines(placement(child_style, false));
         let (x0, x1) = abspos_area(
-            &columns,
+            if stand_in_column_only { &[] } else { &columns },
             &column_x,
             column.start,
             column.span,
@@ -5385,6 +5435,63 @@ mod tests {
                 (2, [0.0, 13.0, 10.0, 20.0]),
                 (3, [0.0, 33.0, 10.0, 10.0]),
             ],
+        );
+    }
+
+    #[test]
+    fn missing_column_template_uses_the_implicit_auto_column() {
+        // No grid-template-columns: row flow gets one implicit column sized by
+        // grid-auto-columns. Under justify-content:start the auto track keeps
+        // its 30px content width (Chrome, fit-content-tracks-dont-stretch-001).
+        let item = || {
+            Component::boxed(
+                block_box(None, None),
+                vec![leaf(block_box(Some(30.0), Some(10.0)))],
+            )
+        };
+        let mut packed = grid_style(200.0, None, None);
+        mark_justify(&mut packed, "start");
+        expect(
+            &Component::boxed(packed, vec![item()]),
+            &[(1, [0.0, 0.0, 30.0, 10.0])],
+        );
+        let mut sized = grid_style(200.0, None, None);
+        sized.grid_ng_mut().grid_auto_columns = Some("50px".to_string());
+        expect(
+            &Component::boxed(sized, vec![item()]),
+            &[(1, [0.0, 0.0, 50.0, 10.0])],
+        );
+        // The initial value still stretches the single auto column.
+        expect(
+            &Component::boxed(grid_style(200.0, None, None), vec![item()]),
+            &[(1, [0.0, 0.0, 200.0, 10.0])],
+        );
+        // An empty grid has no implicit track, so grid-auto-columns does
+        // not give it a max-content width (Chrome, abspos/empty-grid-001).
+        let mut empty = Style {
+            display: Display::Grid,
+            ..Style::default()
+        };
+        empty.grid_ng_mut().grid_auto_columns = Some("200px".to_string());
+        let mut outer = grid_style(400.0, None, None);
+        mark_justify(&mut outer, "start");
+        expect(
+            &Component::boxed(outer, vec![leaf(empty)]),
+            &[(1, [0.0, 0.0, 0.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn auto_start_with_an_end_line_spans_one_track() {
+        // `auto / 3` is span 1 ending at line 3: the second column.
+        let mut placed = block_box(None, Some(10.0));
+        placed.grid_column = Some("auto / 3".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(100.0, None, Some("40px 60px")),
+                vec![leaf(placed)],
+            ),
+            &[(1, [40.0, 0.0, 60.0, 10.0])],
         );
     }
 

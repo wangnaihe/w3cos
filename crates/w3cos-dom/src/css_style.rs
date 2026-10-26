@@ -1488,6 +1488,41 @@ impl CSSStyleDeclaration {
             }
             "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
             "justify-items" | "justifyItems" => self.inner.justify_items = parse_align_items(value),
+            "place-content" | "placeContent" => {
+                // `<'align-content'> <'justify-content'>?` (CSS Box Alignment).
+                // An overflow-position or baseline-position prefix belongs to
+                // the keyword after it. With one value, justify-content takes
+                // the same value, except a baseline value, which gives start.
+                let mut groups: Vec<String> = Vec::new();
+                let mut prefix: Option<&str> = None;
+                for token in value.split_whitespace() {
+                    let lower = token.to_ascii_lowercase();
+                    if prefix.is_none()
+                        && matches!(lower.as_str(), "safe" | "unsafe" | "first" | "last")
+                    {
+                        prefix = Some(token);
+                        continue;
+                    }
+                    groups.push(match prefix.take() {
+                        Some(p) => format!("{p} {token}"),
+                        None => token.to_string(),
+                    });
+                }
+                if let Some(p) = prefix {
+                    groups.push(p.to_string());
+                }
+                if let Some(align) = groups.first().cloned() {
+                    let justify = match groups.get(1) {
+                        Some(justify) => justify.clone(),
+                        None if align.to_ascii_lowercase().ends_with("baseline") => {
+                            "start".to_string()
+                        }
+                        None => align.clone(),
+                    };
+                    self.set_property("align-content", &align);
+                    self.set_property("justify-content", &justify);
+                }
+            }
             "place-items" | "placeItems" => {
                 let mut values = value.split_whitespace();
                 if let Some(align) = values.next() {
@@ -3642,6 +3677,38 @@ fn computed_tab_size_calc(body: &str, font_size: f32) -> Option<String> {
     } else {
         format!("{total}")
     })
+}
+
+#[cfg(test)]
+mod place_content_tests {
+    use super::{CSSStyleDeclaration, JUSTIFY_CONTENT_PROPERTY};
+    use w3cos_std::style::{AlignContent, JustifyContent};
+
+    fn justify_marker(style: &CSSStyleDeclaration) -> Option<String> {
+        style
+            .to_style()
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(JUSTIFY_CONTENT_PROPERTY))
+            .cloned()
+    }
+
+    #[test]
+    fn place_content_sets_both_content_alignments() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("place-content", "start");
+        assert_eq!(style.to_style().align_content, AlignContent::FlexStart);
+        assert_eq!(justify_marker(&style).as_deref(), Some("start"));
+        style.set_property("place-content", "end space-between");
+        assert_eq!(style.to_style().align_content, AlignContent::FlexEnd);
+        assert_eq!(
+            style.to_style().justify_content,
+            JustifyContent::SpaceBetween
+        );
+        // A baseline value only applies to align-content; justify gets start.
+        style.set_property("place-content", "first baseline");
+        assert_eq!(justify_marker(&style).as_deref(), Some("start"));
+    }
 }
 
 #[cfg(test)]
