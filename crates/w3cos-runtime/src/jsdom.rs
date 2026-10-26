@@ -822,6 +822,46 @@ pub(crate) fn report_callback_exception(callback: &Value, exception: Value) {
     });
 }
 
+/// Report an exception no script caught (HTML "report the exception", Node
+/// `process` 'uncaughtException'). Returns `false` when neither the
+/// callback's global has an `onerror` handler nor `process` has an
+/// 'uncaughtException' listener, so the caller keeps the throw fatal.
+pub(crate) fn report_uncaught_callback_exception(callback: &Value, exception: Value) -> bool {
+    let global = callback.get_property("__w3cos_callback_global");
+    let global = if global.is_object() {
+        global
+    } else {
+        window_value()
+    };
+    if global.get_property("onerror").is_callable() {
+        eprintln!("[js.uncaught] {}", exception.to_js_string());
+        report_callback_exception(callback, exception);
+        return true;
+    }
+    let process = global.get_property("process");
+    if process.is_object()
+        && process.get_property("listenerCount").is_callable()
+        && process
+            .call_method("listenerCount", vec![Value::string("uncaughtException")])
+            .to_number()
+            > 0.0
+    {
+        eprintln!("[js.uncaught] {}", exception.to_js_string());
+        let _ = w3cos_core::catch_js(|| {
+            process.call_method(
+                "emit",
+                vec![
+                    Value::string("uncaughtException"),
+                    exception,
+                    Value::string("uncaughtException"),
+                ],
+            )
+        });
+        return true;
+    }
+    false
+}
+
 pub(crate) type WeakRealmObject = WeakJsObject;
 
 pub(crate) fn weak_realm_object(value: &Value) -> WeakRealmObject {
@@ -22114,10 +22154,13 @@ pub fn tick_timers() -> usize {
     for (cb, args) in fired {
         // HTML timer initialization steps: an exception thrown by the callback
         // is reported (window `onerror`) and does not stop the other due timers
-        // or the event loop.
+        // or the event loop. Node semantics apply when nothing handles it: a
+        // `process` 'uncaughtException' listener gets it, otherwise the throw
+        // stays fatal (a worker then exits with an 'error' event).
         if let Err(exception) = w3cos_core::catch_js(|| cb.call(Value::Undefined, args)) {
-            eprintln!("[js.uncaught] {}", exception.to_js_string());
-            report_callback_exception(&cb, exception);
+            if !report_uncaught_callback_exception(&cb, exception.clone()) {
+                std::panic::panic_any(w3cos_core::PanicValue(exception));
+            }
         }
     }
     ran
@@ -29674,6 +29717,63 @@ try {
         assert_eq!(fired.get(), 1);
         assert_eq!(reported.borrow().as_str(), "timer boom");
         win.set_property("onerror", Value::Null);
+    }
+
+    #[test]
+    fn unhandled_timer_exception_goes_to_process_uncaught_exception_or_stays_fatal() {
+        setup();
+        let win = window_value();
+        win.set_property("onerror", Value::Null);
+        let saved_process = win.get_property("process");
+        let throwing = || {
+            func(|_, _| {
+                w3cos_core::throw_value(Value::string("no handler"));
+            })
+        };
+        // No onerror and no 'uncaughtException' listener: the throw is fatal.
+        win.set_property("process", Value::Undefined);
+        win.call_method("setTimeout", vec![throwing(), Value::Number(1.0)]);
+        std::thread::sleep(Duration::from_millis(10));
+        let fatal = w3cos_core::catch_js(|| Value::Number(tick_timers() as f64));
+        assert_eq!(
+            fatal.err().map(|e| e.to_js_string()).as_deref(),
+            Some("no handler")
+        );
+        // A process with an 'uncaughtException' listener receives it.
+        let emitted = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = emitted.clone();
+        let process = Value::object(HashMap::new());
+        process.set_property(
+            "listenerCount",
+            func(|_, args| {
+                Value::Number(if arg(&args, 0).to_js_string() == "uncaughtException" {
+                    1.0
+                } else {
+                    0.0
+                })
+            }),
+        );
+        process.set_property(
+            "emit",
+            func(move |_, args| {
+                log.borrow_mut().push(format!(
+                    "{} {} {}",
+                    arg(&args, 0).to_js_string(),
+                    arg(&args, 1).to_js_string(),
+                    arg(&args, 2).to_js_string()
+                ));
+                Value::Bool(true)
+            }),
+        );
+        win.set_property("process", process);
+        win.call_method("setTimeout", vec![throwing(), Value::Number(1.0)]);
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(
+            emitted.borrow().as_slice(),
+            ["uncaughtException no handler uncaughtException"]
+        );
+        win.set_property("process", saved_process);
     }
 
     #[test]
