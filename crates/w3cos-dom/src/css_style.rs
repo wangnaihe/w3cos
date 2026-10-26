@@ -272,6 +272,9 @@ impl CSSStyleDeclaration {
         if !valid_multicol_declaration(name, value) {
             return;
         }
+        if matches!(name, "tab-size" | "tabSize") && !valid_tab_size_declaration(value) {
+            return;
+        }
         if name == "resize"
             && !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -1815,6 +1818,14 @@ impl CSSStyleDeclaration {
                 .and_then(|properties| properties.get(RESIZE_PROPERTY))
                 .cloned()
                 .unwrap_or_else(|| "none".into()),
+            // Computed tab-size: a number, or an absolute length in px.
+            "tab-size" | "tabSize" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(TAB_SIZE_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| "8".into()),
             "clip" => self.inner.clip.map_or_else(
                 || "auto".to_string(),
                 |clip| {
@@ -3537,6 +3548,12 @@ pub(crate) fn computed_tab_size(value: &str, font_size: f32) -> Option<String> {
     if let Some(number) = finite(&value) {
         return Some(format!("{number}"));
     }
+    if let Some(body) = value
+        .strip_prefix("calc(")
+        .and_then(|body| body.strip_suffix(')'))
+    {
+        return computed_tab_size_calc(body, font_size);
+    }
     let pixels = [
         ("px", 1.0),
         ("rem", 16.0),
@@ -3547,6 +3564,7 @@ pub(crate) fn computed_tab_size(value: &str, font_size: f32) -> Option<String> {
         ("mm", 96.0 / 25.4),
         ("pt", 96.0 / 72.0),
         ("pc", 16.0),
+        ("q", 96.0 / 101.6),
     ]
     .into_iter()
     .find_map(|(unit, scale)| {
@@ -3558,6 +3576,61 @@ pub(crate) fn computed_tab_size(value: &str, font_size: f32) -> Option<String> {
         finite(number).map(|number| number * scale)
     })?;
     Some(format!("{pixels}px"))
+}
+
+/// Whether `value` is a valid `tab-size` declaration value (a CSS-wide
+/// keyword, or a non-negative number or length).
+pub fn valid_tab_size_declaration(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "unset" | "revert" | "revert-layer"
+    ) || computed_tab_size(value, 16.0).is_some()
+}
+
+/// A `calc()` sum of terms that are all numbers or all lengths, joined by
+/// ` + ` / ` - `; a negative result clamps to 0 (CSS Values 4 10.12, the
+/// property only allows non-negative values).  Nested functions are not
+/// resolved.
+fn computed_tab_size_calc(body: &str, font_size: f32) -> Option<String> {
+    if body.contains('(') {
+        return None;
+    }
+    let mut total = 0.0f32;
+    let mut lengths = None;
+    let mut sign = 1.0f32;
+    let mut expect_term = true;
+    for token in body.split_whitespace() {
+        if expect_term {
+            let (magnitude, term_sign) = match token.strip_prefix('-') {
+                Some(rest) if !rest.is_empty() => (rest, -1.0),
+                _ => (token, 1.0),
+            };
+            let computed = computed_tab_size(magnitude, font_size)?;
+            let is_length = computed.ends_with("px");
+            if *lengths.get_or_insert(is_length) != is_length {
+                return None;
+            }
+            let number = computed.trim_end_matches("px").parse::<f32>().ok()?;
+            total += sign * term_sign * number;
+            expect_term = false;
+        } else {
+            sign = match token {
+                "+" => 1.0,
+                "-" => -1.0,
+                _ => return None,
+            };
+            expect_term = true;
+        }
+    }
+    if expect_term {
+        return None;
+    }
+    let total = total.max(0.0);
+    Some(if lengths? {
+        format!("{total}px")
+    } else {
+        format!("{total}")
+    })
 }
 
 #[cfg(test)]

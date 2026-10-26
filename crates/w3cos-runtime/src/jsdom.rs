@@ -7960,6 +7960,9 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     ) {
         return w3cos_dom::css_style::valid_multicol_declaration(&property, value);
     }
+    if property == "tab-size" {
+        return w3cos_dom::css_style::valid_tab_size_declaration(value);
+    }
     matches!(
         property.as_str(),
         "align-content"
@@ -13860,6 +13863,13 @@ fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
 
 fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
     let value = value.trim();
+    // An invalid tab-size (negative, percentage) is dropped at parse time.
+    if property == "tab-size"
+        && !value.is_empty()
+        && !w3cos_dom::css_style::valid_tab_size_declaration(value)
+    {
+        return None;
+    }
     if property != "color" && !property.ends_with("-color") || value.is_empty() {
         return Some(value.to_string());
     }
@@ -33220,6 +33230,27 @@ try {
             computed.get_property("columnFill"),
             Value::string("balance")
         );
+    }
+
+    #[test]
+    fn tab_size_cssom_drops_invalid_values_and_computes_lengths() {
+        setup();
+        assert!(css_property_supported("tab-size", "2.5"));
+        assert!(css_property_supported("tabSize", "calc(10px + 1em)"));
+        for value in ["-10px", "-20", "30%", "calc(40% + 50px)"] {
+            assert!(!css_property_supported("tab-size", value), "{value}");
+        }
+        let element = create_in_body("div");
+        let style = element.get_property("style");
+        style.set_property("fontSize", Value::string("40px"));
+        style.set_property("tabSize", Value::string("calc(10px + 0.5em)"));
+        style.set_property("tabSize", Value::string("-10px"));
+        assert_eq!(
+            style.call_method("getPropertyValue", vec![Value::string("tab-size")]),
+            Value::string("calc(10px + 0.5em)")
+        );
+        let computed = window_value().call_method("getComputedStyle", vec![element]);
+        assert_eq!(computed.get_property("tabSize"), Value::string("30px"));
     }
 
     #[test]

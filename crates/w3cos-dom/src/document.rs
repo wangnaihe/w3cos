@@ -28024,6 +28024,18 @@ mod computed_style_cache_tests {
             ("tab-size:3", "tab-size:initial", Some("8")),
             ("", "tab-size:20px", Some("20px")),
             ("", "tab-size:1rem;font-size:40px", Some("16px")),
+            (
+                "",
+                "font-size:40px;tab-size:calc(10px + 0.5em)",
+                Some("30px"),
+            ),
+            (
+                "",
+                "font-size:40px;tab-size:calc(10px - 0.5em)",
+                Some("0px"),
+            ),
+            ("", "tab-size:calc(2 + 3)", Some("5")),
+            ("tab-size:3", "tab-size:calc(2 + 3px)", Some("3")),
         ] {
             let mut document = Document::new();
             let parent = document.create_element("div");
