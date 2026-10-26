@@ -79,6 +79,33 @@ fn node_process_kill_matches_node() {
     assert_eq!(lines, expected);
 }
 
+/// `http.createServer` over `net.Server`: Content-Length and chunked request
+/// bodies, header folding, keep-alive pipelining, chunked responses and the
+/// `upgrade` socket hand-off (Code-OSS agent host's `ws` server).
+const HTTP_SERVER_NODE: &str = r#"listening number
+req POST /p?q=1 1.1 1, 2 ["a","b"] "abcde"
+post "HTTP/1.1 201 Created|Content-Type: text/plain|Connection: close|Transfer-Encoding: chunked||4|ok:5|0||"
+req POST /chunked 1.1 undefined undefined "abcde"
+chunked "HTTP/1.1 200 OK|X-Kind: chunked|Connection: close|Transfer-Encoding: chunked||6|hello |5|world|0||"
+req GET /one 1.1 undefined undefined ""
+req GET /two 1.1 undefined undefined ""
+keepalive "HTTP/1.1 201 Created|Content-Type: text/plain|Connection: keep-alive|Keep-Alive: timeout=5|Transfer-Encoding: chunked||4|ok:0|0||HTTP/1.1 201 Created|Content-Type: text/plain|Connection: close|Transfer-Encoding: chunked||4|ok:0|0||"
+upgrade /ws test "ping"
+upgrade "HTTP/1.1 101 Switching Protocols|Upgrade: test|Connection: Upgrade||echo:ping"
+closed
+"#;
+
+#[test]
+fn node_http_server_matches_node() {
+    let lines = run(
+        "http_server",
+        include_str!("fixtures/node_io/http_server.js"),
+        &[],
+    );
+    let expected: Vec<&str> = HTTP_SERVER_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
 const NET_NODE: &str = r#"isIP 4 6 0 true true
 uds listening true true true
 uds connecting true
