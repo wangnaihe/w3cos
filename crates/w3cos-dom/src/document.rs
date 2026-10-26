@@ -22149,6 +22149,43 @@ mod image_component_tests {
     }
 
     #[test]
+    fn run_in_on_a_div_records_the_ua_block() {
+        fn marked(node: &w3cos_std::Component) -> bool {
+            node.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key(crate::css_style::RUN_IN_BLOCK_PROPERTY)
+                })
+                || node.children.iter().any(marked)
+        }
+        for (way, tag, expected) in [
+            ("sheet", "div", true),
+            ("sheet", "span", false),
+            ("inline", "div", true),
+        ] {
+            crate::stylesheet::clear_rules();
+            if way == "sheet" {
+                crate::stylesheet::register_rule(tag, &[("display", "run-in")]);
+            }
+            let mut document = Document::new();
+            let element = document.create_element(tag);
+            match way {
+                "inline" => element
+                    .style_mut(&mut document)
+                    .set_property("display", "run-in"),
+                _ => {}
+            }
+            let text = document.create_text_node("run-in");
+            element.append_child(&mut document, text);
+            document.body().append_child(&mut document, element);
+            let tree = document.to_component_tree();
+            assert_eq!(marked(&tree), expected, "{way} {tag}");
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn first_letter_layout_marker_requires_an_applied_fragment() {
         fn marked(node: &w3cos_std::Component) -> bool {
             node.style

@@ -2558,6 +2558,182 @@ fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
     );
 }
 
+/// Chrome rejects `display: run-in`, so the earlier `block` applies. The
+/// DOM keeps legacy `flex` plus markers; NG lays a run-in over a block out
+/// as that block when it holds nothing, one text, or only blocks.
+/// Headless Chrome 155, body margin 0, Ahem 10px/1:
+/// - text: run-in (0,0,800,10), text (0,0,50,10), next block y=10;
+/// - two block children (padding 4, margins 8/12 collapse): run-in
+///   (0,0,800,40), children at (4,4) and (4,26), 792×10;
+/// - margins collapse through the run-in: parent (margin-top 10) and
+///   run-in (margins 20) at y=20; the next block (margin-top 30) at y=55;
+/// - empty run-in with border 3 and padding 2 is 800×10.
+#[test]
+fn run_in_over_block_lays_out_as_that_block() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let run_in = |style: Style, prior_block: bool| {
+        let mut markers = vec![(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "run-in".to_string(),
+        )];
+        if prior_block {
+            markers.push(("--w3cos-internal-run-in-block".to_string(), "1".to_string()));
+        }
+        Style {
+            display: Display::Flex,
+            custom_properties: Some(CustomProperties::from_iter(markers)),
+            ..style
+        }
+    };
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let ng = |root: &Component| {
+        let flat = pre_flatten(root);
+        let mut out = layout_tree(root, &flat, 800.0, 600.0).expect("ng");
+        out.sort_by_key(|(_, i)| *i);
+        out
+    };
+
+    // 0 root, 1 run-in, 2 text, 3 next block.
+    let root = node(
+        block(),
+        vec![
+            node(
+                run_in(font.clone(), true),
+                vec![Component::text("XX XX", text_style.clone())],
+            ),
+            node(sized(5.0), vec![]),
+        ],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 3), (0.0, 10.0, 800.0, 5.0));
+
+    // 0 root, 1 run-in, 2 and 3 children: stacked, not a flex row.
+    let padded = Style {
+        padding: margins(4.0, 4.0, 4.0, 4.0),
+        ..block()
+    };
+    let first = Style {
+        margin: margins(0.0, 0.0, 8.0, 0.0),
+        ..sized(10.0)
+    };
+    let second = Style {
+        margin: margins(12.0, 0.0, 0.0, 0.0),
+        ..sized(10.0)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            run_in(padded, true),
+            vec![node(first, vec![]), node(second, vec![])],
+        )],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 40.0));
+    assert_eq!(rect(&out, 2), (4.0, 4.0, 792.0, 10.0));
+    assert_eq!(rect(&out, 3), (4.0, 26.0, 792.0, 10.0));
+
+    // 0 root, 1 parent, 2 run-in, 3 next block.
+    let parent = Style {
+        margin: margins(10.0, 0.0, 0.0, 0.0),
+        ..block()
+    };
+    let collapsing = Style {
+        margin: margins(20.0, 0.0, 20.0, 0.0),
+        ..sized(5.0)
+    };
+    let next = Style {
+        margin: margins(30.0, 0.0, 0.0, 0.0),
+        ..sized(5.0)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            parent,
+            vec![node(run_in(collapsing, true), vec![]), node(next, vec![])],
+        )],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 20.0, 800.0, 40.0));
+    assert_eq!(rect(&out, 2), (0.0, 20.0, 800.0, 5.0));
+    assert_eq!(rect(&out, 3), (0.0, 55.0, 800.0, 5.0));
+
+    let bordered = Style {
+        border_width: 3.0,
+        padding: margins(2.0, 2.0, 2.0, 2.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(run_in(bordered, true), vec![]),
+            node(sized(5.0), vec![]),
+        ],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 10.0, 800.0, 5.0));
+
+    // Without a prior block, or with text beside a block (which needs an
+    // anonymous block), the run-in keeps its marker.
+    for (prior_block, children) in [
+        (
+            false,
+            vec![node(sized(5.0), vec![]), node(sized(5.0), vec![])],
+        ),
+        (
+            true,
+            vec![
+                Component::text("XX", text_style.clone()),
+                node(sized(5.0), vec![]),
+            ],
+        ),
+    ] {
+        let root = node(
+            block(),
+            vec![node(run_in(font.clone(), prior_block), children)],
+        );
+        let flat = pre_flatten(&root);
+        assert!(block::run_in_block_styles(&flat).is_empty());
+    }
+
+    // run-in-table-row-between: a text-only `display: table-row` span in
+    // an anonymous table has no cell for its line, so the page stays on
+    // legacy (which paints the row) rather than dropping the text.
+    let table = Style {
+        display: Display::Table,
+        ..Style::default()
+    };
+    let row_text = Style {
+        display: Display::TableRow,
+        ..text_style.clone()
+    };
+    let root = node(
+        block(),
+        vec![node(table, vec![Component::text("Some text.", row_text)])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|r| r == "table:text-track"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+}
+
 /// A definite top-level `inline-grid` is a line box, not a stretched block.
 /// Chrome (body margin 0): a 100×20 grid with `40px 60px` columns places
 /// its items at x=0 and x=40; two 50×100 grids sit at x=0 and x=50 on the

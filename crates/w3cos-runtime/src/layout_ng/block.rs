@@ -108,6 +108,8 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stored; only a grid container consults the marker.
             | "grid-lanes"
             | "percent-gap"
+            // Read with the run-in display marker (run_in_block_styles).
+            | "run-in-block"
     ) || name.starts_with("decoration-owner")
 }
 
@@ -1552,6 +1554,51 @@ fn inline_grid_line_ascent(result: &LayoutResult) -> f32 {
 
 fn is_run_in(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "run-in")
+}
+
+/// Chrome rejects `display: run-in` as invalid, so the earlier cascaded
+/// value applies. The DOM marks a run-in over `block`; such a box is laid
+/// out as that block (in place of the legacy flex lowering) when its
+/// contents need no anonymous boxes: nothing, one inline text, or only
+/// in-flow block-level boxes. Returns the replacement styles by index.
+pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
+    let mut styles = Vec::new();
+    for (index, info) in flat.iter().enumerate() {
+        if !is_run_in(info.style) || marker(info.style, "--w3cos-internal-run-in-block").is_none() {
+            continue;
+        }
+        let children: Vec<&FlatNodeInfo> = flat[index + 1..info.subtree_end]
+            .iter()
+            .filter(|child| child.parent == Some(index))
+            .collect();
+        let contents = match children.as_slice() {
+            [] => true,
+            [text] if matches!(text.kind, ComponentKind::Text { .. }) => {
+                text.style.display == Display::Inline
+            }
+            _ => children.iter().all(|child| {
+                matches!(
+                    child.style.display,
+                    Display::Block | Display::FlowRoot | Display::ListItem | Display::Table
+                ) && child.style.float == Float::None
+                    && matches!(child.style.position, Position::Static | Position::Relative)
+                    && unrecognized_display(child.style).is_none()
+            }),
+        };
+        if contents {
+            let mut style = info.style.clone();
+            style.display = Display::Block;
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove("--w3cos-internal-unrecognized-display");
+                properties.remove("--w3cos-internal-run-in-block");
+                if properties.is_empty() {
+                    style.custom_properties = None;
+                }
+            }
+            styles.push((index, style));
+        }
+    }
+    styles
 }
 
 /// Legacy `display: -webkit-box` and `-webkit-inline-box`. Both parse as

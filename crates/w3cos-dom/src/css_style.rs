@@ -29,6 +29,10 @@ pub const UNRECOGNIZED_DISPLAY_PROPERTY: &str = "--w3cos-internal-unrecognized-d
 /// out). LayoutNG treats the marker as a grid when the subset matches an
 /// ordinary grid reference.
 pub const GRID_LANES_PROPERTY: &str = "--w3cos-internal-grid-lanes";
+/// `display: run-in` over an earlier `block`. Chrome rejects `run-in` as an
+/// invalid declaration, so the earlier value applies. Legacy keeps the
+/// unrecognized `flex`; LayoutNG reads this and lays the box out as a block.
+pub const RUN_IN_BLOCK_PROPERTY: &str = "--w3cos-internal-run-in-block";
 /// `gap` / `row-gap` / `column-gap` contains a percentage. The used gap
 /// stays unset (legacy ignores it). Value is `row`, `column`, or `both`.
 pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
@@ -349,8 +353,20 @@ impl CSSStyleDeclaration {
                 }
             }
             "display" => {
-                self.inner.display = parse_display(value);
                 let keyword = value.trim().to_ascii_lowercase();
+                let custom = self.inner.custom_properties.as_ref();
+                let run_in_block = keyword == "run-in"
+                    && (custom.is_some_and(|props| props.contains_key(RUN_IN_BLOCK_PROPERTY))
+                        || self.inner.display == Display::Block
+                            && custom.is_none_or(|props| {
+                                !props.contains_key(UNRECOGNIZED_DISPLAY_PROPERTY)
+                            }));
+                set_marker(
+                    &mut self.inner,
+                    RUN_IN_BLOCK_PROPERTY,
+                    run_in_block.then(|| "1".to_string()),
+                );
+                self.inner.display = parse_display(value);
                 let grid_lanes = keyword == "grid-lanes";
                 set_marker(
                     &mut self.inner,
@@ -6424,6 +6440,32 @@ fn grid_lanes_stays_flex_and_percent_gaps_are_marked() {
             .as_ref()
             .is_none_or(|props| !props.contains_key(PERCENT_GAP_PROPERTY))
     );
+}
+
+#[test]
+fn run_in_records_an_earlier_block() {
+    let run_in_block = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key(RUN_IN_BLOCK_PROPERTY))
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("display", "run-in");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert!(!run_in_block(&declaration));
+    declaration.set_property("display", "block");
+    declaration.set_property("display", "run-in");
+    assert_eq!(declaration.inner.display, Display::Flex);
+    assert!(run_in_block(&declaration));
+    declaration.set_property("display", "run-in");
+    assert!(run_in_block(&declaration));
+    declaration.set_property("display", "flex");
+    assert!(!run_in_block(&declaration));
+    declaration.set_property("display", "inline-grid");
+    declaration.set_property("display", "run-in");
+    assert!(!run_in_block(&declaration));
 }
 
 #[test]
