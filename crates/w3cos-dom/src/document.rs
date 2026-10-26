@@ -9210,7 +9210,7 @@ impl Document {
                 // A flex or grid container's atomic children are blockified
                 // items, not an inline formatting context (CSS Display
                 // §2.7), so its authored alignment must survive. Flex keeps
-                // this path for non-image atomic children (e.g. buttons)
+                // this path for non-replaced atomic children (e.g. buttons)
                 // for now: without writing-mode support, button-min-width's
                 // vertical-rl column only matches Chrome as a row.
                 let blockified_atomic_items = !children.is_empty()
@@ -9221,7 +9221,11 @@ impl Document {
                         }),
                         w3cos_std::style::Display::Flex | w3cos_std::style::Display::InlineFlex => {
                             children.iter().all(|child| {
-                                matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+                                matches!(
+                                    child.kind,
+                                    w3cos_std::ComponentKind::Image { .. }
+                                        | w3cos_std::ComponentKind::Canvas { .. }
+                                )
                             })
                         }
                         _ => false,
@@ -25076,26 +25080,33 @@ mod image_component_tests {
                 ("height", "50px"),
             ],
         );
-        let mut document = Document::new();
-        let flex = document.create_element("div");
-        flex.set_attribute(&mut document, "id", "flex");
-        for _ in 0..2 {
-            let img = document.create_element("img");
-            img.set_attribute(&mut document, "src", "a.png");
-            flex.append_child(&mut document, img);
-        }
-        document.body().append_child(&mut document, flex);
+        // Canvases are replaced the same way (Blink LayoutHTMLCanvas).
+        for tag in ["img", "canvas"] {
+            let mut document = Document::new();
+            let flex = document.create_element("div");
+            flex.set_attribute(&mut document, "id", "flex");
+            for _ in 0..2 {
+                let item = document.create_element(tag);
+                if tag == "img" {
+                    item.set_attribute(&mut document, "src", "a.png");
+                }
+                flex.append_child(&mut document, item);
+            }
+            document.body().append_child(&mut document, flex);
 
-        let tree = document.to_component_subtree(flex.id);
-        assert_eq!(tree.style.display, w3cos_std::style::Display::Flex);
-        assert_eq!(
-            tree.style.align_items,
-            w3cos_std::style::AlignItems::Stretch
-        );
-        assert_eq!(
-            tree.style.flex_direction,
-            w3cos_std::style::FlexDirection::Column
-        );
+            let tree = document.to_component_subtree(flex.id);
+            assert_eq!(tree.style.display, w3cos_std::style::Display::Flex, "{tag}");
+            assert_eq!(
+                tree.style.align_items,
+                w3cos_std::style::AlignItems::Stretch,
+                "{tag}"
+            );
+            assert_eq!(
+                tree.style.flex_direction,
+                w3cos_std::style::FlexDirection::Column,
+                "{tag}"
+            );
+        }
         crate::stylesheet::clear_rules();
     }
 

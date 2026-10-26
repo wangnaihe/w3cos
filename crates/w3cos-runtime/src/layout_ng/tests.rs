@@ -4245,3 +4245,77 @@ fn float_min_max_resolves_child_percent_height() {
     assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
     assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 100.0));
 }
+
+/// A `<canvas>` flex item is replaced like an `<img>` (Blink
+/// LayoutHTMLCanvas is a LayoutReplaced): a stretched row item transfers
+/// the definite line height through its ratio, a column item stretches to
+/// the container width, and its automatic minimum keeps a row from
+/// shrinking it. Rects from headless Chrome (`canvas { display: block }`).
+#[test]
+fn flex_canvas_item_matches_chrome() {
+    use w3cos_std::style::{AlignSelf, Dimension as D, FlexDirection};
+    let canvas = |align_self: AlignSelf| {
+        Component::canvas(
+            40,
+            20,
+            Style {
+                display: Display::Block,
+                align_self,
+                ..Style::default()
+            },
+        )
+    };
+    let flex = |style: Style, items: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Flex,
+                ..style
+            },
+            items,
+        )
+    };
+    let row = |width: f32, height: D| Style {
+        flex_direction: FlexDirection::Row,
+        width: D::Px(width),
+        height,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            flex(
+                row(300.0, D::Px(50.0)),
+                vec![canvas(AlignSelf::Auto), canvas(AlignSelf::FlexStart)],
+            ),
+            flex(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    width: D::Px(100.0),
+                    ..block()
+                },
+                vec![canvas(AlignSelf::Auto)],
+            ),
+            flex(
+                row(60.0, D::Auto),
+                vec![canvas(AlignSelf::Auto), canvas(AlignSelf::Auto)],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("flex canvas");
+    let expected = [
+        (2, (0.0, 0.0, 100.0, 50.0)),
+        (3, (100.0, 0.0, 40.0, 20.0)),
+        (5, (0.0, 50.0, 100.0, 50.0)),
+        (7, (0.0, 100.0, 40.0, 20.0)),
+        (8, (40.0, 100.0, 40.0, 20.0)),
+    ];
+    for (index, rect_) in expected {
+        assert_eq!(rect(&out, index), rect_, "canvas {index}");
+    }
+}

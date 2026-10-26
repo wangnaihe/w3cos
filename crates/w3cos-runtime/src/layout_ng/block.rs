@@ -783,10 +783,20 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
     {
         return Some("canvas:float-or-oof");
     }
-    if info.parent.is_some_and(|parent| {
-        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-    }) {
+    // Like an image (Blink LayoutHTMLCanvas is a LayoutReplaced): a flex
+    // item is sized by the flex algorithm and its inline-level display is
+    // blockified (CSS Display §2.7). Grid items stay on legacy.
+    if info
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
         return Some("canvas:flex-grid-item");
+    }
+    if info
+        .parent
+        .is_some_and(|parent| is_author_flex(flat[parent].style))
+    {
+        return unsupported_box_style(style, &[inline::VALIGN_MARKER], true);
     }
     if matches!(style.display, Display::Block | Display::FlowRoot)
         && info.parent.is_some_and(|parent| {
@@ -1094,21 +1104,45 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
 /// Inline size of a replaced box whose block size is `height` (a flex
 /// item's definite stretched cross size): the height transfers through the
 /// aspect ratio, then the inline min/max clamp it. `None` for a box that is
-/// not an image.
+/// not replaced.
 pub(super) fn replaced_inline_at_block(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
     height: f32,
 ) -> Option<f32> {
-    let ComponentKind::Image { src } = flat[index].kind else {
+    if !is_replaced(flat[index].kind) {
         return None;
-    };
+    }
     let mut definite = flat[index].style.clone();
     definite.height = Dimension::Px(height);
     definite.min_height = Dimension::Auto;
     definite.max_height = Dimension::Auto;
-    replaced_content_size(src, &definite, space).map(|(width, _)| width)
+    replaced_size(flat[index].kind, &definite, space).map(|(width, _)| width)
+}
+
+/// An `<img>` or `<canvas>`: a Blink LayoutReplaced.
+pub(super) fn is_replaced(kind: &ComponentKind) -> bool {
+    matches!(
+        kind,
+        ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+    )
+}
+
+/// Content-box size of a replaced box under `style`; `None` (with the
+/// kind's bail reason) when it has no NG size, or for a non-replaced box.
+pub(super) fn replaced_size(
+    kind: &ComponentKind,
+    style: &Style,
+    space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    match kind {
+        ComponentKind::Image { src } => replaced_content_size(src, style, space).why("image"),
+        ComponentKind::Canvas { width, height } => {
+            canvas_content_size(*width, *height, style, space).why("canvas:size")
+        }
+        _ => None,
+    }
 }
 
 /// Replaced size under min/max constraints.
@@ -1922,7 +1956,7 @@ fn layout_block_in(
     // definite width. `sized` is a shrink-to-fit override for floats and
     // new formatting contexts; a replaced box keeps its own width and the
     // overlap check sends a float collision back to legacy.
-    let image_size = if let ComponentKind::Image { src } = info.kind {
+    let image_size = if is_replaced(info.kind) {
         Some(match sized {
             // A flex item's used content box (FlexLayoutAlgorithm gives the
             // replaced box its flexed and stretched sizes). An automatic
@@ -1935,15 +1969,10 @@ fn layout_block_in(
                 definite.width = Dimension::Px(width);
                 definite.min_width = Dimension::Auto;
                 definite.max_width = Dimension::Auto;
-                (
-                    width,
-                    replaced_content_size(src, &definite, space).why("image")?.1,
-                )
+                (width, replaced_size(info.kind, &definite, space)?.1)
             }
-            None => replaced_content_size(src, style, space).why("image")?,
+            None => replaced_size(info.kind, style, space)?,
         })
-    } else if let ComponentKind::Canvas { width, height } = info.kind {
-        Some(canvas_content_size(*width, *height, style, space).why("canvas:size")?)
     } else {
         None
     };

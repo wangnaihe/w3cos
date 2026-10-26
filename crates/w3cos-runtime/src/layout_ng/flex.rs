@@ -446,7 +446,7 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     }
     // A replaced item's min- and max-content sizes are its natural size
     // under its constraints (CSS Sizing 3 §5.1).
-    if matches!(info.kind, w3cos_std::ComponentKind::Image { .. }) {
+    if block::is_replaced(info.kind) {
         return block::intrinsic_sizes(flat, index, space);
     }
     // A nested flex container's min/max-content sizes are its own flex
@@ -574,7 +574,7 @@ fn stretched_image_main(
     };
     if !row_axis(container.flex_direction)
         || container.flex_wrap != FlexWrap::NoWrap
-        || !matches!(flat[child].kind, w3cos_std::ComponentKind::Image { .. })
+        || !block::is_replaced(flat[child].kind)
         || !matches!(style.width, Dimension::Auto)
         || !matches!(style.height, Dimension::Auto)
         || used_align(container.align_items, style.align_self) != AlignItems::Stretch
@@ -681,7 +681,7 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
         let line = info.style.font_size * info.style.line_height.max(1.0);
         return Some(line.max(0.0));
     }
-    if matches!(info.kind, w3cos_std::ComponentKind::Image { .. }) {
+    if block::is_replaced(info.kind) {
         // Natural block size; a column item's is transferred from its used
         // width in `layout`.
         let laid = block::layout_block_sized(flat, index, space, false, None).why("flex:image")?;
@@ -1194,8 +1194,9 @@ pub(super) fn layout(
             {
                 min.max(height)
             }
-            (w3cos_std::ComponentKind::Image { .. }, Some(height))
-                if !row
+            (kind, Some(height))
+                if block::is_replaced(kind)
+                    && !row
                     && matches!(child_style.min_height, Dimension::Auto)
                     && !block::is_overflow_scroll_container(child_style) =>
             {
