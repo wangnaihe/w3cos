@@ -41,6 +41,7 @@ const MAX_REPEAT: usize = 1024;
 const MAX_TRACKS: usize = 1024;
 const INF: i64 = i64::MAX / 4;
 const HEIGHT_KEYWORD: &str = "--w3cos-internal-height-keyword";
+const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 const JUSTIFY_KEYWORD: &str = "--w3cos-internal-justify-content";
 
 fn units(v: f32) -> i64 {
@@ -217,9 +218,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("grid:contain");
-    }
-    if has_marker(style, "--w3cos-internal-width-keyword") {
-        return Some("grid:width-keyword");
     }
     if style.grid_areas().is_some() {
         return Some("grid:areas");
@@ -2805,6 +2803,105 @@ pub(super) fn layout(
     space: &ConstraintSpace,
     sized: Option<(f32, Option<f32>)>,
 ) -> Option<LayoutResult> {
+    match layout_impl(flat, index, space, sized, false)? {
+        GridOut::Laid(result) => Some(result),
+        GridOut::Measured(_) => super::bail("grid:measure"),
+    }
+}
+
+/// Min-content and max-content inline sizes of a grid container's content
+/// box (Blink GridLayoutAlgorithm::ComputeMinMaxSizes): the column tracks
+/// sized under a min-content and a max-content constraint, plus gutters.
+pub(super) fn min_max(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    match layout_impl(flat, index, space, None, true)? {
+        GridOut::Measured(sizes) => Some(sizes),
+        GridOut::Laid(_) => super::bail("grid:measure"),
+    }
+}
+
+enum GridOut {
+    Laid(LayoutResult),
+    Measured(MinMax),
+}
+
+/// Column sizes under a min-content (`min`) and a max-content (`max`)
+/// constraint (CSS Grid §12.3–§12.7 with zero / infinite free space). An
+/// auto minimum is the items' min-content contribution; growth limits are
+/// reached only under the max-content constraint, and flexible tracks take
+/// the fr size that fits each item's max-content contribution (§12.7.1,
+/// Blink FindFrSize: a flex sum below 1 counts as 1).
+fn measure_columns(
+    specs: &[Spec],
+    collapsed: &[bool],
+    min_c: &[i64],
+    max_c: &[i64],
+    gap: i64,
+    font: f32,
+) -> MinMax {
+    // (base, growth limit, flex factor) of each track.
+    let mut tracks = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        let (low, high) = (min_c[index].max(0), max_c[index].max(0));
+        let floor = |breadth: Breadth| match breadth {
+            Breadth::Auto | Breadth::MinContent | Breadth::Fr(_) => low,
+            Breadth::MaxContent => high,
+            other => definite_breadth(other, None, font).unwrap_or(low),
+        };
+        let ceiling = |breadth: Breadth| match breadth {
+            Breadth::MinContent => low,
+            Breadth::Auto | Breadth::MaxContent | Breadth::Fr(_) => high,
+            other => definite_breadth(other, None, font).unwrap_or(high),
+        };
+        let track = match spec {
+            Spec::One(Breadth::Fr(factor)) => (low, 0, *factor),
+            Spec::One(breadth) => (floor(*breadth), ceiling(*breadth), 0.0),
+            Spec::Fit(argument) => {
+                let limit = definite_breadth(*argument, None, font).unwrap_or(high);
+                (low, high.min(limit), 0.0)
+            }
+            Spec::MinMax(min, Breadth::Fr(factor)) => (floor(*min), 0, *factor),
+            Spec::MinMax(min, max) => (floor(*min), ceiling(*max), 0.0),
+        };
+        tracks.push(if collapsed[index] { (0, 0, 0.0) } else { track });
+    }
+    let fraction = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.2 > 0.0)
+        .map(|(index, &(base, _, factor))| {
+            let per = |size: i64| size as f64 / factor.max(1.0);
+            per(base).max(per(max_c[index].max(0)))
+        })
+        .fold(0.0_f64, f64::max);
+    let gaps = gap_sum(collapsed, gap);
+    let min: i64 = tracks.iter().map(|track| track.0).sum();
+    let max: i64 = tracks
+        .iter()
+        .map(|&(base, limit, factor)| {
+            if factor > 0.0 {
+                base.max((fraction * factor).round() as i64)
+            } else {
+                base.max(limit)
+            }
+        })
+        .sum();
+    MinMax {
+        min: Some(from_units(min + gaps)),
+        max: from_units(max.max(min) + gaps),
+    }
+}
+
+fn layout_impl(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    sized: Option<(f32, Option<f32>)>,
+    measure: bool,
+) -> Option<GridOut> {
     SUBGRID_CONTENT_ROWS.with(|cell| {
         cell.borrow_mut().retain(|(id, _)| *id != index);
     });
@@ -2812,6 +2909,31 @@ pub(super) fn layout(
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
         metrics.content_width = width;
+    }
+    let keyword = marker(style, WIDTH_KEYWORD).filter(|_| sized.is_none() && !measure);
+    if let Some(keyword) = keyword {
+        // Blink ComputeInlineSizeForFragment: an intrinsic keyword is the
+        // grid's own min/max-content size (fit-content clamps the available
+        // size between them), then min/max-width and auto margins apply
+        // as for a definite width.
+        let sizes = min_max(flat, index, space).why("grid:width-keyword")?;
+        let min = sizes.min.unwrap_or(sizes.max);
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let content = match keyword {
+            "min-content" => min,
+            "max-content" => sizes.max,
+            _ => {
+                let available =
+                    space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+                sizes.max.min(available.max(min))
+            }
+        };
+        let mut definite = style.clone();
+        definite.width = Dimension::Px(match style.box_sizing {
+            BoxSizing::BorderBox => content + edges,
+            BoxSizing::ContentBox => content,
+        });
+        metrics = block::resolve_inline(&definite, space);
     }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
@@ -2838,6 +2960,9 @@ pub(super) fn layout(
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_sub = columns_spec(style).is_some_and(is_subgrid_axis);
     let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
+    if (measure || keyword.is_some()) && (column_sub || row_sub) {
+        return super::bail("grid:intrinsic-subgrid");
+    }
     let inherited = if column_sub || row_sub {
         Some(lookup_inherited(flat, index, space, column_sub, row_sub).why("grid:subgrid")?)
     } else {
@@ -2886,6 +3011,9 @@ pub(super) fn layout(
         }
     };
     let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    if (measure || keyword.is_some()) && columns_template.auto_fit.is_some() {
+        return super::bail("grid:intrinsic-repeat");
+    }
     let inner_u = units(inner_width);
     let inflow = rendered_children(flat, index)
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
@@ -2979,6 +3107,13 @@ pub(super) fn layout(
     for item in &items {
         let child_style = flat[item.index].style;
         if columns_spec(child_style).is_some_and(is_subgrid_axis) {
+            // A column subgrid's items contribute through the parent's
+            // tracks; the standalone-axis pages that size them under an
+            // intrinsic container width use writing modes this engine does
+            // not store.
+            if measure {
+                return super::bail("grid:intrinsic-subgrid");
+            }
             contribute_subgrid_columns(
                 flat,
                 item.index,
@@ -3035,6 +3170,16 @@ pub(super) fn layout(
         spread(&mut col_max[item.col..end], max_c);
         spread(&mut col_min[item.col..end], minimum);
         spread(&mut col_min_content[item.col..end], min_c);
+    }
+    if measure {
+        return Some(GridOut::Measured(measure_columns(
+            &column_specs,
+            &collapsed,
+            &col_min_content,
+            &col_max,
+            column_gap_u,
+            font,
+        )));
     }
     let column_tracks: Vec<Track> = column_specs
         .iter()
@@ -3528,7 +3673,7 @@ pub(super) fn layout(
             cell.borrow_mut().push((index, recorded));
         });
     }
-    Some(LayoutResult {
+    Some(GridOut::Laid(LayoutResult {
         fragment: BoxFragment {
             index,
             width: border_width,
@@ -3552,7 +3697,7 @@ pub(super) fn layout(
         oof: pending_oof,
         bfc_dependent: false,
         float_overlap: false,
-    })
+    }))
 }
 
 fn resolve_block(
@@ -4847,6 +4992,31 @@ mod tests {
         let root = Component::boxed(plain, vec![leaf(block_box(Some(50.0), Some(50.0)))]);
         let flat = pre_flatten(&root);
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    }
+
+    #[test]
+    fn intrinsic_columns_follow_the_min_and_max_content_constraints() {
+        let u = |px: f32| units(px);
+        // auto, 1fr, 50px and fit-content(30px), one item each:
+        // min-content 10/20/_/40, max-content 40/60/_/80, 10px gaps.
+        let specs = [
+            Spec::One(Breadth::Auto),
+            Spec::One(Breadth::Fr(1.0)),
+            Spec::One(Breadth::Px(50.0)),
+            Spec::Fit(Breadth::Px(30.0)),
+        ];
+        let min_c = [u(10.0), u(20.0), 0, u(40.0)];
+        let max_c = [u(40.0), u(60.0), 0, u(80.0)];
+        let sizes = measure_columns(&specs, &[false; 4], &min_c, &max_c, u(10.0), 16.0);
+        // Bases only: 10 + 20 + 50 + 40, plus three gaps.
+        assert_eq!(sizes.min, Some(150.0));
+        // Growth limits and the fr size of 60px: 40 + 60 + 50 + 40 + 30.
+        assert_eq!(sizes.max, 220.0);
+        // Two fr tracks share one fr size: the larger item per fr.
+        let specs = [Spec::One(Breadth::Fr(1.0)), Spec::One(Breadth::Fr(2.0))];
+        let sizes = measure_columns(&specs, &[false; 2], &[0, 0], &[u(30.0), u(40.0)], 0, 16.0);
+        assert_eq!(sizes.min, Some(0.0));
+        assert_eq!(sizes.max, 90.0);
     }
 
     #[test]
