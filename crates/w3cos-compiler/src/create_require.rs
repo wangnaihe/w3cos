@@ -181,6 +181,13 @@ pub fn rewrite(source: &str, calls: &[RequireCall], targets: &[Target]) -> Strin
         cursor = call.end;
     }
     body.push_str(&source[cursor..]);
+    // A `#!` line is only valid as the very first line: keep it there.
+    if body.starts_with("#!") {
+        let split = body.find('\n').map_or(body.len(), |index| index + 1);
+        let (hashbang, rest) = body.split_at(split);
+        let newline = if hashbang.ends_with('\n') { "" } else { "\n" };
+        return format!("{hashbang}{newline}{imports}{rest}");
+    }
     imports + body.as_str()
 }
 
@@ -203,6 +210,19 @@ mod tests {
         assert!(out.contains("let a = __w3cos_require_0;"));
         assert!(out.contains("MODULE_NOT_FOUND"));
         assert!(out.contains("const b = req(name);"));
+    }
+
+    #[test]
+    fn rewritten_imports_stay_after_a_hashbang_line() {
+        let source = "#!/usr/bin/env node\nimport { createRequire } from \"module\";\nconst req = createRequire(import.meta.url);\nconst fs = req(\"fs\");\n";
+        let calls = find_calls(Path::new("sdk.mjs"), source);
+        assert_eq!(calls.len(), 1);
+        let out = rewrite(source, &calls, &[Target::Default]);
+        assert!(
+            out.starts_with("#!/usr/bin/env node\nimport __w3cos_require_0 from \"fs\";\n"),
+            "{out}"
+        );
+        assert!(out.contains("const fs = __w3cos_require_0;"));
     }
 
     #[test]
