@@ -444,6 +444,11 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if let w3cos_std::ComponentKind::Text { content } = info.kind {
         return Some(super::inline::text_min_max(content, info.style));
     }
+    // A replaced item's min- and max-content sizes are its natural size
+    // under its constraints (CSS Sizing 3 §5.1).
+    if matches!(info.kind, w3cos_std::ComponentKind::Image { .. }) {
+        return block::intrinsic_sizes(flat, index, space);
+    }
     // A nested flex container's min/max-content sizes are its own flex
     // algorithm's (FlexLayoutAlgorithm::ComputeMinMaxSizes): a row sums
     // its items, it does not take the widest one. `block::intrinsic_sizes`
@@ -475,8 +480,41 @@ pub(super) fn container_min_max(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
+    container_min_max_at(flat, index, space, None)
+}
+
+/// [`container_min_max`] for a container whose content block size is
+/// already known (`block`: an absolutely positioned box stretched between
+/// its insets, CSS2 10.6.4), as `height` gives it otherwise.
+pub(super) fn container_min_max_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
     let style = flat[index].style;
     let row = row_axis(style.flex_direction);
+    let line = match block {
+        Some(block) => Some(block),
+        None => match definite(style.height, space.percentage_block, style, space)
+            .why("flex:percent")?
+        {
+            Some(size) => {
+                if [style.padding.top, style.padding.bottom]
+                    .iter()
+                    .any(|side| matches!(side, Spacing::Percent(_)))
+                {
+                    return super::bail("flex:intrinsic-percent-padding");
+                }
+                Some(to_content(
+                    style,
+                    item_edges(style, space, 0.0, false),
+                    size,
+                ))
+            }
+            None => None,
+        },
+    };
     let multiline = style.flex_wrap != FlexWrap::NoWrap;
     let mut sizes = MinMax::exact(0.0);
     let mut count = 0usize;
@@ -484,7 +522,16 @@ pub(super) fn container_min_max(
         if oof::is_out_of_flow(flat[child].style) {
             continue;
         }
-        let item = block::min_max_contribution(flat, child, space).why("flex:intrinsic")?;
+        let item =
+            match stretched_image_main(flat, child, style, space, 0.0, line).why("flex:image")? {
+                Some(main) => {
+                    let child_style = flat[child].style;
+                    let margin = spacing_px(child_style, child_style.margin.left, 0.0, space)
+                        + spacing_px(child_style, child_style.margin.right, 0.0, space);
+                    MinMax::exact(main + item_edges(child_style, space, 0.0, true) + margin)
+                }
+                None => block::min_max_contribution(flat, child, space).why("flex:intrinsic")?,
+            };
         count += 1;
         if !row {
             sizes.encompass(item);
@@ -504,6 +551,51 @@ pub(super) fn container_min_max(
         }
     }
     Some(sizes)
+}
+
+/// The content-box inline size of an image row item in a single-line
+/// container whose content block size `line` is definite, when the item
+/// is stretched: its definite cross size is the line's (CSS Flexbox §9.8
+/// item 1) and transfers through the aspect ratio. `Some(None)` when the
+/// item is not such an image. Blink builds the intrinsic space with
+/// `kStretchExplicit` for the same items (BuildSpaceForIntrinsicInlineSize).
+fn stretched_image_main(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    let style = flat[child].style;
+    let (start, end) = cross_margin_sides(style, container.flex_direction, false);
+    let Some(line) = line else {
+        return Some(None);
+    };
+    if !row_axis(container.flex_direction)
+        || container.flex_wrap != FlexWrap::NoWrap
+        || !matches!(flat[child].kind, w3cos_std::ComponentKind::Image { .. })
+        || !matches!(style.width, Dimension::Auto)
+        || !matches!(style.height, Dimension::Auto)
+        || used_align(container.align_items, style.align_self) != AlignItems::Stretch
+        || matches!(start, Spacing::Auto)
+        || matches!(end, Spacing::Auto)
+    {
+        return Some(None);
+    }
+    let edges = item_edges(style, space, inner_width, false);
+    let margins =
+        spacing_px(style, start, inner_width, space) + spacing_px(style, end, inner_width, space);
+    let stretched = clamp_cross(
+        style,
+        true,
+        edges,
+        line - margins - edges,
+        Some(line),
+        space,
+    )
+    .why("flex:cross")?;
+    block::replaced_inline_at_block(flat, child, space, stretched).map(Some)
 }
 
 /// Fit-content inline size of a column item (CSS Sizing 3 §5.2.1):
@@ -588,6 +680,16 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
     if let w3cos_std::ComponentKind::Text { .. } = info.kind {
         let line = info.style.font_size * info.style.line_height.max(1.0);
         return Some(line.max(0.0));
+    }
+    if matches!(info.kind, w3cos_std::ComponentKind::Image { .. }) {
+        // Natural block size; a column item's is transferred from its used
+        // width in `layout`.
+        let laid = block::layout_block_sized(flat, index, space, false, None).why("flex:image")?;
+        let border = block::border_widths(info.style);
+        let pad = |spacing| spacing_px(info.style, spacing, 0.0, space);
+        let edges =
+            border[0] + border[2] + pad(info.style.padding.top) + pad(info.style.padding.bottom);
+        return Some((laid.fragment.height - edges).max(0.0));
     }
     let mut sum = 0.0;
     for child in rendered_children(flat, index) {
@@ -1070,11 +1172,21 @@ pub(super) fn layout(
         // A column text item's min-content block size is its laid-out
         // height at its used width, not one line (the anonymous block's
         // content size, FlexLayoutAlgorithm::ComputeMinMainSize).
+        // A replaced column item's content size suggestion is its block
+        // size transferred from its used width through the aspect ratio,
+        // capped by its max main size (CSS Flexbox §4.5).
         let min = match (flat[child].kind, measured) {
             (w3cos_std::ComponentKind::Text { .. }, Some(height))
                 if !row && matches!(child_style.min_height, Dimension::Auto) =>
             {
                 min.max(height)
+            }
+            (w3cos_std::ComponentKind::Image { .. }, Some(height))
+                if !row
+                    && matches!(child_style.min_height, Dimension::Auto)
+                    && !block::is_overflow_scroll_container(child_style) =>
+            {
+                height.min(max)
             }
             _ => min,
         };
@@ -1089,7 +1201,25 @@ pub(super) fn layout(
             measured,
         )
         .why("flex:basis")?;
-        let base = base.max(0.0);
+        let mut base = base.max(0.0);
+        // A replaced row item stretched in a single line with a definite
+        // cross size has that definite cross size (CSS Flexbox §9.8), so its
+        // content-based flex base size and its content size suggestion are
+        // transferred from it through the aspect ratio (§9.2.3 B, §4.5).
+        let mut min = min;
+        if let Some(transferred) =
+            stretched_image_main(flat, child, style, space, inner_width, specified_height)
+                .why("flex:image")?
+        {
+            if matches!(child_style.flex_basis, Dimension::Auto) {
+                base = transferred;
+            }
+            if matches!(child_style.min_width, Dimension::Auto)
+                && !block::is_overflow_scroll_container(child_style)
+            {
+                min = transferred.min(max);
+            }
+        }
         items.push(Item {
             index: child,
             order: child_style.order,

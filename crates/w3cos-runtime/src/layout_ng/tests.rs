@@ -3934,3 +3934,227 @@ fn flex_wrap_baseline_groups_match_chrome() {
         assert_eq!(rect(&out, index), rect_expected, "node {index}");
     }
 }
+
+/// Headless Chrome, body margin 0: a 100×50 image as a flex item. The flex
+/// algorithm sizes it; an automatic cross size transfers from the main size
+/// through the ratio, stretch distorts it, and a definite stretched cross
+/// size transfers into the flex base size (CSS Flexbox §9.2.3 B, §9.8).
+#[test]
+fn flex_image_item_matches_chrome() {
+    use w3cos_std::style::{AlignItems, Dimension as D, FlexDirection};
+    let source = "w3cos-ng-flex-image-100x50.png";
+    let image = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let flex = |container: Style, item: Style| {
+        node(
+            block(),
+            vec![node(
+                Style {
+                    display: Display::Flex,
+                    ..container
+                },
+                vec![Component::image(
+                    source,
+                    Style {
+                        // Blockified as a flex item (CSS Display §2.7).
+                        display: Display::Block,
+                        ..item
+                    },
+                )],
+            )],
+        )
+    };
+    // The CSS initial `flex-direction: row` (w3cos defaults to column).
+    let row = || Style {
+        flex_direction: FlexDirection::Row,
+        ..block()
+    };
+    let grow = Style {
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        flex_basis: D::Px(0.0),
+        ..Style::default()
+    };
+    let cases = [
+        // A: natural size, the line is the image's.
+        (
+            Style {
+                width: D::Px(400.0),
+                ..row()
+            },
+            Style::default(),
+            (400.0, 50.0),
+            (0.0, 0.0, 100.0, 50.0),
+        ),
+        // B: the definite stretched cross size 120 transfers to 240.
+        (
+            Style {
+                width: D::Px(400.0),
+                height: D::Px(120.0),
+                ..row()
+            },
+            Style::default(),
+            (400.0, 120.0),
+            (0.0, 0.0, 240.0, 120.0),
+        ),
+        // C: the automatic minimum keeps the natural width.
+        (
+            Style {
+                width: D::Px(60.0),
+                ..row()
+            },
+            Style::default(),
+            (60.0, 50.0),
+            (0.0, 0.0, 100.0, 50.0),
+        ),
+        // D: a column stretches the width; the height transfers.
+        (
+            Style {
+                width: D::Px(300.0),
+                flex_direction: FlexDirection::Column,
+                ..row()
+            },
+            Style::default(),
+            (300.0, 150.0),
+            (0.0, 0.0, 300.0, 150.0),
+        ),
+        // F: flexed to 400, the cross size transfers to 200.
+        (
+            Style {
+                width: D::Px(400.0),
+                ..row()
+            },
+            grow.clone(),
+            (400.0, 200.0),
+            (0.0, 0.0, 400.0, 200.0),
+        ),
+        // H: not stretched, natural size in a 120px line.
+        (
+            Style {
+                width: D::Px(400.0),
+                height: D::Px(120.0),
+                align_items: AlignItems::FlexStart,
+                ..row()
+            },
+            Style::default(),
+            (400.0, 120.0),
+            (0.0, 0.0, 100.0, 50.0),
+        ),
+        // I: a column's automatic minimum keeps the transferred height.
+        (
+            Style {
+                width: D::Px(300.0),
+                height: D::Px(40.0),
+                flex_direction: FlexDirection::Column,
+                ..row()
+            },
+            Style::default(),
+            (300.0, 40.0),
+            (0.0, 0.0, 300.0, 150.0),
+        ),
+        // J: min-width 0 shrinks it to 60; the height transfers to 30.
+        (
+            Style {
+                width: D::Px(60.0),
+                align_items: AlignItems::FlexStart,
+                ..row()
+            },
+            Style {
+                min_width: D::Px(0.0),
+                ..Style::default()
+            },
+            (60.0, 30.0),
+            (0.0, 0.0, 60.0, 30.0),
+        ),
+    ];
+    for (container, item, (cw, ch), expected) in cases {
+        let root = flex(container, item);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("flex image");
+        assert_eq!(
+            rect(&out, 1),
+            (0.0, 0.0, cw, ch),
+            "{expected:?} {:?}",
+            rect(&out, 2)
+        );
+        assert_eq!(rect(&out, 2), expected);
+    }
+    crate::image_loader::invalidate(source);
+}
+
+/// Headless Chrome: an absolutely positioned flex row stretched between its
+/// insets has a definite block size (CSS Flexbox §9.8), so its stretched
+/// 100×50 image transfers that cross size into the container's
+/// shrink-to-fit width (flex-abspos-inset-cross-size-001).
+#[test]
+fn abspos_flex_row_transfers_inset_height_to_image() {
+    use w3cos_std::style::{Dimension as D, FlexDirection, Position, Spacing as S};
+    let source = "w3cos-ng-flex-abspos-image-100x50.png";
+    let image = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let edges = |v: f32| Edges {
+        top: S::Px(v),
+        right: S::Px(v),
+        bottom: S::Px(v),
+        left: S::Px(v),
+    };
+    let holder = |inset: f32, item: Style| {
+        node(
+            Style {
+                position: Position::Relative,
+                height: D::Px(200.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    position: Position::Absolute,
+                    top: D::Px(inset),
+                    bottom: D::Px(inset),
+                    ..Style::default()
+                },
+                vec![Component::image(source, item)],
+            )],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            holder(0.0, block()),
+            holder(
+                10.0,
+                Style {
+                    margin: edges(5.0),
+                    padding: edges(3.0),
+                    ..block()
+                },
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("abspos flex image");
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 400.0, 200.0));
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 400.0, 200.0));
+    assert_eq!(rect(&out, 5), (0.0, 210.0, 344.0, 180.0));
+    assert_eq!(rect(&out, 6), (5.0, 215.0, 334.0, 170.0));
+    crate::image_loader::invalidate(source);
+}

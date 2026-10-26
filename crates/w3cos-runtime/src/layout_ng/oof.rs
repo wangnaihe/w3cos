@@ -14,7 +14,7 @@
 //! the box's fragment.
 
 use super::Why;
-use super::block::{border_widths, clamp_inline_size, intrinsic_sizes, layout_block_sized};
+use super::block::{border_widths, clamp_inline_size, intrinsic_sizes_at, layout_block_sized};
 use super::{BoxFragment, ConstraintSpace, MarginStrut};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
 use w3cos_std::style::{BoxSizing, Dimension, Position, Spacing, Style, TextDirection};
@@ -175,7 +175,24 @@ pub(super) fn layout_out_of_flow(
                     - ml.unwrap_or(0.0)
                     - mr.unwrap_or(0.0)
                     - edges_h;
-                let sizes = intrinsic_sizes(flat, index, &space).why("oof-intrinsic")?;
+                // A block size that does not depend on the inline size
+                // (specified, or stretched between both insets, CSS2
+                // 10.6.4) is definite for the content (CSS Flexbox §9.8).
+                let content_h = |v: f32| match style.box_sizing {
+                    BoxSizing::BorderBox => (v - edges_v).max(0.0),
+                    BoxSizing::ContentBox => v,
+                };
+                let block = length(style.height, h, style, &space)
+                    .map(content_h)
+                    .or_else(|| {
+                        let top = length(style.top, h, style, &space)?;
+                        let bottom = length(style.bottom, h, style, &space)?;
+                        Some(
+                            (h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v)
+                                .max(0.0),
+                        )
+                    });
+                let sizes = intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
                 let fit = match sizes.min {
                     Some(min) => sizes.max.min(available.max(min)),
                     None if sizes.max <= available + 1.0 / 128.0 => sizes.max,

@@ -488,7 +488,14 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         }
         Position::Relative => None,
         Position::Absolute | Position::Fixed => {
-            if !matches!(style.display, Display::Block | Display::FlowRoot) {
+            // An absolutely positioned box is blockified (CSS2 9.7):
+            // `inline-flex` lays out as `flex`, and OOF layout sizes a flex
+            // container like a block box (Blink
+            // OutOfFlowLayoutPart::LayoutOOFNode runs its own algorithm).
+            if !matches!(
+                style.display,
+                Display::Block | Display::FlowRoot | Display::Flex | Display::InlineFlex
+            ) {
                 return Some("position:display");
             }
             let Some(parent) = info.parent else {
@@ -708,10 +715,19 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
     {
         return Some("image:float-or-oof");
     }
-    if info.parent.is_some_and(|parent| {
-        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-    }) {
+    // A flex item is sized by the flex algorithm (`layout_block_in` takes
+    // its used content box). Grid items stay on legacy.
+    if info
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
         return Some("image:flex-grid-item");
+    }
+    if info
+        .parent
+        .is_some_and(|parent| is_author_flex(flat[parent].style))
+    {
+        return unsupported_box_style(style, &[inline::VALIGN_MARKER], false);
     }
     // A block replaced box must not overlap a float in the same BFC
     // (CSS 2.1 9.5). Placement beside a float is still the legacy path.
@@ -1063,6 +1079,26 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     ))
 }
 
+/// Inline size of a replaced box whose block size is `height` (a flex
+/// item's definite stretched cross size): the height transfers through the
+/// aspect ratio, then the inline min/max clamp it. `None` for a box that is
+/// not an image.
+pub(super) fn replaced_inline_at_block(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    height: f32,
+) -> Option<f32> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    let mut definite = flat[index].style.clone();
+    definite.height = Dimension::Px(height);
+    definite.min_height = Dimension::Auto;
+    definite.max_height = Dimension::Auto;
+    replaced_content_size(src, &definite, space).map(|(width, _)| width)
+}
+
 /// Replaced size under min/max constraints.
 ///
 /// Follows Blink `ComputeReplacedSizeInternal` (kNormal) in
@@ -1410,6 +1446,18 @@ pub(super) fn intrinsic_sizes(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
+    intrinsic_sizes_at(flat, index, space, None)
+}
+
+/// [`intrinsic_sizes`] of a box whose content block size is already known
+/// (`block`), which a flex row's stretched images transfer through their
+/// aspect ratio (CSS Flexbox §9.8).
+pub(super) fn intrinsic_sizes_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
     let info = &flat[index];
     let subtree = &flat[index + 1..info.subtree_end.max(index + 1)];
     let rendered = |node: &&FlatNodeInfo| node.style.display != Display::None;
@@ -1439,7 +1487,7 @@ pub(super) fn intrinsic_sizes(
         return super::bail("intrinsic-percent");
     }
     if is_author_flex(info.style) {
-        return super::flex::container_min_max(flat, index, space);
+        return super::flex::container_min_max_at(flat, index, space, block);
     }
     if is_author_grid(info.style) {
         // A grid's min/max-content size is the sum of its tracks, not the
@@ -1814,7 +1862,25 @@ fn layout_block_in(
     // new formatting contexts; a replaced box keeps its own width and the
     // overlap check sends a float collision back to legacy.
     let image_size = if let ComponentKind::Image { src } = info.kind {
-        Some(replaced_content_size(src, style, space).why("image")?)
+        Some(match sized {
+            // A flex item's used content box (FlexLayoutAlgorithm gives the
+            // replaced box its flexed and stretched sizes). An automatic
+            // block size is transferred from that inline size through the
+            // aspect ratio, then clamped (Blink ComputeReplacedSize with an
+            // inline-size override).
+            Some((width, Some(height))) => (width, height),
+            Some((width, None)) => {
+                let mut definite = style.clone();
+                definite.width = Dimension::Px(width);
+                definite.min_width = Dimension::Auto;
+                definite.max_width = Dimension::Auto;
+                (
+                    width,
+                    replaced_content_size(src, &definite, space).why("image")?.1,
+                )
+            }
+            None => replaced_content_size(src, style, space).why("image")?,
+        })
     } else if let ComponentKind::Canvas { width, height } = info.kind {
         Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
     } else {
