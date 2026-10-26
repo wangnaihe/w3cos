@@ -23291,10 +23291,7 @@ mod tests {
         );
         assert_eq!(second.get_property("id").to_js_string(), "row-1");
 
-        let replacement = Value::object(HashMap::from([(
-            "marker".into(),
-            Value::Number(17.0),
-        )]));
+        let replacement = Value::object(HashMap::from([("marker".into(), Value::Number(17.0))]));
         w3cos_core::class::set_prototype_of(&rect, &replacement);
         assert_ne!(w3cos_core::intrinsics::dom_shape_epoch(), epoch);
         assert_eq!(rect.get_property("marker"), Value::Number(17.0));
