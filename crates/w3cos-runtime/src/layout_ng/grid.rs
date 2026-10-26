@@ -215,9 +215,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-document-element") {
         return Some("grid:root");
     }
-    if has_marker(style, "--w3cos-internal-size-containment") {
-        return Some("grid:contain");
-    }
     if style.grid_areas().is_some() {
         return Some("grid:areas");
     }
@@ -236,6 +233,15 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         // formatting context as its ordinary-grid reference: explicit
         // columns, or definite rows without auto-repeat or abspos items.
         return Some("grid:lanes");
+    }
+    if !block::size_contained(style)
+        && row_lane_count(style).is_some_and(|lanes| inflow_count(flat, index) > lanes)
+    {
+        // Row lanes holding several items each stay on legacy, except under
+        // size containment, where the contained-grid references are on NG.
+        // NG does not parse `safe`/`unsafe` self-alignment yet, which those
+        // lanes reftests (row-overflow-alignment-001) depend on.
+        return Some("grid:lanes-rows");
     }
     if rows_match_legacy_lanes(flat, index)
         && style.grid_rows().is_some_and(rows_are_sized)
@@ -1090,6 +1096,12 @@ struct Flow {
 /// with the same tracks paints the same picture.
 fn lanes_like_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
     let style = flat[index].style;
+    // A size-contained lanes box sizes itself from contain-intrinsic-size,
+    // the same as its contained ordinary-grid reference, so both lay out
+    // on NG.
+    if block::size_contained(style) {
+        return true;
+    }
     if columns_spec(style).is_some_and(|spec| {
         let spec = spec.trim();
         !spec.is_empty() && !spec.eq_ignore_ascii_case("none")
@@ -1143,7 +1155,9 @@ fn rows_match_legacy_lanes(flat: &[FlatNodeInfo], index: usize) -> bool {
 }
 
 fn indefinite_block(style: &Style) -> bool {
-    matches!(style.height, Dimension::Auto)
+    // Size containment gives the block size from contain-intrinsic-size.
+    !block::size_contained(style)
+        && matches!(style.height, Dimension::Auto)
         && matches!(style.min_height, Dimension::Auto)
         && !has_marker(style, "--w3cos-internal-height-keyword")
 }
@@ -1188,6 +1202,42 @@ fn rows_are_sized(spec: &str) -> bool {
         .iter()
         .chain(template.auto_tracks.iter())
         .any(|track| !spec_is_auto(*track))
+}
+
+/// The number of row lanes when a grid-lanes box has rows but no columns
+/// (its lanes are rows and its items stack along the inline axis).
+fn row_lane_count(style: &Style) -> Option<usize> {
+    if !lanes_stack_axis(style, false) {
+        return None;
+    }
+    let template = parse_template(style.grid_rows()?, true)?;
+    (!template.tracks.is_empty() && template.auto_fit.is_none()).then_some(template.tracks.len())
+}
+
+fn inflow_count(flat: &[FlatNodeInfo], index: usize) -> usize {
+    rendered_children(flat, index)
+        .filter(|&child| !oof::is_out_of_flow(flat[child].style))
+        .count()
+}
+
+/// The auto-placement direction. Each item of a grid-lanes box with row
+/// lanes goes into the shortest lane, so equally sized items fill the lanes
+/// in turn, like column auto-flow over those rows. With no more items than
+/// lanes both flows give each item its own lane, and row flow keeps the 1fr
+/// stand-in column that the column-flow references match.
+fn container_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
+    let style = flat[index].style;
+    let flow = parse_flow(style.grid_flow())?;
+    let more_items_than_lanes =
+        row_lane_count(style).is_some_and(|lanes| inflow_count(flat, index) > lanes);
+    Some(if more_items_than_lanes {
+        Flow {
+            column: true,
+            ..flow
+        }
+    } else {
+        flow
+    })
 }
 
 fn parse_flow(value: Option<&str>) -> Option<Flow> {
@@ -3305,7 +3355,7 @@ fn contribute_subgrid_columns(
         }
     };
     let explicit_rows = row_names.len().saturating_sub(1);
-    let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    let flow = container_flow(flat, index).why("grid:auto-flow")?;
     let mut pending = Vec::new();
     for (ordinal, child) in rendered_children(flat, index).enumerate() {
         let child_style = flat[child].style;
@@ -3433,6 +3483,12 @@ pub(super) fn min_max(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
+    // Size containment: the intrinsic sizes ignore the items.
+    if block::size_contained(flat[index].style) {
+        return Some(MinMax::exact(
+            block::contain_intrinsic_size(flat[index].style).0,
+        ));
+    }
     match layout_impl(flat, index, space, None, true)? {
         GridOut::Measured(sizes) => Some(sizes),
         GridOut::Laid(_) => super::bail("grid:measure"),
@@ -3511,6 +3567,18 @@ fn measure_columns(
     }
 }
 
+/// A `<percent> <px>` gap marker resolved against `basis` (zero when
+/// indefinite). `None` when the gap has no percentage.
+fn percent_gap(style: &Style, name: &str, basis: Option<f32>) -> Option<f32> {
+    let mut parts = marker(style, name)?.split_whitespace();
+    let percent = parts.next()?.parse::<f32>().ok()?;
+    let px = parts
+        .next()
+        .and_then(|part| part.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    Some((percent / 100.0 * basis.unwrap_or(0.0).max(0.0) + px).max(0.0))
+}
+
 fn layout_impl(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -3561,6 +3629,10 @@ fn layout_impl(
         resolve_block(style.height, space.percentage_block, style, space, edges_v)
             .why("grid:percent")?
     };
+    // Size containment: an auto height is the contain-intrinsic one, and
+    // the tracks size into it as a definite height.
+    let specified_height = specified_height
+        .or_else(|| block::size_contained(style).then(|| block::contain_intrinsic_size(style).1));
     let min_h = match style.min_height {
         Dimension::Auto => None,
         other => resolve_block(other, space.percentage_block, style, space, edges_v)
@@ -3584,6 +3656,17 @@ fn layout_impl(
     } else {
         None
     };
+    // A percentage gap resolves against the content box (CSS Box
+    // Alignment). Chrome resolves it against zero while measuring
+    // intrinsic sizes and for an indefinite height.
+    let column_gap = percent_gap(
+        style,
+        "--w3cos-internal-column-gap-percent",
+        (!measure).then_some(inner_width),
+    )
+    .unwrap_or(column_gap);
+    let row_gap =
+        percent_gap(style, "--w3cos-internal-row-gap-percent", specified_height).unwrap_or(row_gap);
     let mut column_gap_u = units(column_gap);
     let mut row_gap_u = units(row_gap);
     if let Some(inherited) = &inherited {
@@ -3628,7 +3711,7 @@ fn layout_impl(
             Some(spec) => parse_template(spec, true).why("grid:template")?,
         }
     };
-    let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    let flow = container_flow(flat, index).why("grid:auto-flow")?;
     if (measure || keyword.is_some()) && columns_template.auto_fit.is_some() {
         return super::bail("grid:intrinsic-repeat");
     }
@@ -4123,15 +4206,30 @@ fn layout_impl(
     {
         return super::bail("grid:max-height");
     }
+    // An indefinite height sized the rows with a zero percentage row gap;
+    // the gap itself resolves against the resulting height (CSS Box
+    // Alignment: zero for intrinsic contributions, the final size for
+    // layout), so the rows may overflow it.
+    if specified_height.is_none()
+        && !row_sub
+        && let Some(gap) = percent_gap(
+            style,
+            "--w3cos-internal-row-gap-percent",
+            Some(from_units(used)),
+        )
+    {
+        row_gap_u = units(gap);
+    }
     // Rows that overflow a short grid keep their sizes (the content
     // overflows), except in two cases that stay on legacy. A grid-lanes box
     // stacks its items rather than placing them in rows, which this
     // algorithm only approximates, and the difference shows once they
-    // overflow. A row subgrid's own gap is legacy-only on the grid-lanes
+    // overflow (a single item stacks where its one track puts it). A row
+    // subgrid's own gap is legacy-only on the grid-lanes
     // side (grid:lanes), and the grid-lanes subgrid references are short
     // grids that have to match it.
     if used < base
-        && (has_marker(style, "--w3cos-internal-grid-lanes")
+        && ((has_marker(style, "--w3cos-internal-grid-lanes") && built.len() > 1)
             || built.iter().any(|item| {
                 flat[item.index]
                     .style
@@ -5478,6 +5576,102 @@ mod tests {
         expect(
             &Component::boxed(outer, vec![leaf(empty)]),
             &[(1, [0.0, 0.0, 0.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn size_contained_grid_sizes_rows_into_the_contain_intrinsic_height() {
+        // contain: size; contain-intrinsic-size: 80px 90px. The auto height
+        // is 90px and the 1fr 2fr rows split it (Chrome: 30px and 60px).
+        let mut style = grid_style(200.0, None, Some("50px"));
+        style.grid_ng_mut().grid_template_rows = Some("1fr 2fr".to_string());
+        style.custom_properties = Some(CustomProperties::from_iter([
+            (
+                "--w3cos-internal-size-containment".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "--w3cos-internal-contain-intrinsic-size".to_string(),
+                "80 90".to_string(),
+            ),
+        ]));
+        let items = (0..2)
+            .map(|_| leaf(block_box(None, None)))
+            .collect::<Vec<_>>();
+        expect(
+            &Component::boxed(style, items),
+            &[(1, [0.0, 0.0, 50.0, 30.0]), (2, [0.0, 30.0, 50.0, 60.0])],
+        );
+    }
+
+    #[test]
+    fn row_lanes_fill_each_lane_in_turn() {
+        // grid-lanes with only grid-template-rows: the rows are the lanes and
+        // each item goes into the shortest one, so equal items alternate
+        // between the two lanes and stack along the inline axis. Only the
+        // size-contained case is on NG.
+        let mut style = grid_style(200.0, None, None);
+        style.grid_ng_mut().grid_template_rows = Some("30px 30px".to_string());
+        style.custom_properties = Some(CustomProperties::from_iter([
+            ("--w3cos-internal-grid-lanes".to_string(), "1".to_string()),
+            (
+                "--w3cos-internal-size-containment".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "--w3cos-internal-contain-intrinsic-size".to_string(),
+                "200 60".to_string(),
+            ),
+        ]));
+        let items = (0..4)
+            .map(|_| leaf(block_box(Some(20.0), None)))
+            .collect::<Vec<_>>();
+        expect(
+            &Component::boxed(style, items),
+            &[
+                (1, [0.0, 0.0, 20.0, 30.0]),
+                (2, [0.0, 30.0, 20.0, 30.0]),
+                (3, [20.0, 0.0, 20.0, 30.0]),
+                (4, [20.0, 30.0, 20.0, 30.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn percentage_gaps_resolve_against_the_content_box() {
+        // Chrome: 10% of the 200px width is a 20px column gap. The row gap
+        // resolves against the definite 100px height (10px). With an auto
+        // height the rows size with no gap (20px tall) and the gap is then
+        // 10% of that, so the rows overflow.
+        let gap = |style: &mut Style| {
+            style.custom_properties = Some(CustomProperties::from_iter([
+                (
+                    "--w3cos-internal-column-gap-percent".to_string(),
+                    "10 0".to_string(),
+                ),
+                (
+                    "--w3cos-internal-row-gap-percent".to_string(),
+                    "10 0".to_string(),
+                ),
+            ]));
+        };
+        let items = || {
+            (0..3)
+                .map(|_| leaf(block_box(None, Some(10.0))))
+                .collect::<Vec<_>>()
+        };
+        let mut definite = grid_style(200.0, Some(100.0), Some("50px 50px"));
+        definite.grid_ng_mut().grid_template_rows = Some("10px 10px".to_string());
+        gap(&mut definite);
+        expect(
+            &Component::boxed(definite, items()),
+            &[(2, [70.0, 0.0, 50.0, 10.0]), (3, [0.0, 20.0, 50.0, 10.0])],
+        );
+        let mut auto = grid_style(200.0, None, Some("50px 50px"));
+        gap(&mut auto);
+        expect(
+            &Component::boxed(auto, items()),
+            &[(3, [0.0, 12.0, 50.0, 10.0])],
         );
     }
 

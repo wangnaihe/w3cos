@@ -38,6 +38,11 @@ pub const GRID_LANES_PROPERTY: &str = "--w3cos-internal-grid-lanes";
 /// `gap` / `row-gap` / `column-gap` contains a percentage. The used gap
 /// stays unset (legacy ignores it). Value is `row`, `column`, or `both`.
 pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
+/// A percentage `row-gap` / `column-gap` as `<percent> <px>`: the gap is
+/// `percent`% of the content box plus `px` (`10%`, or `calc(10% + 25px)`).
+/// LayoutNG grid resolves it; other layouts keep the marker above only.
+pub const ROW_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-row-gap-percent";
+pub const COLUMN_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-column-gap-percent";
 /// `flex-wrap` keyword this engine does not model (`balance`, …). The used
 /// value falls through to `nowrap`.
 pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
@@ -45,6 +50,47 @@ pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized
 /// untouched, so legacy layout never consults it. LayoutNG reads it only
 /// as a column flex container's definite block size.
 pub const ASPECT_RATIO_PROPERTY: &str = "--w3cos-internal-aspect-ratio";
+
+/// `N%`, or `calc()` of one percentage plus or minus one px length.
+fn parse_percent_gap(value: &str) -> Option<String> {
+    let value = value.trim();
+    let percent = |token: &str| token.strip_suffix('%')?.trim().parse::<f32>().ok();
+    if let Some(p) = percent(value) {
+        return (p >= 0.0).then(|| format!("{p} 0"));
+    }
+    let lower = value.to_ascii_lowercase();
+    let inner = lower.strip_prefix("calc(")?.strip_suffix(')')?;
+    let tokens: Vec<&str> = inner.split_whitespace().collect();
+    let [first, op, second] = tokens.as_slice() else {
+        return None;
+    };
+    let sign = match *op {
+        "+" => 1.0,
+        "-" => -1.0,
+        _ => return None,
+    };
+    let (p, px) = if let Some(p) = percent(first) {
+        (p, sign * parse_px(second)?)
+    } else if sign > 0.0 {
+        (percent(second)?, parse_px(first)?)
+    } else {
+        return None;
+    };
+    Some(format!("{p} {px}"))
+}
+
+fn update_percent_gap_values(style: &mut Style, row: Option<&str>, column: Option<&str>) {
+    if let Some(row) = row {
+        set_marker(style, ROW_GAP_PERCENT_PROPERTY, parse_percent_gap(row));
+    }
+    if let Some(column) = column {
+        set_marker(
+            style,
+            COLUMN_GAP_PERCENT_PROPERTY,
+            parse_percent_gap(column),
+        );
+    }
+}
 
 fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>) {
     let current = style
@@ -411,7 +457,9 @@ impl CSSStyleDeclaration {
             }
             "flex" => apply_flex_shorthand(&mut self.inner, value),
 
-            "gap" => {
+            // `grid-gap`, `grid-row-gap`, and `grid-column-gap` are the legacy
+            // aliases (CSS Box Alignment) that Chrome still parses.
+            "gap" | "grid-gap" | "gridGap" => {
                 let parts = split_css_whitespace(value);
                 let row_pct = parts.first().is_some_and(|part| part.contains('%'));
                 let column_pct = parts
@@ -419,6 +467,10 @@ impl CSSStyleDeclaration {
                     .map(|part| part.contains('%'))
                     .unwrap_or(row_pct);
                 update_percent_gap(&mut self.inner, Some(row_pct), Some(column_pct));
+                if let Some(row) = parts.first() {
+                    let column = parts.get(1).unwrap_or(row);
+                    update_percent_gap_values(&mut self.inner, Some(row), Some(column));
+                }
                 if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
                     self.inner.row_gap = Some(v);
                     self.inner.column_gap =
@@ -426,12 +478,14 @@ impl CSSStyleDeclaration {
                     self.inner.gap = v;
                 }
             }
-            "row-gap" | "rowGap" => {
+            "row-gap" | "rowGap" | "grid-row-gap" | "gridRowGap" => {
                 update_percent_gap(&mut self.inner, Some(value.contains('%')), None);
+                update_percent_gap_values(&mut self.inner, Some(value), None);
                 self.inner.row_gap = parse_px(value);
             }
-            "column-gap" | "columnGap" => {
+            "column-gap" | "columnGap" | "grid-column-gap" | "gridColumnGap" => {
                 update_percent_gap(&mut self.inner, None, Some(value.contains('%')));
+                update_percent_gap_values(&mut self.inner, None, Some(value));
                 self.inner.column_gap = parse_px(value);
             }
             "column-width" | "columnWidth" => {
@@ -1568,6 +1622,16 @@ impl CSSStyleDeclaration {
                 self.inner.grid_ng_mut().grid_template_areas = Some(value.trim().to_string());
             }
             "grid-area" | "gridArea" => apply_grid_area(&mut self.inner, value),
+            "grid-column-start" | "gridColumnStart" => {
+                apply_grid_line(&mut self.inner, false, false, value)
+            }
+            "grid-column-end" | "gridColumnEnd" => {
+                apply_grid_line(&mut self.inner, false, true, value)
+            }
+            "grid-row-start" | "gridRowStart" => {
+                apply_grid_line(&mut self.inner, true, false, value)
+            }
+            "grid-row-end" | "gridRowEnd" => apply_grid_line(&mut self.inner, true, true, value),
 
             // Outline
             "outline" => {
@@ -2662,6 +2726,53 @@ fn apply_grid_shorthand(style: &mut Style, value: &str) {
     }
 }
 
+/// A `grid-{row,column}-{start,end}` longhand. LayoutNG reads the cascaded
+/// `start / end` pair, so the longhand rewrites one side of it. A lone
+/// custom ident in the shorthand also names the end line (CSS Grid 8.4).
+fn apply_grid_line(style: &mut Style, row: bool, end: bool, value: &str) {
+    let value = value.trim();
+    let value = if css_wide_keyword(&value.to_ascii_lowercase()) || value.is_empty() {
+        "auto"
+    } else {
+        value
+    };
+    remember_grid_placement(style);
+    let ng = style.grid_ng_mut();
+    let current = if row {
+        ng.grid_row_used.as_deref()
+    } else {
+        ng.grid_column_used.as_deref()
+    };
+    let (mut start_line, mut end_line) = match current.map(split_grid_slash).as_deref() {
+        Some([start, end]) => ((*start).to_string(), (*end).to_string()),
+        Some([only]) if is_grid_custom_ident(only) => ((*only).to_string(), (*only).to_string()),
+        Some([only]) if !only.is_empty() => ((*only).to_string(), "auto".to_string()),
+        _ => ("auto".to_string(), "auto".to_string()),
+    };
+    if end {
+        end_line = value.to_string();
+    } else {
+        start_line = value.to_string();
+    }
+    let pair = Some(format!("{start_line} / {end_line}"));
+    if row {
+        ng.grid_row_used = pair;
+    } else {
+        ng.grid_column_used = pair;
+    }
+}
+
+fn is_grid_custom_ident(value: &str) -> bool {
+    let mut tokens = value.split_whitespace();
+    let (Some(token), None) = (tokens.next(), tokens.next()) else {
+        return false;
+    };
+    let lower = token.to_ascii_lowercase();
+    !matches!(lower.as_str(), "auto" | "span")
+        && !css_wide_keyword(&lower)
+        && token.parse::<i64>().is_err()
+}
+
 fn apply_grid_area(style: &mut Style, value: &str) {
     let value = value.trim();
     style.grid_ng_mut().grid_area = Some(value.to_string());
@@ -3677,6 +3788,66 @@ fn computed_tab_size_calc(body: &str, font_size: f32) -> Option<String> {
     } else {
         format!("{total}")
     })
+}
+
+#[cfg(test)]
+mod grid_longhand_tests {
+    use super::{COLUMN_GAP_PERCENT_PROPERTY, CSSStyleDeclaration, ROW_GAP_PERCENT_PROPERTY};
+
+    #[test]
+    fn grid_line_longhands_rewrite_one_side_of_the_pair() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("grid-column-start", "2");
+        style.set_property("grid-row-end", "span 2");
+        let used = style.to_style();
+        assert_eq!(used.grid_column_used(), Some("2 / auto"));
+        assert_eq!(used.grid_row_used(), Some("auto / span 2"));
+        // A lone custom ident in the shorthand is also the end line.
+        style.set_property("grid-column", "a");
+        style.set_property("grid-column-start", "1");
+        assert_eq!(style.to_style().grid_column_used(), Some("1 / a"));
+        style.set_property("grid-row", "1 / 3");
+        style.set_property("grid-row-start", "initial");
+        assert_eq!(style.to_style().grid_row_used(), Some("auto / 3"));
+    }
+
+    #[test]
+    fn percentage_gaps_keep_their_value() {
+        let gap = |style: &CSSStyleDeclaration, name: &str| {
+            style
+                .to_style()
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(name))
+                .cloned()
+        };
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("gap", "calc(10% + 25px)");
+        assert_eq!(
+            gap(&style, ROW_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("10 25")
+        );
+        assert_eq!(
+            gap(&style, COLUMN_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("10 25")
+        );
+        style.set_property("gap", "5% 8px");
+        assert_eq!(
+            gap(&style, ROW_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("5 0")
+        );
+        assert_eq!(gap(&style, COLUMN_GAP_PERCENT_PROPERTY), None);
+        style.set_property("row-gap", "4px");
+        assert_eq!(gap(&style, ROW_GAP_PERCENT_PROPERTY), None);
+        style.set_property("grid-column-gap", "20%");
+        assert_eq!(
+            gap(&style, COLUMN_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("20 0")
+        );
+        style.set_property("grid-gap", "3px 6px");
+        let used = style.to_style();
+        assert_eq!((used.row_gap, used.column_gap), (Some(3.0), Some(6.0)));
+    }
 }
 
 #[cfg(test)]
