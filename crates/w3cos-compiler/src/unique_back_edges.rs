@@ -65,8 +65,14 @@ pub fn analyze_unique_back_edges(
     for block in &function.blocks {
         let mut origins: HashMap<u32, RegOrigin> = HashMap::new();
         let mut fresh_closures: HashMap<u32, Vec<(FunctionId, Vec<BindingId>)>> = HashMap::new();
+        // Keys proven before `instruction`, advanced one step per iteration
+        // (rebuilding the prefix each time was quadratic on bundled blocks).
+        let mut proven_before: HashMap<u32, String> = HashMap::new();
         for (index, instruction) in block.instructions.iter().enumerate() {
-            let proven = proven_string_keys(&block.instructions, index);
+            if let Some(previous) = index.checked_sub(1) {
+                advance_proven_string_keys(&mut proven_before, &block.instructions[previous]);
+            }
+            let proven = &proven_before;
             match instruction {
                 Instruction::LoadBinding { dst, binding } => {
                     origins.insert(dst.0, RegOrigin::Binding(*binding));
@@ -333,24 +339,20 @@ fn push_closure_origin(
     }
 }
 
-fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32, String> {
-    let mut known = HashMap::new();
-    for instruction in &instructions[..index] {
-        match instruction {
-            Instruction::LoadConstant {
-                dst,
-                value: Constant::String(value),
-            } => {
-                known.insert(dst.0, value.clone());
-            }
-            other => {
-                if let Some(dst) = written_register(other) {
-                    known.remove(&dst.0);
-                }
+fn advance_proven_string_keys(known: &mut HashMap<u32, String>, instruction: &Instruction) {
+    match instruction {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::String(value),
+        } => {
+            known.insert(dst.0, value.clone());
+        }
+        other => {
+            if let Some(dst) = written_register(other) {
+                known.remove(&dst.0);
             }
         }
     }
-    known
 }
 
 fn written_register(instruction: &Instruction) -> Option<Register> {

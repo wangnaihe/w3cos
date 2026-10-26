@@ -2666,24 +2666,33 @@ fn last_uses_in_sequence(
     last_uses
 }
 
+/// String constants known to sit in each register before `instructions[index]`.
+#[cfg(test)]
 fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32, String> {
     let mut known = HashMap::new();
     for instruction in &instructions[..index] {
-        match instruction {
-            Instruction::LoadConstant {
-                dst,
-                value: Constant::String(value),
-            } => {
-                known.insert(dst.0, value.clone());
-            }
-            other => {
-                if let Some(dst) = written_register(other) {
-                    known.remove(&dst.0);
-                }
+        advance_proven_string_keys(&mut known, instruction);
+    }
+    known
+}
+
+/// Apply one instruction's effect to the proven string-key map. Callers walk a
+/// block forward once instead of recomputing the prefix per instruction, which
+/// was quadratic (cubic in `dead_string_loads`) on huge bundled blocks.
+fn advance_proven_string_keys(known: &mut HashMap<u32, String>, instruction: &Instruction) {
+    match instruction {
+        Instruction::LoadConstant {
+            dst,
+            value: Constant::String(value),
+        } => {
+            known.insert(dst.0, value.clone());
+        }
+        other => {
+            if let Some(dst) = written_register(other) {
+                known.remove(&dst.0);
             }
         }
     }
-    known
 }
 
 fn analyze_and_warn(function: &Function, specifier: Option<&str>) -> UniqueBackEdgePlan {
@@ -4565,32 +4574,34 @@ fn dead_string_loads(
     live_in: &HashMap<BlockId, HashSet<u32>>,
 ) -> HashSet<usize> {
     let end_live = successor_live(instructions, function, exception_target, live_in);
+    // Forward pass: what each instruction reads, given the keys proven there.
+    let mut proven = HashMap::new();
+    let uses: Vec<_> = instructions
+        .iter()
+        .map(|instruction| {
+            let reads = value_uses(instruction, &proven);
+            advance_proven_string_keys(&mut proven, instruction);
+            reads
+        })
+        .collect();
+    // Backward pass: `pending` holds registers read later in the block before
+    // being overwritten, so a string load is needed iff its dst is pending.
     let mut dead = HashSet::new();
-    for (index, instruction) in instructions.iter().enumerate() {
-        let Instruction::LoadConstant {
+    let mut pending: HashSet<u32> = HashSet::new();
+    for (index, instruction) in instructions.iter().enumerate().rev() {
+        if let Instruction::LoadConstant {
             dst,
             value: Constant::String(_),
         } = instruction
-        else {
-            continue;
-        };
-        if end_live.contains(&dst.0) {
-            continue;
-        }
-        let mut needed = false;
-        for (later_index, later) in instructions.iter().enumerate().skip(index + 1) {
-            let proven = proven_string_keys(instructions, later_index);
-            if value_uses(later, &proven).contains(&dst.0) {
-                needed = true;
-                break;
-            }
-            if written_register(later).is_some_and(|written| written.0 == dst.0) {
-                break;
-            }
-        }
-        if !needed {
+            && !end_live.contains(&dst.0)
+            && !pending.contains(&dst.0)
+        {
             dead.insert(index);
         }
+        if let Some(written) = written_register(instruction) {
+            pending.remove(&written.0);
+        }
+        pending.extend(uses[index].iter().copied());
     }
     dead
 }
@@ -4611,12 +4622,12 @@ fn emit_block_instructions(
     let live_in = analyze_live_in(function);
     let last_uses = last_uses_in_sequence(instructions, function, exception_target, &live_in);
     let dead_strings = dead_string_loads(instructions, function, exception_target, &live_in);
+    let mut proven = HashMap::new();
     let emitted = instructions
         .iter()
         .enumerate()
         .map(|(index, instruction)| {
-            let proven = proven_string_keys(instructions, index);
-            emit_instruction(
+            let emitted = emit_instruction(
                 instruction,
                 exception_target,
                 function,
@@ -4629,8 +4640,9 @@ fn emit_block_instructions(
                 back_edges,
                 &reaching[index],
                 &last_uses[index],
-            )
-            .map(|emitted| match mode {
+            );
+            advance_proven_string_keys(&mut proven, instruction);
+            emitted.map(|emitted| match mode {
                 EmissionMode::Async => emitted.replace("__W3COS_ASYNC_FRAME__", type_name),
                 EmissionMode::Generator | EmissionMode::AsyncGenerator => {
                     emitted.replace("__W3COS_STATE__", &format!("{type_name}State"))
@@ -8770,6 +8782,104 @@ mod tests {
     use std::process::Command;
     use w3cos_core::Value;
     use w3cos_vm::{Limits, Vm};
+
+    /// The pre-linearization `dead_string_loads`: rescans the proven-key
+    /// prefix for every later instruction.
+    fn naive_dead_string_loads(
+        instructions: &[Instruction],
+        function: &Function,
+        live_in: &HashMap<BlockId, HashSet<u32>>,
+    ) -> HashSet<usize> {
+        let end_live = successor_live(instructions, function, None, live_in);
+        let mut dead = HashSet::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            let Instruction::LoadConstant {
+                dst,
+                value: Constant::String(_),
+            } = instruction
+            else {
+                continue;
+            };
+            if end_live.contains(&dst.0) {
+                continue;
+            }
+            let mut needed = false;
+            for (later_index, later) in instructions.iter().enumerate().skip(index + 1) {
+                let proven = proven_string_keys(instructions, later_index);
+                if value_uses(later, &proven).contains(&dst.0) {
+                    needed = true;
+                    break;
+                }
+                if written_register(later).is_some_and(|written| written.0 == dst.0) {
+                    break;
+                }
+            }
+            if !needed {
+                dead.insert(index);
+            }
+        }
+        dead
+    }
+
+    #[test]
+    fn linear_dead_string_loads_match_the_prefix_rescan() {
+        let module = crate::w3ir_lowering::lower_module(
+            r#"
+                export function keys(o, flag) {
+                    let k = "alpha";
+                    o.alpha = "one";
+                    o[k] = o.beta + "two";
+                    k = "gamma";
+                    const s = "lit";
+                    o.gamma = s;
+                    if (flag) { o[k] = k; } else { o.delta = "x" + s; }
+                    return o["epsilon"] + k;
+                }
+            "#,
+            "app:///dead-strings.mjs",
+        )
+        .unwrap();
+        let mut checked = 0;
+        for function in &module.functions {
+            let live_in = analyze_live_in(function);
+            for block in &function.blocks {
+                let instructions = &block.instructions;
+                assert_eq!(
+                    dead_string_loads(instructions, function, None, &live_in),
+                    naive_dead_string_loads(instructions, function, &live_in),
+                );
+                checked += instructions.len();
+            }
+        }
+        assert!(checked > 20, "test fixture lowered to too few instructions");
+    }
+
+    #[test]
+    fn huge_straight_line_blocks_emit_in_linear_time() {
+        // esbuild bundles (playwright-core's coreBundle.js) put thousands of
+        // string-keyed stores in one block; per-instruction prefix rescans
+        // made AOT emission effectively hang there.
+        let mut source = String::from("export function init(o) {\n");
+        for index in 0..4000 {
+            source.push_str(&format!("o.k{index} = \"v{index}\";\n"));
+        }
+        source.push_str("return o;\n}\n");
+        let module = crate::w3ir_lowering::lower_module(&source, "app:///huge-block.mjs").unwrap();
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name.as_deref() == Some("init"))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let generated =
+            generate_sync_function_from_module(&module, function, "huge_block").unwrap();
+        let elapsed = started.elapsed();
+        assert!(generated.contains("k3999"), "last store missing");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "emitting 4000 stores took {elapsed:?}"
+        );
+    }
 
     #[test]
     fn emits_a_native_state_machine_from_generator_suspension_metadata() {
