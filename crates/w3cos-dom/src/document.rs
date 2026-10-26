@@ -3429,6 +3429,7 @@ impl Document {
             !property.starts_with("--w3cos-internal-")
                 || property == "--w3cos-internal-text-align-last"
                 || property == user_agent::HTML_STANDARD_FONT_PROPERTY
+                || property == crate::css_style::TAB_SIZE_PROPERTY
         });
 
         // Custom properties participate in the cascade independently of
@@ -3931,6 +3932,24 @@ impl Document {
             style.font_weight = weight;
         }
         let edge_ex_size = css_ex_size(&style);
+        // Font-relative tab-size lengths use the final cascaded font.
+        if let Some((_, value)) = declared_valid_property_value(&["tab-size", "tabSize"])
+            && let Some(computed) = crate::css_style::computed_tab_size(value, style.font_size)
+        {
+            let lower = value.trim().to_ascii_lowercase();
+            let computed = if lower.ends_with("ex") && !lower.ends_with("rex") {
+                lower
+                    .strip_suffix("ex")
+                    .and_then(|number| number.trim().parse::<f32>().ok())
+                    .map_or(computed, |number| format!("{}px", number * edge_ex_size))
+            } else {
+                computed
+            };
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(crate::css_style::TAB_SIZE_PROPERTY.to_string(), computed);
+        }
         if let Some(value) = declared_value(&["text-indent", "textIndent"])
             && let Some(number) = value.trim().strip_suffix("ex")
             && let Ok(number) = number.trim().parse::<f32>()
@@ -12727,6 +12746,12 @@ fn declaration_value_is_valid(property: &str, value: &str) -> bool {
     if css_property_eq(property, "line-height") {
         return crate::css_style::is_valid_line_height_value(value);
     }
+    if css_property_eq(property, "tab-size") {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "inherit" | "unset" | "revert" | "revert-layer"
+        ) || crate::css_style::computed_tab_size(value, 16.0).is_some();
+    }
     true
 }
 
@@ -12763,6 +12788,7 @@ fn inherit_text_style(
     for property in [
         user_agent::HTML_STANDARD_FONT_PROPERTY,
         user_agent::TEXT_LANGUAGE_PROPERTY,
+        crate::css_style::TAB_SIZE_PROPERTY,
     ] {
         if let Some(value) = parent
             .custom_properties
@@ -27972,6 +27998,61 @@ mod computed_style_cache_tests {
                 document.computed_style_for(child.id).word_spacing,
                 expected,
                 "descendants inherit the computed length, not em units"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_size_inherits_pixels_and_drops_invalid_values() {
+        crate::stylesheet::clear_rules();
+        let tab_size = |document: &Document, id| {
+            document
+                .computed_style_for(id)
+                .custom_properties
+                .and_then(|properties| properties.get(crate::css_style::TAB_SIZE_PROPERTY).cloned())
+        };
+        // (parent declarations, target declarations, target, child)
+        for (parent_css, target_css, expected) in [
+            ("", "", None),
+            ("tab-size:4", "", Some("4")),
+            ("tab-size:4", "tab-size:2.5", Some("2.5")),
+            ("", "tab-size:5em;font-size:10px", Some("50px")),
+            ("", "font-size:10px;tab-size:5em", Some("50px")),
+            ("tab-size:3", "tab-size:-1", Some("3")),
+            ("tab-size:3", "tab-size:10%", Some("3")),
+            ("tab-size:3", "tab-size:inherit", Some("3")),
+            ("tab-size:3", "tab-size:initial", Some("8")),
+            ("", "tab-size:20px", Some("20px")),
+            ("", "tab-size:1rem;font-size:40px", Some("16px")),
+        ] {
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            let target = document.create_element("span");
+            for (element, css) in [(&parent, parent_css), (&target, target_css)] {
+                for declaration in css.split(';').filter(|s| !s.is_empty()) {
+                    let (property, value) = declaration.split_once(':').unwrap();
+                    element
+                        .style_mut(&mut document)
+                        .set_property(property, value);
+                }
+            }
+            let child = document.create_element("span");
+            child
+                .style_mut(&mut document)
+                .set_property("font-size", "30px");
+            target.append_child(&mut document, child);
+            parent.append_child(&mut document, target);
+            document.body().append_child(&mut document, parent);
+            let expected = expected.map(str::to_string);
+            assert_eq!(
+                tab_size(&document, target.id),
+                expected,
+                "{parent_css}; {target_css}"
+            );
+            assert_eq!(
+                tab_size(&document, child.id),
+                expected,
+                "inherits the computed value"
             );
         }
     }

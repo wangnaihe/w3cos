@@ -443,6 +443,22 @@ fn fallback_grows_line(content: &str, style: &Style) -> bool {
     false
 }
 
+/// The content a text leaf cannot carry yet: an empty leaf, a carriage
+/// return, a preserved tab, or a preserved newline (unless `newline_ok`).
+fn text_content_reason(content: &str, newline_ok: bool) -> Option<&'static str> {
+    if content.is_empty() {
+        Some("text:empty")
+    } else if content.contains('\r') {
+        Some("text:cr")
+    } else if content.contains('\t') {
+        Some("text:tab")
+    } else if content.contains('\n') && !newline_ok {
+        Some("text:newline")
+    } else {
+        None
+    }
+}
+
 /// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
 /// block-axis margins are handled by block layout.
 pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
@@ -469,8 +485,8 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
 /// [`block_text_reason`] without the box edges: the text of a block text
 /// leaf, or the label of a button leaf whose edges are its own box's.
 pub(super) fn block_text_content_reason(content: &str, style: &Style) -> Option<&'static str> {
-    if content.is_empty() || content.contains(['\n', '\r', '\t']) {
-        return Some("text:content");
+    if let Some(reason) = text_content_reason(content, false) {
+        return Some(reason);
     }
     // (A visual-order fragment from the cascade's bidi pass: paint draws
     // the paragraph leaf as given.)
@@ -614,11 +630,8 @@ fn inline_text_reason(
             }
             _ => false,
         };
-    if content.is_empty()
-        || content.contains(['\r', '\t'])
-        || (content.contains('\n') && !newline_ok)
-    {
-        return Some("text:content");
+    if let Some(reason) = text_content_reason(content, newline_ok) {
+        return Some(reason);
     }
     // A fragment with a line break the cascade froze inside it (one
     // item per fragment here).

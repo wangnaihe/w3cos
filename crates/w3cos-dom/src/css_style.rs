@@ -8,6 +8,9 @@ use w3cos_std::style::{
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
+/// Computed `tab-size` (CSS Text 3 4.2, inherited): `<number>` spaces as a
+/// bare number, a `<length>` resolved at the declaring element as `Npx`.
+pub const TAB_SIZE_PROPERTY: &str = "--w3cos-internal-tab-size";
 /// `contain` with a real `size` (or `strict`) token: size containment
 /// (CSS Contain 2 3.1; `inline-size` alone is not). `Contain` folds tokens.
 pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
@@ -1177,6 +1180,18 @@ impl CSSStyleDeclaration {
                         "--w3cos-internal-text-align-last".to_string(),
                         value.trim().to_ascii_lowercase(),
                     );
+            }
+            "tab-size" | "tabSize" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                let properties = self
+                    .inner
+                    .custom_properties
+                    .get_or_insert_with(Default::default);
+                if matches!(keyword.as_str(), "inherit" | "unset") {
+                    properties.remove(TAB_SIZE_PROPERTY);
+                } else if let Some(computed) = computed_tab_size(value, self.inner.font_size) {
+                    properties.insert(TAB_SIZE_PROPERTY.to_string(), computed);
+                }
             }
             "white-space" | "whiteSpace" => {
                 if value.trim().eq_ignore_ascii_case("break-spaces") {
@@ -3500,6 +3515,49 @@ fn parse_kern_feature_override(value: &str) -> Option<bool> {
             _ => None,
         }
     })
+}
+
+/// `tab-size: <number [0,inf]> | <length [0,inf]>` (CSS Text 3 4.2).
+/// Percentages and negative values are invalid; font-relative lengths
+/// resolve against `font_size` (the declaring element's, so descendants
+/// inherit pixels). Returns the computed value stored under
+/// [`TAB_SIZE_PROPERTY`].
+pub(crate) fn computed_tab_size(value: &str, font_size: f32) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "initial" {
+        return Some("8".into());
+    }
+    let finite = |number: &str| {
+        number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite() && *number >= 0.0)
+    };
+    if let Some(number) = finite(&value) {
+        return Some(format!("{number}"));
+    }
+    let pixels = [
+        ("px", 1.0),
+        ("rem", 16.0),
+        ("em", font_size),
+        ("ex", font_size * 0.5),
+        ("in", 96.0),
+        ("cm", 96.0 / 2.54),
+        ("mm", 96.0 / 25.4),
+        ("pt", 96.0 / 72.0),
+        ("pc", 16.0),
+    ]
+    .into_iter()
+    .find_map(|(unit, scale)| {
+        let number = value.strip_suffix(unit)?;
+        // `rem` also ends in `em`; the earlier entry wins.
+        if unit == "em" && number.ends_with('r') {
+            return None;
+        }
+        finite(number).map(|number| number * scale)
+    })?;
+    Some(format!("{pixels}px"))
 }
 
 #[cfg(test)]
