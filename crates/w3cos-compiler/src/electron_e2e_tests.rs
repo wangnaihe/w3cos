@@ -750,3 +750,75 @@ fn electron_message_ports_transfer_to_the_page_and_a_utility_process() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Code-OSS forks `bootstrap-fork.js` (an ES module) through a computed
+/// path and imports its entry point with a computed specifier: the app
+/// declares both in `package.json` (`"w3cos": { "workers", "modules" }`).
+const ESM_UTILITY: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-esm-utility", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "workers": ["child.js"], "modules": ["lazy/feature.js"] } }"#,
+    ),
+    (
+        "main.js",
+        r#"import { app, utilityProcess } from 'electron'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { shared } from './shared.js'
+const dir = path.dirname(fileURLToPath(import.meta.url))
+const name = ['child', 'js'].join('.')
+app.whenReady().then(() => {
+  const child = utilityProcess.fork(path.join(dir, name), ['feature'])
+  child.on('message', (message) => {
+    console.log('main got', message, shared)
+    child.kill()
+  })
+  child.on('exit', () => app.quit())
+  child.postMessage('hi')
+})
+"#,
+    ),
+    (
+        "shared.js",
+        r#"export const shared = 'shared'
+console.log('shared evaluated in', process.parentPort ? 'child' : 'main')
+"#,
+    ),
+    (
+        "child.js",
+        r#"import { shared } from './shared.js'
+const which = process.argv[2]
+const feature = await import(`./lazy/${which}.js`)
+process.parentPort.on('message', (event) => {
+  process.parentPort.postMessage(shared + ':' + feature.describe(event.data))
+})
+"#,
+    ),
+    (
+        "lazy/feature.js",
+        r#"export function describe(data) { return 'feature(' + data + ')' }
+"#,
+    ),
+];
+
+#[test]
+fn electron_declared_esm_utility_process_and_computed_import() {
+    let root = write_fixture("w3cos_electron_esm_utility", ESM_UTILITY);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_esm_utility",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        [
+            "shared evaluated in main",
+            "shared evaluated in child",
+            "main got shared:feature(hi) shared",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

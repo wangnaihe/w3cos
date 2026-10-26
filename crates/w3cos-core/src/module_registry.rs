@@ -281,6 +281,34 @@ pub fn namespace(specifier: &str) -> Option<Value> {
     })
 }
 
+/// `./x.js` / `../x.js` resolved against the referrer module's path or
+/// `file://` URL (`.` and `..` segments folded); `None` for bare or
+/// absolute specifiers.
+pub fn resolve_relative_specifier(referrer: &str, specifier: &str) -> Option<String> {
+    if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+        return None;
+    }
+    let referrer = referrer.strip_prefix("file://").unwrap_or(referrer);
+    if !referrer.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = referrer
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    segments.pop();
+    for part in specifier.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            part => segments.push(part),
+        }
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
 pub fn evaluate(specifier: &str) -> Option<Value> {
     let specifier = canonical_specifier(specifier);
     enum EvaluationAction {
@@ -487,6 +515,21 @@ pub fn import_meta(specifier: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_specifiers_resolve_against_the_referrer() {
+        assert_eq!(
+            resolve_relative_specifier("/app/out/bootstrap-fork.js", "./vs/code/main.js")
+                .as_deref(),
+            Some("/app/out/vs/code/main.js")
+        );
+        assert_eq!(
+            resolve_relative_specifier("file:///app/out/a/b.js", "../c/./d.js").as_deref(),
+            Some("/app/out/c/d.js")
+        );
+        assert_eq!(resolve_relative_specifier("/app/out/a.js", "vs/x.js"), None);
+        assert_eq!(resolve_relative_specifier("relative.js", "./x.js"), None);
+    }
     use std::cell::{Cell, RefCell};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
