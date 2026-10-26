@@ -665,3 +665,88 @@ fn electron_renderer_trace_logs_scripts_and_ipc() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Code-OSS's shared-process handshake: main transfers one end of a
+/// MessageChannelMain to a utility process and the other to the page
+/// (`webContents.postMessage(channel, nonce, [port])`); the preload forwards
+/// it with `window.postMessage(nonce, '*', event.ports)`.
+const PORT_TRANSFER: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-port-transfer", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, BrowserWindow, ipcMain, utilityProcess, MessageChannelMain } = require('electron')
+const path = require('node:path')
+let win
+let child
+app.whenReady().then(() => {
+  child = utilityProcess.fork(path.join(__dirname, 'child.js'))
+  ipcMain.on('report', (_event, line) => {
+    console.log(line)
+    if (line.startsWith('renderer got')) {
+      child.kill()
+      setTimeout(() => win.close(), 0)
+    }
+  })
+  win = new BrowserWindow({ show: false, webPreferences: { preload: path.join(__dirname, 'preload.js') } })
+  win.webContents.on('did-finish-load', () => {
+    const { port1, port2 } = new MessageChannelMain()
+    child.postMessage({ hello: 'child' }, [port2])
+    win.webContents.postMessage('port', 'nonce-1', [port1])
+  })
+  win.loadFile('index.html')
+})
+app.on('window-all-closed', () => app.quit())
+"#,
+    ),
+    (
+        "child.js",
+        r#"process.parentPort.on('message', (event) => {
+  const port = event.ports[0]
+  port.on('message', (e) => port.postMessage('pong:' + e.data + ':' + event.data.hello))
+  port.start()
+})
+"#,
+    ),
+    (
+        "preload.js",
+        r#"const { contextBridge, ipcRenderer } = require('electron')
+ipcRenderer.on('port', (event, nonce) => window.postMessage(nonce, '*', event.ports))
+contextBridge.exposeInMainWorld('bridge', { report: (line) => ipcRenderer.send('report', line) })
+"#,
+    ),
+    (
+        "renderer.js",
+        r#"window.addEventListener('message', (event) => {
+  if (event.data !== 'nonce-1') return
+  const port = event.ports[0]
+  window.bridge.report('renderer ports ' + event.ports.length)
+  port.onmessage = (e) => window.bridge.report('renderer got ' + e.data)
+  port.postMessage('ping')
+})
+"#,
+    ),
+    (
+        "index.html",
+        r#"<!DOCTYPE html><html><head><title>ports</title></head><body><script src="renderer.js"></script></body></html>"#,
+    ),
+];
+
+#[test]
+fn electron_message_ports_transfer_to_the_page_and_a_utility_process() {
+    let root = write_fixture("w3cos_electron_port_transfer", PORT_TRANSFER);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_port_transfer",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        ["renderer ports 1", "renderer got pong:ping:child"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

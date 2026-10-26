@@ -21985,13 +21985,26 @@ fn build_window_value() -> Value {
         "postMessage".to_string(),
         func(|target, args| {
             let data = arg(&args, 0);
-            let target_origin = arg(&args, 1).to_js_string();
+            // HTML: postMessage(message, targetOrigin, transfer) or
+            // postMessage(message, { targetOrigin, transfer }).
+            let second = arg(&args, 1);
+            let (target_origin, transfer) = if second.is_object() && !second.is_string() {
+                let origin = second.get_property("targetOrigin");
+                let origin = if origin.is_undefined() {
+                    "/".to_string()
+                } else {
+                    origin.to_js_string()
+                };
+                (origin, second.get_property("transfer"))
+            } else {
+                (second.to_js_string(), arg(&args, 2))
+            };
             let own_origin = target
                 .get_property("location")
                 .get_property("origin")
                 .to_js_string();
-            if target_origin == "*" || target_origin == own_origin {
-                queue_window_message(target, data);
+            if target_origin == "*" || target_origin == "/" || target_origin == own_origin {
+                queue_window_message(target, data, transferred_ports(&transfer));
             }
             Value::Undefined
         }),
@@ -22632,7 +22645,23 @@ fn dispatch_lifecycle_event(target: &Value, event_type: &str) {
     }
 }
 
-fn queue_window_message(target: Value, data: Value) {
+/// The MessagePorts in a postMessage transfer list (array-like), which the
+/// MessageEvent carries as `ports`; other transferables are left out.
+fn transferred_ports(transfer: &Value) -> Vec<Value> {
+    if !transfer.is_object() && !transfer.is_array() {
+        return Vec::new();
+    }
+    let length = transfer.get_property("length").to_number();
+    if !length.is_finite() || length <= 0.0 {
+        return Vec::new();
+    }
+    (0..length as usize)
+        .map(|index| transfer.get_property(&index.to_string()))
+        .filter(|item| item.is_object() && item.get_property("postMessage").is_callable())
+        .collect()
+}
+
+fn queue_window_message(target: Value, data: Value, ports: Vec<Value>) {
     queue_microtask_value(Value::function(move |_, _| {
         let event = w3cos_core::class::construct(
             &crate::web_events::event_subclass_class("MessageEvent"),
@@ -22642,7 +22671,7 @@ fn queue_window_message(target: Value, data: Value) {
                     ("data".to_string(), data.clone()),
                     ("origin".to_string(), Value::string("null")),
                     ("source".to_string(), Value::Null),
-                    ("ports".to_string(), Value::array(vec![])),
+                    ("ports".to_string(), Value::array(ports.clone())),
                 ])),
             ],
         );
@@ -22945,6 +22974,68 @@ pub fn reset_bridge() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_post_message_carries_transferred_ports() {
+        setup();
+        let window = window_value();
+        let seen = Rc::new(RefCell::new(Vec::<(String, usize, bool)>::new()));
+        let log = Rc::clone(&seen);
+        window.set_property(
+            "onmessage",
+            Value::function(move |_, args| {
+                let event = args.first().cloned().unwrap_or(Value::Undefined);
+                let ports = event.get_property("ports");
+                let first = ports.get_property("0");
+                log.borrow_mut().push((
+                    event.get_property("data").to_js_string(),
+                    ports.get_property("length").to_number() as usize,
+                    first.get_property("tag").to_js_string() == "port",
+                ));
+                Value::Undefined
+            }),
+        );
+        let port = Value::object(HashMap::from([
+            ("tag".to_string(), Value::string("port")),
+            (
+                "postMessage".to_string(),
+                Value::function(|_, _| Value::Undefined),
+            ),
+        ]));
+        let not_a_port = Value::object(HashMap::new());
+        window.call_method(
+            "postMessage",
+            vec![
+                Value::string("positional"),
+                Value::string("*"),
+                Value::array(vec![port.clone(), not_a_port]),
+            ],
+        );
+        window.call_method(
+            "postMessage",
+            vec![
+                Value::string("options"),
+                Value::object(HashMap::from([(
+                    "transfer".to_string(),
+                    Value::array(vec![port.clone()]),
+                )])),
+            ],
+        );
+        window.call_method(
+            "postMessage",
+            vec![Value::string("none"), Value::string("*")],
+        );
+        drain_microtasks();
+        window.set_property("onmessage", Value::Null);
+        assert_eq!(
+            *seen.borrow(),
+            [
+                ("positional".to_string(), 1, true),
+                ("options".to_string(), 1, true),
+                ("none".to_string(), 0, false),
+            ]
+        );
+    }
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
         w3cos_core::intrinsics::dom_fusion_surface_ok(document, parent, nodes, "div")

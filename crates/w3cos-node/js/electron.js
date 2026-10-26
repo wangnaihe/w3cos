@@ -455,7 +455,23 @@ class WebContents extends EventEmitter {
       ipcRenderer.emit(String(channel), makeEvent({ sender: ipcRenderer, senderId: 0, ports: [] }), ...copies);
     });
   }
-  postMessage(channel, message) { this.send(channel, message); }
+  // Ports in `transfer` reach the page as DOM-style MessagePorts on the
+  // ipcRenderer event's `ports` (Code-OSS hands out shared-process channels
+  // this way).
+  postMessage(channel, message, transfer) {
+    const ports = transferredPorts(transfer);
+    if (ports.length === 0) {
+      this.send(channel, message);
+      return;
+    }
+    if (this._destroyed) return;
+    const copy = clone(message);
+    const rendererPorts = ports.map(rendererPort);
+    task(() => {
+      if (this._destroyed || this !== hostContents) return;
+      ipcRenderer.emit(String(channel), makeEvent({ sender: ipcRenderer, senderId: 0, ports: rendererPorts }), copy);
+    });
+  }
   executeJavaScript() {
     // No `eval` in an AOT-compiled app: renderer code must be compiled in.
     return Promise.reject(unsupported('webContents.executeJavaScript()'));
@@ -883,14 +899,31 @@ class MessagePortMain extends EventEmitter {
     this._started = false;
     this._closed = false;
     this._scheduled = false;
+    this._remote = null;
+    this._remoteId = 0;
   }
   postMessage(message, transfer) {
     if (Array.isArray(transfer) && transfer.length > 0) throw unsupported('Transferring MessagePortMain objects');
     const data = structuredCodec.serialize(message);
     const other = this._other;
     if (this._closed || other === null || other._closed) return;
+    if (other._remote !== null) {
+      // The other end was transferred to a utility process.
+      other._remote._sendPort('message', other._remoteId, structuredCodec.deserialize(data));
+      return;
+    }
     other._queue.push(data);
     other._schedule();
+  }
+  // Hand this port to a utility process: messages to it cross the worker
+  // channel, and what the child posts on its end comes back through here.
+  _transferTo(child, id) {
+    this._remote = child;
+    this._remoteId = id;
+    this._started = true;
+    const queued = this._queue;
+    this._queue = [];
+    for (const data of queued) child._sendPort('message', id, structuredCodec.deserialize(data));
   }
   _schedule() {
     if (!this._started || this._scheduled || this._queue.length === 0) return;
@@ -911,12 +944,59 @@ class MessagePortMain extends EventEmitter {
   close() {
     if (this._closed) return;
     this._closed = true;
+    if (this._remote !== null) this._remote._sendPort('close', this._remoteId);
     const other = this._other;
     if (other !== null && !other._closed) {
       other._closed = true;
-      task(() => other.emit('close'));
+      if (other._remote !== null) other._remote._sendPort('close', other._remoteId);
+      else task(() => other.emit('close'));
     }
   }
+}
+
+function transferredPorts(transfer) {
+  return Array.isArray(transfer) ? transfer.filter((item) => item instanceof MessagePortMain) : [];
+}
+
+// The page's view of a MessagePortMain: a DOM MessagePort (message events
+// with `data`, `onmessage` starts it, `start()` / `close()`). Main and
+// renderer share this thread, so it drives the main-side port directly.
+function rendererPort(port) {
+  const listeners = [];
+  let onmessage = null;
+  let started = false;
+  const dom = {
+    postMessage(message) { port.postMessage(message); },
+    start() {
+      if (started) return;
+      started = true;
+      port.on('message', (event) => {
+        const messageEvent = { type: 'message', data: event.data, ports: [], target: dom, currentTarget: dom };
+        for (const listener of listeners.slice()) {
+          if (typeof listener === 'function') listener.call(dom, messageEvent);
+          else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(messageEvent);
+        }
+        if (typeof onmessage === 'function') onmessage.call(dom, messageEvent);
+      });
+      port.start();
+    },
+    close() { port.close(); },
+    addEventListener(type, listener) {
+      if (String(type) === 'message' && listeners.indexOf(listener) < 0) listeners.push(listener);
+    },
+    removeEventListener(type, listener) {
+      const index = listeners.indexOf(listener);
+      if (String(type) === 'message' && index >= 0) listeners.splice(index, 1);
+    },
+  };
+  Object.defineProperty(dom, 'onmessage', {
+    get() { return onmessage; },
+    set(value) {
+      onmessage = typeof value === 'function' ? value : null;
+      if (onmessage) dom.start();
+    },
+  });
+  return dom;
 }
 
 class MessageChannelMain {
@@ -929,6 +1009,7 @@ class MessageChannelMain {
 }
 
 const utilityChildren = new Set();
+let nextTransferId = 1;
 
 class UtilityProcess extends EventEmitter {
   constructor(modulePath, args, options) {
@@ -948,7 +1029,23 @@ class UtilityProcess extends EventEmitter {
       this.pid = process.pid;
       this.emit('spawn');
     });
-    this._worker.on('message', (message) => this.emit('message', message));
+    this._ports = new Map();
+    this._worker.on('message', (message) => {
+      const envelope = message !== null && typeof message === 'object' ? message.__w3cosPort : undefined;
+      if (envelope === undefined) {
+        this.emit('message', message);
+        return;
+      }
+      // The child's end of a transferred port posted or closed.
+      const port = this._ports.get(message.id);
+      if (port === undefined) return;
+      if (envelope === 'message') port.postMessage(message.data);
+      else if (envelope === 'close') {
+        this._ports.delete(message.id);
+        port._remote = null;
+        port.close();
+      }
+    });
     this._worker.on('error', (error) => this.emit('error', 'FatalError', error && error.stack ? String(error.stack) : String(error)));
     this._worker.on('exit', (code) => {
       this._exited = true;
@@ -958,8 +1055,22 @@ class UtilityProcess extends EventEmitter {
     });
   }
   postMessage(message, transfer) {
-    if (Array.isArray(transfer) && transfer.length > 0) throw unsupported('Transferring MessagePortMain objects');
-    this._worker.postMessage(message);
+    const ports = transferredPorts(transfer);
+    if (ports.length === 0) {
+      this._worker.postMessage(message);
+      return;
+    }
+    const ids = ports.map((port) => {
+      const id = nextTransferId++;
+      this._ports.set(id, port);
+      return id;
+    });
+    this._worker.postMessage({ __w3cosPort: 'transfer', message, ids });
+    ports.forEach((port, index) => port._transferTo(this, ids[index]));
+  }
+  _sendPort(kind, id, data) {
+    if (this._exited) return;
+    this._worker.postMessage({ __w3cosPort: kind, id, data });
   }
   kill() {
     if (this._exited) return false;
