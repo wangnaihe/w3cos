@@ -8876,7 +8876,7 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(generated.contains("k3999"), "last store missing");
         assert!(
-            elapsed < std::time::Duration::from_secs(30),
+            elapsed < std::time::Duration::from_secs(10),
             "emitting 4000 stores took {elapsed:?}"
         );
     }
