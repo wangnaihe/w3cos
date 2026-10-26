@@ -4088,7 +4088,22 @@ fn layout_impl(
     {
         return super::bail("grid:max-height");
     }
-    if used < base {
+    // Rows that overflow a short grid keep their sizes (the content
+    // overflows), except in two cases that stay on legacy. A grid-lanes box
+    // stacks its items rather than placing them in rows, which this
+    // algorithm only approximates, and the difference shows once they
+    // overflow. A row subgrid's own gap is legacy-only on the grid-lanes
+    // side (grid:lanes), and the grid-lanes subgrid references are short
+    // grids that have to match it.
+    if used < base
+        && (has_marker(style, "--w3cos-internal-grid-lanes")
+            || built.iter().any(|item| {
+                flat[item.index]
+                    .style
+                    .grid_rows()
+                    .is_some_and(is_subgrid_axis)
+            }))
+    {
         return super::bail("grid:short-height");
     }
     if stretch_rows && used > base && !rows.is_empty() {
@@ -4131,7 +4146,7 @@ fn layout_impl(
             .max(0);
         let target_content = (target_border - units(item.edges_v)).max(0);
         let measured = units(fragment.fragment.height) - units(item.edges_v);
-        if target_content > measured {
+        if target_content != measured {
             *fragment = layout_item(
                 flat,
                 item.index,
@@ -4153,9 +4168,8 @@ fn layout_impl(
     let row_sum: i64 = rows.iter().sum();
     let row_free = used - gap_sum(&row_collapsed, row_gap_u) - row_sum;
     let active_rows = rows.len().max(1);
-    let (row_lead, row_between) =
-        pack_gap(row_pack(style), row_free.max(0), active_rows, row_gap_u);
-    let row_y = positions(&rows, &row_collapsed, row_between, row_lead.max(0));
+    let (row_lead, row_between) = pack_gap(row_pack(style), row_free, active_rows, row_gap_u);
+    let row_y = positions(&rows, &row_collapsed, row_between, row_lead);
 
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);
@@ -4973,13 +4987,33 @@ mod tests {
                 vec![leaf(block_box(None, Some(10.0)))],
             )],
         );
-        let short = Component::boxed(
-            grid_style(200.0, Some(5.0), None),
-            vec![leaf(block_box(None, Some(10.0)))],
+    }
+
+    #[test]
+    fn rows_overflow_a_short_grid() {
+        // Chrome: an auto row keeps its min-content size when the grid is
+        // shorter than it; the content overflows the 5px grid.
+        expect(
+            &Component::boxed(
+                grid_style(200.0, Some(5.0), None),
+                vec![leaf(block_box(None, Some(10.0)))],
+            ),
+            &[(0, [0.0, 0.0, 200.0, 5.0]), (1, [0.0, 0.0, 200.0, 10.0])],
         );
-        let flat = pre_flatten(&short);
-        assert!(block::supports_tree(&flat));
-        assert!(super::super::layout_tree(&short, &flat, 800.0, 600.0).is_none());
+        // A stretched item shrinks to a fixed row smaller than its content:
+        // its automatic minimum is zero because it spans no auto-minimum track.
+        let mut grid = grid_style(200.0, Some(5.0), None);
+        grid.grid_ng_mut().grid_template_rows = Some("4px".to_string());
+        expect(
+            &Component::boxed(
+                grid,
+                vec![Component::boxed(
+                    block_box(None, None),
+                    vec![leaf(block_box(None, Some(10.0)))],
+                )],
+            ),
+            &[(1, [0.0, 0.0, 200.0, 4.0]), (2, [0.0, 0.0, 200.0, 10.0])],
+        );
     }
 
     #[test]
