@@ -85,10 +85,40 @@ proc.abort = function abort() {
   proc.exit(134);
 };
 
-proc.kill = function kill() {
-  const error = new Error('process.kill() is not supported');
-  error.code = 'ERR_W3COS_UNSUPPORTED';
-  throw error;
+// process.kill(pid[, signal]): signal 0 probes liveness (Code-OSS utility
+// processes poll their parent this way and exit when it throws).
+proc.kill = function kill(pid, signal) {
+  if (typeof pid !== 'number' && typeof pid !== 'string' || pid != (pid | 0)) {
+    const error = new TypeError('The "pid" argument must be of type number. Received ' +
+      (pid === null ? 'null' : typeof pid));
+    error.code = 'ERR_INVALID_ARG_TYPE';
+    throw error;
+  }
+  let number;
+  if (signal === undefined || signal === null) {
+    number = 15;
+  } else if (typeof signal === 'number') {
+    number = signal;
+  } else {
+    number = require('os').constants.signals[String(signal)];
+    if (number === undefined) {
+      const error = new TypeError('Unknown signal: ' + signal);
+      error.code = 'ERR_UNKNOWN_SIGNAL';
+      throw error;
+    }
+  }
+  const failure = nodeHost !== null && typeof nodeHost.processKill === 'function'
+    ? nodeHost.processKill(pid | 0, number)
+    : 'ENOSYS';
+  if (failure !== null) {
+    const errnos = { EPERM: -1, ESRCH: -3, EINVAL: -22, ENOSYS: -38 };
+    const error = new Error('kill ' + failure);
+    error.errno = errnos[failure];
+    error.code = failure;
+    error.syscall = 'kill';
+    throw error;
+  }
+  return true;
 };
 
 // nextTick callbacks run before promise jobs queued after them; a dedicated

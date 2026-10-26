@@ -262,6 +262,26 @@ fn send_signal(pid: u32, signal: i32) -> bool {
     unsafe { kill(pid as i32, signal) == 0 }
 }
 
+#[cfg(unix)]
+fn process_kill(pid: i32, signal: i32) -> Result<(), &'static str> {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if unsafe { kill(pid, signal) } == 0 {
+        return Ok(());
+    }
+    Err(match std::io::Error::last_os_error().raw_os_error() {
+        Some(1) => "EPERM",
+        Some(3) => "ESRCH",
+        _ => "EINVAL",
+    })
+}
+
+#[cfg(not(unix))]
+fn process_kill(_pid: i32, _signal: i32) -> Result<(), &'static str> {
+    Err("ENOSYS")
+}
+
 pub(crate) fn install(host: &Value) {
     define(host, "permissionHas", |args| {
         let scope = arg(&args, 0).to_js_string();
@@ -347,6 +367,20 @@ pub(crate) fn install(host: &Value) {
             }
         });
         Value::Undefined
+    });
+
+    // processKill(pid, signal) -> null, or the errno code (`ESRCH`, `EPERM`,
+    // `EINVAL`). Signal 0 only probes liveness; real signals need `child`.
+    define(host, "processKill", |args| {
+        let pid = arg(&args, 0).to_number() as i32;
+        let signal = arg(&args, 1).to_number() as i32;
+        if signal != 0 {
+            require_permission("child", "kill");
+        }
+        match process_kill(pid, signal) {
+            Ok(()) => Value::Null,
+            Err(code) => Value::from(code),
+        }
     });
 
     define(host, "cpKill", |args| {
