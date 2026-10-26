@@ -1629,17 +1629,30 @@ impl Builder {
     fn declare_parameter(&mut self, pattern: &Pat, index: usize) -> Result<Option<BindingId>> {
         let source = self.declare_hidden_parameter(index);
         if let Pat::Rest(rest) = pattern {
-            let Pat::Ident(identifier) = rest.arg.as_ref() else {
-                return Err(anyhow!(
-                    "runtime W3IR rest parameters currently require identifier patterns"
-                ));
-            };
             if self.rest_parameter.is_some() {
                 return Err(anyhow!(
                     "runtime W3IR function has multiple rest parameters"
                 ));
             }
-            self.declare_local_with_kind(identifier.id.sym.as_ref(), BindingKind::Let, true)?;
+            match rest.arg.as_ref() {
+                Pat::Ident(identifier) => {
+                    self.declare_local_with_kind(
+                        identifier.id.sym.as_ref(),
+                        BindingKind::Let,
+                        true,
+                    )?;
+                }
+                // `...[a, b]` / `...{ length }`: the rest array is
+                // destructured by `initialize_parameter`.
+                Pat::Array(_) | Pat::Object(_) => {
+                    self.declare_parameter_pattern_bindings(&rest.arg)?;
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "runtime W3IR does not yet support this rest parameter pattern"
+                    ));
+                }
+            }
             self.rest_parameter = Some(source);
             return Ok(Some(source));
         }
@@ -1806,6 +1819,14 @@ impl Builder {
                 let binding = self
                     .find_binding(&name)
                     .ok_or_else(|| anyhow!("missing runtime pattern binding {name:?}"))?;
+                // An assignment pattern may write an enclosing function's
+                // binding (`({ a } = v)` in a closure): capture it like a
+                // plain `a = v` does.
+                let binding = if assignment {
+                    self.resolve_binding(&name)
+                } else {
+                    binding
+                };
                 if assignment {
                     self.ensure_mutable_binding(&name, binding)?;
                     self.emit(Instruction::StoreBinding { binding, value });
