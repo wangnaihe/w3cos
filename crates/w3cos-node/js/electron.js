@@ -1021,6 +1021,8 @@ class UtilityProcess extends EventEmitter {
     this._exited = false;
     this._worker = new workerThreads.Worker(modulePath, {
       workerData: { args: Array.isArray(args) ? args.map(String) : [], serviceName: opts.serviceName },
+      // Electron: `env` replaces the child's environment (default process.env).
+      env: opts.env,
       name: opts.serviceName,
       w3cosKind: 'utility',
     });

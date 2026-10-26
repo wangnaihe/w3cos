@@ -106,6 +106,11 @@ function setUpUtilityProcess() {
 
 exports.entry = function entry() {
   if (context === null) return undefined;
+  // The environment the parent gave this worker (`new Worker(file, { env })`,
+  // `utilityProcess.fork(path, args, { env })`), before the entry module reads it.
+  if (typeof context.env === 'string' && context.env !== '') {
+    require('process').env = JSON.parse(context.env);
+  }
   if (context.kind === 'utility') setUpUtilityProcess();
   return context.path;
 };

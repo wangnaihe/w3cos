@@ -769,9 +769,9 @@ import { shared } from './shared.js'
 const dir = path.dirname(fileURLToPath(import.meta.url))
 const name = ['child', 'js'].join('.')
 app.whenReady().then(() => {
-  const child = utilityProcess.fork(path.join(dir, name), ['feature'])
+  const child = utilityProcess.fork(path.join(dir, name), ['feature'], { env: { ...process.env, W3COS_FORK_ENTRY: 'lazy' } })
   child.on('message', (message) => {
-    console.log('main got', message, shared)
+    console.log('main got', message, shared, typeof process.env.W3COS_FORK_ENTRY)
     child.kill()
   })
   child.on('exit', () => app.quit())
@@ -789,7 +789,8 @@ console.log('shared evaluated in', process.parentPort ? 'child' : 'main')
         "child.js",
         r#"import { shared } from './shared.js'
 const which = process.argv[2]
-const feature = await import(`./lazy/${which}.js`)
+// Like Code-OSS's bootstrap-fork.js: the entry comes from the fork's env.
+const feature = await import(`./${process.env.W3COS_FORK_ENTRY}/${which}.js`)
 process.parentPort.on('message', (event) => {
   process.parentPort.postMessage(shared + ':' + feature.describe(event.data))
 })
@@ -816,7 +817,7 @@ fn electron_declared_esm_utility_process_and_computed_import() {
         [
             "shared evaluated in main",
             "shared evaluated in child",
-            "main got shared:feature(hi) shared",
+            "main got shared:feature(hi) shared undefined",
         ],
         "{lines:#?}"
     );

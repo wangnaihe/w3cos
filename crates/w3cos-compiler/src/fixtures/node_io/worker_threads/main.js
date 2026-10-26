@@ -72,9 +72,23 @@ function t6(next) {
   next();
 }
 
+// `env`: the worker's process.env (default: a copy of the parent's).
+function t7(next) {
+  process.env.W3COS_T7_INHERIT = 'inherited';
+  const w = new Worker(__filename, { workerData: 'env', env: { W3COS_T7: 7 } });
+  w.on('message', (msg) => console.log('t7 message', msg));
+  w.on('exit', () => {
+    const d = new Worker(__filename, { workerData: 'env' });
+    d.on('message', (msg) => console.log('t7 default', msg, process.env.W3COS_T7));
+    d.on('exit', () => next());
+  });
+}
+
 if (isMainThread) {
   console.log('main', isMainThread, threadId, workerData, parentPort);
-  t1(() => t2(() => t3(() => t4(() => t5(() => t6(() => console.log('done')))))));
+  t1(() => t2(() => t3(() => t4(() => t5(() => t6(() => t7(() => console.log('done'))))))));
+} else if (workerData === 'env') {
+  parentPort.postMessage(typeof process.env.W3COS_T7 + ' ' + process.env.W3COS_T7 + ' ' + process.env.W3COS_T7_INHERIT);
 } else {
   parentPort.postMessage('from self ' + workerData + ' ' + (threadId > 0));
 }

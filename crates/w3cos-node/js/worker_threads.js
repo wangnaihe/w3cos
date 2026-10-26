@@ -161,6 +161,21 @@ function toFilename(filename) {
   return String(filename);
 }
 
+// `new Worker(file, { env })`: the worker's `process.env` (as in Node, a
+// copy of the parent's `process.env` by default, string-valued);
+// `SHARE_ENV` keeps the host environment.
+function workerEnv(env) {
+  if (env === SHARE_ENV) return null;
+  const source = env === undefined || env === null ? process.env : env;
+  if (source === null || typeof source !== 'object') return null;
+  const copy = {};
+  for (const key of Object.keys(source)) {
+    const value = source[key];
+    if (value !== undefined) copy[key] = String(value);
+  }
+  return JSON.stringify(copy);
+}
+
 class Worker extends EventEmitter {
   constructor(filename, options) {
     super();
@@ -178,7 +193,7 @@ class Worker extends EventEmitter {
     }
     checkTransfer(opts.transferList);
     const spawned = host.workerSpawn(resolved, clone.serialize(opts.workerData),
-      opts.name === undefined ? null : String(opts.name), opts.w3cosKind === undefined ? null : String(opts.w3cosKind), null);
+      opts.name === undefined ? null : String(opts.name), opts.w3cosKind === undefined ? null : String(opts.w3cosKind), workerEnv(opts.env));
     this._id = spawned.id;
     this.threadId = spawned.threadId;
     this._pollRef = true;
