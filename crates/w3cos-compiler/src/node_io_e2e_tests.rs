@@ -53,6 +53,32 @@ fn node_child_process_matches_node() {
     assert_eq!(lines, expected);
 }
 
+const PROCESS_KILL_NODE: &str = r#"self true
+missing ESRCH -3 kill kill ESRCH
+pid ERR_INVALID_ARG_TYPE true
+pid ERR_INVALID_ARG_TYPE true
+pid ERR_INVALID_ARG_TYPE true
+signal ERR_UNKNOWN_SIGNAL true
+child alive true
+child term true
+child exit null SIGTERM
+reaped true
+done
+"#;
+
+/// `process.kill(pid, 0)` probes liveness; Code-OSS utility processes poll
+/// their parent this way and exit when it throws.
+#[test]
+fn node_process_kill_matches_node() {
+    let lines = run(
+        "process_kill",
+        include_str!("fixtures/node_io/process_kill.js"),
+        &[],
+    );
+    let expected: Vec<&str> = PROCESS_KILL_NODE.lines().collect();
+    assert_eq!(lines, expected);
+}
+
 const NET_NODE: &str = r#"isIP 4 6 0 true true
 uds listening true true true
 uds connecting true
