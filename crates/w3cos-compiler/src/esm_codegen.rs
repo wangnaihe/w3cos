@@ -10961,15 +10961,21 @@ export function main() {
             bundle.unresolved
         );
         let code = generate_with_bodies(&bundle);
+        let frame = |index: u32| {
+            format!(
+                "struct {}Frame ",
+                crate::w3ir_aot::upper_camel(&format!("m0__init_w3ir_{index}"))
+            )
+        };
         assert_eq!(
-            code.matches("struct M0U2InitW3ir0Frame").count(),
+            code.matches(&frame(0)).count(),
             1,
             "the first bounded segment should produce one W3IR AOT frame"
         );
         assert!(
-            code.matches("struct M0U2InitW3ir32Frame").count() == 1
-                && code.matches("struct M0U2InitW3ir64Frame").count() == 1
-                && !code.contains("struct M0U2InitW3ir65Frame")
+            code.matches(&frame(32)).count() == 1
+                && code.matches(&frame(64)).count() == 1
+                && !code.contains(&frame(65))
                 && code.matches("m0__init_w3ir_0(").count() == 2
                 && code.matches("m0__init_w3ir_32(").count() == 2
                 && code.matches("m0__init_w3ir_64(").count() == 2
