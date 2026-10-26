@@ -38,6 +38,71 @@ pub fn register_entry(entry: fn() -> Value) {
     let _ = ENTRY.set(entry);
 }
 
+/// ES-module worker entries linked into the program (absolute paths), see
+/// [`run_worker_modules`].
+static WORKER_MODULES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Called by generated code: these ES modules can be worker /
+/// `utilityProcess` entries.
+pub fn register_worker_modules(paths: &[&str]) {
+    let mut modules = WORKER_MODULES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for path in paths {
+        if !modules.iter().any(|known| known == path) {
+            modules.push((*path).to_string());
+        }
+    }
+}
+
+/// Whether `path` is a registered ES-module worker entry.
+pub fn is_worker_module(path: &str) -> bool {
+    WORKER_MODULES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .any(|known| known == path)
+}
+
+/// The module this worker thread runs (`None` on the main thread).
+pub fn worker_entry_path() -> Option<String> {
+    CONTEXT.with(|slot| slot.borrow().as_ref().map(|context| context.path.clone()))
+}
+
+/// Run an ES-module worker entry on this worker thread: evaluate the
+/// worker boot record first (`boot`, whose `entry()` sets up
+/// `process.parentPort` for utility processes), then every module of the
+/// entry's static closure in `order` (dependencies first), each after the
+/// previous one's evaluation promise settles (top-level await).
+pub fn run_worker_modules(boot: Option<&str>, order: &[&str]) -> Value {
+    if let Some(boot) = boot {
+        let _ = crate::module_registry::evaluate(boot);
+        if let Some(exports) = crate::module_registry::export(boot, "default") {
+            let mut exports = exports.read();
+            // A CommonJS record's default export is its load-once thunk.
+            if !exports.get_property("entry").is_callable() && exports.is_callable() {
+                exports = exports.call(Value::Undefined, Vec::new());
+            }
+            let entry = exports.get_property("entry");
+            if entry.is_callable() {
+                entry.call(exports, Vec::new());
+            }
+        }
+    }
+    let mut evaluation = crate::promise::resolve(vec![Value::Undefined]);
+    for specifier in order {
+        let specifier = (*specifier).to_string();
+        evaluation = crate::intrinsics::call_method(
+            &evaluation,
+            &Value::string("then"),
+            vec![Value::function(move |_, _| {
+                crate::module_registry::evaluate(&specifier).unwrap_or(Value::Undefined)
+            })],
+        );
+    }
+    evaluation
+}
+
 /// Called by the runtime that drives timers and microtasks.
 pub fn register_event_loop(hooks: EventLoopHooks) {
     let _ = EVENT_LOOP.set(hooks);
@@ -311,6 +376,10 @@ pub(crate) fn install(host: &Value) {
         let id = arg(&args, 0).to_number() as u32;
         CHILDREN.with(|children| children.borrow_mut().remove(&id));
         Value::Undefined
+    });
+    // workerModuleCompiled(path) -> whether an ES-module worker entry is linked
+    define(host, "workerModuleCompiled", |args| {
+        Value::Bool(is_worker_module(&arg(&args, 0).to_js_string()))
     });
     // workerContext() -> null | { threadId, path, data, name, kind, env }
     define(host, "workerContext", |_| {

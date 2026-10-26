@@ -17,7 +17,9 @@ exports.compiled = function compiled(paths) {
 };
 
 exports.isCompiled = function isCompiled(path) {
-  return compiledPaths !== null && compiledPaths.has(path);
+  // CommonJS workers are listed by the entry record; ES-module workers
+  // (package.json "w3cos": { "workers": [...] }) by the generated entry.
+  return (compiledPaths !== null && compiledPaths.has(path)) || host.workerModuleCompiled(path) === true;
 };
 
 // Electron `utilityProcess` children see `process.type === 'utility'`,

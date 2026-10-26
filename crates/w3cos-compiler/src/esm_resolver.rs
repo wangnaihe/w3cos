@@ -477,6 +477,17 @@ pub struct EsmBundle {
     pub lazy_start: Option<usize>,
     /// Literal `import()` edges, with the lazy modules each one evaluates.
     pub dynamic_imports: Vec<BundledDynamicImport>,
+    /// Declared worker entries that run as ES modules on a worker thread.
+    pub workers: Vec<BundledWorker>,
+}
+
+/// An ES-module worker entry: the worker thread evaluates its whole static
+/// closure (dependencies first) instead of the program entry.
+#[derive(Debug, Clone, Default)]
+pub struct BundledWorker {
+    pub path: PathBuf,
+    /// Bundle indices, dependencies first, ending with the worker module.
+    pub evaluation_order: Vec<usize>,
 }
 
 /// A literal `import("specifier")` linked into the bundle.
@@ -524,6 +535,31 @@ impl EsmBundle {
                     referrer: edge.referrer,
                     specifier: edge.specifier,
                     target,
+                    evaluation_order,
+                });
+            }
+        }
+
+        let workers = resolver.esm_worker_entries();
+        if !workers.is_empty() {
+            let index_of: HashMap<&Path, usize> = order
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), index))
+                .collect();
+            for worker in workers {
+                if !index_of.contains_key(worker.as_path()) {
+                    continue;
+                }
+                let mut visited = HashSet::new();
+                let mut closure = Vec::new();
+                visit_module(&worker, parsed, resolver, &mut visited, &mut closure);
+                let evaluation_order = closure
+                    .iter()
+                    .filter_map(|path| index_of.get(path.as_path()).copied())
+                    .collect();
+                bundle.workers.push(BundledWorker {
+                    path: worker,
                     evaluation_order,
                 });
             }
@@ -819,6 +855,9 @@ pub struct EsmResolver {
     entry: RefCell<Option<PathBuf>>,
     /// Statically named worker modules found so far, in discovery order.
     worker_entries: RefCell<Vec<PathBuf>>,
+    /// ES-module worker entries the app declares (`package.json`
+    /// `"w3cos": { "workers": [...] }`), linked as lazy roots.
+    esm_worker_entries: RefCell<Vec<PathBuf>>,
 }
 
 impl EsmResolver {
@@ -835,6 +874,7 @@ impl EsmResolver {
             dynamic_imports: RefCell::new(Vec::new()),
             entry: RefCell::new(None),
             worker_entries: RefCell::new(Vec::new()),
+            esm_worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
         }
     }
@@ -964,10 +1004,89 @@ impl EsmResolver {
         let entry = self.resolve_entry(entry)?;
         *self.entry.borrow_mut() = Some(entry.path.clone());
         self.dynamic_imports.borrow_mut().clear();
+        self.esm_worker_entries.borrow_mut().clear();
+        let entry_path = entry.path.clone();
         let mut graph = ModuleGraph::default();
         let mut visited = HashSet::new();
         self.visit_module(entry, &mut visited, &mut graph)?;
+        self.link_declared_roots(&entry_path, &mut visited, &mut graph);
         Ok(graph)
+    }
+
+    /// Modules an app loads through paths only known at run time (Code-OSS:
+    /// `utilityProcess.fork(FileAccess.asFileUri("bootstrap-fork.js").fsPath)`
+    /// and `import(\`./${entryPoint}.js\`)`), declared in the project's
+    /// `package.json`:
+    ///
+    /// ```json
+    /// "w3cos": { "workers": ["out/bootstrap-fork.js"], "modules": ["out/vs/x/main.js"] }
+    /// ```
+    ///
+    /// Both are linked as lazily evaluated modules (a computed `import()`
+    /// that resolves to one evaluates it); `workers` are also worker /
+    /// utility-process entries that may be ES modules.
+    fn link_declared_roots(
+        &self,
+        entry: &Path,
+        visited: &mut HashSet<PathBuf>,
+        graph: &mut ModuleGraph,
+    ) {
+        let manifest = self.project_root.join("package.json");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            return;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let Some(config) = json.get("w3cos") else {
+            return;
+        };
+        let list = |key: &str| -> Vec<String> {
+            config
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(|item| {
+                            if item.starts_with("./") || item.starts_with("../") {
+                                item.to_string()
+                            } else {
+                                format!("./{}", item.trim_start_matches('/'))
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let root = self.project_root.clone();
+        for (key, worker) in [("workers", true), ("modules", false)] {
+            for specifier in list(key) {
+                let edges_before = self.dynamic_imports.borrow().len();
+                self.link_dynamic_import(entry, &specifier, &root, visited, graph);
+                let linked = self.dynamic_imports.borrow().get(edges_before).cloned();
+                match linked {
+                    Some(edge) if worker => {
+                        let mut workers = self.esm_worker_entries.borrow_mut();
+                        if !workers.contains(&edge.target) {
+                            workers.push(edge.target);
+                        }
+                    }
+                    Some(_) => {}
+                    None => self.commonjs_diagnostics.borrow_mut().push(format!(
+                        "{}: w3cos.{key} entry `{specifier}` was not linked",
+                        manifest.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Declared worker entries (see [`Self::link_declared_roots`]) of the
+    /// last built graph.
+    pub fn esm_worker_entries(&self) -> Vec<PathBuf> {
+        self.esm_worker_entries.borrow().clone()
     }
 
     pub fn parse_graph_from_entry(&self, entry: &Path) -> Result<ParsedModuleGraph> {

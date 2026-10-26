@@ -338,7 +338,11 @@ fn generate_parts(
                 .join(" ")
         )
     };
-    let dynamic_import_adapter = emit_dynamic_import_adapter(bundle);
+    let dynamic_import_adapter = format!(
+        "{}{}",
+        emit_dynamic_import_adapter(bundle),
+        emit_worker_dispatch(bundle)
+    );
 
     let entry_call = if let Some(symbol) = bundle
         .symbols
@@ -701,7 +705,10 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
         return String::new();
     }
     let mut arms = String::new();
-    let mut fallback = String::from("{ let __s = __specifier.as_str(); ");
+    // A computed relative specifier resolves against its referrer.
+    let mut fallback = String::from(
+        "{ let __s = __specifier.as_str(); let __abs = w3cos_core::module_registry::resolve_relative_specifier(__referrer_path, __s); let __abs = __abs.as_deref(); ",
+    );
     for edge in &bundle.dynamic_imports {
         let referrer = edge.referrer.to_string_lossy();
         let specifier = &edge.specifier;
@@ -720,7 +727,7 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
         // Computed vscode-file / file URL: match by absolute target or by /<specifier> suffix.
         let spec_len = specifier.len();
         fallback.push_str(&format!(
-            "if __s == {target:?} || __s.ends_with({specifier:?}) && (__s.len() == {spec_len} || __s.as_bytes().get(__s.len().saturating_sub({spec_len} + 1)) == Some(&b'/')) {{ {load} }} else ",
+            "if __s == {target:?} || __abs == Some({target:?}) || __s.ends_with({specifier:?}) && (__s.len() == {spec_len} || __s.as_bytes().get(__s.len().saturating_sub({spec_len} + 1)) == Some(&b'/')) {{ {load} }} else ",
             spec_len = spec_len,
             specifier = specifier,
             target = target,
@@ -730,6 +737,53 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
     fallback.push_str("{ w3cos_core::Value::Undefined } }");
     format!(
         " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}_ => {fallback}, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
+    )
+}
+
+/// ES-module worker entries (`package.json` `"w3cos": { "workers": [...] }`):
+/// register them so `new Worker(path)` / `utilityProcess.fork(path)` accept
+/// them, and on a worker thread running one, evaluate its static closure
+/// instead of the program entry.
+fn emit_worker_dispatch(bundle: &EsmBundle) -> String {
+    if bundle.workers.is_empty() {
+        return String::new();
+    }
+    let boot = bundle
+        .modules
+        .iter()
+        .find(|module| {
+            module
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "internal__w3cos_worker.js.w3cos-cjs.js")
+        })
+        .map(|module| format!("Some({:?})", module.path.to_string_lossy()))
+        .unwrap_or_else(|| "None".to_string());
+    let paths = bundle
+        .workers
+        .iter()
+        .map(|worker| format!("{:?}", worker.path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let arms = bundle
+        .workers
+        .iter()
+        .map(|worker| {
+            let order = worker
+                .evaluation_order
+                .iter()
+                .map(|&index| format!("{:?}", bundle.modules[index].path.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{:?} => return w3cos_core::node_workers::run_worker_modules({boot}, &[{order}]), ",
+                worker.path.to_string_lossy()
+            )
+        })
+        .collect::<String>();
+    format!(
+        " w3cos_core::node_workers::register_worker_modules(&[{paths}]); if let Some(__w3cos_worker) = w3cos_core::node_workers::worker_entry_path() {{ match __w3cos_worker.as_str() {{ {arms}_ => {{}} }} }}"
     )
 }
 
