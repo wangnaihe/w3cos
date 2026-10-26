@@ -9731,8 +9731,22 @@ fn set_element_scroll_offset(node: u32, left: Option<f32>, top: Option<f32>) {
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    static BLOCK_INLINE_PARENT_STYLE_QUERIES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[inline]
+fn block_inline_parent_style(node: u32) -> w3cos_std::style::Style {
+    #[cfg(test)]
+    BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(count.get() + 1));
+    dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)))
+}
+
 fn block_in_inline_host(node: u32) -> bool {
-    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    let style = block_inline_parent_style(node);
     matches!(style.display, w3cos_std::style::Display::Inline)
         && dom::children(node).iter().copied().any(|child| {
             dom::node_type(child) == 1
@@ -9755,7 +9769,15 @@ fn block_in_inline_fragment_bounds(
     node: u32,
     mut child_rect: impl FnMut(u32) -> Option<w3cos_dom::DOMRect>,
 ) -> Option<w3cos_dom::DOMRect> {
-    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    let children = dom::children(node);
+    if !children
+        .iter()
+        .copied()
+        .any(|child| dom::node_type(child) == 1)
+    {
+        return None;
+    }
+    let style = block_inline_parent_style(node);
     if !block_in_inline_host(node)
         || style.padding != w3cos_std::style::Edges::ZERO
         || style.border_width != 0.0
@@ -9767,7 +9789,7 @@ fn block_in_inline_fragment_bounds(
         return None;
     }
     let mut bounds: Option<w3cos_dom::DOMRect> = None;
-    for child in dom::children(node) {
+    for child in children {
         if dom::node_type(child) != 1 {
             continue;
         }
@@ -32638,6 +32660,115 @@ try {
             .set_property("width", Value::string("200px"));
         let rect = div.call_method("getBoundingClientRect", vec![]);
         assert_eq!(rect.get_property("width").to_number(), 200.0);
+    }
+
+    #[test]
+    fn leaf_fragment_probe_counts_parent_style_queries() {
+        setup();
+        let document = document_value();
+        let root = create_in_body("div");
+        let mut nodes = Vec::with_capacity(4_000);
+        for _ in 0..4_000 {
+            let node = document.call_method("createElement", vec![Value::string("div")]);
+            let id = node_id_of(&node).expect("element node id");
+            root.call_method("appendChild", vec![node]);
+            nodes.push(id);
+        }
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        for _ in 0..2 {
+            for node in &nodes {
+                assert!(block_in_inline_fragment_bounds(*node, |_| None).is_none());
+            }
+        }
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            0
+        );
+    }
+
+    #[test]
+    fn fragment_probe_preserves_dynamic_element_child_path() {
+        setup();
+        let document = document_value();
+        let target = create_in_body("span");
+        let target_id = node_id_of(&target).expect("target node id");
+        target.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("text")])],
+        );
+
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        assert!(block_in_inline_fragment_bounds(target_id, |_| None).is_none());
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            0,
+            "text-only children cannot form block-in-inline fragments"
+        );
+
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        block
+            .get_property("style")
+            .set_property("display", Value::string("block"));
+        target.call_method("appendChild", vec![block.clone()]);
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        let bounds = block_in_inline_fragment_bounds(target_id, |_| {
+            Some(w3cos_dom::DOMRect::new(3.0, 4.0, 20.0, 10.0))
+        })
+        .expect("the real element-child path must still be evaluated");
+        assert_eq!(bounds, w3cos_dom::DOMRect::new(3.0, 4.0, 20.0, 10.0));
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            2,
+            "the positive path still checks both existing style gates"
+        );
+
+        target.call_method("removeChild", vec![block]);
+        BLOCK_INLINE_PARENT_STYLE_QUERIES.with(|count| count.set(0));
+        assert!(block_in_inline_fragment_bounds(target_id, |_| None).is_none());
+        assert_eq!(
+            BLOCK_INLINE_PARENT_STYLE_QUERIES.with(std::cell::Cell::get),
+            0,
+            "removing the last element child must restore the early exit"
+        );
+    }
+
+    #[test]
+    fn display_contents_rect_stays_empty_while_dynamic_child_layout_flushes() {
+        setup();
+        let document = document_value();
+        let contents = create_in_body("div");
+        contents
+            .get_property("style")
+            .set_property("display", Value::string("contents"));
+
+        let assert_empty = |value: &Value| {
+            let rect = value.call_method("getBoundingClientRect", vec![]);
+            assert_eq!(rect.get_property("x").to_number(), 0.0);
+            assert_eq!(rect.get_property("y").to_number(), 0.0);
+            assert_eq!(rect.get_property("width").to_number(), 0.0);
+            assert_eq!(rect.get_property("height").to_number(), 0.0);
+        };
+        assert_empty(&contents);
+
+        contents.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("text")])],
+        );
+        assert_empty(&contents);
+
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let block_style = block.get_property("style");
+        block_style.set_property("display", Value::string("block"));
+        block_style.set_property("width", Value::string("30px"));
+        block_style.set_property("height", Value::string("12px"));
+        contents.call_method("appendChild", vec![block.clone()]);
+        assert_empty(&contents);
+        let child_rect = block.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(child_rect.get_property("width").to_number(), 30.0);
+        assert_eq!(child_rect.get_property("height").to_number(), 12.0);
+
+        contents.call_method("removeChild", vec![block]);
+        assert_empty(&contents);
     }
 
     #[test]
