@@ -33098,6 +33098,14 @@ try {
     fn block_in_inline_retained_child_geometry_keeps_fragment_owner() {
         setup();
         set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::register_rule(
+            ".cold",
+            &[("display", "block"), ("width", "20px"), ("height", "10px")],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".hot",
+            &[("display", "block"), ("width", "24px"), ("height", "12px")],
+        );
         let document = document_value();
         let outer = create_in_body("div");
         outer
@@ -33105,20 +33113,38 @@ try {
             .set_property("width", Value::string("400px"));
         let host = document.call_method("createElement", vec![Value::string("span")]);
         outer.call_method("appendChild", vec![host.clone()]);
+        let internal_owner = w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER;
+        let computed_owner = || {
+            window_value()
+                .call_method("getComputedStyle", vec![host.clone()])
+                .call_method("getPropertyValue", vec![Value::string(internal_owner)])
+                .to_js_string()
+        };
+        assert_eq!(computed_owner(), "");
+        host.get_property("style").call_method(
+            "setProperty",
+            vec![Value::string(internal_owner), Value::string("user-token")],
+        );
+        let inline_owner = || {
+            host.get_property("style")
+                .call_method("getPropertyValue", vec![Value::string(internal_owner)])
+                .to_js_string()
+        };
+        assert_eq!(inline_owner(), "user-token");
         let block = document.call_method("createElement", vec![Value::string("div")]);
-        let style = block.get_property("style");
-        style.set_property("display", Value::string("block"));
-        style.set_property("width", Value::string("20px"));
-        style.set_property("height", Value::string("10px"));
+        block.set_property("className", Value::string("cold"));
         host.call_method("appendChild", vec![block.clone()]);
         let initial = host.call_method("getClientRects", vec![]);
         assert_eq!(
             initial.get_property("1").get_property("width").to_number(),
             400.0
         );
+        // The engine does not yet expose computed custom properties, but the
+        // internal numeric owner must not leak through that existing surface.
+        assert_eq!(computed_owner(), "");
+        assert_eq!(inline_owner(), "user-token");
 
-        style.set_property("width", Value::string("24px"));
-        style.set_property("height", Value::string("12px"));
+        block.set_property("className", Value::string("hot"));
         outer
             .get_property("style")
             .set_property("width", Value::string("420px"));
@@ -33135,6 +33161,8 @@ try {
         let bounds = host.call_method("getBoundingClientRect", vec![]);
         assert_eq!(bounds.get_property("width").to_number(), 420.0);
         assert_eq!(bounds.get_property("height").to_number(), 12.0);
+        assert_eq!(computed_owner(), "");
+        assert_eq!(inline_owner(), "user-token");
     }
 
     #[test]
