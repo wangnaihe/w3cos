@@ -29,6 +29,10 @@ pub(crate) struct RareObjectData {
     /// `super(...)` call to return. This is internal execution state, not an
     /// observable JavaScript property.
     pub(crate) pending_class_initializers: Vec<(u64, Value, Value)>,
+    /// Object returned by a base constructor during `super(...)`. It replaces
+    /// this pre-allocated instance as the derived constructor's `this` and as
+    /// the result of `new` (ECMAScript [[Construct]] / BindThisValue).
+    pub(crate) construct_replacement: Option<Value>,
     /// Opaque class brands and private elements are intentionally kept out of
     /// `properties`, so proxy traps and reflection cannot observe them.
     pub(crate) class_brand: Option<u64>,
@@ -690,6 +694,7 @@ impl JsObject {
         let rare = self.rare.as_ref().map(|rare| {
             Box::new(RareObjectData {
                 pending_class_initializers: Vec::new(),
+                construct_replacement: None,
                 class_brand: rare.class_brand,
                 private_brands: HashSet::new(),
                 private_elements: HashMap::new(),
@@ -978,6 +983,9 @@ impl JsObject {
             for (_, a, b) in &rare.pending_class_initializers {
                 push_value(out, "[[PendingInitializer]]".to_string(), a);
                 push_value(out, "[[PendingInitializer]]".to_string(), b);
+            }
+            if let Some(replacement) = &rare.construct_replacement {
+                push_value(out, "[[ConstructReplacement]]".to_string(), replacement);
             }
             let mut private = rare.private_elements.iter().collect::<Vec<_>>();
             private.sort_by(|a, b| a.0.1.cmp(&b.0.1));

@@ -2041,6 +2041,12 @@ impl Builder {
         self.declare_local_with_kind("*this*", BindingKind::Parameter, false)
     }
 
+    /// A derived constructor's `this` is rebound by `super(...)` when the
+    /// parent constructor returns an object, so its binding is assignable.
+    fn declare_derived_constructor_this_binding(&mut self) -> Result<BindingId> {
+        self.declare_local_with_kind("*this*", BindingKind::Parameter, true)
+    }
+
     fn declare_arguments_binding(&mut self) -> Result<()> {
         if self.scopes[0].contains_key("arguments") {
             return Ok(());
@@ -3953,6 +3959,12 @@ impl Builder {
                     let key = self.constant(Constant::String("__w3cos_super_ctor".into()));
                     let dst = self.register();
                     self.emit_method_call(dst, parent, key, arguments);
+                    // `super(...)` yields the bound `this`: the parent's
+                    // returned object when it substituted one.
+                    self.emit(Instruction::StoreBinding {
+                        binding: this_binding,
+                        value: dst,
+                    });
                     return Ok(dst);
                 }
                 if let Callee::Expr(callee) = &call.callee
@@ -5225,7 +5237,11 @@ impl Builder {
             .map(|parameter| parameter_hint(parameter, &self.type_names))
             .collect::<Vec<_>>();
         let this_binding = if bind_this {
-            Some(child.declare_this_binding()?)
+            if class_constructor && child.find_binding("*super*").is_some() {
+                Some(child.declare_derived_constructor_this_binding()?)
+            } else {
+                Some(child.declare_this_binding()?)
+            }
         } else {
             None
         };
