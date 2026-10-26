@@ -53612,7 +53612,7 @@ mod tests {
             (rect(30.0, 15.0, 15.0, 18.0), 3),
             (rect(45.0, 15.0, 15.0, 18.0), 4),
         ];
-        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+        let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
         assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
         assert_eq!(layouts[0].0.height, 30.0 + descent);
         assert_eq!(layouts[3].0.y, leading);
@@ -53710,7 +53710,7 @@ mod tests {
                     3,
                 ),
             ];
-            let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
+            let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
             assert!(
                 project_image_text_lines(&root, 0, &mut layouts, &positions),
                 "offset={offset}"
@@ -53802,7 +53802,7 @@ mod tests {
                     3,
                 ),
             ];
-            let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
+            let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
             assert!(
                 project_image_text_lines(&root, 0, &mut layouts, &positions),
                 "{display:?}"

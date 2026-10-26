@@ -686,9 +686,7 @@ fn spacing_is_px(spacing: Spacing) -> bool {
 /// stay out. A flex or grid item is blockified separately. An auto size
 /// whose columns and rows are both definite px tracks is
 /// `fixed_track_inline_grid` (the border box is the sum of those tracks).
-/// Everything else keeps the unrecognized-display marker: those boxes
-/// are the references of pages that still fall back, and laying out only
-/// the reference splits the reftest.
+/// Automatic boxes with non-fixed tracks use `intrinsic_track_inline_grid`.
 pub(super) fn definite_inline_grid(style: &Style) -> bool {
     if style.direction == TextDirection::Rtl
         || style.float != Float::None
@@ -703,11 +701,7 @@ pub(super) fn definite_inline_grid(style: &Style) -> bool {
     if !matches!(style.height, Dimension::Px(h) if h.is_finite() && h >= 0.0) {
         return false;
     }
-    if !spacing_is_zero(style.margin.top)
-        || !spacing_is_zero(style.margin.right)
-        || !spacing_is_zero(style.margin.bottom)
-        || !spacing_is_zero(style.margin.left)
-    {
+    if !zero_margins(style) {
         return false;
     }
     if style.align_items != AlignItems::Stretch
@@ -743,11 +737,15 @@ fn axis_is_auto_or_px(dim: Dimension) -> bool {
     }
 }
 
-fn zero_box_edges(style: &Style) -> bool {
+fn zero_margins(style: &Style) -> bool {
     spacing_is_zero(style.margin.top)
         && spacing_is_zero(style.margin.right)
         && spacing_is_zero(style.margin.bottom)
         && spacing_is_zero(style.margin.left)
+}
+
+fn zero_box_edges(style: &Style) -> bool {
+    zero_margins(style)
         && spacing_is_zero(style.padding.top)
         && spacing_is_zero(style.padding.right)
         && spacing_is_zero(style.padding.bottom)
@@ -764,6 +762,16 @@ fn zero_box_edges(style: &Style) -> bool {
 /// A margin, padding, border, out-of-flow child, or flex/grid item stays
 /// on the marker: those are the references that still fall back.
 pub(super) fn fixed_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
+    inline_grid_tracks(flat, index, false)
+}
+
+/// An automatic inline-grid needs intrinsic column sizing before its
+/// percentage and flexible tracks can resolve against the used inline size.
+pub(super) fn intrinsic_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
+    !definite_inline_grid(flat[index].style) && inline_grid_tracks(flat, index, true)
+}
+
+fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> bool {
     let style = flat[index].style;
     if marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid") {
         return false;
@@ -774,10 +782,20 @@ pub(super) fn fixed_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bo
     }) {
         return false;
     }
+    // First-letter splits a shaped source run. Its fragment advances and
+    // the independently authored reference still snap differently in the
+    // inline engines; intrinsic grid sizing must not switch only one side.
+    if intrinsic
+        && flat[index + 1..flat[index].subtree_end]
+            .iter()
+            .any(|node| has_marker(node.style, w3cos_dom::document::FIRST_LETTER_STYLE_MARKER))
+    {
+        return false;
+    }
     // Static boxes stay on the marker. A static `inline-grid` reference
     // (fixed px tracks, no insets) is paired with tests that still fall
     // back, and switching only the reference splits the reftest.
-    if style.position != Position::Relative {
+    if style.position != Position::Relative && !(intrinsic && style.position == Position::Static) {
         return false;
     }
     if style.direction == TextDirection::Rtl
@@ -796,7 +814,11 @@ pub(super) fn fixed_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bo
     {
         return false;
     }
-    if !zero_box_edges(style) {
+    if !(if intrinsic {
+        zero_margins(style)
+    } else {
+        zero_box_edges(style)
+    }) {
         return false;
     }
     if is_baseline(style.align_items) || is_baseline(style.justify_items) {
@@ -820,16 +842,28 @@ pub(super) fn fixed_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bo
     }) {
         return false;
     }
-    let Some(columns) = columns_spec(style).and_then(|spec| parse_template(spec, false)) else {
+    let Some(columns) = parse_template(columns_spec(style).unwrap_or(""), false) else {
         return false;
     };
-    let Some(rows) = style
-        .grid_rows()
-        .and_then(|spec| parse_template(spec, true))
-    else {
+    let Some(rows) = parse_template(style.grid_rows().unwrap_or(""), true) else {
         return false;
     };
-    fixed_px_sum(&columns).is_some() && fixed_px_sum(&rows).is_some()
+    // An empty, zero-height atomic inline needs the surrounding IFC's
+    // strut baseline. The inline-grid-only line builder does not yet own
+    // that strut, so keep content-sized empty rows on the legacy path.
+    if intrinsic
+        && matches!(style.height, Dimension::Auto)
+        && fixed_px_sum(&rows).is_none()
+        && rendered_children(flat, index).next().is_none()
+    {
+        return false;
+    }
+    let fixed = fixed_px_sum(&columns).is_some() && fixed_px_sum(&rows).is_some();
+    if intrinsic {
+        !fixed && axis_line(columns_spec(style), false) && axis_line(style.grid_rows(), true)
+    } else {
+        columns_spec(style).is_some() && style.grid_rows().is_some() && fixed
+    }
 }
 
 /// The same definite box, and not a flex or grid item. Intrinsic tracks
@@ -846,7 +880,7 @@ fn inline_grid_line_lays_out(flat: &[FlatNodeInfo], index: usize) -> bool {
     }) {
         return false;
     }
-    definite_inline_grid(style)
+    definite_inline_grid(style) || intrinsic_track_inline_grid(flat, index)
 }
 
 fn breadth_is_line(breadth: Breadth) -> bool {
@@ -2209,6 +2243,52 @@ fn gap_sum(collapsed: &[bool], gap: i64) -> i64 {
     gap * active.saturating_sub(1) as i64
 }
 
+/// CSS Grid §12.5 / §12.7, following Blink's ComputeMinMaxSizes two
+/// sizing constraints. Percentages are indefinite during this pass. The
+/// max-content flex fraction must accommodate each track's contribution;
+/// simply summing the flex bases loses the ratios between flexible tracks.
+fn intrinsic_tracks(
+    specs: &[Spec],
+    minimum: &[i64],
+    maximum: &[i64],
+    collapsed: &[bool],
+    gap: i64,
+    font: f32,
+) -> (i64, i64) {
+    let mut min_sum = gap_sum(collapsed, gap);
+    let mut max_sum = min_sum;
+    let tracks: Vec<Track> = specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| track_from_spec(spec, minimum[i], maximum[i], None, font, false))
+        .collect();
+    let fraction = tracks
+        .iter()
+        .enumerate()
+        .filter(|(i, track)| !collapsed[*i] && track.flex > 0.0)
+        .map(|(i, track)| maximum[i].max(track.base) as f64 / track.flex.max(1.0))
+        .fold(0.0_f64, f64::max);
+    for (i, spec) in specs.iter().enumerate() {
+        if collapsed[i] {
+            continue;
+        }
+        let min = match *spec {
+            Spec::One(Breadth::MaxContent) => maximum[i],
+            Spec::One(breadth) => definite_breadth(breadth, None, font).unwrap_or(minimum[i]),
+            Spec::MinMax(min, _) => breadth_floor(min, minimum[i], maximum[i], None, font),
+            Spec::Fit(_) => minimum[i],
+        };
+        min_sum += min;
+        let track = &tracks[i];
+        max_sum += if track.flex > 0.0 {
+            track.base.max((fraction * track.flex).ceil() as i64)
+        } else {
+            track.base
+        };
+    }
+    (min_sum, max_sum.max(min_sum))
+}
+
 fn grow(used: &mut [i64], caps: &[i64], mut free: i64) {
     if free <= 0 {
         return;
@@ -2960,13 +3040,14 @@ pub(super) fn layout(
     // §6). Stretching it to the containing block would grow those tracks
     // under the initial `justify-content: normal` (stretch).
     let inline_fixed = fixed_track_inline_grid(flat, index);
+    let inline_intrinsic = intrinsic_track_inline_grid(flat, index);
     if inline_fixed && sized.is_none() && matches!(style.width, Dimension::Auto) {
         if let Some(sum) = fixed_px_sum(&columns_template) {
             let gaps = column_gap * columns_template.tracks.len().saturating_sub(1) as f32;
             inner_width = sum + gaps;
         }
     }
-    let inner_u = units(inner_width);
+    let mut inner_u = units(inner_width);
     let inflow = rendered_children(flat, index)
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
         .count();
@@ -3013,7 +3094,7 @@ pub(super) fn layout(
         // Whitespace-only text does not generate a grid item when
         // white-space collapses (CSS Grid §4.1). Only the inline-grid
         // line path skips it; an ordinary grid keeps its current items.
-        if inline_fixed
+        if (inline_fixed || inline_intrinsic)
             && matches!(
                 flat[child].kind,
                 w3cos_std::ComponentKind::Text { content } if content.chars().all(|ch| ch.is_whitespace())
@@ -3119,6 +3200,20 @@ pub(super) fn layout(
             }
         }
     }
+    let mut shrink_intrinsic_columns = false;
+    if inline_intrinsic && sized.is_none() && matches!(style.width, Dimension::Auto) {
+        let (min, max) = intrinsic_tracks(
+            &column_specs,
+            &col_min,
+            &col_max,
+            &collapsed,
+            column_gap_u,
+            font,
+        );
+        inner_u = inner_u.clamp(min, max);
+        inner_width = from_units(inner_u);
+        shrink_intrinsic_columns = inner_u < max;
+    }
     let column_tracks: Vec<Track> = column_specs
         .iter()
         .enumerate()
@@ -3131,6 +3226,11 @@ pub(super) fn layout(
                 font,
                 stretch_columns,
             );
+            if shrink_intrinsic_columns && matches!(spec, Spec::One(Breadth::Auto)) {
+                track.base = col_min[index];
+                track.cap = col_max[index];
+                track.stretchy = false;
+            }
             if collapsed[index] {
                 track.collapsed = true;
                 track.base = 0;
@@ -3320,7 +3420,22 @@ pub(super) fn layout(
         fragments.push(laid);
     }
     let stretch_rows = row_pack(style) == Pack::Stretch;
-    let row_available = definite_block.map(units);
+    let intrinsic_row_size = if inline_intrinsic && definite_block.is_none() {
+        Some(
+            intrinsic_tracks(
+                &row_specs,
+                &row_min,
+                &row_max,
+                &vec![false; row_specs.len()],
+                row_gap_u,
+                font,
+            )
+            .1,
+        )
+    } else {
+        None
+    };
+    let row_available = definite_block.map(units).or(intrinsic_row_size);
     let row_tracks: Vec<Track> = row_specs
         .iter()
         .enumerate()
@@ -3337,7 +3452,7 @@ pub(super) fn layout(
         .collect();
     let mut rows = if row_tracks.is_empty() {
         Vec::new()
-    } else if row_tracks.iter().any(|track| track.flex > 0.0) {
+    } else if intrinsic_row_size.is_some() || row_tracks.iter().any(|track| track.flex > 0.0) {
         finalize(&row_tracks, row_available, row_gap_u)
     } else {
         finalize(&row_tracks, None, row_gap_u)
@@ -3357,7 +3472,10 @@ pub(super) fn layout(
     }
     let row_collapsed = vec![false; rows.len()];
     let base = rows.iter().sum::<i64>() + gap_sum(&row_collapsed, row_gap_u);
-    let mut used = specified_height.map(units).unwrap_or(base);
+    let mut used = specified_height
+        .map(units)
+        .or(intrinsic_row_size)
+        .unwrap_or(base);
     if let Some(min) = min_h {
         used = used.max(units(min));
     }
@@ -3366,7 +3484,7 @@ pub(super) fn layout(
     {
         return super::bail("grid:max-height");
     }
-    if used < base {
+    if used < base && !inline_intrinsic {
         return super::bail("grid:short-height");
     }
     if stretch_rows && used > base && !rows.is_empty() {

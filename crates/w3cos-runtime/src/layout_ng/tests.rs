@@ -2644,10 +2644,12 @@ fn top_level_definite_inline_grid_shares_a_line() {
     );
     let auto_flat = pre_flatten(&auto);
     assert!(
-        !block::supports_tree(&auto_flat),
+        block::supports_tree(&auto_flat),
         "{:?}",
         block::unsupported_reasons(&auto_flat)
     );
+    let auto_out = layout_tree(&auto, &auto_flat, 800.0, 600.0).expect("auto inline size");
+    assert_eq!(at(&auto_out, 1), (0.0, 0.0, 100.0, 20.0));
 }
 
 /// An auto-sized top-level `inline-grid` with definite px tracks shrinks
@@ -2799,6 +2801,223 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
         "{:?}",
         block::unsupported_reasons(&static_flat)
     );
+}
+
+#[test]
+fn auto_sized_inline_grid_uses_intrinsic_non_fixed_tracks() {
+    use w3cos_std::style::CustomProperties;
+    // Measured with headless Chrome 155.0.8059.86, 800x600 viewport,
+    // body margin 0, no whitespace between items, auto width/height.
+    // Each item is 10px tall; the first is 40px wide. Columns, second
+    // item width, available width, gap, grid width, second item x:
+    for (columns, second, available, gap, width, second_x) in [
+        ("auto auto", 30.0, 800.0, 0.0, 70.0, 40.0),
+        ("1fr 2fr", 30.0, 800.0, 0.0, 120.0, 40.0),
+        (
+            "minmax(20px,1fr) minmax(50px,max-content)",
+            80.0,
+            800.0,
+            0.0,
+            120.0,
+            40.0,
+        ),
+        ("25% 75%", 30.0, 800.0, 0.0, 70.0, 17.5),
+        ("min-content max-content", 30.0, 800.0, 0.0, 70.0, 40.0),
+        ("auto auto", 30.0, 800.0, 10.0, 80.0, 50.0),
+        ("auto auto", 30.0, 50.0, 0.0, 70.0, 40.0),
+        ("0.5fr 1fr", 30.0, 800.0, 0.0, 80.0, 40.0),
+    ] {
+        let item = |width| {
+            node(
+                Style {
+                    width: Dimension::Px(width),
+                    height: Dimension::Px(10.0),
+                    ..block()
+                },
+                vec![],
+            )
+        };
+        let grid = Style {
+            display: Display::Flex,
+            grid_template_columns: Some(columns.to_string()),
+            column_gap: Some(gap),
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            )])),
+            ..Style::default()
+        };
+        let root = node(block(), vec![node(grid, vec![item(40.0), item(second)])]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{columns}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, available, 600.0).expect(columns);
+        let at = |index| {
+            let rect = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+            (rect.x, rect.y, rect.width, rect.height)
+        };
+        assert_eq!(at(1), (0.0, 0.0, width, 10.0), "{columns}: grid");
+        assert_eq!(at(2), (0.0, 0.0, 40.0, 10.0), "{columns}: first item");
+        assert_eq!(
+            at(3),
+            (second_x, 0.0, second, 10.0),
+            "{columns}: second item"
+        );
+    }
+}
+
+#[test]
+fn intrinsic_inline_grid_keeps_split_first_letter_text_on_legacy() {
+    use w3cos_std::style::CustomProperties;
+    let grid = Style {
+        display: Display::Flex,
+        grid_template_columns: Some("auto".to_string()),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let mut item = sized(10.0);
+    item.width = Dimension::Px(40.0);
+    let plain = node(
+        block(),
+        vec![node(grid.clone(), vec![node(item.clone(), vec![])])],
+    );
+    assert!(block::supports_tree(&pre_flatten(&plain)));
+    item.custom_properties = Some(CustomProperties::from_iter([(
+        w3cos_dom::document::FIRST_LETTER_STYLE_MARKER.to_string(),
+        "1".to_string(),
+    )]));
+    let split = node(block(), vec![node(grid, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&split);
+    assert!(!block::supports_tree(&flat));
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| reason.starts_with("unrecognized-display:inline-grid"))
+    );
+}
+
+#[test]
+fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
+    use w3cos_std::style::CustomProperties;
+    // Headless Chrome 155: auto/100px border-box widths, 3px padding
+    // and 2px borders, auto auto columns containing 40px/30px items.
+    for (width, outer, second_x) in [
+        (Dimension::Auto, 80.0, 45.0),
+        (Dimension::Px(100.0), 100.0, 55.0),
+    ] {
+        let grid = Style {
+            display: Display::Flex,
+            width,
+            box_sizing: BoxSizing::BorderBox,
+            padding: margins(3.0, 3.0, 3.0, 3.0),
+            border_width: 2.0,
+            grid_template_columns: Some("auto auto".to_string()),
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            )])),
+            ..Style::default()
+        };
+        let item = |width| {
+            node(
+                Style {
+                    width: Dimension::Px(width),
+                    ..sized(10.0)
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(grid, vec![item(40.0), item(30.0)])]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("border box");
+        assert_eq!(rect(&out, 1), (0.0, 0.0, outer, 20.0));
+        assert_eq!(rect(&out, 2), (5.0, 5.0, 40.0, 10.0));
+        assert_eq!(rect(&out, 3), (second_x, 5.0, 30.0, 10.0));
+    }
+}
+
+#[test]
+fn auto_sized_inline_grid_resolves_flexible_and_percent_rows() {
+    use w3cos_std::style::CustomProperties;
+    // Headless Chrome 155: a 40px column with 40px/30px tall items.
+    // Indefinite flex rows preserve their 1:2 ratio; percentages resolve
+    // after the automatic height has been measured with auto tracks.
+    for (rows, height, second_y) in [("1fr 2fr", 120.0, 40.0), ("25% 75%", 70.0, 17.5)] {
+        let mut grid = Style {
+            display: Display::Flex,
+            grid_template_columns: Some("40px".to_string()),
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            )])),
+            ..Style::default()
+        };
+        grid.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        let root = node(
+            block(),
+            vec![node(
+                grid,
+                vec![node(sized(40.0), vec![]), node(sized(30.0), vec![])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{rows}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 60.0, 600.0).expect(rows);
+        assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, height));
+        assert_eq!(rect(&out, 2), (0.0, 0.0, 40.0, 40.0));
+        assert_eq!(rect(&out, 3), (0.0, second_y, 40.0, 30.0));
+    }
+}
+
+#[test]
+fn auto_sized_inline_grid_shrinks_and_wraps_auto_track_text() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let grid = Style {
+        display: Display::Flex,
+        grid_template_columns: Some("auto auto".to_string()),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )])),
+        ..font.clone()
+    };
+    let item = |text: &str| node(font.clone(), vec![Component::text(text, font.clone())]);
+    let root = node(block(), vec![node(grid, vec![item("XX XX"), item("X X")])]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 60.0, 600.0).expect("intrinsic text");
+    // Chrome 155, Ahem 10px/1: max-content columns are 50/30, minimum
+    // columns are 20/10. In 60px they grow to 35/25 and wrap to 20px tall.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 60.0, 20.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 35.0, 20.0));
+    assert_eq!(rect(&out, 4), (35.0, 0.0, 25.0, 20.0));
 }
 
 /// Non-fixed tracks on a definite top-level `inline-grid`, and baseline

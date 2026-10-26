@@ -1541,7 +1541,8 @@ fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
     is_inline_grid(flat[index].style)
         && !is_blockified_inline_grid(flat, index)
         && (super::grid::definite_inline_grid(flat[index].style)
-            || super::grid::fixed_track_inline_grid(flat, index))
+            || super::grid::fixed_track_inline_grid(flat, index)
+            || super::grid::intrinsic_track_inline_grid(flat, index))
 }
 
 /// Ascent of an inline-grid on a line. `NoLines` is the bottom border
