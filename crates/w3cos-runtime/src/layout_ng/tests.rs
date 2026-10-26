@@ -3960,8 +3960,9 @@ fn flex_image_item_matches_chrome() {
                 vec![Component::image(
                     source,
                     Style {
-                        // Blockified as a flex item (CSS Display §2.7).
-                        display: Display::Block,
+                        // An `<img>` is inline-level; as a flex item it is
+                        // blockified (CSS Display §2.7).
+                        display: Display::InlineBlock,
                         ..item
                     },
                 )],
@@ -4134,13 +4135,20 @@ fn abspos_flex_row_transfers_inset_height_to_image() {
     let root = node(
         block(),
         vec![
-            holder(0.0, block()),
+            holder(
+                0.0,
+                Style {
+                    display: Display::InlineBlock,
+                    ..Style::default()
+                },
+            ),
             holder(
                 10.0,
                 Style {
                     margin: edges(5.0),
                     padding: edges(3.0),
-                    ..block()
+                    display: Display::InlineBlock,
+                    ..Style::default()
                 },
             ),
         ],
@@ -4156,5 +4164,50 @@ fn abspos_flex_row_transfers_inset_height_to_image() {
     assert_eq!(rect(&out, 3), (0.0, 0.0, 400.0, 200.0));
     assert_eq!(rect(&out, 5), (0.0, 210.0, 344.0, 180.0));
     assert_eq!(rect(&out, 6), (5.0, 215.0, 334.0, 170.0));
+    crate::image_loader::invalidate(source);
+}
+
+/// flex-minimum-height-flex-items-021: a column item's definite cross size
+/// (`width: 0`) is clamped by `min-width: 100px`; the 300×150 image's height
+/// transfers to 50 and its automatic minimum keeps it in a 0px column.
+#[test]
+fn flex_column_image_cross_honors_min_width() {
+    use w3cos_std::style::{Dimension as D, FlexDirection};
+    let source = "w3cos-ng-flex-column-image-300x150.png";
+    let image = image::RgbaImage::from_pixel(300, 150, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                height: D::Px(0.0),
+                ..block()
+            },
+            vec![Component::image(
+                source,
+                Style {
+                    display: Display::InlineBlock,
+                    width: D::Px(0.0),
+                    min_width: D::Px(100.0),
+                    ..Style::default()
+                },
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("column image");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 0.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
     crate::image_loader::invalidate(source);
 }

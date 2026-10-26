@@ -727,7 +727,8 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
         .parent
         .is_some_and(|parent| is_author_flex(flat[parent].style))
     {
-        return unsupported_box_style(style, &[inline::VALIGN_MARKER], false);
+        // Its inline-level display is blockified (CSS Display §2.7).
+        return unsupported_box_style(style, &[inline::VALIGN_MARKER], true);
     }
     // A block replaced box must not overlap a float in the same BFC
     // (CSS 2.1 9.5). Placement beside a float is still the legacy path.

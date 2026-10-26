@@ -1118,7 +1118,20 @@ pub(super) fn layout(
         let cross_auto = matches!(cross_dim, Dimension::Auto);
         let mut cross =
             match definite(cross_dim, cross_basis, child_style, space).why("flex:percent")? {
-                Some(size) => Some(to_content(child_style, cross_edges, size)),
+                // The used cross size honors the cross min/max sizes
+                // (Blink ComputeInlineSizeForFragment / ComputeBlockSize
+                // clamp a fixed size too).
+                Some(size) => Some(
+                    clamp_cross(
+                        child_style,
+                        row,
+                        cross_edges,
+                        to_content(child_style, cross_edges, size),
+                        cross_basis,
+                        space,
+                    )
+                    .why("flex:cross")?,
+                ),
                 None => None,
             };
         // A column item's cross size is its width. Nowrap stretch uses the

@@ -9207,11 +9207,31 @@ impl Document {
                 // One passive inline may contain several differently styled
                 // text runs. It still uses the enclosing block's line width;
                 // its nested runs must not become max-content atomic rows.
-                if (children.len() >= 2
-                    || children.iter().any(|child| {
-                        child.style.display == w3cos_std::style::Display::Inline
-                            && !child.children.is_empty()
-                    }))
+                // A flex or grid container's atomic children are blockified
+                // items, not an inline formatting context (CSS Display
+                // §2.7), so its authored alignment must survive. Flex keeps
+                // this path for non-image atomic children (e.g. buttons)
+                // for now: without writing-mode support, button-min-width's
+                // vertical-rl column only matches Chrome as a row.
+                let blockified_atomic_items = !children.is_empty()
+                    && match style.display {
+                        w3cos_std::style::Display::Grid => children.iter().all(|child| {
+                            !matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                                && child.style.display != w3cos_std::style::Display::Inline
+                        }),
+                        w3cos_std::style::Display::Flex | w3cos_std::style::Display::InlineFlex => {
+                            children.iter().all(|child| {
+                                matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+                            })
+                        }
+                        _ => false,
+                    };
+                if !blockified_atomic_items
+                    && (children.len() >= 2
+                        || children.iter().any(|child| {
+                            child.style.display == w3cos_std::style::Display::Inline
+                                && !child.children.is_empty()
+                        }))
                     && children.iter().any(|component| {
                         component.style.display != w3cos_std::style::Display::None
                             && !matches!(
@@ -25039,6 +25059,44 @@ mod image_component_tests {
             w3cos_std::style::AlignSelf::FlexStart
         );
         assert_eq!(row.children[0].children.len(), 1);
+    }
+
+    #[test]
+    fn flex_container_of_images_keeps_authored_alignment() {
+        // Images in a flex container are blockified flex items (CSS
+        // Display §2.7), not an anonymous line, so `align-items` and
+        // `flex-direction` stay as authored
+        // (css-flexbox-img-expand-evenly.html).
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#flex",
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("height", "50px"),
+            ],
+        );
+        let mut document = Document::new();
+        let flex = document.create_element("div");
+        flex.set_attribute(&mut document, "id", "flex");
+        for _ in 0..2 {
+            let img = document.create_element("img");
+            img.set_attribute(&mut document, "src", "a.png");
+            flex.append_child(&mut document, img);
+        }
+        document.body().append_child(&mut document, flex);
+
+        let tree = document.to_component_subtree(flex.id);
+        assert_eq!(tree.style.display, w3cos_std::style::Display::Flex);
+        assert_eq!(
+            tree.style.align_items,
+            w3cos_std::style::AlignItems::Stretch
+        );
+        assert_eq!(
+            tree.style.flex_direction,
+            w3cos_std::style::FlexDirection::Column
+        );
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
