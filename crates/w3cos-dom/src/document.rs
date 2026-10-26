@@ -10500,6 +10500,7 @@ impl Document {
                         }
                         let mut contents_style = w3cos_std::style::Style::default();
                         contents_style.display = w3cos_std::style::Display::Contents;
+                        mark_split_inline_fragments(id, &mut children);
                         return w3cos_std::Component::boxed(contents_style, children);
                     }
                 }
@@ -10565,7 +10566,7 @@ impl Document {
                     if principal_box_can_merge_generated_inline_text(&unfiltered) {
                         let mut child = children.remove(0);
                         child.style.filter = style.filter.clone();
-                        return boxed_split_inline_group(&style, vec![child]);
+                        return boxed_split_inline_group(id, &style, vec![child]);
                     }
                 }
 
@@ -10639,7 +10640,7 @@ impl Document {
                         }
                     }
                     fragments.push(fragment(!inline_start_is_left, inline_start_is_left));
-                    return boxed_split_inline_group(&style, fragments);
+                    return boxed_split_inline_group(id, &style, fragments);
                 }
 
                 if block_in_inline
@@ -10692,7 +10693,7 @@ impl Document {
                         // preserve around a leading in-flow block. Its nearest
                         // painted inline ancestor owns the split fragments, but
                         // the host's opacity group still has to reach the block.
-                        return boxed_split_inline_group(&style, children);
+                        return boxed_split_inline_group(id, &style, children);
                     }
                     let fragment_style = |retain_left: bool, retain_right: bool| {
                         let mut fragment = style.clone();
@@ -10902,7 +10903,7 @@ impl Document {
                             trailing,
                         ));
                     }
-                    return boxed_split_inline_group(&style, fragments);
+                    return boxed_split_inline_group(id, &style, fragments);
                 }
 
                 if block_in_inline
@@ -10962,7 +10963,7 @@ impl Document {
                     let trailing = children.collect::<Vec<_>>();
                     let start = w3cos_std::Component::row_shared(fragment_style(true), Vec::new());
                     let end = w3cos_std::Component::row_shared(fragment_style(false), trailing);
-                    return boxed_split_inline_group(&style, vec![start, block, end]);
+                    return boxed_split_inline_group(id, &style, vec![start, block, end]);
                 }
 
                 if block_in_inline
@@ -11035,7 +11036,7 @@ impl Document {
                         // principal box wrapped around the sole block child.
                         // A decoration-free auto box falls through and stays
                         // the block container established above.
-                        return boxed_split_inline_group(&style, children);
+                        return boxed_split_inline_group(id, &style, children);
                     }
                     if has_left_fragment || has_right_fragment {
                         let block = children.remove(0);
@@ -11053,8 +11054,20 @@ impl Document {
                         {
                             fragments.push(side_fragment(!inline_start_is_left));
                         }
-                        return boxed_split_inline_group(&style, fragments);
+                        return boxed_split_inline_group(id, &style, fragments);
                     }
+
+                    // CSSOM still exposes the empty leading and trailing
+                    // inline fragments around a sole in-flow block. Preserve
+                    // those physical roots even when the host has no visible
+                    // edge decoration; otherwise `getClientRects()` collapses
+                    // the split to one authored child box.
+                    let block = children.remove(0);
+                    return boxed_split_inline_group(
+                        id,
+                        &style,
+                        vec![side_fragment(true), block, side_fragment(false)],
+                    );
                 }
 
                 let is_row = matches!(
@@ -13852,6 +13865,23 @@ fn contains_absolute_positioned_component(component: &w3cos_std::Component) -> b
         .any(contains_absolute_positioned_component)
 }
 
+/// Private component metadata used to re-associate the physical boxes emitted
+/// for one split inline with its source DOM element after the boxless
+/// `display: contents` carrier is dissolved.
+pub const SPLIT_INLINE_FRAGMENT_OWNER: &str = "--w3cos-internal-split-inline-owner";
+
+fn mark_split_inline_fragments(id: NodeId, children: &mut [w3cos_std::Component]) {
+    let owner = id.as_u32().to_string();
+    for child in children {
+        child
+            .style
+            .make_mut()
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(SPLIT_INLINE_FRAGMENT_OWNER.into(), owner.clone());
+    }
+}
+
 /// Wrap the boxes a split inline lowers to in a boxless group.
 ///
 /// A block-in-inline split lowers to a `display: contents` wrapper holding the
@@ -13864,6 +13894,7 @@ fn contains_absolute_positioned_component(component: &w3cos_std::Component) -> b
 /// is what `css/CSS2/stacking-context/opacity-affects-block-in-inline.html`
 /// catches.
 fn boxed_split_inline_group(
+    id: NodeId,
     style: &w3cos_std::style::Style,
     mut children: Vec<w3cos_std::Component>,
 ) -> w3cos_std::Component {
@@ -13895,6 +13926,7 @@ fn boxed_split_inline_group(
             child.style.opacity *= style.opacity;
         }
     }
+    mark_split_inline_fragments(id, &mut children);
     w3cos_std::Component::boxed(group, children)
 }
 
@@ -19801,6 +19833,55 @@ mod image_component_tests {
             found,
             vec![0.5],
             "the hoisted block must not fall out of the split inline's group"
+        );
+    }
+
+    #[test]
+    fn split_inline_physical_roots_retain_their_dom_owner() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let outer = document.create_element("div");
+        outer
+            .style_mut(&mut document)
+            .set_property("width", "400px");
+        let host = document.create_element("span");
+        let block = document.create_element("div");
+        block.style_mut(&mut document).set_property("width", "20px");
+        block
+            .style_mut(&mut document)
+            .set_property("height", "10px");
+        for child in [
+            document.create_text_node("before"),
+            block,
+            document.create_text_node("after"),
+        ] {
+            host.append_child(&mut document, child);
+        }
+        outer.append_child(&mut document, host);
+        document.body().append_child(&mut document, outer);
+
+        fn collect(component: &w3cos_std::Component, owners: &mut Vec<String>) {
+            if let Some(owner) = component
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(SPLIT_INLINE_FRAGMENT_OWNER))
+            {
+                owners.push(owner.clone());
+            }
+            for child in &component.children {
+                collect(child, owners);
+            }
+        }
+
+        let mut owners = Vec::new();
+        collect(&document.to_component_tree(), &mut owners);
+        assert_eq!(owners.len(), 3, "leading run, block and trailing run");
+        assert!(
+            owners
+                .iter()
+                .all(|owner| owner == &host.id.as_u32().to_string()),
+            "every surviving physical root must retain the source inline id: {owners:?}"
         );
     }
 

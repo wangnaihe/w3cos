@@ -4,6 +4,7 @@
 //! Tree shape, text metrics, and inherited cascades rebuild once.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
@@ -22,6 +23,7 @@ struct WidthMemo {
     viewport_w_bits: u32,
     viewport_h_bits: u32,
     rects: Vec<(u32, f32, f32, f32, f32)>,
+    client_rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
 }
 
 struct Cache {
@@ -60,6 +62,20 @@ thread_local! {
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
     static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
         const { std::cell::Cell::new(("none", 0, 0)) };
+    static CLIENT_RECTS: RefCell<HashMap<u32, Vec<w3cos_dom::DOMRect>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
+    CLIENT_RECTS.with(|rects| rects.borrow().get(&node).cloned())
+}
+
+fn client_rect_snapshot() -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
+    CLIENT_RECTS.with(|rects| rects.borrow().clone())
+}
+
+fn restore_client_rects(rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>) {
+    CLIENT_RECTS.with(|current| *current.borrow_mut() = rects);
 }
 
 /// What the most recent [`flush`] solved. `solved_nodes` is the subtree that
@@ -91,6 +107,7 @@ fn phase_log_enabled() -> bool {
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     PAINT.with(|cache| *cache.borrow_mut() = None);
+    CLIENT_RECTS.with(|rects| rects.borrow_mut().clear());
     PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     crate::headless::invalidate_retained_frame();
@@ -345,7 +362,7 @@ fn patch_and_compute(
                     && memo.viewport_w_bits == viewport_w_bits
                     && memo.viewport_h_bits == viewport_h_bits
             })
-            .map(|memo| memo.rects.clone())
+            .map(|memo| (memo.rects.clone(), memo.client_rects.clone()))
     });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
@@ -359,8 +376,9 @@ fn patch_and_compute(
         note_flush("paint", 0, 0);
         return true;
     }
-    if let Some(rects) = memo_hit {
+    if let Some((rects, client_rects)) = memo_hit {
         restore_rects(&rects);
+        restore_client_rects(client_rects);
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         note_flush("memo", 0, 0);
@@ -454,6 +472,7 @@ fn write_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
 ) -> Vec<(u32, f32, f32, f32, f32)> {
+    publish_client_rects(flat, layouts);
     let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
@@ -474,6 +493,95 @@ fn write_rects(
         }
     });
     snaps
+}
+
+fn split_inline_owner(info: &crate::layout::FlatNodeInfo<'_>) -> Option<u32> {
+    info.style
+        .custom_properties
+        .as_ref()?
+        .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)?
+        .parse()
+        .ok()
+}
+
+fn publish_client_rects(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+) {
+    let mut by_index = vec![None; flat.len()];
+    for (rect, index) in layouts {
+        if let Some(slot) = by_index.get_mut(*index) {
+            *slot = Some(*rect);
+        }
+    }
+    let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
+    let mut owners_with_inline_fragments = HashSet::new();
+    for (index, info) in flat.iter().enumerate() {
+        let Some(owner) = split_inline_owner(info) else {
+            continue;
+        };
+        let Some(mut rect) = by_index.get(index).copied().flatten() else {
+            continue;
+        };
+        let properties = info.style.custom_properties.as_ref();
+        let synthetic_inline = properties.is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-split-inline-edge")
+                || properties.contains_key("--w3cos-internal-split-inline-fragment")
+        });
+        if synthetic_inline {
+            owners_with_inline_fragments.insert(owner);
+            // Taffy lays an anonymous inline carrier out at the containing
+            // block's available width. CSSOM exposes the physical inline
+            // fragment instead, whose inline extent is its max-content width.
+            if let Some(component) = info.component {
+                let width = crate::layout::component_max_content_width(component)
+                    .min(rect.width)
+                    .max(0.0);
+                rect.width = width;
+                if width == 0.0 && component.children.is_empty() {
+                    rect.height = 0.0;
+                }
+            }
+        } else if matches!(
+            info.style.display,
+            Display::Block | Display::Flex | Display::Grid | Display::Table | Display::ListItem
+        ) && let Some(parent) = info.parent
+            && let Some(containing) = by_index.get(parent).copied().flatten()
+        {
+            // CSS 2.1 block-in-inline creates an anonymous block around the
+            // in-flow block. Its inline extent is the actual containing block,
+            // while its block extent follows the authored child.
+            rect.x = containing.x;
+            rect.width = containing.width;
+        }
+        published
+            .entry(owner)
+            .or_default()
+            .push(w3cos_dom::DOMRect::new(
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+            ));
+    }
+    for (owner, rects) in &mut published {
+        if owners_with_inline_fragments.contains(owner) || rects.is_empty() {
+            continue;
+        }
+        let mut union = rects[0];
+        for rect in &rects[1..] {
+            let left = union.x.min(rect.x);
+            let top = union.y.min(rect.y);
+            let right = (union.x + union.width).max(rect.x + rect.width);
+            let bottom = (union.y + union.height).max(rect.y + rect.height);
+            union = w3cos_dom::DOMRect::new(left, top, right - left, bottom - top);
+        }
+        let zero_before = w3cos_dom::DOMRect::new(union.x, union.y, 0.0, 0.0);
+        let middle = w3cos_dom::DOMRect::new(union.x, union.y, union.width, union.height);
+        let zero_after = w3cos_dom::DOMRect::new(union.x, union.y + union.height, 0.0, 0.0);
+        *rects = vec![zero_before, middle, zero_after];
+    }
+    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
 }
 
 fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
@@ -526,6 +634,7 @@ fn remember_width(
         viewport_w_bits,
         viewport_h_bits,
         rects,
+        client_rects: client_rect_snapshot(),
     });
 }
 
@@ -550,6 +659,7 @@ fn memos_for_tree(
             viewport_w_bits,
             viewport_h_bits,
             rects: rects.clone(),
+            client_rects: client_rect_snapshot(),
         })
         .collect()
 }
@@ -1000,6 +1110,8 @@ fn try_shift_absolute_insets(
         }
     }
     write_host_rects(&cache.node_ids, &cache.results.layout_cache);
+    let flat = pre_flatten(&cache.component);
+    publish_client_rects(&flat, &cache.results.layout_cache);
     cache.cascade = cascade;
     note_paint_patch();
     note_paint_shift();

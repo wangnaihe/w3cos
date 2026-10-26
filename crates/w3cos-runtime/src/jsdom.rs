@@ -9765,6 +9765,42 @@ fn block_in_inline_host(node: u32) -> bool {
         })
 }
 
+fn inline_with_only_out_of_flow_children(node: u32) -> bool {
+    let style = block_inline_parent_style(node);
+    if !matches!(style.display, w3cos_std::style::Display::Inline) {
+        return false;
+    }
+    let mut has_out_of_flow_child = false;
+    for child in dom::children(node) {
+        match dom::node_type(child) {
+            1 => {
+                let child_style = dom::with_document(|document| {
+                    document.computed_style_for(NodeId::from_u32(child))
+                });
+                if matches!(child_style.display, w3cos_std::style::Display::None) {
+                    continue;
+                }
+                if !matches!(
+                    child_style.position,
+                    w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+                ) {
+                    return false;
+                }
+                has_out_of_flow_child = true;
+            }
+            3 if !dom::get_text_content(child)
+                .unwrap_or_default()
+                .trim()
+                .is_empty() =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    has_out_of_flow_child
+}
+
 fn block_in_inline_fragment_bounds(
     node: u32,
     mut child_rect: impl FnMut(u32) -> Option<w3cos_dom::DOMRect>,
@@ -9810,13 +9846,46 @@ fn block_in_inline_fragment_bounds(
     bounds
 }
 
+fn published_fragment_bounds(node: u32) -> Option<w3cos_dom::DOMRect> {
+    let rects = crate::incremental_layout::client_rects(node)?;
+    let mut bounds: Option<w3cos_dom::DOMRect> = None;
+    for rect in rects {
+        if rect.width == 0.0 || rect.height == 0.0 {
+            continue;
+        }
+        bounds = Some(bounds.map_or(rect, |bounds| {
+            let left = bounds.x.min(rect.x);
+            let top = bounds.y.min(rect.y);
+            let right = (bounds.x + bounds.width).max(rect.x + rect.width);
+            let bottom = (bounds.y + bounds.height).max(rect.y + rect.height);
+            w3cos_dom::DOMRect::new(left, top, right - left, bottom - top)
+        }));
+    }
+    bounds
+}
+
+fn forced_client_rects(node: u32) -> Vec<w3cos_dom::DOMRect> {
+    let bounds = forced_bounding_rect(node);
+    crate::incremental_layout::client_rects(node)
+        .unwrap_or_else(|| vec![bounds])
+        .into_iter()
+        .map(|rect| apply_css_motion_to_rect(node, rect))
+        .collect()
+}
+
 fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     let live = dom::bounding_rect(node);
     if !dom::is_document_dirty() {
+        if let Some(rect) = published_fragment_bounds(node) {
+            return apply_css_motion_to_rect(node, rect);
+        }
         if let Some(rect) =
             block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
         {
             return apply_css_motion_to_rect(node, rect);
+        }
+        if inline_with_only_out_of_flow_children(node) {
+            return w3cos_dom::DOMRect::default();
         }
         if live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0 {
             return apply_css_motion_to_rect(node, live);
@@ -9834,10 +9903,16 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
         return live;
     }
     let stored = dom::bounding_rect(node);
+    if let Some(rect) = published_fragment_bounds(node) {
+        return apply_css_motion_to_rect(node, rect);
+    }
     if let Some(rect) =
         block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
     {
         return apply_css_motion_to_rect(node, rect);
+    }
+    if inline_with_only_out_of_flow_children(node) {
+        return w3cos_dom::DOMRect::default();
     }
     let rect = if stored.width != 0.0 || stored.height != 0.0 || stored.x != 0.0 || stored.y != 0.0
     {
@@ -11327,7 +11402,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         // ── Layout (zeros until the layout engine runs) ──
         "getBoundingClientRect" => func(move |_, _| rect_value(forced_bounding_rect(node))),
         "getClientRects" => func(move |_, _| {
-            crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
+            crate::geometry_web::rect_list(
+                forced_client_rects(node)
+                    .into_iter()
+                    .map(rect_value)
+                    .collect(),
+            )
         }),
         "offsetWidth" | "clientWidth" => Value::Number(forced_bounding_rect(node).width as f64),
         "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
@@ -32801,6 +32881,187 @@ try {
 
         let rect = target.call_method("getBoundingClientRect", vec![]);
         assert_eq!(rect.get_property("width").to_number(), 200.0);
+    }
+
+    #[test]
+    fn block_in_inline_cssom_keeps_ordered_physical_fragments() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        host.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("before")])],
+        );
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block.clone()]);
+        host.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("after")])],
+        );
+
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        let before = rects.get_property("0");
+        let middle = rects.get_property("1");
+        let after = rects.get_property("2");
+        assert!(before.get_property("width").to_number() > 0.0);
+        assert!(before.get_property("width").to_number() < 400.0);
+        assert_eq!(middle.get_property("width").to_number(), 400.0);
+        assert_eq!(middle.get_property("height").to_number(), 10.0);
+        assert!(after.get_property("width").to_number() > 0.0);
+        assert!(after.get_property("width").to_number() < 400.0);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert!(bounds.get_property("height").to_number() > 10.0);
+
+        host.call_method("removeChild", vec![block.clone()]);
+        assert_eq!(
+            host.call_method("getClientRects", vec![])
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        host.call_method("appendChild", vec![block]);
+        assert_eq!(
+            host.call_method("getClientRects", vec![])
+                .get_property("length")
+                .to_u32(),
+            2
+        );
+    }
+
+    #[test]
+    fn block_in_inline_block_flex_grid_and_positioned_matrix() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        for (display, width, height) in [
+            ("block", 20.0, 10.0),
+            ("flex", 30.0, 11.0),
+            ("grid", 40.0, 12.0),
+        ] {
+            let outer = create_in_body("div");
+            outer
+                .get_property("style")
+                .set_property("width", Value::string("400px"));
+            let host = document.call_method("createElement", vec![Value::string("span")]);
+            outer.call_method("appendChild", vec![host.clone()]);
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            style.set_property("display", Value::string(display));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+            host.call_method("appendChild", vec![child]);
+
+            let rects = host.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_u32(), 3, "{display}");
+            for edge in ["0", "2"] {
+                let rect = rects.get_property(edge);
+                assert_eq!(rect.get_property("width").to_number(), 0.0, "{display}");
+                assert_eq!(rect.get_property("height").to_number(), 0.0, "{display}");
+            }
+            let middle = rects.get_property("1");
+            assert_eq!(middle.get_property("width").to_number(), 400.0, "{display}");
+            assert_eq!(
+                middle.get_property("height").to_number(),
+                height,
+                "{display}"
+            );
+        }
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        for (width, height) in [(20.0, 10.0), (30.0, 11.0)] {
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            style.set_property("display", Value::string("block"));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+            host.call_method("appendChild", vec![child]);
+        }
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        assert_eq!(
+            rects.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        assert_eq!(
+            rects.get_property("1").get_property("height").to_number(),
+            21.0
+        );
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        let nested = document.call_method("createElement", vec![Value::string("span")]);
+        nested.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("nested")])],
+        );
+        block.call_method("appendChild", vec![nested]);
+        host.call_method("appendChild", vec![block]);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert_eq!(bounds.get_property("height").to_number(), 10.0);
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        let host_style = host.get_property("style");
+        host_style.set_property("padding", Value::string("2px"));
+        host_style.set_property("border", Value::string("1px solid black"));
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block]);
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert!(bounds.get_property("height").to_number() >= 10.0);
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let positioned = document.call_method("createElement", vec![Value::string("div")]);
+        let style = positioned.get_property("style");
+        style.set_property("position", Value::string("absolute"));
+        style.set_property("width", Value::string("50px"));
+        style.set_property("height", Value::string("13px"));
+        host.call_method("appendChild", vec![positioned]);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 0.0);
+        assert_eq!(bounds.get_property("height").to_number(), 0.0);
     }
 
     #[test]

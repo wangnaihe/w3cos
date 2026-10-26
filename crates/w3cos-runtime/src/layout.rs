@@ -1184,6 +1184,7 @@ pub struct ScrollExtent {
 // ---------------------------------------------------------------------------
 
 pub struct FlatNodeInfo<'a> {
+    pub component: Option<&'a Component>,
     /// Stable identity for this compiled tree slot across reactive rebuilds.
     /// The compiler keeps conditional branches mounted and only toggles
     /// display, so a structural path is stable even when visibility changes.
@@ -1630,7 +1631,7 @@ fn atomic_inline_intrinsic_width(component: &Component, minimum: bool) -> Option
     Some(widest.max(advance).max(0.0))
 }
 
-fn component_max_content_width(component: &Component) -> f32 {
+pub(crate) fn component_max_content_width(component: &Component) -> f32 {
     #[cfg(feature = "skia")]
     let contextual_widths =
         if component.children.len() >= 3 || component.style.white_space == WWhiteSpace::Pre {
@@ -4658,6 +4659,7 @@ fn pre_flatten_recursive<'a>(
 ) {
     let my_idx = out.len();
     out.push(FlatNodeInfo {
+        component: Some(comp),
         stable_id,
         kind: &comp.kind,
         style: &comp.style,
