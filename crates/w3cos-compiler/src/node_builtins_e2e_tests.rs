@@ -159,6 +159,7 @@ const cp = Buffer.alloc(6, "."); console.log("copy", Buffer.from("xyz").copy(cp,
 console.log("inspect", require("util").inspect(Buffer.from("hi")), Buffer.from("hi").inspect());
 console.log("ab", Buffer.from(new Uint8Array([1, 2, 3]).buffer, 1).toString("hex"), Buffer.from(Buffer.from("x")).toString(), Object.prototype.toString.call(b));
 console.log("fill", Buffer.alloc(4).fill("ab").toString(), Buffer.alloc(4).fill(0x41, 1, 3).toString("hex"), typeof Buffer.poolSize, require("node:buffer").kMaxLength > 0);
+const big = Buffer.concat([Buffer.alloc(300000, 1), Buffer.alloc(300000, 2)]); const cq = Buffer.alloc(4, "."); console.log("bulk", big.length, big[299999], big[300000], big[599999], Buffer.from("abcdef").copy(cq, 1, 2), cq.toString(), Buffer.from("ab").copy(cq, 9), Buffer.from("abc").copy(cq, 0, 3), Buffer.concat([Buffer.from("abc"), Buffer.from("def")], 4).toString());
 "##;
 
 /// `node main.cjs` (v20.19.2).
@@ -179,6 +180,7 @@ copy 3 ..xyz. badc dcba
 inspect <Buffer 68 69> <Buffer 68 69>
 ab 0203 x [object Uint8Array]
 fill abab 00414100 number true
+bulk 600000 1 2 2 3 .cde 0 0 abcd
 "##;
 
 #[test]

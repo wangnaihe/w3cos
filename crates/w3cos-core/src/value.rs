@@ -657,6 +657,14 @@ impl ArrayStorage {
         self.refresh_heap_accounting();
     }
 
+    /// Overwrite one existing slot; out-of-range indexes are ignored. The
+    /// capacity is unchanged, so heap accounting needs no refresh.
+    pub(crate) fn set_value(&mut self, index: usize, value: Value) {
+        if let Some(slot) = self.values.get_mut(index) {
+            *slot = value;
+        }
+    }
+
     pub(crate) fn push(&mut self, value: Value) {
         self.values.push(value);
         self.refresh_heap_accounting();
