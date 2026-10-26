@@ -858,6 +858,9 @@ pub struct EsmResolver {
     /// ES-module worker entries the app declares (`package.json`
     /// `"w3cos": { "workers": [...] }`), linked as lazy roots.
     esm_worker_entries: RefCell<Vec<PathBuf>>,
+    /// Packages the app keeps out of the compiled graph (`package.json`
+    /// `"w3cos": { "exclude": [...] }`); see [`Self::is_excluded_dynamic_import`].
+    excluded_packages: std::cell::OnceCell<Vec<String>>,
 }
 
 impl EsmResolver {
@@ -876,7 +879,42 @@ impl EsmResolver {
             worker_entries: RefCell::new(Vec::new()),
             esm_worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
+            excluded_packages: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Whether a bare `import(specifier)` names a package the app excludes:
+    ///
+    /// ```json
+    /// "w3cos": { "exclude": ["playwright-core"] }
+    /// ```
+    ///
+    /// Code-OSS lazily imports `playwright-core` (a 3 MB esbuild bundle that
+    /// compiles to ~185 MB of Rust) for an optional feature; excluded
+    /// packages are not linked and `import()` of them rejects with
+    /// `ERR_MODULE_NOT_FOUND`, as for any module missing from the build.
+    fn is_excluded_dynamic_import(&self, specifier: &str) -> bool {
+        let excluded = self.excluded_packages.get_or_init(|| {
+            let manifest = self.project_root.join("package.json");
+            std::fs::read_to_string(manifest)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|json| {
+                    json.get("w3cos")?.get("exclude")?.as_array().map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default()
+        });
+        excluded.iter().any(|name| {
+            specifier == name
+                || specifier
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 
     pub fn with_runtime_modules(mut self, specifiers: impl IntoIterator<Item = String>) -> Self {
@@ -1243,6 +1281,7 @@ impl EsmResolver {
         if is_asset_import(specifier)
             || is_host_module(specifier)
             || self.is_runtime_module(specifier)
+            || self.is_excluded_dynamic_import(specifier)
         {
             return;
         }

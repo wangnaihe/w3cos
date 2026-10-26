@@ -734,7 +734,9 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
             load = load,
         ));
     }
-    fallback.push_str("{ w3cos_core::Value::Undefined } }");
+    // Not in the compiled graph (unlinked, or excluded via `"w3cos":
+    // { "exclude": [...] }`): reject like a missing module.
+    fallback.push_str("{ return w3cos_core::intrinsics::promise_reject(vec![w3cos_core::module_registry::module_not_found(__s)]); } }");
     format!(
         " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}_ => {fallback}, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
     )
