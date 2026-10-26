@@ -21,6 +21,9 @@ pub const WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-width-keyword";
 /// `height` / `min-height` / `max-height` intrinsic keyword. The dimension
 /// is left untouched so legacy layout keeps the value it already stored.
 pub const HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-height-keyword";
+/// `min-width: min-content | max-content | fit-content`; `min_width` stays
+/// auto and layouts that do not resolve the keyword ignore it.
+pub const MIN_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-width-keyword";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
@@ -655,10 +658,18 @@ impl CSSStyleDeclaration {
                 }
             }
             "min-width" | "minWidth" => {
-                if let Some(value) =
+                let keyword = value.trim().to_ascii_lowercase();
+                if matches!(
+                    keyword.as_str(),
+                    "max-content" | "min-content" | "fit-content"
+                ) {
+                    self.inner.min_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.min_width = value;
+                    set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "min-height" | "minHeight" => {

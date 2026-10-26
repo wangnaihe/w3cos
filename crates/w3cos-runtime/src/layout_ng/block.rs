@@ -49,6 +49,7 @@ const SIZE_CONTAINMENT: &str = "--w3cos-internal-size-containment";
 const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width is auto).
 const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
+pub(super) const MIN_WIDTH_KEYWORD: &str = "--w3cos-internal-min-width-keyword";
 
 fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
@@ -273,6 +274,9 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                     // the cascade kept the keyword (legacy does the same).
                     // TODO: Blink ComputeInlineSizeForFragment keywords.
                     && key != WIDTH_KEYWORD
+                    // Grid items resolve min-width keywords; elsewhere
+                    // min-width stays auto, as before the cascade kept them.
+                    && key != MIN_WIDTH_KEYWORD
             })
         })
         .then_some("internal-marker")

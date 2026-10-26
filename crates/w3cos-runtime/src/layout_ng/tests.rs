@@ -2895,7 +2895,7 @@ fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
     );
     let ordinary_flat = pre_flatten(&ordinary);
     assert!(
-        block::unsupported_reasons(&ordinary_flat)
+        !block::unsupported_reasons(&ordinary_flat)
             .iter()
             .any(|reason| *reason == "grid:intrinsic-track"),
         "{:?}",
