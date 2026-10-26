@@ -689,3 +689,44 @@ function g(ch) { return ch?.startsWith("vs"); } console.log("6", g("vsx"));
         ]
     );
 }
+
+#[test]
+/// An anonymous `export default function () {}` is recorded by codegen as
+/// `__w3cos_default_export_N` while W3IR binds it as `*default:N*`; both must
+/// name the same function (zod `v4/locales/*.js`).
+fn anonymous_default_export_function_is_emitted_from_w3ir() {
+    let root = write_fixture(
+        "w3cos_anon_default_fn",
+        &[
+            ("package.json", r#"{"name":"adf","type":"module"}"#),
+            (
+                "locale.mjs",
+                r#"import { helper } from "./util.mjs";
+const error = () => { return (issue) => helper(issue); };
+export default function () {
+  return { localeError: error() };
+}
+"#,
+            ),
+            (
+                "util.mjs",
+                "export function helper(x) { return \"msg:\" + x; }\n",
+            ),
+            (
+                "gen.mjs",
+                "export default function* () { yield 1; yield 2; }\n",
+            ),
+            (
+                "main.mjs",
+                r#"import locale from "./locale.mjs";
+import gen from "./gen.mjs";
+console.log("1", typeof locale, locale().localeError("x"));
+console.log("2", [...gen()].join(","));
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_anon_default_fn");
+    assert_eq!(lines, vec!["1 function msg:x", "2 1,2"]);
+    std::fs::remove_dir_all(root).ok();
+}
