@@ -2687,11 +2687,42 @@ fn proven_string_keys(instructions: &[Instruction], index: usize) -> HashMap<u32
 }
 
 fn analyze_and_warn(function: &Function, specifier: Option<&str>) -> UniqueBackEdgePlan {
-    let plan = analyze_unique_back_edges(function, specifier);
+    let mut plan = analyze_unique_back_edges(function, specifier);
+    // A weakened capture is a snapshot read through a WeakRef with no
+    // setter: a binding that is ever reassigned (`let p = load();
+    // p.then(() => { p = undefined; })`) must stay a shared cell.
+    if !plan.weak_captures.is_empty() {
+        let reassigned = reassigned_bindings(function);
+        plan.weak_captures
+            .retain(|(_, binding)| !reassigned.contains(&binding.0));
+    }
     for warning in &plan.warnings {
         eprintln!("warning: {warning}");
     }
     plan
+}
+
+/// Binding ids that some `StoreBinding` (ordinary assignment, not the
+/// declaration's `InitializeBinding`) writes, in `function` or anywhere in
+/// the module being emitted.
+fn reassigned_bindings(function: &Function) -> HashSet<u32> {
+    fn collect(function: &Function, out: &mut HashSet<u32>) {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                if let Instruction::StoreBinding { binding, .. } = instruction {
+                    out.insert(binding.0);
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    collect(function, &mut out);
+    MODULE_FUNCTIONS.with(|functions| {
+        for other in functions.borrow().iter() {
+            collect(other, &mut out);
+        }
+    });
+    out
 }
 
 /// Emit a native synchronous-generator factory for one W3IR function.
