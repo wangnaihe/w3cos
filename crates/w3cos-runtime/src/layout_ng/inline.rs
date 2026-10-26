@@ -468,9 +468,11 @@ fn text_content_reason(content: &str, newline_ok: bool, tabs_ok: bool) -> Option
 /// text-align).  The leaf's measured advance and paint then both resolve
 /// the stops from offset 0: one `pre` LTR line, and the block's stops
 /// equal the leaf's own (`block` is the leaf's own style for a block text
-/// leaf).  pre-wrap tabs hang at soft wraps and other offsets need the
+/// leaf).  Items past the first line (after a forced break) need their own
 /// line position: legacy.
 fn preserved_tabs_ok(content: &str, style: &Style, block: &Style) -> bool {
+    // (pre-wrap: paint resolves block tab stops from the line box only for
+    // `pre` text, InlineLineContext.)
     style.white_space == WhiteSpace::Pre
         && style.direction == TextDirection::Ltr
         && block.direction == TextDirection::Ltr
@@ -594,7 +596,7 @@ fn inline_text_reason(
     content: &str,
     style: &Style,
     sole: bool,
-    line_start: bool,
+    first_line: bool,
     container: &Style,
 ) -> Option<&'static str> {
     if style.display != Display::Inline {
@@ -661,9 +663,9 @@ fn inline_text_reason(
             }
             _ => false,
         };
-    // (`line_start`: the IFC's first entry, so its tabs resolve from the
-    // first line's start like a sole leaf's.)
-    let tabs_ok = (sole || line_start) && preserved_tabs_ok(content, style, container);
+    // (`first_line`: the item's line offset is known when items are built;
+    // see `tab_item_advance`.)
+    let tabs_ok = (sole || first_line) && preserved_tabs_ok(content, style, container);
     if let Some(reason) = text_content_reason(content, newline_ok, tabs_ok) {
         return Some(reason);
     }
@@ -1056,9 +1058,15 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if info.style.white_space != style.white_space {
             return Some("text:white-space");
         }
-        let line_start =
-            matches!(entries.first(), Some(InlineEntry::Leaf(first)) if *first == child);
-        if let Some(reason) = inline_text_reason(content, info.style, sole, line_start, style) {
+        // On the first line (no forced break or preserved newline in an
+        // earlier leaf), a `pre` line never soft-wraps, so the item's line
+        // offset is the advance of everything before it.
+        let first_line = !entries[..position].iter().any(|entry| {
+            matches!(entry, InlineEntry::Leaf(earlier)
+                if matches!(&flat[*earlier].kind, ComponentKind::Text { content }
+                    if content.contains(['\n', '\r', '\u{2028}', '\u{2029}'])))
+        });
+        if let Some(reason) = inline_text_reason(content, info.style, sole, first_line, style) {
             return Some(reason);
         }
         if content != FORCED_BREAK && content.contains('\u{2028}') {
@@ -1293,6 +1301,35 @@ fn same_run(a: &Style, b: &Style) -> bool {
         && a.font_variant == b.font_variant
         && a.letter_spacing == b.letter_spacing
         && a.word_spacing == b.word_spacing
+}
+
+/// A text item holding preserved tabs (the gate keeps it on the first line
+/// of a `pre` LTR IFC): Blink shapes the tab from the item's line position
+/// (HarfBuzzShaper tab stops from the text run's x position), so its
+/// advance is measured from the end of the earlier items plus the item's
+/// own start edges.  Paint resolves the same stops from the run's x in the
+/// line box.
+fn tab_item_advance(
+    content: &str,
+    style: &Style,
+    container: &Style,
+    earlier: &[InlineItem],
+    start_edges: f32,
+) -> Option<f32> {
+    if !content.contains('\t') || earlier.iter().any(|item| item.forced) {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    {
+        let offset = earlier.iter().map(|item| item.raw).sum::<f32>() + start_edges;
+        crate::render_skia::preserved_tab_advance_in_block(content, style, container, offset)
+    }
+    // Without Skia tabs are measured from the line start (no stops).
+    #[cfg(not(feature = "skia"))]
+    {
+        let _ = (style, container, start_edges);
+        None
+    }
 }
 
 /// Raw in-context advances of one run's pieces (Skia shapes the run once);
@@ -2087,16 +2124,20 @@ pub(super) fn layout_inline_beside(
                 }
             });
             let measure = bare.as_ref().unwrap_or(style);
+            let k = start + offset;
+            let box_start = start_edges(&opens[k]);
+            let box_end = end_edges(&closes[k]);
             let text_raw = if content == FORCED_BREAK {
                 0.0
+            } else if let Some(advance) =
+                tab_item_advance(content, measure, container, &items, box_start + edges.start)
+            {
+                advance
             } else if bare.is_some() {
                 text_intrinsic_size(content, measure).0
             } else {
                 advances[offset]
             };
-            let k = start + offset;
-            let box_start = start_edges(&opens[k]);
-            let box_end = end_edges(&closes[k]);
             let raw = text_raw + inline_edges + box_start + box_end;
             let (height, baseline) = text_line_metrics(content, style);
             let parent = parents[k].map_or(container, |b| flat[b].style);
@@ -2345,6 +2386,18 @@ pub(super) fn layout_inline_beside(
         opportunities.push((line_top, opportunity.0, opportunity.1));
     }
     debug_assert_eq!(lines.len(), opportunities.len());
+    // Tab advances were measured from the first line's start (see
+    // `tab_item_advance`): a wrapped (pre-wrap) or float-shifted tab item
+    // needs its own line position.
+    let has_tab = |i: &usize| {
+        matches!(&flat[items[*i].index].kind, ComponentKind::Text { content }
+            if content.contains('\t'))
+    };
+    if lines.iter().skip(1).flatten().any(has_tab)
+        || (floats.is_some() && lines.iter().flatten().any(has_tab))
+    {
+        return super::bail("text:tab-wrapped");
+    }
     if floats.is_some()
         && paint_rewraps_beside_floats(flat, &children)
         && opportunities
@@ -2771,7 +2824,7 @@ mod tab_tests {
     use super::*;
 
     #[test]
-    fn preserved_tabs_stay_on_ng_only_from_the_line_start_of_one_pre_line() {
+    fn preserved_tabs_stay_on_ng_only_on_the_first_line() {
         let pre = Style {
             white_space: WhiteSpace::Pre,
             ..Style::default()
@@ -2780,13 +2833,18 @@ mod tab_tests {
         assert_eq!(text_content_reason("a\tb", false, true), None);
         assert_eq!(text_content_reason("a\tb", false, false), Some("text:tab"));
         assert!(supported_script_in("\tP", false));
-        // pre-wrap tabs hang at soft wraps; a preserved newline starts a line
-        // whose stops NG does not resolve yet.
+        // pre-wrap tabs: paint resolves line-box stops only for `pre`; a
+        // preserved newline starts a line whose stops NG does not resolve.
         let pre_wrap = Style {
             white_space: WhiteSpace::PreWrap,
             ..Style::default()
         };
         assert!(!preserved_tabs_ok("a\tb", &pre_wrap, &pre_wrap));
+        assert_eq!(
+            block_text_content_reason("a\tb", &pre_wrap),
+            Some("text:tab")
+        );
+        assert_eq!(block_text_content_reason("a\tb", &pre), None);
         assert!(!preserved_tabs_ok("a\n\tb", &pre, &pre));
         // Paint offsets the stops by the line's alignment shift.
         let centered = Style {
