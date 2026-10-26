@@ -823,3 +823,62 @@ fn electron_declared_esm_utility_process_and_computed_import() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Code-OSS posts the shared process's configuration right after
+/// `utilityProcess.fork()`; the child only listens (`parentPort.once`) once
+/// its entry module has loaded. Electron's ParentPort queues messages until a
+/// 'message' listener is added and pauses again when the last one goes.
+const PARENT_PORT_QUEUE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-parent-port-queue", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, utilityProcess } = require('electron')
+const path = require('node:path')
+app.whenReady().then(() => {
+  const child = utilityProcess.fork(path.join(__dirname, 'child.js'))
+  child.postMessage('first')
+  child.postMessage('second')
+  child.on('message', (message) => {
+    console.log('main got', message)
+    if (message === 'done') child.kill()
+  })
+  child.on('exit', () => app.quit())
+})
+"#,
+    ),
+    (
+        "child.js",
+        r#"setTimeout(() => {
+  process.parentPort.once('message', (event) => {
+    process.parentPort.postMessage('once ' + event.data)
+    setTimeout(() => {
+      process.parentPort.on('message', (later) => {
+        process.parentPort.postMessage('on ' + later.data)
+        process.parentPort.postMessage('done')
+      })
+    }, 20)
+  })
+}, 20)
+"#,
+    ),
+];
+
+#[test]
+fn electron_parent_port_queues_messages_until_a_listener_is_added() {
+    let root = write_fixture("w3cos_electron_parent_port_queue", PARENT_PORT_QUEUE);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_parent_port_queue",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        ["main got once first", "main got on second", "main got done"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

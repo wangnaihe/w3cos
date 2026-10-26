@@ -33,7 +33,37 @@ function setUpUtilityProcess() {
   proc.type = 'utility';
   proc.argv = [proc.execPath, context.path].concat(Array.isArray(data.args) ? data.args : []);
   const { setImmediate } = require('timers');
+  // Electron's ParentPort queues incoming messages until a 'message'
+  // listener is added and pauses again once the last one is removed, so a
+  // child that registers `parentPort.once('message')` after an `await`
+  // still gets what the main process posted right after fork().
   const port = new EventEmitter();
+  const incoming = [];
+  let flowing = false;
+  let draining = false;
+  function drain() {
+    if (!flowing || draining || incoming.length === 0) return;
+    draining = true;
+    setImmediate(() => {
+      draining = false;
+      if (!flowing || incoming.length === 0) return;
+      port.emit('message', incoming.shift());
+      drain();
+    });
+  }
+  function enqueue(event) {
+    incoming.push(event);
+    drain();
+  }
+  port.on('newListener', (event) => {
+    if (event === 'message' && port.listenerCount('message') === 0) {
+      flowing = true;
+      drain();
+    }
+  });
+  port.on('removeListener', (event) => {
+    if (event === 'message' && port.listenerCount('message') === 0) flowing = false;
+  });
   port.postMessage = function postMessage(message) {
     threads.parentPort.postMessage(message);
   };
@@ -91,9 +121,9 @@ function setUpUtilityProcess() {
   threads.parentPort.on('message', (message) => {
     const envelope = message !== null && typeof message === 'object' ? message.__w3cosPort : undefined;
     if (envelope === undefined) {
-      port.emit('message', { data: message, ports: [] });
+      enqueue({ data: message, ports: [] });
     } else if (envelope === 'transfer') {
-      port.emit('message', { data: message.message, ports: message.ids.map((id) => new TransferredPort(id)) });
+      enqueue({ data: message.message, ports: message.ids.map((id) => new TransferredPort(id)) });
     } else {
       const target = transferred.get(message.id);
       if (target === undefined) return;
