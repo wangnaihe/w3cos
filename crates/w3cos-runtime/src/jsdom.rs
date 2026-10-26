@@ -23242,6 +23242,79 @@ mod tests {
     }
 
     #[test]
+    fn fresh_dom_rect_preserves_hit_guard_until_public_prototype_change() {
+        setup();
+        seal_dom_shape_baseline();
+        let document = document_value();
+        let body = document.get_property("body");
+        let root = document.call_method("createElement", vec![Value::string("div")]);
+        let _ = body.call_method("appendChild", vec![root.clone()]);
+        let nodes = Value::array(Vec::new());
+        assert!(surface_ok(&document, &root, Some(&nodes)));
+
+        // Initialize the geometry class before sampling the guarded DOM shape.
+        let _ = crate::geometry_web::class("DOMRect");
+        let epoch = w3cos_core::intrinsics::dom_shape_epoch();
+        let first = w3cos_core::intrinsics::dom_build_guarded(
+            &document,
+            &root,
+            "div",
+            u32::MAX,
+            "row-",
+            0.0,
+            "row",
+            u32::MAX,
+            "item ",
+            0.0,
+            epoch,
+        );
+        assert!(!first.is_undefined(), "the guarded path must be hit first");
+
+        let rect = crate::geometry_web::rect(8.0, 9.0, 20.0, 12.0);
+        assert_eq!(w3cos_core::intrinsics::dom_shape_epoch(), epoch);
+        let second = w3cos_core::intrinsics::dom_build_guarded(
+            &document,
+            &root,
+            "div",
+            u32::MAX,
+            "row-",
+            1.0,
+            "row",
+            u32::MAX,
+            "item ",
+            1.0,
+            epoch,
+        );
+        assert!(
+            !second.is_undefined(),
+            "fresh DOMRect initialization must preserve the hit guard"
+        );
+        assert_eq!(second.get_property("id").to_js_string(), "row-1");
+
+        let replacement = Value::object(HashMap::from([("marker".into(), Value::Number(17.0))]));
+        w3cos_core::class::set_prototype_of(&rect, &replacement);
+        assert_ne!(w3cos_core::intrinsics::dom_shape_epoch(), epoch);
+        assert_eq!(rect.get_property("marker"), Value::Number(17.0));
+        let refused = w3cos_core::intrinsics::dom_build_guarded(
+            &document,
+            &root,
+            "div",
+            u32::MAX,
+            "row-",
+            2.0,
+            "row",
+            u32::MAX,
+            "item ",
+            2.0,
+            epoch,
+        );
+        assert!(
+            refused.is_undefined(),
+            "public prototype mutation must invalidate the sampled guard"
+        );
+    }
+
+    #[test]
     fn fused_create_surface_rejects_observable_overrides() {
         let reject = |mutate: fn(&Value, &Value, &Value)| {
             setup();
