@@ -306,7 +306,9 @@ Buffer.concat = function concat(list, totalLength) {
   let offset = 0;
   for (let i = 0; i < list.length && offset < totalLength; i++) {
     const item = list[i];
-    for (let j = 0; j < item.length && offset < totalLength; j++) out[offset++] = item[j];
+    const take = Math.min(item.length, totalLength - offset);
+    out.set(take === item.length ? item : item.subarray(0, take), offset);
+    offset += take;
   }
   return out;
 };
@@ -386,10 +388,8 @@ proto.copy = function copy(target, targetStart, sourceStart, sourceEnd) {
   targetStart = targetStart === undefined ? 0 : targetStart;
   sourceStart = sourceStart === undefined ? 0 : sourceStart;
   sourceEnd = sourceEnd === undefined ? this.length : Math.min(sourceEnd, this.length);
-  let count = 0;
-  const values = [];
-  for (let i = sourceStart; i < sourceEnd && targetStart + count < target.length; i++, count++) values.push(this[i]);
-  for (let i = 0; i < values.length; i++) target[targetStart + i] = values[i];
+  const count = Math.max(0, Math.min(sourceEnd - sourceStart, target.length - targetStart));
+  if (count > 0) target.set(this.subarray(sourceStart, sourceStart + count), targetStart);
   return count;
 };
 

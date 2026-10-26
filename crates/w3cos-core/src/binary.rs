@@ -570,7 +570,7 @@ pub fn fill_array_buffer_view(view: &Value, source: &[u8]) -> Option<Value> {
         None => source.len().min(byte_length),
     };
     bytes.borrow_mut()[offset..offset + written].copy_from_slice(&source[..written]);
-    sync_views(&bytes);
+    sync_views_range(&bytes, offset, offset + written);
     Some(slice_array_buffer_view(view, written).unwrap_or_else(|| view.clone()))
 }
 
@@ -859,6 +859,72 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     });
 }
 
+/// Refresh only the elements of aliasing views that overlap the changed
+/// byte range `[start, end)`. Element writes (`view[i] = x`, DataView
+/// setters, Atomics) touch a few bytes; re-decoding every aliasing view in
+/// full made a byte-at-a-time copy loop quadratic in the buffer size.
+fn sync_views_range(changed: &Rc<RefCell<Vec<u8>>>, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    VIEWS.with(|views| {
+        let views = views.borrow();
+        let bytes = changed.borrow();
+        for view in views.iter() {
+            if !Rc::ptr_eq(&view.bytes, changed) {
+                continue;
+            }
+            let width = view.kind.bytes();
+            let view_end = view.offset + view.length * width;
+            let lo = start.max(view.offset);
+            let hi = end.min(view_end);
+            if lo >= hi {
+                continue;
+            }
+            let Some(storage) = view.storage.upgrade() else {
+                continue;
+            };
+            let first = (lo - view.offset) / width;
+            let last = (hi - view.offset).div_ceil(width).min(view.length);
+            let mut storage = storage.borrow_mut();
+            for index in first..last {
+                let from = view.offset + index * width;
+                if from + width <= bytes.len() {
+                    storage.set_value(index, view.kind.decode(&bytes[from..from + width]));
+                }
+            }
+        }
+    });
+}
+
+/// Encode `items` into consecutive elements starting at `first` and refresh
+/// the aliasing views once for the whole range (`set`, `fill`).
+fn write_typed_elements(
+    buffer: &Value,
+    offset: usize,
+    kind: Kind,
+    first: usize,
+    items: Vec<Value>,
+) {
+    let Some(bytes) = buffer_state(buffer) else {
+        return;
+    };
+    let width = kind.bytes();
+    let start = offset + first * width;
+    let mut end = start;
+    {
+        let mut data = bytes.borrow_mut();
+        for item in &items {
+            if end + width > data.len() {
+                break;
+            }
+            data[end..end + width].copy_from_slice(&kind.encode(item));
+            end += width;
+        }
+    }
+    sync_views_range(&bytes, start, end);
+}
+
 fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     let bytes = buffer_state(&buffer).expect("typed-array buffer");
     let values = {
@@ -873,7 +939,13 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     let value = Value::array(values);
     let storage = value.as_array().expect("typed array storage");
     VIEWS.with(|views| {
-        views.borrow_mut().push(View {
+        let mut views = views.borrow_mut();
+        // Element writes refresh aliasing views without sweeping the list,
+        // so drop collected views here at doubling sizes (amortized O(1)).
+        if views.len() >= 64 && views.len().is_power_of_two() {
+            views.retain(|view| view.storage.upgrade().is_some());
+        }
+        views.push(View {
             storage: storage.downgrade(),
             buffer,
             bytes,
@@ -1171,9 +1243,7 @@ pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>
             {
                 binary_error("RangeError", "TypedArray source does not fit in the target");
             }
-            for (index, item) in source.into_iter().enumerate() {
-                set_typed_array_index(value, target + index, item);
-            }
+            write_typed_elements(&buffer, offset, kind, target, source);
             Value::Undefined
         }
         "subarray" => {
@@ -1191,9 +1261,13 @@ pub(crate) fn typed_array_call_method(value: &Value, key: &str, args: Vec<Value>
             let start = normalize_index(args.get(1), length, 0);
             let end = normalize_index(args.get(2), length, length).max(start);
             let item = argument(0);
-            for index in start..end {
-                set_typed_array_index(value, index, item.clone());
-            }
+            write_typed_elements(
+                &buffer,
+                offset,
+                kind,
+                start,
+                std::iter::repeat_n(item, end - start).collect(),
+            );
             value.clone()
         }
         "copyWithin" => {
@@ -1368,7 +1442,7 @@ pub fn set_typed_array_index(value: &Value, index: usize, item: Value) -> bool {
         return true;
     }
     bytes.borrow_mut()[start..start + kind.bytes()].copy_from_slice(&encoded);
-    sync_views(&bytes);
+    sync_views_range(&bytes, start, start + kind.bytes());
     true
 }
 
@@ -1656,7 +1730,7 @@ fn write_data(
         encoded.reverse();
     }
     bytes.borrow_mut()[offset..offset + encoded.len()].copy_from_slice(&encoded);
-    sync_views(bytes);
+    sync_views_range(bytes, offset, offset + encoded.len());
 }
 
 pub fn data_view_class() -> Value {
@@ -1807,6 +1881,63 @@ mod tests {
             view.call_method("getUint16", vec![Value::Number(4.0), Value::Bool(false)])
                 .to_number(),
             0xabcd as f64
+        );
+    }
+
+    #[test]
+    fn element_writes_refresh_only_overlapping_aliases_and_stay_linear() {
+        let buffer = crate::class::construct(&array_buffer_class(), vec![Value::Number(8.0)]);
+        let bytes = crate::class::construct(&typed_array_class("Uint8Array"), vec![buffer.clone()]);
+        let tail = crate::class::construct(
+            &typed_array_class("Uint8Array"),
+            vec![buffer.clone(), Value::Number(5.0), Value::Number(3.0)],
+        );
+        let words = crate::class::construct(
+            &typed_array_class("Uint16Array"),
+            vec![buffer.clone(), Value::Number(2.0), Value::Number(3.0)],
+        );
+        // `set` writes a run of bytes; the straddling Uint16 element and
+        // the offset Uint8 view both observe it.
+        bytes.call_method(
+            "set",
+            vec![
+                Value::array(vec![
+                    Value::Number(1.0),
+                    Value::Number(2.0),
+                    Value::Number(3.0),
+                ]),
+                Value::Number(4.0),
+            ],
+        );
+        assert_eq!(words.get_property("1").to_number(), 0x0201 as f64);
+        assert_eq!(words.get_property("2").to_number(), 3.0);
+        assert_eq!(tail.get_property("0").to_number(), 2.0);
+        assert_eq!(tail.get_property("1").to_number(), 3.0);
+        tail.call_method(
+            "fill",
+            vec![Value::Number(255.0), Value::Number(1.0), Value::Number(3.0)],
+        );
+        assert_eq!(bytes.get_property("6").to_number(), 255.0);
+        assert_eq!(bytes.get_property("7").to_number(), 255.0);
+        assert_eq!(words.get_property("2").to_number(), 0xffff as f64);
+        assert_eq!(bytes.get_property("4").to_number(), 1.0);
+
+        // A byte-at-a-time copy into a large aliased buffer used to
+        // re-decode every alias per write (quadratic); 256 KiB must be quick.
+        let size = 256 * 1024;
+        let big = crate::class::construct(
+            &typed_array_class("Uint8Array"),
+            vec![Value::Number(size as f64)],
+        );
+        let alias = big.call_method("subarray", vec![Value::Number(0.0)]);
+        let started = std::time::Instant::now();
+        for index in 0..size {
+            big.set_property(&index.to_string(), Value::Number((index % 251) as f64));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(
+            alias.get_property(&(size - 1).to_string()).to_number(),
+            ((size - 1) % 251) as f64
         );
     }
 
