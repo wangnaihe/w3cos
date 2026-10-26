@@ -8308,6 +8308,23 @@ impl Document {
                     );
                 }
                 if tag == "svg" {
+                    let mut style = style;
+                    for (name, property) in [
+                        ("width", crate::user_agent::SVG_WIDTH_PROPERTY),
+                        ("height", crate::user_agent::SVG_HEIGHT_PROPERTY),
+                    ] {
+                        if let Some((_, value)) = self
+                            .get_node(id)
+                            .attributes
+                            .iter()
+                            .find(|(key, _)| key.as_str().eq_ignore_ascii_case(name))
+                        {
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(property.into(), value.as_str().into());
+                        }
+                    }
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
                     let width = match style.width {
                         w3cos_std::style::Dimension::Px(width) => width,
@@ -11853,11 +11870,41 @@ impl Document {
         match tag {
             "svg" => {
                 let (width, height) = self.svg_root_size(id);
+                // The element's own attribute (`svg_attribute` also reads
+                // ancestors) as an HTML dimension.
+                let own_dimension = |name: &str| {
+                    self.get_node(id)
+                        .attributes
+                        .iter()
+                        .find(|(key, _)| key.as_str() == name)
+                        .and_then(|(_, value)| parse_html_dimension_attribute(value.as_str()))
+                };
                 if matches!(style.width, Dimension::Auto) {
                     let attribute_width = self
                         .svg_attribute(id, "width")
                         .and_then(|value| parse_html_dimension_attribute(&value));
                     style.width = attribute_width.unwrap_or(Dimension::Px(width));
+                    if own_dimension("width").is_none() {
+                        let mut marker = |property: &str| {
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(property.into(), "1".into());
+                        };
+                        marker(crate::user_agent::SVG_FALLBACK_WIDTH_PROPERTY);
+                        let auto_margin =
+                            matches!(style.margin.left, w3cos_std::style::Spacing::Auto)
+                                || matches!(style.margin.right, w3cos_std::style::Spacing::Auto);
+                        if auto_margin {
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(
+                                    crate::user_agent::SVG_AUTO_MARGIN_PROPERTY.into(),
+                                    "1".into(),
+                                );
+                        }
+                    }
                     if attribute_width.is_none() {
                         if matches!(style.margin.left, w3cos_std::style::Spacing::Auto) {
                             style.margin.left = w3cos_std::style::Spacing::Px(0.0);
@@ -11868,10 +11915,19 @@ impl Document {
                     }
                 }
                 if matches!(style.height, Dimension::Auto) {
-                    style.height = self
+                    let attribute_height = self
                         .svg_attribute(id, "height")
-                        .and_then(|value| parse_html_dimension_attribute(&value))
-                        .unwrap_or(Dimension::Px(height));
+                        .and_then(|value| parse_html_dimension_attribute(&value));
+                    style.height = attribute_height.unwrap_or(Dimension::Px(height));
+                    if own_dimension("height").is_none() {
+                        style
+                            .custom_properties
+                            .get_or_insert_with(Default::default)
+                            .insert(
+                                crate::user_agent::SVG_FALLBACK_HEIGHT_PROPERTY.into(),
+                                "1".into(),
+                            );
+                    }
                 }
             }
             "g" | "defs" => {

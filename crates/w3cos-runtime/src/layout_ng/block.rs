@@ -339,6 +339,7 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
             ComponentKind::Image { .. }
                 | ComponentKind::Canvas { .. }
                 | ComponentKind::TextInput { .. }
+                | ComponentKind::SvgDocument { .. }
         )
 }
 
@@ -554,6 +555,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     }
     if matches!(info.kind, ComponentKind::TextInput { .. }) {
         return text_field_box_reason(flat, index);
+    }
+    if let ComponentKind::SvgDocument { source, .. } = info.kind {
+        return svg_box_reason(flat, index, source);
     }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
         if !inline::in_inline_container(flat, index) {
@@ -834,8 +838,6 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
     }
 }
 
-/// Content-box size of a canvas. `None` when a percentage has no basis
-/// or `box-sizing` is `border-box` (that used size stays on legacy).
 /// The `<input>` type states laid out as a single-line text field (Blink
 /// LayoutTextControlSingleLine without a decoration or picker: no search
 /// cancel button, number spin button, or date / color picker).
@@ -1015,6 +1017,8 @@ fn text_field_baseline(style: &Style, content_height: f32) -> Option<f32> {
     )
 }
 
+/// Content-box size of a canvas. `None` when a percentage has no basis
+/// or `box-sizing` is `border-box` (that used size stays on legacy).
 fn canvas_content_size(
     attr_width: u32,
     attr_height: u32,
@@ -1299,6 +1303,7 @@ pub(super) fn replaced_inline_at_block(
     }
     let mut definite = flat[index].style.clone();
     definite.height = Dimension::Px(height);
+    override_replaced_axis(&mut definite, false);
     definite.min_height = Dimension::Auto;
     definite.max_height = Dimension::Auto;
     replaced_size(flat[index].kind, &definite, space).map(|(width, _)| width)
@@ -1313,6 +1318,7 @@ pub(super) fn is_replaced(kind: &ComponentKind) -> bool {
         ComponentKind::Image { .. }
             | ComponentKind::Canvas { .. }
             | ComponentKind::TextInput { .. }
+            | ComponentKind::SvgDocument { .. }
     )
 }
 
@@ -1329,8 +1335,358 @@ pub(super) fn replaced_size(
             canvas_content_size(*width, *height, style, space).why("canvas:size")
         }
         ComponentKind::TextInput { .. } => text_field_content_size(style, space),
+        ComponentKind::SvgDocument { source, .. } => {
+            svg_content_size(source, style, space).why("svg:size")
+        }
         _ => None,
     }
+}
+
+const SVG_WIDTH_MARKER: &str = "--w3cos-internal-svg-width";
+const SVG_HEIGHT_MARKER: &str = "--w3cos-internal-svg-height";
+/// The DOM's used width / height of an svg whose own attribute did not
+/// give one: a fallback size, read as auto here.
+const SVG_FALLBACK_WIDTH_MARKER: &str = "--w3cos-internal-svg-fallback-width";
+const SVG_FALLBACK_HEIGHT_MARKER: &str = "--w3cos-internal-svg-fallback-height";
+const SVG_MARKERS: [&str; 4] = [
+    SVG_WIDTH_MARKER,
+    SVG_HEIGHT_MARKER,
+    SVG_FALLBACK_WIDTH_MARKER,
+    SVG_FALLBACK_HEIGHT_MARKER,
+];
+
+/// `Some(Auto)` when the DOM put a fallback size on that axis of an svg
+/// (its used width/height is then not a specified size).
+fn svg_specified(style: &Style, width: bool) -> Option<Dimension> {
+    let marker = if width {
+        SVG_FALLBACK_WIDTH_MARKER
+    } else {
+        SVG_FALLBACK_HEIGHT_MARKER
+    };
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.get(marker).is_some())
+        .then_some(Dimension::Auto)
+}
+
+/// A layout override of an svg's width (or height) is a specified size:
+/// the DOM fallback no longer applies on that axis.
+fn override_replaced_axis(style: &mut Style, width: bool) {
+    if let Some(props) = style.custom_properties.as_mut() {
+        props.remove(if width {
+            SVG_FALLBACK_WIDTH_MARKER
+        } else {
+            SVG_FALLBACK_HEIGHT_MARKER
+        });
+    }
+}
+
+/// Sizing attributes of an outer `<svg>` (Blink LayoutSVGRoot).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SvgRootSizing {
+    /// The width / height attributes as presentation sizes (Blink
+    /// SVGSVGElement::CollectStyleForPresentationAttribute maps them on
+    /// the outermost svg): `Auto` when absent.
+    width: Dimension,
+    height: Dimension,
+    /// Natural sizes: the absolute (non-percentage) attributes.
+    natural_width: Option<f32>,
+    natural_height: Option<f32>,
+    /// width:height when both natural sizes are non-empty, else the
+    /// viewBox size.
+    ratio: Option<f32>,
+}
+
+/// An svg length attribute as a CSS length. `Err` for a value whose
+/// unit this stage does not resolve (ex, ch, viewport units, calc, a
+/// negative or malformed length); an absent or empty one is auto.
+fn svg_length_attribute(value: &str, style: &Style) -> Result<Dimension, ()> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return Ok(Dimension::Auto);
+    }
+    let parsed = if let Some(percent) = value.strip_suffix('%') {
+        percent.trim().parse::<f32>().ok().map(Dimension::Percent)
+    } else if let Some(rem) = value.strip_suffix("rem") {
+        rem.trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| Dimension::Px(v * crate::layout::ROOT_FONT_SIZE))
+    } else if let Some(em) = value.strip_suffix("em") {
+        em.trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| Dimension::Px(v * style.font_size))
+    } else {
+        w3cos_std::style::parse_absolute_length_px(value).map(Dimension::Px)
+    };
+    match parsed {
+        Some(Dimension::Px(v)) | Some(Dimension::Percent(v)) if v.is_finite() && v >= 0.0 => {
+            Ok(parsed.unwrap())
+        }
+        _ => Err(()),
+    }
+}
+
+/// The outer svg element's sizing attributes from the serialized source.
+/// `None` for a length this stage does not resolve.
+fn svg_root_sizing(source: &str, style: &Style) -> Option<SvgRootSizing> {
+    let mut reader = quick_xml::Reader::from_reader(source.as_bytes());
+    let mut sizing = SvgRootSizing {
+        width: Dimension::Auto,
+        height: Dimension::Auto,
+        natural_width: None,
+        natural_height: None,
+        ratio: None,
+    };
+    // The DOM keeps the written width / height as markers; the source has
+    // a rasterization size in place of an absent one.
+    let props = style.custom_properties.as_ref();
+    for (property, slot) in [
+        (SVG_WIDTH_MARKER, &mut sizing.width),
+        (SVG_HEIGHT_MARKER, &mut sizing.height),
+    ] {
+        if let Some(value) = props.and_then(|props| props.get(property)) {
+            *slot = svg_length_attribute(value, style).ok()?;
+        }
+    }
+    let mut view_box = None;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(element))
+            | Ok(quick_xml::events::Event::Empty(element))
+                if element.local_name().as_ref() == b"svg" =>
+            {
+                for attribute in element.attributes().flatten() {
+                    let Ok(name) = std::str::from_utf8(attribute.key.as_ref()) else {
+                        continue;
+                    };
+                    let Ok(value) = attribute.decode_and_unescape_value(reader.decoder()) else {
+                        continue;
+                    };
+                    if name.eq_ignore_ascii_case("viewbox") {
+                        // An invalid viewBox is ignored (SVG 2 §8.2).
+                        let values = value
+                            .split(|c: char| c.is_ascii_whitespace() || c == ',')
+                            .filter(|v| !v.is_empty())
+                            .map(str::parse::<f32>)
+                            .collect::<Result<Vec<_>, _>>()
+                            .unwrap_or_default();
+                        if values.len() == 4 && values[2] > 0.0 && values[3] > 0.0 {
+                            view_box = Some(values[2] / values[3]);
+                        }
+                    }
+                }
+                break;
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+    let natural = |dim: Dimension| match dim {
+        Dimension::Px(v) => Some(v),
+        _ => None,
+    };
+    sizing.natural_width = natural(sizing.width);
+    sizing.natural_height = natural(sizing.height);
+    sizing.ratio = match (sizing.natural_width, sizing.natural_height) {
+        (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some(w / h),
+        _ => view_box,
+    };
+    Some(sizing)
+}
+
+/// An outer `<svg>` (Blink LayoutSVGRoot, a LayoutReplaced). Like a
+/// canvas, plus: an attribute size in a flex item stays on legacy (the
+/// flex algorithm reads only the author width/height, so it would
+/// stretch a presentation height), as does a CSS `aspect-ratio`.
+fn svg_box_reason(flat: &[FlatNodeInfo], index: usize, source: &str) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if style.box_sizing == BoxSizing::BorderBox || size_contained(style) {
+        return Some("svg:border-box-or-contain");
+    }
+    if style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.get("--w3cos-internal-aspect-ratio").is_some())
+    {
+        return Some("svg:aspect-ratio");
+    }
+    if svg_root_sizing(source, style).is_none() {
+        return Some("svg:length");
+    }
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some("svg:float-or-oof");
+    }
+    if info
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
+        return Some("svg:flex-grid-item");
+    }
+    if info
+        .parent
+        .is_some_and(|parent| is_author_flex(flat[parent].style))
+    {
+        if svg_specified(style, true).is_some() || svg_specified(style, false).is_some() {
+            return Some("svg:flex-fallback-size");
+        }
+        return unsupported_box_style(
+            style,
+            &[
+                inline::VALIGN_MARKER,
+                SVG_MARKERS[0],
+                SVG_MARKERS[1],
+                SVG_MARKERS[2],
+                SVG_MARKERS[3],
+            ],
+            true,
+        );
+    }
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("svg:beside-float");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => unsupported_box_style(
+            style,
+            &[
+                inline::VALIGN_MARKER,
+                SVG_MARKERS[0],
+                SVG_MARKERS[1],
+                SVG_MARKERS[2],
+                SVG_MARKERS[3],
+            ],
+            false,
+        ),
+        // An inline svg in an inline formatting context is an atomic
+        // inline (Blink LayoutSVGRoot is a LayoutReplaced).
+        Display::Inline | Display::InlineBlock if inline::in_inline_container(flat, index) => {
+            unsupported_box_style(
+                style,
+                &[
+                    SVG_MARKERS[0],
+                    SVG_MARKERS[1],
+                    SVG_MARKERS[2],
+                    SVG_MARKERS[3],
+                    inline::VALIGN_MARKER,
+                    inline::VALIGN_LENGTH_MARKER,
+                ],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
+        Display::Inline | Display::InlineBlock => Some("svg:inline"),
+        _ => Some("svg:display"),
+    }
+}
+
+/// Content-box size of an outer `<svg>`: the sizing behavior of Blink
+/// `LayoutSVGRoot::UnscaledIntrinsicSizingInfo` (checked in Chrome),
+/// written from SVG 2 §8.2 and CSS 2.1 10.3.2 / 10.6.2; no code is taken
+/// from layout_svg_root.cc (LGPL). The min/max step is
+/// `clamp_replaced_size` (Blink ComputeReplacedSizeInternal).
+///
+/// The width/height attributes are presentation sizes under the author
+/// ones. Natural sizes are the absolute attributes; the ratio is theirs,
+/// else the viewBox's. With only a ratio the inline size fills the
+/// available inline size (less margins, border, padding); with nothing
+/// the size is 300x150 (CSS 2.1 10.3.2). A percentage height without a
+/// definite basis is auto (CSS 2.1 10.5).
+fn svg_content_size(source: &str, style: &Style, space: &ConstraintSpace) -> Option<(f32, f32)> {
+    if style.box_sizing == BoxSizing::BorderBox {
+        return super::bail("svg:size");
+    }
+    let sizing = svg_root_sizing(source, style).why("svg:length")?;
+    let width = resolve_dim(
+        svg_specified(style, true).map_or(style.width, |_| sizing.width),
+        Some(space.available_inline),
+        style,
+        space,
+    );
+    let height = resolve_dim(
+        svg_specified(style, false).map_or(style.height, |_| sizing.height),
+        space.percentage_block,
+        style,
+        space,
+    );
+    let limit = |dim: Dimension, basis: Option<f32>| -> Option<Option<f32>> {
+        match dim {
+            Dimension::Auto => Some(None),
+            other => resolve_dim(other, basis, style, space).map(Some),
+        }
+    };
+    let limits = [
+        limit(style.min_width, Some(space.available_inline))?,
+        limit(style.max_width, Some(space.available_inline))?,
+        limit(style.min_height, space.percentage_block)?,
+        limit(style.max_height, space.percentage_block)?,
+    ];
+    let ratio = sizing.ratio;
+    let stretch = || {
+        let spacing = |s: Spacing| {
+            resolve_spacing_for_layout(
+                s,
+                space.available_inline,
+                style,
+                space.viewport_w,
+                space.viewport_h,
+            )
+        };
+        let b = border(style);
+        let edges = b[1]
+            + b[3]
+            + spacing(style.padding.left)
+            + spacing(style.padding.right)
+            + spacing(style.margin.left)
+            + spacing(style.margin.right);
+        (space.available_inline - edges).max(0.0)
+    };
+    let (natural_w, natural_h) = (sizing.natural_width, sizing.natural_height);
+    let unclamped = match (width, height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (
+            w,
+            ratio.map_or(natural_h.unwrap_or(150.0), |r| layout_unit(w / r)),
+        ),
+        (None, Some(h)) => (
+            ratio.map_or(natural_w.unwrap_or(300.0), |r| layout_unit(h * r)),
+            h,
+        ),
+        (None, None) => match (natural_w, natural_h, ratio) {
+            (Some(w), Some(h), _) => (w, h),
+            (Some(w), None, Some(r)) => (w, layout_unit(w / r)),
+            (None, Some(h), Some(r)) => (layout_unit(h * r), h),
+            (Some(w), None, None) => (w, 150.0),
+            (None, Some(h), None) => (300.0, h),
+            (None, None, Some(r)) => {
+                let w = layout_unit(stretch());
+                (w, layout_unit(w / r))
+            }
+            (None, None, None) => (300.0, 150.0),
+        },
+    };
+    Some(clamp_replaced_size(
+        unclamped,
+        ratio,
+        width.is_some(),
+        height.is_some(),
+        limits,
+    ))
 }
 
 /// Replaced size under min/max constraints.
@@ -1346,6 +1702,32 @@ fn constrained_replaced_size(
     src: &str,
     definite: &Style,
     containing: Option<f32>,
+    limits: [Option<f32>; 4],
+) -> (f32, f32) {
+    let mut auto = definite.clone();
+    auto.min_width = Dimension::Auto;
+    auto.max_width = Dimension::Auto;
+    auto.min_height = Dimension::Auto;
+    auto.max_height = Dimension::Auto;
+    // Used size before min/max, with the specified width/height applied.
+    let unclamped = crate::layout::image_intrinsic_size(src, &auto, containing);
+    let ratio = crate::layout::image_intrinsic_ratio(src);
+    clamp_replaced_size(
+        unclamped,
+        ratio,
+        definite.width != Dimension::Auto,
+        definite.height != Dimension::Auto,
+        limits,
+    )
+}
+
+/// The min/max step of `ComputeReplacedSizeInternal` on a used size
+/// `(w0, h0)` computed without min/max.
+fn clamp_replaced_size(
+    (w0, h0): (f32, f32),
+    ratio: Option<f32>,
+    width_given: bool,
+    height_given: bool,
     [min_w, max_w, min_h, max_h]: [Option<f32>; 4],
 ) -> (f32, f32) {
     let clamp = |v: f32, min: Option<f32>, max: Option<f32>| {
@@ -1355,17 +1737,7 @@ fn constrained_replaced_size(
     };
     let clamp_i = |v: f32| clamp(v, min_w, max_w);
     let clamp_b = |v: f32| clamp(v, min_h, max_h);
-    let mut auto = definite.clone();
-    auto.min_width = Dimension::Auto;
-    auto.max_width = Dimension::Auto;
-    auto.min_height = Dimension::Auto;
-    auto.max_height = Dimension::Auto;
-    let width_given = definite.width != Dimension::Auto;
-    let height_given = definite.height != Dimension::Auto;
-    // Used size before min/max, with the specified width/height applied.
-    let (w0, h0) = crate::layout::image_intrinsic_size(src, &auto, containing);
-    let ratio = crate::layout::image_intrinsic_ratio(src).filter(|r| *r > 0.0);
-    match ratio {
+    match ratio.filter(|r| *r > 0.0) {
         Some(ratio) if !(width_given && height_given) => {
             if width_given {
                 let w = clamp_i(w0);
@@ -1743,6 +2115,10 @@ pub(super) fn intrinsic_sizes_at(
     }
     if let ComponentKind::TextInput { .. } = info.kind {
         let (width, _) = text_field_content_size(info.style, space)?;
+        return Some(MinMax::exact(width));
+    }
+    if let ComponentKind::SvgDocument { source, .. } = info.kind {
+        let (width, _) = svg_content_size(source, info.style, space).why("svg:size")?;
         return Some(MinMax::exact(width));
     }
     if size_contained(info.style) {
@@ -2159,6 +2535,7 @@ fn layout_block_in(
             Some((width, None)) => {
                 let mut definite = style.clone();
                 definite.width = Dimension::Px(width);
+                override_replaced_axis(&mut definite, true);
                 definite.min_width = Dimension::Auto;
                 definite.max_width = Dimension::Auto;
                 (width, replaced_size(info.kind, &definite, space)?.1)
@@ -2205,8 +2582,11 @@ fn layout_block_in(
         BoxSizing::BorderBox => (h - bt - bb - pt - pb).max(0.0),
         BoxSizing::ContentBox => h,
     };
-    let specified_height = match sized {
-        Some((_, Some(height))) => Some(height),
+    // A replaced box's used height is its content height (an svg's used
+    // `height` may be the DOM's fallback size, not a specified one).
+    let specified_height = match (sized, image_size) {
+        (Some((_, Some(height))), _) => Some(height),
+        (_, Some((_, height))) => Some(height),
         _ => resolve_dim(style.height, space.percentage_block, style, space).map(to_content_h),
     };
     // DOM lowering gives an authored IFC block `min-height: font-size *
@@ -2533,7 +2913,9 @@ fn layout_block_in(
             resolve_inline(&definite, &child_space)
         } else if matches!(
             child_info.kind,
-            ComponentKind::Canvas { .. } | ComponentKind::TextInput { .. }
+            ComponentKind::Canvas { .. }
+                | ComponentKind::TextInput { .. }
+                | ComponentKind::SvgDocument { .. }
         ) {
             let (width, _) = replaced_size(child_info.kind, child_info.style, &child_space)?;
             let mut definite = child_info.style.clone();

@@ -4448,3 +4448,119 @@ fn text_field_matches_chrome() {
     let text_offset = |input: usize| rect(&out, input - 1).1 - rect(&out, input).1;
     assert_eq!(text_offset(i2) - text_offset(i1), (56.0 - h1) / 2.0);
 }
+
+#[test]
+fn svg_root_matches_chrome() {
+    // Expected sizes from Chrome (/workspace/ngtools/svg/s1.html).
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "400px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    let cases: &[(&[(&str, &str)], &[(&str, &str)], (f32, f32))] = &[
+        (&[], &[], (300.0, 150.0)),
+        (&[("width", "100"), ("height", "50")], &[], (100.0, 50.0)),
+        (&[("viewBox", "0 0 4 1")], &[], (400.0, 100.0)),
+        (
+            &[("viewBox", "0 0 4 1"), ("height", "40")],
+            &[],
+            (160.0, 40.0),
+        ),
+        (
+            &[("viewBox", "0 0 4 1"), ("width", "40")],
+            &[],
+            (40.0, 10.0),
+        ),
+        (&[("width", "50%")], &[], (200.0, 150.0)),
+        (
+            &[("viewBox", "0 0 4 1")],
+            &[("display", "block")],
+            (400.0, 100.0),
+        ),
+        (
+            &[("viewBox", "0 0 2 1")],
+            &[("width", "100px")],
+            (100.0, 50.0),
+        ),
+        (
+            &[("width", "100"), ("height", "50"), ("viewBox", "0 0 1 1")],
+            &[("width", "200px")],
+            (200.0, 50.0),
+        ),
+        (&[], &[("max-width", "50px")], (50.0, 150.0)),
+        (
+            &[("width", "100"), ("height", "50")],
+            &[("max-width", "60px")],
+            (60.0, 50.0),
+        ),
+        (
+            &[("width", "100")],
+            &[("padding", "5px"), ("border", "2px solid")],
+            (114.0, 164.0),
+        ),
+        (
+            &[("viewBox", "0 0 4 1")],
+            &[("padding", "5px"), ("border", "2px solid")],
+            (400.0, 110.5),
+        ),
+        (&[("width", "1in"), ("height", "2em")], &[], (96.0, 32.0)),
+        (
+            &[("width", "100"), ("height", "50")],
+            &[("height", "auto")],
+            (100.0, 50.0),
+        ),
+        (
+            &[("viewBox", "0 0 4 1")],
+            &[("height", "20px")],
+            (80.0, 20.0),
+        ),
+    ];
+    for (attrs, css, _) in cases {
+        let parent = div(&mut document, &[]);
+        let svg = document.create_element("svg");
+        for (k, v) in *attrs {
+            svg.set_attribute(&mut document, k, v);
+        }
+        for (k, v) in *css {
+            svg.style_mut(&mut document).set_property(k, v);
+        }
+        parent.append_child(&mut document, svg);
+    }
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let svgs: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::SvgDocument { .. }))
+        .collect();
+    assert_eq!(svgs.len(), cases.len());
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("svg roots");
+    for (index, (attrs, css, expected)) in svgs.iter().zip(cases) {
+        let r = rect(&out, *index);
+        assert_eq!((r.2, r.3), *expected, "{attrs:?} {css:?}");
+    }
+    // The DOM's fallback size is not a specified one: a flex item that
+    // has one stays on legacy (the flex algorithm reads the used size).
+    let column = div(&mut document, &[("display", "flex")]);
+    let svg = document.create_element("svg");
+    svg.set_attribute(&mut document, "viewBox", "0 0 4 1");
+    column.append_child(&mut document, svg);
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    assert_eq!(
+        block::unsupported_reasons(&flat),
+        vec!["svg:flex-fallback-size".to_string()]
+    );
+}
