@@ -214,6 +214,21 @@ fn register_with_kind(
     });
 }
 
+/// The rejection value of `import(specifier)` for a module that is not in the
+/// compiled graph: an `Error` with Node's `ERR_MODULE_NOT_FOUND` code.
+pub fn module_not_found(specifier: &str) -> Value {
+    let error = crate::error_instance(
+        "Error",
+        vec![Value::string(&format!("Cannot find module '{specifier}'"))],
+    );
+    crate::intrinsics::set_property(
+        &error,
+        &Value::string("code"),
+        Value::string("ERR_MODULE_NOT_FOUND"),
+    );
+    error
+}
+
 pub fn contains(specifier: &str) -> bool {
     let specifier = canonical_specifier(specifier);
     MODULES.with(|modules| modules.borrow().contains_key(&specifier))
