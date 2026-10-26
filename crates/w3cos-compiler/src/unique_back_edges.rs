@@ -444,6 +444,28 @@ mod tests {
     }
 
     #[test]
+    fn reassigned_back_edge_capture_stays_a_writable_cell() {
+        // A weakened capture has no setter: `pending = undefined` inside the
+        // reaction threw "captured binding is immutable" (Code-OSS).
+        let (_, generated) = analyze_named(
+            r#"
+                function track(job) {
+                    let pending = job;
+                    pending.then(() => { pending = undefined; });
+                    return job;
+                }
+                track;
+            "#,
+            "track",
+            "app:///reassigned-promise-reaction.js",
+        );
+        assert!(
+            !is_rewritten(&generated),
+            "a reassigned capture must not become a setter-less WeakRef: {generated}"
+        );
+    }
+
+    #[test]
     fn promise_reaction_unique_capture_is_rewritten_to_weakref() {
         let (plan, generated) = analyze_named(
             r#"
