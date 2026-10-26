@@ -389,6 +389,57 @@ function legacyIs(check) {
   return function (value) { return check(value); };
 }
 
+// `util.debuglog(section[, callback])`: like Node, `NODE_DEBUG` is a
+// comma-separated list of section names (`*` wildcards, case-insensitive);
+// the logger writes `SECTION pid: message` to stderr only when enabled.
+let debugEnvMatcher;
+function nodeProcess() {
+  // Lazy: `process` itself loads `events`, which may load this module.
+  return require('process');
+}
+function debugEnabledFor(section) {
+  if (debugEnvMatcher === undefined) {
+    const proc = nodeProcess();
+    const raw = proc && proc.env ? proc.env.NODE_DEBUG : undefined;
+    if (raw) {
+      const source = String(raw)
+        .replace(/[|\\{}()[\]^$+?.]/g, '\\$&')
+        .replace(/\*/g, '.*')
+        .replace(/,/g, '$|^');
+      debugEnvMatcher = new RegExp('^' + source + '$', 'i');
+    } else {
+      debugEnvMatcher = null;
+    }
+  }
+  return debugEnvMatcher !== null && debugEnvMatcher.test(section);
+}
+
+function debuglog(set, cb) {
+  const section = String(set).toUpperCase();
+  let enabled;
+  let initialized = false;
+  function isEnabled() {
+    if (enabled === undefined) enabled = debugEnabledFor(section);
+    return enabled;
+  }
+  function logger() {
+    if (!initialized) {
+      initialized = true;
+      if (typeof cb === 'function') cb(logger);
+    }
+    if (!isEnabled()) return;
+    const proc = nodeProcess();
+    const line = section + ' ' + proc.pid + ': ' + format.apply(null, arguments) + '\n';
+    if (proc.stderr && typeof proc.stderr.write === 'function') {
+      proc.stderr.write(line);
+    } else {
+      console.error(line.slice(0, -1));
+    }
+  }
+  Object.defineProperty(logger, 'enabled', { get: isEnabled, enumerable: true, configurable: true });
+  return logger;
+}
+
 module.exports = {
   format: format,
   formatWithOptions: function formatWithOptions(options) {
@@ -401,6 +452,8 @@ module.exports = {
   promisify: promisify,
   callbackify: callbackify,
   deprecate: deprecate,
+  debuglog: debuglog,
+  debug: debuglog,
   isDeepStrictEqual: isDeepStrictEqual,
   types: types,
   isArray: Array.isArray,
