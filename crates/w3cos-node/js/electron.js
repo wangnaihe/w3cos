@@ -23,11 +23,27 @@ const ELECTRON_VERSION = '44.9.0';
 if (process.versions.electron === undefined) process.versions.electron = ELECTRON_VERSION;
 
 const env = process.env || {};
-const TRACE = env.W3COS_ELECTRON_TRACE === '1';
+// W3COS_ELECTRON_TRACE=1 logs the app lifecycle; =2 also logs renderer
+// script evaluation and renderer→main IPC (to see where a page stalls).
+const TRACE = env.W3COS_ELECTRON_TRACE === '1' || env.W3COS_ELECTRON_TRACE === '2';
+const RENDERER_TRACE = env.W3COS_ELECTRON_TRACE === '2';
 const EXIT_AFTER_LOAD = env.W3COS_ELECTRON_EXIT_AFTER_LOAD === '1';
 
 function trace(message) {
   if (TRACE) console.log('[electron] ' + message);
+}
+
+function rendererTrace(message) {
+  if (RENDERER_TRACE) console.log('[electron] ' + message);
+}
+
+function describeError(error) {
+  if (error && error.message !== undefined) return String(error.message);
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 // One task per message, like Electron's IPC and navigation.
@@ -257,6 +273,7 @@ function runRendererScript(file, label, contents) {
     return;
   }
   const report = (error) => {
+    rendererTrace(label + '-failed ' + key + ' ' + describeError(error));
     console.error(label === 'preload'
       ? 'Unable to load preload script: ' + file
       : 'Uncaught ' + (error && error.stack ? error.stack : error));
@@ -265,8 +282,12 @@ function runRendererScript(file, label, contents) {
   try {
     // ES module scripts (`<script type="module">`, ESM preloads) are linked
     // as lazily evaluated modules: `load` returns their `import()` promise.
+    rendererTrace(label + '-start ' + key);
     const result = withRendererArgv(contents, () => assets.load(key));
-    if (result && typeof result.then === 'function') return result.then(undefined, report);
+    if (result && typeof result.then === 'function') {
+      return result.then(() => rendererTrace(label + '-done ' + key), report);
+    }
+    rendererTrace(label + '-done ' + key);
   } catch (error) {
     report(error);
   }
@@ -610,6 +631,7 @@ class IpcRenderer extends EventEmitter {
   send(channel, ...args) {
     const contents = rendererContents();
     const copies = cloneArgs(args);
+    rendererTrace('ipc-send ' + String(channel));
     task(() => ipcMain.emit(String(channel), mainEvent(contents), ...copies));
   }
   invoke(channel, ...args) {
@@ -621,17 +643,24 @@ class IpcRenderer extends EventEmitter {
       return Promise.reject(error);
     }
     const copies = cloneArgs(args);
+    rendererTrace('ipc-invoke ' + name);
     return new Promise((resolve, reject) => {
       task(() => {
         const handler = handlers.get(name);
-        const fail = (error) => reject(new Error("Error invoking remote method '" + name + "': " + error));
+        const fail = (error) => {
+          rendererTrace('ipc-invoke-failed ' + name + ' ' + describeError(error));
+          reject(new Error("Error invoking remote method '" + name + "': " + error));
+        };
         if (handler === undefined) {
           fail(new Error("No handler registered for '" + name + "'"));
           return;
         }
         Promise.resolve()
           .then(() => handler(mainEvent(contents), ...copies))
-          .then((result) => resolve(clone(result)), fail);
+          .then((result) => {
+            rendererTrace('ipc-invoke-done ' + name);
+            resolve(clone(result));
+          }, fail);
       });
     });
   }
