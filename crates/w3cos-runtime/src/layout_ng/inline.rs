@@ -698,10 +698,13 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
         flat[index].style.display,
         Display::InlineBlock | Display::InlineTable
     );
-    if matches!(flat[index].kind, ComponentKind::Image { .. }) {
+    if matches!(
+        flat[index].kind,
+        ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+    ) {
         // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
-        // sheet gives img `inline-block`; an author `inline` is the same
-        // kind of item.
+        // sheet gives img and canvas `inline-block`; an author `inline` is
+        // the same kind of item (Blink LayoutReplaced is atomic either way).
         return inline_block || flat[index].style.display == Display::Inline;
     }
     matches!(
@@ -2667,7 +2670,9 @@ pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
 
 /// NGInlineNode::ComputeMinMaxSizes: the line breaker's widest line at
 /// available 0 (every opportunity taken) and at an indefinite size (only
-/// forced breaks).  A paragraph leaf is measured as text.
+/// forced breaks).  A paragraph leaf is measured as text. `space` carries
+/// the container's child percentage basis (block::intrinsic_sizes_at), so
+/// an atomic inline's percentage height resolves as in layout.
 pub(super) fn inline_min_max(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -2687,7 +2692,6 @@ pub(super) fn inline_min_max(
             index,
             &ConstraintSpace {
                 available_inline: available,
-                percentage_block: None,
                 ..*space
             },
         )

@@ -692,6 +692,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 )
             }
         }
+        ComponentKind::Button { .. } => Some("kind:button"),
+        ComponentKind::TextInput { .. } => Some("kind:text-input"),
+        ComponentKind::SvgPath { .. } | ComponentKind::SvgDocument { .. } => Some("kind:svg"),
         _ => Some("kind:other"),
     }
 }
@@ -764,13 +767,13 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
 
 /// A definite `<canvas>` is a replaced box (CSS 2.1 10.3.2 / 10.4).
 /// The width and height attributes are the intrinsic size. A specified
-/// `aspect-ratio` replaces that ratio. SVG and form controls stay
-/// `kind:other`.
+/// `aspect-ratio` replaces that ratio. SVG and form controls have
+/// their own `kind:*` reasons.
 fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     let style = info.style;
     if style.box_sizing == BoxSizing::BorderBox || size_contained(style) {
-        return Some("kind:other");
+        return Some("canvas:border-box-or-contain");
     }
     if style.float != Float::None
         || matches!(
@@ -778,12 +781,12 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
             Position::Absolute | Position::Fixed | Position::Sticky
         )
     {
-        return Some("kind:other");
+        return Some("canvas:float-or-oof");
     }
     if info.parent.is_some_and(|parent| {
         is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
     }) {
-        return Some("kind:other");
+        return Some("canvas:flex-grid-item");
     }
     if matches!(style.display, Display::Block | Display::FlowRoot)
         && info.parent.is_some_and(|parent| {
@@ -794,18 +797,26 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
             })
         })
     {
-        return Some("kind:other");
+        return Some("canvas:beside-float");
     }
     match style.display {
         Display::Block | Display::FlowRoot => {
             unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
         }
-        // The UA display is `inline-block`. The line box under this font
-        // is 24.1875px for a 20px canvas; Chrome's is 24px. A block
-        // reference of the same border box would be one-sided, so inline
-        // canvases stay `kind:other`.
-        Display::Inline | Display::InlineBlock => Some("kind:other"),
-        _ => Some("kind:other"),
+        // An inline canvas in an inline formatting context is an atomic
+        // inline, like an inline image (CSS 2.1 10.8.1; Blink
+        // LayoutHTMLCanvas is a LayoutReplaced). Outside one it stays on
+        // legacy.
+        Display::Inline | Display::InlineBlock if inline::in_inline_container(flat, index) => {
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
+        Display::Inline | Display::InlineBlock => Some("canvas:inline"),
+        _ => Some("canvas:display"),
     }
 }
 
@@ -818,7 +829,7 @@ fn canvas_content_size(
     space: &ConstraintSpace,
 ) -> Option<(f32, f32)> {
     if style.box_sizing == BoxSizing::BorderBox {
-        return super::bail("kind:other");
+        return super::bail("canvas:size");
     }
     let unresolved = |dim: Dimension| matches!(dim, Dimension::Ch(_));
     if unresolved(style.width)
@@ -828,7 +839,7 @@ fn canvas_content_size(
         || unresolved(style.min_height)
         || unresolved(style.max_height)
     {
-        return super::bail("kind:other");
+        return super::bail("canvas:size");
     }
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
         match dim {
@@ -1505,13 +1516,22 @@ pub(super) fn intrinsic_sizes_at(
     }
     if let ComponentKind::Canvas { width, height } = info.kind {
         let (width, _) =
-            canvas_content_size(*width, *height, info.style, space).why("kind:other")?;
+            canvas_content_size(*width, *height, info.style, space).why("canvas:size")?;
         return Some(MinMax::exact(width));
     }
     if size_contained(info.style) {
         // Size containment: intrinsic sizes ignore the contents.
         return Some(MinMax::exact(contain_intrinsic_size(info.style).0));
     }
+    // BlockNode::ComputeMinMaxSizes passes its children the percentage
+    // resolution block size of this box (Blink
+    // CalculateChildPercentageBlockSizeForMinMax): its definite content
+    // height, or none. Anonymous blocks are skipped (CSS 2.1 10.5).
+    let child_space = ConstraintSpace {
+        percentage_block: child_percentage_block(info.style, space),
+        ..*space
+    };
+    let space = &child_space;
     if inline::is_inline_container(flat, index) {
         // Floats among inline content would take the float_left /
         // float_right inline sizes into InlineNode::ComputeMinMaxSizes.
@@ -1599,6 +1619,46 @@ pub(super) fn intrinsic_sizes_at(
         }
     }
     Some(sizes)
+}
+
+/// Percentage basis that a box gives its in-flow children: its definite
+/// content height after min/max (CSS 2.1 10.5), or `None`.
+fn child_percentage_block(style: &Style, space: &ConstraintSpace) -> Option<f32> {
+    let anonymous_block = style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
+    if anonymous_block {
+        return space.percentage_block;
+    }
+    let edges = match style.box_sizing {
+        BoxSizing::BorderBox => {
+            let b = border(style);
+            let side = |s: Spacing| match s {
+                Spacing::Auto => 0.0,
+                s => resolve_spacing_for_layout(
+                    s,
+                    space.available_inline,
+                    style,
+                    space.viewport_w,
+                    space.viewport_h,
+                ),
+            };
+            b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom)
+        }
+        BoxSizing::ContentBox => 0.0,
+    };
+    let content = |dim: Dimension| {
+        resolve_dim(dim, space.percentage_block, style, space).map(|h| (h - edges).max(0.0))
+    };
+    let mut height = content(style.height)?;
+    if let Some(max) = content(style.max_height) {
+        height = height.min(max);
+    }
+    if let Some(min) = content(style.min_height) {
+        height = height.max(min);
+    }
+    Some(height)
 }
 
 /// ComputeMinAndMaxContentContribution of a child: its margin box, from a
@@ -1883,7 +1943,7 @@ fn layout_block_in(
             None => replaced_content_size(src, style, space).why("image")?,
         })
     } else if let ComponentKind::Canvas { width, height } = info.kind {
-        Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
+        Some(canvas_content_size(*width, *height, style, space).why("canvas:size")?)
     } else {
         None
     };
@@ -2246,7 +2306,7 @@ fn layout_block_in(
             resolve_inline(&definite, &child_space)
         } else if let ComponentKind::Canvas { width, height } = child_info.kind {
             let (width, _) = canvas_content_size(*width, *height, child_info.style, &child_space)
-                .why("kind:other")?;
+                .why("canvas:size")?;
             let mut definite = child_info.style.clone();
             definite.width = Dimension::Px(width);
             definite.min_width = Dimension::Auto;

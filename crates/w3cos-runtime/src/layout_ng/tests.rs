@@ -3221,8 +3221,8 @@ fn definite_canvas_matches_chrome() {
     ));
     assert_eq!(at(&out, 1), (0.0, 0.0, 90.0, 50.0));
 
-    // Inline-block stays on legacy: the NG line is 24.1875px and Chrome's
-    // is 24px, so a block reference of the same border box would be one-sided.
+    // An inline-block canvas is an atomic inline on the first line
+    // (CSS 2.1 10.8.1).
     let inline = node(
         block(),
         vec![canvas(
@@ -3235,10 +3235,9 @@ fn definite_canvas_matches_chrome() {
         )],
     );
     let flat = pre_flatten(&inline);
-    assert_eq!(
-        block::unsupported_reasons(&flat),
-        vec!["kind:other".to_string()]
-    );
+    assert!(block::unsupported_reasons(&flat).is_empty());
+    let out = layout_tree(&inline, &flat, 800.0, 600.0).expect("inline canvas");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 20.0));
 }
 
 #[test]
@@ -4210,4 +4209,39 @@ fn flex_column_image_cross_honors_min_width() {
     assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 0.0));
     assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
     crate::image_loader::invalidate(source);
+}
+
+/// intrinsic-percent-replaced-001: a shrink-to-fit float with a definite
+/// height resolves its canvas child's percentage height during min/max
+/// (Blink CalculateChildPercentageBlockSizeForMinMax), so the canvas's
+/// ratio turns `height: 100%` into a 100px intrinsic width.
+#[test]
+fn float_min_max_resolves_child_percent_height() {
+    let canvas = Component::canvas(
+        10,
+        10,
+        Style {
+            display: Display::Block,
+            height: Dimension::Percent(100.0),
+            ..Style::default()
+        },
+    );
+    let float = node(
+        Style {
+            float: w3cos_std::style::Float::Left,
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![canvas],
+    );
+    let root = node(block(), vec![float]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("float canvas");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 100.0));
 }
