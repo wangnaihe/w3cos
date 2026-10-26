@@ -32660,6 +32660,45 @@ try {
     }
 
     #[test]
+    fn display_contents_rect_stays_empty_while_dynamic_child_layout_flushes() {
+        setup();
+        let document = document_value();
+        let contents = create_in_body("div");
+        contents
+            .get_property("style")
+            .set_property("display", Value::string("contents"));
+
+        let assert_empty = |value: &Value| {
+            let rect = value.call_method("getBoundingClientRect", vec![]);
+            assert_eq!(rect.get_property("x").to_number(), 0.0);
+            assert_eq!(rect.get_property("y").to_number(), 0.0);
+            assert_eq!(rect.get_property("width").to_number(), 0.0);
+            assert_eq!(rect.get_property("height").to_number(), 0.0);
+        };
+        assert_empty(&contents);
+
+        contents.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("text")])],
+        );
+        assert_empty(&contents);
+
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let block_style = block.get_property("style");
+        block_style.set_property("display", Value::string("block"));
+        block_style.set_property("width", Value::string("30px"));
+        block_style.set_property("height", Value::string("12px"));
+        contents.call_method("appendChild", vec![block.clone()]);
+        assert_empty(&contents);
+        let child_rect = block.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(child_rect.get_property("width").to_number(), 30.0);
+        assert_eq!(child_rect.get_property("height").to_number(), 12.0);
+
+        contents.call_method("removeChild", vec![block]);
+        assert_empty(&contents);
+    }
+
+    #[test]
     fn block_in_inline_bounds_ignore_zero_sized_fragments() {
         setup();
         set_viewport(800.0, 600.0);
