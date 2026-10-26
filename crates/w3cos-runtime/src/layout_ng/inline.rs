@@ -690,8 +690,11 @@ fn inline_text_reason(
         if let Some(reason) = valign_reason(style) {
             return Some(reason);
         }
-        if sole && line_relative_align(style).is_some() {
-            return Some("vertical-align-keyword");
+        // A top/bottom-aligned sole leaf is an ordinary aligned item
+        // (`aligned` covers the leaf itself) unless it takes the
+        // preserved-newline path, which places it without alignment.
+        if sole && line_relative_align(style).is_some() && content.contains('\n') {
+            return Some("vertical-align-keyword-newline");
         }
         // break-all / overflow-wrap add emergency breaks inside an item.
         if !matches!(
@@ -906,7 +909,7 @@ fn inline_box_reason(
             .map(String::as_str),
         Some("text-top" | "text-bottom")
     ) {
-        return Some("vertical-align-keyword");
+        return Some("vertical-align-text-edge-box");
     }
     let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
     let m = style.margin_lengths();
@@ -2397,6 +2400,11 @@ pub(super) fn layout_inline_beside(
         || (floats.is_some() && lines.iter().flatten().any(has_tab))
     {
         return super::bail("text:tab-wrapped");
+    }
+    // Paint re-wraps a sole leaf beside floats from its rect, without the
+    // line-relative alignment.
+    if floats.is_some() && children.len() == 1 && aligned.iter().any(Option::is_some) {
+        return super::bail("vertical-align-keyword-float");
     }
     if floats.is_some()
         && paint_rewraps_beside_floats(flat, &children)
