@@ -589,6 +589,37 @@ console.log(S.name, N.name, Object.keys(A).length, Object.keys(Plain).length)
     );
 }
 
+/// `new.target` in a class constructor (and arrows inside it) is the class
+/// that was constructed, also through `super()` (zod's `ZodError` does
+/// `Object.setPrototypeOf(this, new.target.prototype)` after `super()`).
+#[test]
+fn class_constructor_new_target_is_the_constructed_class() {
+    let root = write_fixture(
+        "w3cos_class_new_target",
+        &[
+            (
+                "package.json",
+                r#"{ "name": "p", "version": "0.1.0", "type": "module" }"#,
+            ),
+            (
+                "main.js",
+                r#"class Base { constructor() { this.kind = new.target.name; const arrow = () => new.target; this.same = arrow() === new.target } }
+class Derived extends Base { constructor() { super(); this.proto = new.target.prototype === Derived.prototype } }
+class ZodError extends Error { constructor(issues) { super(); const actualProto = new.target.prototype; Object.setPrototypeOf(this, actualProto); this.issues = issues } }
+const b = new Base();
+const d = new Derived();
+const z = new ZodError([1]);
+console.log(b.kind, b.same, d.kind, d.same, d.proto)
+console.log(z instanceof ZodError, z instanceof Error, z.issues.length)
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_class_new_target");
+    assert_eq!(lines, vec!["Base true Derived true true", "true true 1"]);
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 /// A primitive string inherits `String.prototype` methods by value, so
 /// `s.startsWith` is a function and `s?.startsWith(x)` calls it (Code-OSS
