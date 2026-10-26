@@ -7599,6 +7599,7 @@ fn function_compat_class() -> Value {
     let prototype = Value::object(HashMap::new());
     prototype.set_property("constructor", class.clone());
     install_function_prototype_methods(&prototype);
+    w3cos_core::register_function_prototype(&prototype);
     class.set_property("prototype", prototype);
     class
 }
@@ -7618,56 +7619,11 @@ fn incompatible_function_receiver(method: &str, this: &Value) -> Value {
 /// bind.call($call, $apply)`) see real functions. Each dispatches on its
 /// receiver directly instead of re-entering the method lookup.
 fn install_function_prototype_methods(prototype: &Value) {
-    prototype.set_property(
-        "call",
-        Value::function(|this, args| {
-            if !this.is_callable() {
-                return incompatible_function_receiver("call", &this);
-            }
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            this.call(this_arg, args.into_iter().skip(1).collect())
-        }),
-    );
-    prototype.set_property(
-        "apply",
-        Value::function(|this, args| {
-            if !this.is_callable() {
-                return incompatible_function_receiver("apply", &this);
-            }
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            let list = args.get(1).cloned().unwrap_or(Value::Undefined);
-            let applied = if list.is_undefined() || list.is_null() {
-                Vec::new()
-            } else {
-                let length = list.get_property("length").to_number();
-                let length = if length.is_finite() && length > 0.0 {
-                    length as usize
-                } else {
-                    0
-                };
-                (0..length)
-                    .map(|index| list.get_property(&index.to_string()))
-                    .collect()
-            };
-            this.call(this_arg, applied)
-        }),
-    );
-    prototype.set_property(
-        "bind",
-        Value::function(|this, args| {
-            if !this.is_callable() {
-                return incompatible_function_receiver("bind", &this);
-            }
-            let target = this.clone();
-            let this_arg = args.first().cloned().unwrap_or(Value::Undefined);
-            let bound_args: Vec<Value> = args.into_iter().skip(1).collect();
-            Value::function(move |_, call_args| {
-                let mut combined = bound_args.clone();
-                combined.extend(call_args);
-                target.call(this_arg.clone(), combined)
-            })
-        }),
-    );
+    for method in ["call", "apply", "bind"] {
+        if let Some(function) = w3cos_core::function_prototype_method(method) {
+            prototype.set_property(method, function);
+        }
+    }
     prototype.set_property(
         "toString",
         Value::function(|this, _| {

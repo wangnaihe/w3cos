@@ -905,3 +905,54 @@ fn promise_all_settled_any_with_resolvers_match_node() {
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Optional calls keep their receiver: `super.m?.()`, `f?.call(o)`, and
+/// functions inheriting `Function.prototype` (`f.call`, polyfills).
+const OPTIONAL_CALL_RECEIVER_MAIN: &str = r#""use strict";
+function setB(s) { this.b = s; return this; }
+const o = {};
+console.log(setB?.call(o, 2) === o, o.b);
+console.log(setB?.apply(o, [4]) === o, o.b);
+const c = setB.call, a = setB.apply, b = setB.bind;
+console.log(typeof c, typeof a, typeof b, "call" in setB, "nope" in setB);
+console.log(c === Function.prototype.call, a === Function.prototype.apply, setB.bind === b);
+console.log(Reflect.apply(c, setB, [o, 5]) === o, o.b, b.call(setB, o, 6)().b);
+try { c.call({}); } catch (e) { console.log(e instanceof TypeError); }
+Function.prototype.w3cosExtra = function () { return typeof this; };
+console.log(setB.w3cosExtra(), (() => 1).w3cosExtra());
+class Base { setB(s) { this.b = s; } static make(v) { return v + 1; } }
+class Side extends Base {
+  setB(s) { super.setB?.(s); super.setB?.call(this, s + 1); return this.b; }
+  static make(v) { return (super.make)?.(v); }
+}
+console.log(new Side().setB(7), Side.make(1));
+"#;
+
+/// Captured from `node main.js` (Node v24).
+const OPTIONAL_CALL_RECEIVER_NODE_OUTPUT: &str = "true 2\n\
+true 4\n\
+function function function true false\n\
+true true true\n\
+true 5 6\n\
+true\n\
+function function\n\
+8 2\n";
+
+#[test]
+fn optional_calls_keep_receiver_and_functions_inherit_function_prototype_match_node() {
+    let root = write_fixture(
+        "w3cos_cjs_e2e_optional_call_receiver",
+        &[
+            ("package.json", r#"{"name":"optional-call-receiver"}"#),
+            ("main.js", OPTIONAL_CALL_RECEIVER_MAIN),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_cjs_e2e_optional_call_receiver",
+    );
+    let expected: Vec<&str> = OPTIONAL_CALL_RECEIVER_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
