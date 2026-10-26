@@ -22112,7 +22112,13 @@ pub fn tick_timers() -> usize {
     });
     let ran = fired.len();
     for (cb, args) in fired {
-        cb.call(Value::Undefined, args);
+        // HTML timer initialization steps: an exception thrown by the callback
+        // is reported (window `onerror`) and does not stop the other due timers
+        // or the event loop.
+        if let Err(exception) = w3cos_core::catch_js(|| cb.call(Value::Undefined, args)) {
+            eprintln!("[js.uncaught] {}", exception.to_js_string());
+            report_callback_exception(&cb, exception);
+        }
     }
     ran
 }
@@ -29627,6 +29633,47 @@ try {
         });
         drain_microtasks();
         assert_eq!(count.get(), 0);
+    }
+
+    #[test]
+    fn throwing_timer_is_reported_and_other_timers_still_run() {
+        setup();
+        let win = window_value();
+        let reported = Rc::new(RefCell::new(String::new()));
+        let reported2 = reported.clone();
+        win.set_property(
+            "onerror",
+            func(move |_, args| {
+                *reported2.borrow_mut() = arg(&args, 0).to_js_string();
+                Value::Undefined
+            }),
+        );
+        let fired = Rc::new(Cell::new(0));
+        let fired2 = fired.clone();
+        win.call_method(
+            "setTimeout",
+            vec![
+                func(|_, _| {
+                    w3cos_core::throw_value(Value::string("timer boom"));
+                }),
+                Value::Number(1.0),
+            ],
+        );
+        win.call_method(
+            "setTimeout",
+            vec![
+                func(move |_, _| {
+                    fired2.set(fired2.get() + 1);
+                    Value::Undefined
+                }),
+                Value::Number(1.0),
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(tick_timers(), 2);
+        assert_eq!(fired.get(), 1);
+        assert_eq!(reported.borrow().as_str(), "timer boom");
+        win.set_property("onerror", Value::Null);
     }
 
     #[test]
