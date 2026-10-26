@@ -730,3 +730,56 @@ console.log("2", [...gen()].join(","));
     assert_eq!(lines, vec!["1 function msg:x", "2 1,2"]);
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+/// A class whose computed `[Symbol.iterator]()` returns `Map#values()` must be
+/// iterable with `for...of`, including inside nested loops with early
+/// `continue` (Code-OSS `ContributedCustomEditors`).
+fn class_symbol_iterator_returning_map_values_is_iterable() {
+    let root = write_fixture(
+        "w3cos_class_symiter_map",
+        &[
+            ("package.json", r#"{"name":"symiter","type":"module"}"#),
+            (
+                "editors.mjs",
+                r#"class Disposable { _register(x) { return x; } }
+export class Contributed extends Disposable {
+  constructor() { super(); this._editors = new Map(); }
+  add(info) { this._editors.set(info.id, info); }
+  [Symbol.iterator]() { return this._editors.values(); }
+}
+"#,
+            ),
+            (
+                "main.mjs",
+                r#"import { Contributed } from "./editors.mjs";
+class Service extends Object {
+  constructor() {
+    super();
+    this._c = new Contributed();
+    this._c.add({ id: "a", selector: [{ filenamePattern: "*.a" }, {}] });
+    this._c.add({ id: "b", selector: [{ filenamePattern: "*.b" }] });
+  }
+  register() {
+    const out = [];
+    for (const editor of this._c) {
+      for (const glob of editor.selector) {
+        if (!glob.filenamePattern) { continue; }
+        out.push(editor.id + ":" + glob.filenamePattern);
+      }
+    }
+    return out.join(",");
+  }
+}
+const s = new Service();
+console.log("1", s.register());
+console.log("2", [...new Contributed()].length);
+const it = new Map([[1, "x"]]).values();
+console.log("3", typeof it.next, typeof it[Symbol.iterator]);
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_class_symiter_map");
+    assert_eq!(lines, vec!["1 a:*.a,b:*.b", "2 0", "3 function function"]);
+}

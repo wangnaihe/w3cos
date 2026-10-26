@@ -294,11 +294,20 @@ fn map_proto_for_each(this: Value, args: Vec<Value>) -> Value {
     Value::Undefined
 }
 
+/// `%MapIteratorPrototype%` / `%SetIteratorPrototype%` result: an iterator
+/// object (callable `next`, self-returning `[Symbol.iterator]`) over a
+/// snapshot of the collection. Returning a bare Array broke code that calls
+/// `next()` on `map.values()` directly, e.g. a class whose
+/// `[Symbol.iterator]()` returns `this._map.values()`.
+fn collection_iterator(items: Vec<Value>) -> Value {
+    crate::value::iterator_object(crate::value::ValueIterator::new(items.into_iter()))
+}
+
 fn map_proto_entries(this: Value, _args: Vec<Value>) -> Value {
     let Some(entries) = map_state_of(&this) else {
-        return Value::array(Vec::new());
+        return collection_iterator(Vec::new());
     };
-    Value::array(
+    collection_iterator(
         entries
             .borrow()
             .iter()
@@ -310,9 +319,9 @@ fn map_proto_entries(this: Value, _args: Vec<Value>) -> Value {
 
 fn map_proto_keys(this: Value, _args: Vec<Value>) -> Value {
     let Some(entries) = map_state_of(&this) else {
-        return Value::array(Vec::new());
+        return collection_iterator(Vec::new());
     };
-    Value::array(
+    collection_iterator(
         entries
             .borrow()
             .iter()
@@ -324,9 +333,9 @@ fn map_proto_keys(this: Value, _args: Vec<Value>) -> Value {
 
 fn map_proto_values(this: Value, _args: Vec<Value>) -> Value {
     let Some(entries) = map_state_of(&this) else {
-        return Value::array(Vec::new());
+        return collection_iterator(Vec::new());
     };
-    Value::array(
+    collection_iterator(
         entries
             .borrow()
             .iter()
@@ -455,9 +464,9 @@ fn set_proto_for_each(this: Value, args: Vec<Value>) -> Value {
 
 fn set_proto_values(this: Value, _args: Vec<Value>) -> Value {
     let Some(values) = set_state_of(&this) else {
-        return Value::array(Vec::new());
+        return collection_iterator(Vec::new());
     };
-    Value::array(
+    collection_iterator(
         values
             .borrow()
             .iter()
@@ -469,9 +478,9 @@ fn set_proto_values(this: Value, _args: Vec<Value>) -> Value {
 
 fn set_proto_entries(this: Value, _args: Vec<Value>) -> Value {
     let Some(values) = set_state_of(&this) else {
-        return Value::array(Vec::new());
+        return collection_iterator(Vec::new());
     };
-    Value::array(
+    collection_iterator(
         values
             .borrow()
             .iter()
@@ -715,6 +724,35 @@ mod tests {
     use super::*;
     use crate::class::{construct, instance_of};
 
+    /// Drain an iterator result into a comma-joined string.
+    fn drained(iterator: &Value) -> String {
+        Value::array(iterator.iter().collect()).to_js_string()
+    }
+
+    #[test]
+    fn collection_iterators_expose_next_and_return_themselves() {
+        let map = new_map(vec![Value::array(vec![
+            pair(Value::string("x"), Value::Number(1.0)),
+            pair(Value::string("y"), Value::Number(2.0)),
+        ])]);
+        let values = map.call_method("values", vec![]);
+        assert_eq!(
+            values.call_method("__w3cos_symbol_iterator", vec![]),
+            values
+        );
+        let first = values.call_method("__w3cos_iterator_next", vec![]);
+        assert_eq!(first.get_property("value").to_number(), 1.0);
+        assert!(!first.get_property("done").to_bool());
+        // Iterating continues from the cursor, not from the start.
+        assert_eq!(drained(&values), "2");
+        let done = values.call_method("next", vec![]);
+        assert!(done.get_property("done").to_bool());
+        let set = new_set(vec![Value::array(vec![Value::string("a")])]);
+        let keys = set.call_method("keys", vec![]);
+        assert!(keys.get_property("next").is_callable());
+        assert_eq!(drained(&keys), "a");
+    }
+
     fn new_map(args: Vec<Value>) -> Value {
         construct(&map_class(), args)
     }
@@ -856,7 +894,7 @@ mod tests {
             9.0
         );
         // Insertion order kept: k first despite the overwrite.
-        assert_eq!(map.call_method("keys", vec![]).to_js_string(), "k,j");
+        assert_eq!(drained(&map.call_method("keys", vec![])), "k,j");
     }
 
     #[test]
@@ -929,16 +967,17 @@ mod tests {
     }
 
     #[test]
-    fn map_entries_keys_values_return_arrays() {
+    fn map_entries_keys_values_return_iterators() {
         let map = new_map(vec![Value::array(vec![
             pair(Value::string("x"), Value::Number(1.0)),
             pair(Value::string("y"), Value::Number(2.0)),
         ])]);
         let entries = map.call_method("entries", vec![]);
-        assert!(entries.is_array());
-        assert_eq!(entries.to_js_string(), "x,1,y,2");
-        assert_eq!(map.call_method("keys", vec![]).to_js_string(), "x,y");
-        assert_eq!(map.call_method("values", vec![]).to_js_string(), "1,2");
+        assert!(!entries.is_array());
+        assert!(entries.get_property("next").is_callable());
+        assert_eq!(drained(&entries), "x,1,y,2");
+        assert_eq!(drained(&map.call_method("keys", vec![])), "x,y");
+        assert_eq!(drained(&map.call_method("values", vec![])), "1,2");
     }
 
     #[test]
@@ -968,7 +1007,7 @@ mod tests {
             map.call_method("get", vec![Value::string("a")]).to_number(),
             3.0
         );
-        assert_eq!(map.call_method("keys", vec![]).to_js_string(), "a,b");
+        assert_eq!(drained(&map.call_method("keys", vec![])), "a,b");
 
         // new Map(other) copies entries; the copy is independent.
         let copy = new_map(vec![map.clone()]);
@@ -1151,9 +1190,9 @@ mod tests {
             Value::string("b"), // duplicate in seed ignored
         ])]);
         assert_eq!(set.get_property("size").to_number(), 2.0);
-        assert_eq!(set.call_method("values", vec![]).to_js_string(), "b,a");
-        assert_eq!(set.call_method("keys", vec![]).to_js_string(), "b,a");
-        assert_eq!(set.call_method("entries", vec![]).to_js_string(), "b,b,a,a");
+        assert_eq!(drained(&set.call_method("values", vec![])), "b,a");
+        assert_eq!(drained(&set.call_method("keys", vec![])), "b,a");
+        assert_eq!(drained(&set.call_method("entries", vec![])), "b,b,a,a");
 
         // forEach visits (value, value, set) in insertion order.
         let log = Rc::new(RefCell::new(Vec::new()));
