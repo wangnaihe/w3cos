@@ -794,8 +794,16 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     }
     // Static boxes stay on the marker. A static `inline-grid` reference
     // (fixed px tracks, no insets) is paired with tests that still fall
-    // back, and switching only the reference splits the reftest.
-    if style.position != Position::Relative && !(intrinsic && style.position == Position::Static) {
+    // back, and switching only the reference splits the reftest. The same
+    // holds for a static bordered intrinsic box: it is the reference drawn
+    // for `display: inline grid-lanes` tests, which stay on legacy flex.
+    if style.position != Position::Relative
+        && !(intrinsic
+            && style.position == Position::Static
+            && block::border_widths(style)
+                .iter()
+                .all(|value| value.abs() <= EPS))
+    {
         return false;
     }
     if style.direction == TextDirection::Rtl

@@ -2904,15 +2904,20 @@ fn intrinsic_inline_grid_keeps_split_first_letter_text_on_legacy() {
 
 #[test]
 fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
-    use w3cos_std::style::CustomProperties;
+    use w3cos_std::style::{CustomProperties, Position};
     // Headless Chrome 155: auto/100px border-box widths, 3px padding
     // and 2px borders, auto auto columns containing 40px/30px items.
-    for (width, outer, second_x) in [
-        (Dimension::Auto, 80.0, 45.0),
-        (Dimension::Px(100.0), 100.0, 55.0),
+    // A static bordered box stays on legacy (`inline grid-lanes`
+    // references); the relative one is laid out here.
+    for (width, position, outer, second_x) in [
+        (Dimension::Auto, Position::Static, 0.0, 0.0),
+        (Dimension::Auto, Position::Relative, 80.0, 45.0),
+        (Dimension::Px(100.0), Position::Static, 0.0, 0.0),
+        (Dimension::Px(100.0), Position::Relative, 100.0, 55.0),
     ] {
         let grid = Style {
             display: Display::Flex,
+            position,
             width,
             box_sizing: BoxSizing::BorderBox,
             padding: margins(3.0, 3.0, 3.0, 3.0),
@@ -2935,6 +2940,10 @@ fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
         };
         let root = node(block(), vec![node(grid, vec![item(40.0), item(30.0)])]);
         let flat = pre_flatten(&root);
+        if outer == 0.0 {
+            assert!(!block::supports_tree(&flat));
+            continue;
+        }
         assert!(
             block::supports_tree(&flat),
             "{:?}",
