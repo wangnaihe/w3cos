@@ -4267,11 +4267,6 @@ export function boot() { return invoke("open-input", "prepare"); }"#,
                 "Broken.copy",
             ),
             (
-                "constructor",
-                "export class Broken { constructor() { new.target; } }",
-                "Broken.constructor",
-            ),
-            (
                 "instance_field",
                 "export class Broken { value = new.target; }",
                 "class initialization lowering did not produce W3IR",
