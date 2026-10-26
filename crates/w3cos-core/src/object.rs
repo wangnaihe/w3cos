@@ -124,6 +124,23 @@ impl JsObject {
         object
     }
 
+    /// Construct a fresh proxy with its initial prototype already installed.
+    ///
+    /// This is only for native host wrappers before the object can escape to
+    /// JavaScript. It deliberately bypasses Proxy `setPrototypeOf` and the
+    /// observable shape-epoch invalidation used by later prototype mutation.
+    #[doc(hidden)]
+    pub fn with_proxy_and_initial_prototype(
+        properties: HashMap<String, Value>,
+        handler: ProxyHandler,
+        prototype: &Value,
+    ) -> Self {
+        debug_assert!(handler.set_prototype_of.is_none());
+        let mut object = Self::with_proxy(properties, handler);
+        object.set_prototype_direct(prototype);
+        object
+    }
+
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
     pub fn with_call_slot(properties: HashMap<String, Value>, call: Rc<FunctionData>) -> Self {
@@ -489,6 +506,10 @@ impl JsObject {
                 return trap(&target, proto);
             }
         }
+        self.set_prototype_direct(proto)
+    }
+
+    fn set_prototype_direct(&mut self, proto: &Value) -> bool {
         match proto {
             _ if proto.as_object().is_some() => {
                 self.prototype = Some(proto.as_object().expect("object"));
