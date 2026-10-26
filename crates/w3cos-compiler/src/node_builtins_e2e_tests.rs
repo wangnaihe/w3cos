@@ -2,7 +2,7 @@
 //! path / events / util / url / os / process / timers is AOT-compiled with
 //! the builtin glue and must print what Node 20 prints for the same file.
 
-use crate::cjs_e2e_tests::{compile_and_run, write_fixture};
+use crate::cjs_e2e_tests::{compile_and_run, compile_and_run_with_env, write_fixture};
 
 const MAIN: &str = r##"const path = require("path");
 const posix = require("node:path/posix");
@@ -754,6 +754,50 @@ fn node_zlib_matches_node() {
     );
     let lines = compile_and_run(&root, &root.join("main.cjs"), "w3cos_node_zlib_e2e");
     let expected: Vec<&str> = ZLIB_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
+
+const DEBUGLOG_MAIN: &str = r##"const util = require("util");
+const process = require("process");
+const out = [];
+const origWrite = process.stderr.write;
+process.stderr.write = function (chunk) { out.push(String(chunk).replace(/ \d+: /, " PID: ")); return true; };
+const a = util.debuglog("undici");
+const b = util.debuglog("fetch", (fn) => out.push("cb " + (typeof fn)));
+const c = util.debuglog("http2");
+const d = util.debug("netx");
+console.log("types", typeof a, a.enabled, b.enabled, c.enabled, d.enabled, util.debug === util.debuglog);
+a("hello %s %d", "x", 5);
+b("fetching %j", { u: 1 });
+c("hidden");
+d("wild");
+process.stderr.write = origWrite;
+console.log("out", JSON.stringify(out));
+"##;
+
+/// `NODE_DEBUG=undici,FETCH,net* node main.cjs` (v24.18.0). undici's
+/// `lib/core/diagnostics.js` reads `util.debuglog(...).enabled` at load time.
+const DEBUGLOG_NODE_OUTPUT: &str = r##"types function true true false true true
+out ["UNDICI PID: hello x 5\n","cb function","FETCH PID: fetching {\"u\":1}\n","NETX PID: wild\n"]
+"##;
+
+#[test]
+fn node_util_debuglog_matches_node() {
+    let root = write_fixture(
+        "w3cos_node_debuglog_e2e",
+        &[
+            ("package.json", r#"{"name":"node-debuglog"}"#),
+            ("main.cjs", DEBUGLOG_MAIN),
+        ],
+    );
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.cjs"),
+        "w3cos_node_debuglog_e2e",
+        &[("NODE_DEBUG", "undici,FETCH,net*")],
+    );
+    let expected: Vec<&str> = DEBUGLOG_NODE_OUTPUT.lines().collect();
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
