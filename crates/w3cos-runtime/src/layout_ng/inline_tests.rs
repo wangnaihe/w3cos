@@ -2819,3 +2819,43 @@ fn split_inline_box_gets_union_of_line_fragments() {
     // Starting mid-line: offsetLeft (40) is not the union's left (0).
     assert_eq!(layout(Some("X "), "XX XX", None, false), None);
 }
+
+/// `<div><span style="font: 24px X">text</span></div>`: the span folds into
+/// its text leaf, so the unmarked div is a one-item IFC that owns the strut.
+/// A default-style box (a shadow `<slot>`) whose text carries another font
+/// stays out.
+#[test]
+fn a_cascaded_box_with_one_folded_text_leaf_is_an_ifc_root() {
+    let leaf = Style {
+        display: Display::Inline,
+        font_family: Some("CSSFW".into()),
+        font_size: 24.0,
+        line_height: 1.0,
+        ..Style::default()
+    };
+    let tree = |family: Option<&str>, children: Vec<Component>| {
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: Display::Block,
+                    font_family: family.map(Into::into),
+                    ..Style::default()
+                },
+                children,
+            )],
+        )
+    };
+    let reason = |root: &Component| inline::container_reason(&pre_flatten(root), 1);
+    let one = || vec![Component::text("hello there", leaf.clone())];
+    assert_eq!(reason(&tree(Some("serif"), one())), None);
+    assert_eq!(reason(&tree(None, one())), Some("ifc:unmarked"));
+    let two = vec![
+        Component::text("hello", leaf.clone()),
+        Component::text(" there", leaf.clone()),
+    ];
+    assert_eq!(reason(&tree(Some("serif"), two)), Some("ifc:unmarked"));
+}

@@ -972,8 +972,23 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // box's own font; a box whose text does not inherit its font (a shadow
     // <slot>, display:contents in Chrome, carries a default style) does not
     // own the strut, so its style must not drive line metrics.
+    // A cascaded box (a resolved font-family, unlike that default style)
+    // whose only child is one inline text leaf (`<div><span>text</span>
+    // </div>`, the span folded into its text) is a one-item IFC: the box
+    // owns the strut and the leaf keeps its own font (CSS 2.1 10.8.1).
+    let sole_text_leaf = || {
+        let mut children = rendered_children(flat, index);
+        style.font_family.is_some()
+            && matches!(
+                (children.next(), children.next()),
+                (Some(child), None)
+                    if matches!(flat[child].kind, ComponentKind::Text { .. })
+                        && flat[child].style.display == Display::Inline
+            )
+    };
     if !has_marker(style, IFC_MARKER)
         && rendered_children(flat, index).any(|child| !same_font(flat[child].style, style))
+        && !sole_text_leaf()
     {
         return Some("ifc:unmarked");
     }
