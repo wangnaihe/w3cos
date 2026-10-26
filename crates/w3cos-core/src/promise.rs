@@ -569,6 +569,137 @@ pub fn race(args: Vec<Value>) -> Value {
     promise
 }
 
+/// The items of a `Promise.<combinator>(array)` argument (`None` when it is
+/// not an array; nullish counts as empty, like [`all`]).
+fn combinator_items(args: &[Value]) -> Option<Vec<Value>> {
+    match args.first() {
+        None => Some(Vec::new()),
+        Some(v) if v.is_nullish() => Some(Vec::new()),
+        Some(items) if items.as_array().is_some() => Some(
+            items
+                .as_array()
+                .expect("array")
+                .borrow()
+                .iter()
+                .cloned()
+                .map(crate::value::array_slot_value)
+                .collect(),
+        ),
+        Some(_) => None,
+    }
+}
+
+fn settled_record(status: &str, key: &str, value: Value) -> Value {
+    let record = Value::object(HashMap::new());
+    record.set_property("status", Value::string(status));
+    record.set_property(key, value);
+    record
+}
+
+/// `Promise.allSettled(iterable)` — fulfilled, once every item settles,
+/// with `{ status: "fulfilled", value }` / `{ status: "rejected", reason }`
+/// records in input order. Never rejects for settled inputs.
+pub fn all_settled(args: Vec<Value>) -> Value {
+    let Some(items) = combinator_items(&args) else {
+        return reject(vec![js_error(
+            "TypeError: Promise.allSettled expects an array",
+        )]);
+    };
+    let state = pending_state();
+    let promise = promise_value_from_state(&state);
+    if items.is_empty() {
+        fulfill_state(&state, Value::array(Vec::new()));
+        return promise;
+    }
+    let results = Rc::new(RefCell::new(vec![Value::Undefined; items.len()]));
+    let remaining = Rc::new(Cell::new(items.len()));
+    for (index, item) in items.into_iter().enumerate() {
+        let item_state = pending_state();
+        fulfill_state(&item_state, item);
+        let record = |status: &'static str, key: &'static str| {
+            let results = results.clone();
+            let remaining = remaining.clone();
+            let state = state.clone();
+            Value::function(move |_, args| {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                results.borrow_mut()[index] = settled_record(status, key, value);
+                remaining.set(remaining.get() - 1);
+                if remaining.get() == 0 {
+                    fulfill_state(&state, Value::array(results.borrow().clone()));
+                }
+                Value::Undefined
+            })
+        };
+        let on_fulfilled = record("fulfilled", "value");
+        let on_rejected = record("rejected", "reason");
+        subscribe(&item_state, on_fulfilled, on_rejected);
+    }
+    promise
+}
+
+fn all_rejected_error(errors: Vec<Value>) -> Value {
+    crate::builtins::error_instance(
+        "AggregateError",
+        vec![
+            Value::array(errors),
+            Value::string("All promises were rejected"),
+        ],
+    )
+}
+
+/// `Promise.any(iterable)` — fulfilled with the first item that fulfills;
+/// rejected with an `AggregateError` of every reason (input order) when all
+/// of them reject, or immediately for an empty input.
+pub fn any(args: Vec<Value>) -> Value {
+    let Some(items) = combinator_items(&args) else {
+        return reject(vec![js_error("TypeError: Promise.any expects an array")]);
+    };
+    let state = pending_state();
+    let promise = promise_value_from_state(&state);
+    if items.is_empty() {
+        reject_state(&state, all_rejected_error(Vec::new()));
+        return promise;
+    }
+    let errors = Rc::new(RefCell::new(vec![Value::Undefined; items.len()]));
+    let remaining = Rc::new(Cell::new(items.len()));
+    for (index, item) in items.into_iter().enumerate() {
+        let item_state = pending_state();
+        fulfill_state(&item_state, item);
+        let on_fulfilled = {
+            let state = state.clone();
+            Value::function(move |_, args| {
+                fulfill_state(&state, args.first().cloned().unwrap_or(Value::Undefined));
+                Value::Undefined
+            })
+        };
+        let on_rejected = {
+            let errors = errors.clone();
+            let remaining = remaining.clone();
+            let state = state.clone();
+            Value::function(move |_, args| {
+                errors.borrow_mut()[index] = args.first().cloned().unwrap_or(Value::Undefined);
+                remaining.set(remaining.get() - 1);
+                if remaining.get() == 0 {
+                    reject_state(&state, all_rejected_error(errors.borrow().clone()));
+                }
+                Value::Undefined
+            })
+        };
+        subscribe(&item_state, on_fulfilled, on_rejected);
+    }
+    promise
+}
+
+/// `Promise.withResolvers()` — `{ promise, resolve, reject }`.
+pub fn with_resolvers(_args: Vec<Value>) -> Value {
+    let state = pending_state();
+    let result = Value::object(HashMap::new());
+    result.set_property("promise", promise_value_from_state(&state));
+    result.set_property("resolve", make_resolve(state.clone()));
+    result.set_property("reject", make_reject(state));
+    result
+}
+
 // ── Microtask queue ────────────────────────────────────────────────────
 
 /// Enqueue a host or JavaScript microtask in the same FIFO used by Promise

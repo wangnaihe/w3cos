@@ -562,6 +562,18 @@ pub fn promise_race(arguments: Vec<Value>) -> Value {
     crate::promise::race(arguments)
 }
 
+pub fn promise_all_settled(arguments: Vec<Value>) -> Value {
+    crate::promise::all_settled(arguments)
+}
+
+pub fn promise_any(arguments: Vec<Value>) -> Value {
+    crate::promise::any(arguments)
+}
+
+pub fn promise_with_resolvers(arguments: Vec<Value>) -> Value {
+    crate::promise::with_resolvers(arguments)
+}
+
 /// Property access for a DOM node that is still a tagged immediate.
 pub struct DomImmOps {
     pub generation: fn() -> u32,

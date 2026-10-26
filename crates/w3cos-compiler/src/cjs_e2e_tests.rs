@@ -849,3 +849,59 @@ console.log("4", leaf instanceof P, leaf instanceof Leaf, leaf.g, leaf.y, leaf.z
         ]
     );
 }
+
+const PROMISE_COMBINATORS_MAIN: &str = r#"class S {
+  async a() { return [1]; }
+  async b() { throw new Error("no"); }
+  async run(flag) {
+    const result = await Promise.allSettled([this.a(), this.b(), flag ? [] : Promise.resolve([2])]);
+    return result.map((r) => r.status + ":" + JSON.stringify(r.value ?? r.reason.message)).join(" ");
+  }
+}
+(async () => {
+  console.log(await new S().run(true));
+  console.log(await new S().run(false));
+  const empty = await Promise.allSettled([]);
+  console.log("empty", Array.isArray(empty), empty.length);
+  console.log("any", await Promise.any([Promise.reject(1), new Promise((r) => setTimeout(() => r("late"), 5)), Promise.resolve("first")]));
+  try {
+    await Promise.any([Promise.reject(new Error("e1")), Promise.reject("e2")]);
+  } catch (e) {
+    console.log("anyerr", e instanceof AggregateError, e.message, e.errors.length, e.errors[1]);
+  }
+  try { await Promise.any([]); } catch (e) { console.log("anyempty", e.constructor.name, e.errors.length); }
+  const { promise, resolve, reject } = Promise.withResolvers();
+  setTimeout(() => resolve("wr"), 1);
+  console.log("withResolvers", typeof reject, await promise);
+})();
+"#;
+
+/// `node main.js` (v24.18.0). Code-OSS's cachedExtensionScanner awaits
+/// `Promise.allSettled([...])` and reads `result[0].status`.
+const PROMISE_COMBINATORS_NODE_OUTPUT: &str = r#"fulfilled:[1] rejected:"no" fulfilled:[]
+fulfilled:[1] rejected:"no" fulfilled:[2]
+empty true 0
+any first
+anyerr true All promises were rejected 2 e2
+anyempty AggregateError 0
+withResolvers function wr
+"#;
+
+#[test]
+fn promise_all_settled_any_with_resolvers_match_node() {
+    let root = write_fixture(
+        "w3cos_cjs_e2e_promise_combinators",
+        &[
+            ("package.json", r#"{"name":"promise-combinators"}"#),
+            ("main.js", PROMISE_COMBINATORS_MAIN),
+        ],
+    );
+    let lines = compile_and_run(
+        &root,
+        &root.join("main.js"),
+        "w3cos_cjs_e2e_promise_combinators",
+    );
+    let expected: Vec<&str> = PROMISE_COMBINATORS_NODE_OUTPUT.lines().collect();
+    assert_eq!(lines, expected);
+    std::fs::remove_dir_all(root).ok();
+}
