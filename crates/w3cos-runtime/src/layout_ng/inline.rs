@@ -405,7 +405,8 @@ fn visual_order(levels: &[u8]) -> Vec<usize> {
 fn supported_script_in(content: &str, reordered: bool) -> bool {
     content.chars().all(|c| {
         let u = c as u32;
-        if matches!(c, '\n' | '\u{2028}' | '\u{2029}') {
+        // (Preserved tabs are gated by `text_content_reason`.)
+        if matches!(c, '\n' | '\t' | '\u{2028}' | '\u{2029}') {
             return true;
         }
         if c < ' ' || ('\u{7f}'..='\u{9f}').contains(&c) {
@@ -444,19 +445,46 @@ fn fallback_grows_line(content: &str, style: &Style) -> bool {
 }
 
 /// The content a text leaf cannot carry yet: an empty leaf, a carriage
-/// return, a preserved tab, or a preserved newline (unless `newline_ok`).
-fn text_content_reason(content: &str, newline_ok: bool) -> Option<&'static str> {
+/// return, a preserved tab (unless `tabs_ok`), or a preserved newline
+/// (unless `newline_ok`).
+fn text_content_reason(content: &str, newline_ok: bool, tabs_ok: bool) -> Option<&'static str> {
     if content.is_empty() {
         Some("text:empty")
     } else if content.contains('\r') {
         Some("text:cr")
-    } else if content.contains('\t') {
+    } else if content.contains('\t') && !tabs_ok {
         Some("text:tab")
     } else if content.contains('\n') && !newline_ok {
         Some("text:newline")
     } else {
         None
     }
+}
+
+/// Preserved tabs in a leaf that is its line's only content from the line
+/// start (Blink NGInlineItemsBuilder keeps a preserved tab as its own
+/// item; its ShapeResult advances to the next stop of the block's
+/// `tab-size` interval from the line start, stops computed before
+/// text-align).  The leaf's measured advance and paint then both resolve
+/// the stops from offset 0: one `pre` LTR line, and the block's stops
+/// equal the leaf's own (`block` is the leaf's own style for a block text
+/// leaf).  pre-wrap tabs hang at soft wraps and other offsets need the
+/// line position: legacy.
+fn preserved_tabs_ok(content: &str, style: &Style, block: &Style) -> bool {
+    style.white_space == WhiteSpace::Pre
+        && style.direction == TextDirection::Ltr
+        && block.direction == TextDirection::Ltr
+        && !content.contains(['\n', '\r', '\u{2028}', '\u{2029}'])
+        && style.text_indent == Dimension::Px(0.0)
+        && block.text_indent == Dimension::Px(0.0)
+        && matches!(block.text_align, TextAlign::Start | TextAlign::Left)
+        && style.font_family == block.font_family
+        && style.font_size == block.font_size
+        && style.font_weight == block.font_weight
+        && style.font_style == block.font_style
+        && style.font_variant == block.font_variant
+        && style.letter_spacing == block.letter_spacing
+        && style.word_spacing == block.word_spacing
 }
 
 /// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
@@ -485,7 +513,9 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
 /// [`block_text_reason`] without the box edges: the text of a block text
 /// leaf, or the label of a button leaf whose edges are its own box's.
 pub(super) fn block_text_content_reason(content: &str, style: &Style) -> Option<&'static str> {
-    if let Some(reason) = text_content_reason(content, false) {
+    if let Some(reason) =
+        text_content_reason(content, false, preserved_tabs_ok(content, style, style))
+    {
         return Some(reason);
     }
     // (A visual-order fragment from the cascade's bidi pass: paint draws
@@ -564,6 +594,7 @@ fn inline_text_reason(
     content: &str,
     style: &Style,
     sole: bool,
+    line_start: bool,
     container: &Style,
 ) -> Option<&'static str> {
     if style.display != Display::Inline {
@@ -630,7 +661,10 @@ fn inline_text_reason(
             }
             _ => false,
         };
-    if let Some(reason) = text_content_reason(content, newline_ok) {
+    // (`line_start`: the IFC's first entry, so its tabs resolve from the
+    // first line's start like a sole leaf's.)
+    let tabs_ok = (sole || line_start) && preserved_tabs_ok(content, style, container);
+    if let Some(reason) = text_content_reason(content, newline_ok, tabs_ok) {
         return Some(reason);
     }
     // A fragment with a line break the cascade froze inside it (one
@@ -1022,7 +1056,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if info.style.white_space != style.white_space {
             return Some("text:white-space");
         }
-        if let Some(reason) = inline_text_reason(content, info.style, sole, style) {
+        let line_start =
+            matches!(entries.first(), Some(InlineEntry::Leaf(first)) if *first == child);
+        if let Some(reason) = inline_text_reason(content, info.style, sole, line_start, style) {
             return Some(reason);
         }
         if content != FORCED_BREAK && content.contains('\u{2028}') {
@@ -2728,4 +2764,46 @@ pub(super) fn inline_min_max(
         min: at(0.0).map(|min| min.min(max)),
         max,
     })
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    #[test]
+    fn preserved_tabs_stay_on_ng_only_from_the_line_start_of_one_pre_line() {
+        let pre = Style {
+            white_space: WhiteSpace::Pre,
+            ..Style::default()
+        };
+        assert!(preserved_tabs_ok("a\tb", &pre, &pre));
+        assert_eq!(text_content_reason("a\tb", false, true), None);
+        assert_eq!(text_content_reason("a\tb", false, false), Some("text:tab"));
+        assert!(supported_script_in("\tP", false));
+        // pre-wrap tabs hang at soft wraps; a preserved newline starts a line
+        // whose stops NG does not resolve yet.
+        let pre_wrap = Style {
+            white_space: WhiteSpace::PreWrap,
+            ..Style::default()
+        };
+        assert!(!preserved_tabs_ok("a\tb", &pre_wrap, &pre_wrap));
+        assert!(!preserved_tabs_ok("a\n\tb", &pre, &pre));
+        // Paint offsets the stops by the line's alignment shift.
+        let centered = Style {
+            text_align: TextAlign::Center,
+            ..pre.clone()
+        };
+        assert!(!preserved_tabs_ok("\t", &pre, &centered));
+        // The block's space advance sets the interval.
+        let spaced = Style {
+            letter_spacing: 2.0,
+            ..pre.clone()
+        };
+        assert!(!preserved_tabs_ok("\t", &pre, &spaced));
+        let indented = Style {
+            text_indent: Dimension::Px(4.0),
+            ..pre.clone()
+        };
+        assert!(!preserved_tabs_ok("\t", &pre, &indented));
+    }
 }

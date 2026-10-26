@@ -113,6 +113,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "document-element"
             | "size-containment"
             | "contain-intrinsic-size"
+            // The computed `tab-size` (inherited). Text measure and paint
+            // read it for preserved tabs; `text:tab` gates the leaves whose
+            // stops need a line position NG does not pass yet.
+            | "tab-size"
             // Grid reads these. The cascade leaves the legacy fields alone:
             // height stays the dimension it already stored, and justify-content
             // stays the enum flex already uses.
