@@ -8748,7 +8748,43 @@ fn sanitize_identifier(name: &str) -> String {
 /// `m5_NKeyMap__m_values` and `m5_NKeyMap__m__values` are distinct JS
 /// methods (`values` / `_values`) and need distinct frame types, so each
 /// underscore run is kept as a count-tagged separator instead of dropped.
+/// Rust type-name stem for a generated function, injective over Rust idents.
+///
+/// Plain snake_case names (`[a-z][a-z0-9]*` segments joined by single `_`,
+/// no segment starting with `u<digit>`) keep the readable camel form, which
+/// is unambiguous for them. Any other name (minified `y` vs `Y`, `a_1` vs
+/// `a1`, `a__b` vs `a_u2_b`) gets a `U0<fnv64>` suffix, a sequence the plain
+/// form can never produce, so distinct symbols never share a frame type.
 fn upper_camel(name: &str) -> String {
+    let readable = readable_upper_camel(name);
+    if is_plain_snake_ident(name) {
+        return readable;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{readable}U0{hash:016x}")
+}
+
+fn is_plain_snake_ident(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('_').all(|segment| {
+            let mut bytes = segment.bytes();
+            match bytes.next() {
+                Some(first) if first.is_ascii_lowercase() => {
+                    let rest = segment.as_bytes()[1..].to_vec();
+                    rest.iter()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                        && !(first == b'u' && rest.first().is_some_and(u8::is_ascii_digit))
+                }
+                _ => false,
+            }
+        })
+}
+
+fn readable_upper_camel(name: &str) -> String {
     let mut output = String::new();
     let mut uppercase = true;
     let mut underscores = 0usize;
@@ -8777,6 +8813,18 @@ fn upper_camel(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_type_names_are_distinct_for_case_and_underscore_variants() {
+        assert_eq!(upper_camel("values_aot"), "ValuesAot");
+        let names = [
+            "m5644_y", "m5644_Y", "a_1", "a1", "a__b", "a_u2_b", "_a", "a", "a_", "aB", "a_b",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            assert!(seen.insert(upper_camel(name)), "collision for {name}");
+        }
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::process::Command;
