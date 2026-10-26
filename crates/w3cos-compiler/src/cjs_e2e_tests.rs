@@ -783,3 +783,69 @@ console.log("3", typeof it.next, typeof it[Symbol.iterator]);
     let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_class_symiter_map");
     assert_eq!(lines, vec!["1 a:*.a,b:*.b", "2 0", "3 function function"]);
 }
+
+#[test]
+fn derived_class_super_returning_object_and_proxy_getter() {
+    let root = write_fixture(
+        "w3cos_super_return_proxy",
+        &[
+            ("package.json", r#"{"name":"superret","type":"module"}"#),
+            (
+                "main.mjs",
+                r#"const State = { Uninitialized: { type: "uninitialized" } };
+class Client {
+  constructor(channel) {
+    this.channel = channel;
+    this._state = State.Uninitialized;
+    channel.then((s) => this.state = s);
+  }
+  get state() { return this._state; }
+  set state(s) { this._state = s; }
+}
+class Stub {
+  constructor(name, options) {
+    return new options.ctor(Promise.resolve({ type: "disabled" }));
+  }
+}
+let MainStub = class extends Stub {
+  constructor(name, options) { super(name, options); }
+};
+MainStub = (function (c) { return c; })(MainStub);
+const direct = new MainStub("update", { ctor: Client });
+console.log("1", direct instanceof Client, direct.state.type);
+let cached;
+const proxy = new Proxy(Object.create(null), {
+  get(target, key) {
+    if (key in target) { return target[key]; }
+    const obj = cached ?? (cached = new MainStub("update", { ctor: Client }));
+    let prop = obj[key];
+    if (typeof prop !== "function") { return prop; }
+    prop = prop.bind(obj);
+    target[key] = prop;
+    return prop;
+  },
+  getPrototypeOf() { return MainStub.prototype; }
+});
+console.log("2", proxy.state.type);
+setTimeout(() => console.log("3", proxy.state.type, direct.state.type, cached.state.type), 0);
+class P { constructor() { this.x = 1; } get g() { return this.x; } }
+class Base { constructor(c) { return new c(); } }
+class Mid extends Base { constructor(c) { super(c); this.y = 2; } }
+class Leaf extends Mid { z = 3; }
+const leaf = new Leaf(P);
+console.log("4", leaf instanceof P, leaf instanceof Leaf, leaf.g, leaf.y, leaf.z);
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_super_return_proxy");
+    assert_eq!(
+        lines,
+        vec![
+            "1 true uninitialized",
+            "2 uninitialized",
+            "4 true false 1 2 3",
+            "3 disabled disabled disabled",
+        ]
+    );
+}
