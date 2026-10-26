@@ -783,6 +783,12 @@ struct Builder {
     /// Name an anonymous function/arrow takes from its object-literal key
     /// (`{ f: () => 1 }.f.name === "f"`); consumed by the next one lowered.
     pending_function_name: Option<String>,
+    /// Inside a class constructor (or an arrow nested in one): `new.target`
+    /// is the constructor that created `this`.
+    class_constructor_scope: bool,
+    /// Set just before lowering a class constructor body; consumed by
+    /// `lower_nested_function`.
+    pending_class_constructor: bool,
 }
 
 impl Builder {
@@ -836,6 +842,8 @@ impl Builder {
             type_names: Default::default(),
             pending_return_hint: None,
             pending_function_name: None,
+            class_constructor_scope: false,
+            pending_class_constructor: false,
         }
     }
 
@@ -893,6 +901,8 @@ impl Builder {
             type_names: Default::default(),
             pending_return_hint: None,
             pending_function_name: None,
+            class_constructor_scope: false,
+            pending_class_constructor: false,
         }
     }
 
@@ -4005,6 +4015,25 @@ impl Builder {
                 self.emit_construct(dst, constructor, arguments);
                 Ok(dst)
             }
+            // `new.target` in a class constructor: the runtime creates `this`
+            // from the constructed class's prototype, so (as Babel's
+            // transform-new-target) it is `this.constructor`.
+            Expr::MetaProp(meta)
+                if meta.kind == swc_ecma_ast::MetaPropKind::NewTarget
+                    && self.class_constructor_scope
+                    && self.find_binding("*this*").is_some() =>
+            {
+                let binding = self.resolve_binding("*this*");
+                let this_value = self.load_binding(binding);
+                let key = self.constant(Constant::String("constructor".into()));
+                let dst = self.register();
+                self.emit(Instruction::GetProperty {
+                    dst,
+                    object: this_value,
+                    key,
+                });
+                Ok(dst)
+            }
             Expr::MetaProp(meta) if meta.kind == swc_ecma_ast::MetaPropKind::ImportMeta => {
                 let dst = self.register();
                 self.emit(Instruction::ImportMeta { dst });
@@ -4721,6 +4750,7 @@ impl Builder {
                         statements = parameter_properties;
                     }
                 }
+                self.pending_class_constructor = true;
                 constructor = Some(self.lower_nested_function(
                     parameters,
                     &statements,
@@ -5149,6 +5179,7 @@ impl Builder {
     ) -> Result<Register> {
         let function_id = FunctionId(self.next_function);
         self.next_function += 1;
+        let class_constructor = std::mem::take(&mut self.pending_class_constructor);
         let strict_mode = self.strict_mode
             || class_super_is_static.is_some()
             || statements_have_use_strict_directive(statements.iter());
@@ -5164,6 +5195,8 @@ impl Builder {
         );
         child.class_super_is_static = class_super_is_static
             .or_else(|| (!bind_this).then_some(self.class_super_is_static).flatten());
+        child.class_constructor_scope =
+            class_constructor || (!bind_this && self.class_constructor_scope);
         child.type_names = std::rc::Rc::clone(&self.type_names);
         let return_hint = self.pending_return_hint.take().unwrap_or_default();
         let parameter_hints = parameters
