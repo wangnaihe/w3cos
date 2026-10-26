@@ -31,6 +31,9 @@ pub const INPUT_TYPE_PROPERTY: &str = "--w3cos-internal-input-type";
 /// The `width` / `height` attributes of an outer `<svg>`, as written (the
 /// serialized source carries a rasterization size in their place when
 /// they are absent). Set only when the attribute is present.
+/// Set on an HTML `<button>` element: `1`, or `empty` when the lowered
+/// button has no content and its paint label is the placeholder.
+pub const BUTTON_PROPERTY: &str = "--w3cos-internal-html-button";
 pub const SVG_WIDTH_PROPERTY: &str = "--w3cos-internal-svg-width";
 pub const SVG_HEIGHT_PROPERTY: &str = "--w3cos-internal-svg-height";
 /// Set on an outer `<svg>` whose author width / height is auto and whose

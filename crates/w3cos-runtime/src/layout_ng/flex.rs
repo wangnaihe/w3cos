@@ -449,6 +449,12 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if block::is_replaced(info.kind) {
         return block::intrinsic_sizes(flat, index, space);
     }
+    // So are a button leaf's: its label (or nothing when empty).
+    if matches!(info.kind, w3cos_std::ComponentKind::Button { .. })
+        && rendered_children(flat, index).next().is_none()
+    {
+        return block::intrinsic_sizes(flat, index, space);
+    }
     // A nested flex container's min/max-content sizes are its own flex
     // algorithm's (FlexLayoutAlgorithm::ComputeMinMaxSizes): a row sums
     // its items, it does not take the widest one. `block::intrinsic_sizes`

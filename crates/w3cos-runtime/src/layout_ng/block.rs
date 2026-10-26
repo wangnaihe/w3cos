@@ -58,6 +58,26 @@ fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// An HTML `<button>` (the DOM marks it; a collapsed `<select>` lowers to
+/// the same component kind but is a menu list, Blink LayoutMenuList).
+pub(super) fn is_html_button(info: &FlatNodeInfo) -> bool {
+    matches!(info.kind, ComponentKind::Button { .. })
+        && marker(info.style, w3cos_dom::user_agent::BUTTON_PROPERTY).is_some()
+}
+
+/// The label a button leaf lays out: none for an empty button (its
+/// placeholder label is only painted) or one with rendered children.
+fn button_leaf_label<'a>(flat: &'a [FlatNodeInfo], index: usize) -> Option<&'a str> {
+    let info = &flat[index];
+    let ComponentKind::Button { label } = info.kind else {
+        return None;
+    };
+    (inline::rendered_children(flat, index).next().is_none()
+        && !label.is_empty()
+        && marker(info.style, w3cos_dom::user_agent::BUTTON_PROPERTY) != Some("empty"))
+    .then_some(label.as_str())
+}
+
 pub(super) fn size_contained(style: &Style) -> bool {
     marker(style, SIZE_CONTAINMENT).is_some()
 }
@@ -559,6 +579,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if let ComponentKind::SvgDocument { source, .. } = info.kind {
         return svg_box_reason(flat, index, source);
     }
+    if matches!(info.kind, ComponentKind::Button { .. }) {
+        return button_box_reason(flat, index);
+    }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
         if !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
@@ -704,6 +727,97 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         ComponentKind::Button { .. } => Some("kind:button"),
         ComponentKind::SvgPath { .. } | ComponentKind::SvgDocument { .. } => Some("kind:svg"),
         _ => Some("kind:other"),
+    }
+}
+
+/// HTML §15.5.3 button layout (Blink LayoutButton: the content sits in an
+/// anonymous inner block, centered in the block axis; the box is an
+/// inline-block whatever its inline display). Its children are checked as
+/// the children of a block container; a label leaf as block text.
+fn button_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if !is_html_button(info) {
+        return Some("kind:select");
+    }
+    if !matches!(
+        style.display,
+        Display::Block | Display::FlowRoot | Display::Inline | Display::InlineBlock
+    ) {
+        return Some("button:display");
+    }
+    if style.float != Float::None || style.position != Position::Static {
+        return Some("button:float-or-position");
+    }
+    let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_));
+    if [
+        style.width,
+        style.height,
+        style.min_width,
+        style.max_width,
+        style.min_height,
+        style.max_height,
+    ]
+    .into_iter()
+    .any(percent)
+    {
+        return Some("button:percent");
+    }
+    if size_contained(style) {
+        return Some("button:contain");
+    }
+    if info
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
+        return Some("button:grid-item");
+    }
+    let allowed = [
+        inline::VALIGN_MARKER,
+        // Paint only here: `appearance: none` keeps the button's layout
+        // (the UA edges are ordinary declarations).
+        w3cos_dom::user_agent::CONTROL_APPEARANCE_PROPERTY,
+        w3cos_dom::user_agent::BUTTON_PROPERTY,
+        inline::VALIGN_LENGTH_MARKER,
+    ];
+    let block_allowed = &allowed[..allowed.len() - 1];
+    let content = || {
+        if let Some(label) = button_leaf_label(flat, index) {
+            inline::block_text_content_reason(label, style)
+        } else if inline::is_inline_container(flat, index) {
+            inline::container_reason(flat, index)
+        } else {
+            None
+        }
+    };
+    if info
+        .parent
+        .is_some_and(|parent| is_author_flex(flat[parent].style))
+    {
+        // A flex item is blockified (CSS Display §2.7).
+        return unsupported_box_style(style, block_allowed, true).or_else(content);
+    }
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("button:beside-float");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => {
+            unsupported_box_style(style, block_allowed, false).or_else(content)
+        }
+        _ if inline::in_inline_container(flat, index) => {
+            unsupported_box_style(style, &allowed, true)
+                .or_else(|| inline::atomic_inline_reason(style))
+                .or_else(content)
+        }
+        _ => Some("button:inline"),
     }
 }
 
@@ -2121,6 +2235,14 @@ pub(super) fn intrinsic_sizes_at(
         let (width, _) = svg_content_size(source, info.style, space).why("svg:size")?;
         return Some(MinMax::exact(width));
     }
+    if matches!(info.kind, ComponentKind::Button { .. })
+        && inline::rendered_children(flat, index).next().is_none()
+    {
+        return Some(match button_leaf_label(flat, index) {
+            Some(label) => inline::text_min_max(label, info.style),
+            None => MinMax::exact(0.0),
+        });
+    }
     if size_contained(info.style) {
         // Size containment: intrinsic sizes ignore the contents.
         return Some(MinMax::exact(contain_intrinsic_size(info.style).0));
@@ -2558,14 +2680,20 @@ fn layout_block_in(
     if image_size.is_none() {
         if let Some((width, _)) = sized {
             metrics.content_width = width;
-        } else if style.width == Dimension::Auto && inline::is_atomic_inline(flat, index) {
+        } else if style.width == Dimension::Auto
+            && (inline::is_atomic_inline(flat, index) || is_html_button(info))
+        {
+            // A button's auto width is fit-content even when it is
+            // block-level (HTML §15.5.3, Blink LayoutButton).
             metrics.content_width =
                 shrink_to_fit(flat, index, space, &metrics).why("shrink-to-fit")?;
         }
     }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
-    let bfc_root = force_bfc_root || is_bfc_root(style);
+    // A button establishes a formatting context for its content.
+    let button = is_html_button(info);
+    let bfc_root = force_bfc_root || is_bfc_root(style) || button;
     // NGBfcOffset of our border box; a BFC root starts new coordinates and
     // a new exclusion space (NGConstraintSpace::IsNewFormattingContext).
     let mut own_exclusions = ExclusionSpace::default();
@@ -2683,6 +2811,19 @@ fn layout_block_in(
         cursor = height;
         last_baseline = baseline.offset(content_top);
         first_baseline = last_baseline;
+        at_top = false;
+    } else if button && inline::rendered_children(flat, index).next().is_none() {
+        // A button leaf: its label is one line of block text (paint
+        // draws it on one line), or nothing for an empty button.
+        if let Some(label) = button_leaf_label(flat, index) {
+            let (height, baseline) = inline::block_text_layout(label, metrics.content_width, style);
+            if !matches!(baseline, LastBaseline::At(_)) {
+                return super::bail("button:wrap");
+            }
+            cursor = height;
+            last_baseline = baseline.offset(content_top);
+            first_baseline = last_baseline;
+        }
         at_top = false;
     } else if inline::is_inline_container(flat, index) {
         // NGLineLayoutOpportunity: line boxes avoid the BFC's floats.
@@ -2918,6 +3059,18 @@ fn layout_block_in(
                 | ComponentKind::SvgDocument { .. }
         ) {
             let (width, _) = replaced_size(child_info.kind, child_info.style, &child_space)?;
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
+        } else if is_html_button(child_info) && child_info.style.width == Dimension::Auto {
+            // A block-level button is fit-content wide; auto margins are
+            // then solved against that width (as for a replaced box).
+            let auto = resolve_inline(child_info.style, &child_space);
+            let width =
+                shrink_to_fit(flat, child, &child_space, &auto).why("button:shrink-to-fit")?;
             let mut definite = child_info.style.clone();
             definite.width = Dimension::Px(width);
             definite.min_width = Dimension::Auto;
@@ -3168,7 +3321,9 @@ fn layout_block_in(
         let child_style = child_info.style;
         if !exclusions.is_empty()
             && result.fragment.height > 0.0
-            && (matches!(child_info.kind, ComponentKind::Text { .. }) || is_bfc_root(child_style))
+            && (matches!(child_info.kind, ComponentKind::Text { .. })
+                || is_bfc_root(child_style)
+                || is_html_button(child_info))
             && exclusions.overlaps(
                 bfc_x + x,
                 content_bfc_y + resolved,
@@ -3386,6 +3541,27 @@ fn layout_block_in(
         start_strut = own;
     }
 
+    if button {
+        // HTML §15.5.3 / Blink LayoutButton: the anonymous content box is
+        // centered in the block axis when it fits (safe alignment, like
+        // its auto margins); an overflowing one starts at the top. The
+        // baseline is the content's last line, else the content-box
+        // bottom, whatever the overflow.
+        let shift = ((content_height - auto_content) / 2.0).max(0.0);
+        for placed in &mut children {
+            placed.1 += shift;
+        }
+        for candidate in &mut oof_candidates {
+            *candidate = candidate.translated(0.0, shift);
+        }
+        let bottom = LastBaseline::At(content_top + content_height);
+        let centered = |baseline: LastBaseline| match baseline {
+            LastBaseline::NoLines => bottom,
+            other => other.offset(shift),
+        };
+        last_baseline = centered(last_baseline);
+        first_baseline = centered(first_baseline);
+    }
     let width = metrics.content_width + bl + br + pl + pr;
     let height = content_height + bt + bb + pt + pb;
     if style.position != Position::Static && !oof_candidates.is_empty() {

@@ -463,6 +463,12 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     {
         return Some("text:edges");
     }
+    block_text_content_reason(content, style)
+}
+
+/// [`block_text_reason`] without the box edges: the text of a block text
+/// leaf, or the label of a button leaf whose edges are its own box's.
+pub(super) fn block_text_content_reason(content: &str, style: &Style) -> Option<&'static str> {
     if content.is_empty() || content.contains(['\n', '\r', '\t']) {
         return Some("text:content");
     }
@@ -704,12 +710,14 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
             | ComponentKind::Canvas { .. }
             | ComponentKind::TextInput { .. }
             | ComponentKind::SvgDocument { .. }
+            | ComponentKind::Button { .. }
     ) {
         // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
         // sheet gives img and canvas `inline-block`; an author `inline` is
         // the same kind of item (Blink LayoutReplaced is atomic either way).
         // So is a text field (Blink LayoutTextControl is an inline-block
-        // whatever its inline display).
+        // whatever its inline display). A button is an inline-block
+        // too (HTML §15.5.3: `inline` behaves as `inline-block`).
         return inline_block || flat[index].style.display == Display::Inline;
     }
     matches!(

@@ -4564,3 +4564,170 @@ fn svg_root_matches_chrome() {
         vec!["svg:flex-fallback-size".to_string()]
     );
 }
+
+#[test]
+fn button_matches_chrome() {
+    // Facts from Chrome (/workspace/ngtools/btn/b1-b3.html) that do not
+    // depend on the font: the UA box (2px border, 1px 6px padding,
+    // border-box), fit-content width, safe block-axis centering, and the
+    // baseline (last line, else the content-box bottom).
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "400px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    // Each line: "x" text, then a button.
+    let line = |document: &mut w3cos_dom::Document,
+                parent_css: &[(&str, &str)],
+                label: Option<&str>,
+                css: &[(&str, &str)]| {
+        let parent = div(document, parent_css);
+        let text = document.create_text_node("x ");
+        parent.append_child(document, text);
+        let button = document.create_element("button");
+        if let Some(label) = label {
+            let text = document.create_text_node(label);
+            button.append_child(document, text);
+        }
+        for (k, v) in css {
+            button.style_mut(document).set_property(k, v);
+        }
+        parent.append_child(document, button);
+    };
+    line(&mut document, &[], None, &[]);
+    line(&mut document, &[], None, &[("height", "60px")]);
+    line(&mut document, &[], Some("Hi"), &[]);
+    line(&mut document, &[], Some("Hi"), &[("height", "60px")]);
+    line(&mut document, &[], Some("Hi"), &[("height", "10px")]);
+    line(
+        &mut document,
+        &[],
+        Some("Hi"),
+        &[("height", "60px"), ("padding-top", "20px")],
+    );
+    line(
+        &mut document,
+        &[],
+        Some("Hi"),
+        &[("height", "60px"), ("overflow", "hidden")],
+    );
+    line(
+        &mut document,
+        &[],
+        Some("Hi"),
+        &[
+            ("box-sizing", "content-box"),
+            ("width", "100px"),
+            ("height", "40px"),
+        ],
+    );
+    // Block-level: fit-content, centered by auto margins.
+    let block = div(&mut document, &[]);
+    let button = document.create_element("button");
+    let text = document.create_text_node("Hi");
+    button.append_child(&mut document, text);
+    for (k, v) in [("display", "block"), ("margin", "0 auto")] {
+        button.style_mut(&mut document).set_property(k, v);
+    }
+    block.append_child(&mut document, button);
+    // Block children fill the content box and are centered as one.
+    let block_children = |document: &mut w3cos_dom::Document, height: &str| {
+        let parent = div(document, &[]);
+        let button = document.create_element("button");
+        for (k, v) in [("width", "200px"), ("height", height)] {
+            button.style_mut(document).set_property(k, v);
+        }
+        for word in ["aa", "bb"] {
+            let child = document.create_element("div");
+            let text = document.create_text_node(word);
+            child.append_child(document, text);
+            button.append_child(document, child);
+        }
+        parent.append_child(document, button);
+    };
+    block_children(&mut document, "auto");
+    block_children(&mut document, "100px");
+    // Flex items: a row item takes its content width, a column item
+    // stretches, and a stretched height centers the label.
+    for (css, label) in [
+        (&[("display", "flex")][..], "Hi"),
+        (
+            &[("display", "flex"), ("flex-direction", "column")][..],
+            "Hi",
+        ),
+        (&[("display", "flex"), ("height", "80px")][..], "Hi"),
+    ] {
+        let parent = div(&mut document, css);
+        let button = document.create_element("button");
+        let text = document.create_text_node(label);
+        button.append_child(&mut document, text);
+        parent.append_child(&mut document, button);
+    }
+
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let buttons: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::Button { .. }))
+        .collect();
+    assert_eq!(buttons.len(), 14);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("buttons");
+    let r = |n: usize| rect(&out, buttons[n]);
+    // The "x" text before a button: its top relative to the button's top
+    // moves with the button's baseline.
+    let offset = |n: usize| rect(&out, buttons[n] - 1).1 - r(n).1;
+    let near = |a: f32, b: f32| assert!((a - b).abs() < 0.01, "{a} != {b}");
+    // Empty: border and padding only; the baseline is the content-box
+    // bottom (Chrome 3 and 57).
+    assert_eq!((r(0).2, r(0).3), (16.0, 6.0));
+    assert_eq!(r(1).3, 60.0);
+    near(offset(1) - offset(0), 54.0);
+    // A label centered in a taller box moves the baseline by half the
+    // extra height; an overflowing one starts at the top (safe).
+    let (w, h) = (r(2).2, r(2).3);
+    // (Chrome 40; legacy reserved 2em of label, 56.)
+    assert!(w > 16.0 && w < 48.0, "fit-content label width {w}");
+    near(offset(3) - offset(2), (60.0 - h) / 2.0);
+    near(offset(4), offset(2));
+    // Padding moves the content box down by 19 and shrinks it to 35:
+    // Chrome's baseline moves from 37 to 46.5 against the 60px button.
+    near(offset(5) - offset(3), 9.5);
+    near(offset(6), offset(3)); // overflow does not move the baseline
+    assert_eq!((r(7).2, r(7).3), (116.0, 46.0));
+    // Block-level button: fit-content and centered.
+    assert_eq!(r(8).2, w);
+    // (LayoutUnit margins.)
+    assert!((r(8).0 - (400.0 - w) / 2.0).abs() <= 1.0 / 64.0);
+    // Block children: content width 184, centered as one block.
+    let child = |n: usize, k: usize| {
+        let first = buttons[n] + 1;
+        let index = if k == 0 {
+            first
+        } else {
+            flat[first].subtree_end
+        };
+        rect(&out, index)
+    };
+    assert_eq!(child(9, 0).2, 184.0);
+    let auto_h = r(9).3;
+    let shift = (100.0 - auto_h) / 2.0;
+    near(child(10, 0).1 - r(10).1, child(9, 0).1 - r(9).1 + shift);
+    near(child(10, 1).1 - r(10).1, child(9, 1).1 - r(9).1 + shift);
+    // Flex items.
+    assert_eq!(r(11).2, w);
+    assert_eq!(r(12).2, 400.0);
+    assert_eq!(r(13).3, 80.0);
+}

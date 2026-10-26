@@ -3552,6 +3552,12 @@ impl Document {
                     control_appearance.into(),
                 );
         }
+        if control_tag == "button" {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(user_agent::BUTTON_PROPERTY.into(), "1".into());
+        }
 
         if let Some(parent) = inherited {
             // `pre` keeps the UA stylesheet's `monospace` unless the author asks
@@ -11198,6 +11204,14 @@ impl Document {
                         // A non-leaf DOM button paints through its child nodes.
                         // Keeping the descendant text in Button::label would
                         // make every renderer paint it a second time.
+                        let mut style = style;
+                        if !has_visual_children && label.is_empty() {
+                            // No content: the placeholder is only a paint label.
+                            style
+                                .custom_properties
+                                .get_or_insert_with(Default::default)
+                                .insert(user_agent::BUTTON_PROPERTY.into(), "empty".into());
+                        }
                         let mut button = w3cos_std::Component::button_shared(paint_label, style);
                         button.children = children;
                         button
