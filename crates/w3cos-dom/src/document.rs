@@ -8333,6 +8333,9 @@ impl Document {
                     // zero-width marker paints nothing but still establishes
                     // the inherited line-height strut for following content.
                     style.display = w3cos_std::style::Display::Inline;
+                    // Blink's LayoutBR is a text-like object: margins on a
+                    // <br> do not apply (flexbox-min-width-auto-005).
+                    style.margin = w3cos_std::style::Edges::ZERO;
                     style.width = w3cos_std::style::Dimension::Px(0.0);
                     style.height =
                         w3cos_std::style::Dimension::Px(style.font_size * style.line_height);
