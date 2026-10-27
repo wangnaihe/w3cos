@@ -2451,13 +2451,12 @@ impl Value {
             _ if self.is_string() => {
                 let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
-                    s.encode_utf16()
-                        .nth(idx)
+                    utf16_unit_at(&s, idx)
                         .and_then(|unit| String::from_utf16(&[unit]).ok())
                         .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(s.encode_utf16().count() as f64)
+                    Value::Number(utf16_len(&s) as f64)
                 } else {
                     // ToObject(string) inherits String.prototype: `s.startsWith`
                     // and `s?.startsWith(...)` read the method by value.
@@ -3308,8 +3307,15 @@ impl Value {
             }
             (this, "slice") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                // ASCII: UTF-16 units are bytes, so slice the text directly
+                // instead of re-encoding it on every call.
+                let ascii = is_ascii_js_string(&value);
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let normalize = |argument: Option<&Value>, fallback: i64| {
                     let raw = argument
                         .map(Value::to_number)
@@ -3324,12 +3330,20 @@ impl Value {
                 };
                 let start = normalize(args.first(), 0);
                 let end = normalize(args.get(1), length).max(start);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "substr") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                let length = units.len() as i64;
+                let ascii = is_ascii_js_string(&value);
+                let units = if ascii {
+                    Vec::new()
+                } else {
+                    value.encode_utf16().collect::<Vec<_>>()
+                };
+                let length = if ascii { value.len() } else { units.len() } as i64;
                 let raw_start = args
                     .first()
                     .map(Value::to_number)
@@ -3346,8 +3360,11 @@ impl Value {
                     .map(Value::to_number)
                     .filter(|number| number.is_finite())
                     .map(|number| number.trunc().max(0.0) as usize)
-                    .unwrap_or(units.len() - start);
-                let end = start.saturating_add(count).min(units.len());
+                    .unwrap_or(length as usize - start);
+                let end = start.saturating_add(count).min(length as usize);
+                if ascii {
+                    return Value::from(&value[start..end]);
+                }
                 return Value::from(String::from_utf16_lossy(&units[start..end]));
             }
             (this, "repeat") if this.is_string() => {
@@ -3406,11 +3423,22 @@ impl Value {
                 let value = this.as_js_string().expect("string");
                 let needle = args.first().cloned().unwrap_or_default().to_js_string();
                 let start = args.get(1).map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
-                let start_byte = string_index_to_byte(&value, start);
+                let ascii = is_ascii_js_string(&value);
+                let start_byte = if ascii {
+                    start.min(value.len())
+                } else {
+                    string_index_to_byte(&value, start)
+                };
                 let index = value
                     .get(start_byte..)
                     .and_then(|tail| tail.find(&needle).map(|offset| start_byte + offset))
-                    .map(|byte| value[..byte].chars().count() as f64)
+                    .map(|byte| {
+                        if ascii {
+                            byte as f64
+                        } else {
+                            value[..byte].chars().count() as f64
+                        }
+                    })
                     .unwrap_or(-1.0);
                 return Value::Number(index);
             }
@@ -3479,6 +3507,11 @@ impl Value {
                 if !index.is_finite() || index < 0.0 {
                     return Value::from(String::new());
                 }
+                if is_ascii_js_string(&value) {
+                    return Value::from(
+                        value.get(index as usize..index as usize + 1).unwrap_or(""),
+                    );
+                }
                 return Value::from(
                     value
                         .chars()
@@ -3489,7 +3522,12 @@ impl Value {
             }
             (this, "substring") if this.is_string() => {
                 let value = this.as_js_string().expect("string");
-                let len = value.chars().count();
+                let ascii = is_ascii_js_string(&value);
+                let len = if ascii {
+                    value.len()
+                } else {
+                    value.chars().count()
+                };
                 let mut start = args.first().map(Value::to_number).unwrap_or(0.0).max(0.0) as usize;
                 let mut end = args
                     .get(1)
@@ -3500,6 +3538,9 @@ impl Value {
                 end = end.min(len);
                 if start > end {
                     std::mem::swap(&mut start, &mut end);
+                }
+                if ascii {
+                    return Value::from(&value[start..end]);
                 }
                 let start = string_index_to_byte(&value, start);
                 let end = string_index_to_byte(&value, end);
@@ -4120,6 +4161,47 @@ thread_local! {
     /// parse is quadratic in the text length.
     static UTF16_CURSOR: RefCell<Option<(crate::JsString, usize, usize)>> =
         const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The last long string whose UTF-16 length was measured. `s.length`
+    /// in a scanner loop (`while (i < s.length)`) reads it once per step;
+    /// re-encoding the whole text each time makes the loop quadratic.
+    /// Holding a clone keeps the `Rc` shared, so the text cannot be
+    /// mutated in place while cached.
+    static UTF16_LEN: RefCell<Option<(crate::JsString, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// Whether every character is ASCII (UTF-16 units, chars and bytes then
+/// coincide). Amortized O(1) for long strings via the [`utf16_len`] cache:
+/// the UTF-16 length equals the byte length only for all-ASCII text.
+pub(crate) fn is_ascii_js_string(value: &crate::JsString) -> bool {
+    utf16_len(value) == value.as_str().len()
+}
+
+/// `String.prototype.length`: the UTF-16 length, amortized O(1) for
+/// repeated reads of the same long string.
+pub(crate) fn utf16_len(value: &crate::JsString) -> usize {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().count();
+    }
+    if let Some(len) = UTF16_LEN.with(|cache| match &*cache.borrow() {
+        Some((cached, len)) if cached.ptr_eq(value) && cached.as_str().len() == text.len() => {
+            Some(*len)
+        }
+        _ => None,
+    }) {
+        return len;
+    }
+    let len = if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    };
+    UTF16_LEN.with(|cache| *cache.borrow_mut() = Some((value.clone(), len)));
+    len
 }
 
 /// The UTF-16 code unit at `index` (`String.prototype.charCodeAt`), or
@@ -5877,6 +5959,89 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_string_length_and_index_scan_is_linear() {
+        // `for (i = 0; i < s.length; i++) s[i]` over a 2 MB string: each
+        // step reads `length` and an index; both must be amortized O(1).
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let other = Value::from("\u{e9}\u{1f600}".repeat(200).as_str());
+        let started = std::time::Instant::now();
+        let mut index = 0usize;
+        let mut bytes = 0usize;
+        while (index as f64) < value.get_property("length").to_number() {
+            bytes += value.get_property(&index.to_string()).to_js_string().len();
+            if index % 50_000 == 0 {
+                // Another long string takes over the caches; non-ASCII
+                // lengths count UTF-16 units (astral = 2).
+                assert_eq!(other.get_property("length"), Value::Number(600.0));
+                assert_eq!(other.get_property("0"), Value::from("\u{e9}"));
+            }
+            index += 1;
+        }
+        assert_eq!((index, bytes), (text.len(), text.len()));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_ascii_string_slicing_is_linear_and_matches_unicode_path() {
+        // hexBytes-style `s.substr(i, 2)` / `s.slice(i, i + 2)` scans over
+        // a 2 MB string: each call used to re-encode the whole text.
+        let text = "0123456789abcdef".repeat(130_000);
+        let value = Value::from(text.as_str());
+        let started = std::time::Instant::now();
+        let mut i = 0usize;
+        while i + 1 < text.len() {
+            let expected = Value::from(&text[i..i + 2]);
+            let n = |x: usize| Value::Number(x as f64);
+            assert_eq!(value.call_method("substr", vec![n(i), n(2)]), expected);
+            assert_eq!(value.call_method("slice", vec![n(i), n(i + 2)]), expected);
+            assert_eq!(
+                value.call_method("substring", vec![n(i + 2), n(i)]),
+                expected
+            );
+            assert_eq!(
+                value.call_method("charAt", vec![n(i)]),
+                Value::from(&text[i..i + 1])
+            );
+            i += 2_001;
+        }
+        for i in (0..text.len()).step_by(3) {
+            let _ = value.call_method("substr", vec![Value::Number(i as f64), Value::Number(2.0)]);
+        }
+        assert_eq!(
+            value.call_method("indexOf", vec![Value::from("f0"), Value::Number(20.0)]),
+            Value::Number(31.0)
+        );
+        assert_eq!(
+            value.call_method("slice", vec![Value::Number(-3.0)]),
+            Value::from("def")
+        );
+        assert_eq!(
+            value.call_method("substr", vec![Value::Number(-2.0)]),
+            Value::from("ef")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        // Long non-ASCII strings keep the UTF-16 path (astral = 2 units).
+        let wide = Value::from("\u{1f600}ab".repeat(100).as_str());
+        assert_eq!(
+            wide.call_method("slice", vec![Value::Number(2.0), Value::Number(4.0)]),
+            Value::from("ab")
+        );
+        assert_eq!(
+            wide.call_method("substr", vec![Value::Number(4.0), Value::Number(2.0)]),
+            Value::from("\u{1f600}")
         );
     }
 
