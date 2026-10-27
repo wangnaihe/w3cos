@@ -1953,6 +1953,65 @@ fn width_limit_keywords_and_fit_content_function() {
     }
 }
 
+/// The automatic minimum width of a flex item is clamped by its definite
+/// max-width, and a child's min-width keyword raises the item's
+/// min-content size (flexbox-min-width-auto-001,
+/// flex-item-content-is-min-width-max-content).
+#[test]
+fn flex_auto_min_width_respects_max_width_and_child_keywords() {
+    use w3cos_std::style::FlexDirection;
+    let flex = || Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        width: Dimension::Px(1.0),
+        ..sized(10.0)
+    };
+    let content = |w: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                ..sized(10.0)
+            },
+            vec![],
+        )
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        max_width: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(flex(), vec![node(item, vec![content(80.0)])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 50.0);
+
+    let mut inner = Style {
+        width: Dimension::Px(30.0),
+        ..sized(10.0)
+    };
+    inner.width = Dimension::Auto;
+    inner
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-min-width-keyword".into(),
+            "max-content".into(),
+        );
+    let wide = node(inner, vec![content(30.0), content(40.0)]);
+    let root = node(
+        block(),
+        vec![node(flex(), vec![node(Style::default(), vec![wide])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 40.0);
+}
+
 /// A flex item's percentage margin resolves against zero in its
 /// container's min-content size and against the container's width in
 /// layout (calc-margins-percent-flex).

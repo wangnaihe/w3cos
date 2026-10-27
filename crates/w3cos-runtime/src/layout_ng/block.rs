@@ -50,9 +50,9 @@ const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width is auto).
 pub(super) const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 pub(super) const MIN_WIDTH_KEYWORD: &str = "--w3cos-internal-min-width-keyword";
-const MAX_WIDTH_KEYWORD: &str = "--w3cos-internal-max-width-keyword";
+pub(super) const MAX_WIDTH_KEYWORD: &str = "--w3cos-internal-max-width-keyword";
 
-fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
+pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
         .custom_properties
         .as_ref()

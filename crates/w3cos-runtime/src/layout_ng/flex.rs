@@ -765,6 +765,19 @@ fn inline_contribution(
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
     let style = flat[index].style;
+    // Intrinsic width keywords (and min-/max-width keywords) clamp the
+    // contribution; the block contribution resolves them
+    // (flex-item-content-is-min-width-max-content).
+    if [
+        block::WIDTH_KEYWORD,
+        block::MIN_WIDTH_KEYWORD,
+        block::MAX_WIDTH_KEYWORD,
+    ]
+    .iter()
+    .any(|name| block::marker(style, name).is_some())
+    {
+        return block::min_max_contribution(flat, index, space);
+    }
     let border = block::border_widths(style);
     let pad = |spacing| spacing_px(style, spacing, 0.0, space);
     let edges = border[1] + border[3] + pad(style.padding.left) + pad(style.padding.right);
@@ -871,9 +884,15 @@ fn resolve_main_limits(
             block_content_min(flat, index, space).why("flex:block-min")?
         }
         .max(0.0);
-        match definite(specified, inner, style, space).why("flex:percent")? {
+        let suggestion = match definite(specified, inner, style, space).why("flex:percent")? {
             Some(size) => content_min.min(to_content(style, edges, size)),
             None => content_min,
+        };
+        // The content-based minimum size is further clamped by a definite
+        // max main size (CSS Flexbox §4.5; flexbox-min-width-auto-001).
+        match definite(max_dim, inner, style, space).why("flex:percent")? {
+            Some(size) => suggestion.min(to_content(style, edges, size)),
+            None => suggestion,
         }
     } else {
         match definite(min_dim, inner, style, space).why("flex:percent")? {
