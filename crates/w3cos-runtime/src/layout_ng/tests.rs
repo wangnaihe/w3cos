@@ -2522,7 +2522,7 @@ fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
     assert!(
         block::unsupported_reasons(&web)
             .iter()
-            .any(|r| r == "unrecognized-display"),
+            .any(|r| { r.starts_with("unrecognized-display:-webkit-box|") }),
         "{:?}",
         block::unsupported_reasons(&web)
     );
@@ -2555,6 +2555,182 @@ fn inline_grid_is_a_grid_and_webkit_box_stays_legacy() {
     assert_eq!(
         (run_rect.x, run_rect.y, run_rect.width, run_rect.height),
         (0.0, 0.0, 96.0, 96.0)
+    );
+}
+
+/// Chrome rejects `display: run-in`, so the earlier `block` applies. The
+/// DOM keeps legacy `flex` plus markers; NG lays a run-in over a block out
+/// as that block when it holds nothing, one text, or only blocks.
+/// Headless Chrome 155, body margin 0, Ahem 10px/1:
+/// - text: run-in (0,0,800,10), text (0,0,50,10), next block y=10;
+/// - two block children (padding 4, margins 8/12 collapse): run-in
+///   (0,0,800,40), children at (4,4) and (4,26), 792×10;
+/// - margins collapse through the run-in: parent (margin-top 10) and
+///   run-in (margins 20) at y=20; the next block (margin-top 30) at y=55;
+/// - empty run-in with border 3 and padding 2 is 800×10.
+#[test]
+fn run_in_over_block_lays_out_as_that_block() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let run_in = |style: Style, prior_block: bool| {
+        let mut markers = vec![(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "run-in".to_string(),
+        )];
+        if prior_block {
+            markers.push(("--w3cos-internal-run-in-block".to_string(), "1".to_string()));
+        }
+        Style {
+            display: Display::Flex,
+            custom_properties: Some(CustomProperties::from_iter(markers)),
+            ..style
+        }
+    };
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let ng = |root: &Component| {
+        let flat = pre_flatten(root);
+        let mut out = layout_tree(root, &flat, 800.0, 600.0).expect("ng");
+        out.sort_by_key(|(_, i)| *i);
+        out
+    };
+
+    // 0 root, 1 run-in, 2 text, 3 next block.
+    let root = node(
+        block(),
+        vec![
+            node(
+                run_in(font.clone(), true),
+                vec![Component::text("XX XX", text_style.clone())],
+            ),
+            node(sized(5.0), vec![]),
+        ],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 3), (0.0, 10.0, 800.0, 5.0));
+
+    // 0 root, 1 run-in, 2 and 3 children: stacked, not a flex row.
+    let padded = Style {
+        padding: margins(4.0, 4.0, 4.0, 4.0),
+        ..block()
+    };
+    let first = Style {
+        margin: margins(0.0, 0.0, 8.0, 0.0),
+        ..sized(10.0)
+    };
+    let second = Style {
+        margin: margins(12.0, 0.0, 0.0, 0.0),
+        ..sized(10.0)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            run_in(padded, true),
+            vec![node(first, vec![]), node(second, vec![])],
+        )],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 40.0));
+    assert_eq!(rect(&out, 2), (4.0, 4.0, 792.0, 10.0));
+    assert_eq!(rect(&out, 3), (4.0, 26.0, 792.0, 10.0));
+
+    // 0 root, 1 parent, 2 run-in, 3 next block.
+    let parent = Style {
+        margin: margins(10.0, 0.0, 0.0, 0.0),
+        ..block()
+    };
+    let collapsing = Style {
+        margin: margins(20.0, 0.0, 20.0, 0.0),
+        ..sized(5.0)
+    };
+    let next = Style {
+        margin: margins(30.0, 0.0, 0.0, 0.0),
+        ..sized(5.0)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            parent,
+            vec![node(run_in(collapsing, true), vec![]), node(next, vec![])],
+        )],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 20.0, 800.0, 40.0));
+    assert_eq!(rect(&out, 2), (0.0, 20.0, 800.0, 5.0));
+    assert_eq!(rect(&out, 3), (0.0, 55.0, 800.0, 5.0));
+
+    let bordered = Style {
+        border_width: 3.0,
+        padding: margins(2.0, 2.0, 2.0, 2.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(run_in(bordered, true), vec![]),
+            node(sized(5.0), vec![]),
+        ],
+    );
+    let out = ng(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 10.0, 800.0, 5.0));
+
+    // Without a prior block, or with text beside a block (which needs an
+    // anonymous block), the run-in keeps its marker.
+    for (prior_block, children) in [
+        (
+            false,
+            vec![node(sized(5.0), vec![]), node(sized(5.0), vec![])],
+        ),
+        (
+            true,
+            vec![
+                Component::text("XX", text_style.clone()),
+                node(sized(5.0), vec![]),
+            ],
+        ),
+    ] {
+        let root = node(
+            block(),
+            vec![node(run_in(font.clone(), prior_block), children)],
+        );
+        let flat = pre_flatten(&root);
+        assert!(block::run_in_block_styles(&flat).is_empty());
+    }
+
+    // run-in-table-row-between: a text-only `display: table-row` span in
+    // an anonymous table has no cell for its line, so the page stays on
+    // legacy (which paints the row) rather than dropping the text.
+    let table = Style {
+        display: Display::Table,
+        ..Style::default()
+    };
+    let row_text = Style {
+        display: Display::TableRow,
+        ..text_style.clone()
+    };
+    let root = node(
+        block(),
+        vec![node(table, vec![Component::text("Some text.", row_text)])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|r| r == "table:text-track"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
     );
 }
 
@@ -2644,10 +2820,389 @@ fn top_level_definite_inline_grid_shares_a_line() {
     );
     let auto_flat = pre_flatten(&auto);
     assert!(
-        !block::supports_tree(&auto_flat),
+        block::supports_tree(&auto_flat),
         "{:?}",
         block::unsupported_reasons(&auto_flat)
     );
+    let auto_out = layout_tree(&auto, &auto_flat, 800.0, 600.0).expect("auto inline size");
+    assert_eq!(at(&auto_out, 1), (0.0, 0.0, 100.0, 20.0));
+}
+
+/// An auto-sized top-level `inline-grid` with definite px tracks shrinks
+/// to those tracks. Headless Chrome, body margin 0, no inter-element
+/// whitespace: `100px / 200px` is a 100×200 border box and a stretched
+/// item fills it; `align-items: start` keeps a 20×10 item at the start;
+/// `100px 150px` with a 10px column gap is 260×40; `left: 8px; top: 4px`
+/// offsets that border box. Two empty grids after a 15px block share the
+/// bottom-margin baseline. An out-of-flow child and a margin stay on the
+/// legacy marker.
+#[test]
+fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
+    use w3cos_std::style::{AlignItems, CustomProperties, Position};
+    let mark = |mut style: Style| {
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )]));
+        style
+    };
+    let grid = |columns: &str, rows: &str, align| {
+        let mut style = mark(Style {
+            display: Display::Flex,
+            position: Position::Relative,
+            align_items: align,
+            grid_template_columns: Some(columns.to_string()),
+            ..Style::default()
+        });
+        style.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        style
+    };
+    let at = |out: &[(LayoutRect, usize)], index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    let stretched = node(
+        block(),
+        vec![node(
+            grid("100px", "200px", AlignItems::Stretch),
+            vec![node(block(), vec![])],
+        )],
+    );
+    let stretched_flat = pre_flatten(&stretched);
+    assert!(
+        block::supports_tree(&stretched_flat),
+        "{:?}",
+        block::unsupported_reasons(&stretched_flat)
+    );
+    let stretched_out = layout_tree(&stretched, &stretched_flat, 800.0, 600.0).expect("stretch");
+    // 0 root, 1 grid, 2 item.
+    assert_eq!(at(&stretched_out, 1), (0.0, 0.0, 100.0, 200.0));
+    assert_eq!(at(&stretched_out, 2), (0.0, 0.0, 100.0, 200.0));
+
+    let started = node(
+        block(),
+        vec![node(
+            grid("100px", "200px", AlignItems::FlexStart),
+            vec![node(
+                Style {
+                    width: Dimension::Px(20.0),
+                    height: Dimension::Px(10.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        )],
+    );
+    let started_flat = pre_flatten(&started);
+    assert!(
+        block::supports_tree(&started_flat),
+        "{:?}",
+        block::unsupported_reasons(&started_flat)
+    );
+    let started_out = layout_tree(&started, &started_flat, 800.0, 600.0).expect("start");
+    assert_eq!(at(&started_out, 1), (0.0, 0.0, 100.0, 200.0));
+    assert_eq!(at(&started_out, 2), (0.0, 0.0, 20.0, 10.0));
+
+    let mut gapped = grid("100px 150px", "40px", AlignItems::Stretch);
+    gapped.column_gap = Some(10.0);
+    let gap_root = node(block(), vec![node(gapped, vec![])]);
+    let gap_flat = pre_flatten(&gap_root);
+    assert!(
+        block::supports_tree(&gap_flat),
+        "{:?}",
+        block::unsupported_reasons(&gap_flat)
+    );
+    let gap_out = layout_tree(&gap_root, &gap_flat, 800.0, 600.0).expect("gap");
+    assert_eq!(at(&gap_out, 1), (0.0, 0.0, 260.0, 40.0));
+
+    let mut shifted = grid("100px", "40px", AlignItems::Stretch);
+    shifted.left = Dimension::Px(8.0);
+    shifted.top = Dimension::Px(4.0);
+    let shift_root = node(block(), vec![node(shifted, vec![])]);
+    let shift_flat = pre_flatten(&shift_root);
+    let shift_out = layout_tree(&shift_root, &shift_flat, 800.0, 600.0).expect("relative");
+    assert_eq!(at(&shift_out, 1), (8.0, 4.0, 100.0, 40.0));
+
+    let row = node(
+        block(),
+        vec![
+            node(sized(15.0), vec![]),
+            node(grid("40px", "20px", AlignItems::Stretch), vec![]),
+            node(grid("40px", "60px", AlignItems::Stretch), vec![]),
+        ],
+    );
+    let row_flat = pre_flatten(&row);
+    assert!(
+        block::supports_tree(&row_flat),
+        "{:?}",
+        block::unsupported_reasons(&row_flat)
+    );
+    let row_out = layout_tree(&row, &row_flat, 800.0, 600.0).expect("baseline");
+    assert_eq!(at(&row_out, 2), (0.0, 55.0, 40.0, 20.0));
+    assert_eq!(at(&row_out, 3), (40.0, 15.0, 40.0, 60.0));
+
+    let mut absolute_child = block();
+    absolute_child.position = Position::Absolute;
+    let oof = node(
+        block(),
+        vec![node(
+            grid("100px", "100px", AlignItems::Stretch),
+            vec![node(absolute_child, vec![])],
+        )],
+    );
+    let oof_flat = pre_flatten(&oof);
+    assert!(
+        !block::supports_tree(&oof_flat),
+        "{:?}",
+        block::unsupported_reasons(&oof_flat)
+    );
+
+    let mut margined = grid("100px", "40px", AlignItems::Stretch);
+    margined.margin = margins(10.0, 0.0, 0.0, 0.0);
+    let margin_root = node(block(), vec![node(margined, vec![])]);
+    let margin_flat = pre_flatten(&margin_root);
+    assert!(
+        !block::supports_tree(&margin_flat),
+        "{:?}",
+        block::unsupported_reasons(&margin_flat)
+    );
+
+    // A static box is the reference side of reftests that still fall back.
+    let mut static_grid = grid("100px", "40px", AlignItems::Stretch);
+    static_grid.position = Position::Static;
+    let static_root = node(block(), vec![node(static_grid, vec![])]);
+    let static_flat = pre_flatten(&static_root);
+    assert!(
+        !block::supports_tree(&static_flat),
+        "{:?}",
+        block::unsupported_reasons(&static_flat)
+    );
+}
+
+#[test]
+fn auto_sized_inline_grid_uses_intrinsic_non_fixed_tracks() {
+    use w3cos_std::style::CustomProperties;
+    // Measured with headless Chrome 155.0.8059.86, 800x600 viewport,
+    // body margin 0, no whitespace between items, auto width/height.
+    // Each item is 10px tall; the first is 40px wide. Columns, second
+    // item width, available width, gap, grid width, second item x:
+    for (columns, second, available, gap, width, second_x) in [
+        ("auto auto", 30.0, 800.0, 0.0, 70.0, 40.0),
+        ("1fr 2fr", 30.0, 800.0, 0.0, 120.0, 40.0),
+        (
+            "minmax(20px,1fr) minmax(50px,max-content)",
+            80.0,
+            800.0,
+            0.0,
+            120.0,
+            40.0,
+        ),
+        ("25% 75%", 30.0, 800.0, 0.0, 70.0, 17.5),
+        ("min-content max-content", 30.0, 800.0, 0.0, 70.0, 40.0),
+        ("auto auto", 30.0, 800.0, 10.0, 80.0, 50.0),
+        ("auto auto", 30.0, 50.0, 0.0, 70.0, 40.0),
+        ("0.5fr 1fr", 30.0, 800.0, 0.0, 80.0, 40.0),
+    ] {
+        let item = |width| {
+            node(
+                Style {
+                    width: Dimension::Px(width),
+                    height: Dimension::Px(10.0),
+                    ..block()
+                },
+                vec![],
+            )
+        };
+        let grid = Style {
+            display: Display::Flex,
+            grid_template_columns: Some(columns.to_string()),
+            column_gap: Some(gap),
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            )])),
+            ..Style::default()
+        };
+        let root = node(block(), vec![node(grid, vec![item(40.0), item(second)])]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{columns}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, available, 600.0).expect(columns);
+        let at = |index| {
+            let rect = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+            (rect.x, rect.y, rect.width, rect.height)
+        };
+        assert_eq!(at(1), (0.0, 0.0, width, 10.0), "{columns}: grid");
+        assert_eq!(at(2), (0.0, 0.0, 40.0, 10.0), "{columns}: first item");
+        assert_eq!(
+            at(3),
+            (second_x, 0.0, second, 10.0),
+            "{columns}: second item"
+        );
+    }
+}
+
+#[test]
+fn intrinsic_inline_grid_keeps_split_first_letter_text_on_legacy() {
+    use w3cos_std::style::CustomProperties;
+    let grid = Style {
+        display: Display::Flex,
+        grid_template_columns: Some("auto".to_string()),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let mut item = sized(10.0);
+    item.width = Dimension::Px(40.0);
+    let plain = node(
+        block(),
+        vec![node(grid.clone(), vec![node(item.clone(), vec![])])],
+    );
+    assert!(block::supports_tree(&pre_flatten(&plain)));
+    item.custom_properties = Some(CustomProperties::from_iter([(
+        w3cos_dom::document::FIRST_LETTER_STYLE_MARKER.to_string(),
+        "1".to_string(),
+    )]));
+    let split = node(block(), vec![node(grid, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&split);
+    assert!(!block::supports_tree(&flat));
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| reason.starts_with("unrecognized-display:inline-grid"))
+    );
+}
+
+#[test]
+fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
+    use w3cos_std::style::{CustomProperties, Position};
+    // Headless Chrome 155: auto/100px border-box widths, 3px padding
+    // and 2px borders, auto auto columns containing 40px/30px items.
+    // A static bordered box stays on legacy (`inline grid-lanes`
+    // references); the relative one is laid out here.
+    for (width, position, outer, second_x) in [
+        (Dimension::Auto, Position::Static, 0.0, 0.0),
+        (Dimension::Auto, Position::Relative, 80.0, 45.0),
+        (Dimension::Px(100.0), Position::Static, 0.0, 0.0),
+        (Dimension::Px(100.0), Position::Relative, 100.0, 55.0),
+    ] {
+        let grid = Style {
+            display: Display::Flex,
+            position,
+            width,
+            box_sizing: BoxSizing::BorderBox,
+            padding: margins(3.0, 3.0, 3.0, 3.0),
+            border_width: 2.0,
+            grid_template_columns: Some("auto auto".to_string()),
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            )])),
+            ..Style::default()
+        };
+        let item = |width| {
+            node(
+                Style {
+                    width: Dimension::Px(width),
+                    ..sized(10.0)
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(grid, vec![item(40.0), item(30.0)])]);
+        let flat = pre_flatten(&root);
+        if outer == 0.0 {
+            assert!(!block::supports_tree(&flat));
+            continue;
+        }
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("border box");
+        assert_eq!(rect(&out, 1), (0.0, 0.0, outer, 20.0));
+        assert_eq!(rect(&out, 2), (5.0, 5.0, 40.0, 10.0));
+        assert_eq!(rect(&out, 3), (second_x, 5.0, 30.0, 10.0));
+    }
+}
+
+#[test]
+fn auto_sized_inline_grid_resolves_flexible_and_percent_rows() {
+    use w3cos_std::style::CustomProperties;
+    // Headless Chrome 155: a 40px column with 40px/30px tall items.
+    // Indefinite flex rows preserve their 1:2 ratio; percentages resolve
+    // after the automatic height has been measured with auto tracks.
+    for (rows, height, second_y) in [("1fr 2fr", 120.0, 40.0), ("25% 75%", 70.0, 17.5)] {
+        let mut grid = Style {
+            display: Display::Flex,
+            grid_template_columns: Some("40px".to_string()),
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            )])),
+            ..Style::default()
+        };
+        grid.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        let root = node(
+            block(),
+            vec![node(
+                grid,
+                vec![node(sized(40.0), vec![]), node(sized(30.0), vec![])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{rows}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 60.0, 600.0).expect(rows);
+        assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, height));
+        assert_eq!(rect(&out, 2), (0.0, 0.0, 40.0, 40.0));
+        assert_eq!(rect(&out, 3), (0.0, second_y, 40.0, 30.0));
+    }
+}
+
+#[test]
+fn auto_sized_inline_grid_shrinks_and_wraps_auto_track_text() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let grid = Style {
+        display: Display::Flex,
+        grid_template_columns: Some("auto auto".to_string()),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )])),
+        ..font.clone()
+    };
+    let item = |text: &str| node(font.clone(), vec![Component::text(text, font.clone())]);
+    let root = node(block(), vec![node(grid, vec![item("XX XX"), item("X X")])]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 60.0, 600.0).expect("intrinsic text");
+    // Chrome 155, Ahem 10px/1: max-content columns are 50/30, minimum
+    // columns are 20/10. In 60px they grow to 35/25 and wrap to 20px tall.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 60.0, 20.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 35.0, 20.0));
+    assert_eq!(rect(&out, 4), (35.0, 0.0, 25.0, 20.0));
 }
 
 /// Non-fixed tracks on a definite top-level `inline-grid`, and baseline

@@ -1,6 +1,6 @@
 //! Single-line metrics with authored inline struts and parent font context.
 #[cfg(test)]
-use crate::layout::HashMap;
+use crate::layout::LayoutPositions;
 use crate::layout::{
     LayoutRect, count_nodes, inline_font_baseline_from_line_top, inline_font_content_ascent,
     inline_font_height, inline_leaf_alignment_keyword, inline_leaf_baseline_offset,
@@ -1511,7 +1511,7 @@ mod tests {
             (rect(161.625, 263.0, 24.0, 18.0), 2),
             (rect(185.625, 224.0, 153.625, 72.0), 3),
         ];
-        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
+        let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
         let projected = project(&root, 0, &mut layouts, &positions);
         registry.clear_owner(OWNER);
         assert!(projected);
@@ -1919,7 +1919,7 @@ mod tests {
                         3,
                     ),
                 ];
-                let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
+                let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
                 assert!(
                     project(&root, 0, &mut layouts, &positions),
                     "one line with empty atomic {keyword} box, inline padding={decorated}"
@@ -1987,7 +1987,7 @@ mod tests {
                     1,
                 ),
             ];
-            let positions = HashMap::from_iter([(0, 0), (1, 1)]);
+            let positions = LayoutPositions::from_iter([(0, 0), (1, 1)]);
             assert!(
                 project(&root, 0, &mut layouts, &positions),
                 "fractional single line must not be rejected as wrapped"
@@ -2036,7 +2036,7 @@ mod tests {
             height: 14.0,
         };
         let mut layouts = vec![(rect, 0), (rect, 1)];
-        let positions = HashMap::from_iter([(0, 0), (1, 1)]);
+        let positions = LayoutPositions::from_iter([(0, 0), (1, 1)]);
         assert!(project(&root, 0, &mut layouts, &positions));
         assert_eq!(
             layouts[1].0.y, 11.0,
@@ -2168,7 +2168,7 @@ mod tests {
             (rect(8.0, 8.0, 57.78125, 92.0), 1),
             (rect(65.78125, 82.0, 12.0, 18.0), 2),
         ];
-        let positions = HashMap::from_iter([(0, 0), (1, 1), (2, 2)]);
+        let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2)]);
         assert!(
             project(&root, 0, &mut layouts, &positions),
             "outer top alignment does not disable its internal baseline"

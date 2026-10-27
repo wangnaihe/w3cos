@@ -108,6 +108,8 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stored; only a grid container consults the marker.
             | "grid-lanes"
             | "percent-gap"
+            // Read with the run-in display marker (run_in_block_styles).
+            | "run-in-block"
     ) || name.starts_with("decoration-owner")
 }
 
@@ -568,10 +570,11 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             } else if is_author_grid(info.style) {
                 // CSS Flexbox §4 / Grid §6.1 blockify `inline-grid` on a
                 // flex or grid item. A top-level `inline-grid` joins the
-                // grid for a definite px box whose tracks are fixed, auto,
-                // fr, minmax, or intrinsic (`is_inline_grid_line`); the
-                // other boxes stay on the marker so a reference that still
-                // falls back does not switch engines alone.
+                // grid for a definite px box, and for an auto box whose
+                // columns and rows are definite px tracks
+                // (`is_inline_grid_line`). The other boxes stay on the
+                // marker so a reference that still falls back does not
+                // switch engines alone.
                 let blockified = is_blockified_inline_grid(flat, index);
                 let allowed: &[&str] = if blockified || is_inline_grid_line(flat, index) {
                     &[
@@ -1021,8 +1024,53 @@ pub(super) fn unsupported_tree(flat: &[FlatNodeInfo]) -> Option<&'static str> {
     reason
 }
 
+/// Trace token for one box whose fallback is the unrecognized-display
+/// marker. Spaces in the authored value become `+` so the coverage line
+/// stays one whitespace field. The context is the box's formatting
+/// parent, not a second layout.
+fn unrecognized_display_label(flat: &[FlatNodeInfo], index: usize) -> String {
+    let value = unrecognized_display(flat[index].style).unwrap_or("");
+    let mut token = String::from("unrecognized-display:");
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            token.push('+');
+        } else if ch == ',' || ch == '|' {
+            token.push('_');
+        } else {
+            token.push(ch);
+        }
+    }
+    token.push('|');
+    token.push_str(unrecognized_display_context(flat, index));
+    token
+}
+
+fn unrecognized_display_context(flat: &[FlatNodeInfo], index: usize) -> &'static str {
+    let style = flat[index].style;
+    if matches!(style.position, Position::Absolute | Position::Fixed) {
+        return "out-of-flow";
+    }
+    if style.float != Float::None {
+        return "float";
+    }
+    if let Some(parent) = flat[index].parent {
+        let parent_style = flat[parent].style;
+        if is_author_flex(parent_style) {
+            return "flex-item";
+        }
+        if is_author_grid(parent_style) {
+            return "grid-item";
+        }
+        if inline::in_inline_container(flat, index) {
+            return "inline";
+        }
+    }
+    "block"
+}
+
 /// Every distinct reason in the tree (trace mode only); internal markers
-/// are reported by name.
+/// are reported by name. `unrecognized-display` includes the authored
+/// value and formatting context (`unrecognized-display:<value>|<context>`).
 pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
     let mut reasons = Vec::new();
     walk_rendered(flat, |index| {
@@ -1030,27 +1078,29 @@ pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
         let Some(reason) = node_reason(flat, index) else {
             return false;
         };
-        let names: Vec<String> = if reason == "internal-marker" {
-            info.style
-                .custom_properties
-                .iter()
-                .flat_map(|props| props.keys())
-                .filter(|key| {
-                    key.starts_with("--w3cos-internal")
-                        && !is_value_carrier_marker(key)
-                        && key.as_str() != inline::IFC_MARKER
-                        && key.as_str() != inline::ANONYMOUS_BLOCK_MARKER
-                        && key.as_str() != inline::LINE_WIDTH_MARKER
-                })
-                .map(|key| key.trim_start_matches("--w3cos-internal-").to_string())
-                .collect()
-        } else {
-            vec![reason.to_string()]
-        };
-        for name in names {
-            if !reasons.contains(&name) {
-                reasons.push(name);
+        if reason == "internal-marker" {
+            if let Some(properties) = &info.style.custom_properties {
+                for key in properties.keys() {
+                    if !key.starts_with("--w3cos-internal")
+                        || is_value_carrier_marker(key)
+                        || key == inline::IFC_MARKER
+                        || key == inline::ANONYMOUS_BLOCK_MARKER
+                        || key == inline::LINE_WIDTH_MARKER
+                    {
+                        continue;
+                    }
+                    let name = if key == "--w3cos-internal-unrecognized-display" {
+                        unrecognized_display_label(flat, index)
+                    } else {
+                        key.trim_start_matches("--w3cos-internal-").to_string()
+                    };
+                    if !reasons.contains(&name) {
+                        reasons.push(name);
+                    }
+                }
             }
+        } else if !reasons.iter().any(|name| name == reason) {
+            reasons.push(reason.to_string());
         }
         false
     });
@@ -1488,7 +1538,9 @@ fn is_blockified_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
 fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
     is_inline_grid(flat[index].style)
         && !is_blockified_inline_grid(flat, index)
-        && super::grid::definite_inline_grid(flat[index].style)
+        && (super::grid::definite_inline_grid(flat[index].style)
+            || super::grid::fixed_track_inline_grid(flat, index)
+            || super::grid::intrinsic_track_inline_grid(flat, index))
 }
 
 /// Ascent of an inline-grid on a line. `NoLines` is the bottom border
@@ -1502,6 +1554,51 @@ fn inline_grid_line_ascent(result: &LayoutResult) -> f32 {
 
 fn is_run_in(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "run-in")
+}
+
+/// Chrome rejects `display: run-in` as invalid, so the earlier cascaded
+/// value applies. The DOM marks a run-in over `block`; such a box is laid
+/// out as that block (in place of the legacy flex lowering) when its
+/// contents need no anonymous boxes: nothing, one inline text, or only
+/// in-flow block-level boxes. Returns the replacement styles by index.
+pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
+    let mut styles = Vec::new();
+    for (index, info) in flat.iter().enumerate() {
+        if !is_run_in(info.style) || marker(info.style, "--w3cos-internal-run-in-block").is_none() {
+            continue;
+        }
+        let children: Vec<&FlatNodeInfo> = flat[index + 1..info.subtree_end]
+            .iter()
+            .filter(|child| child.parent == Some(index))
+            .collect();
+        let contents = match children.as_slice() {
+            [] => true,
+            [text] if matches!(text.kind, ComponentKind::Text { .. }) => {
+                text.style.display == Display::Inline
+            }
+            _ => children.iter().all(|child| {
+                matches!(
+                    child.style.display,
+                    Display::Block | Display::FlowRoot | Display::ListItem | Display::Table
+                ) && child.style.float == Float::None
+                    && matches!(child.style.position, Position::Static | Position::Relative)
+                    && unrecognized_display(child.style).is_none()
+            }),
+        };
+        if contents {
+            let mut style = info.style.clone();
+            style.display = Display::Block;
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove("--w3cos-internal-unrecognized-display");
+                properties.remove("--w3cos-internal-run-in-block");
+                if properties.is_empty() {
+                    style.custom_properties = None;
+                }
+            }
+            styles.push((index, style));
+        }
+    }
+    styles
 }
 
 /// Legacy `display: -webkit-box` and `-webkit-inline-box`. Both parse as
