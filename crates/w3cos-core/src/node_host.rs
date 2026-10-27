@@ -968,7 +968,9 @@ fn build_host() -> Value {
     // the compiled graph. Lets `require(absolutePath)` reach modules the app
     // declares for run-time loading (`package.json` `"w3cos": { "modules" }`).
     define(&host, "compiledModule", |args| {
-        Value::Bool(crate::module_registry::contains(&arg(&args, 0).to_js_string()))
+        Value::Bool(crate::module_registry::contains(
+            &arg(&args, 0).to_js_string(),
+        ))
     });
     define(&host, "requireCompiled", |args| {
         require_compiled(&arg(&args, 0).to_js_string()).unwrap_or(Value::Undefined)
@@ -1002,8 +1004,9 @@ pub fn require_compiled(path: &str) -> Option<Value> {
             vec![Value::function(|_, _| Value::Undefined)],
         );
     }
-    if let Some(crate::promise::PromiseStatus::Rejected(error)) =
-        module_registry::evaluate(path).as_ref().and_then(crate::promise::status)
+    if let Some(crate::promise::PromiseStatus::Rejected(error)) = module_registry::evaluate(path)
+        .as_ref()
+        .and_then(crate::promise::status)
     {
         crate::throw_value(error);
     }

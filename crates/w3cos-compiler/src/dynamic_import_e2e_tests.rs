@@ -80,7 +80,10 @@ const RUNTIME_REQUIRE: &[(&str, &str)] = &[
   "w3cos": { "modules": ["ext/out/extension.js"] } }"#,
     ),
     // An extension directory has its own (CommonJS) package.json.
-    ("ext/package.json", r#"{ "name": "ext", "main": "./out/extension.js" }"#),
+    (
+        "ext/package.json",
+        r#"{ "name": "ext", "main": "./out/extension.js" }"#,
+    ),
     (
         "ext/out/extension.js",
         "console.log('extension evaluated');\nexports.activate = function () { return 'activated ' + require('./helper').name; };\n",
