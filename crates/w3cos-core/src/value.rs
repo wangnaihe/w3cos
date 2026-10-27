@@ -3442,14 +3442,15 @@ impl Value {
                 let value = this.as_js_string().expect("string");
                 let index = args.first().map(Value::to_number).unwrap_or(0.0);
                 let index = if index.is_nan() { 0.0 } else { index.trunc() };
-                let units = value.encode_utf16().collect::<Vec<_>>();
-                if index < 0.0 || index >= units.len() as f64 {
+                if !index.is_finite() || index < 0.0 {
                     return Value::Undefined;
                 }
                 let index = index as usize;
-                let first = units[index];
+                let Some(first) = utf16_unit_at(&value, index) else {
+                    return Value::Undefined;
+                };
                 if (0xD800..0xDC00).contains(&first)
-                    && let Some(&second) = units.get(index + 1)
+                    && let Some(second) = utf16_unit_at(&value, index + 1)
                     && (0xDC00..0xE000).contains(&second)
                 {
                     let code = 0x10000
@@ -3467,9 +3468,7 @@ impl Value {
                     return Value::Number(f64::NAN);
                 }
                 return Value::Number(
-                    value
-                        .encode_utf16()
-                        .nth(index as usize)
+                    utf16_unit_at(&value, index as usize)
                         .map(f64::from)
                         .unwrap_or(f64::NAN),
                 );
@@ -4107,6 +4106,59 @@ fn array_index(value: Option<&Value>, len: usize, default: usize) -> usize {
     } else {
         (n as usize).min(len)
     }
+}
+
+/// Strings shorter than this are indexed by re-encoding from the start.
+const UTF16_CURSOR_MIN_LEN: usize = 256;
+
+thread_local! {
+    /// The last long string indexed by UTF-16 unit, with a char-boundary
+    /// cursor into it: `(string, unit index, byte offset)`. Holding the
+    /// `JsString` keeps its storage alive, so `ptr_eq` cannot see a reused
+    /// allocation. Scanners walk `charCodeAt(i)` forward one unit at a
+    /// time; without the cursor every call re-encodes the prefix and a
+    /// parse is quadratic in the text length.
+    static UTF16_CURSOR: RefCell<Option<(crate::JsString, usize, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// The UTF-16 code unit at `index` (`String.prototype.charCodeAt`), or
+/// `None` past the end. Amortized O(1) for nearby indices on long strings.
+fn utf16_unit_at(value: &crate::JsString, index: usize) -> Option<u16> {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().nth(index);
+    }
+    let (mut unit, mut byte) = UTF16_CURSOR.with(|cursor| match &*cursor.borrow() {
+        Some((cached, unit, byte))
+            if cached.ptr_eq(value) && cached.as_str().len() == text.len() =>
+        {
+            (*unit, *byte)
+        }
+        _ => (0, 0),
+    });
+    if index < unit {
+        if index < unit / 2 {
+            (unit, byte) = (0, 0);
+        } else {
+            while unit > index {
+                let ch = text[..byte].chars().next_back()?;
+                byte -= ch.len_utf8();
+                unit -= ch.len_utf16();
+            }
+        }
+    }
+    let ch = loop {
+        let ch = text[byte..].chars().next()?;
+        if unit + ch.len_utf16() > index {
+            break ch;
+        }
+        byte += ch.len_utf8();
+        unit += ch.len_utf16();
+    };
+    UTF16_CURSOR.with(|cursor| *cursor.borrow_mut() = Some((value.clone(), unit, byte)));
+    let mut units = [0u16; 2];
+    Some(ch.encode_utf16(&mut units)[index - unit])
 }
 
 fn string_index_to_byte(value: &str, index: usize) -> usize {
@@ -4990,6 +5042,18 @@ pub fn throw_value(value: Value) -> ! {
             message.to_js_string()
         };
         eprintln!("[js.throw] {detail}");
+        if let Some(patterns) = std::env::var_os("W3COS_THROW_BT") {
+            let patterns = patterns.to_string_lossy().into_owned();
+            if patterns
+                .split('|')
+                .any(|p| !p.is_empty() && detail.contains(p))
+            {
+                eprintln!(
+                    "[js.throw.bt]\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+        }
     }
     std::panic::panic_any(PanicValue(value))
 }
@@ -5744,6 +5808,75 @@ mod tests {
                 .call_method("charCodeAt", vec![Value::Number(2.0)])
                 .to_number()
                 .is_nan()
+        );
+    }
+
+    #[test]
+    fn long_string_char_code_at_matches_utf16_in_any_order() {
+        // Long enough for the UTF-16 cursor; mixes 1-, 2-, 3- and 4-byte
+        // characters so unit and byte offsets diverge (astral = 2 units).
+        let text: String = "a\u{e9}\u{20ac}\u{1f600}x".repeat(200);
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let value = Value::from(text.as_str());
+        let other = Value::from("z".repeat(300).as_str());
+        let char_code =
+            |v: &Value, i: usize| v.call_method("charCodeAt", vec![Value::Number(i as f64)]);
+        // Forward, backward, random jumps, and interleaved with another
+        // long string (which takes over the cursor).
+        let mut order: Vec<usize> = (0..units.len()).collect();
+        order.extend((0..units.len()).rev());
+        order.extend((0..units.len()).map(|i| (i * 7919) % units.len()));
+        for (step, &index) in order.iter().enumerate() {
+            assert_eq!(
+                char_code(&value, index),
+                Value::Number(f64::from(units[index])),
+                "index {index}"
+            );
+            if step % 97 == 0 {
+                assert_eq!(
+                    char_code(&other, step % 300),
+                    Value::Number(f64::from(b'z'))
+                );
+            }
+        }
+        assert!(char_code(&value, units.len()).to_number().is_nan());
+        // codePointAt pairs surrogates and reports a lone low surrogate.
+        let astral = units
+            .iter()
+            .position(|unit| (0xD800..0xDC00).contains(unit))
+            .unwrap();
+        assert_eq!(
+            value.call_method("codePointAt", vec![Value::Number(astral as f64)]),
+            Value::Number(f64::from(0x1f600))
+        );
+        assert_eq!(
+            value.call_method("codePointAt", vec![Value::Number((astral + 1) as f64)]),
+            Value::Number(f64::from(units[astral + 1]))
+        );
+        assert_eq!(
+            value.call_method("codePointAt", vec![Value::Number(units.len() as f64)]),
+            Value::Undefined
+        );
+    }
+
+    #[test]
+    fn long_string_char_code_at_scan_is_linear() {
+        // 2 MB scanned unit by unit: quadratic re-encoding would take
+        // minutes; the cursor makes it a single pass.
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let started = std::time::Instant::now();
+        let mut sum = 0.0;
+        for index in 0..text.len() {
+            sum += value
+                .call_method("charCodeAt", vec![Value::Number(index as f64)])
+                .to_number();
+        }
+        assert_eq!(sum, text.bytes().map(f64::from).sum::<f64>());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
         );
     }
 
