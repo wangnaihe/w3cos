@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
 use crate::Value;
+use crate::object::IntegrityLevel;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
@@ -10,6 +11,9 @@ thread_local! {
     static OBJECT_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
     static ARRAY_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
     static STRING_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// The builtin `String.prototype[Symbol.iterator]`, for the native
+    /// string fast path in `Value::iter`.
+    static STRING_ITERATOR: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Drop cached constructors before the page arena reset.
@@ -22,6 +26,7 @@ pub fn reset_constructors() {
     drop(retired);
     ARRAY_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     STRING_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    STRING_ITERATOR.with(|slot| slot.borrow_mut().take());
     ERROR_CLASSES.with(|slot| slot.borrow_mut().take());
 }
 
@@ -554,9 +559,48 @@ fn build_object_value() -> Value {
             crate::class::define_property_from_js(&object, &key, &descriptor)
         }),
     );
+    for (name, level) in [
+        ("freeze", IntegrityLevel::Frozen),
+        ("seal", IntegrityLevel::Sealed),
+        ("preventExtensions", IntegrityLevel::NonExtensible),
+    ] {
+        properties.insert(
+            name.into(),
+            Value::function(move |_, arguments| {
+                let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(object) = target.as_object() {
+                    object.borrow_mut().raise_integrity(level);
+                }
+                target
+            }),
+        );
+    }
+    for (name, level) in [
+        ("isFrozen", IntegrityLevel::Frozen),
+        ("isSealed", IntegrityLevel::Sealed),
+    ] {
+        properties.insert(
+            name.into(),
+            Value::function(move |_, arguments| {
+                let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+                Value::Bool(match target.as_object() {
+                    Some(object) => object.borrow().integrity() >= level,
+                    // Primitives are trivially frozen and sealed; other heap
+                    // values do not record integrity yet.
+                    None => !target.is_object() && !target.is_callable(),
+                })
+            }),
+        );
+    }
     properties.insert(
-        "freeze".into(),
-        Value::function(|_, arguments| arguments.first().cloned().unwrap_or(Value::Undefined)),
+        "isExtensible".into(),
+        Value::function(|_, arguments| {
+            let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+            Value::Bool(match target.as_object() {
+                Some(object) => object.borrow().integrity() == IntegrityLevel::Extensible,
+                None => target.is_object() || target.is_callable(),
+            })
+        }),
     );
     properties.insert(
         "getOwnPropertyNames".into(),
@@ -913,6 +957,15 @@ fn to_uint16(value: &Value) -> u16 {
 /// Hidden slot holding a `String` wrapper's primitive ([[StringData]]).
 const STRING_DATA: &str = "__w3cos_string_data";
 
+/// Whether strings still iterate with the builtin
+/// `String.prototype[Symbol.iterator]` (not overridden by the program).
+pub(crate) fn string_iterator_is_builtin() -> bool {
+    let current = string_value()
+        .get_property("prototype")
+        .get_property("__w3cos_symbol_iterator");
+    STRING_ITERATOR.with(|slot| slot.borrow().as_ref() == Some(&current))
+}
+
 pub(crate) fn string_wrapper_data(value: &Value) -> Option<Value> {
     let object = value.as_object()?;
     if !object.borrow().has_own_property(STRING_DATA) {
@@ -1045,6 +1098,24 @@ fn build_string_value() -> Value {
         });
         define_builtin(&prototype, name, method);
     }
+    // String.prototype[Symbol.iterator]: code points of ToString(this).
+    let iterator = native_function("[Symbol.iterator]", 0, |this, _| {
+        if this.is_nullish() {
+            crate::throw_value(crate::value::type_error(
+                "String.prototype[Symbol.iterator] called on null or undefined",
+            ));
+        }
+        let text = if this.is_string() {
+            this
+        } else if let Some(data) = string_wrapper_data(&this) {
+            data
+        } else {
+            Value::from(this.to_js_string())
+        };
+        crate::value::iterator_object(crate::value::string_code_points(&text))
+    });
+    STRING_ITERATOR.with(|slot| *slot.borrow_mut() = Some(iterator.clone()));
+    define_builtin(&prototype, "__w3cos_symbol_iterator", iterator);
     let constructor = Value::callable(HashMap::new(), |_, arguments| match arguments.first() {
         None => Value::string(""),
         Some(value) => Value::from(value.to_js_string()),
@@ -3149,6 +3220,76 @@ mod tests {
             prototype
                 .call_method("isPrototypeOf", vec![target])
                 .to_bool()
+        );
+    }
+
+    #[test]
+    fn object_integrity_builtins_return_target_and_report_level() {
+        let object = object_value();
+        let sealed = Value::object(HashMap::new());
+        sealed.set_property("tagCheck", Value::Null);
+        assert!(
+            object
+                .call_method("seal", vec![sealed.clone()])
+                .strict_eq(&sealed)
+        );
+        // DOMPurify assigns writable props on a sealed object.
+        crate::intrinsics::set_property_strict(
+            &sealed,
+            &Value::from("tagCheck"),
+            Value::Number(1.0),
+        );
+        assert_eq!(sealed.get_property("tagCheck"), Value::Number(1.0));
+        assert!(
+            object
+                .call_method("isSealed", vec![sealed.clone()])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isFrozen", vec![sealed.clone()])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isExtensible", vec![sealed.clone()])
+                .to_bool()
+        );
+
+        let plain = Value::object(HashMap::new());
+        assert!(
+            object
+                .call_method("isExtensible", vec![plain.clone()])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isFrozen", vec![plain.clone()])
+                .to_bool()
+        );
+        object.call_method("freeze", vec![plain.clone()]);
+        assert!(
+            object
+                .call_method("isFrozen", vec![plain.clone()])
+                .to_bool()
+        );
+        // Lowering never happens: preventExtensions after freeze stays frozen.
+        object.call_method("preventExtensions", vec![plain.clone()]);
+        assert!(object.call_method("isSealed", vec![plain]).to_bool());
+
+        assert!(
+            object
+                .call_method("isFrozen", vec![Value::Number(3.0)])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isExtensible", vec![Value::Undefined])
+                .to_bool()
+        );
+        assert_eq!(
+            object.call_method("seal", vec![Value::Number(3.0)]),
+            Value::Number(3.0)
         );
     }
 
