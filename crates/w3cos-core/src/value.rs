@@ -3893,6 +3893,9 @@ impl Value {
         if let Some(values) = self.as_array() {
             return ValueIterator::new(LiveArrayIterator { values, index: 0 });
         }
+        if let Some(iterator) = crate::collections::default_collection_iter(self) {
+            return ValueIterator::boxed(iterator);
+        }
         if self.is_string() && crate::builtins::string_iterator_is_builtin() {
             return string_code_points(self);
         }
