@@ -24,7 +24,13 @@ function dataCloneError(value) {
 const BYTE_HEX = [];
 for (let i = 0; i < 256; i++) BYTE_HEX.push((i < 16 ? '0' : '') + i.toString(16));
 const HEX_CHUNK = 16384;
+// Native (std) codecs when the host provides them: a JS loop per byte is the
+// dominant cost of cloning a MB-sized IPC payload between realms.
+const NATIVE = typeof __w3cos_node_host === 'object' && __w3cos_node_host !== null &&
+  typeof __w3cos_node_host.hexEncode === 'function' &&
+  typeof __w3cos_node_host.hexDecode === 'function' ? __w3cos_node_host : null;
 function toHex(bytes) {
+  if (NATIVE !== null) return NATIVE.hexEncode(bytes, 0, bytes.length);
   const length = bytes.length;
   if (length <= HEX_CHUNK) {
     const parts = new Array(length);
@@ -45,6 +51,7 @@ function hexDigit(code) {
   return code <= 57 ? code - 48 : (code | 32) - 87;
 }
 function fromHex(text) {
+  if (NATIVE !== null) return new Uint8Array(NATIVE.hexDecode(text));
   const bytes = new Uint8Array(text.length / 2);
   for (let i = 0; i < bytes.length; i++) {
     bytes[i] = (hexDigit(text.charCodeAt(i * 2)) << 4) | hexDigit(text.charCodeAt(i * 2 + 1));
