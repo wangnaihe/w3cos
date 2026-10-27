@@ -6928,3 +6928,95 @@ fn flex_container_with_logical_size_and_calc_items_stays_on_legacy() {
     let flat = pre_flatten(&root);
     assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
 }
+
+#[test]
+fn column_percent_descendant_keeps_the_container_on_legacy() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let column = |inner_percent: bool, height: Dimension| {
+        let item1 = Style {
+            flex_basis: Dimension::Percent(100.0),
+            flex_shrink: 1.0,
+            ..block()
+        };
+        let item2 = Style {
+            flex_grow: 1.0,
+            flex_basis: Dimension::Px(30.0),
+            ..block()
+        };
+        let inner = Style {
+            height: if inner_percent {
+                Dimension::Percent(100.0)
+            } else {
+                Dimension::Auto
+            },
+            min_height: Dimension::Px(100.0),
+            ..block()
+        };
+        let col = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            width: Dimension::Px(100.0),
+            height,
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                col,
+                vec![node(item1, vec![]), node(item2, vec![node(inner, vec![])])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        flex::container_reason(&flat, 1)
+    };
+    // The item's own percentage resolves against a length height.
+    assert_eq!(column(false, Dimension::Px(100.0)), None);
+    // Without a definite height it cycles through the automatic minimum.
+    assert_eq!(column(false, Dimension::Auto), Some("flex:column-percent"));
+    // A percentage further down resolves against the flexed size.
+    assert_eq!(
+        column(true, Dimension::Px(100.0)),
+        Some("flex:column-percent")
+    );
+}
+
+#[test]
+fn column_item_automatic_minimum_counts_child_min_height() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let item1 = Style {
+        flex_basis: Dimension::Px(100.0),
+        flex_shrink: 1.0,
+        ..block()
+    };
+    let item2 = Style {
+        flex_grow: 1.0,
+        flex_shrink: 0.0,
+        flex_basis: Dimension::Px(30.0),
+        ..block()
+    };
+    let inner = Style {
+        min_height: Dimension::Px(100.0),
+        ..block()
+    };
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            col,
+            vec![node(item1, vec![]), node(item2, vec![node(inner, vec![])])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // The second item's content minimum is its child's 100px min-height,
+    // so the first item shrinks to nothing (019's layout).
+    assert_eq!(rect(&ng, 2).3, 0.0);
+    assert_eq!(rect(&ng, 3).3, 100.0);
+}

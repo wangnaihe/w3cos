@@ -177,7 +177,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         }
         // Percentage main sizes and percentage block descendants cycle
         // through the automatic minimum. Leave those columns on legacy.
-        if !row && column_percent_size(flat, child) {
+        // A container with a definite (length) height is a basis for the
+        // item's own percentages; only a percentage further down, which
+        // resolves against the item's flexed size, still cycles.
+        if !row
+            && column_percent_size(flat, child)
+            && (!matches!(style.height, Dimension::Px(_)) || column_percent_descendant(flat, child))
+        {
             return Some("flex:column-percent");
         }
         let (cross_start, cross_end) = cross_margin_sides(
@@ -277,6 +283,24 @@ fn subtree_has_float(flat: &[FlatNodeInfo], index: usize) -> bool {
 fn column_percent_size(flat: &[FlatNodeInfo], index: usize) -> bool {
     let end = flat[index].subtree_end.max(index + 1);
     let mut child = index;
+    while child < end {
+        if flat[child].style.display == w3cos_std::style::Display::None {
+            child = flat[child].subtree_end.max(child + 1);
+            continue;
+        }
+        if percent_block_size(flat[child].style) {
+            return true;
+        }
+        child += 1;
+    }
+    false
+}
+
+/// A percentage block size on a descendant of this column item (not the
+/// item itself).
+fn column_percent_descendant(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let end = flat[index].subtree_end.max(index + 1);
+    let mut child = index + 1;
     while child < end {
         if flat[child].style.display == w3cos_std::style::Display::None {
             child = flat[child].subtree_end.max(child + 1);
@@ -1143,6 +1167,18 @@ fn block_contribution(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpa
     let inner = match definite(style.height, None, style, space).why("flex:percent")? {
         Some(size) => to_content(style, edges, size),
         None => block_content_min(flat, index, space).why("flex:block-min")?,
+    };
+    // A length `min-height` / `max-height` bounds the box's block size
+    // (flex-minimum-height-flex-items-019).
+    let inner = if let Dimension::Px(min) = style.min_height {
+        inner.max(to_content(style, edges, min))
+    } else {
+        inner
+    };
+    let inner = if let Dimension::Px(max) = style.max_height {
+        inner.min(to_content(style, edges, max))
+    } else {
+        inner
     };
     Some((inner + edges + margin).max(0.0))
 }
