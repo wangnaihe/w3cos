@@ -197,6 +197,28 @@ fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
     }
 }
 
+/// Sets one axis (0 = width, 1 = height) of the `contain-intrinsic-size`
+/// marker from a longhand value; an invalid value is dropped.
+fn set_contain_intrinsic_axis(style: &mut Style, axis: usize, value: &str) {
+    let Some(parsed) = contain_intrinsic_axis(value) else {
+        return;
+    };
+    let mut axes: Vec<String> = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(CONTAIN_INTRINSIC_SIZE_PROPERTY))
+        .map(|v| v.split_ascii_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    axes.resize(2, "none".to_string());
+    axes[axis] = parsed;
+    let both_none = axes.iter().all(|a| a == "none");
+    set_marker(
+        style,
+        CONTAIN_INTRINSIC_SIZE_PROPERTY,
+        (!both_none).then(|| axes.join(" ")),
+    );
+}
+
 /// One `contain-intrinsic-*` axis value: `none`, `<length>` or
 /// `auto <length>` (no remembered sizes here, so the length is used).
 fn contain_intrinsic_axis(value: &str) -> Option<String> {
@@ -680,52 +702,52 @@ impl CSSStyleDeclaration {
                 }
             }
             "margin-top" | "marginTop" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.top = v
                 }
             }
             "margin-right" | "marginRight" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.right = v
                 }
             }
             "margin-bottom" | "marginBottom" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.bottom = v
                 }
             }
             "margin-left" | "marginLeft" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.left = v
                 }
             }
             "margin-inline" | "marginInline" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_spacing(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_margin_spacing(value)) {
                     let end = values
                         .get(1)
-                        .and_then(|value| parse_spacing(value))
+                        .and_then(|value| parse_margin_spacing(value))
                         .unwrap_or(start);
                     self.inner.margin.left = start;
                     self.inner.margin.right = end;
                 }
             }
             "margin-inline-start" | "marginInlineStart" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.left = v
                 }
             }
             "margin-inline-end" | "marginInlineEnd" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.right = v
                 }
             }
             "margin-block" | "marginBlock" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_spacing(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_margin_spacing(value)) {
                     let end = values
                         .get(1)
-                        .and_then(|value| parse_spacing(value))
+                        .and_then(|value| parse_margin_spacing(value))
                         .unwrap_or(start);
                     self.inner.margin.top = start;
                     self.inner.margin.bottom = end;
@@ -1250,6 +1272,20 @@ impl CSSStyleDeclaration {
                     ),
                     _ => {}
                 }
+            }
+            // The longhands. Logical names map to the physical axes of
+            // horizontal-tb, the only writing mode the cascade models.
+            "contain-intrinsic-width"
+            | "containIntrinsicWidth"
+            | "contain-intrinsic-inline-size"
+            | "containIntrinsicInlineSize" => {
+                set_contain_intrinsic_axis(&mut self.inner, 0, value);
+            }
+            "contain-intrinsic-height"
+            | "containIntrinsicHeight"
+            | "contain-intrinsic-block-size"
+            | "containIntrinsicBlockSize" => {
+                set_contain_intrinsic_axis(&mut self.inner, 1, value);
             }
             "filter" => {
                 let v = value.trim();
@@ -2407,7 +2443,7 @@ fn parse_padding_shorthand(value: &str) -> Option<Edges> {
 fn parse_margin_shorthand(value: &str) -> Option<Edges> {
     let parts: Vec<Spacing> = split_css_whitespace(value)
         .iter()
-        .map(|part| parse_spacing(part))
+        .map(|part| parse_margin_spacing(part))
         .collect::<Option<_>>()?;
     expand_edge_spacing(&parts)
 }
@@ -3250,7 +3286,7 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
 /// with only percentages, a percentage; otherwise `Dimension::Calc`.
 /// Relative units and anything else return `None` (the declaration is
 /// dropped, as before).
-fn parse_size_calc(value: &str) -> Option<Dimension> {
+fn parse_calc_length(value: &str) -> Option<(f32, f32, bool, bool)> {
     let lower = value.trim().to_ascii_lowercase();
     if !lower.starts_with("calc(") {
         return None;
@@ -3270,14 +3306,31 @@ fn parse_size_calc(value: &str) -> Option<Dimension> {
     else {
         return None;
     };
-    if !(percent.is_finite() && px.is_finite()) {
-        return None;
-    }
+    (percent.is_finite() && px.is_finite()).then_some((percent, px, has_percent, has_px))
+}
+
+fn parse_size_calc(value: &str) -> Option<Dimension> {
+    let (percent, px, has_percent, has_px) = parse_calc_length(value)?;
     Some(match (has_percent, has_px) {
         (false, _) => Dimension::Px(px.max(0.0)),
         (true, false) => Dimension::Percent(percent.max(0.0)),
         (true, true) => Dimension::Calc { percent, px },
     })
+}
+
+/// A margin `calc()` of absolute lengths and one percentage. Margins may
+/// be negative, so nothing is clamped here.
+fn parse_margin_calc(value: &str) -> Option<Spacing> {
+    let (percent, px, has_percent, has_px) = parse_calc_length(value)?;
+    Some(match (has_percent, has_px) {
+        (false, _) => Spacing::Px(px),
+        (true, false) => Spacing::Percent(percent),
+        (true, true) => Spacing::Calc { percent, px },
+    })
+}
+
+fn parse_margin_spacing(value: &str) -> Option<Spacing> {
+    parse_margin_calc(value).or_else(|| parse_spacing(value))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5378,6 +5431,59 @@ mod font_shorthand_tests {
             assert_eq!(parse_font_line_height(value, 20.0), None, "{value}");
             assert!(!is_valid_font_line_height_token(value), "{value}");
         }
+    }
+
+    #[test]
+    fn contain_intrinsic_longhands_set_one_axis() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("contain-intrinsic-inline-size", "100px");
+        declaration.set_property("contain-intrinsic-block-size", "auto 50px");
+        let marker = |d: &CSSStyleDeclaration| {
+            d.inner
+                .custom_properties
+                .as_ref()
+                .and_then(|p| p.get(super::CONTAIN_INTRINSIC_SIZE_PROPERTY).cloned())
+        };
+        assert_eq!(marker(&declaration).as_deref(), Some("100 50"));
+        declaration.set_property("contain-intrinsic-width", "none");
+        assert_eq!(marker(&declaration).as_deref(), Some("none 50"));
+        declaration.set_property("contain-intrinsic-height", "none");
+        assert_eq!(marker(&declaration), None);
+    }
+
+    /// Margins keep a mixed `calc()` (which may be negative) for LayoutNG.
+    #[test]
+    fn margin_calc_parses_percent_and_px() {
+        use w3cos_std::style::Spacing;
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("margin-left", "calc(10% + 100px)");
+        declaration.set_property("margin-top", "calc(50% - 20px)");
+        declaration.set_property("margin-right", "calc(5px + 7px)");
+        let style = declaration.inner.clone();
+        assert_eq!(
+            style.margin.left,
+            Spacing::Calc {
+                percent: 10.0,
+                px: 100.0
+            }
+        );
+        assert_eq!(
+            style.margin.top,
+            Spacing::Calc {
+                percent: 50.0,
+                px: -20.0
+            }
+        );
+        assert_eq!(style.margin.right, Spacing::Px(12.0));
+        declaration.set_property("margin", "calc(10px + 5%) 0");
+        let style = declaration.inner.clone();
+        assert_eq!(
+            style.margin.bottom,
+            Spacing::Calc {
+                percent: 5.0,
+                px: 10.0
+            }
+        );
     }
 
     /// Size properties keep a mixed `calc()` for LayoutNG to resolve.

@@ -741,6 +741,9 @@ fn gen_spacing(s: Spacing) -> String {
         Spacing::Vw(v) => format!("Spacing::Vw({v}_f32)"),
         Spacing::Vh(v) => format!("Spacing::Vh({v}_f32)"),
         Spacing::Auto => "Spacing::Auto".to_string(),
+        Spacing::Calc { percent, px } => {
+            format!("Spacing::Calc {{ percent: {percent}_f32, px: {px}_f32 }}")
+        }
         Spacing::SafeAreaInset(SafeAreaEdge::Top) => {
             "Spacing::SafeAreaInset(SafeAreaEdge::Top)".to_string()
         }
@@ -1919,6 +1922,7 @@ fn dom_spacing_css(value: Spacing) -> String {
         Spacing::Vw(v) => format!("{v}vw"),
         Spacing::Vh(v) => format!("{v}vh"),
         Spacing::Auto => "auto".to_string(),
+        Spacing::Calc { percent, px } => format!("calc({percent}% + {px}px)"),
         Spacing::SafeAreaInset(edge) => format!(
             "env(safe-area-inset-{})",
             match edge {

@@ -6695,6 +6695,104 @@ fn calc_percent_plus_px_sizes() {
     assert!((flexed - 50.1).abs() < 0.02, "flex item min-width {flexed}");
 }
 
+/// A size-contained replaced box takes `contain-intrinsic-size` instead of
+/// its natural size or ratio, per auto axis (contain-intrinsic-size-012).
+#[test]
+fn size_contained_image_uses_contain_intrinsic_size() {
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let mut auto = Style {
+        display: w3cos_std::style::Display::Block,
+        ..block()
+    };
+    mark(
+        &mut auto,
+        &[
+            ("--w3cos-internal-size-containment", "1"),
+            ("--w3cos-internal-contain-intrinsic-size", "100 200"),
+        ],
+    );
+    let mut fixed = auto.clone();
+    fixed.width = Dimension::Px(30.0);
+    let root = node(
+        block(),
+        vec![
+            Component::image("missing.png", auto),
+            Component::image("missing.png", fixed),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (_, _, w, h) = rect(&ng, 1);
+    assert_eq!((w, h), (100.0, 200.0), "both axes from the override");
+    let (_, _, w, h) = rect(&ng, 2);
+    assert_eq!((w, h), (30.0, 200.0), "no ratio transfers the width");
+}
+
+/// A mixed `calc()` margin resolves its percentage against the containing
+/// block's width, and against zero for intrinsic sizing, which leaves the
+/// length (css-sizing/calc-margins-*, grid-calc-margin).
+#[test]
+fn calc_margins_resolve_percent_and_zero_for_intrinsic() {
+    use w3cos_std::style::Display;
+    let calc = Spacing::Calc {
+        percent: 10.0,
+        px: 100.0,
+    };
+    let mut fixed_child = Style {
+        height: Dimension::Px(5.0),
+        ..block()
+    };
+    fixed_child.margin.left = calc;
+    let mut shrink_child = fixed_child.clone();
+    shrink_child.height = Dimension::Auto;
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let mut shrink = Style {
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    mark(
+        &mut shrink,
+        &[("--w3cos-internal-width-keyword", "min-content")],
+    );
+    let mut flex = Style {
+        display: Display::Flex,
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    mark(
+        &mut flex,
+        &[("--w3cos-internal-width-keyword", "min-content")],
+    );
+    let root = node(
+        Style {
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![
+            node(block(), vec![node(fixed_child, vec![])]),
+            node(shrink, vec![node(shrink_child.clone(), vec![])]),
+            node(flex, vec![node(shrink_child, vec![])]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).0, 140.0, "10% of 400 + 100");
+    assert_eq!(rect(&ng, 3).2, 100.0, "min-content block against zero");
+    assert_eq!(rect(&ng, 5).2, 100.0, "min-content flex against zero");
+}
+
 /// A replaced row flex item's content size suggestion is its natural width
 /// at its definite height, not its specified `width`, which only caps it
 /// (flexbox-min-width-auto-002a).

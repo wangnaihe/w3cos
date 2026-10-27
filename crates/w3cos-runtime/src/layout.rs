@@ -3967,6 +3967,11 @@ pub(crate) fn resolve_spacing_for_layout(
 ) -> f32 {
     w3cos_std::style::used_box_spacing(match spacing {
         WSpacing::Percent(value) => percentage_spacing_for_layout(percentage_basis, value),
+        // `calc(P% + Xpx)`: against a zero basis (intrinsic sizing) only
+        // the length remains.
+        WSpacing::Calc { percent, px } => {
+            percentage_spacing_for_layout(percentage_basis, percent) + px
+        }
         WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
         WSpacing::Em(value) => value * font_style.font_size,
         WSpacing::Ch(value) => value * font_style.ch_advance(),
@@ -26540,6 +26545,8 @@ fn to_taffy_margin(
     match spacing {
         WSpacing::Auto => LengthPercentageAuto::auto(),
         WSpacing::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
+        // Legacy keeps reading a mixed calc() margin as zero.
+        WSpacing::Calc { .. } => LengthPercentageAuto::length(0.0),
         other => LengthPercentageAuto::length(resolve_spacing_for_layout(
             other, 0.0, font_style, viewport_w, viewport_h,
         )),

@@ -14301,6 +14301,7 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
     let resolve = |spacing: Spacing, font_style: &w3cos_std::style::Style| match spacing {
         Spacing::Px(value) => value,
         Spacing::Percent(value) => percentage_basis * value / 100.0,
+        Spacing::Calc { percent, px } => percentage_basis * percent / 100.0 + px,
         Spacing::Rem(value) => value * 16.0,
         Spacing::Em(value) => value * font_style.font_size,
         Spacing::Ch(value) => value * font_style.ch_advance(),

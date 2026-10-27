@@ -33,6 +33,8 @@ fn supported_spacing(s: Spacing, allow_auto: bool) -> bool {
         | Spacing::Ch(_)
         | Spacing::Vw(_)
         | Spacing::Vh(_) => true,
+        // Padding is parsed without calc, so only margins reach this.
+        Spacing::Calc { .. } => allow_auto,
         Spacing::Auto => allow_auto,
         // env() insets depend on host state the legacy path owns.
         _ => false,
@@ -1670,6 +1672,16 @@ pub(super) fn replaced_size(
     style: &Style,
     space: &ConstraintSpace,
 ) -> Option<(f32, f32)> {
+    if size_contained(style)
+        && matches!(
+            kind,
+            ComponentKind::Image { .. }
+                | ComponentKind::Canvas { .. }
+                | ComponentKind::SvgDocument { .. }
+        )
+    {
+        return contained_replaced_size(style);
+    }
     match kind {
         ComponentKind::Image { src } => replaced_content_size(src, style, space).why("image"),
         ComponentKind::Canvas { width, height } => {
@@ -1681,6 +1693,38 @@ pub(super) fn replaced_size(
         }
         _ => None,
     }
+}
+
+/// A size-contained replaced box has no natural size or aspect ratio: an
+/// auto axis is its `contain-intrinsic-size` (zero when `none`), and a
+/// length is used as given. Percentages, `calc()`, limits and keywords
+/// stay with legacy (`None`).
+fn contained_replaced_size(style: &Style) -> Option<(f32, f32)> {
+    let (intrinsic_w, intrinsic_h) = contain_intrinsic_size(style);
+    let axis = |dim: Dimension, intrinsic: f32| match dim {
+        Dimension::Auto => Some(intrinsic),
+        Dimension::Px(v) if style.box_sizing != BoxSizing::BorderBox => Some(v),
+        _ => None,
+    };
+    let limited = [
+        style.min_width,
+        style.max_width,
+        style.min_height,
+        style.max_height,
+    ]
+    .iter()
+    .any(|d| *d != Dimension::Auto);
+    if limited
+        || marker(style, WIDTH_KEYWORD).is_some()
+        || marker(style, MIN_WIDTH_KEYWORD).is_some()
+        || marker(style, MAX_WIDTH_KEYWORD).is_some()
+    {
+        return super::bail("replaced:contain-size-limits");
+    }
+    Some((
+        axis(style.width, intrinsic_w).or_else(|| super::bail("replaced:contain-size-unit"))?,
+        axis(style.height, intrinsic_h).or_else(|| super::bail("replaced:contain-size-unit"))?,
+    ))
 }
 
 /// A replaced box's content size with intrinsic `min-*` / `max-*`
@@ -2505,7 +2549,7 @@ pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
 /// percentages): such subtrees stay on legacy.
 fn percent_inline(style: &Style) -> bool {
     let dim = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
-    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
     dim(style.width)
         || dim(style.min_width)
         || dim(style.max_width)
@@ -2529,7 +2573,7 @@ fn compressible_replaced_content(
 ) -> Option<Option<MinMax>> {
     let style = flat[child].style;
     let pct = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
-    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
     let applies = is_replaced(flat[child].kind)
         && (pct(style.width) || pct(style.max_width))
         && !pct(style.min_width)
@@ -2575,7 +2619,7 @@ fn box_percent_inline(flat: &[FlatNodeInfo], node: usize) -> bool {
         return false;
     }
     if style.display == Display::Inline && !inline::is_atomic_inline(flat, node) {
-        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
         return spacing(style.margin.left)
             || spacing(style.margin.right)
             || spacing(style.padding.left)
@@ -2618,7 +2662,7 @@ fn flex_percent_below(flat: &[FlatNodeInfo], index: usize) -> bool {
             return false;
         }
         let dim = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
-        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
         dim(style.width)
             || dim(style.min_width)
             || dim(style.max_width)

@@ -1355,6 +1355,12 @@ pub enum Spacing {
         px: f32,
         safe_area: SafeAreaEdge,
     },
+    /// `calc(P% + Xpx)`, a margin that mixes a percentage and a length.
+    /// Only LayoutNG resolves it; legacy layout reads it as zero.
+    Calc {
+        percent: f32,
+        px: f32,
+    },
     /// `env(keyboard-inset-height)` — virtual keyboard occlusion (logical px).
     KeyboardInsetHeight,
     /// `calc(Npx + env(...))` — one optional `safe-area` and/or `keyboard-inset` term.
@@ -1375,7 +1381,7 @@ impl Spacing {
     pub fn resolve_env(&self, insets: &SafeAreaInsets, keyboard_bottom: f32) -> f32 {
         match self {
             Spacing::Px(v) => *v,
-            Spacing::Percent(_) | Spacing::Auto => 0.0,
+            Spacing::Percent(_) | Spacing::Calc { .. } | Spacing::Auto => 0.0,
             Spacing::Rem(v) => *v * 16.0,
             Spacing::Em(v) => *v * 16.0,
             Spacing::Ch(v) => *v * 8.0,
