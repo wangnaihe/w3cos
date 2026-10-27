@@ -48,7 +48,7 @@ const SIZE_CONTAINMENT: &str = "--w3cos-internal-size-containment";
 /// `contain-intrinsic-size` per axis: "<w> <h>", px or `none`.
 const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width is auto).
-const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
+pub(super) const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 pub(super) const MIN_WIDTH_KEYWORD: &str = "--w3cos-internal-min-width-keyword";
 const MAX_WIDTH_KEYWORD: &str = "--w3cos-internal-max-width-keyword";
 
@@ -293,7 +293,8 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                     && !is_value_carrier_marker(key)
                     && !allowed.contains(&key.as_str())
                     // Intrinsic width keywords: in-flow blocks resolve
-                    // them (keyword_inline_size); flex containers bail.
+                    // them (keyword_inline_size), flex containers through
+                    // apply_width_keywords.
                     && key != WIDTH_KEYWORD
                     // Blocks and grid items resolve min-width keywords and
                     // blocks max-width keywords; elsewhere the limit stays
@@ -2855,7 +2856,7 @@ pub(super) fn min_max_contribution(
 /// and so does fit-content(<percentage>), whose percentage is cyclic here
 /// (css-sizing-3: it behaves as the initial value). Without a keyword (or
 /// for a replaced or size-contained box) the sizes are returned as is.
-fn keyword_width_contribution(
+pub(super) fn keyword_width_contribution(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
@@ -3011,6 +3012,33 @@ fn apply_keyword_inline_limits(
     definite.min_width = Dimension::Auto;
     definite.max_width = Dimension::Auto;
     Some(resolve_inline(&definite, space))
+}
+
+/// A non-replaced box's inline metrics after its intrinsic `width`
+/// keyword and its `min-width` / `max-width` keywords: the keyword size
+/// becomes a definite width, then the limits clamp it. Flex containers
+/// laid out without a parent-imposed width use this.
+pub(super) fn apply_width_keywords(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    mut metrics: BoxMetrics,
+) -> Option<BoxMetrics> {
+    let style = flat[index].style;
+    if size_contained(style) || is_replaced(flat[index].kind) {
+        return Some(metrics);
+    }
+    if let Some(keyword) = marker(style, WIDTH_KEYWORD) {
+        let content = keyword_inline_size(flat, index, space, &metrics, keyword)?;
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let mut definite = style.clone();
+        definite.width = Dimension::Px(match style.box_sizing {
+            BoxSizing::BorderBox => content + edges,
+            BoxSizing::ContentBox => content,
+        });
+        metrics = resolve_inline(&definite, space);
+    }
+    apply_keyword_inline_limits(flat, index, space, style, metrics)
 }
 
 /// The content-box inline size of an intrinsic `width` keyword

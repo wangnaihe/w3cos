@@ -83,9 +83,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("flex:contain");
     }
-    if has_marker(style, "--w3cos-internal-width-keyword") {
-        return Some("flex:width-keyword");
-    }
     // An automatic column block size is one flex line, except when a gap
     // is present. gap-003's reference spaces items with logical margins
     // under `writing-mode`, neither of which is stored; both sides of
@@ -1032,6 +1029,11 @@ pub(super) fn layout(
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
         metrics.content_width = width;
+    } else {
+        // Intrinsic `width` / `min-width` / `max-width` keywords resolve
+        // against the container's own min/max-content sizes
+        // (container_min_max_at), as for a block.
+        metrics = block::apply_width_keywords(flat, index, space, metrics)?;
     }
     let direction = style.flex_direction;
     let row = row_axis(direction);

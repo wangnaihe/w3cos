@@ -303,7 +303,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.position == Position::Relative && inset_set(child_style) {
             return Some("grid:inset");
         }
-        if has_marker(child_style, "--w3cos-internal-width-keyword") {
+        // Replaced and size-contained items with an intrinsic width keyword
+        // stay on legacy (item_width_keyword resolves the others).
+        if has_marker(child_style, block::WIDTH_KEYWORD)
+            && item_width_keyword(flat, child).is_none()
+        {
             return Some("grid:item-width-keyword");
         }
     }
@@ -3253,6 +3257,13 @@ fn inline_minmax(
     let content = match style.width {
         Dimension::Percent(_) | Dimension::Auto => {
             let sizes = block::intrinsic_sizes(flat, index, space).why("grid:intrinsic")?;
+            // An intrinsic `width` keyword contributes its own size
+            // (fit-content, and a percentage fit-content(), as auto).
+            let sizes = if item_width_keyword(flat, index).is_some() {
+                block::keyword_width_contribution(flat, index, space, edges, sizes)?
+            } else {
+                sizes
+            };
             (sizes.min.unwrap_or(sizes.max).max(0.0), sizes.max.max(0.0))
         }
         other => {
@@ -3270,6 +3281,16 @@ fn inline_minmax(
         .max(floor)
         .max(0.0);
     Some((units(min + extra), units(max.max(min) + extra)))
+}
+
+/// A grid item's intrinsic `width` keyword, unless the item is replaced
+/// or size-contained (those keep their own sizing paths).
+fn item_width_keyword<'a>(flat: &[FlatNodeInfo<'a>], index: usize) -> Option<&'a str> {
+    let style = flat[index].style;
+    if block::size_contained(style) || block::is_replaced(flat[index].kind) {
+        return None;
+    }
+    marker(style, block::WIDTH_KEYWORD)
 }
 
 /// The content-box size a `min-width: min-content | max-content` keyword
@@ -4210,11 +4231,29 @@ fn layout_impl(
             border[1] + border[3] + pad(child_style.padding.left) + pad(child_style.padding.right);
         let edges_v =
             border[0] + border[2] + pad(child_style.padding.top) + pad(child_style.padding.bottom);
+        let width_keyword = item_width_keyword(flat, item.index);
         let stretch_inline = justify == Pack::Stretch
             && matches!(child_style.width, Dimension::Auto)
+            && width_keyword.is_none()
             && !auto_margin[3]
             && !auto_margin[1];
-        let raw = if stretch_inline {
+        let raw = if let Some(keyword) = width_keyword {
+            // css-sizing-3 intrinsic keywords within the grid area: the
+            // available size for fit-content is the area less margins.
+            let sizes = block::intrinsic_sizes(flat, item.index, space).why("grid:intrinsic")?;
+            let min = sizes.min.unwrap_or(sizes.max).max(0.0);
+            block::keyword_content_size(
+                keyword,
+                min,
+                sizes.max,
+                Some((area - ml - mr - edges_h).max(0.0)),
+                Some(area),
+                child_style,
+                space,
+                edges_h,
+            )
+            .or_else(|| super::bail("grid:item-width-keyword"))?
+        } else if stretch_inline {
             (area - ml - mr - edges_h).max(0.0)
         } else if matches!(child_style.width, Dimension::Auto) {
             // A non-stretched auto width is fit-content within the grid area:

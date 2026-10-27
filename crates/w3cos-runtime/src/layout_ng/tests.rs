@@ -1953,6 +1953,81 @@ fn width_limit_keywords_and_fit_content_function() {
     }
 }
 
+/// Intrinsic width keywords on a flex container resolve against its own
+/// min/max-content sizes, and a grid item with one is sized by it inside
+/// its area instead of being stretched.
+#[test]
+fn width_keywords_on_flex_containers_and_grid_items() {
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let child = |w: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                ..sized(10.0)
+            },
+            vec![],
+        )
+    };
+    // A single-line container's min-content size sums its items' (Flexbox
+    // §9.9.1); a multi-line one takes the largest.
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    for (word, wrap, width) in [
+        ("max-content", FlexWrap::NoWrap, 100.0),
+        ("min-content", FlexWrap::NoWrap, 100.0),
+        ("min-content", FlexWrap::Wrap, 60.0),
+        ("fit-content", FlexWrap::NoWrap, 100.0),
+        ("fit-content(80px)", FlexWrap::Wrap, 80.0),
+    ] {
+        let mut flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: wrap,
+            ..Style::default()
+        };
+        mark(&mut flex, &[("--w3cos-internal-width-keyword", word)]);
+        let root = node(block(), vec![node(flex, vec![child(40.0), child(60.0)])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "{word}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1).2, width, "flex {word}");
+    }
+    for (word, width) in [
+        ("max-content", 60.0),
+        ("min-content", 60.0),
+        ("fit-content(30px)", 60.0),
+    ] {
+        let grid = Style {
+            display: Display::Grid,
+            width: Dimension::Px(300.0),
+            grid_template_columns: Some("200px".to_string()),
+            ..Style::default()
+        };
+        let mut item = block();
+        mark(&mut item, &[("--w3cos-internal-width-keyword", word)]);
+        let root = node(
+            block(),
+            vec![node(grid, vec![node(item, vec![child(40.0), child(60.0)])])],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "{word}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 2), (0.0, 0.0, width, 20.0), "grid item {word}");
+    }
+}
+
 /// CSS2 9.4.1: overflow other than visible is a BFC. The box sits beside
 /// a float instead of overlapping it, and a float inside it contributes
 /// to the auto height (10.6.7) without its margin escaping.
