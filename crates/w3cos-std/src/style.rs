@@ -1175,7 +1175,7 @@ impl Style {
             Dimension::Ch(value) => value * self.ch_advance(),
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
-            Dimension::Auto => 0.0,
+            Dimension::Auto | Dimension::Calc { .. } => 0.0,
         }
     }
 }
@@ -1329,6 +1329,13 @@ pub enum Dimension {
     Ch(f32),
     Vw(f32),
     Vh(f32),
+    /// `calc()` of a percentage and a px length: `percent`% of the basis
+    /// plus `px`. Only LayoutNG resolves it; legacy layout treats it as
+    /// `auto`, as it did when the declaration was dropped.
+    Calc {
+        percent: f32,
+        px: f32,
+    },
 }
 
 /// CSS length for padding/margin.
@@ -2259,6 +2266,7 @@ impl Dimension {
             Dimension::Ch(v) => Some(*v * local_font_size * 0.5),
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
+            Dimension::Calc { .. } => None,
         }
     }
 }

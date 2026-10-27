@@ -788,9 +788,9 @@ impl CSSStyleDeclaration {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
-                } else if let Some(width) =
+                } else if let Some(width) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.width = width;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
                 }
@@ -803,9 +803,9 @@ impl CSSStyleDeclaration {
                     self.inner.height = height;
                     self.inner.max_height = max_height;
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
-                } else if let Some(height) =
+                } else if let Some(height) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.height = height;
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                 }
@@ -815,9 +815,9 @@ impl CSSStyleDeclaration {
                     self.inner.min_width = Dimension::Auto;
                     set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, Some(keyword));
                 } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
-                } else if let Some(value) =
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.min_width = value;
                     set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, None);
                 }
@@ -827,9 +827,9 @@ impl CSSStyleDeclaration {
                 if is_intrinsic_size_keyword(&keyword) {
                     self.inner.min_height = Dimension::Auto;
                     set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
-                } else if let Some(value) =
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.min_height = value;
                     set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, None);
                 }
@@ -841,9 +841,9 @@ impl CSSStyleDeclaration {
                 } else if value.trim().eq_ignore_ascii_case("none") {
                     self.inner.max_width = Dimension::Auto;
                     set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
-                } else if let Some(value) =
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.max_width = value;
                     set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
                 }
@@ -856,9 +856,9 @@ impl CSSStyleDeclaration {
                 } else if value.trim().eq_ignore_ascii_case("none") {
                     self.inner.max_height = Dimension::Auto;
                     set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
-                } else if let Some(value) =
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.max_height = value;
                     set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
                 }
@@ -2532,6 +2532,10 @@ pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
+        w3cos_std::style::Dimension::Calc { percent, px } => {
+            let (sign, px) = if *px < 0.0 { ('-', -px) } else { ('+', *px) };
+            format!("calc({percent}% {sign} {px}px)")
+        }
     }
 }
 
@@ -3240,9 +3244,237 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     None
 }
 
+/// A `calc()` value of a sizing property that is a linear sum of
+/// percentages and absolute lengths (`calc(10% + 50px)`,
+/// `calc((100% - 20px) / 2)`). Without a percentage it is a px length;
+/// with only percentages, a percentage; otherwise `Dimension::Calc`.
+/// Relative units and anything else return `None` (the declaration is
+/// dropped, as before).
+fn parse_size_calc(value: &str) -> Option<Dimension> {
+    let lower = value.trim().to_ascii_lowercase();
+    if !lower.starts_with("calc(") {
+        return None;
+    }
+    let tokens = calc_tokens(&lower)?;
+    let mut pos = 0;
+    let result = calc_sum(&tokens, &mut pos)?;
+    if pos != tokens.len() {
+        return None;
+    }
+    let CalcValue::Length {
+        percent,
+        px,
+        has_percent,
+        has_px,
+    } = result
+    else {
+        return None;
+    };
+    if !(percent.is_finite() && px.is_finite()) {
+        return None;
+    }
+    Some(match (has_percent, has_px) {
+        (false, _) => Dimension::Px(px.max(0.0)),
+        (true, false) => Dimension::Percent(percent.max(0.0)),
+        (true, true) => Dimension::Calc { percent, px },
+    })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CalcToken {
+    Open,
+    Close,
+    Op(char),
+    Value(CalcValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CalcValue {
+    Number(f32),
+    Length {
+        percent: f32,
+        px: f32,
+        has_percent: bool,
+        has_px: bool,
+    },
+}
+
+fn calc_tokens(input: &str) -> Option<Vec<CalcToken>> {
+    let bytes = input.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if input[i..].starts_with("calc(") {
+            tokens.push(CalcToken::Open);
+            i += 5;
+            continue;
+        }
+        let operand_expected = matches!(
+            tokens.last(),
+            None | Some(CalcToken::Open) | Some(CalcToken::Op(_))
+        );
+        match c {
+            b'(' => {
+                tokens.push(CalcToken::Open);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(CalcToken::Close);
+                i += 1;
+            }
+            b'*' | b'/' => {
+                tokens.push(CalcToken::Op(c as char));
+                i += 1;
+            }
+            b'+' | b'-' if !operand_expected => {
+                // `+` and `-` need whitespace on both sides (css-values).
+                let spaced = i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes.get(i + 1).is_some_and(|b| b.is_ascii_whitespace());
+                if !spaced {
+                    return None;
+                }
+                tokens.push(CalcToken::Op(c as char));
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && !matches!(bytes[i], b'(' | b')' | b'*' | b'/')
+                {
+                    i += 1;
+                }
+                tokens.push(CalcToken::Value(calc_operand(&input[start..i])?));
+            }
+        }
+    }
+    Some(tokens)
+}
+
+fn calc_operand(token: &str) -> Option<CalcValue> {
+    if let Ok(number) = token.parse::<f32>() {
+        return Some(CalcValue::Number(number));
+    }
+    if let Some(percent) = token.strip_suffix('%') {
+        return Some(CalcValue::Length {
+            percent: percent.parse().ok()?,
+            px: 0.0,
+            has_percent: true,
+            has_px: false,
+        });
+    }
+    if !token.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(CalcValue::Length {
+        percent: 0.0,
+        px: parse_px(token)?,
+        has_percent: false,
+        has_px: true,
+    })
+}
+
+fn calc_sum(tokens: &[CalcToken], pos: &mut usize) -> Option<CalcValue> {
+    let mut acc = calc_product(tokens, pos)?;
+    while let Some(CalcToken::Op(op @ ('+' | '-'))) = tokens.get(*pos) {
+        let sign = if *op == '-' { -1.0 } else { 1.0 };
+        *pos += 1;
+        let rhs = calc_product(tokens, pos)?;
+        acc = match (acc, rhs) {
+            (CalcValue::Number(a), CalcValue::Number(b)) => CalcValue::Number(a + sign * b),
+            (
+                CalcValue::Length {
+                    percent: ap,
+                    px: ax,
+                    has_percent: ah,
+                    has_px: axh,
+                },
+                CalcValue::Length {
+                    percent: bp,
+                    px: bx,
+                    has_percent: bh,
+                    has_px: bxh,
+                },
+            ) => CalcValue::Length {
+                percent: ap + sign * bp,
+                px: ax + sign * bx,
+                has_percent: ah || bh,
+                has_px: axh || bxh,
+            },
+            _ => return None,
+        };
+    }
+    Some(acc)
+}
+
+fn calc_product(tokens: &[CalcToken], pos: &mut usize) -> Option<CalcValue> {
+    let mut acc = calc_primary(tokens, pos)?;
+    while let Some(CalcToken::Op(op @ ('*' | '/'))) = tokens.get(*pos) {
+        let divide = *op == '/';
+        *pos += 1;
+        let rhs = calc_primary(tokens, pos)?;
+        acc = match (acc, rhs, divide) {
+            (CalcValue::Number(a), CalcValue::Number(b), false) => CalcValue::Number(a * b),
+            (CalcValue::Number(a), CalcValue::Number(b), true) if b != 0.0 => {
+                CalcValue::Number(a / b)
+            }
+            (CalcValue::Length { .. }, CalcValue::Number(b), true) if b != 0.0 => {
+                calc_scale(acc, 1.0 / b)
+            }
+            (CalcValue::Length { .. }, CalcValue::Number(b), false) => calc_scale(acc, b),
+            (CalcValue::Number(a), CalcValue::Length { .. }, false) => calc_scale(rhs, a),
+            _ => return None,
+        };
+    }
+    Some(acc)
+}
+
+fn calc_scale(value: CalcValue, factor: f32) -> CalcValue {
+    match value {
+        CalcValue::Number(n) => CalcValue::Number(n * factor),
+        CalcValue::Length {
+            percent,
+            px,
+            has_percent,
+            has_px,
+        } => CalcValue::Length {
+            percent: percent * factor,
+            px: px * factor,
+            has_percent,
+            has_px,
+        },
+    }
+}
+
+fn calc_primary(tokens: &[CalcToken], pos: &mut usize) -> Option<CalcValue> {
+    match tokens.get(*pos)? {
+        CalcToken::Open => {
+            *pos += 1;
+            let value = calc_sum(tokens, pos)?;
+            if tokens.get(*pos) != Some(&CalcToken::Close) {
+                return None;
+            }
+            *pos += 1;
+            Some(value)
+        }
+        CalcToken::Value(value) => {
+            *pos += 1;
+            Some(*value)
+        }
+        _ => None,
+    }
+}
+
 fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
     match *value {
-        Dimension::Auto => true,
+        Dimension::Auto | Dimension::Calc { .. } => true,
         Dimension::Px(value)
         | Dimension::Percent(value)
         | Dimension::Rem(value)
@@ -5146,6 +5378,46 @@ mod font_shorthand_tests {
             assert_eq!(parse_font_line_height(value, 20.0), None, "{value}");
             assert!(!is_valid_font_line_height_token(value), "{value}");
         }
+    }
+
+    /// Size properties keep a mixed `calc()` for LayoutNG to resolve.
+    #[test]
+    fn size_calc_parses_percent_and_px() {
+        use w3cos_std::style::Dimension;
+        assert_eq!(
+            super::parse_size_calc("calc(10% + 50px)"),
+            Some(Dimension::Calc {
+                percent: 10.0,
+                px: 50.0
+            })
+        );
+        assert_eq!(
+            super::parse_size_calc("calc((100% - 20px) / 2)"),
+            Some(Dimension::Calc {
+                percent: 50.0,
+                px: -10.0
+            })
+        );
+        assert_eq!(
+            super::parse_size_calc("calc(20px + 5px)"),
+            Some(Dimension::Px(25.0))
+        );
+        assert_eq!(
+            super::parse_size_calc("calc(50% * 2)"),
+            Some(Dimension::Percent(100.0))
+        );
+        assert_eq!(super::parse_size_calc("calc(10% + 2em)"), None);
+        assert_eq!(super::parse_size_calc("calc(10%+5px)"), None);
+        assert_eq!(super::parse_size_calc("10px"), None);
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("width", "calc(10% + 50px)");
+        assert_eq!(
+            declaration.to_style().width,
+            Dimension::Calc {
+                percent: 10.0,
+                px: 50.0
+            }
+        );
     }
 
     /// `font-148` puts a length-valued `calc()` where the size belongs.

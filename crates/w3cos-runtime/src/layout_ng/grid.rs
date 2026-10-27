@@ -85,9 +85,15 @@ fn spacing_px(style: &Style, spacing: Spacing, cb: f32, space: &ConstraintSpace)
 }
 
 fn percent_block(style: &Style) -> bool {
-    matches!(style.height, Dimension::Percent(_))
-        || matches!(style.min_height, Dimension::Percent(_))
-        || matches!(style.max_height, Dimension::Percent(_))
+    matches!(style.height, Dimension::Percent(_) | Dimension::Calc { .. })
+        || matches!(
+            style.min_height,
+            Dimension::Percent(_) | Dimension::Calc { .. }
+        )
+        || matches!(
+            style.max_height,
+            Dimension::Percent(_) | Dimension::Calc { .. }
+        )
 }
 
 fn inset_set(style: &Style) -> bool {
@@ -3255,7 +3261,7 @@ fn inline_minmax(
         return Some((0, 0));
     }
     let content = match style.width {
-        Dimension::Percent(_) | Dimension::Auto => {
+        Dimension::Percent(_) | Dimension::Calc { .. } | Dimension::Auto => {
             let sizes = block::intrinsic_sizes(flat, index, space).why("grid:intrinsic")?;
             // An intrinsic `width` keyword contributes its own size
             // (fit-content, and a percentage fit-content(), as auto).
@@ -3335,7 +3341,7 @@ fn inline_minimum(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
         return Some(units((keyword + outer).max(0.0)));
     }
     match style.min_width {
-        Dimension::Auto | Dimension::Percent(_) => {
+        Dimension::Auto | Dimension::Percent(_) | Dimension::Calc { .. } => {
             if !block::scrolls_in_axis(style, true) || !matches!(style.min_width, Dimension::Auto) {
                 return None;
             }
@@ -4868,7 +4874,7 @@ fn resolve_block(
 ) -> Option<Option<f32>> {
     match dim {
         Dimension::Auto => Some(None),
-        Dimension::Percent(_) if basis.is_none() => None,
+        Dimension::Percent(_) | Dimension::Calc { .. } if basis.is_none() => None,
         other => {
             let size = block::resolve_length(other, basis, style, space)?;
             Some(Some(to_content(style, edges, size)))

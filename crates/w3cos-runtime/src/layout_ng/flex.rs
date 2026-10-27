@@ -83,6 +83,28 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("flex:contain");
     }
+    // A container sized by logical properties the cascade does not resolve
+    // (`block-size`) whose items carry `calc()` widths: gap-003/008 and
+    // their references only agree while both sides ignore both, so they
+    // stay on legacy together.
+    if style.custom_properties.as_ref().is_some_and(|props| {
+        props
+            .keys()
+            .any(|key| key.starts_with("--w3cos-internal-logical-size-"))
+    }) {
+        let end = flat[index].subtree_end.max(index + 1);
+        let mut child = index + 1;
+        while child < end {
+            let item = flat[child].style;
+            if [item.width, item.min_width, item.max_width]
+                .iter()
+                .any(|dim| matches!(dim, Dimension::Calc { .. }))
+            {
+                return Some("flex:logical-calc");
+            }
+            child = flat[child].subtree_end.max(child + 1);
+        }
+    }
     // An automatic column block size is one flex line, except when a gap
     // is present. gap-003's reference spaces items with logical margins
     // under `writing-mode`, neither of which is stored; both sides of
@@ -277,9 +299,15 @@ fn percent_block_size(style: &Style) -> bool {
         _ => false,
     };
     basis
-        || matches!(style.height, Dimension::Percent(_))
-        || matches!(style.min_height, Dimension::Percent(_))
-        || matches!(style.max_height, Dimension::Percent(_))
+        || matches!(style.height, Dimension::Percent(_) | Dimension::Calc { .. })
+        || matches!(
+            style.min_height,
+            Dimension::Percent(_) | Dimension::Calc { .. }
+        )
+        || matches!(
+            style.max_height,
+            Dimension::Percent(_) | Dimension::Calc { .. }
+        )
 }
 
 struct Item {
@@ -343,7 +371,7 @@ fn definite(
 ) -> Option<Option<f32>> {
     match dim {
         Dimension::Auto => Some(None),
-        Dimension::Percent(_) if basis.is_none() => None,
+        Dimension::Percent(_) | Dimension::Calc { .. } if basis.is_none() => None,
         other => Some(block::resolve_length(other, basis, style, space)),
     }
 }
@@ -1011,7 +1039,33 @@ fn resolve_main_limits(
         // (FlexLayoutAlgorithm::ShouldApplyMinSizeAutoForChild).
         0.0
     } else if matches!(min_dim, Dimension::Auto) {
-        let content_min = if row {
+        let (main_dim, cross_dim) = if row {
+            (style.width, style.height)
+        } else {
+            (style.height, style.width)
+        };
+        let natural_replaced = matches!(
+            flat[index].kind,
+            w3cos_std::ComponentKind::Image { .. }
+                | w3cos_std::ComponentKind::Canvas { .. }
+                | w3cos_std::ComponentKind::SvgDocument { .. }
+        ) && !matches!(main_dim, Dimension::Auto)
+            && !matches!(cross_dim, Dimension::Percent(_) | Dimension::Calc { .. });
+        let content_min = if natural_replaced {
+            // A replaced item's min-content size is its natural size (its
+            // own main size read as auto), with a definite cross size
+            // transferred through its aspect ratio; the specified size
+            // suggestion caps it below (flexbox-min-width-auto-002a,
+            // flexbox-min-height-auto-002a).
+            let mut natural = style.clone();
+            if row {
+                natural.width = Dimension::Auto;
+            } else {
+                natural.height = Dimension::Auto;
+            }
+            let size = block::replaced_size(flat[index].kind, &natural, space)?;
+            if row { size.0 } else { size.1 }
+        } else if row {
             let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
             content.min.unwrap_or(content.max)
         } else if block::size_contained(style) {

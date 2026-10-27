@@ -190,6 +190,27 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         if node.style.position == Position::Sticky {
             return Some("table:sticky");
         }
+        // The table width algorithms here know percentages and lengths,
+        // not their `calc()` mix (css-tables calc-percent-plus-0px-*).
+        if (offset == 0
+            || is_table_display(node.style.display)
+                && !matches!(
+                    node.style.display,
+                    Display::TableColumn | Display::TableColumnGroup
+                ))
+            && [
+                node.style.width,
+                node.style.min_width,
+                node.style.max_width,
+                node.style.height,
+                node.style.min_height,
+                node.style.max_height,
+            ]
+            .iter()
+            .any(|dim| matches!(dim, Dimension::Calc { .. }))
+        {
+            return Some("table:calc");
+        }
         // A relatively positioned row, row group or cell moves its fragment
         // by its insets and is the containing block of its absolute
         // descendants; the grid here places them unmoved. One with auto
@@ -262,7 +283,7 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
 fn percent_height(style: &Style) -> bool {
     [style.height, style.min_height, style.max_height]
         .iter()
-        .any(|dim| matches!(dim, Dimension::Percent(_)))
+        .any(|dim| matches!(dim, Dimension::Percent(_) | Dimension::Calc { .. }))
 }
 
 /// Whether `node` is the in-flow child of a (possibly anonymous) cell of
@@ -327,6 +348,16 @@ fn length_px(
     basis: Option<f32>,
     space: &ConstraintSpace,
 ) -> Option<f32> {
+    // A column's mixed `calc()` width is auto in an auto-layout table
+    // (css-tables auto-layout-calc-width-001).
+    if matches!(dim, Dimension::Calc { .. })
+        && matches!(
+            style.display,
+            Display::TableColumn | Display::TableColumnGroup
+        )
+    {
+        return None;
+    }
     block::resolve_length(dim, basis, style, space)
 }
 

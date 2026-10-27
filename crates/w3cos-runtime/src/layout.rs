@@ -1930,7 +1930,7 @@ fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
-        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc { .. } => None,
     };
     let constraint_border_box = |dimension| {
         intrinsic_constraint(dimension).map(|width| {
@@ -3840,7 +3840,8 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Em(_)
         | WDim::Ch(_)
         | WDim::Vw(_)
-        | WDim::Vh(_) => None,
+        | WDim::Vh(_)
+        | WDim::Calc { .. } => None,
     }
 }
 
@@ -4389,6 +4390,7 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
+            WDim::Calc { .. } => (0, 0),
         },
         padding_top: padding.top.to_bits(),
         padding_right: padding.right.to_bits(),
@@ -21281,7 +21283,7 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
-        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) => None,
+        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) | WDim::Calc { .. } => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
     // Keep their own height automatic, while descendants use the nearest
@@ -21627,7 +21629,7 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
-        WDim::Auto | WDim::Percent(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Calc { .. } => None,
     };
     let absorbs_ua_inline_padding =
         uses_ua_table_cell_padding && absolute_dimension(comp.style.width).is_some();
@@ -25268,7 +25270,7 @@ fn collect_layouts_fast(
         .get_node_context(node)
         .and_then(|index| flat.get(*index))
         .is_some_and(|info| match info.style.height {
-            WDim::Auto => {
+            WDim::Auto | WDim::Calc { .. } => {
                 matches!(info.style.position, WPos::Absolute | WPos::Fixed)
                     && !matches!(info.style.top, WDim::Auto)
                     && !matches!(info.style.bottom, WDim::Auto)
@@ -26551,7 +26553,8 @@ fn to_taffy_dim(
     viewport_h: f32,
 ) -> Dimension {
     match d {
-        WDim::Auto => Dimension::auto(),
+        // LayoutNG alone resolves a `calc()` size; legacy keeps `auto`.
+        WDim::Auto | WDim::Calc { .. } => Dimension::auto(),
         WDim::Px(v) => Dimension::length(v),
         WDim::Percent(v) => Dimension::percent(v / 100.0),
         WDim::Rem(v) => Dimension::length(v * 16.0),
@@ -26569,7 +26572,7 @@ fn to_taffy_auto(
     viewport_h: f32,
 ) -> LengthPercentageAuto {
     match d {
-        WDim::Auto => LengthPercentageAuto::auto(),
+        WDim::Auto | WDim::Calc { .. } => LengthPercentageAuto::auto(),
         WDim::Px(v) => LengthPercentageAuto::length(v),
         WDim::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
         WDim::Rem(v) => LengthPercentageAuto::length(v * 16.0),

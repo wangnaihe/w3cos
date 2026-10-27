@@ -6640,3 +6640,141 @@ fn abspos_stretched_height_is_percentage_basis_for_intrinsic_width() {
     assert_eq!(rect(&ng, 2), (0.0, 0.0, 200.0, 100.0), "abspos");
     assert_eq!(rect(&ng, 3), (0.0, 0.0, 200.0, 100.0), "canvas");
 }
+
+/// A `calc()` of a percentage and a px length resolves against the
+/// containing block in block layout, and as a flex item's specified size
+/// suggestion (flexbox-min-width-auto-001).
+#[test]
+fn calc_percent_plus_px_sizes() {
+    use w3cos_std::style::Display;
+    let calc = |percent: f32, px: f32| Dimension::Calc { percent, px };
+    let sized = Style {
+        width: calc(10.0, 50.0),
+        height: Dimension::Px(5.0),
+        ..block()
+    };
+    let half = Style {
+        width: Dimension::Px(300.0),
+        max_width: calc(50.0, -10.0),
+        height: Dimension::Px(5.0),
+        ..block()
+    };
+    let item = Style {
+        flex_shrink: 1.0,
+        width: calc(10.0, 50.0),
+        ..block()
+    };
+    let wide = Style {
+        width: Dimension::Px(80.0),
+        height: Dimension::Px(10.0),
+        ..block()
+    };
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Row,
+        width: Dimension::Px(1.0),
+        ..block()
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![
+            node(sized, vec![]),
+            node(half, vec![]),
+            node(flex, vec![node(item, vec![node(wide, vec![])])]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 90.0, "calc(10% + 50px)");
+    assert_eq!(rect(&ng, 2).2, 190.0, "max-width calc(50% - 10px)");
+    let flexed = rect(&ng, 4).2;
+    assert!((flexed - 50.1).abs() < 0.02, "flex item min-width {flexed}");
+}
+
+/// A replaced row flex item's content size suggestion is its natural width
+/// at its definite height, not its specified `width`, which only caps it
+/// (flexbox-min-width-auto-002a).
+#[test]
+fn flex_replaced_item_min_width_auto_ignores_its_width() {
+    use w3cos_std::style::Display;
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Row,
+        width: Dimension::Px(0.0),
+        ..block()
+    };
+    let canvas = |width: f32| Style {
+        flex_shrink: 1.0,
+        width: Dimension::Px(width),
+        height: Dimension::Px(30.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(flex.clone(), vec![Component::canvas(16, 16, canvas(100.0))]),
+            node(flex, vec![Component::canvas(16, 16, canvas(20.0))]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 30.0, "transferred from height 30");
+    assert_eq!(rect(&ng, 4).2, 20.0, "specified width caps it");
+}
+
+/// The column counterpart: the natural height at the definite width
+/// (flexbox-min-height-auto-002a).
+#[test]
+fn flex_replaced_item_min_height_auto_ignores_its_height() {
+    use w3cos_std::style::Display;
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Column,
+        height: Dimension::Px(1.0),
+        ..block()
+    };
+    let canvas = Style {
+        flex_shrink: 1.0,
+        width: Dimension::Px(30.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![Component::canvas(16, 16, canvas)])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).3, 30.0, "transferred from width 30");
+}
+
+/// gap-003/008 pair a `block-size` the cascade ignores with `calc()` item
+/// widths; both sides stay on legacy together.
+#[test]
+fn flex_container_with_logical_size_and_calc_items_stays_on_legacy() {
+    use w3cos_std::style::{CustomProperties, Display};
+    let mut container = Style {
+        display: Display::Flex,
+        ..block()
+    };
+    container.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-logical-size-block-size".to_string(),
+        "100px".to_string(),
+    )]));
+    let item = Style {
+        width: Dimension::Calc {
+            percent: 50.0,
+            px: -10.0,
+        },
+        ..block()
+    };
+    let root = node(container, vec![node(item, vec![])]);
+    let flat = pre_flatten(&root);
+    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+}

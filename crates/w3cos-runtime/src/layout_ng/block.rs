@@ -871,7 +871,7 @@ fn button_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
     if style.float != Float::None || style.position != Position::Static {
         return Some("button:float-or-position");
     }
-    let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_));
+    let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_) | Dimension::Calc { .. });
     if [
         style.width,
         style.height,
@@ -1114,7 +1114,7 @@ fn text_field_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static
             return Some("text-input:line-height");
         }
     }
-    let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_));
+    let percent = |dim: Dimension| matches!(dim, Dimension::Percent(_) | Dimension::Calc { .. });
     if [
         style.width,
         style.height,
@@ -1341,9 +1341,10 @@ fn canvas_content_size(
     }
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
         match dim {
-            Dimension::Percent(_) | Dimension::Vw(_) | Dimension::Vh(_) => {
-                resolve_dim(dim, basis, style, space).map(Dimension::Px)
-            }
+            Dimension::Percent(_)
+            | Dimension::Calc { .. }
+            | Dimension::Vw(_)
+            | Dimension::Vh(_) => resolve_dim(dim, basis, style, space).map(Dimension::Px),
             other => Some(other),
         }
     };
@@ -1553,9 +1554,10 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     let mut definite = style.clone();
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
         match dim {
-            Dimension::Percent(_) | Dimension::Vw(_) | Dimension::Vh(_) => {
-                resolve_dim(dim, basis, style, space).map(Dimension::Px)
-            }
+            Dimension::Percent(_)
+            | Dimension::Calc { .. }
+            | Dimension::Vw(_)
+            | Dimension::Vh(_) => resolve_dim(dim, basis, style, space).map(Dimension::Px),
             other => Some(other),
         }
     };
@@ -2312,6 +2314,9 @@ fn resolve_dim(
         Dimension::Ch(v) => Some(v * style.ch_advance()),
         Dimension::Vw(v) => Some(v * space.viewport_w / 100.0),
         Dimension::Vh(v) => Some(v * space.viewport_h / 100.0),
+        Dimension::Calc { percent, px } => {
+            basis.map(|b| layout_unit(b * percent / 100.0 + px).max(0.0))
+        }
     }
 }
 
@@ -2499,7 +2504,7 @@ pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
 /// which intrinsic sizing has not sized yet (CSS Sizing 3 5.2.1 cyclic
 /// percentages): such subtrees stay on legacy.
 fn percent_inline(style: &Style) -> bool {
-    let dim = |d: Dimension| matches!(d, Dimension::Percent(_));
+    let dim = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
     let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
     dim(style.width)
         || dim(style.min_width)
@@ -2523,7 +2528,7 @@ fn compressible_replaced_content(
     space: &ConstraintSpace,
 ) -> Option<Option<MinMax>> {
     let style = flat[child].style;
-    let pct = |d: Dimension| matches!(d, Dimension::Percent(_));
+    let pct = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
     let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
     let applies = is_replaced(flat[child].kind)
         && (pct(style.width) || pct(style.max_width))
@@ -2612,7 +2617,7 @@ fn flex_percent_below(flat: &[FlatNodeInfo], index: usize) -> bool {
         if oof::is_out_of_flow(style) || matches!(flat[child].kind, ComponentKind::Text { .. }) {
             return false;
         }
-        let dim = |d: Dimension| matches!(d, Dimension::Percent(_));
+        let dim = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
         let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
         dim(style.width)
             || dim(style.min_width)
