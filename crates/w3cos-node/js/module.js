@@ -171,11 +171,41 @@ Module._resolveFilename = function _resolveFilename(request, parent) {
   if (resolved !== undefined) return resolved;
   throw dynamicRequireError(request);
 };
+// The request a compiled CommonJS module could not link (see below): if it
+// reaches the default loader unserved, the module's own "Cannot find module"
+// error is thrown instead of a dynamic-require one.
+let unlinkedRequest;
+const unlinked = {};
 Module._load = function _load(request, parent) {
   const resolved = resolveCompiled(request, parentFilenameOf(parent));
-  if (resolved === undefined) throw dynamicRequireError(request);
+  if (resolved === undefined) {
+    if (unlinkedRequest !== undefined && unlinkedRequest.request === request && unlinkedRequest.parent === parent) {
+      throw unlinked;
+    }
+    throw dynamicRequireError(request);
+  }
   return host.requireCompiled(resolved);
 };
+// A compiled CommonJS module's `require()` of a specifier its build could not
+// link (`require("vscode")` in a Code-OSS extension) goes through
+// `Module._load` like in Node, so a loader patched over it can serve it.
+// Returns `{ value }`, or undefined when nothing did.
+Object.defineProperty(globalThis, '__w3cos_cjs_runtime_load', {
+  configurable: true,
+  writable: true,
+  value: function runtimeLoad(request, parent) {
+    const previous = unlinkedRequest;
+    unlinkedRequest = { request: request, parent: parent };
+    try {
+      return { value: Module._load(request, parent, false) };
+    } catch (error) {
+      if (error === unlinked) return undefined;
+      throw error;
+    } finally {
+      unlinkedRequest = previous;
+    }
+  },
+});
 Module.register = function register() {};
 Module.registerHooks = function registerHooks() {
   return { deregister: function deregister() {} };
