@@ -1665,6 +1665,52 @@ pub(super) fn replaced_size(
     }
 }
 
+/// A replaced box's content size with intrinsic `min-*` / `max-*`
+/// keywords applied. In either axis min-content, max-content and
+/// fit-content all mean the size it would have with that axis auto (its
+/// natural size, or the other axis transferred through its ratio;
+/// css-sizing-3 for replaced elements).
+fn replaced_size_with_keyword_limits(
+    kind: &ComponentKind,
+    style: &Style,
+    space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    let (mut width, height) = replaced_size(kind, style, space)?;
+    let has = |key| marker(style, key).is_some();
+    let (min_w, max_w) = (has(MIN_WIDTH_KEYWORD), has(MAX_WIDTH_KEYWORD));
+    let (min_h, max_h) = (has(MIN_HEIGHT_KEYWORD), has(MAX_HEIGHT_KEYWORD));
+    if !(min_w || max_w || min_h || max_h) {
+        return Some((width, height));
+    }
+    if min_w || max_w {
+        let mut auto = style.clone();
+        auto.width = Dimension::Auto;
+        override_replaced_axis(&mut auto, true);
+        let content = replaced_size(kind, &auto, space)?.0;
+        let limited = limit_by_content(width, content, min_w, max_w);
+        if (limited - width).abs() > 1.0 / 128.0 && style.height == Dimension::Auto {
+            // The height would follow the new width through the ratio.
+            return super::bail("replaced:width-keyword");
+        }
+        width = limited;
+    }
+    if !(min_h || max_h) {
+        return Some((width, height));
+    }
+    let mut auto = style.clone();
+    auto.height = Dimension::Auto;
+    override_replaced_axis(&mut auto, false);
+    let content = replaced_size(kind, &auto, space)?.1;
+    Some((width, limit_by_content(height, content, min_h, max_h)))
+}
+
+/// `size` limited by intrinsic min / max keywords that both resolve to
+/// `content` (max first, then min).
+fn limit_by_content(size: f32, content: f32, min: bool, max: bool) -> f32 {
+    let size = if max { size.min(content) } else { size };
+    if min { size.max(content) } else { size }
+}
+
 const SVG_WIDTH_MARKER: &str = "--w3cos-internal-svg-width";
 const SVG_HEIGHT_MARKER: &str = "--w3cos-internal-svg-height";
 /// The DOM's used width / height of an svg whose own attribute did not
@@ -3523,7 +3569,7 @@ fn layout_block_in(
                 definite.max_width = Dimension::Auto;
                 (width, replaced_size(info.kind, &definite, space)?.1)
             }
-            None => replaced_size(info.kind, style, space)?,
+            None => replaced_size_with_keyword_limits(info.kind, style, space)?,
         })
     } else {
         None

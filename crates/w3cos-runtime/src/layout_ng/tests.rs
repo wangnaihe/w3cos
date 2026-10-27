@@ -6385,3 +6385,38 @@ fn abspos_size_limited_by_intrinsic_min_max_keywords() {
         assert_eq!(rect(&ng, index).3, 100.0, "{label} height");
     }
 }
+
+/// A replaced box's intrinsic min/max keywords resolve to the size it has
+/// with that axis auto, here a 10x10 canvas's other axis through its
+/// ratio (css-sizing replaced-max-height-min-content,
+/// replaced-min-width-min-content).
+#[test]
+fn replaced_size_limited_by_intrinsic_min_max_keywords() {
+    let canvas = |width: f32, height: f32, key: &str| {
+        Component::canvas(
+            10,
+            10,
+            with_markers(
+                Style {
+                    display: Display::Block,
+                    width: Dimension::Px(width),
+                    height: Dimension::Px(height),
+                    ..Style::default()
+                },
+                &[(key, "min-content")],
+            ),
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            canvas(100.0, 1000.0, "--w3cos-internal-max-height-keyword"),
+            canvas(10.0, 100.0, "--w3cos-internal-min-width-keyword"),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "max-height");
+    assert_eq!(rect(&ng, 2), (0.0, 100.0, 100.0, 100.0), "min-width");
+}
