@@ -241,6 +241,59 @@ impl Kind {
     }
 }
 
+/// Storage addresses are aligned pointers: a multiplicative hash spreads
+/// them without SipHash's cost on the hot `is_typed_array` path.
+#[derive(Default, Clone, Copy)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 =
+                (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type ViewIndexBuild = std::hash::BuildHasherDefault<AddressHasher>;
+
+fn storage_address(storage: &crate::value::JsArrayRef) -> usize {
+    std::ptr::from_ref::<RefCell<crate::value::ArrayStorage>>(storage) as usize
+}
+
+/// Index in `views` of the live view whose storage is `candidate`.
+fn view_index(views: &[View], candidate: &crate::value::JsArrayRef) -> Option<usize> {
+    let index =
+        VIEW_INDEX.with(|index| index.borrow().get(&storage_address(candidate)).copied())?;
+    let view = views.get(index)?;
+    view.storage
+        .upgrade()
+        .is_some_and(|storage| storage.ptr_eq(candidate))
+        .then_some(index)
+}
+
+/// Drop collected views and rebuild `VIEW_INDEX` for the survivors.
+fn sweep_views(views: &mut Vec<View>) {
+    views.retain(|view| view.storage.upgrade().is_some());
+    VIEW_INDEX.with(|index| {
+        let mut index = index.borrow_mut();
+        index.clear();
+        for (position, view) in views.iter().enumerate() {
+            if let Some(storage) = view.storage.upgrade() {
+                index.insert(storage_address(&storage), position);
+            }
+        }
+    });
+}
+
 struct View {
     storage: WeakJsArray,
     buffer: Value,
@@ -261,6 +314,12 @@ thread_local! {
     /// `BUFFERS` size that triggers the next sweep of dead entries.
     static BUFFER_SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
     static VIEWS: RefCell<Vec<View>> = const { RefCell::new(Vec::new()) };
+    /// Storage address -> index in `VIEWS`. `is_typed_array` runs on every
+    /// array method call, so scanning `VIEWS` made each `push`/`slice` on
+    /// any array O(live typed arrays). A stale entry (address reused after
+    /// its view was collected) is rejected by the `ptr_eq` check.
+    static VIEW_INDEX: RefCell<HashMap<usize, usize, ViewIndexBuild>> =
+        RefCell::new(HashMap::default());
     /// `VIEWS` length that triggers the next sweep of collected views:
     /// twice the live count after the previous sweep, so dead views never
     /// outnumber live ones (plus a small floor) and sweeping stays O(1)
@@ -868,25 +927,21 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
     // Collected views are swept in `new_view`; lookups stay read-only.
     VIEWS.with(|views| {
         let views = views.borrow();
-        views.iter().rev().find_map(|view| {
-            let storage = view.storage.upgrade()?;
-            storage.ptr_eq(&candidate).then(|| {
-                (
-                    view.bytes.clone(),
-                    view.offset,
-                    view.length,
-                    view.kind,
-                    view.buffer.clone(),
-                )
-            })
-        })
+        let view = &views[view_index(&views, &candidate)?];
+        Some((
+            view.bytes.clone(),
+            view.offset,
+            view.length,
+            view.kind,
+            view.buffer.clone(),
+        ))
     })
 }
 
 fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
+        sweep_views(&mut views);
         let bytes = changed.borrow();
         for view in views.iter() {
             if !Rc::ptr_eq(&view.bytes, changed) {
@@ -993,10 +1048,15 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
         // so drop collected views here once the list doubles past its
         // last live size (amortized O(1), dead views bounded by live ones).
         if views.len() >= VIEW_SWEEP_AT.with(|at| at.get()) {
-            views.retain(|view| view.storage.upgrade().is_some());
+            sweep_views(&mut views);
             let next = (views.len() * 2).max(64);
             VIEW_SWEEP_AT.with(|at| at.set(next));
         }
+        VIEW_INDEX.with(|index| {
+            index
+                .borrow_mut()
+                .insert(storage_address(&storage), views.len());
+        });
         views.push(View {
             storage: storage.downgrade(),
             buffer,
@@ -1114,14 +1174,8 @@ pub fn typed_array_prototype(value: &Value) -> Option<Value> {
     }
     let candidate = value.as_array()?;
     VIEWS.with(|views| {
-        views.borrow().iter().find_map(|view| {
-            let storage = view.storage.upgrade()?;
-            if storage.ptr_eq(&candidate) {
-                view.prototype.clone()
-            } else {
-                None
-            }
-        })
+        let views = views.borrow();
+        views[view_index(&views, &candidate)?].prototype.clone()
     })
 }
 
@@ -1133,21 +1187,16 @@ pub fn set_typed_array_prototype(value: &Value, prototype: &Value) -> bool {
     };
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        for view in views.iter_mut() {
-            if view
-                .storage
-                .upgrade()
-                .is_some_and(|storage| storage.ptr_eq(&candidate))
-            {
-                view.prototype =
-                    (prototype.is_object() || prototype.is_function()).then(|| prototype.clone());
-                if view.prototype.is_some() {
-                    ANY_VIEW_PROTOTYPE.with(|flag| flag.set(true));
-                }
-                return true;
-            }
+        let Some(index) = view_index(&views, &candidate) else {
+            return false;
+        };
+        let view = &mut views[index];
+        view.prototype =
+            (prototype.is_object() || prototype.is_function()).then(|| prototype.clone());
+        if view.prototype.is_some() {
+            ANY_VIEW_PROTOTYPE.with(|flag| flag.set(true));
         }
-        false
+        true
     })
 }
 
@@ -2022,6 +2071,39 @@ mod tests {
             bytes.upgrade().is_none(),
             "TypedArray bytes outlived the view"
         );
+    }
+
+    #[test]
+    fn view_lookups_stay_exact_across_sweeps() {
+        let kept: Vec<Value> = (0..200)
+            .map(|index| {
+                let class = if index % 2 == 0 {
+                    "Uint8Array"
+                } else {
+                    "Float64Array"
+                };
+                crate::class::construct(&typed_array_class(class), vec![Value::Number(4.0)])
+            })
+            .collect();
+        for _ in 0..5_000 {
+            drop(kept[0].call_method("subarray", vec![Value::Number(1.0)]));
+        }
+        let plain = Value::array(vec![Value::Number(1.0)]);
+        assert!(!is_typed_array(&plain));
+        for (index, view) in kept.iter().enumerate() {
+            let expected = if index % 2 == 0 {
+                "Uint8Array"
+            } else {
+                "Float64Array"
+            };
+            assert_eq!(typed_array_name(view), Some(expected), "view {index}");
+        }
+        let prototype = Value::object(HashMap::new());
+        prototype.set_property("marker", Value::Number(7.0));
+        assert!(set_typed_array_prototype(&kept[150], &prototype));
+        assert!(!set_typed_array_prototype(&plain, &prototype));
+        assert!(typed_array_prototype(&kept[150]).is_some());
+        assert!(typed_array_prototype(&kept[151]).is_none());
     }
 
     #[test]
