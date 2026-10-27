@@ -257,6 +257,11 @@ thread_local! {
     static NEXT_BUFFER_ID: RefCell<u64> = const { RefCell::new(1) };
     static BUFFERS: RefCell<HashMap<u64, Rc<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
     static VIEWS: RefCell<Vec<View>> = const { RefCell::new(Vec::new()) };
+    /// `VIEWS` length that triggers the next sweep of collected views:
+    /// twice the live count after the previous sweep, so dead views never
+    /// outnumber live ones (plus a small floor) and sweeping stays O(1)
+    /// amortized.
+    static VIEW_SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
     /// Set once any typed array gets a custom prototype: array property
     /// reads skip the view lookup until then.
     static ANY_VIEW_PROTOTYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -941,9 +946,12 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         // Element writes refresh aliasing views without sweeping the list,
-        // so drop collected views here at doubling sizes (amortized O(1)).
-        if views.len() >= 64 && views.len().is_power_of_two() {
+        // so drop collected views here once the list doubles past its
+        // last live size (amortized O(1), dead views bounded by live ones).
+        if views.len() >= VIEW_SWEEP_AT.with(|at| at.get()) {
             views.retain(|view| view.storage.upgrade().is_some());
+            let next = (views.len() * 2).max(64);
+            VIEW_SWEEP_AT.with(|at| at.set(next));
         }
         views.push(View {
             storage: storage.downgrade(),
@@ -1939,6 +1947,25 @@ mod tests {
             alias.get_property(&(size - 1).to_string()).to_number(),
             ((size - 1) % 251) as f64
         );
+    }
+
+    #[test]
+    fn collected_views_are_swept_so_dead_views_stay_bounded() {
+        let keep =
+            crate::class::construct(&typed_array_class("Uint8Array"), vec![Value::Number(16.0)]);
+        for _ in 0..10_000 {
+            let transient = keep.call_method("subarray", vec![Value::Number(1.0)]);
+            drop(transient);
+        }
+        let (total, live) = VIEWS.with(|views| {
+            let views = views.borrow();
+            let live = views
+                .iter()
+                .filter(|view| view.storage.upgrade().is_some())
+                .count();
+            (views.len(), live)
+        });
+        assert!(total <= live * 2 + 64, "{total} views tracked, {live} live");
     }
 
     #[test]
