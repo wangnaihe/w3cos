@@ -158,52 +158,81 @@ pub(super) fn layout_out_of_flow(
         BoxSizing::BorderBox => (v - edges_h).max(0.0),
         BoxSizing::ContentBox => v,
     };
-    let width = match length(style.width, w, style, &space).map(content_w) {
-        Some(v) => clamp_inline_size(style, &space, edges_h, v),
-        None => match (left, right) {
-            (Some(l), Some(r)) => clamp_inline_size(
-                style,
-                &space,
-                edges_h,
-                (w - l - r - ml.unwrap_or(0.0) - mr.unwrap_or(0.0) - edges_h).max(0.0),
-            ),
-            _ => {
-                // Shrink-to-fit (CSS2 10.3.7 cases 1, 3).
-                let available = w
-                    - left.unwrap_or(0.0)
-                    - right.unwrap_or(0.0)
-                    - ml.unwrap_or(0.0)
-                    - mr.unwrap_or(0.0)
-                    - edges_h;
-                // A block size that does not depend on the inline size
-                // (specified, or stretched between both insets, CSS2
-                // 10.6.4) is definite for the content (CSS Flexbox §9.8).
-                let content_h = |v: f32| match style.box_sizing {
-                    BoxSizing::BorderBox => (v - edges_v).max(0.0),
-                    BoxSizing::ContentBox => v,
-                };
-                let block = length(style.height, h, style, &space)
-                    .map(content_h)
-                    .or_else(|| {
-                        if content_height_keyword(style) {
-                            return None;
-                        }
-                        let top = length(style.top, h, style, &space)?;
-                        let bottom = length(style.bottom, h, style, &space)?;
-                        Some(
-                            (h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v)
-                                .max(0.0),
-                        )
-                    });
-                let sizes = intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
-                let fit = match sizes.min {
-                    Some(min) => sizes.max.min(available.max(min)),
-                    None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
-                    None => return super::bail("oof-shrink-min"),
-                };
-                clamp_inline_size(style, &space, edges_h, fit.max(0.0))
+    // A block size that does not depend on the inline size
+    // (specified, or stretched between both insets, CSS2
+    // 10.6.4) is definite for the content (CSS Flexbox §9.8).
+    let content_h = |v: f32| match style.box_sizing {
+        BoxSizing::BorderBox => (v - edges_v).max(0.0),
+        BoxSizing::ContentBox => v,
+    };
+    let block = length(style.height, h, style, &space)
+        .map(content_h)
+        .or_else(|| {
+            if content_height_keyword(style) {
+                return None;
             }
-        },
+            let top = length(style.top, h, style, &space)?;
+            let bottom = length(style.bottom, h, style, &space)?;
+            Some((h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0))
+        });
+    // An intrinsic `width` keyword (css-sizing-3) is the box's own
+    // min/max-content size, or for fit-content the available size clamped
+    // between them, whatever its insets.
+    let width_keyword = super::block::marker(style, super::block::WIDTH_KEYWORD).filter(|_| {
+        style.width == Dimension::Auto
+            && !super::block::is_replaced(flat[index].kind)
+            && !super::block::size_contained(style)
+    });
+    let width = if let Some(keyword) = width_keyword {
+        let available = w
+            - left.unwrap_or(0.0)
+            - right.unwrap_or(0.0)
+            - ml.unwrap_or(0.0)
+            - mr.unwrap_or(0.0)
+            - edges_h;
+        let sizes = intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
+        let min = sizes.min.or_else(|| super::bail("oof-width-keyword-min"))?;
+        let content = super::block::keyword_content_size(
+            keyword,
+            min,
+            sizes.max,
+            Some(available.max(0.0)),
+            Some(w),
+            style,
+            &space,
+            edges_h,
+        )
+        .why("oof-width-keyword")?;
+        clamp_inline_size(style, &space, edges_h, content.max(0.0))
+    } else {
+        match length(style.width, w, style, &space).map(content_w) {
+            Some(v) => clamp_inline_size(style, &space, edges_h, v),
+            None => match (left, right) {
+                (Some(l), Some(r)) => clamp_inline_size(
+                    style,
+                    &space,
+                    edges_h,
+                    (w - l - r - ml.unwrap_or(0.0) - mr.unwrap_or(0.0) - edges_h).max(0.0),
+                ),
+                _ => {
+                    // Shrink-to-fit (CSS2 10.3.7 cases 1, 3).
+                    let available = w
+                        - left.unwrap_or(0.0)
+                        - right.unwrap_or(0.0)
+                        - ml.unwrap_or(0.0)
+                        - mr.unwrap_or(0.0)
+                        - edges_h;
+                    let sizes =
+                        intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
+                    let fit = match sizes.min {
+                        Some(min) => sizes.max.min(available.max(min)),
+                        None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
+                        None => return super::bail("oof-shrink-min"),
+                    };
+                    clamp_inline_size(style, &space, edges_h, fit.max(0.0))
+                }
+            },
+        }
     };
     // Intrinsic min-width / max-width keywords (css-sizing-3).
     let available = w

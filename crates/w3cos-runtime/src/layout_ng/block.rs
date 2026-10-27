@@ -56,6 +56,22 @@ pub(super) const MIN_WIDTH_KEYWORD: &str = "--w3cos-internal-min-width-keyword";
 pub(super) const MIN_HEIGHT_KEYWORD: &str = "--w3cos-internal-min-height-keyword";
 pub(super) const MAX_HEIGHT_KEYWORD: &str = "--w3cos-internal-max-height-keyword";
 pub(super) const MAX_WIDTH_KEYWORD: &str = "--w3cos-internal-max-width-keyword";
+const COMPUTED_HEIGHT_PERCENT: &str = "--w3cos-internal-computed-height-percent";
+
+/// The `height` to size a box with. DOM lowering turns a percentage height
+/// under an auto-height block parent into `auto` (an indefinite basis,
+/// CSS 2.1 10.5) and keeps the percentage in a marker. When the parent's
+/// block size is definite after all (stretched between its insets, a
+/// stretched flex item, an aspect ratio), the percentage resolves against
+/// it, as in Chrome (css-sizing intrinsic-percent-replaced-005).
+pub(super) fn used_height(style: &Style, space: &ConstraintSpace) -> Dimension {
+    if style.height == Dimension::Auto && space.percentage_block.is_some() {
+        if let Some(value) = marker(style, COMPUTED_HEIGHT_PERCENT).and_then(|v| v.parse().ok()) {
+            return Dimension::Percent(value);
+        }
+    }
+    style.height
+}
 
 pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
@@ -1333,7 +1349,7 @@ fn canvas_content_size(
     };
     let mut definite = style.clone();
     definite.width = sub(style.width, Some(space.available_inline))?;
-    definite.height = sub(style.height, space.percentage_block)?;
+    definite.height = sub(used_height(style, space), space.percentage_block)?;
     definite.min_width = sub(style.min_width, Some(space.available_inline))?;
     definite.max_width = sub(style.max_width, Some(space.available_inline))?;
     definite.min_height = sub(style.min_height, space.percentage_block)?;
@@ -1544,7 +1560,7 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
         }
     };
     definite.width = sub(style.width, Some(space.available_inline))?;
-    definite.height = sub(style.height, space.percentage_block)?;
+    definite.height = sub(used_height(style, space), space.percentage_block)?;
     // Every min/max length (em, rem, ch, %, vw, vh) resolves here.
     let limit = |dim: Dimension, basis: Option<f32>| -> Option<Option<f32>> {
         match dim {
@@ -1988,7 +2004,7 @@ fn svg_content_size(source: &str, style: &Style, space: &ConstraintSpace) -> Opt
         space,
     );
     let height = resolve_dim(
-        svg_specified(style, false).map_or(style.height, |_| sizing.height),
+        svg_specified(style, false).map_or(used_height(style, space), |_| sizing.height),
         space.percentage_block,
         style,
         space,
@@ -2494,6 +2510,56 @@ fn percent_inline(style: &Style) -> bool {
         || spacing(style.padding.right)
 }
 
+/// The content-box min/max-content contribution of a block-level replaced
+/// child (image, canvas or SVG root) whose only inline percentages are its
+/// `width` and/or `max-width`: a compressible replaced element
+/// (css-sizing-3) resolves them against zero for its min-content
+/// contribution, and treats them as `auto` / `none` for its max-content
+/// contribution, which is then its natural size. `Some(None)` when the rule
+/// does not apply; `None` is a bail.
+fn compressible_replaced_content(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    space: &ConstraintSpace,
+) -> Option<Option<MinMax>> {
+    let style = flat[child].style;
+    let pct = |d: Dimension| matches!(d, Dimension::Percent(_));
+    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+    let applies = is_replaced(flat[child].kind)
+        && (pct(style.width) || pct(style.max_width))
+        && !pct(style.min_width)
+        && !spacing(style.margin.left)
+        && !spacing(style.margin.right)
+        && !spacing(style.padding.left)
+        && !spacing(style.padding.right)
+        && marker(style, WIDTH_KEYWORD).is_none()
+        && marker(style, MIN_WIDTH_KEYWORD).is_none()
+        && marker(style, MAX_WIDTH_KEYWORD).is_none();
+    if !applies {
+        return Some(None);
+    }
+    let mut auto = style.clone();
+    if pct(auto.width) {
+        auto.width = Dimension::Auto;
+    }
+    if pct(auto.max_width) {
+        auto.max_width = Dimension::Auto;
+    }
+    let (natural, _) = match flat[child].kind {
+        ComponentKind::Image { src } => replaced_content_size(src, &auto, space),
+        ComponentKind::Canvas { width, height } => {
+            canvas_content_size(*width, *height, &auto, space)
+        }
+        ComponentKind::SvgDocument { source, .. } => svg_content_size(source, &auto, space),
+        _ => return Some(None),
+    }
+    .why("compressible-replaced")?;
+    Some(Some(MinMax {
+        min: Some(0.0),
+        max: natural,
+    }))
+}
+
 /// [`percent_inline`] for the box `node` generates. Text has no box of its
 /// own (its style carries the runtime's leaf width, which never applies),
 /// and width, min-width and max-width do not apply to a non-replaced
@@ -2722,9 +2788,11 @@ pub(super) fn intrinsic_sizes_at(
     // BlockNode::ComputeMinMaxSizes passes its children the percentage
     // resolution block size of this box (Blink
     // CalculateChildPercentageBlockSizeForMinMax): its definite content
-    // height, or none. Anonymous blocks are skipped (CSS 2.1 10.5).
+    // height, or none. Anonymous blocks are skipped (CSS 2.1 10.5). A
+    // block size the caller already knows (an out-of-flow box's specified
+    // or inset-stretched height) is that definite content height.
     let child_space = ConstraintSpace {
-        percentage_block: child_percentage_block(info.style, space),
+        percentage_block: block.or_else(|| child_percentage_block(info.style, space)),
         ..*space
     };
     let space = &child_space;
@@ -2776,7 +2844,8 @@ pub(super) fn intrinsic_sizes_at(
             flat[child].kind,
             ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
         ) && !matches!(style.display, Display::Table | Display::InlineTable);
-        if !plain && box_percent_inline(flat, child) {
+        let compressible = compressible_replaced_content(flat, child, space)?;
+        if !plain && compressible.is_none() && box_percent_inline(flat, child) {
             return super::bail(
                 if matches!(style.display, Display::Table | Display::InlineTable) {
                     "intrinsic-percent:table"
@@ -2796,22 +2865,26 @@ pub(super) fn intrinsic_sizes_at(
         let b = border(style);
         let edges = b[1] + b[3] + side(style.padding.left) + side(style.padding.right);
         let (margin_left, margin_right) = (side(style.margin.left), side(style.margin.right));
-        let content = match resolve_dim(style.width, None, style, space) {
-            Some(w) => MinMax::exact(match style.box_sizing {
-                BoxSizing::BorderBox => (w - edges).max(0.0),
-                BoxSizing::ContentBox => w,
-            }),
-            None => {
-                let sizes = intrinsic_sizes(flat, child, space).why("intrinsic")?;
-                // An aspect-ratio box with a definite height contributes
-                // its transferred width (aspect-ratio/intrinsic-size-001).
-                let block_edges =
-                    b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
-                match ratio_inline_contribution(flat, child, space, edges, block_edges, sizes)? {
-                    Some(inline) => MinMax::exact(inline),
-                    None => keyword_width_contribution(flat, child, space, edges, sizes)?,
+        let content = match compressible {
+            Some(content) => content,
+            None => match resolve_dim(style.width, None, style, space) {
+                Some(w) => MinMax::exact(match style.box_sizing {
+                    BoxSizing::BorderBox => (w - edges).max(0.0),
+                    BoxSizing::ContentBox => w,
+                }),
+                None => {
+                    let sizes = intrinsic_sizes(flat, child, space).why("intrinsic")?;
+                    // An aspect-ratio box with a definite height contributes
+                    // its transferred width (aspect-ratio/intrinsic-size-001).
+                    let block_edges =
+                        b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
+                    match ratio_inline_contribution(flat, child, space, edges, block_edges, sizes)?
+                    {
+                        Some(inline) => MinMax::exact(inline),
+                        None => keyword_width_contribution(flat, child, space, edges, sizes)?,
+                    }
                 }
-            }
+            },
         };
         let limits = keyword_contribution_limits(flat, child, space, edges)?;
         let border_box = apply_contribution_limits(content, limits, |w| {
@@ -2885,7 +2958,7 @@ fn child_percentage_block(style: &Style, space: &ConstraintSpace) -> Option<f32>
     let content = |dim: Dimension| {
         resolve_dim(dim, space.percentage_block, style, space).map(|h| (h - edges).max(0.0))
     };
-    let mut height = content(style.height)?;
+    let mut height = content(used_height(style, space))?;
     if let Some(max) = content(style.max_height) {
         height = height.min(max);
     }
@@ -3711,7 +3784,13 @@ fn layout_block_in(
     let specified_height = match (sized, image_size) {
         (Some((_, Some(height))), _) => Some(height),
         (_, Some((_, height))) => Some(height),
-        _ => resolve_dim(style.height, space.percentage_block, style, space).map(to_content_h),
+        _ => resolve_dim(
+            used_height(style, space),
+            space.percentage_block,
+            style,
+            space,
+        )
+        .map(to_content_h),
     };
     // DOM lowering gives an authored IFC block `min-height: font-size *
     // line-height` so its flex-row form keeps the initial strut.  The NG

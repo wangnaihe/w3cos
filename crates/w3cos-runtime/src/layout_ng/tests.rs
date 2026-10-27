@@ -6561,3 +6561,82 @@ fn max_width_keyword_uses_aspect_ratio_size() {
     assert_eq!(rect(&ng, 1).2, 500.0, "wrapper");
     assert_eq!(rect(&ng, 2), (0.0, 0.0, 500.0, 500.0), "item");
 }
+
+/// A block canvas with `width: 100%` is a compressible replaced element:
+/// its min-content contribution is zero and its max-content contribution
+/// its natural width, so a shrink-to-fit abspos box stays on NG
+/// (css-sizing keyword-sizes-on-abspos).
+#[test]
+fn abspos_shrink_to_fit_around_percent_width_canvas() {
+    use w3cos_std::style::Position;
+    let canvas = Style {
+        width: Dimension::Percent(100.0),
+        ..block()
+    };
+    let holder = |abs: Style| {
+        node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(1000.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![node(abs, vec![Component::canvas(300, 150, canvas.clone())])],
+        )
+    };
+    let abs = Style {
+        position: Position::Absolute,
+        left: Dimension::Px(0.0),
+        ..block()
+    };
+    let min = with_markers(
+        abs.clone(),
+        &[("--w3cos-internal-width-keyword", "min-content")],
+    );
+    let root = node(block(), vec![holder(abs), holder(min)]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 1200.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 300.0, "fit-content abspos");
+    assert_eq!(rect(&ng, 3).2, 300.0, "canvas fills it");
+    assert_eq!(rect(&ng, 5).2, 0.0, "min-content abspos");
+    assert_eq!(rect(&ng, 6).2, 0.0, "canvas compresses");
+}
+
+/// A canvas whose `height: 100%` was lowered to the computed-percent marker
+/// resolves it against an inset-stretched abspos height, both in layout and
+/// in the abspos box's shrink-to-fit width (intrinsic-percent-replaced-005).
+#[test]
+fn abspos_stretched_height_is_percentage_basis_for_intrinsic_width() {
+    use w3cos_std::style::Position;
+    let canvas = with_markers(
+        block(),
+        &[("--w3cos-internal-computed-height-percent", "100")],
+    );
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(500.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    position: Position::Absolute,
+                    left: Dimension::Px(0.0),
+                    top: Dimension::Px(0.0),
+                    bottom: Dimension::Px(0.0),
+                    ..block()
+                },
+                vec![Component::canvas(300, 150, canvas)],
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 200.0, 100.0), "abspos");
+    assert_eq!(rect(&ng, 3), (0.0, 0.0, 200.0, 100.0), "canvas");
+}
