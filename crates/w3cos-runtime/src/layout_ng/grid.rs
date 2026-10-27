@@ -3746,6 +3746,7 @@ pub(super) fn layout(
             width: border_width,
             height: border_height,
             text_range: None,
+            ellipsis: false,
             children,
         },
         last_baseline: LastBaseline::NoLines,

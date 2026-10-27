@@ -33,6 +33,9 @@ web-device-access = ["dep:hidapi", "dep:nusb"]
 # NotReadableError instead of inventing samples. Host injection still works
 # when the feature is off, and in unit tests unless W3COS_SENSOR_DEVICE_TESTS=1.
 web-sensors = []
+# Compiles the W3COS_LAYOUT_NG_TRACE fallback accounting (the WPT runner and
+# unit tests); other builds omit it and its reason strings.
+layout-ng-trace = []
 # Desktop `navigator.geolocation` on a dedicated thread. Linux uses GeoClue2
 # through zbus (no extra system libraries). macOS uses CoreLocation and Windows
 # uses Windows.Devices.Geolocation. iOS, Android, and OHOS stay unavailable.

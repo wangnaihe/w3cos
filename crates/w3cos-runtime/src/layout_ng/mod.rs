@@ -57,9 +57,20 @@ pub(crate) fn mode() -> Mode {
 
 /// `W3COS_LAYOUT_NG_TRACE=1`: log whether each compute used NG or fell back
 /// (coverage accounting for the WPT gate).
+///
+/// Compiled only with the `layout-ng-trace` feature (the WPT runner enables
+/// it) and in unit tests; other builds drop the trace code and the fallback
+/// reason strings.
+#[cfg(any(test, feature = "layout-ng-trace"))]
 fn trace() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| std::env::var_os("W3COS_LAYOUT_NG_TRACE").is_some_and(|v| v != "0"))
+}
+
+#[cfg(not(any(test, feature = "layout-ng-trace")))]
+#[inline(always)]
+fn trace() -> bool {
+    false
 }
 
 /// NGConstraintSpace: the input of every layout algorithm.
@@ -131,6 +142,9 @@ pub(crate) struct BoxFragment {
     /// A text fragment covering part of its leaf's text: the byte range
     /// (NGPhysicalTextFragment start/end offsets).  `None` is a whole node.
     pub text_range: Option<(usize, usize)>,
+    /// The piece ends a `-webkit-line-clamp` box: paint draws its text with
+    /// a block ellipsis (U+2026) after it, trailing breaks removed.
+    pub ellipsis: bool,
     /// Children with their border-box offset from this border box.
     pub children: Vec<(f32, f32, BoxFragment)>,
 }
@@ -184,6 +198,7 @@ pub(crate) struct LayoutResult {
     pub float_overlap: bool,
 }
 
+#[cfg(any(test, feature = "layout-ng-trace"))]
 thread_local! {
     /// Why the last layout pass gave up at runtime (trace accounting).
     static RUNTIME_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
@@ -191,9 +206,13 @@ thread_local! {
 
 /// A runtime fallback with its reason, reported by
 /// `W3COS_LAYOUT_NG_TRACE` as `fallback runtime:<reason>`.
-#[cold]
+#[cfg_attr(any(test, feature = "layout-ng-trace"), cold)]
+#[cfg_attr(not(any(test, feature = "layout-ng-trace")), inline(always))]
 pub(crate) fn bail<T>(reason: &'static str) -> Option<T> {
+    #[cfg(any(test, feature = "layout-ng-trace"))]
     RUNTIME_REASON.with(|r| r.set(reason));
+    #[cfg(not(any(test, feature = "layout-ng-trace")))]
+    let _ = reason;
     None
 }
 
@@ -213,13 +232,17 @@ impl<T> Why for Option<T> {
     }
 }
 
-#[cold]
+#[cfg_attr(any(test, feature = "layout-ng-trace"), cold)]
+#[cfg_attr(not(any(test, feature = "layout-ng-trace")), inline(always))]
 fn note(reason: &'static str) {
+    #[cfg(any(test, feature = "layout-ng-trace"))]
     RUNTIME_REASON.with(|r| {
         if r.get().is_empty() {
             r.set(reason);
         }
     });
+    #[cfg(not(any(test, feature = "layout-ng-trace")))]
+    let _ = reason;
 }
 
 /// One line-box piece of a text node broken inside its content, like
@@ -296,7 +319,7 @@ fn layout_flat_with_text(
             ),
         }
     }
-    if std::env::var_os("W3COS_LAYOUT_NG_TRACE").is_some_and(|v| v == "2") {
+    if trace() && std::env::var_os("W3COS_LAYOUT_NG_TRACE").is_some_and(|v| v == "2") {
         // Tree dump for diagnosing pages whose scripts the unit probe cannot run.
         for (i, node) in flat.iter().enumerate() {
             let s = node.style;
@@ -328,8 +351,10 @@ fn layout_flat_with_text(
     if reason.is_some() {
         return None;
     }
+    #[cfg(any(test, feature = "layout-ng-trace"))]
     RUNTIME_REASON.with(|r| r.set(""));
     let Some((x, y, fragment)) = block::layout_root(flat, viewport_w, viewport_h) else {
+        #[cfg(any(test, feature = "layout-ng-trace"))]
         if trace() {
             let reason = RUNTIME_REASON.with(|r| r.get());
             let sep = if reason.is_empty() { "" } else { ":" };
@@ -424,10 +449,22 @@ fn flatten(
         height: fragment.height,
     };
     if let Some((start, end)) = fragment.text_range {
-        let text = match flat[fragment.index].kind {
+        let mut text = match flat[fragment.index].kind {
             w3cos_std::ComponentKind::Text { content } => content[start..end].to_string(),
             _ => String::new(),
         };
+        if fragment.ellipsis {
+            // (The line's collapsible trailing space goes before the ellipsis.)
+            let keep_spaces =
+                flat[fragment.index].style.white_space == w3cos_std::style::WhiteSpace::Pre;
+            text.truncate(
+                text.trim_end_matches(|c| {
+                    matches!(c, '\n' | '\u{2028}') || (c == ' ' && !keep_spaces)
+                })
+                .len(),
+            );
+            text.push('\u{2026}');
+        }
         texts.push(TextFragment {
             index: fragment.index,
             start,
