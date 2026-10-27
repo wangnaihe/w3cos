@@ -533,6 +533,14 @@ pub(super) fn container_min_max_at(
     };
     let mut sizes = MinMax::exact(0.0);
     let mut count = 0usize;
+    // CSS Flexbox §9.9.1: a row whose items carry a definite `flex-basis`
+    // sizes the container from the items' flex base sizes and factors.
+    let mut spec_items: Vec<SpecItem> = Vec::new();
+    let use_spec = row
+        && rendered_children(flat, index).any(|child| {
+            !oof::is_out_of_flow(flat[child].style)
+                && matches!(flat[child].style.flex_basis, Dimension::Px(_))
+        });
     for child in rendered_children(flat, index) {
         if oof::is_out_of_flow(flat[child].style) {
             continue;
@@ -557,11 +565,21 @@ pub(super) fn container_min_max_at(
             sizes.encompass(item);
             continue;
         }
+        if use_spec {
+            spec_items.push(spec_item(flat, child, space, item, stretched.is_some())?);
+        }
         sizes.max += item.max;
         sizes.min = sizes
             .min
             .zip(item.min)
             .map(|(a, b)| if multiline { a.max(b) } else { a + b });
+    }
+    if use_spec {
+        let max_sum = spec_line_sum(&spec_items, false);
+        sizes.max = max_sum;
+        if !multiline {
+            sizes.min = Some(spec_line_sum(&spec_items, true));
+        }
     }
     if row && count > 1 {
         let gaps = style.column_gap.unwrap_or(style.gap).max(0.0) * (count - 1) as f32;
@@ -580,6 +598,116 @@ pub(super) fn container_min_max_at(
         sizes.max = column_wrap_max_content(flat, index, space, main)?.max(sizes.max);
     }
     Some(sizes)
+}
+
+/// One flex item as the intrinsic main size algorithm reads it (CSS
+/// Flexbox §9.9.1). Sizes are outer (margin box) except `base`, `min`,
+/// and `max`, which are content-box and share `outer_extra` with them.
+struct SpecItem {
+    min_contribution: f32,
+    max_contribution: f32,
+    base: f32,
+    min: f32,
+    max: f32,
+    outer_extra: f32,
+    grow: f32,
+    shrink: f32,
+}
+
+fn spec_item(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    space: &ConstraintSpace,
+    contribution: MinMax,
+    fixed: bool,
+) -> Option<SpecItem> {
+    let style = flat[child].style;
+    let edges = item_edges(style, space, 0.0, true);
+    let margin = spacing_px(style, style.margin.left, 0.0, space)
+        + spacing_px(style, style.margin.right, 0.0, space);
+    let outer_extra = edges + margin;
+    let max_contribution = contribution.max;
+    let min_contribution = contribution.min.unwrap_or(max_contribution);
+    if fixed {
+        // A stretched replaced item's size is already its final one.
+        let content = (max_contribution - outer_extra).max(0.0);
+        return Some(SpecItem {
+            min_contribution,
+            max_contribution,
+            base: content,
+            min: content,
+            max: content,
+            outer_extra,
+            grow: 0.0,
+            shrink: 0.0,
+        });
+    }
+    let base = flex_base(style, true, edges, None, space, flat, child, None)?;
+    let (min, max) = resolve_main_limits(style, true, edges, None, space, flat, child)?;
+    Some(SpecItem {
+        min_contribution,
+        max_contribution,
+        base: base.max(0.0),
+        min,
+        max,
+        outer_extra,
+        grow: style.flex_grow.max(0.0),
+        shrink: style.flex_shrink.max(0.0),
+    })
+}
+
+/// The line's content-based size: each item takes its flex base size plus
+/// its factor times the line's chosen flex fraction, clamped by its min and
+/// max main sizes (Flexbox §9.9.1 steps 1-5). `min_content` reads the
+/// min-content contributions instead of the max-content ones.
+fn spec_line_sum(items: &[SpecItem], min_content: bool) -> f32 {
+    let contribution = |item: &SpecItem| {
+        if min_content {
+            item.min_contribution
+        } else {
+            item.max_contribution
+        }
+    };
+    let fraction = |item: &SpecItem| {
+        let diff = contribution(item) - (item.base + item.outer_extra);
+        if diff > 0.0 {
+            if item.grow >= 1.0 {
+                diff / item.grow
+            } else {
+                diff * item.grow
+            }
+        } else if diff < 0.0 {
+            let scaled = item.shrink * item.base;
+            if scaled == 0.0 {
+                f32::NEG_INFINITY
+            } else {
+                diff / scaled
+            }
+        } else {
+            0.0
+        }
+    };
+    let mut chosen = items.iter().map(fraction).fold(f32::NEG_INFINITY, f32::max);
+    let grow_sum: f32 = items.iter().map(|item| item.grow).sum();
+    let shrink_sum: f32 = items.iter().map(|item| item.shrink).sum();
+    if chosen > 0.0 && grow_sum < 1.0 && grow_sum > 0.0 {
+        chosen /= grow_sum;
+    } else if chosen < 0.0 && chosen.is_finite() && shrink_sum < 1.0 {
+        chosen *= shrink_sum;
+    }
+    items
+        .iter()
+        .map(|item| {
+            let factor = if chosen > 0.0 {
+                item.grow
+            } else {
+                item.shrink * item.base
+            };
+            let delta = if factor == 0.0 { 0.0 } else { factor * chosen };
+            let size = (item.base + delta).min(item.max).max(item.min);
+            size + item.outer_extra
+        })
+        .sum()
 }
 
 /// The max-content inline size of a column-wrap flex container whose

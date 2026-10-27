@@ -6695,6 +6695,58 @@ fn calc_percent_plus_px_sizes() {
     assert!((flexed - 50.1).abs() < 0.02, "flex item min-width {flexed}");
 }
 
+/// CSS Flexbox §9.9.1 (flex intrinsic-size row-002..004): a floated row
+/// container takes its items' flex base sizes when they cannot shrink (min-
+/// and max-content) or grow, whatever their contents contribute.
+#[test]
+fn floated_flex_row_uses_item_flex_base_sizes() {
+    use w3cos_std::style::{Display, Float};
+    let width_of = |grow: f32, shrink: f32, inner: Option<f32>, min_zero: bool| {
+        let mut item = Style {
+            flex_grow: grow,
+            flex_shrink: shrink,
+            flex_basis: Dimension::Px(100.0),
+            ..block()
+        };
+        if min_zero {
+            item.min_width = Dimension::Px(0.0);
+        }
+        let kids = inner
+            .map(|w| {
+                vec![node(
+                    Style {
+                        width: Dimension::Px(w),
+                        ..block()
+                    },
+                    vec![],
+                )]
+            })
+            .unwrap_or_default();
+        let flex = Style {
+            display: Display::Flex,
+            flex_direction: w3cos_std::style::FlexDirection::Row,
+            float: Float::Left,
+            height: Dimension::Px(100.0),
+            ..block()
+        };
+        let root = node(
+            Style {
+                width: Dimension::Px(0.0),
+                ..block()
+            },
+            vec![node(flex, vec![node(item, kids)])],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        rect(&ng, 1).2
+    };
+    // row-003: `flex: 1 0 100px`, empty, in a zero-width parent.
+    assert_eq!(width_of(1.0, 0.0, None, false), 100.0);
+    // row-004: `flex: 0 1 100px; min-width: 0` around a 200px child.
+    assert_eq!(width_of(0.0, 1.0, Some(200.0), true), 100.0);
+}
+
 /// A size-contained replaced box takes `contain-intrinsic-size` instead of
 /// its natural size or ratio, per auto axis (contain-intrinsic-size-012).
 #[test]
