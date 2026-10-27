@@ -29,6 +29,13 @@ pub const MIN_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-width-keyword
 /// width markers also carry `fit-content(<length-percentage>)`, serialized
 /// with its argument in a canonical unit (`fit-content(100px)`).
 pub const MAX_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-width-keyword";
+/// `min-height: min-content | max-content | fit-content`; `min_height`
+/// stays `Auto`. In a block container's block axis all of them are its
+/// content height (css-sizing-3); NG block layout reads the marker.
+pub const MIN_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-height-keyword";
+/// `max-height: min-content | max-content | fit-content`; `max_height`
+/// stays `Auto` (none).
+pub const MAX_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-height-keyword";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
@@ -816,10 +823,15 @@ impl CSSStyleDeclaration {
                 }
             }
             "min-height" | "minHeight" => {
-                if let Some(value) =
+                let keyword = value.trim().to_ascii_lowercase();
+                if is_intrinsic_size_keyword(&keyword) {
+                    self.inner.min_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.min_height = value;
+                    set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "max-width" | "maxWidth" => {
@@ -837,12 +849,18 @@ impl CSSStyleDeclaration {
                 }
             }
             "max-height" | "maxHeight" => {
-                if value.trim().eq_ignore_ascii_case("none") {
+                let keyword = value.trim().to_ascii_lowercase();
+                if is_intrinsic_size_keyword(&keyword) {
                     self.inner.max_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
+                } else if value.trim().eq_ignore_ascii_case("none") {
+                    self.inner.max_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
                 } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.max_height = value;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "aspect-ratio" | "aspectRatio" => {
@@ -6816,6 +6834,21 @@ mod tests {
         declaration.set_property("max-width", "30px");
         assert_eq!(declaration.inner.max_width, Dimension::Px(30.0));
         assert!(marker(&declaration, MAX_WIDTH_KEYWORD_PROPERTY).is_none());
+        declaration.set_property("min-height", "20px");
+        declaration.set_property("min-height", "Max-Content");
+        assert_eq!(declaration.inner.min_height, Dimension::Auto);
+        assert_eq!(
+            marker(&declaration, MIN_HEIGHT_KEYWORD_PROPERTY).as_deref(),
+            Some("max-content")
+        );
+        declaration.set_property("min-height", "10px");
+        assert_eq!(declaration.inner.min_height, Dimension::Px(10.0));
+        assert!(marker(&declaration, MIN_HEIGHT_KEYWORD_PROPERTY).is_none());
+        declaration.set_property("max-height", "min-content");
+        assert_eq!(declaration.inner.max_height, Dimension::Auto);
+        assert!(marker(&declaration, MAX_HEIGHT_KEYWORD_PROPERTY).is_some());
+        declaration.set_property("max-height", "none");
+        assert!(marker(&declaration, MAX_HEIGHT_KEYWORD_PROPERTY).is_none());
         declaration.set_property("word-break", "auto-phrase");
         assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_some());
         declaration.set_property("word-break", "normal");

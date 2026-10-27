@@ -202,6 +202,23 @@ pub(super) fn layout_out_of_flow(
             }
         },
     };
+    // Intrinsic min-width / max-width keywords (css-sizing-3).
+    let available = w
+        - left.unwrap_or(0.0)
+        - right.unwrap_or(0.0)
+        - ml.unwrap_or(0.0)
+        - mr.unwrap_or(0.0)
+        - edges_h;
+    let width = super::block::keyword_limited_inline(
+        flat,
+        index,
+        &space,
+        edges_h,
+        width,
+        available.max(0.0),
+        w,
+    )
+    .why("oof-width-keyword")?;
     let border_w = width + edges_h;
     let (margin_left, x) = match (left, right) {
         (Some(l), Some(r)) => {
@@ -256,14 +273,26 @@ pub(super) fn layout_out_of_flow(
         }
         _ => None,
     };
-    let result = layout_block_sized(
-        flat,
-        index,
-        &space,
-        true,
-        Some((width, specified_h.or(stretched))),
-    )
-    .why("oof-layout")?;
+    let mut fixed_h = specified_h.or(stretched);
+    // An intrinsic min-height / max-height keyword is the content height
+    // (css-sizing-3); a specified or stretched height is limited by it.
+    let min_keyword = super::block::marker(style, super::block::MIN_HEIGHT_KEYWORD).is_some();
+    let max_keyword = super::block::marker(style, super::block::MAX_HEIGHT_KEYWORD).is_some();
+    if let Some(fixed) = fixed_h.filter(|_| min_keyword || max_keyword) {
+        let auto =
+            layout_block_sized(flat, index, &space, true, Some((width, None))).why("oof-layout")?;
+        let content = (auto.fragment.height - edges_v).max(0.0);
+        let mut limited = fixed;
+        if max_keyword {
+            limited = limited.min(content);
+        }
+        if min_keyword {
+            limited = limited.max(content);
+        }
+        fixed_h = Some(limited);
+    }
+    let result =
+        layout_block_sized(flat, index, &space, true, Some((width, fixed_h))).why("oof-layout")?;
     let border_h = result.fragment.height;
     let y = match (top, bottom) {
         (Some(t), Some(bo)) => {

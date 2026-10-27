@@ -6290,3 +6290,98 @@ fn block_min_content_uses_aspect_ratio_with_definite_height() {
     assert_eq!(rect(&ng, 6).2, 100.0, "014 outer");
     assert_eq!(rect(&ng, 7).2, 100.0, "014 child");
 }
+
+/// `min-height: max-content` floors and `max-height: max-content` caps a
+/// block's specified height at its content height (css-sizing
+/// block-size-with-min-or-max-content-2, -3).
+#[test]
+fn block_height_limited_by_intrinsic_min_max_height_keywords() {
+    let tall = || {
+        node(
+            Style {
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let sized = |height: f32, key: &str| {
+        with_markers(
+            Style {
+                height: Dimension::Px(height),
+                ..block()
+            },
+            &[(key, "max-content")],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                sized(0.0, "--w3cos-internal-min-height-keyword"),
+                vec![tall()],
+            ),
+            node(
+                sized(200.0, "--w3cos-internal-max-height-keyword"),
+                vec![tall()],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).3, 100.0, "min-height floor");
+    assert_eq!(rect(&ng, 3).3, 100.0, "max-height cap");
+    assert_eq!(rect(&ng, 3).1, 100.0, "next block follows the capped one");
+}
+
+/// An absolutely positioned box's specified width and height are limited
+/// by intrinsic min/max-width and min/max-height keywords (css-sizing
+/// block-size-with-min-or-max-content-6, -7).
+#[test]
+fn abspos_size_limited_by_intrinsic_min_max_keywords() {
+    let square = || {
+        node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let abspos = |size: f32, prefix: &str| {
+        with_markers(
+            Style {
+                position: w3cos_std::style::Position::Absolute,
+                width: Dimension::Px(size),
+                height: Dimension::Px(size),
+                ..block()
+            },
+            &[
+                (
+                    &format!("--w3cos-internal-{prefix}-width-keyword"),
+                    "max-content",
+                ),
+                (
+                    &format!("--w3cos-internal-{prefix}-height-keyword"),
+                    "max-content",
+                ),
+            ],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            node(abspos(0.0, "min"), vec![square()]),
+            node(abspos(200.0, "max"), vec![square()]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    for (index, label) in [(1, "min"), (3, "max")] {
+        assert_eq!(rect(&ng, index).2, 100.0, "{label} width");
+        assert_eq!(rect(&ng, index).3, 100.0, "{label} height");
+    }
+}

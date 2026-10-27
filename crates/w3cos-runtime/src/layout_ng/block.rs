@@ -50,6 +50,11 @@ const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width is auto).
 pub(super) const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 pub(super) const MIN_WIDTH_KEYWORD: &str = "--w3cos-internal-min-width-keyword";
+/// `min-height` / `max-height` intrinsic keywords (the limit stays auto /
+/// none in the style). Block flow resolves them to the content height;
+/// other formatting contexts ignore them, as before the cascade kept them.
+pub(super) const MIN_HEIGHT_KEYWORD: &str = "--w3cos-internal-min-height-keyword";
+pub(super) const MAX_HEIGHT_KEYWORD: &str = "--w3cos-internal-max-height-keyword";
 pub(super) const MAX_WIDTH_KEYWORD: &str = "--w3cos-internal-max-width-keyword";
 
 pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
@@ -301,6 +306,8 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                     // auto / none, as before the cascade kept them.
                     && key != MIN_WIDTH_KEYWORD
                     && key != MAX_WIDTH_KEYWORD
+                    && key != MIN_HEIGHT_KEYWORD
+                    && key != MAX_HEIGHT_KEYWORD
             })
         })
         .then_some("internal-marker")
@@ -3076,6 +3083,30 @@ fn keyword_inline_limits(
     ))
 }
 
+/// An out-of-flow box's content-box width limited by intrinsic
+/// `min-width` / `max-width` keywords (`available` is the inline space
+/// between its insets, `cb` the containing block width).
+pub(super) fn keyword_limited_inline(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    edges: f32,
+    width: f32,
+    available: f32,
+    cb: f32,
+) -> Option<f32> {
+    let (min_kw, max_kw) =
+        keyword_inline_limits(flat, index, space, edges, Some(available), Some(cb))?;
+    let mut width = width;
+    if let Some(max) = max_kw {
+        width = width.min(max);
+    }
+    if let Some(min) = min_kw {
+        width = width.max(min);
+    }
+    Some(width)
+}
+
 /// Apply intrinsic min-width / max-width keywords to a laid-out box's
 /// inline size: re-solve the box as for that definite width so auto
 /// margins follow (CSS2 10.4).
@@ -4449,6 +4480,22 @@ fn layout_block_in(
             clamp_h(height.max(floor))
         }
         (None, None) => clamp_h(auto_content),
+    };
+    // css-sizing-3: in a block container's block axis min-content,
+    // max-content and fit-content all mean its content (auto) height, so
+    // a keyword max-height caps the height there and a keyword min-height
+    // floors it (min wins over max). A replaced box and a block size the
+    // parent's algorithm already fixed (flex / grid items) keep theirs.
+    let keyword_limits = image_size.is_none() && !matches!(sized, Some((_, Some(_))));
+    let content_height = if keyword_limits && marker(style, MAX_HEIGHT_KEYWORD).is_some() {
+        content_height.min(auto_content)
+    } else {
+        content_height
+    };
+    let content_height = if keyword_limits && marker(style, MIN_HEIGHT_KEYWORD).is_some() {
+        content_height.max(auto_content)
+    } else {
+        content_height
     };
     // A definite block size that clips overflowing content is a scrollport.
     // Scroll offsets stay on the legacy engine. An auto-height BFC does not.

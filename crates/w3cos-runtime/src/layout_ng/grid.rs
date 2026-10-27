@@ -4458,6 +4458,16 @@ fn layout_impl(
     {
         return super::bail("grid:max-height");
     }
+    // css-sizing-3 intrinsic min-height / max-height keywords: the limit
+    // is the content height, the sum of the sized rows and gaps (a height
+    // the parent's algorithm fixed stays).
+    let parent_fixed = matches!(sized, Some((_, Some(_))));
+    if !parent_fixed && has_marker(style, block::MAX_HEIGHT_KEYWORD) {
+        used = used.min(base);
+    }
+    if !parent_fixed && has_marker(style, block::MIN_HEIGHT_KEYWORD) {
+        used = used.max(base);
+    }
     // An indefinite height sized the rows with a zero percentage row gap;
     // the gap itself resolves against the resulting height (CSS Box
     // Alignment: zero for intrinsic contributions, the final size for
