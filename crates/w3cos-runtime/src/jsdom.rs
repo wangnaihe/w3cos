@@ -280,6 +280,25 @@ impl ListenerStore {
         }
     }
 
+    /// Whether a non-inline listener with this callback and capture flag is
+    /// registered on `(node, event_type)`. Uses the index, not a full scan.
+    fn contains(&self, node: u32, event_type: EventType, handler: &Value, capture: bool) -> bool {
+        let Some(index) = self.index.as_ref() else {
+            return false;
+        };
+        index.get(&(node, event_type)).is_some_and(|idxs| {
+            idxs.iter().any(|&idx| {
+                same_listener(
+                    &self.items[idx as usize],
+                    node,
+                    event_type,
+                    handler,
+                    capture,
+                )
+            })
+        })
+    }
+
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
         self.items.retain(|listener| pred(listener));
         self.reindex();
@@ -11356,7 +11375,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
             Value::Undefined
         }),
         "removeEventListener" => func(move |_, args| {
-            js_remove_event_listener(node, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                node,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
         "dispatchEvent" => func(move |_, args| Value::Bool(js_dispatch_event(node, arg(&args, 0)))),
@@ -14357,24 +14381,51 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
     if !handler.is_function() {
         return;
     }
-    let capture = if let Some(b) = options.as_bool() {
-        b
-    } else if options.is_object() {
-        options.get_property("capture").to_bool()
-    } else {
-        false
-    };
+    let capture = listener_capture(&options);
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
-        l.borrow_mut().push(JsListener {
+    let added = LISTENERS.with(|l| {
+        let mut listeners = l.borrow_mut();
+        // DOM: a listener already registered with the same type, callback
+        // and capture flag is not added again.
+        if listeners.contains(node, et, &handler, capture) {
+            return false;
+        }
+        listeners.push(JsListener {
             node,
             event_type: et,
             handler,
             capture,
             inline: false,
-        })
+        });
+        true
     });
-    ensure_native_registration(node, et);
+    if added {
+        ensure_native_registration(node, et);
+    }
+}
+
+fn listener_capture(options: &Value) -> bool {
+    if let Some(b) = options.as_bool() {
+        b
+    } else if options.is_object() {
+        options.get_property("capture").to_bool()
+    } else {
+        false
+    }
+}
+
+fn same_listener(
+    jl: &JsListener,
+    node: u32,
+    et: EventType,
+    handler: &Value,
+    capture: bool,
+) -> bool {
+    !jl.inline
+        && jl.node == node
+        && jl.event_type == et
+        && jl.capture == capture
+        && jl.handler.strict_eq(handler)
 }
 
 pub(crate) fn js_set_inline_event_listener(node: u32, type_name: &str, handler: Value) {
@@ -14423,11 +14474,20 @@ fn ensure_native_registration(node: u32, et: EventType) {
 /// v1 limitation: removes ALL bridge listeners for (node, type) — individual
 /// JS function identity cannot be compared (`Value` equality on functions is
 /// always false).
-fn js_remove_event_listener(node: u32, type_name: &str) {
+/// DOM `removeEventListener(type, callback, options)`: removes only the
+/// listener registered with that callback and capture flag, so disposing one
+/// subscriber leaves the node's other listeners of the same type in place.
+fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
+    if !handler.is_function() {
+        return;
+    }
+    let capture = listener_capture(&options);
     let et = event_type_for(type_name);
     LISTENERS.with(|l| {
-        l.borrow_mut()
-            .retain(|jl| !(jl.node == node && jl.event_type == et));
+        let mut listeners = l.borrow_mut();
+        if listeners.contains(node, et, &handler, capture) {
+            listeners.retain(|jl| !same_listener(jl, node, et, &handler, capture));
+        }
     });
 }
 
@@ -18622,7 +18682,12 @@ fn build_document_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -21969,7 +22034,12 @@ fn build_window_value() -> Value {
     props.insert(
         "removeEventListener".to_string(),
         func(|_, args| {
-            js_remove_event_listener(0, &arg(&args, 0).to_js_string());
+            js_remove_event_listener(
+                0,
+                &arg(&args, 0).to_js_string(),
+                arg(&args, 1),
+                arg(&args, 2),
+            );
             Value::Undefined
         }),
     );
@@ -29646,23 +29716,135 @@ try {
         let btn_id = node_id_of(&btn).unwrap();
         let count = Rc::new(Cell::new(0));
         let count2 = count.clone();
+        let listener = func(move |_, _| {
+            count2.set(count2.get() + 1);
+            Value::Undefined
+        });
         btn.call_method(
             "addEventListener",
-            vec![
-                Value::string("click"),
-                func(move |_, _| {
-                    count2.set(count2.get() + 1);
-                    Value::Undefined
-                }),
-            ],
+            vec![Value::string("click"), listener.clone()],
         );
-        btn.call_method("removeEventListener", vec![Value::string("click")]);
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), listener],
+        );
         dom::with_document_mut(|doc| {
             let mut ev = Event::click(NodeId::from_u32(btn_id), 0.0, 0.0);
             doc.dispatch_event_bubbling(&mut ev);
         });
         drain_microtasks();
         assert_eq!(count.get(), 0);
+    }
+
+    fn counting_listener(count: &Rc<Cell<u32>>, weight: u32) -> Value {
+        let count = count.clone();
+        func(move |_, _| {
+            count.set(count.get() + weight);
+            Value::Undefined
+        })
+    }
+
+    fn click(node: u32) {
+        dom::with_document_mut(|doc| {
+            let mut ev = Event::click(NodeId::from_u32(node), 0.0, 0.0);
+            doc.dispatch_event_bubbling(&mut ev);
+        });
+        drain_microtasks();
+    }
+
+    #[test]
+    fn remove_event_listener_removes_only_the_matching_callback_and_capture() {
+        setup();
+        let btn = create_in_body("button");
+        let btn_id = node_id_of(&btn).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let first = counting_listener(&count, 1);
+        let second = counting_listener(&count, 10);
+        let captured = counting_listener(&count, 100);
+        for (listener, capture) in [(&first, false), (&second, false), (&captured, true)] {
+            btn.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("click"),
+                    listener.clone(),
+                    Value::Bool(capture),
+                ],
+            );
+        }
+        // No callback, an unknown callback, or the wrong capture flag remove nothing.
+        btn.call_method("removeEventListener", vec![Value::string("click")]);
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), counting_listener(&count, 1000)],
+        );
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), captured.clone(), Value::Bool(false)],
+        );
+        click(btn_id);
+        assert_eq!(count.get(), 111);
+
+        count.set(0);
+        btn.call_method("removeEventListener", vec![Value::string("click"), first]);
+        let capture_options =
+            Value::object(HashMap::from([("capture".to_string(), Value::Bool(true))]));
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), captured, capture_options],
+        );
+        click(btn_id);
+        assert_eq!(count.get(), 10);
+    }
+
+    #[test]
+    fn add_event_listener_ignores_a_duplicate_registration() {
+        setup();
+        let btn = create_in_body("button");
+        let btn_id = node_id_of(&btn).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let listener = counting_listener(&count, 1);
+        for _ in 0..2 {
+            btn.call_method(
+                "addEventListener",
+                vec![Value::string("click"), listener.clone()],
+            );
+        }
+        click(btn_id);
+        assert_eq!(count.get(), 1);
+        btn.call_method(
+            "removeEventListener",
+            vec![Value::string("click"), listener],
+        );
+        click(btn_id);
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn window_message_listeners_survive_removing_another_one() {
+        // Two concurrent `acquirePort` calls each listen for window 'message';
+        // the first to resolve removes only its own listener.
+        setup();
+        let window = window_value();
+        let count = Rc::new(Cell::new(0));
+        let first = counting_listener(&count, 1);
+        let second = counting_listener(&count, 10);
+        for listener in [&first, &second] {
+            window.call_method(
+                "addEventListener",
+                vec![Value::string("message"), listener.clone()],
+            );
+        }
+        window.call_method("removeEventListener", vec![Value::string("message"), first]);
+        window.call_method(
+            "postMessage",
+            vec![Value::string("hello"), Value::string("*")],
+        );
+        drain_microtasks();
+        assert_eq!(count.get(), 10);
+        window.call_method(
+            "removeEventListener",
+            vec![Value::string("message"), second],
+        );
     }
 
     #[test]
