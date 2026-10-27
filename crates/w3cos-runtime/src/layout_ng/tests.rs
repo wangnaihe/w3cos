@@ -5157,6 +5157,40 @@ fn float_min_max_resolves_child_percent_height() {
     assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 100.0));
 }
 
+/// A stretched replaced row item with a specified width keeps its
+/// automatic minimum at its min-content width under the stretched height,
+/// capped by the specified width (flex-minimum-width-flex-items-013).
+#[test]
+fn flex_stretched_replaced_auto_min_ignores_specified_width() {
+    use w3cos_std::style::{Dimension as D, FlexDirection};
+    let item = Component::canvas(
+        300,
+        150,
+        Style {
+            display: Display::Block,
+            width: D::Px(999.0),
+            ..Style::default()
+        },
+    );
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                width: D::Px(0.0),
+                height: D::Px(50.0),
+                ..block()
+            },
+            vec![item],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
+}
+
 /// A `<canvas>` flex item is replaced like an `<img>` (Blink
 /// LayoutHTMLCanvas is a LayoutReplaced): a stretched row item transfers
 /// the definite line height through its ratio, a column item stretches to
@@ -6101,4 +6135,48 @@ fn block_aspect_ratio_sizes_the_auto_axis() {
     assert_eq!(rect(&out, 4), (0.0, 250.0, 100.0, 50.0));
     assert_eq!(rect(&out, 5), (0.0, 300.0, 100.0, 60.0));
     assert_eq!(rect(&out, 7), (0.0, 360.0, 100.0, 25.0));
+}
+
+/// `min-width: fit-content` on a fixed-width block-level flex container
+/// resolves against the line's available width less its computed margins,
+/// not its over-constrained used margins (flex-minimum-width-flex-items-014).
+#[test]
+fn flex_min_width_fit_content_uses_available_width() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let child = || {
+        node(
+            Style {
+                width: Dimension::Px(20.0),
+                ..sized(20.0)
+            },
+            vec![],
+        )
+    };
+    for (outer, expected) in [(800.0, 40.0), (30.0, 30.0), (10.0, 20.0)] {
+        let mut flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            width: Dimension::Px(10.0),
+            ..Style::default()
+        };
+        flex.custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-min-width-keyword".into(),
+                "fit-content".into(),
+            );
+        let wrapper = Style {
+            width: Dimension::Px(outer),
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(wrapper, vec![node(flex, vec![child(), child()])])],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 2).2, expected, "outer {outer}");
+    }
 }

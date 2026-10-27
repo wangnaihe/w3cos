@@ -1589,10 +1589,35 @@ pub(super) fn replaced_inline_at_block(
     space: &ConstraintSpace,
     height: f32,
 ) -> Option<f32> {
+    replaced_inline_at(flat, index, space, height, false)
+}
+
+/// [`replaced_inline_at_block`] with the box's own `width` read as auto:
+/// its min-content inline size at that block size, which is a flex item's
+/// content size suggestion (flex-minimum-width-flex-items-013).
+pub(super) fn replaced_content_inline_at_block(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    height: f32,
+) -> Option<f32> {
+    replaced_inline_at(flat, index, space, height, true)
+}
+
+fn replaced_inline_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    height: f32,
+    auto_width: bool,
+) -> Option<f32> {
     if !is_replaced(flat[index].kind) {
         return None;
     }
     let mut definite = flat[index].style.clone();
+    if auto_width {
+        definite.width = Dimension::Auto;
+    }
     definite.height = Dimension::Px(height);
     override_replaced_axis(&mut definite, false);
     definite.min_height = Dimension::Auto;
@@ -3011,7 +3036,22 @@ fn apply_keyword_inline_limits(
     metrics: BoxMetrics,
 ) -> Option<BoxMetrics> {
     let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
-    let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+    // The available size subtracts the computed margins (auto as zero),
+    // not the used ones: an over-constrained box's used end margin takes
+    // up the rest of the line (CSS2 10.3.3) and would leave only its own
+    // width (flex-minimum-width-flex-items-014).
+    let margin = |spacing| match spacing {
+        Spacing::Auto => 0.0,
+        other => resolve_spacing_for_layout(
+            other,
+            space.available_inline,
+            style,
+            space.viewport_w,
+            space.viewport_h,
+        ),
+    };
+    let available =
+        space.available_inline - margin(style.margin.left) - margin(style.margin.right) - edges;
     let (min_kw, max_kw) = keyword_inline_limits(
         flat,
         index,

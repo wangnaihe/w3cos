@@ -648,6 +648,27 @@ fn stretched_image_main(
     inner_width: f32,
     line: Option<f32>,
 ) -> Option<Option<f32>> {
+    if !matches!(flat[child].style.width, Dimension::Auto) {
+        return Some(None);
+    }
+    match stretched_image_cross(flat, child, container, space, inner_width, line)? {
+        Some(stretched) => block::replaced_inline_at_block(flat, child, space, stretched).map(Some),
+        None => Some(None),
+    }
+}
+
+/// The definite stretched content block size of an image row item in a
+/// single-line container whose content block size `line` is definite
+/// (CSS Flexbox §9.8 item 1), whatever its own `width`. `Some(None)` when
+/// the item is not such an image.
+fn stretched_image_cross(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
     let style = flat[child].style;
     let (start, end) = cross_margin_sides(style, container.flex_direction, false);
     let Some(line) = line else {
@@ -656,7 +677,6 @@ fn stretched_image_main(
     if !row_axis(container.flex_direction)
         || container.flex_wrap != FlexWrap::NoWrap
         || !block::is_replaced(flat[child].kind)
-        || !matches!(style.width, Dimension::Auto)
         || !matches!(style.height, Dimension::Auto)
         || used_align(container.align_items, style.align_self) != AlignItems::Stretch
         || matches!(start, Spacing::Auto)
@@ -676,7 +696,7 @@ fn stretched_image_main(
         space,
     )
     .why("flex:cross")?;
-    block::replaced_inline_at_block(flat, child, space, stretched).map(Some)
+    Some(Some(stretched))
 }
 
 /// The max-content inline size of a column-wrap flex item stretched in a
@@ -1417,6 +1437,27 @@ pub(super) fn layout(
                 && !block::is_overflow_scroll_container(child_style)
             {
                 min = transferred.min(max);
+            }
+        } else if matches!(child_style.min_width, Dimension::Auto)
+            && !block::is_overflow_scroll_container(child_style)
+        {
+            // With a specified width the content size suggestion is still
+            // the image's min-content width at the stretched height, and
+            // the specified size suggestion caps it (§4.5).
+            if let Some(stretched) =
+                stretched_image_cross(flat, child, style, space, inner_width, specified_height)
+                    .why("flex:image")?
+            {
+                let content =
+                    block::replaced_content_inline_at_block(flat, child, space, stretched)
+                        .why("flex:image")?;
+                let specified = match definite(child_style.width, inner_main, child_style, space)
+                    .why("flex:percent")?
+                {
+                    Some(size) => content.min(to_content(child_style, main_edges, size)),
+                    None => content,
+                };
+                min = specified.min(max);
             }
         }
         if let Some(stretched) =
