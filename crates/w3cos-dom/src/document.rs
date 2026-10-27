@@ -49,8 +49,16 @@ struct CachedComputedStyle {
     stylesheet_generation: u64,
     inherited_style: Option<w3cos_std::style::Style>,
     style: w3cos_std::style::Style,
+    /// Identity of this entry. A recompute stores a new entry and stamp.
+    stamp: u64,
+    /// Stamp of the parent entry whose style `inherited_style` equals, as
+    /// verified by `computed_style_for`. `STYLE_LINK_ROOT` means no inherited
+    /// style; `STYLE_LINK_UNKNOWN` means not verified yet.
+    inherited_link: u64,
 }
 
+const STYLE_LINK_UNKNOWN: u64 = 0;
+const STYLE_LINK_ROOT: u64 = 1;
 /// Remaining stack below which DOM lowering switches to a fresh segment. It
 /// must exceed one unoptimized lowering level (node frame plus children).
 const LOWERING_STACK_RED_ZONE: usize = 1024 * 1024;
@@ -433,6 +441,9 @@ pub struct Document {
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    computed_style_stamp_clock: Cell<u64>,
+    #[cfg(test)]
+    computed_style_chain_fast_hits: Cell<usize>,
     /// Sibling selector contexts are rebuilt for every node during a tree walk.
     /// Caching one pass, and skipping the sibling chain when no rule needs it,
     /// keeps that walk linear.
@@ -568,6 +579,9 @@ impl Document {
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
+            computed_style_stamp_clock: Cell::new(STYLE_LINK_ROOT),
+            #[cfg(test)]
+            computed_style_chain_fast_hits: Cell::new(0),
             selector_context_cache: RefCell::new(SelectorContextCache {
                 style_clock: 0,
                 stylesheet_generation: 0,
@@ -4287,6 +4301,12 @@ impl Document {
                 stylesheet_generation,
                 inherited_style: inherited.cloned(),
                 style: style.clone(),
+                stamp: {
+                    let stamp = self.computed_style_stamp_clock.get() + 1;
+                    self.computed_style_stamp_clock.set(stamp);
+                    stamp
+                },
+                inherited_link: STYLE_LINK_UNKNOWN,
             },
         );
         style
@@ -4359,17 +4379,74 @@ impl Document {
             current = self.get_node(parent).parent;
         }
         ancestor_ids.reverse();
+        ancestor_ids.retain(|ancestor| self.get_node(*ancestor).node_type == NodeType::Element);
+        ancestor_ids.push(id);
+        if let Some(style) = self.linked_cached_style(&ancestor_ids) {
+            return style;
+        }
+        let (target, ancestor_ids) = ancestor_ids.split_last().expect("chain holds the target");
         let mut ancestors = Vec::new();
         let mut inherited = None;
-        for ancestor in ancestor_ids {
-            if self.get_node(ancestor).node_type != NodeType::Element {
-                continue;
-            }
+        for &ancestor in ancestor_ids {
             let style = self.computed_style(ancestor, &ancestors, inherited.as_ref());
             inherited = Some(style);
             ancestors.push(self.selector_context(ancestor));
         }
-        self.computed_style(id, &ancestors, inherited.as_ref())
+        let style = self.computed_style(*target, &ancestors, inherited.as_ref());
+        self.link_cached_chain(ancestor_ids.iter().chain(std::iter::once(target)));
+        style
+    }
+
+    /// The cached style of the chain's last node when every entry along the
+    /// element chain is current and was computed from its parent's entry.
+    /// Each ancestor lookup is then a stamp comparison instead of a `Style`
+    /// clone plus an `inherited_style` equality test.
+    fn linked_cached_style(&self, chain: &[NodeId]) -> Option<w3cos_std::style::Style> {
+        let stylesheet_generation = stylesheet::generation();
+        let cache = self.computed_style_cache.borrow();
+        let mut parent = STYLE_LINK_ROOT;
+        let mut last = None;
+        for id in chain {
+            let entry = cache.get(id)?;
+            if entry.node_revision != *self.style_revisions.get(id.0 as usize)?
+                || entry.stylesheet_generation != stylesheet_generation
+                || entry.inherited_link != parent
+            {
+                return None;
+            }
+            parent = entry.stamp;
+            last = Some(entry);
+        }
+        #[cfg(test)]
+        {
+            self.computed_style_chain_fast_hits
+                .set(self.computed_style_chain_fast_hits.get() + 1);
+            self.computed_style_cache_hits
+                .set(self.computed_style_cache_hits.get() + 1);
+        }
+        last.map(|entry| entry.style.clone())
+    }
+
+    /// Record that each entry along a just-resolved chain inherited from the
+    /// entry before it. `computed_style_for` passed every node exactly its
+    /// parent entry's style, so the link holds until either entry is replaced.
+    fn link_cached_chain<'a>(&self, chain: impl Iterator<Item = &'a NodeId>) {
+        let stylesheet_generation = stylesheet::generation();
+        let mut cache = self.computed_style_cache.borrow_mut();
+        let mut parent = STYLE_LINK_ROOT;
+        for id in chain {
+            let current = self.style_revisions.get(id.0 as usize).copied();
+            let Some(entry) = cache.get_mut(id) else {
+                return;
+            };
+            if Some(entry.node_revision) != current
+                || entry.stylesheet_generation != stylesheet_generation
+            {
+                return;
+            }
+            entry.inherited_link = parent;
+            parent = entry.stamp;
+        }
     }
 
     /// Cascade one element from an already-computed parent style.
@@ -25955,6 +26032,59 @@ mod computed_style_cache_tests {
         assert_eq!(
             parent_properties.get("--theme-color-3").map(String::as_str),
             Some("#123456")
+        );
+    }
+
+    #[test]
+    fn computed_style_for_reuses_a_linked_ancestor_chain_and_sees_ancestor_edits() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        for index in 0..300 {
+            body.style_mut(&mut document)
+                .set_property(&format!("--vscode-color-{index}"), "#123456");
+        }
+        let mut parent = body;
+        let mut chain = Vec::new();
+        for _ in 0..40 {
+            let div = document.create_element("div");
+            parent.append_child(&mut document, div);
+            chain.push(div);
+            parent = div;
+        }
+        let leaf = parent.id;
+        let mid = chain[20];
+        let custom = |style: &w3cos_std::style::Style, name: &str| {
+            style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(name).cloned())
+        };
+        let first = document.computed_style_for(leaf);
+        assert_eq!(
+            custom(&first, "--vscode-color-7").as_deref(),
+            Some("#123456")
+        );
+        let (_, misses) = document.computed_style_cache_stats();
+        let fast = document.computed_style_chain_fast_hits.get();
+        for _ in 0..50 {
+            assert_eq!(document.computed_style_for(leaf), first);
+        }
+        assert_eq!(document.computed_style_chain_fast_hits.get(), fast + 50);
+        assert_eq!(document.computed_style_cache_stats().1, misses);
+
+        mid.style_mut(&mut document).set_property("--probe", "2");
+        let edited = document.computed_style_for(leaf);
+        assert_eq!(custom(&edited, "--probe").as_deref(), Some("2"));
+        assert_eq!(document.computed_style_for(leaf), edited);
+        assert_eq!(
+            custom(&document.computed_style_for(chain[5].id), "--probe"),
+            None
+        );
+        assert_eq!(
+            document.computed_style_for(leaf),
+            edited,
+            "a linked chain survives lookups of other chains"
         );
     }
 
