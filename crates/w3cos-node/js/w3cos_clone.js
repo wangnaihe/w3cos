@@ -18,15 +18,37 @@ function dataCloneError(value) {
   return error;
 }
 
-const HEX = '0123456789abcdef';
+// Hex text for byte payloads. Built from a 256-entry table and joined per
+// chunk: `out += ...` per byte made each step a new full-length string,
+// quadratic in the payload (multi-GB RSS spikes cloning MB-sized buffers).
+const BYTE_HEX = [];
+for (let i = 0; i < 256; i++) BYTE_HEX.push((i < 16 ? '0' : '') + i.toString(16));
+const HEX_CHUNK = 16384;
 function toHex(bytes) {
-  let out = '';
-  for (let i = 0; i < bytes.length; i++) out += HEX[bytes[i] >> 4] + HEX[bytes[i] & 15];
-  return out;
+  const length = bytes.length;
+  if (length <= HEX_CHUNK) {
+    const parts = new Array(length);
+    for (let i = 0; i < length; i++) parts[i] = BYTE_HEX[bytes[i]];
+    return parts.join('');
+  }
+  const chunks = [];
+  for (let start = 0; start < length; start += HEX_CHUNK) {
+    const end = Math.min(start + HEX_CHUNK, length);
+    const parts = new Array(end - start);
+    for (let i = start; i < end; i++) parts[i - start] = BYTE_HEX[bytes[i]];
+    chunks.push(parts.join(''));
+  }
+  return chunks.join('');
+}
+function hexDigit(code) {
+  // '0'-'9' -> 0-9, 'a'-'f' / 'A'-'F' -> 10-15.
+  return code <= 57 ? code - 48 : (code | 32) - 87;
 }
 function fromHex(text) {
   const bytes = new Uint8Array(text.length / 2);
-  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(text.substr(i * 2, 2), 16);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = (hexDigit(text.charCodeAt(i * 2)) << 4) | hexDigit(text.charCodeAt(i * 2 + 1));
+  }
   return bytes;
 }
 
