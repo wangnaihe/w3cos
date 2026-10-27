@@ -222,7 +222,10 @@ fn is_soft_wrap_char(c: char) -> bool {
 
 /// Text style requirements shared by every S2a text leaf.
 fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
-    if style.position != Position::Static || style.float != Float::None {
+    // An inline-level relatively positioned leaf only moves its fragments
+    // (`relative_inline_offsets`); a block-level one stays on legacy.
+    let inline_relative = style.position == Position::Relative && style.display == Display::Inline;
+    if (style.position != Position::Static && !inline_relative) || style.float != Float::None {
         return Some("text:positioned");
     }
     // (direction and unicode-bidi are checked by the callers.)
@@ -745,6 +748,8 @@ pub(super) fn is_inline_box(flat: &[FlatNodeInfo], index: usize) -> bool {
         flat[index].kind,
         ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
     ) && flat[index].style.display == Display::Inline
+        // (An absolutely positioned one is blockified, CSS2 9.7.)
+        && !super::oof::is_out_of_flow(flat[index].style)
 }
 
 /// An inline-block box: an atomic inline (NGInlineItem kAtomicInline),
@@ -779,6 +784,8 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
             | ComponentKind::Row
             | ComponentKind::Text { .. }
     ) && inline_block
+        // An absolutely positioned inline-block is blockified (CSS2 9.7).
+        && !super::block::inline_level_oof(flat, index)
 }
 
 fn inline_level_child(flat: &[FlatNodeInfo], child: usize) -> bool {
@@ -793,6 +800,9 @@ fn inline_level_child(flat: &[FlatNodeInfo], child: usize) -> bool {
         && flat[child].style.display == Display::Inline)
         || is_inline_box(flat, child)
         || is_atomic_inline(flat, child)
+        // An OOF box with an inline original display is still an inline
+        // item of its parent (NGInlineItem kOutOfFlowPositioned).
+        || super::block::inline_level_oof(flat, child)
 }
 
 /// True when the block container's rendered children are inline content.
@@ -883,7 +893,9 @@ fn inline_box_reason(
     if super::block::unsupported_marker(style, &[VALIGN_MARKER]).is_some() {
         return Some("internal-marker");
     }
-    if style.position != Position::Static || style.float != Float::None {
+    if !matches!(style.position, Position::Static | Position::Relative)
+        || style.float != Float::None
+    {
         return Some("text:positioned");
     }
     if style.direction != container.direction
@@ -1840,6 +1852,53 @@ fn paint_rewraps_beside_floats(flat: &[FlatNodeInfo], children: &[usize]) -> boo
 /// not even its first piece fits.  Line tops assume the container's strut
 /// height (checked once the lines are built).
 pub(super) fn layout_inline_beside(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    floats: Option<LineFloats>,
+) -> Option<InlineResult> {
+    let mut result = layout_lines(flat, index, space, floats)?;
+    relative_inline_offsets(flat, index, space, &mut result.children);
+    Some(result)
+}
+
+/// NGInlineLayoutAlgorithm / NGInlineBoxState: a relatively positioned
+/// inline box, atomic inline, or text leaf keeps its place in the line and
+/// only its fragments (and those of everything inside it) move by its
+/// relative offset (CSS2 9.4.3, NGRelativeUtils::ComputeRelativeOffset
+/// against the IFC container's content box).  The fragments here are flat,
+/// so each one moves by the sum of the offsets of its relatively
+/// positioned inline ancestors below the container.
+fn relative_inline_offsets(
+    flat: &[FlatNodeInfo],
+    container: usize,
+    space: &ConstraintSpace,
+    children: &mut [(f32, f32, BoxFragment)],
+) {
+    let offset_of = |mut node: usize| {
+        let (mut dx, mut dy) = (0.0f32, 0.0f32);
+        while node != container {
+            let style = flat[node].style;
+            if style.position == Position::Relative {
+                let (x, y) = super::oof::relative_offset(style, space);
+                dx += x;
+                dy += y;
+            }
+            match flat[node].parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+        (dx, dy)
+    };
+    for (x, y, fragment) in children.iter_mut() {
+        let (dx, dy) = offset_of(fragment.index);
+        *x += dx;
+        *y += dy;
+    }
+}
+
+fn layout_lines(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,

@@ -4974,3 +4974,109 @@ fn inline_min_max_ignores_text_and_inline_box_widths() {
     assert!(rects(&percent).0.2 > 0.0);
     assert_eq!(rects(&percent), rects(&auto));
 }
+
+#[test]
+fn relative_inline_moves_its_fragments_only() {
+    use w3cos_std::style::Position;
+    let tree = |position: Position| {
+        let text = |content: &str| {
+            Component::text(
+                content,
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            )
+        };
+        let span = node(
+            Style {
+                display: Display::Inline,
+                position,
+                left: Dimension::Px(10.0),
+                top: Dimension::Px(5.0),
+                ..Style::default()
+            },
+            vec![text("bb")],
+        );
+        node(
+            Style {
+                width: Dimension::Px(300.0),
+                ..block()
+            },
+            vec![text("aa "), span],
+        )
+    };
+    let rects = |root: &Component| {
+        let flat = pre_flatten(root);
+        assert!(block::supports_tree(&flat), "relative inline outside NG");
+        let out = layout_tree(root, &flat, 800.0, 600.0).expect("relative inline");
+        (rect(&out, 1), rect(&out, 2), rect(&out, 3))
+    };
+    let (text, span, inner) = rects(&tree(Position::Static));
+    let (moved_text, moved_span, moved_inner) = rects(&tree(Position::Relative));
+    assert_eq!(moved_text, text);
+    assert_eq!(moved_span, (span.0 + 10.0, span.1 + 5.0, span.2, span.3));
+    assert_eq!(
+        moved_inner,
+        (inner.0 + 10.0, inner.1 + 5.0, inner.2, inner.3)
+    );
+}
+
+#[test]
+fn inline_level_abspos_static_position_follows_floats_and_text_align() {
+    use w3cos_std::style::{Float, Position, TextAlign, TextDirection};
+    let case = |direction: TextDirection, text_align: TextAlign, float: Float| {
+        let container = node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                direction,
+                text_align,
+                ..block()
+            },
+            vec![
+                node(sized(50.0), vec![]),
+                node(
+                    Style {
+                        float,
+                        width: Dimension::Px(50.0),
+                        height: Dimension::Px(50.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+                node(
+                    Style {
+                        display: Display::Inline,
+                        position: Position::Absolute,
+                        width: Dimension::Px(20.0),
+                        height: Dimension::Px(20.0),
+                        direction,
+                        text_align,
+                        ..Style::default()
+                    },
+                    vec![],
+                ),
+            ],
+        );
+        let root = node(block(), vec![container]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "inline-level abspos outside NG"
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("inline-level abspos");
+        let (x, y, _, _) = rect(&out, 4);
+        (x, y)
+    };
+    let (ltr, rtl) = (TextDirection::Ltr, TextDirection::Rtl);
+    // The opportunity beside the float is [50, 100] (left float) or
+    // [0, 50] (right float); ltr places the left edge, rtl the right edge.
+    assert_eq!(case(ltr, TextAlign::Left, Float::Left), (50.0, 50.0));
+    assert_eq!(case(ltr, TextAlign::Center, Float::Left), (75.0, 50.0));
+    assert_eq!(case(ltr, TextAlign::Right, Float::Right), (50.0, 50.0));
+    assert_eq!(case(rtl, TextAlign::Right, Float::Right), (30.0, 50.0));
+    assert_eq!(case(rtl, TextAlign::Left, Float::Right), (-20.0, 50.0));
+    assert_eq!(case(rtl, TextAlign::Center, Float::Left), (55.0, 50.0));
+}

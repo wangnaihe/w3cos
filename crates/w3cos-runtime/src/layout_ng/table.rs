@@ -190,6 +190,34 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         if node.style.position == Position::Sticky {
             return Some("table:sticky");
         }
+        // A relatively positioned row, row group or cell moves its fragment
+        // by its insets and is the containing block of its absolute
+        // descendants; the grid here places them unmoved. One with auto
+        // insets and no absolute descendants is unaffected.
+        if offset != 0
+            && node.style.position == Position::Relative
+            && (![
+                node.style.top,
+                node.style.right,
+                node.style.bottom,
+                node.style.left,
+            ]
+            .iter()
+            .all(|inset| matches!(inset, Dimension::Auto))
+                || flat[table + offset + 1..node.subtree_end.max(table + offset + 1)]
+                    .iter()
+                    .any(|inner| super::oof::is_out_of_flow(inner.style)))
+            && matches!(
+                node.style.display,
+                Display::TableRow
+                    | Display::TableRowGroup
+                    | Display::TableHeaderGroup
+                    | Display::TableFooterGroup
+                    | Display::TableCell
+            )
+        {
+            return Some("table:relative-part");
+        }
         // A percentage block size on a cell's child resolves against the
         // cell's final height once the table, row or cell has a definite
         // one (Chrome lays the cell out again at its stretched height).

@@ -166,8 +166,13 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     let blockified_float = style.float != Float::None
         && !oof::is_out_of_flow(style)
         && matches!(style.display, Display::InlineBlock | Display::ListItem);
+    // So are absolutely positioned inline and inline-block boxes (the
+    // replaced and text ones are rejected by position_reason).
+    let blockified_oof = oof::is_out_of_flow(style)
+        && matches!(style.display, Display::Inline | Display::InlineBlock);
     if !atomic
         && !blockified_float
+        && !blockified_oof
         && !matches!(style.display, Display::Block | Display::FlowRoot)
         && !lowered_ifc
         && !author_flex
@@ -181,8 +186,12 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
         });
     }
     // Positioned block-level boxes are checked by node_reason
-    // (position_reason); atomics and sticky stay on legacy.
-    if style.position != Position::Static && (atomic || style.position == Position::Sticky) {
+    // (position_reason); relatively positioned atomics move with their
+    // line (inline::relative_inline_offsets), other atomics and sticky
+    // stay on legacy.
+    if (atomic && !matches!(style.position, Position::Static | Position::Relative))
+        || style.position == Position::Sticky
+    {
         return Some("position");
     }
     // Floats and clearance of block-level boxes are checked by node_reason
@@ -516,10 +525,32 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     let style = info.style;
     match style.position {
         Position::Static | Position::Sticky => None,
-        _ if inline::is_atomic_inline(flat, index) || style.display == Display::Inline => {
+        // An inline-level relatively positioned box in an IFC moves its
+        // fragments after line layout (inline::relative_inline_offsets).
+        Position::Relative
+            if (inline::is_atomic_inline(flat, index) || style.display == Display::Inline)
+                && !inline::in_inline_container(flat, index) =>
+        {
             Some("position:inline")
         }
         Position::Relative => None,
+        Position::Absolute | Position::Fixed if inline_level_oof(flat, index) => {
+            // Blockified (CSS2 9.7) and laid out like a block box; its
+            // static position is still inline-level (`inline_static_offset`).
+            // In an IFC it would be an OOF inline item: legacy.
+            if info.parent.is_none_or(|p| {
+                inline::is_inline_container(flat, p) || inline::in_inline_container(flat, index)
+            }) {
+                return Some("position:inline");
+            }
+            if style.position == Position::Fixed {
+                return oof::fixed_reason(flat, index);
+            }
+            None
+        }
+        _ if inline::is_atomic_inline(flat, index) || style.display == Display::Inline => {
+            Some("position:inline")
+        }
         Position::Absolute | Position::Fixed => {
             // An absolutely positioned box is blockified (CSS2 9.7):
             // `inline-flex` lays out as `flex`, and OOF layout sizes a flex
@@ -545,6 +576,50 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             None
         }
     }
+}
+
+/// An absolutely positioned non-replaced box whose original display is
+/// `inline` or `inline-block` (Blink IsOriginalDisplayInlineType).
+pub(super) fn inline_level_oof(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let info = &flat[index];
+    oof::is_out_of_flow(info.style)
+        && matches!(info.style.display, Display::Inline | Display::InlineBlock)
+        && matches!(
+            info.kind,
+            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+        )
+}
+
+/// CalculateOutOfFlowStaticInlineLevelOffset: the static inline offset of
+/// an inline-level OOF box in a block-level context is where a zero-sized
+/// line would start, i.e. inside the layout opportunity beside the floats
+/// at that block offset, aligned by text-align and moved by text-indent.
+/// `bfc` is the container content box's BFC offset; the result is the
+/// logical offset from the content box's inline-start edge.
+fn inline_static_offset(
+    container: &Style,
+    exclusions: &ExclusionSpace,
+    bfc: (f32, f32),
+    block: f32,
+    available: f32,
+    rtl: bool,
+) -> Option<f32> {
+    let (left, right) = exclusions.band(bfc.1 + block, 0.0);
+    let start = left.map_or(0.0, |l| (l - bfc.0).max(0.0));
+    let end = right.map_or(available, |r| (r - bfc.0).min(available));
+    let size = (end - start).max(0.0);
+    let line = inline::align_offset(container, size);
+    let mut offset = if rtl {
+        (available - end) + (size - line)
+    } else {
+        start + line
+    };
+    offset += match container.text_indent {
+        Dimension::Px(v) => v,
+        Dimension::Percent(p) => p / 100.0 * available,
+        _ => return None,
+    };
+    Some(offset)
 }
 
 /// Inline text whose parent is a block container but not an inline
@@ -3081,12 +3156,25 @@ fn layout_block_in(
                 cursor + pending.sum()
             };
             let content_width = metrics.content_width;
+            let inline_offset = if inline_level_oof(flat, child) {
+                inline_static_offset(
+                    info.style,
+                    exclusions,
+                    (bfc_x + bl + pl, bfc_y + bt + pt),
+                    block,
+                    content_width,
+                    child_space.rtl,
+                )
+                .why("oof:inline-static-offset")?
+            } else {
+                0.0
+            };
             oof_candidates.push(OofCandidate {
                 index: child,
                 static_inline: if child_space.rtl {
-                    bl + pl + content_width
+                    bl + pl + content_width - inline_offset
                 } else {
-                    bl + pl
+                    bl + pl + inline_offset
                 },
                 static_block: bt + pt + block,
                 static_rtl: child_space.rtl,
