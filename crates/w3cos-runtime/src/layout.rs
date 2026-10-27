@@ -3584,7 +3584,7 @@ pub(crate) fn install_font_unit_provider() {
             font_kerning: style.font_kerning,
             font_feature_kern: style.font_feature_kern,
             direction: style.direction,
-            custom_properties: (!font_context.is_empty()).then_some(font_context),
+            custom_properties: (!font_context.is_empty()).then(|| font_context.into()),
             ..w3cos_std::style::Style::default()
         };
         #[cfg(test)]
@@ -25495,7 +25495,7 @@ mod tests {
             ..s()
         };
         let mut standard = embedding.clone();
-        standard.custom_properties = Some(HashMap::from([(
+        standard.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
             "1".into(),
         )]));
@@ -28382,7 +28382,7 @@ mod tests {
                 table_layout_fixed: true,
                 width: WDim::Px(256.0),
                 border_width: 3.0,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-html-table-element".to_string(),
                     "1".to_string(),
                 )])),
@@ -29986,7 +29986,7 @@ mod tests {
                 width: WDim::Px(400.0),
                 font_size: 16.0,
                 line_height: 1.25,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -30113,7 +30113,7 @@ mod tests {
                 min_height: WDim::Px(30.0),
                 text_align: w3cos_std::style::TextAlign::Center,
                 justify_content: WJustify::Center,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -31088,7 +31088,7 @@ mod tests {
                     };
                     let image_style = Style {
                         display: WDisp::InlineBlock,
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-vertical-align-keyword".into(),
                             alignment.into(),
                         )])),
@@ -32297,7 +32297,7 @@ mod tests {
                 line_height: 1.0,
                 align_self: WAlignSelf::FlexStart,
                 align_items: WAlign::Baseline,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-vertical-align-keyword".into(),
                     "top".into(),
                 )])),
@@ -32347,7 +32347,7 @@ mod tests {
                     line_height: 1.0,
                     align_self: WAlignSelf::FlexEnd,
                     align_items: WAlign::Baseline,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-vertical-align-keyword".into(),
                         "bottom".into(),
                     )])),
@@ -32623,7 +32623,7 @@ mod tests {
             let anonymous = || {
                 Component::row(
                     Style {
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-anonymous-block-line".into(),
                             "1".into(),
                         )])),
@@ -32709,7 +32709,7 @@ mod tests {
                 Style {
                     display: WDisp::Flex,
                     width: WDim::Px(200.0),
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -32735,10 +32735,12 @@ mod tests {
                             line_height: 1.0,
                             line_height_is_normal: false,
                             align_self: WAlignSelf::FlexStart,
-                            custom_properties: Some(HashMap::from([(
-                                "--w3cos-internal-vertical-align-keyword".into(),
-                                "top".into(),
-                            )])),
+                            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter(
+                                [(
+                                    "--w3cos-internal-vertical-align-keyword".into(),
+                                    "top".into(),
+                                )],
+                            )),
                             ..Style::default()
                         },
                     ),
@@ -32833,7 +32835,7 @@ mod tests {
                             bottom: WSpacing::Px(margin),
                             ..Default::default()
                         },
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-vertical-align-keyword".into(),
                             edge.into(),
                         )])),
@@ -32853,7 +32855,7 @@ mod tests {
                         left: WSpacing::Px(10.0),
                         right: WSpacing::Px(10.0),
                     },
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -32958,7 +32960,7 @@ mod tests {
                 ..Style::default()
             };
             if alignment != "baseline" {
-                style.custom_properties = Some(HashMap::from([(
+                style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-vertical-align-keyword".into(),
                     alignment.into(),
                 )]));
@@ -32982,7 +32984,7 @@ mod tests {
                     font_size: 20.0,
                     line_height: 1.5,
                     align_items: WAlign::Baseline,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -33016,7 +33018,7 @@ mod tests {
             align_self: WAlignSelf::FlexStart,
             ..Style::default()
         };
-        top_style.custom_properties = Some(HashMap::from([(
+        top_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-vertical-align-keyword".into(),
             "top".into(),
         )]));
@@ -33027,7 +33029,7 @@ mod tests {
                 font_family: Some("Arial".into()),
                 line_height: 1.2,
                 line_height_is_normal: false,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -33177,7 +33179,7 @@ mod tests {
                     } else {
                         w3cos_std::style::TextDirection::Ltr
                     },
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -33504,10 +33506,11 @@ mod tests {
             };
             if lowered {
                 atomic_style.margin.bottom = WSpacing::Px(7.5);
-                atomic_style.custom_properties = Some(HashMap::from([(
-                    "--w3cos-internal-vertical-align-length".into(),
-                    "-7.5 4.5".into(),
-                )]));
+                atomic_style.custom_properties =
+                    Some(w3cos_std::style::CustomProperties::from_iter([(
+                        "--w3cos-internal-vertical-align-length".into(),
+                        "-7.5 4.5".into(),
+                    )]));
             }
             let atomic = if image {
                 Component::image("swatch.png", atomic_style)
@@ -33520,7 +33523,7 @@ mod tests {
                     white_space: WWhiteSpace::NoWrap,
                     font_size: 15.0,
                     line_height: 5.0,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -33562,7 +33565,7 @@ mod tests {
                 align_self: WAlignSelf::FlexStart,
                 ..Style::default()
             };
-            style.custom_properties = Some(HashMap::from([(
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-keyword".into(),
                 "top".into(),
             )]));
@@ -33592,7 +33595,7 @@ mod tests {
             align_self: WAlignSelf::FlexStart,
             ..Style::default()
         };
-        target_style.custom_properties = Some(HashMap::from([(
+        target_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-vertical-align-keyword".into(),
             "text-top".into(),
         )]));
@@ -33603,7 +33606,7 @@ mod tests {
                 font_size: 20.0,
                 line_height: 1.5,
                 align_items: WAlign::Baseline,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -35722,7 +35725,7 @@ mod tests {
             Style {
                 display: WDisp::Flex,
                 width: WDim::Px(200.0),
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -35912,7 +35915,7 @@ mod tests {
                     Style {
                         display: WDisp::Block,
                         custom_properties: anonymous.then(|| {
-                            HashMap::from([(
+                            w3cos_std::style::CustomProperties::from_iter([(
                                 "--w3cos-internal-anonymous-block-line".into(),
                                 "1".into(),
                             )])
@@ -39060,7 +39063,7 @@ mod tests {
                 display: WDisp::InlineFlex,
                 direction: w3cos_std::style::TextDirection::Rtl,
                 flex_direction: WDir::Row,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-unbroken-inline-word".into(),
                     "1".into(),
                 )])),
@@ -41674,7 +41677,7 @@ mod tests {
                     display: WDisp::TableCell,
                     width: WDim::Px(80.0),
                     height: WDim::Px(20.0),
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-table-row-span".into(),
                         span.to_string(),
                     )])),
@@ -41734,7 +41737,7 @@ mod tests {
                     display: WDisp::TableCell,
                     width: WDim::Px(80.0),
                     height: WDim::Px(20.0),
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-table-row-span".into(),
                         span.to_string(),
                     )])),
@@ -41812,7 +41815,7 @@ mod tests {
                     display: WDisp::TableCell,
                     width: WDim::Px(100.0),
                     height: WDim::Px(100.0),
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-table-column-span".into(),
                         span.to_string(),
                     )])),
@@ -42299,10 +42302,12 @@ mod tests {
                             display: WDisp::Flex,
                             align_items: WAlign::Baseline,
                             flex_wrap: WWrap::Wrap,
-                            custom_properties: Some(HashMap::from([(
-                                "--w3cos-internal-inline-formatting-context".into(),
-                                "1".into(),
-                            )])),
+                            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter(
+                                [(
+                                    "--w3cos-internal-inline-formatting-context".into(),
+                                    "1".into(),
+                                )],
+                            )),
                             ..inline.clone()
                         }
                     };
@@ -42453,7 +42458,7 @@ mod tests {
                 ..Style::default()
             };
             if generated {
-                style.custom_properties = Some(HashMap::from([(
+                style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".to_string(),
                     "1".to_string(),
                 )]));
@@ -42564,10 +42569,11 @@ mod tests {
                 ..Style::default()
             };
             if lowered {
-                line_style.custom_properties = Some(HashMap::from([(
-                    "--w3cos-internal-inline-formatting-context".into(),
-                    "1".into(),
-                )]));
+                line_style.custom_properties =
+                    Some(w3cos_std::style::CustomProperties::from_iter([(
+                        "--w3cos-internal-inline-formatting-context".into(),
+                        "1".into(),
+                    )]));
             }
             let expected = 32.0
                 + if lowered {
@@ -42672,7 +42678,7 @@ mod tests {
             )],
         );
         assert_eq!(compute(&root, 800.0, 600.0).unwrap()[0].0.height, 50.0);
-        root.style.custom_properties = Some(HashMap::from([(
+        root.style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-inline-formatting-context".to_string(),
             "1".to_string(),
         )]));
@@ -44623,7 +44629,7 @@ mod tests {
         );
         style
             .custom_properties
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(Default::default)
             .insert(
                 "--w3cos-internal-text-line-width".to_string(),
                 "1".to_string(),
@@ -44721,7 +44727,7 @@ mod tests {
             Component::row(
                 Style {
                     display: WDisp::Flex,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".to_string(),
                         "1".to_string(),
                     )])),
@@ -44770,7 +44776,7 @@ mod tests {
         let wrapped_separator = Component::boxed(
             Style {
                 display: WDisp::InlineFlex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-line-item".to_string(),
                     "1".to_string(),
                 )])),
@@ -45116,7 +45122,7 @@ mod tests {
                 display: WDisp::InlineFlex,
                 width: WDim::Px(100.0),
                 height: WDim::Px(20.0),
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-unbroken-inline-word".to_string(),
                     "1".to_string(),
                 )])),
@@ -45576,7 +45582,7 @@ mod tests {
             align_items: WAlign::Baseline,
             line_height: 1.375,
             line_height_is_normal: false,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -46061,7 +46067,7 @@ mod tests {
                         ..w3cos_std::style::Edges::ZERO
                     },
                     custom_properties: marked.then(|| {
-                        HashMap::from([(
+                        w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-inline-formatting-context".into(),
                             "1".into(),
                         )])
@@ -46720,7 +46726,7 @@ mod tests {
                         display: WDisp::Flex,
                         position: WPos::Relative,
                         top: WDim::Px(relative),
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-inline-formatting-context".into(),
                             "1".into(),
                         )])),
@@ -50916,7 +50922,7 @@ mod tests {
                 font_size: 50.0,
                 line_height: 1.0,
                 height: WDim::Px(90.0),
-                custom_properties: Some(HashMap::from([
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
                     (
                         "--w3cos-internal-vertical-align-length".into(),
                         "40 40".into(),
@@ -50985,7 +50991,7 @@ mod tests {
                     display: WDisp::InlineFlex,
                     font_size: 50.0,
                     line_height: 1.0,
-                    custom_properties: Some(properties),
+                    custom_properties: Some(properties.into()),
                     ..Style::default()
                 },
             );
@@ -51733,7 +51739,7 @@ mod tests {
                     max_height,
                     box_sizing,
                     border_width: 5.0,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -52063,7 +52069,7 @@ mod tests {
                 Style {
                     display: WDisp::Flex,
                     width: WDim::Px(200.0),
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -52161,7 +52167,7 @@ mod tests {
             Style {
                 display: WDisp::Flex,
                 width: WDim::Px(300.0),
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -52211,7 +52217,7 @@ mod tests {
         let root = Component::row(
             Style {
                 display: WDisp::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -52262,7 +52268,7 @@ mod tests {
         let descent = 18.0 - inline_font_baseline_from_line_top(&plain, 18.0);
         let top = Style {
             align_self: WAlignSelf::FlexStart,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-keyword".into(),
                 "top".into(),
             )])),
@@ -52271,7 +52277,7 @@ mod tests {
         let word = Component::row(
             Style {
                 display: WDisplay::InlineFlex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-unbroken-inline-word".into(),
                     "1".into(),
                 )])),
@@ -52285,7 +52291,7 @@ mod tests {
         let root = Component::row(
             Style {
                 display: WDisplay::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -52338,7 +52344,7 @@ mod tests {
         };
         for offset in [20.0_f32, -20.0, 80.0, -80.0] {
             let shifted = Style {
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-vertical-align-length".into(),
                     format!("{offset} 0"),
                 )])),
@@ -52347,7 +52353,7 @@ mod tests {
             let root = Component::row(
                 Style {
                     display: WDisplay::Flex,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -52448,7 +52454,7 @@ mod tests {
                 Style {
                     display,
                     width: WDim::Px(392.0),
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -52697,7 +52703,7 @@ mod tests {
         let mut root = Component::row(
             Style {
                 display: WDisp::Inline,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -52738,7 +52744,7 @@ mod tests {
         let root = Component::row(
             Style {
                 display: WDisp::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -52802,7 +52808,7 @@ mod tests {
         let root = Component::row(
             Style {
                 display: WDisp::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -52839,7 +52845,7 @@ mod tests {
         let root = Component::row(
             Style {
                 display: WDisp::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -54576,7 +54582,7 @@ mod tests {
                     width: WDim::Percent(100.0),
                     min_height: WDim::Px(20.0),
                     flex_wrap: WWrap::Wrap,
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -54750,7 +54756,7 @@ mod tests {
                 font_family: Some("Times".into()),
                 font_size: 16.0,
                 line_height: 1.2,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -54819,7 +54825,7 @@ mod tests {
                 display: WDisp::Flex,
                 width: WDim::Px(80.0),
                 flex_wrap: WWrap::Wrap,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -55950,7 +55956,7 @@ mod tests {
     fn breakable_inline_text_starts_in_the_leading_float_side_band() {
         let root = Component::row(
             Style {
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -56072,7 +56078,7 @@ mod tests {
                 line_height: 1.0,
                 line_height_is_normal: false,
                 align_items: WAlign::Baseline,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -56146,7 +56152,7 @@ mod tests {
                     display: WDisp::Flex,
                     // This is the internal inline packet, not authored flex:
                     // a browser flex item would blockify the outer span.
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -56184,7 +56190,7 @@ mod tests {
             Style {
                 display: WDisp::Flex,
                 width: WDim::Px(400.0),
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -56243,7 +56249,7 @@ mod tests {
             Style {
                 display: WDisp::Flex,
                 width: WDim::Px(400.0),
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -57274,7 +57280,7 @@ mod tests {
         assert!(resolve_float_text_layouts(&authored_nodes, &rects, 800.0, 600.0).is_empty());
 
         let mut synthetic = authored_flex.clone();
-        synthetic.custom_properties = Some(HashMap::from([(
+        synthetic.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-inline-formatting-context".into(),
             "1".into(),
         )]));

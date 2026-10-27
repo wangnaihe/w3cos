@@ -3526,7 +3526,7 @@ fn defocus_node(node: &mut Component) {
 fn mark_dialog(card: &mut Component, role: &str) {
     card.style
         .custom_properties
-        .get_or_insert_with(HashMap::new)
+        .get_or_insert_with(Default::default)
         .insert("--w3cos-dialog".to_string(), role.to_string());
 }
 
@@ -4328,7 +4328,7 @@ fn build_intent_panel() -> Component {
         min_height: Dimension::Px(go),
         ..Style::default()
     };
-    input_style.custom_properties = Some(HashMap::from([
+    input_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         ("--w3cos-intent-submit".to_string(), OP_PROPOSE.to_string()),
         ("--w3cos-ime".to_string(), "intent".to_string()),
     ]));
@@ -4926,7 +4926,7 @@ fn mark_initial_focus(button: &mut Component) {
     let props = button
         .style
         .custom_properties
-        .get_or_insert_with(HashMap::new);
+        .get_or_insert_with(Default::default);
     props.insert("--w3cos-initial-focus".to_string(), "1".to_string());
 }
 
@@ -5630,7 +5630,7 @@ fn build_lock_screen() -> Component {
         padding: Edges::xy(12.0, 10.0),
         ..Style::default()
     };
-    field_style.custom_properties = Some(HashMap::from([
+    field_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         ("--w3cos-intent-submit".to_string(), OP_UNLOCK.to_string()),
         ("--w3cos-ime".to_string(), "secure".to_string()),
     ]));
@@ -5790,7 +5790,7 @@ fn notice_row(notice: &ShellNotice) -> Component {
         lines,
     );
     if !notice.draft.is_empty() {
-        row.style.custom_properties = Some(HashMap::from([(
+        row.style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-draft".to_string(),
             notice.draft.clone(),
         )]));
@@ -6010,7 +6010,7 @@ fn build_window_frame(id: i64, focused: bool) -> Component {
         label: String::new(),
     };
     window.on_click = invoke(focus_code(id));
-    window.style.custom_properties = Some(win_props(id, None));
+    window.style.custom_properties = Some(win_props(id, None).into());
     window
 }
 
@@ -6037,7 +6037,7 @@ fn resize_handle(id: i64, gesture: &str, width: Dimension, height: Dimension) ->
         },
         invoke(focus_code(id)),
     );
-    handle.style.custom_properties = Some(win_props(id, Some(gesture)));
+    handle.style.custom_properties = Some(win_props(id, Some(gesture)).into());
     handle
 }
 
@@ -6056,7 +6056,7 @@ fn resize_corner(id: i64) -> Component {
         },
         invoke(focus_code(id)),
     );
-    corner.style.custom_properties = Some(win_props(id, Some("se")));
+    corner.style.custom_properties = Some(win_props(id, Some("se")).into());
     corner
 }
 
@@ -6425,7 +6425,7 @@ fn nav_button(name: &str, active: bool, code: u8) -> Component {
         let props = button
             .style
             .custom_properties
-            .get_or_insert_with(HashMap::new);
+            .get_or_insert_with(Default::default);
         props.insert("--w3cos-selected".to_string(), "1".to_string());
     }
     button
@@ -6450,7 +6450,7 @@ fn settings_switch(label: &str, on: bool, code: u8) -> Component {
     let props = button
         .style
         .custom_properties
-        .get_or_insert_with(HashMap::new);
+        .get_or_insert_with(Default::default);
     props.insert(
         "--w3cos-switch".to_string(),
         if on { "1" } else { "0" }.to_string(),
@@ -6478,10 +6478,11 @@ fn file_row(name: &str, kind: &str, size: &str, open: Option<u8>) -> Component {
         Component::button_with_click(name, name_style, invoke(open.unwrap_or(OP_PREVIEW)));
     name_node.style.min_height = Dimension::Px(48.0);
     if open.is_none() {
-        name_node.style.custom_properties = Some(HashMap::from([(
-            "--w3cos-draft".to_string(),
-            name.to_string(),
-        )]));
+        name_node.style.custom_properties =
+            Some(w3cos_std::style::CustomProperties::from_iter([(
+                "--w3cos-draft".to_string(),
+                name.to_string(),
+            )]));
     }
     Component::row(
         Style {
@@ -6578,10 +6579,11 @@ fn build_terminal_app() -> Component {
                                     flex_grow: 1.0,
                                     ..Style::default()
                                 };
-                                term_style.custom_properties = Some(HashMap::from([(
-                                    "--w3cos-ime".to_string(),
-                                    "terminal".to_string(),
-                                )]));
+                                term_style.custom_properties =
+                                    Some(w3cos_std::style::CustomProperties::from_iter([(
+                                        "--w3cos-ime".to_string(),
+                                        "terminal".to_string(),
+                                    )]));
                                 note_preedit(&mut term_style, "terminal");
                                 Component::text_input(
                                     state::get_signal_text(TERMINAL_SIGNAL),
@@ -7435,7 +7437,7 @@ fn lexicon_draft_field() -> Component {
         }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([(
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
         "--w3cos-ime".to_string(),
         "text".to_string(),
     )]));
@@ -7688,7 +7690,7 @@ fn sign_message_field() -> Component {
         min_height: Dimension::Px(if coarse { 48.0 } else { 36.0 }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         (
             "--w3cos-intent-submit".to_string(),
             OP_SIGN_PROPOSE.to_string(),
@@ -8828,7 +8830,7 @@ fn window_button(
         8.0,
         false,
     );
-    button.style.custom_properties = Some(win_props(app_id, None));
+    button.style.custom_properties = Some(win_props(app_id, None).into());
     button
 }
 
@@ -8922,7 +8924,7 @@ fn app_titlebar(title: impl Into<String>, accent: &str, app_id: i64) -> Componen
         label: String::new(),
     };
     bar.on_click = invoke(focus_code(app_id));
-    bar.style.custom_properties = Some(win_props(app_id, Some("move")));
+    bar.style.custom_properties = Some(win_props(app_id, Some("move")).into());
     bar
 }
 
@@ -8983,7 +8985,7 @@ fn build_launcher() -> Component {
         padding: Edges::xy(12.0, 8.0),
         ..Style::default()
     };
-    search_style.custom_properties = Some(HashMap::from([
+    search_style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         (
             "--w3cos-intent-submit".to_string(),
             OP_LAUNCHER_SEARCH.to_string(),
@@ -9210,7 +9212,7 @@ fn receipt_query_field() -> Component {
         }),
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         (
             "--w3cos-intent-submit".to_string(),
             OP_RECEIPT_QUERY.to_string(),

@@ -1,6 +1,7 @@
 use crate::color::Color;
 use serde::{Deserialize, Serialize};
 
+pub use crate::custom_properties::CustomProperties;
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
 /// Per-thread renderer adapter for the final font's zero-glyph advance.
@@ -295,7 +296,7 @@ pub struct Style {
     pub unicode_bidi: UnicodeBidi,
 
     // CSS Custom Properties (#34)
-    pub custom_properties: Option<std::collections::HashMap<String, String>>,
+    pub custom_properties: Option<crate::custom_properties::CustomProperties>,
 
     // CSS Containment — layout isolation boundaries (Chrome-inspired)
     pub contain: Contain,

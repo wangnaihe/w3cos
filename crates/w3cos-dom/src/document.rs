@@ -2709,7 +2709,7 @@ impl Document {
             {
                 style.custom_properties.clone().unwrap_or_default()
             } else {
-                HashMap::new()
+                Default::default()
             };
             let declares = |property: &str| {
                 // `var()` is substituted before validation, as in the
@@ -2954,7 +2954,7 @@ impl Document {
                 let empty = HashMap::new();
                 let value = resolve_css_variables(
                     value,
-                    style.custom_properties.as_ref().unwrap_or(&empty),
+                    style.custom_properties.as_deref().unwrap_or(&empty),
                 );
                 if !crate::css_style::valid_multicol_declaration(property, &value) {
                     continue;
@@ -4262,6 +4262,18 @@ impl Document {
             {
                 style.line_height = ratio;
             }
+        }
+        // Most elements end with exactly their parent's custom properties
+        // (theme variables plus the same internal markers). Share the
+        // parent's map then, so cache hits, child clones and the inherited
+        // equality test below stay O(1) instead of O(#variables).
+        if let (Some(own), Some(parent)) = (
+            style.custom_properties.as_mut(),
+            inherited.and_then(|parent| parent.custom_properties.as_ref()),
+        ) && !own.ptr_eq(parent)
+            && own == parent
+        {
+            *own = parent.clone();
         }
         self.computed_style_cache.borrow_mut().insert(
             id,
@@ -8600,7 +8612,7 @@ impl Document {
                         first
                             .style
                             .custom_properties
-                            .get_or_insert_with(std::collections::HashMap::new)
+                            .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-text-line-width".to_string(),
                                 "1".to_string(),
@@ -8659,7 +8671,7 @@ impl Document {
                         children[0]
                             .style
                             .custom_properties
-                            .get_or_insert_with(std::collections::HashMap::new)
+                            .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-text-line-width".to_string(),
                                 "1".to_string(),
@@ -8691,7 +8703,7 @@ impl Document {
                         trailing
                             .style
                             .custom_properties
-                            .get_or_insert_with(std::collections::HashMap::new)
+                            .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-text-line-width".to_string(),
                                 "1".to_string(),
@@ -8867,7 +8879,7 @@ impl Document {
                                     other => other,
                                 };
                                 line_item_style.custom_properties =
-                                    Some(std::collections::HashMap::from([(
+                                    Some(w3cos_std::style::CustomProperties::from_iter([(
                                         "--w3cos-internal-inline-line-item".to_string(),
                                         "1".to_string(),
                                     )]));
@@ -11921,7 +11933,7 @@ mod inline_line_extra_ascent_tests {
         // `promote_vertical_align_line_box_extension` has already run on the
         // fragment by the time the line is annotated.
         style.display = w3cos_std::style::Display::InlineFlex;
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-vertical-align-length".to_string(),
             format!("{offset} {}", offset - 4.0),
         )]));
@@ -11945,7 +11957,7 @@ mod inline_line_extra_ascent_tests {
     fn vertical_align_line_extension_does_not_clip_glyph_ink() {
         for offset in [40.0, -40.0] {
             let mut style = text_style();
-            style.custom_properties = Some(std::collections::HashMap::from([(
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-length".to_string(),
                 format!("{offset} {}", offset - 4.0),
             )]));
@@ -12748,7 +12760,7 @@ fn group_unbroken_ascii_inline_words(
             style.white_space = WhiteSpace::NoWrap;
             style
                 .custom_properties
-                .get_or_insert_with(std::collections::HashMap::new)
+                .get_or_insert_with(Default::default)
                 .insert(
                     "--w3cos-internal-unbroken-inline-word".to_string(),
                     "1".to_string(),
@@ -13775,7 +13787,7 @@ fn split_collapsible_space_after_nonbreaking_run(component: &mut w3cos_std::Comp
 fn mark_bidi_visual_order(style: &mut w3cos_std::style::Style) {
     style
         .custom_properties
-        .get_or_insert_with(std::collections::HashMap::new)
+        .get_or_insert_with(Default::default)
         .insert(
             "--w3cos-internal-bidi-visual-order".to_string(),
             "1".to_string(),
@@ -13968,7 +13980,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         component
             .style
             .custom_properties
-            .get_or_insert_with(std::collections::HashMap::new)
+            .get_or_insert_with(Default::default)
             .insert(
                 "--w3cos-internal-bidi-font-runs".to_string(),
                 "1".to_string(),
@@ -14013,7 +14025,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         component
             .style
             .custom_properties
-            .get_or_insert_with(std::collections::HashMap::new)
+            .get_or_insert_with(Default::default)
             .insert(
                 "--w3cos-internal-bidi-font-runs".to_string(),
                 "1".to_string(),
@@ -21667,7 +21679,7 @@ mod image_component_tests {
             Style {
                 display: Display::Block,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21760,7 +21772,7 @@ mod image_component_tests {
             Style {
                 display: Display::Block,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21802,7 +21814,7 @@ mod image_component_tests {
                 direction: TextDirection::Rtl,
                 flex_wrap: FlexWrap::Wrap,
                 justify_content: JustifyContent::FlexEnd,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21846,7 +21858,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -21914,7 +21926,7 @@ mod image_component_tests {
                 Style {
                     display: Display::Inline,
                     flex_wrap: w3cos_std::style::FlexWrap::Wrap,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -21955,7 +21967,7 @@ mod image_component_tests {
                 float: w3cos_std::style::Float::Right,
                 width: w3cos_std::style::Dimension::Percent(50.0),
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22034,7 +22046,7 @@ mod image_component_tests {
                 Style {
                     display: Display::Flex,
                     flex_wrap: FlexWrap::Wrap,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -22094,7 +22106,7 @@ mod image_component_tests {
                 Style {
                     display: Display::Flex,
                     flex_wrap: FlexWrap::Wrap,
-                    custom_properties: Some(std::collections::HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-inline-formatting-context".into(),
                         "1".into(),
                     )])),
@@ -22130,7 +22142,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22195,7 +22207,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22256,7 +22268,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22312,7 +22324,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -22343,7 +22355,7 @@ mod image_component_tests {
             Style {
                 display: Display::Flex,
                 flex_wrap: FlexWrap::Wrap,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -23359,7 +23371,7 @@ mod image_component_tests {
     fn synthetic_pieces_of_one_text_source_do_not_create_authored_boundaries() {
         let style = w3cos_std::Style {
             display: Display::Inline,
-            custom_properties: Some(std::collections::HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-text-source-run".into(),
                 "pseudo:42:before:1".into(),
             )])),
@@ -23423,7 +23435,7 @@ mod image_component_tests {
         ] {
             let aligned = Style {
                 align_self: alignment,
-                custom_properties: Some(std::collections::HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     marker.into(),
                     value.into(),
                 )])),
@@ -25569,7 +25581,7 @@ mod image_component_tests {
             display: Display::Inline,
             ..w3cos_std::Style::default()
         };
-        style.custom_properties = Some(std::collections::HashMap::from([(
+        style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
             "--w3cos-internal-vertical-align-keyword".into(),
             "top".into(),
         )]));
@@ -25886,6 +25898,45 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn children_share_an_unchanged_inherited_custom_property_map() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        for index in 0..32 {
+            body.style_mut(&mut document)
+                .set_property(&format!("--theme-color-{index}"), "#123456");
+        }
+        let child = document.create_element("div");
+        body.append_child(&mut document, child);
+        let override_child = document.create_element("span");
+        body.append_child(&mut document, override_child);
+        override_child
+            .style_mut(&mut document)
+            .set_property("--theme-color-3", "red");
+
+        let parent = document.computed_style_for(body.id);
+        let shared = document.computed_style_for(child.id);
+        let overridden = document.computed_style_for(override_child.id);
+        let parent_properties = parent.custom_properties.as_ref().unwrap();
+        let child_properties = shared.custom_properties.as_ref().unwrap();
+        assert!(child_properties.ptr_eq(parent_properties));
+        assert_eq!(
+            child_properties.get("--theme-color-0").map(String::as_str),
+            Some("#123456")
+        );
+        let overridden = overridden.custom_properties.as_ref().unwrap();
+        assert!(!overridden.ptr_eq(parent_properties));
+        assert_eq!(
+            overridden.get("--theme-color-3").map(String::as_str),
+            Some("red")
+        );
+        assert_eq!(
+            parent_properties.get("--theme-color-3").map(String::as_str),
+            Some("#123456")
+        );
+    }
 
     #[test]
     fn definite_text_rewrite_reuses_the_computed_style() {

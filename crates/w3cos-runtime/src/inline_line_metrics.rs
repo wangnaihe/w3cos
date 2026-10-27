@@ -1240,7 +1240,7 @@ mod tests {
             font_size: 24.0,
             line_height: 1.375,
             line_height_is_normal: true,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
                 "1".into(),
             )])),
@@ -1382,7 +1382,7 @@ mod tests {
             width: Dimension::Px(288.0),
             height: Dimension::Px(288.0),
             border_width: 3.0,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
                 "1".into(),
             )])),
@@ -1725,7 +1725,7 @@ mod tests {
         for absolute in [false, true] {
             let mut style = Style {
                 display: Display::Flex,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -1848,7 +1848,7 @@ mod tests {
                         display: Display::InlineBlock,
                         width: Dimension::Px(30.0),
                         height: Dimension::Px(30.0),
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-vertical-align-keyword".into(),
                             keyword.into(),
                         )])),
@@ -1946,7 +1946,7 @@ mod tests {
                 font_size: 16.0,
                 line_height: 1.2,
                 line_height_is_normal: false,
-                custom_properties: Some(HashMap::from([(
+                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-inline-formatting-context".into(),
                     "1".into(),
                 )])),
@@ -2011,7 +2011,7 @@ mod tests {
             line_height: 20.0 / 12.0,
             line_height_is_normal: false,
             align_self: w3cos_std::style::AlignSelf::FlexStart,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-keyword".into(),
                 "top".into(),
             )])),
@@ -2083,10 +2083,9 @@ mod tests {
                     vec![Component::row(
                         Style {
                             display: Display::InlineFlex,
-                            custom_properties: Some(HashMap::from([(
-                                "--w3cos-internal-unbroken-inline-word".into(),
-                                "1".into(),
-                            )])),
+                            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter(
+                                [("--w3cos-internal-unbroken-inline-word".into(), "1".into())],
+                            )),
                             ..small
                         },
                         children,
@@ -2132,7 +2131,7 @@ mod tests {
             font_size: 16.0,
             line_height: 1.125,
             line_height_is_normal: true,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-keyword".into(),
                 "top".into(),
             )])),
@@ -2229,7 +2228,7 @@ mod tests {
             font_size: 60.0,
             line_height: 0.4,
             line_height_is_normal: false,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2245,7 +2244,7 @@ mod tests {
             .into_iter()
             .map(|offset| {
                 let mut style = small.clone();
-                style.custom_properties = Some(HashMap::from([(
+                style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
                     "--w3cos-internal-vertical-align-length".into(),
                     format!("{offset} 0"),
                 )]));
@@ -2306,7 +2305,7 @@ mod tests {
             font_size: 60.0,
             line_height: 0.4,
             line_height_is_normal: false,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-inline-formatting-context".into(),
                 "1".into(),
             )])),
@@ -2315,7 +2314,7 @@ mod tests {
         let child = Style {
             display: Display::Inline,
             font_size: 24.0,
-            custom_properties: Some(HashMap::from([(
+            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                 "--w3cos-internal-vertical-align-length".into(),
                 "24 0".into(),
             )])),
@@ -2376,14 +2375,14 @@ mod tests {
         ] {
             for offset in [-20.0_f32, 0.0, 20.0] {
                 let leaf = Style {
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-vertical-align-keyword".into(),
                         keyword.into(),
                     )])),
                     ..small.clone()
                 };
                 let nested = Style {
-                    custom_properties: Some(HashMap::from([(
+                    custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                         "--w3cos-internal-vertical-align-length".into(),
                         format!("{offset} 0"),
                     )])),
@@ -2392,7 +2391,7 @@ mod tests {
                 let root = Component::row(
                     Style {
                         display: Display::Flex,
-                        custom_properties: Some(HashMap::from([(
+                        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
                             "--w3cos-internal-inline-formatting-context".into(),
                             "1".into(),
                         )])),
