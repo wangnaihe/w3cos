@@ -950,6 +950,9 @@ fn sync_views(changed: &Rc<RefCell<Vec<u8>>>) {
             let Some(storage) = view.storage.upgrade() else {
                 continue;
             };
+            if storage.borrow().is_lazy() {
+                continue;
+            }
             let mut decoded = Vec::with_capacity(view.length);
             for index in 0..view.length {
                 let start = view.offset + index * view.kind.bytes();
@@ -1031,16 +1034,22 @@ fn write_typed_elements(
 
 fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     let bytes = buffer_state(&buffer).expect("typed-array buffer");
-    let values = {
-        let bytes = bytes.borrow();
-        (0..length)
-            .map(|index| {
-                let start = offset + index * kind.bytes();
-                kind.decode(&bytes[start..start + kind.bytes()])
-            })
-            .collect()
+    // The bytes are the source of truth; the `Value` elements are decoded
+    // only if generic array code asks for them (see `ArrayStorage::new_lazy`).
+    let value = {
+        let bytes = bytes.clone();
+        Value::lazy_array(length, move || {
+            let bytes = bytes.borrow();
+            (0..length)
+                .filter_map(|index| {
+                    let start = offset + index * kind.bytes();
+                    bytes
+                        .get(start..start + kind.bytes())
+                        .map(|slice| kind.decode(slice))
+                })
+                .collect()
+        })
     };
-    let value = Value::array(values);
     let storage = value.as_array().expect("typed array storage");
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
@@ -2636,5 +2645,40 @@ mod tests {
             .downcast::<PanicValue>()
             .expect("exception should contain a JavaScript value");
         assert_eq!(error.0.get_property("name").to_js_string(), "TypeError");
+    }
+
+    fn is_lazy(value: &Value) -> bool {
+        value
+            .as_array()
+            .is_some_and(|array| array.borrow().is_lazy())
+    }
+
+    #[test]
+    fn typed_array_elements_decode_lazily_and_stay_coherent() {
+        let array =
+            crate::class::construct(&typed_array_class("Uint16Array"), vec![Value::Number(4.0)]);
+        assert!(is_lazy(&array));
+        // Typed access, writes and length never decode the Value elements.
+        array.set_property("1", Value::Number(513.0));
+        assert_eq!(array.get_property("1").to_number(), 513.0);
+        assert_eq!(array.get_property("length").to_number(), 4.0);
+        assert!(is_lazy(&array));
+        // A view over the same bytes sees the write; both stay lazy.
+        let bytes = array.get_property("buffer");
+        let view = crate::class::construct(&typed_array_class("Uint8Array"), vec![bytes]);
+        assert!(is_lazy(&view));
+        assert_eq!(view.get_property("2").to_number(), 1.0);
+        assert_eq!(view.get_property("3").to_number(), 2.0);
+        // Generic iteration decodes from the current bytes, then writes keep
+        // the decoded copy in sync.
+        let seen: Vec<f64> = view.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(!is_lazy(&view));
+        view.set_property("0", Value::Number(9.0));
+        array.set_property("3", Value::Number(1.0));
+        let seen: Vec<f64> = view.iter().map(|v| v.to_number()).collect();
+        assert_eq!(seen, [9.0, 0.0, 1.0, 2.0, 0.0, 0.0, 1.0, 0.0]);
+        let wide: Vec<f64> = array.iter().map(|v| v.to_number()).collect();
+        assert_eq!(wide, [9.0, 513.0, 0.0, 1.0]);
     }
 }
