@@ -42,6 +42,22 @@ pub(crate) struct RareObjectData {
     /// enumerable; `Object.defineProperty` can clear the flag so `for-in` and
     /// `CopyDataProperties` skip them, matching ECMAScript.
     non_enumerable: HashSet<String>,
+    /// Integrity level recorded by `Object.preventExtensions` / `seal` /
+    /// `freeze` so the matching `isExtensible` / `isSealed` / `isFrozen`
+    /// predicates answer consistently (graph walkers such as Code-OSS
+    /// `deepFreeze` rely on `isFrozen` to terminate on cycles). Writes are
+    /// not yet enforced.
+    pub(crate) integrity: IntegrityLevel,
+}
+
+/// ECMAScript object integrity, ordered weakest to strongest.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum IntegrityLevel {
+    #[default]
+    Extensible,
+    NonExtensible,
+    Sealed,
+    Frozen,
 }
 
 /// A JavaScript-like dynamic object with string-keyed properties,
@@ -174,6 +190,21 @@ impl JsObject {
         self.rare
             .as_ref()
             .map_or(true, |rare| !rare.non_enumerable.contains(key))
+    }
+
+    /// Raise (never lower) the recorded integrity level.
+    pub(crate) fn raise_integrity(&mut self, level: IntegrityLevel) {
+        let rare = self.ensure_rare();
+        if level > rare.integrity {
+            rare.integrity = level;
+        }
+    }
+
+    /// The recorded integrity level.
+    pub(crate) fn integrity(&self) -> IntegrityLevel {
+        self.rare
+            .as_ref()
+            .map_or(IntegrityLevel::Extensible, |rare| rare.integrity)
     }
 
     /// Mark an own property non-enumerable.
@@ -699,6 +730,7 @@ impl JsObject {
                 private_brands: HashSet::new(),
                 private_elements: HashMap::new(),
                 non_enumerable: rare.non_enumerable.clone(),
+                integrity: rare.integrity,
             })
         });
         let clone = Self {

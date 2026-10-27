@@ -1,6 +1,7 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
 use crate::Value;
+use crate::object::IntegrityLevel;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
@@ -554,9 +555,48 @@ fn build_object_value() -> Value {
             crate::class::define_property_from_js(&object, &key, &descriptor)
         }),
     );
+    for (name, level) in [
+        ("freeze", IntegrityLevel::Frozen),
+        ("seal", IntegrityLevel::Sealed),
+        ("preventExtensions", IntegrityLevel::NonExtensible),
+    ] {
+        properties.insert(
+            name.into(),
+            Value::function(move |_, arguments| {
+                let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+                if let Some(object) = target.as_object() {
+                    object.borrow_mut().raise_integrity(level);
+                }
+                target
+            }),
+        );
+    }
+    for (name, level) in [
+        ("isFrozen", IntegrityLevel::Frozen),
+        ("isSealed", IntegrityLevel::Sealed),
+    ] {
+        properties.insert(
+            name.into(),
+            Value::function(move |_, arguments| {
+                let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+                Value::Bool(match target.as_object() {
+                    Some(object) => object.borrow().integrity() >= level,
+                    // Primitives are trivially frozen and sealed; other heap
+                    // values do not record integrity yet.
+                    None => !target.is_object() && !target.is_callable(),
+                })
+            }),
+        );
+    }
     properties.insert(
-        "freeze".into(),
-        Value::function(|_, arguments| arguments.first().cloned().unwrap_or(Value::Undefined)),
+        "isExtensible".into(),
+        Value::function(|_, arguments| {
+            let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+            Value::Bool(match target.as_object() {
+                Some(object) => object.borrow().integrity() == IntegrityLevel::Extensible,
+                None => target.is_object() || target.is_callable(),
+            })
+        }),
     );
     properties.insert(
         "getOwnPropertyNames".into(),
@@ -3149,6 +3189,76 @@ mod tests {
             prototype
                 .call_method("isPrototypeOf", vec![target])
                 .to_bool()
+        );
+    }
+
+    #[test]
+    fn object_integrity_builtins_return_target_and_report_level() {
+        let object = object_value();
+        let sealed = Value::object(HashMap::new());
+        sealed.set_property("tagCheck", Value::Null);
+        assert!(
+            object
+                .call_method("seal", vec![sealed.clone()])
+                .strict_eq(&sealed)
+        );
+        // DOMPurify assigns writable props on a sealed object.
+        crate::intrinsics::set_property_strict(
+            &sealed,
+            &Value::from("tagCheck"),
+            Value::Number(1.0),
+        );
+        assert_eq!(sealed.get_property("tagCheck"), Value::Number(1.0));
+        assert!(
+            object
+                .call_method("isSealed", vec![sealed.clone()])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isFrozen", vec![sealed.clone()])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isExtensible", vec![sealed.clone()])
+                .to_bool()
+        );
+
+        let plain = Value::object(HashMap::new());
+        assert!(
+            object
+                .call_method("isExtensible", vec![plain.clone()])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isFrozen", vec![plain.clone()])
+                .to_bool()
+        );
+        object.call_method("freeze", vec![plain.clone()]);
+        assert!(
+            object
+                .call_method("isFrozen", vec![plain.clone()])
+                .to_bool()
+        );
+        // Lowering never happens: preventExtensions after freeze stays frozen.
+        object.call_method("preventExtensions", vec![plain.clone()]);
+        assert!(object.call_method("isSealed", vec![plain]).to_bool());
+
+        assert!(
+            object
+                .call_method("isFrozen", vec![Value::Number(3.0)])
+                .to_bool()
+        );
+        assert!(
+            !object
+                .call_method("isExtensible", vec![Value::Undefined])
+                .to_bool()
+        );
+        assert_eq!(
+            object.call_method("seal", vec![Value::Number(3.0)]),
+            Value::Number(3.0)
         );
     }
 
