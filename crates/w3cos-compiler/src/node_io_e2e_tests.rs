@@ -79,6 +79,29 @@ fn node_process_kill_matches_node() {
     assert_eq!(lines, expected);
 }
 
+/// Electron's process metric extensions; output matches Electron 39's shapes.
+const ELECTRON_PROCESS_METRICS: &str = r#"shared true
+memory true
+system free,swapFree,swapTotal,total
+heap number number
+blink allocated,total
+cpu number number
+io number
+created number true
+resident private,residentSet,shared number
+"#;
+
+#[test]
+fn electron_process_metric_extensions_have_electron_shapes() {
+    let lines = run(
+        "electron_process_metrics",
+        include_str!("fixtures/node_io/electron_process_metrics.js"),
+        &[],
+    );
+    let expected: Vec<&str> = ELECTRON_PROCESS_METRICS.lines().collect();
+    assert_eq!(lines, expected);
+}
+
 /// `http.createServer` over `net.Server`: Content-Length and chunked request
 /// bodies, header folding, keep-alive pipelining, chunked responses and the
 /// `upgrade` socket hand-off (Code-OSS agent host's `ws` server).
