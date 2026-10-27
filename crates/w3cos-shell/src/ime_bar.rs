@@ -1395,7 +1395,7 @@ fn soft_key(label: String, key: &str, width: f32, special: bool) -> Component {
         overflow: Overflow::Hidden,
         ..Style::default()
     };
-    style.custom_properties = Some(HashMap::from([
+    style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([
         ("--w3cos-softkey".to_string(), key.to_string()),
         ("--w3cos-ime-keep".to_string(), "1".to_string()),
     ]));
