@@ -1953,6 +1953,37 @@ fn width_limit_keywords_and_fit_content_function() {
     }
 }
 
+/// A flex item's percentage margin resolves against zero in its
+/// container's min-content size and against the container's width in
+/// layout (calc-margins-percent-flex).
+#[test]
+fn flex_item_percent_margin_is_zero_in_min_content() {
+    use w3cos_std::style::FlexDirection;
+    let mut flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        ..sized(100.0)
+    };
+    flex.width = Dimension::Auto;
+    flex.custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-width-keyword".into(),
+            "min-content".into(),
+        );
+    let mut item = Style {
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    item.margin.left = Spacing::Percent(50.0);
+    let root = node(block(), vec![node(flex, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0);
+    assert_eq!(rect(&ng, 2).0, 50.0);
+}
+
 /// Intrinsic width keywords on a flex container resolve against its own
 /// min/max-content sizes, and a grid item with one is sized by it inside
 /// its area instead of being stretched.

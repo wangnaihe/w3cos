@@ -2456,6 +2456,29 @@ fn contributing_percent_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     false
 }
 
+/// [`contributing_percent_inline`] for a flex container. Its items'
+/// percentage margins resolve against zero in the min/max-content
+/// contributions (as in Blink's flex ComputeMinMaxSizes) and against the
+/// container's inner width in layout, which `min_max_contribution` and
+/// `flex::layout` already do, so only those margins are allowed
+/// (calc-margins-percent-flex).
+fn flex_percent_below(flat: &[FlatNodeInfo], index: usize) -> bool {
+    inline::rendered_children(flat, index).any(|child| {
+        let style = flat[child].style;
+        if oof::is_out_of_flow(style) || matches!(flat[child].kind, ComponentKind::Text { .. }) {
+            return false;
+        }
+        let dim = |d: Dimension| matches!(d, Dimension::Percent(_));
+        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+        dim(style.width)
+            || dim(style.min_width)
+            || dim(style.max_width)
+            || spacing(style.padding.left)
+            || spacing(style.padding.right)
+            || contributing_percent_inline(flat, child)
+    })
+}
+
 /// [`contributing_percent_inline`] for an inline formatting context. An
 /// atomic inline is laid out at its own shrink-to-fit width, which sizes
 /// its contents from their own intrinsic sizes (this function's block,
@@ -2568,7 +2591,13 @@ pub(super) fn intrinsic_sizes_at(
     // Flex, grid and inline content size their items' percentages their own
     // way, so a percentage anywhere below them stays on legacy. The block
     // children below handle theirs (BlockNode::ComputeMinMaxSizes).
-    let percent_below = || contributing_percent_inline(flat, index);
+    let percent_below = || {
+        if is_author_flex(info.style) {
+            flex_percent_below(flat, index)
+        } else {
+            contributing_percent_inline(flat, index)
+        }
+    };
     if (is_author_flex(info.style) || is_author_grid(info.style)) && percent_below() {
         return super::bail("intrinsic-percent:flex-grid");
     }

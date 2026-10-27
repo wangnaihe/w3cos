@@ -127,12 +127,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if style.direction == TextDirection::Rtl {
         return Some("flex:rtl");
     }
-    if !matches!(
-        style.align_content,
-        AlignContent::Stretch | AlignContent::FlexStart
-    ) {
-        return Some("flex:align-content");
-    }
     let row = row_axis(style.flex_direction);
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
@@ -158,15 +152,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         }
         if subtree_has_float(flat, child) {
             return Some("flex:float-descendant");
-        }
-        // A replaced column item that does not stretch keeps the legacy
-        // fit-content width, which scales a natural size down to the line.
-        if !row_axis(style.flex_direction)
-            && !column_wrap
-            && block::is_replaced(flat[child].kind)
-            && used_align(style.align_items, child_style.align_self) != AlignItems::Stretch
-        {
-            return Some("flex:column-align-replaced");
         }
         // Percentage main sizes and percentage block descendants cycle
         // through the automatic minimum. Leave those columns on legacy.
@@ -1067,6 +1052,23 @@ fn snap_to_inner(items: &mut [Item], inner: f32, gap_sum: f32) {
     items[last].content = unit((inner - used - edges).max(items[last].min));
 }
 
+/// Leading offset and extra space between lines for `align-content`.
+/// Stretch has already grown the lines; negative free space makes the
+/// distributed values fall back to flex-start (space-between) or center.
+fn align_lines(kind: AlignContent, free: f32, count: usize) -> (f32, f32) {
+    let n = count.max(1) as f32;
+    match kind {
+        AlignContent::FlexStart | AlignContent::Stretch => (0.0, 0.0),
+        AlignContent::FlexEnd => (free, 0.0),
+        AlignContent::Center => (free / 2.0, 0.0),
+        AlignContent::SpaceBetween if free > 0.0 && count > 1 => (0.0, free / (n - 1.0)),
+        AlignContent::SpaceBetween => (0.0, 0.0),
+        AlignContent::SpaceAround if free > 0.0 => (free / n / 2.0, free / n),
+        AlignContent::SpaceEvenly if free > 0.0 => (free / (n + 1.0), free / (n + 1.0)),
+        AlignContent::SpaceAround | AlignContent::SpaceEvenly => (free / 2.0, 0.0),
+    }
+}
+
 /// `justify-content: safe <position>`.
 fn safe_justify(style: &Style) -> bool {
     style
@@ -1300,7 +1302,18 @@ pub(super) fn layout(
                 (inner_width - margin_cross_start - margin_cross_end - cross_edges).max(0.0);
             // A single-line item that does not stretch is fit-content too
             // (CSS Flexbox §9.4 hypothetical cross size).
-            let raw = if column_wrap || align != AlignItems::Stretch {
+            // A replaced item sizes as a replaced box in the line's inline
+            // size, so a ratio-only image fills it (CSS 2.1 §10.3.2).
+            let raw = if !column_wrap
+                && align != AlignItems::Stretch
+                && block::is_replaced(flat[child].kind)
+            {
+                let line = ConstraintSpace {
+                    available_inline: available,
+                    ..*space
+                };
+                block::replaced_size(flat[child].kind, child_style, &line)?.0
+            } else if column_wrap || align != AlignItems::Stretch {
                 fit_content_size(flat, child, space, available)
                     .why("flex:wrap-column-auto-cross")?
             } else {
@@ -1481,7 +1494,20 @@ pub(super) fn layout(
         .iter()
         .map(|item| item.margin_box_cross())
         .fold(0.0_f32, f32::max);
-    let definite_line = if style.align_content == AlignContent::Stretch {
+    // A nowrap container's single line fills a definite cross size
+    // whatever align-content says (CSS Flexbox §9.4 step 15). An automatic
+    // wrap column takes this path too; there only stretch and flex-start
+    // are handled.
+    let nowrap = style.flex_wrap == FlexWrap::NoWrap;
+    if !nowrap
+        && !matches!(
+            style.align_content,
+            AlignContent::Stretch | AlignContent::FlexStart
+        )
+    {
+        return super::bail("flex:align-content");
+    }
+    let definite_line = if nowrap || style.align_content == AlignContent::Stretch {
         content_cross_definite
     } else {
         None
@@ -1974,7 +2000,19 @@ fn layout_wrapped(
     let mut children = Vec::with_capacity(items.len());
     let mut oof_out = Vec::new();
     let mut frag_at = 0;
-    let mut cross_cursor = if reverse_cross { used_cross } else { 0.0 };
+    // align-content packs the lines in the free cross space (CSS Align
+    // §5.3), with the distributed values falling back when it is negative.
+    let cross_free = definite_cross.map_or(0.0, |size| size - packed);
+    let (cross_lead, cross_between) = if safe_cross && cross_free < -EPS {
+        (0.0, 0.0)
+    } else {
+        align_lines(style.align_content, cross_free, line_cross.len())
+    };
+    let mut cross_cursor = if reverse_cross {
+        used_cross - cross_lead
+    } else {
+        cross_lead
+    };
     for (line_index, &(start, end)) in lines.iter().enumerate() {
         let line_size = line_cross[line_index];
         if reverse_cross {
@@ -2089,9 +2127,9 @@ fn layout_wrapped(
             };
         }
         if reverse_cross {
-            cross_cursor -= cross_gap;
+            cross_cursor -= cross_gap + cross_between;
         } else {
-            cross_cursor += line_size + cross_gap;
+            cross_cursor += line_size + cross_gap + cross_between;
         }
     }
     // A max-height limit flexes each line but does not force the used
@@ -3232,6 +3270,42 @@ mod tests {
         expect(
             &Component::boxed(container, vec![leaf(fixed_item(100.0, 100.0))]),
             &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn align_content_distributes_wrapped_lines() {
+        // Two 40px-wide items wrap into two 20px lines in a 100px-tall row.
+        // Free cross space is 60px.
+        let lines = |kind: AlignContent, wrap: FlexWrap| {
+            let mut container = flex_style(FlexDirection::Row, 60.0, Some(100.0));
+            container.flex_wrap = wrap;
+            container.align_content = kind;
+            let root = Component::boxed(
+                container,
+                vec![leaf(fixed_item(40.0, 20.0)), leaf(fixed_item(40.0, 20.0))],
+            );
+            let out = lay(&root);
+            (rect(&out, 1)[1], rect(&out, 2)[1])
+        };
+        assert_eq!(lines(AlignContent::Center, FlexWrap::Wrap), (30.0, 50.0));
+        assert_eq!(lines(AlignContent::FlexEnd, FlexWrap::Wrap), (60.0, 80.0));
+        assert_eq!(
+            lines(AlignContent::SpaceBetween, FlexWrap::Wrap),
+            (0.0, 80.0)
+        );
+        assert_eq!(
+            lines(AlignContent::SpaceAround, FlexWrap::Wrap),
+            (15.0, 65.0)
+        );
+        assert_eq!(
+            lines(AlignContent::SpaceEvenly, FlexWrap::Wrap),
+            (20.0, 60.0)
+        );
+        // wrap-reverse: flex-end packs at the top, first line below.
+        assert_eq!(
+            lines(AlignContent::FlexEnd, FlexWrap::WrapReverse),
+            (20.0, 0.0)
         );
     }
 
