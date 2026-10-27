@@ -3893,6 +3893,9 @@ impl Value {
         if let Some(values) = self.as_array() {
             return ValueIterator::new(LiveArrayIterator { values, index: 0 });
         }
+        if self.is_string() && crate::builtins::string_iterator_is_builtin() {
+            return string_code_points(self);
+        }
         if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", vec![]) {
             return ValueIterator::new(ProtocolValueIterator {
                 iterator,
@@ -3903,16 +3906,7 @@ impl Value {
             return iterator;
         }
         match self {
-            _ if self.is_string() => {
-                let value = self.as_js_string().expect("string");
-                ValueIterator::new(
-                    value
-                        .chars()
-                        .map(|character| Value::from(character.to_string()))
-                        .collect::<Vec<_>>()
-                        .into_iter(),
-                )
-            }
+            _ if self.is_string() => string_code_points(self),
             // First use the standards-oriented Map/Set registry. Retain the
             // host runtime's snapshot hook as a fallback for its lightweight
             // built-in Map used by compiled application paths.
@@ -3972,6 +3966,18 @@ impl Value {
 /// iterator object (which would create an uncollectable reference cycle).
 pub(crate) fn self_returning_iterator_method() -> Value {
     Value::function(|this, _| this)
+}
+
+/// The code points of a string value, as one-character strings.
+pub(crate) fn string_code_points(text: &Value) -> ValueIterator {
+    let value = text.as_js_string().expect("string");
+    ValueIterator::new(
+        value
+            .chars()
+            .map(|character| Value::from(character.to_string()))
+            .collect::<Vec<_>>()
+            .into_iter(),
+    )
 }
 
 pub(crate) fn iterator_object(iterator: ValueIterator) -> Value {
@@ -5765,6 +5771,31 @@ mod tests {
             crate::builtins::object_keys(&exports).to_js_string(),
             "plain,g"
         );
+    }
+
+    #[test]
+    fn strings_expose_symbol_iterator_as_a_property() {
+        let text = Value::string("A😀b");
+        let method = text.get_property("__w3cos_symbol_iterator");
+        assert!(method.is_callable());
+        let proto = crate::builtins::string_value().get_property("prototype");
+        assert_eq!(proto.get_property("__w3cos_symbol_iterator"), method);
+        let iterator = method.call(text.clone(), vec![]);
+        let values: Vec<String> = iterator.iter().map(|v| v.to_js_string()).collect();
+        assert_eq!(values, ["A", "😀", "b"]);
+        // `for...of` keeps the native path, and honours an override.
+        assert_eq!(text.iter().count(), 3);
+        proto.set_property(
+            "__w3cos_symbol_iterator",
+            Value::function(|_, _| {
+                Value::array(vec![Value::string("z")])
+                    .call_method("__w3cos_symbol_iterator", vec![])
+            }),
+        );
+        let overridden: Vec<String> = text.iter().map(|v| v.to_js_string()).collect();
+        proto.set_property("__w3cos_symbol_iterator", method);
+        assert_eq!(overridden, ["z"]);
+        assert!(crate::builtins::string_iterator_is_builtin());
     }
 
     #[test]

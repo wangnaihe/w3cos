@@ -11,6 +11,9 @@ thread_local! {
     static OBJECT_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
     static ARRAY_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
     static STRING_CONSTRUCTOR: RefCell<Option<Value>> = const { RefCell::new(None) };
+    /// The builtin `String.prototype[Symbol.iterator]`, for the native
+    /// string fast path in `Value::iter`.
+    static STRING_ITERATOR: RefCell<Option<Value>> = const { RefCell::new(None) };
 }
 
 /// Drop cached constructors before the page arena reset.
@@ -23,6 +26,7 @@ pub fn reset_constructors() {
     drop(retired);
     ARRAY_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
     STRING_CONSTRUCTOR.with(|slot| slot.borrow_mut().take());
+    STRING_ITERATOR.with(|slot| slot.borrow_mut().take());
     ERROR_CLASSES.with(|slot| slot.borrow_mut().take());
 }
 
@@ -953,6 +957,15 @@ fn to_uint16(value: &Value) -> u16 {
 /// Hidden slot holding a `String` wrapper's primitive ([[StringData]]).
 const STRING_DATA: &str = "__w3cos_string_data";
 
+/// Whether strings still iterate with the builtin
+/// `String.prototype[Symbol.iterator]` (not overridden by the program).
+pub(crate) fn string_iterator_is_builtin() -> bool {
+    let current = string_value()
+        .get_property("prototype")
+        .get_property("__w3cos_symbol_iterator");
+    STRING_ITERATOR.with(|slot| slot.borrow().as_ref() == Some(&current))
+}
+
 pub(crate) fn string_wrapper_data(value: &Value) -> Option<Value> {
     let object = value.as_object()?;
     if !object.borrow().has_own_property(STRING_DATA) {
@@ -1085,6 +1098,24 @@ fn build_string_value() -> Value {
         });
         define_builtin(&prototype, name, method);
     }
+    // String.prototype[Symbol.iterator]: code points of ToString(this).
+    let iterator = native_function("[Symbol.iterator]", 0, |this, _| {
+        if this.is_nullish() {
+            crate::throw_value(crate::value::type_error(
+                "String.prototype[Symbol.iterator] called on null or undefined",
+            ));
+        }
+        let text = if this.is_string() {
+            this
+        } else if let Some(data) = string_wrapper_data(&this) {
+            data
+        } else {
+            Value::from(this.to_js_string())
+        };
+        crate::value::iterator_object(crate::value::string_code_points(&text))
+    });
+    STRING_ITERATOR.with(|slot| *slot.borrow_mut() = Some(iterator.clone()));
+    define_builtin(&prototype, "__w3cos_symbol_iterator", iterator);
     let constructor = Value::callable(HashMap::new(), |_, arguments| match arguments.first() {
         None => Value::string(""),
         Some(value) => Value::from(value.to_js_string()),
