@@ -390,6 +390,7 @@ pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
 pub const DOCUMENT_ELEMENT_MARKER: &str = "--w3cos-internal-document-element";
 /// Set on a block whose first line is styled by `::first-line`.
 pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
+pub const FIRST_LETTER_STYLE_MARKER: &str = "--w3cos-internal-first-letter-style";
 
 struct SelectorContextCache {
     style_clock: u64,
@@ -9164,6 +9165,10 @@ impl Document {
                 if !first_letter_declarations.is_empty()
                     && apply_first_letter_style(&mut children, &first_letter_declarations, &style)
                 {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(FIRST_LETTER_STYLE_MARKER.into(), "1".into());
                     if style.float != w3cos_std::style::Float::None {
                         let mut line_style = w3cos_std::style::Style::default();
                         line_style.display = w3cos_std::style::Display::Flex;
@@ -22387,6 +22392,65 @@ mod image_component_tests {
                     "next source fragment, generated={generated}"
                 );
             }
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn run_in_on_a_div_records_the_ua_block() {
+        fn marked(node: &w3cos_std::Component) -> bool {
+            node.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key(crate::css_style::RUN_IN_BLOCK_PROPERTY)
+                })
+                || node.children.iter().any(marked)
+        }
+        for (way, tag, expected) in [
+            ("sheet", "div", true),
+            ("sheet", "span", false),
+            ("inline", "div", true),
+        ] {
+            crate::stylesheet::clear_rules();
+            if way == "sheet" {
+                crate::stylesheet::register_rule(tag, &[("display", "run-in")]);
+            }
+            let mut document = Document::new();
+            let element = document.create_element(tag);
+            match way {
+                "inline" => element
+                    .style_mut(&mut document)
+                    .set_property("display", "run-in"),
+                _ => {}
+            }
+            let text = document.create_text_node("run-in");
+            element.append_child(&mut document, text);
+            document.body().append_child(&mut document, element);
+            let tree = document.to_component_tree();
+            assert_eq!(marked(&tree), expected, "{way} {tag}");
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn first_letter_layout_marker_requires_an_applied_fragment() {
+        fn marked(node: &w3cos_std::Component) -> bool {
+            node.style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key(FIRST_LETTER_STYLE_MARKER))
+                || node.children.iter().any(marked)
+        }
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("p::first-letter", &[("color", "green")]);
+        for (content, expected) in [("This is text", true), ("", false)] {
+            let mut document = Document::new();
+            let paragraph = document.create_element("p");
+            let text = document.create_text_node(content);
+            paragraph.append_child(&mut document, text);
+            document.body().append_child(&mut document, paragraph);
+            assert_eq!(marked(&document.to_component_tree()), expected);
         }
         crate::stylesheet::clear_rules();
     }

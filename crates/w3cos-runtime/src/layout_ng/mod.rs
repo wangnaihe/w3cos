@@ -258,6 +258,29 @@ pub(crate) fn layout_tree_with_text(
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
+    let run_in = block::run_in_block_styles(flat);
+    if !run_in.is_empty() {
+        let mut overrides = run_in.iter().peekable();
+        let patched: Vec<FlatNodeInfo> = flat
+            .iter()
+            .enumerate()
+            .map(|(index, node)| FlatNodeInfo {
+                style: overrides
+                    .next_if(|(at, _)| *at == index)
+                    .map_or(node.style, |(_, style)| style),
+                ..*node
+            })
+            .collect();
+        return layout_flat_with_text(&patched, viewport_w, viewport_h);
+    }
+    layout_flat_with_text(flat, viewport_w, viewport_h)
+}
+
+fn layout_flat_with_text(
+    flat: &[FlatNodeInfo],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
     let reason = if flat.is_empty() {
         Some("empty")
     } else {

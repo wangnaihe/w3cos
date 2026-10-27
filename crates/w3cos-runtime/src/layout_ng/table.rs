@@ -225,6 +225,18 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         if offset != 0 && percent_height(node.style) && cell_height_definite(flat, table, node) {
             return Some("table:cell-percent-height");
         }
+        // A text leaf that is itself a row, section, or column (e.g. a
+        // `display: table-row` span with only text) has no cell to hold its
+        // line; legacy paints it. Text cells and captions are laid out.
+        if matches!(node.kind, ComponentKind::Text { .. })
+            && is_table_display(node.style.display)
+            && !matches!(
+                node.style.display,
+                Display::TableCell | Display::TableCaption
+            )
+        {
+            return Some("table:text-track");
+        }
         if node.style.visibility == Visibility::Collapse
             && matches!(
                 node.style.display,

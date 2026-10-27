@@ -71,7 +71,45 @@ sets = collections.Counter(r[2] for r in res if r[1] == "fallback")
 print("top reason sets:")
 for k, v in sets.most_common(15):
     print(f"  {v:5} {k}")
-single = collections.Counter(r for x in res if x[1] == "fallback" for r in x[2].split(","))
+single = collections.Counter(r for x in res if x[1] == "fallback" for r in x[2].split(",") if r)
 print("pages blocked by reason:", dict(single.most_common()))
 if any(r[3] for r in res):
     print("pages with verify diffs:", sum(1 for r in res if r[3]))
+
+
+def _display_value(token):
+    body = token[len("unrecognized-display:"):] if token.startswith("unrecognized-display:") else token
+    value = body.split("|", 1)[0].replace("+", " ")
+    return value or "(bare)"
+
+
+# Pages whose fallback set names the unrecognized-display marker, split by
+# the authored display value. A sole-reason page has no other fallback.
+display_pages = collections.Counter()
+display_sole = collections.Counter()
+display_ctx = collections.Counter()
+unrecognized_pages = unrecognized_sole = 0
+for _path, cls, reasons, _diffs in res:
+    if cls not in ("fallback", "mixed"):
+        continue
+    tokens = [r for r in reasons.split(",") if r.startswith("unrecognized-display")]
+    if not tokens:
+        continue
+    unrecognized_pages += 1
+    only = all(r.startswith("unrecognized-display") for r in reasons.split(",") if r)
+    if only:
+        unrecognized_sole += 1
+    values = sorted({_display_value(t) for t in tokens})
+    for value in values:
+        display_pages[value] += 1
+        if only and len(values) == 1:
+            display_sole[value] += 1
+    for token in tokens:
+        display_ctx[token.replace("+", " ")] += 1
+print(f"unrecognized-display pages={unrecognized_pages} sole={unrecognized_sole}")
+print("unrecognized-display by value (pages, sole-this-value):")
+for value, count in display_pages.most_common():
+    print(f"  {count:5} sole {display_sole[value]:5} {value}")
+print("unrecognized-display by value and context:")
+for token, count in display_ctx.most_common(40):
+    print(f"  {count:5} {token}")
