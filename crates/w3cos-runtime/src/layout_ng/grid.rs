@@ -1706,6 +1706,14 @@ struct AxisPlace {
     span: usize,
 }
 
+type PlacementOrderItem = (Option<AxisPlace>, Option<AxisPlace>, i32, usize, usize);
+
+// Share the stable-sort instantiation between ordinary grids and subgrids.
+// CSS order is primary; the original child ordinal breaks ties.
+fn sort_placement_order(items: &mut [PlacementOrderItem]) {
+    items.sort_by_key(|item| (item.2, item.4));
+}
+
 fn resolve_axis(value: Option<&str>, names: &[Vec<String>], explicit: usize) -> Option<AxisPlace> {
     let Some(value) = value else {
         return Some(AxisPlace {
@@ -2675,7 +2683,7 @@ fn contribute_subgrid_columns(
             .why("grid:row")?;
         pending.push((Some(column), Some(row), child_style.order, child, ordinal));
     }
-    pending.sort_by_key(|item| (item.2, item.4));
+    sort_placement_order(&mut pending);
     let placed = place_items(&pending, span, explicit_rows, flow).why("grid:place")?;
     let mut covered_start = false;
     let mut covered_end = false;
@@ -2907,7 +2915,7 @@ pub(super) fn layout(
             .why("grid:row")?;
         pending.push((Some(column), Some(row), child_style.order, child, ordinal));
     }
-    pending.sort_by_key(|item| (item.2, item.4));
+    sort_placement_order(&mut pending);
     let placed = place_items(&pending, explicit_cols, explicit_rows, flow).why("grid:place")?;
     let mut items = Vec::new();
     for (child, col, row, col_span, row_span, source) in placed {
@@ -3601,6 +3609,22 @@ mod tests {
         AlignContent, AlignItems, BoxSizing, CustomProperties, Dimension, Display, Edges,
         JustifyContent, Position, Spacing, Style, TextDirection,
     };
+
+    #[test]
+    fn placement_sort_preserves_css_order_and_sparse_source_ordinals() {
+        let mut pending = vec![
+            (None, None, 2, 10, 1),
+            (None, None, -1, 11, 1000),
+            (None, None, 2, 12, 7),
+            (None, None, -1, 13, 2),
+            (None, None, 0, 14, 90),
+        ];
+        sort_placement_order(&mut pending);
+        assert_eq!(
+            pending.iter().map(|item| item.3).collect::<Vec<_>>(),
+            [13, 11, 14, 10, 12]
+        );
+    }
 
     fn px(v: f32) -> Spacing {
         Spacing::Px(v)
