@@ -53,6 +53,10 @@ pub const MODULES: &[(&str, &str)] = &[
         include_str!("../js/native_keymap.js"),
     ),
     (
+        "internal/w3cos_native_watchdog",
+        include_str!("../js/native_watchdog.js"),
+    ),
+    (
         "internal/w3cos_policy_watcher",
         include_str!("../js/policy_watcher.js"),
     ),
@@ -107,6 +111,8 @@ pub const NATIVE_REPLACEMENTS: &[(&str, &str)] = &[
     ("@w3cos/native-keymap", "internal/w3cos_native_keymap"),
     ("@vscode/policy-watcher", "internal/w3cos_policy_watcher"),
     ("@w3cos/policy-watcher", "internal/w3cos_policy_watcher"),
+    ("@vscode/native-watchdog", "internal/w3cos_native_watchdog"),
+    ("@w3cos/native-watchdog", "internal/w3cos_native_watchdog"),
     ("@vscode/spdlog", "internal/w3cos_spdlog"),
     ("@w3cos/spdlog", "internal/w3cos_spdlog"),
     ("@vscode/sqlite3", "internal/w3cos_sqlite3"),
