@@ -303,46 +303,61 @@ fn collection_iterator(items: Vec<Value>) -> Value {
     crate::value::iterator_object(crate::value::ValueIterator::new(items.into_iter()))
 }
 
-fn map_proto_entries(this: Value, _args: Vec<Value>) -> Value {
-    let Some(entries) = map_state_of(&this) else {
+/// `Map.prototype.{entries,keys,values}` iterator object over the live
+/// backing store: entries added during traversal are visited and deleted
+/// ones are skipped, as for-of over `map[Symbol.iterator]()` requires.
+fn live_map_iterator(this: &Value, project: fn(Value, Value) -> Value) -> Value {
+    let Some(entries) = map_state_of(this) else {
         return collection_iterator(Vec::new());
     };
-    collection_iterator(
-        entries
-            .borrow()
-            .iter()
-            .filter(|entry| entry.active)
-            .map(|entry| Value::array(vec![entry.key.clone(), entry.value.clone()]))
-            .collect(),
-    )
+    let index = Cell::new(0);
+    crate::value::iterator_object(crate::value::ValueIterator::new(
+        std::iter::from_fn(move || {
+            let entries = entries.borrow();
+            let mut cursor = index.get();
+            while cursor < entries.len() && !entries[cursor].active {
+                cursor += 1;
+            }
+            let entry = entries.get(cursor)?;
+            index.set(cursor + 1);
+            Some(project(entry.key.clone(), entry.value.clone()))
+        })
+        .fuse(),
+    ))
+}
+
+/// Live `Set.prototype.{values,entries}` iterator object; see
+/// [`live_map_iterator`].
+fn live_set_iterator(this: &Value, project: fn(Value) -> Value) -> Value {
+    let Some(values) = set_state_of(this) else {
+        return collection_iterator(Vec::new());
+    };
+    let index = Cell::new(0);
+    crate::value::iterator_object(crate::value::ValueIterator::new(
+        std::iter::from_fn(move || {
+            let values = values.borrow();
+            let mut cursor = index.get();
+            while cursor < values.len() && !values[cursor].active {
+                cursor += 1;
+            }
+            let entry = values.get(cursor)?;
+            index.set(cursor + 1);
+            Some(project(entry.value.clone()))
+        })
+        .fuse(),
+    ))
+}
+
+fn map_proto_entries(this: Value, _args: Vec<Value>) -> Value {
+    live_map_iterator(&this, |key, value| Value::array(vec![key, value]))
 }
 
 fn map_proto_keys(this: Value, _args: Vec<Value>) -> Value {
-    let Some(entries) = map_state_of(&this) else {
-        return collection_iterator(Vec::new());
-    };
-    collection_iterator(
-        entries
-            .borrow()
-            .iter()
-            .filter(|entry| entry.active)
-            .map(|entry| entry.key.clone())
-            .collect(),
-    )
+    live_map_iterator(&this, |key, _| key)
 }
 
 fn map_proto_values(this: Value, _args: Vec<Value>) -> Value {
-    let Some(entries) = map_state_of(&this) else {
-        return collection_iterator(Vec::new());
-    };
-    collection_iterator(
-        entries
-            .borrow()
-            .iter()
-            .filter(|entry| entry.active)
-            .map(|entry| entry.value.clone())
-            .collect(),
-    )
+    live_map_iterator(&this, |_, value| value)
 }
 
 fn map_proto_size(this: Value, _args: Vec<Value>) -> Value {
@@ -463,31 +478,11 @@ fn set_proto_for_each(this: Value, args: Vec<Value>) -> Value {
 }
 
 fn set_proto_values(this: Value, _args: Vec<Value>) -> Value {
-    let Some(values) = set_state_of(&this) else {
-        return collection_iterator(Vec::new());
-    };
-    collection_iterator(
-        values
-            .borrow()
-            .iter()
-            .filter(|entry| entry.active)
-            .map(|entry| entry.value.clone())
-            .collect(),
-    )
+    live_set_iterator(&this, |value| value)
 }
 
 fn set_proto_entries(this: Value, _args: Vec<Value>) -> Value {
-    let Some(values) = set_state_of(&this) else {
-        return collection_iterator(Vec::new());
-    };
-    collection_iterator(
-        values
-            .borrow()
-            .iter()
-            .filter(|entry| entry.active)
-            .map(|entry| Value::array(vec![entry.value.clone(), entry.value.clone()]))
-            .collect(),
-    )
+    live_set_iterator(&this, |value| Value::array(vec![value.clone(), value]))
 }
 
 fn set_proto_size(this: Value, _args: Vec<Value>) -> Value {
@@ -751,6 +746,55 @@ mod tests {
     /// Drain an iterator result into a comma-joined string.
     fn drained(iterator: &Value) -> String {
         Value::array(iterator.iter().collect()).to_js_string()
+    }
+
+    #[test]
+    fn collection_iterator_objects_observe_live_mutation() {
+        // test262 for-of/{map,set}-{expand,contract}: for-of drives
+        // `[Symbol.iterator]()`, so the iterator objects must be live.
+        let map = new_map(vec![Value::array(vec![pair(
+            Value::Number(0.0),
+            Value::string("a"),
+        )])]);
+        let entries = map.call_method("entries", vec![]);
+        let first = entries.call_method("next", vec![]);
+        assert!(!first.get_property("done").to_bool());
+        map.call_method("set", vec![Value::Number(1.0), Value::string("b")]);
+        let second = entries.call_method("next", vec![]);
+        assert_eq!(second.get_property("value").to_js_string(), "1,b");
+        assert!(
+            entries
+                .call_method("next", vec![])
+                .get_property("done")
+                .to_bool()
+        );
+        map.call_method("set", vec![Value::Number(2.0), Value::string("c")]);
+        assert!(
+            entries
+                .call_method("next", vec![])
+                .get_property("done")
+                .to_bool()
+        );
+
+        let set = construct(
+            &set_class(),
+            vec![Value::array(vec![Value::Number(1.0), Value::Number(2.0)])],
+        );
+        let values = set.call_method("values", vec![]);
+        assert_eq!(
+            values
+                .call_method("next", vec![])
+                .get_property("value")
+                .to_number(),
+            1.0
+        );
+        set.call_method("delete", vec![Value::Number(2.0)]);
+        assert!(
+            values
+                .call_method("next", vec![])
+                .get_property("done")
+                .to_bool()
+        );
     }
 
     #[test]
