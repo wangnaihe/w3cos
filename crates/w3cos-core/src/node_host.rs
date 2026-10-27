@@ -962,12 +962,58 @@ fn build_host() -> Value {
             }
         }
     });
+    // compiledModule(path) -> whether the path is a module of the compiled graph.
+    // requireCompiled(path) -> module.exports (CommonJS) / namespace (ESM)
+    // of a module linked into the app, or undefined when the path is not in
+    // the compiled graph. Lets `require(absolutePath)` reach modules the app
+    // declares for run-time loading (`package.json` `"w3cos": { "modules" }`).
+    define(&host, "compiledModule", |args| {
+        Value::Bool(crate::module_registry::contains(&arg(&args, 0).to_js_string()))
+    });
+    define(&host, "requireCompiled", |args| {
+        require_compiled(&arg(&args, 0).to_js_string()).unwrap_or(Value::Undefined)
+    });
     crate::node_host_io::install(&host);
     crate::node_workers::install(&host);
     for install in EXTENSIONS.lock().unwrap().iter() {
         install(&host);
     }
     host
+}
+
+/// Evaluate a compiled module by path for a run-time `require()`.
+///
+/// Lazily linked modules (declared run-time roots) evaluate their static
+/// closure through the dynamic-import adapter; statically linked modules are
+/// evaluated (or already were) in place. A CommonJS file's facade default is
+/// its `module.exports`; an ES module yields its namespace, as in Node's
+/// `require(esm)`. An evaluation error is rethrown.
+pub fn require_compiled(path: &str) -> Option<Value> {
+    use crate::module_registry;
+    if !module_registry::contains(path) {
+        return None;
+    }
+    let loaded = crate::host_modules::dynamic_import(Value::from(path), Value::from(path));
+    if let Some(crate::promise::PromiseStatus::Rejected(_)) = crate::promise::status(&loaded) {
+        // Not a lazily linked root: mark the probe handled and evaluate in place.
+        let _ = crate::intrinsics::call_method(
+            &loaded,
+            &Value::from("catch"),
+            vec![Value::function(|_, _| Value::Undefined)],
+        );
+    }
+    if let Some(crate::promise::PromiseStatus::Rejected(error)) =
+        module_registry::evaluate(path).as_ref().and_then(crate::promise::status)
+    {
+        crate::throw_value(error);
+    }
+    let commonjs = module_registry::contains(&format!("{path}.w3cos-cjs.js"));
+    if commonjs {
+        if let Some(binding) = module_registry::export(path, "default") {
+            return Some(binding.read());
+        }
+    }
+    module_registry::namespace(path)
 }
 
 /// Canonical digest name for Node's spellings (`SHA256`, `sha-256`, `RSA-SHA1`).

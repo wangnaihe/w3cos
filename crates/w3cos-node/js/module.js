@@ -4,10 +4,15 @@
 // An AOT app is linked at compile time, so there is no module loader to
 // hook. The compiler turns literal calls of a `createRequire` result into
 // static imports (`w3cos-compiler/src/create_require.rs`); what reaches this
-// glue at run time is a computed specifier, which only a loader could serve,
-// so it throws a coded error. The resolution hooks Code-OSS installs
-// (`registerHooks`, `_resolveLookupPaths`, the compile cache) are accepted
-// and have nothing to act on.
+// glue at run time is a computed specifier. An absolute or relative path to a
+// module of the compiled graph (an app's run-time roots, `package.json`
+// `"w3cos": { "modules": [...] }`, e.g. Code-OSS extension entry points
+// loaded through `createRequire(import.meta.url)(fsPath)`) is served from
+// it; anything else would need a loader, so it throws a coded error. As in
+// Node, `require` goes through `Module._load`, so loaders patched over it
+// (the Code-OSS extension host's `vscode` interceptor) see every request.
+// The other resolution hooks (`registerHooks`, `_resolveLookupPaths`, the
+// compile cache) are accepted and have nothing to act on.
 
 const builtinModules = [
   '_http_agent', '_http_client', '_http_common', '_http_incoming', '_http_outgoing',
@@ -40,6 +45,65 @@ function dynamicRequireError(specifier) {
   return error;
 }
 
+const host = typeof __w3cos_node_host === 'undefined' ? undefined : __w3cos_node_host;
+
+function filePath(value) {
+  let path = String(value && typeof value.href === 'string' ? value.href : value);
+  if (path.indexOf('file://') === 0) {
+    path = path.slice(7);
+    const hash = path.search(/[?#]/);
+    if (hash !== -1) path = path.slice(0, hash);
+    try {
+      path = decodeURIComponent(path);
+    } catch (_) {}
+  }
+  return path;
+}
+
+function normalizePath(path) {
+  const segments = [];
+  const parts = path.split('/');
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part === '' || part === '.') continue;
+    if (part === '..') segments.pop();
+    else segments.push(part);
+  }
+  return '/' + segments.join('/');
+}
+
+function dirnameOf(path) {
+  const slash = path.lastIndexOf('/');
+  return slash <= 0 ? '/' : path.slice(0, slash);
+}
+
+const compiledSuffixes = ['', '.js', '.cjs', '.mjs', '.json', '/index.js', '/index.cjs', '/index.mjs', '/index.json'];
+
+// The compiled module path `request` names from `parentFilename`, or undefined.
+function resolveCompiled(request, parentFilename) {
+  if (!host || typeof host.compiledModule !== 'function' || typeof request !== 'string') return undefined;
+  let base;
+  const spec = request.indexOf('file://') === 0 ? filePath(request) : request;
+  if (spec.charAt(0) === '/') {
+    base = spec;
+  } else if (spec === '.' || spec === '..' || spec.indexOf('./') === 0 || spec.indexOf('../') === 0) {
+    if (typeof parentFilename !== 'string' || parentFilename.charAt(0) !== '/') return undefined;
+    base = dirnameOf(parentFilename) + '/' + spec;
+  } else {
+    return undefined;
+  }
+  base = normalizePath(base);
+  for (let i = 0; i < compiledSuffixes.length; i++) {
+    const candidate = base + compiledSuffixes[i];
+    if (host.compiledModule(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function parentFilenameOf(parent) {
+  return parent && typeof parent.filename === 'string' ? parent.filename : undefined;
+}
+
 function createRequire(filename) {
   if (typeof filename !== 'string' && !(filename && typeof filename.href === 'string')) {
     const error = new TypeError(
@@ -48,12 +112,15 @@ function createRequire(filename) {
     error.code = 'ERR_INVALID_ARG_VALUE';
     throw error;
   }
+  const parent = new Module(filePath(filename), undefined);
+  parent.filename = parent.id;
+  parent.path = dirnameOf(parent.id);
+  parent.paths = nodeModulePaths(parent.path);
   function require(specifier) {
-    throw dynamicRequireError(specifier);
+    return Module._load(specifier, parent, false);
   }
   require.resolve = function resolve(specifier) {
-    if (isBuiltin(specifier)) return specifier;
-    throw dynamicRequireError(specifier);
+    return Module._resolveFilename(specifier, parent, false);
   };
   require.resolve.paths = function paths(specifier) {
     return isBuiltin(specifier) ? null : [];
@@ -98,12 +165,16 @@ Module._resolveLookupPaths = function _resolveLookupPaths(request, parent) {
   if (isBuiltin(request)) return null;
   return parent && parent.paths ? parent.paths.slice() : [];
 };
-Module._resolveFilename = function _resolveFilename(request) {
+Module._resolveFilename = function _resolveFilename(request, parent) {
   if (isBuiltin(request)) return request;
+  const resolved = resolveCompiled(request, parentFilenameOf(parent));
+  if (resolved !== undefined) return resolved;
   throw dynamicRequireError(request);
 };
-Module._load = function _load(request) {
-  throw dynamicRequireError(request);
+Module._load = function _load(request, parent) {
+  const resolved = resolveCompiled(request, parentFilenameOf(parent));
+  if (resolved === undefined) throw dynamicRequireError(request);
+  return host.requireCompiled(resolved);
 };
 Module.register = function register() {};
 Module.registerHooks = function registerHooks() {
