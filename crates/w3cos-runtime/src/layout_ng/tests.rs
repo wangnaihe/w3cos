@@ -6221,3 +6221,72 @@ fn flex_stretched_aspect_ratio_item_min_content_width() {
     assert_eq!(rect(&ng, 2).2, 50.0);
     assert_eq!(rect(&ng, 3), (0.0, 0.0, 50.0, 50.0));
 }
+
+fn with_markers(mut style: Style, markers: &[(&str, &str)]) -> Style {
+    let props = style.custom_properties.get_or_insert_with(Default::default);
+    for (key, value) in markers {
+        props.insert((*key).into(), (*value).into());
+    }
+    style
+}
+
+/// A `width: min-content` block sizes to its block child's width
+/// transferred from a definite height through `aspect-ratio`, and a
+/// `width: min-content` aspect-ratio box with a definite height is that
+/// transferred width, floored by its content under `min-width: auto`
+/// (css-sizing aspect-ratio/intrinsic-size-001, -004, -010, -014).
+#[test]
+fn block_min_content_uses_aspect_ratio_with_definite_height() {
+    let ratio = |r: &str, height: f32| {
+        with_markers(
+            Style {
+                height: Dimension::Px(height),
+                ..block()
+            },
+            &[("--w3cos-internal-aspect-ratio", r)],
+        )
+    };
+    let min_content =
+        |style: Style| with_markers(style, &[("--w3cos-internal-width-keyword", "min-content")]);
+    let wide = || {
+        node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(1.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            // 001: auto-width child, 100px tall, 1/1.
+            node(
+                min_content(Style {
+                    height: Dimension::Px(100.0),
+                    ..block()
+                }),
+                vec![node(ratio("1", 100.0), vec![])],
+            ),
+            // 004: min-content width, 50px tall, 2/1.
+            node(min_content(ratio("2", 50.0)), vec![]),
+            // 010: 25px tall, 1/1, 100px-wide content.
+            node(min_content(ratio("1", 25.0)), vec![wide()]),
+            // 014: min-content block around a min-content 1/1 child.
+            node(
+                min_content(block()),
+                vec![node(min_content(ratio("1", 100.0)), vec![])],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0, "001 outer");
+    assert_eq!(rect(&ng, 2).2, 100.0, "001 child");
+    assert_eq!(rect(&ng, 3).2, 100.0, "004");
+    assert_eq!(rect(&ng, 4).2, 100.0, "010");
+    assert_eq!(rect(&ng, 6).2, 100.0, "014 outer");
+    assert_eq!(rect(&ng, 7).2, 100.0, "014 child");
+}

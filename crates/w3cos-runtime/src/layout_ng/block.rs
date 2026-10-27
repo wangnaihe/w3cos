@@ -2750,7 +2750,14 @@ pub(super) fn intrinsic_sizes_at(
             }),
             None => {
                 let sizes = intrinsic_sizes(flat, child, space).why("intrinsic")?;
-                keyword_width_contribution(flat, child, space, edges, sizes)?
+                // An aspect-ratio box with a definite height contributes
+                // its transferred width (aspect-ratio/intrinsic-size-001).
+                let block_edges =
+                    b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
+                match ratio_inline_contribution(flat, child, space, edges, block_edges, sizes)? {
+                    Some(inline) => MinMax::exact(inline),
+                    None => keyword_width_contribution(flat, child, space, edges, sizes)?,
+                }
             }
         };
         let (min_kw, max_kw) = keyword_inline_limits(flat, child, space, edges, None, None)?;
@@ -2841,6 +2848,54 @@ fn child_percentage_block(style: &Style, space: &ConstraintSpace) -> Option<f32>
     Some(height)
 }
 
+/// An auto inline size transferred from a definite block size through the
+/// aspect ratio of a non-replaced box without a width keyword, floored by
+/// the automatic minimum (min-content) of a non-scroll container.
+/// `Some(None)` when there is no such ratio or block size.
+fn ratio_inline_contribution(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    edges: f32,
+    block_edges: f32,
+    sizes: MinMax,
+) -> Option<Option<f32>> {
+    if marker(flat[index].style, WIDTH_KEYWORD).is_some() {
+        return Some(None);
+    }
+    ratio_inline_size(flat, index, space, edges, block_edges, sizes)
+}
+
+/// [`ratio_inline_contribution`] whatever the `width`: Blink's
+/// ComputeMinMaxSizes of a box with an aspect ratio and a definite block
+/// size is the transferred inline size, which intrinsic `width` keywords
+/// then resolve against (aspect-ratio/intrinsic-size-004, -014).
+fn ratio_inline_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    edges: f32,
+    block_edges: f32,
+    sizes: MinMax,
+) -> Option<Option<f32>> {
+    let style = flat[index].style;
+    if is_replaced(flat[index].kind) || size_contained(style) {
+        return Some(None);
+    }
+    let Some(ratio) = BoxAspectRatio::new(style, edges, block_edges) else {
+        return Some(None);
+    };
+    let Some(height) = child_percentage_block(style, space) else {
+        return Some(None);
+    };
+    let floor = if style.min_width == Dimension::Auto && !non_visible_overflow(style) {
+        sizes.min.or_else(|| super::bail("aspect-ratio-min"))?
+    } else {
+        0.0
+    };
+    Some(Some(ratio.inline_from_block(height).max(floor)))
+}
+
 /// ComputeMinAndMaxContentContribution of a child: its margin box, from a
 /// definite width or its own intrinsic sizes, clamped by min/max-width.
 pub(super) fn min_max_contribution(
@@ -2870,23 +2925,9 @@ pub(super) fn min_max_contribution(
         }
         None => {
             let sizes = intrinsic_sizes(flat, index, space).why("intrinsic")?;
-            // An auto inline size transferred from a definite block size
-            // through the aspect ratio, floored by the automatic minimum
-            // (min-content) of a non-scroll container.
             let block_edges = b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
-            let ratio = (!is_replaced(flat[index].kind) && marker(style, WIDTH_KEYWORD).is_none())
-                .then(|| BoxAspectRatio::new(style, edges, block_edges))
-                .flatten();
-            match ratio.zip(child_percentage_block(style, space)) {
-                Some((ratio, height)) => {
-                    let floor =
-                        if style.min_width == Dimension::Auto && !non_visible_overflow(style) {
-                            sizes.min.or_else(|| super::bail("aspect-ratio-min"))?
-                        } else {
-                            0.0
-                        };
-                    MinMax::exact(ratio.inline_from_block(height).max(floor))
-                }
+            match ratio_inline_contribution(flat, index, space, edges, block_edges, sizes)? {
+                Some(inline) => MinMax::exact(inline),
                 None => sizes,
             }
         }
@@ -2925,6 +2966,16 @@ pub(super) fn keyword_width_contribution(
     {
         return Some(sizes);
     }
+    let side = |s: Spacing| match s {
+        Spacing::Auto => 0.0,
+        s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
+    };
+    let b = border(style);
+    let block_edges = b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
+    let sizes = match ratio_inline_size(flat, index, space, edges, block_edges, sizes)? {
+        Some(inline) => MinMax::exact(inline),
+        None => sizes,
+    };
     let min = sizes.min.or_else(|| super::bail("width-keyword-min"))?;
     Some(
         match keyword_content_size(keyword, min, sizes.max, None, None, style, space, edges) {
@@ -3120,8 +3171,14 @@ fn keyword_inline_size(
     keyword: &str,
 ) -> Option<f32> {
     let sizes = intrinsic_sizes(flat, index, space).why("width-keyword")?;
-    let min = sizes.min.or_else(|| super::bail("width-keyword-min"))?;
     let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+    let block_edges =
+        metrics.border[0] + metrics.border[2] + metrics.padding[0] + metrics.padding[2];
+    let sizes = match ratio_inline_size(flat, index, space, edges, block_edges, sizes)? {
+        Some(inline) => MinMax::exact(inline),
+        None => sizes,
+    };
+    let min = sizes.min.or_else(|| super::bail("width-keyword-min"))?;
     let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
     keyword_content_size(
         keyword,
