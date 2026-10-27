@@ -2451,13 +2451,12 @@ impl Value {
             _ if self.is_string() => {
                 let s = self.as_js_string().expect("string");
                 if let Ok(idx) = key.parse::<usize>() {
-                    s.encode_utf16()
-                        .nth(idx)
+                    utf16_unit_at(&s, idx)
                         .and_then(|unit| String::from_utf16(&[unit]).ok())
                         .map(Value::from)
                         .unwrap_or(Value::Undefined)
                 } else if key == "length" {
-                    Value::Number(s.encode_utf16().count() as f64)
+                    Value::Number(utf16_len(&s) as f64)
                 } else {
                     // ToObject(string) inherits String.prototype: `s.startsWith`
                     // and `s?.startsWith(...)` read the method by value.
@@ -4120,6 +4119,40 @@ thread_local! {
     /// parse is quadratic in the text length.
     static UTF16_CURSOR: RefCell<Option<(crate::JsString, usize, usize)>> =
         const { RefCell::new(None) };
+}
+
+thread_local! {
+    /// The last long string whose UTF-16 length was measured. `s.length`
+    /// in a scanner loop (`while (i < s.length)`) reads it once per step;
+    /// re-encoding the whole text each time makes the loop quadratic.
+    /// Holding a clone keeps the `Rc` shared, so the text cannot be
+    /// mutated in place while cached.
+    static UTF16_LEN: RefCell<Option<(crate::JsString, usize)>> =
+        const { RefCell::new(None) };
+}
+
+/// `String.prototype.length`: the UTF-16 length, amortized O(1) for
+/// repeated reads of the same long string.
+pub(crate) fn utf16_len(value: &crate::JsString) -> usize {
+    let text = value.as_str();
+    if text.len() < UTF16_CURSOR_MIN_LEN {
+        return text.encode_utf16().count();
+    }
+    if let Some(len) = UTF16_LEN.with(|cache| match &*cache.borrow() {
+        Some((cached, len)) if cached.ptr_eq(value) && cached.as_str().len() == text.len() => {
+            Some(*len)
+        }
+        _ => None,
+    }) {
+        return len;
+    }
+    let len = if text.is_ascii() {
+        text.len()
+    } else {
+        text.encode_utf16().count()
+    };
+    UTF16_LEN.with(|cache| *cache.borrow_mut() = Some((value.clone(), len)));
+    len
 }
 
 /// The UTF-16 code unit at `index` (`String.prototype.charCodeAt`), or
@@ -5873,6 +5906,34 @@ mod tests {
                 .to_number();
         }
         assert_eq!(sum, text.bytes().map(f64::from).sum::<f64>());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn long_string_length_and_index_scan_is_linear() {
+        // `for (i = 0; i < s.length; i++) s[i]` over a 2 MB string: each
+        // step reads `length` and an index; both must be amortized O(1).
+        let text = "{\"k\": [1, 2, 3]}\n".repeat(120_000);
+        let value = Value::from(text.as_str());
+        let other = Value::from("\u{e9}\u{1f600}".repeat(200).as_str());
+        let started = std::time::Instant::now();
+        let mut index = 0usize;
+        let mut bytes = 0usize;
+        while (index as f64) < value.get_property("length").to_number() {
+            bytes += value.get_property(&index.to_string()).to_js_string().len();
+            if index % 50_000 == 0 {
+                // Another long string takes over the caches; non-ASCII
+                // lengths count UTF-16 units (astral = 2).
+                assert_eq!(other.get_property("length"), Value::Number(600.0));
+                assert_eq!(other.get_property("0"), Value::from("\u{e9}"));
+            }
+            index += 1;
+        }
+        assert_eq!((index, bytes), (text.len(), text.len()));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "{:?}",
