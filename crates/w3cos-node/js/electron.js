@@ -507,6 +507,8 @@ class BrowserWindow extends EventEmitter {
       width: opts.width === undefined ? 800 : opts.width,
       height: opts.height === undefined ? 600 : opts.height,
     };
+    this._minSize = [opts.minWidth || 0, opts.minHeight || 0];
+    this._maxSize = [opts.maxWidth || 0, opts.maxHeight || 0];
     this._title = opts.title === undefined ? appName : String(opts.title);
     this._visible = opts.show !== false;
     this._destroyed = false;
@@ -547,8 +549,11 @@ class BrowserWindow extends EventEmitter {
   getMediaSourceId() { return 'window:' + this.id + ':0'; }
   setPosition(x, y) { this._bounds.x = x; this._bounds.y = y; this.emit('move'); }
   center() {}
-  setMinimumSize() {}
-  setMaximumSize() {}
+  // Electron returns [width, height]; 0 means "no constraint".
+  setMinimumSize(width, height) { this._minSize = [width | 0, height | 0]; }
+  getMinimumSize() { return this._minSize.slice(); }
+  setMaximumSize(width, height) { this._maxSize = [width | 0, height | 0]; }
+  getMaximumSize() { return this._maxSize.slice(); }
   setResizable() {}
   isResizable() { return true; }
   show() { this._visible = true; this.emit('show'); }

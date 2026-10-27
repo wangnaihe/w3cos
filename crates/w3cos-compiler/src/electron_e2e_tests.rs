@@ -479,6 +479,10 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({ show: false })
   const handle = win.getNativeWindowHandle()
   console.log('window', Buffer.isBuffer(handle), handle.length, handle.buffer instanceof ArrayBuffer, handle.readUInt32LE(0) === win.id, win.getMediaSourceId() === 'window:' + win.id + ':0')
+  const sized = new BrowserWindow({ show: false, minWidth: 400, minHeight: 270 })
+  const before = sized.getMinimumSize().join('x')
+  sized.setMinimumSize(500, 300)
+  console.log('minsize', before, sized.getMinimumSize().join('x'), win.getMinimumSize().join('x'), win.getMaximumSize().join('x'), sized.getSize().join('x'))
   app.quit()
 })
 "#,
@@ -506,6 +510,7 @@ fn electron_main_process_service_modules() {
             "notification false t",
             "tracing [] []",
             "window true 8 true true true",
+            "minsize 400x270 500x300 0x0 0x0 800x600",
         ],
         "{lines:#?}"
     );

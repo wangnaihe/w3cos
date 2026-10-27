@@ -57,6 +57,7 @@ console.log("custom", util.inspect(custom), util.inspect.custom === Symbol.for("
 const url = require("url");
 console.log("fileURLToPath", url.fileURLToPath("file:///tmp/a%20b.txt"), url.pathToFileURL("/tmp/x y#1.txt").href);
 console.log("url format", url.format({ protocol: "https", hostname: "example.com", pathname: "/p", query: { q: "1 2" } }));
+const lp = require("url").parse("http://u:p@Example.COM:8080/a b?x=1&y=2#h", true); console.log("url parse", lp.protocol, lp.auth, lp.host, lp.hostname, lp.port, lp.pathname, lp.search, lp.query.y, lp.hash, lp.href, require("url").parse("/rel?q").path, require("url").parse("localhost:3000").hostname, require("url").resolve("http://a.com/b/c", "../d"), require("url").format("HTTP://X.com"));
 console.log("URL", new url.URL("https://a.b/c?d=1").searchParams.get("d"), url.URL === URL);
 try { url.fileURLToPath("https://x/y"); } catch (e) { console.log("url err", e.code); }
 
@@ -112,6 +113,7 @@ types true true true true true
 custom CUSTOM true
 fileURLToPath /tmp/a b.txt file:///tmp/x%20y%231.txt
 url format https://example.com/p?q=1%202
+url parse http: u:p example.com:8080 example.com 8080 /a%20b ?x=1&y=2 2 #h http://u:p@example.com:8080/a%20b?x=1&y=2#h /rel?q 3000 http://a.com/d http://x.com/
 URL 1 true
 url err ERR_INVALID_URL_SCHEME
 os "\n" linux Linux LE string string 15 2
