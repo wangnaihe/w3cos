@@ -185,6 +185,37 @@ proc.memoryUsage.rss = function rss() { return 0; };
 proc.cpuUsage = function cpuUsage() { return { user: 0, system: 0 }; };
 proc.resourceUsage = function resourceUsage() { return {}; };
 
+// Electron's process extensions (main, renderer preload, utility). Code-OSS
+// reads them for startup telemetry (timerService `getProcessMemoryInfo()
+// .residentSet`). Like `memoryUsage`, the runtime reports no live numbers
+// yet, but the shapes match Electron so callers do not throw. Sizes are KB.
+const creationTime = Date.now();
+proc.getProcessMemoryInfo = function getProcessMemoryInfo() {
+  return Promise.resolve({ residentSet: 0, private: 0, shared: 0 });
+};
+proc.getSystemMemoryInfo = function getSystemMemoryInfo() {
+  return { total: 0, free: 0, swapTotal: 0, swapFree: 0 };
+};
+proc.getHeapStatistics = function getHeapStatistics() {
+  return {
+    totalHeapSize: 0, totalHeapSizeExecutable: 0, totalPhysicalSize: 0, totalAvailableSize: 0,
+    usedHeapSize: 0, heapSizeLimit: 0, mallocedMemory: 0, peakMallocedMemory: 0, doesZapGarbage: false,
+  };
+};
+proc.getBlinkMemoryInfo = function getBlinkMemoryInfo() {
+  return { allocated: 0, total: 0 };
+};
+proc.getCPUUsage = function getCPUUsage() {
+  return { percentCPUUsage: 0, cumulativeCPUUsage: 0, idleWakeupsPerSecond: 0 };
+};
+proc.getIOCounters = function getIOCounters() {
+  return {
+    readOperationCount: 0, writeOperationCount: 0, otherOperationCount: 0,
+    readTransferCount: 0, writeTransferCount: 0, otherTransferCount: 0,
+  };
+};
+proc.getCreationTime = function getCreationTime() { return creationTime; };
+
 proc.emitWarning = function emitWarning(warning, type, code) {
   if (typeof type === 'object' && type !== null) {
     code = type.code;
