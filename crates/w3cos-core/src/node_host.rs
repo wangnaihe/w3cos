@@ -187,6 +187,43 @@ pub(crate) fn data_bytes(value: &Value) -> Vec<u8> {
     crate::binary::bytes_of(value).unwrap_or_else(|| value.to_js_string().into_bytes())
 }
 
+/// Bytes of `text` in a Node `Buffer` string encoding (`utf8`, `hex`,
+/// `latin1`, `utf16le`); `None` for an encoding handled in JS.
+pub(crate) fn encode_string_bytes(text: &str, encoding: &str) -> Option<Vec<u8>> {
+    match encoding {
+        "utf8" => Some(text.as_bytes().to_vec()),
+        "hex" => Some(hex_decode(text)),
+        "latin1" | "ascii" => Some(text.encode_utf16().map(|unit| unit as u8).collect()),
+        "utf16le" => Some(
+            text.encode_utf16()
+                .flat_map(|unit| unit.to_le_bytes())
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Lower-case hex text of `bytes`.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 15) as usize] as char);
+    }
+    out
+}
+
+/// Node's lenient hex decode: stops at the first non-hex pair, ignores a
+/// trailing odd digit.
+pub(crate) fn hex_decode(text: &str) -> Vec<u8> {
+    let digit = |byte: u8| (byte as char).to_digit(16);
+    text.as_bytes()
+        .chunks_exact(2)
+        .map_while(|pair| Some((digit(pair[0])? << 4 | digit(pair[1])?) as u8))
+        .collect()
+}
+
 fn millis(time: io::Result<SystemTime>) -> f64 {
     time.ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -519,6 +556,27 @@ fn build_host() -> Value {
             Ok(bytes) => Value::from(String::from_utf8_lossy(&bytes).into_owned()),
             Err(error) => throw_io(error, "open", Some(&path), None),
         }
+    });
+    define(&host, "encodeString", |args| {
+        let text = arg(&args, 0).to_js_string();
+        let encoding = arg(&args, 1).to_js_string();
+        match encode_string_bytes(&text, &encoding) {
+            Some(bytes) => crate::binary::array_buffer_value(bytes),
+            None => Value::Undefined,
+        }
+    });
+    define(&host, "hexEncode", |args| {
+        let bytes = crate::binary::bytes_of(&arg(&args, 0)).unwrap_or_default();
+        let start = (arg(&args, 1).to_number().max(0.0) as usize).min(bytes.len());
+        let end = if arg(&args, 2).is_undefined() {
+            bytes.len()
+        } else {
+            (arg(&args, 2).to_number().max(0.0) as usize).min(bytes.len())
+        };
+        Value::from(hex_encode(&bytes[start..end.max(start)]))
+    });
+    define(&host, "hexDecode", |args| {
+        crate::binary::array_buffer_value(hex_decode(&arg(&args, 0).to_js_string()))
     });
     define(&host, "writeFile", |args| {
         let path = path_arg(&args, 0);
@@ -1190,6 +1248,29 @@ impl FalseFlag for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_codecs_match_node() {
+        assert_eq!(
+            encode_string_bytes("a\u{e9}\u{20ac}\u{1f600}", "utf8")
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(
+            encode_string_bytes("a\u{e9}\u{100}", "latin1").unwrap(),
+            [0x61, 0xe9, 0x00]
+        );
+        assert_eq!(
+            encode_string_bytes("a\u{20ac}", "utf16le").unwrap(),
+            [0x61, 0, 0xac, 0x20]
+        );
+        assert!(encode_string_bytes("x", "base64").is_none());
+        assert_eq!(hex_encode(&[0, 15, 16, 255]), "000f10ff");
+        assert_eq!(hex_decode("000F10ffz"), [0, 15, 16, 255]);
+        assert_eq!(hex_decode("00zz10"), [0]);
+        assert_eq!(hex_decode("abc"), [0xab]);
+    }
 
     #[test]
     fn errors_are_node_shaped() {
