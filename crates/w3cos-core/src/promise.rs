@@ -481,20 +481,10 @@ pub fn reject(args: Vec<Value>) -> Value {
 /// `Promise.all(iterable)` — fulfilled with the results array once every
 /// item fulfills, or rejected with the first rejection. Empty → `[]`.
 pub fn all(args: Vec<Value>) -> Value {
-    let items = match args.first() {
-        None => Vec::new(),
-        Some(v) if v.is_nullish() => Vec::new(),
-        Some(items) if items.as_array().is_some() => items
-            .as_array()
-            .expect("array")
-            .borrow()
-            .iter()
-            .cloned()
-            .map(crate::value::array_slot_value)
-            .collect(),
-        Some(_) => {
-            return reject(vec![js_error("TypeError: Promise.all expects an array")]);
-        }
+    let Some(items) = combinator_items(&args) else {
+        return reject(vec![crate::value::type_error(
+            "Promise.all expects an iterable",
+        )]);
     };
     let state = pending_state();
     let promise = promise_value_from_state(&state);
@@ -534,16 +524,10 @@ pub fn all(args: Vec<Value>) -> Value {
 
 /// `Promise.race(iterable)` — settles with the first item that settles.
 pub fn race(args: Vec<Value>) -> Value {
-    let items = match args.first() {
-        Some(items) if items.as_array().is_some() => items
-            .as_array()
-            .expect("array")
-            .borrow()
-            .iter()
-            .cloned()
-            .map(crate::value::array_slot_value)
-            .collect(),
-        _ => Vec::new(),
+    let Some(items) = combinator_items(&args) else {
+        return reject(vec![crate::value::type_error(
+            "Promise.race expects an iterable",
+        )]);
     };
     let state = pending_state();
     let promise = promise_value_from_state(&state);
@@ -571,6 +555,10 @@ pub fn race(args: Vec<Value>) -> Value {
 
 /// The items of a `Promise.<combinator>(array)` argument (`None` when it is
 /// not an array; nullish counts as empty, like [`all`]).
+/// Items of a combinator's `iterable` argument: arrays read their slots
+/// directly; any other iterable (Set, Map, generators, typed arrays,
+/// strings, `__w3cos_symbol_iterator` objects) is iterated, as
+/// `Promise.all(new Set(promises))` does in Node. `None` for non-iterables.
 fn combinator_items(args: &[Value]) -> Option<Vec<Value>> {
     match args.first() {
         None => Some(Vec::new()),
@@ -585,6 +573,7 @@ fn combinator_items(args: &[Value]) -> Option<Vec<Value>> {
                 .map(crate::value::array_slot_value)
                 .collect(),
         ),
+        Some(items) if items.is_iterable() => Some(items.iter().collect()),
         Some(_) => None,
     }
 }
@@ -601,8 +590,8 @@ fn settled_record(status: &str, key: &str, value: Value) -> Value {
 /// records in input order. Never rejects for settled inputs.
 pub fn all_settled(args: Vec<Value>) -> Value {
     let Some(items) = combinator_items(&args) else {
-        return reject(vec![js_error(
-            "TypeError: Promise.allSettled expects an array",
+        return reject(vec![crate::value::type_error(
+            "Promise.allSettled expects an iterable",
         )]);
     };
     let state = pending_state();
@@ -652,7 +641,9 @@ fn all_rejected_error(errors: Vec<Value>) -> Value {
 /// of them reject, or immediately for an empty input.
 pub fn any(args: Vec<Value>) -> Value {
     let Some(items) = combinator_items(&args) else {
-        return reject(vec![js_error("TypeError: Promise.any expects an array")]);
+        return reject(vec![crate::value::type_error(
+            "Promise.any expects an iterable",
+        )]);
     };
     let state = pending_state();
     let promise = promise_value_from_state(&state);
@@ -1041,6 +1032,62 @@ mod tests {
         let promise = resolve(vec![Value::Number(9.0)]);
         let again = resolve(vec![promise.clone()]);
         assert_eq!(promise, again);
+    }
+
+    #[test]
+    fn combinators_accept_non_array_iterables() {
+        let set = || {
+            crate::intrinsics::construct(
+                &crate::collections::set_class(),
+                vec![Value::array(vec![Value::Number(1.0), Value::Number(2.0)])],
+            )
+        };
+        let log = Rc::new(RefCell::new(Vec::new()));
+        all(vec![set()]).call_method("then", vec![recorder(log.clone())]);
+        race(vec![set()]).call_method("then", vec![recorder(log.clone())]);
+        any(vec![set()]).call_method("then", vec![recorder(log.clone())]);
+        let settled = all_settled(vec![set()]);
+        settled.call_method(
+            "then",
+            vec![{
+                let log = log.clone();
+                Value::function(move |_, args| {
+                    let records = args.first().cloned().unwrap_or(Value::Undefined);
+                    let first = records.get_property("0");
+                    log.borrow_mut().push(format!(
+                        "settled {} {}",
+                        records.get_property("length").to_js_string(),
+                        first.get_property("status").to_js_string()
+                    ));
+                    Value::Undefined
+                })
+            }],
+        );
+        all(vec![Value::Number(3.0)]).call_method(
+            "catch",
+            vec![{
+                let log = log.clone();
+                Value::function(move |_, args| {
+                    let error = args.first().cloned().unwrap_or(Value::Undefined);
+                    log.borrow_mut()
+                        .push(error.get_property("message").to_js_string());
+                    Value::Undefined
+                })
+            }],
+        );
+        drain_microtasks();
+        let mut got = log.borrow().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "1".to_string(),
+                "1".to_string(),
+                "1,2".to_string(),
+                "Promise.all expects an iterable".to_string(),
+                "settled 2 fulfilled".to_string(),
+            ]
+        );
     }
 
     #[test]
