@@ -22000,7 +22000,7 @@ fn build_window_value() -> Value {
                 .get_property("origin")
                 .to_js_string();
             if target_origin == "*" || target_origin == "/" || target_origin == own_origin {
-                queue_window_message(target, data, transferred_ports(&transfer));
+                queue_window_message(target, data, transferred_ports(&transfer), own_origin);
             }
             Value::Undefined
         }),
@@ -22666,7 +22666,17 @@ fn transferred_ports(transfer: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn queue_window_message(target: Value, data: Value, ports: Vec<Value>) {
+/// HTML "window post message steps": the MessageEvent's `source` is the
+/// posting window (the incumbent global; this runtime has one window realm,
+/// so it is the target itself) and `origin` the poster's serialized origin.
+/// Code-OSS's `acquirePort` only accepts responses whose `source` is its own
+/// window.
+fn queue_window_message(target: Value, data: Value, ports: Vec<Value>, origin: String) {
+    let origin = if origin.is_empty() {
+        "null".to_string()
+    } else {
+        origin
+    };
     queue_microtask_value(Value::function(move |_, _| {
         let event = w3cos_core::class::construct(
             &crate::web_events::event_subclass_class("MessageEvent"),
@@ -22674,8 +22684,8 @@ fn queue_window_message(target: Value, data: Value, ports: Vec<Value>) {
                 Value::string("message"),
                 Value::object(HashMap::from([
                     ("data".to_string(), data.clone()),
-                    ("origin".to_string(), Value::string("null")),
-                    ("source".to_string(), Value::Null),
+                    ("origin".to_string(), Value::string(origin.as_str())),
+                    ("source".to_string(), target.clone()),
                     ("ports".to_string(), Value::array(ports.clone())),
                 ])),
             ],
@@ -22986,12 +22996,19 @@ mod tests {
         let window = window_value();
         let seen = Rc::new(RefCell::new(Vec::<(String, usize, bool)>::new()));
         let log = Rc::clone(&seen);
+        let sources = Rc::new(RefCell::new(Vec::<bool>::new()));
+        let source_log = Rc::clone(&sources);
+        let own = window.clone();
         window.set_property(
             "onmessage",
             Value::function(move |_, args| {
                 let event = args.first().cloned().unwrap_or(Value::Undefined);
                 let ports = event.get_property("ports");
                 let first = ports.get_property("0");
+                // HTML: a same-window post's `source` is that window.
+                source_log
+                    .borrow_mut()
+                    .push(event.get_property("source").strict_eq(&own));
                 log.borrow_mut().push((
                     event.get_property("data").to_js_string(),
                     ports.get_property("length").to_number() as usize,
@@ -23040,6 +23057,7 @@ mod tests {
                 ("none".to_string(), 0, false),
             ]
         );
+        assert_eq!(*sources.borrow(), [true, true, true]);
     }
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {
