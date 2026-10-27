@@ -129,6 +129,8 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // Flex reads this as a column wrap's definite block size.
             // Height stays auto, so legacy layout ignores the ratio.
             | "aspect-ratio"
+            // `auto && <ratio>`: the ratio sizes a non-replaced content box.
+            | "aspect-ratio-auto"
             // Grid-lanes stays `display: flex` for legacy. NG reads the
             // marker and lays the box out as a grid. Only a grid container
             // consults these; it resolves the `<percent> <px>` gap values.
@@ -136,7 +138,14 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "percent-gap"
             | "row-gap-percent"
             | "column-gap-percent"
+            // `word-break: auto-phrase`: inline text drops soft hyphens
+            // as break opportunities.
+            | "word-break-auto-phrase"
     ) || name.starts_with("decoration-owner")
+        // Logical sizes the cascade does not resolve. Legacy layout ignores
+        // them too, so both engines size the box the same way; falling back
+        // only for these boxes moved tests and references apart.
+        || name.starts_with("logical-size-")
 }
 
 /// Why a box is outside the current stage (`None`: supported).  The reason
@@ -280,10 +289,8 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                 key.starts_with("--w3cos-internal")
                     && !is_value_carrier_marker(key)
                     && !allowed.contains(&key.as_str())
-                    // Intrinsic width keywords are resolved under size
-                    // containment; elsewhere width stays auto, as before
-                    // the cascade kept the keyword (legacy does the same).
-                    // TODO: Blink ComputeInlineSizeForFragment keywords.
+                    // Intrinsic width keywords: in-flow blocks resolve
+                    // them (keyword_inline_size); flex containers bail.
                     && key != WIDTH_KEYWORD
                     // Grid items resolve min-width keywords; elsewhere
                     // min-width stays auto, as before the cascade kept them.
@@ -2168,6 +2175,58 @@ pub(super) struct BoxMetrics {
 }
 
 /// CSS2 10.3.3 (+10.4) used width and horizontal margins.
+/// `aspect-ratio` of a non-replaced box (css-sizing-4; Blink
+/// ComputeBlockSizeFromAspectRatio / ComputeInlineSizeFromAspectRatio).
+/// The ratio relates the box-sizing boxes, except that `auto && <ratio>`
+/// always relates the content boxes of a non-replaced box.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BoxAspectRatio {
+    ratio: f32,
+    content_box: bool,
+    inline_edges: f32,
+    block_edges: f32,
+}
+
+impl BoxAspectRatio {
+    pub(super) fn of(style: &Style, metrics: &BoxMetrics) -> Option<Self> {
+        let [bt, br, bb, bl] = metrics.border;
+        let [pt, pr, pb, pl] = metrics.padding;
+        Self::new(style, bl + br + pl + pr, bt + bb + pt + pb)
+    }
+
+    pub(super) fn new(style: &Style, inline_edges: f32, block_edges: f32) -> Option<Self> {
+        let ratio = marker(style, "--w3cos-internal-aspect-ratio")?
+            .parse::<f32>()
+            .ok()
+            .filter(|ratio| ratio.is_finite() && *ratio > 0.0)?;
+        Some(Self {
+            ratio,
+            content_box: marker(style, "--w3cos-internal-aspect-ratio-auto").is_some()
+                || style.box_sizing == BoxSizing::ContentBox,
+            inline_edges,
+            block_edges,
+        })
+    }
+
+    /// Content block size for a content inline size.
+    pub(super) fn block_from_inline(self, inline: f32) -> f32 {
+        if self.content_box {
+            inline / self.ratio
+        } else {
+            ((inline + self.inline_edges) / self.ratio - self.block_edges).max(0.0)
+        }
+    }
+
+    /// Content inline size for a content block size.
+    pub(super) fn inline_from_block(self, block: f32) -> f32 {
+        if self.content_box {
+            block * self.ratio
+        } else {
+            ((block + self.block_edges) * self.ratio - self.inline_edges).max(0.0)
+        }
+    }
+}
+
 pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     let cb = space.available_inline;
     let spacing =
@@ -2681,9 +2740,69 @@ pub(super) fn min_max_contribution(
             BoxSizing::BorderBox => (w - edges).max(0.0),
             BoxSizing::ContentBox => w,
         }),
-        None => intrinsic_sizes(flat, index, space).why("intrinsic")?,
+        None if marker(style, WIDTH_KEYWORD).is_some()
+            && !size_contained(style)
+            && !is_replaced(flat[index].kind) =>
+        {
+            // min-content and max-content contribute that size to both
+            // intrinsic sizes; fit-content contributes like auto.
+            let sizes = intrinsic_sizes(flat, index, space).why("intrinsic")?;
+            match marker(style, WIDTH_KEYWORD) {
+                Some("min-content") => {
+                    MinMax::exact(sizes.min.or_else(|| super::bail("width-keyword-min"))?)
+                }
+                Some("max-content") => MinMax::exact(sizes.max),
+                _ => sizes,
+            }
+        }
+        None => {
+            let sizes = intrinsic_sizes(flat, index, space).why("intrinsic")?;
+            // An auto inline size transferred from a definite block size
+            // through the aspect ratio, floored by the automatic minimum
+            // (min-content) of a non-scroll container.
+            let block_edges = b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
+            let ratio = (!is_replaced(flat[index].kind) && marker(style, WIDTH_KEYWORD).is_none())
+                .then(|| BoxAspectRatio::new(style, edges, block_edges))
+                .flatten();
+            match ratio.zip(child_percentage_block(style, space)) {
+                Some((ratio, height)) => {
+                    let floor =
+                        if style.min_width == Dimension::Auto && !non_visible_overflow(style) {
+                            sizes.min.or_else(|| super::bail("aspect-ratio-min"))?
+                        } else {
+                            0.0
+                        };
+                    MinMax::exact(ratio.inline_from_block(height).max(floor))
+                }
+                None => sizes,
+            }
+        }
     };
     Some(content.map(|w| clamp_inline(style, space, edges, w) + edges + margins))
+}
+
+/// The content-box inline size of an intrinsic `width` keyword
+/// (css-sizing-3 min-content, max-content and fit-content).
+fn keyword_inline_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    metrics: &BoxMetrics,
+    keyword: &str,
+) -> Option<f32> {
+    let sizes = intrinsic_sizes(flat, index, space).why("width-keyword")?;
+    let min = sizes.min.or_else(|| super::bail("width-keyword-min"))?;
+    Some(match keyword {
+        "min-content" => min,
+        "max-content" => sizes.max,
+        "fit-content" => {
+            let edges =
+                metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+            let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+            sizes.max.min(available.max(min))
+        }
+        _ => return super::bail("width-keyword"),
+    })
 }
 
 /// CSS2 10.3.9 shrink-to-fit width of an inline-block's content box:
@@ -2953,7 +3072,22 @@ fn layout_block_in(
     } else {
         resolve_inline(style, space)
     };
-    if image_size.is_none() {
+    let width_keyword = marker(style, WIDTH_KEYWORD)
+        .filter(|_| image_size.is_none() && sized.is_none() && !size_contained(style));
+    if let Some(keyword) = width_keyword {
+        // Blink ComputeInlineSizeForFragment: an intrinsic keyword is the
+        // box's own min/max-content size (fit-content clamps the available
+        // size between them), then min/max-width and auto margins apply as
+        // for a definite width.
+        let content = keyword_inline_size(flat, index, space, &metrics, keyword)?;
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let mut definite = style.clone();
+        definite.width = Dimension::Px(match style.box_sizing {
+            BoxSizing::BorderBox => content + edges,
+            BoxSizing::ContentBox => content,
+        });
+        metrics = resolve_inline(&definite, space);
+    } else if image_size.is_none() {
         if let Some((width, _)) = sized {
             metrics.content_width = width;
         } else if style.width == Dimension::Auto
@@ -3020,6 +3154,78 @@ fn layout_block_in(
         }
         h
     };
+    // css-sizing-4 aspect-ratio on a non-replaced block container. With a
+    // definite block size an auto inline size comes from the ratio (its
+    // automatic minimum is the min-content size); otherwise the block size
+    // comes from the inline size, whose range takes the min/max block
+    // sizes through the ratio without overriding min/max-width (Blink
+    // ComputeTransferredMinMaxInlineSizes).
+    let aspect_ratio = image_size
+        .is_none()
+        .then(|| BoxAspectRatio::of(style, &metrics))
+        .flatten();
+    let mut ratio_height = None;
+    if let Some(ratio) = aspect_ratio {
+        let cb = space.available_inline;
+        let edges = ratio.inline_edges;
+        let to_content_w = |w: f32| match style.box_sizing {
+            BoxSizing::BorderBox => (w - edges).max(0.0),
+            BoxSizing::ContentBox => w,
+        };
+        let min_w = resolve_dim(style.min_width, Some(cb), style, space).map(to_content_w);
+        let max_w = resolve_dim(style.max_width, Some(cb), style, space).map(to_content_w);
+        let own_width = sized.is_none()
+            && style.width == Dimension::Auto
+            && marker(style, WIDTH_KEYWORD).is_none();
+        let mut width = None;
+        match specified_height {
+            Some(height) if own_width => {
+                let mut w = ratio.inline_from_block(clamp_h(height));
+                if style.min_width == Dimension::Auto && !non_visible_overflow(style) {
+                    let min_content = intrinsic_sizes(flat, index, space)
+                        .why("aspect-ratio-intrinsic")?
+                        .min
+                        .or_else(|| super::bail("aspect-ratio-min"))?;
+                    w = w.max(max_w.map_or(min_content, |max| min_content.min(max)));
+                }
+                width = Some(w);
+            }
+            Some(_) => {}
+            None => {
+                if own_width {
+                    let mut w = metrics.content_width;
+                    if let Some(max) = max_h.map(|h| ratio.inline_from_block(h)) {
+                        w = w.min(max.max(min_w.unwrap_or(0.0)));
+                    }
+                    if let Some(min) = min_h.map(|h| ratio.inline_from_block(h)) {
+                        w = w.max(max_w.map_or(min, |max| min.min(max)));
+                    }
+                    if (w - metrics.content_width).abs() > 1.0 / 128.0 {
+                        width = Some(w);
+                    }
+                }
+                let w = width.unwrap_or(metrics.content_width);
+                ratio_height = Some(ratio.block_from_inline(w));
+            }
+        }
+        if let Some(mut w) = width {
+            if let Some(max) = max_w {
+                w = w.min(max);
+            }
+            if let Some(min) = min_w {
+                w = w.max(min);
+            }
+            let mut definite = style.clone();
+            definite.width = Dimension::Px(w);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            metrics = resolve_inline(&definite, space);
+            if ratio_height.is_some() {
+                ratio_height = Some(ratio.block_from_inline(w));
+            }
+        }
+    }
     let anonymous_block = style
         .custom_properties
         .as_ref()
@@ -3032,7 +3238,7 @@ fn layout_block_in(
         percentage_block: if anonymous_block {
             space.percentage_block
         } else {
-            specified_height.map(clamp_h)
+            specified_height.or(ratio_height).map(clamp_h)
         },
         viewport_w: space.viewport_w,
         viewport_h: space.viewport_h,
@@ -3791,14 +3997,28 @@ fn layout_block_in(
     } else {
         auto_content
     };
-    let content_height = clamp_h(specified_height.unwrap_or(auto_content));
+    let content_height = match (specified_height, ratio_height) {
+        (Some(height), _) => clamp_h(height),
+        // css-sizing-4: the automatic minimum block size of a box with a
+        // preferred aspect ratio is its content size (capped by max-height)
+        // unless it is a scroll container or min-height is not auto.
+        (None, Some(height)) => {
+            let floor = if min_h.is_none() && !non_visible_overflow(style) {
+                max_h.map_or(auto_content, |max| auto_content.min(max))
+            } else {
+                0.0
+            };
+            clamp_h(height.max(floor))
+        }
+        (None, None) => clamp_h(auto_content),
+    };
     // A definite block size that clips overflowing content is a scrollport.
     // Scroll offsets stay on the legacy engine. An auto-height BFC does not.
     if non_visible_overflow(style)
         && !is_author_flex(style)
         && !is_author_grid(style)
         && style.display != Display::FlowRoot
-        && specified_height.is_some()
+        && (specified_height.is_some() || ratio_height.is_some())
         && auto_content > content_height + 1.0 / 128.0
     {
         return super::bail("overflow-scroll");

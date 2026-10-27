@@ -926,6 +926,10 @@ mod replaced_table_tests;
 #[path = "document/form_control_tests.rs"]
 mod form_control_tests;
 
+#[cfg(test)]
+#[path = "document/flex_item_lowering_tests.rs"]
+mod flex_item_lowering_tests;
+
 impl Document {
     /// The element's own inline style sets a transition.
     pub fn inline_declares_transition(&self, id: NodeId) -> bool {
@@ -8025,6 +8029,16 @@ impl Document {
                 properties.remove("--w3cos-internal-media-controls-layer");
             }
         }
+        // An `audio` element has no media layout here (it lowers to an
+        // empty block), and Chrome draws it the same with or without
+        // aspect-ratio (replaced-element-035), so the ratio must not size
+        // the placeholder.
+        if tag == "audio"
+            && let Some(properties) = style.custom_properties.as_mut()
+        {
+            properties.remove(crate::css_style::ASPECT_RATIO_PROPERTY);
+            properties.remove(crate::css_style::ASPECT_RATIO_AUTO_PROPERTY);
+        }
         if tag == "video"
             && node
                 .attributes
@@ -9251,9 +9265,10 @@ impl Document {
                 // its nested runs must not become max-content atomic rows.
                 // A flex or grid container's atomic children are blockified
                 // items, not an inline formatting context (CSS Display
-                // §2.7), so its authored alignment must survive. Flex keeps
-                // this path for non-replaced atomic children (e.g. buttons)
-                // for now: without writing-mode support, button-min-width's
+                // §2.7), so its authored alignment must survive (an
+                // inline-block item stretches, flexbox_flex-* WPT). Flex
+                // keeps this path for buttons and plain inline text for
+                // now: without writing-mode support, button-min-width's
                 // vertical-rl column only matches Chrome as a row.
                 let blockified_atomic_items = !children.is_empty()
                     && match style.display {
@@ -9267,7 +9282,18 @@ impl Document {
                                     child.kind,
                                     w3cos_std::ComponentKind::Image { .. }
                                         | w3cos_std::ComponentKind::Canvas { .. }
-                                )
+                                ) || (matches!(
+                                    child.kind,
+                                    w3cos_std::ComponentKind::Text { .. }
+                                        | w3cos_std::ComponentKind::Row
+                                        | w3cos_std::ComponentKind::Column
+                                        | w3cos_std::ComponentKind::Box
+                                ) && matches!(
+                                    child.style.display,
+                                    w3cos_std::style::Display::InlineBlock
+                                        | w3cos_std::style::Display::InlineFlex
+                                        | w3cos_std::style::Display::InlineTable
+                                ))
                             })
                         }
                         _ => false,
@@ -12858,6 +12884,27 @@ fn inherit_text_style(
     }
     if !declares("word-break") && !declares("overflow-wrap") && !declares("word-wrap") {
         style.word_break = parent.word_break;
+    }
+    if !declares("word-break") {
+        let key = crate::css_style::WORD_BREAK_AUTO_PHRASE_PROPERTY;
+        let inherited = parent
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+            .cloned();
+        match inherited {
+            Some(value) => {
+                style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(key.to_string(), value);
+            }
+            None => {
+                if let Some(properties) = style.custom_properties.as_mut() {
+                    properties.remove(key);
+                }
+            }
+        }
     }
     if !declares("line-break") {
         style.line_break = parent.line_break;

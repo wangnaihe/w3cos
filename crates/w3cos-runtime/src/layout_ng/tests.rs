@@ -195,6 +195,23 @@ fn percent_height_resolves_against_definite_parent() {
 }
 
 #[test]
+fn unresolved_logical_sizes_stay_on_ng() {
+    use w3cos_std::style::CustomProperties;
+    let mut sized = block();
+    sized.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-logical-size-inline-size".to_string(),
+        "max-content".to_string(),
+    )]));
+    let root = node(
+        block(),
+        vec![node(sized, vec![Component::text("x", Style::default())])],
+    );
+    let flat = pre_flatten(&root);
+    // Both engines ignore the unresolved logical size.
+    assert_eq!(block::unsupported_tree(&flat), None);
+}
+
+#[test]
 fn unsupported_trees_fall_back() {
     // An empty grid with no template is S5. `subgrid` stays on legacy.
     let grid_root = node(
@@ -1783,8 +1800,32 @@ fn size_containment_uses_contain_intrinsic_size() {
     let flat = pre_flatten(&root);
     let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
-    // Without size containment a width keyword is not resolved yet: the
-    // width stays auto (as on legacy).
+    // Without size containment a width keyword is the contents' size
+    // (Blink ComputeInlineSizeForFragment): min-content, max-content and
+    // fit-content of a block holding a 40px and a 60px wide block.
+    for (word, width) in [
+        ("min-content", 60.0),
+        ("max-content", 60.0),
+        ("fit-content", 60.0),
+    ] {
+        let mut keyword = block();
+        mark(&mut keyword, &[("--w3cos-internal-width-keyword", word)]);
+        let child = |w: f32| {
+            node(
+                Style {
+                    width: Dimension::Px(w),
+                    ..sized(10.0)
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(keyword, vec![child(40.0), child(60.0)])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1), (0.0, 0.0, width, 20.0), "{word}");
+    }
+    // An empty max-content block is zero wide.
     let mut keyword = block();
     mark(
         &mut keyword,
@@ -1793,7 +1834,7 @@ fn size_containment_uses_contain_intrinsic_size() {
     let root = node(block(), vec![node(keyword, vec![])]);
     let flat = pre_flatten(&root);
     let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
-    assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 0.0, 0.0));
 }
 
 /// CSS2 9.4.1: overflow other than visible is a BFC. The box sits beside
@@ -5079,4 +5120,115 @@ fn inline_level_abspos_static_position_follows_floats_and_text_align() {
     assert_eq!(case(rtl, TextAlign::Right, Float::Right), (30.0, 50.0));
     assert_eq!(case(rtl, TextAlign::Left, Float::Right), (-20.0, 50.0));
     assert_eq!(case(rtl, TextAlign::Center, Float::Left), (55.0, 50.0));
+}
+
+/// css-sizing-4 aspect-ratio on non-replaced blocks (block-aspect-ratio-*
+/// WPT, Blink ComputeBlockSizeFromAspectRatio).
+#[test]
+fn block_aspect_ratio_sizes_the_auto_axis() {
+    use w3cos_std::style::CustomProperties;
+    fn ratio(mut style: Style, value: &str, auto: bool) -> Style {
+        let mut props = vec![(
+            "--w3cos-internal-aspect-ratio".to_string(),
+            value.to_string(),
+        )];
+        if auto {
+            props.push((
+                "--w3cos-internal-aspect-ratio-auto".to_string(),
+                "1".to_string(),
+            ));
+        }
+        style.custom_properties = Some(CustomProperties::from_iter(props));
+        style
+    }
+    let lay = |root: &Component| {
+        let flat = pre_flatten(root);
+        assert!(block::unsupported_reasons(&flat).is_empty());
+        let mut out = layout_tree(root, &flat, 800.0, 600.0).expect("ng layout");
+        out.sort_by_key(|(_, i)| *i);
+        out
+    };
+    let pad_left = Edges {
+        left: px(50.0),
+        ..margins(0.0, 0.0, 0.0, 0.0)
+    };
+    let root = node(
+        block(),
+        vec![
+            // Width 100, 1/1: height 100.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        ..block()
+                    },
+                    "1",
+                    false,
+                ),
+                vec![],
+            ),
+            // Height 100, auto width: width 100 from the ratio.
+            node(ratio(sized(100.0), "1", false), vec![]),
+            // Border-box 100 wide, 2/1: border-box height 50.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        padding: pad_left,
+                        box_sizing: BoxSizing::BorderBox,
+                        ..block()
+                    },
+                    "2",
+                    false,
+                ),
+                vec![],
+            ),
+            // `auto 1/1` uses the 50px content box whatever box-sizing says.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        padding: pad_left,
+                        box_sizing: BoxSizing::BorderBox,
+                        ..block()
+                    },
+                    "1",
+                    true,
+                ),
+                vec![],
+            ),
+            // Content taller than the ratio grows the box (automatic
+            // minimum); min-height: 0 removes that floor.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        ..block()
+                    },
+                    "4",
+                    false,
+                ),
+                vec![node(sized(60.0), vec![])],
+            ),
+            // max-height 25 transfers a 100px max-width to a stretched box.
+            node(
+                ratio(
+                    Style {
+                        max_height: Dimension::Px(25.0),
+                        ..block()
+                    },
+                    "4",
+                    false,
+                ),
+                vec![],
+            ),
+        ],
+    );
+    let out = lay(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 100.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 3), (0.0, 200.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 4), (0.0, 250.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 5), (0.0, 300.0, 100.0, 60.0));
+    assert_eq!(rect(&out, 7), (0.0, 360.0, 100.0, 25.0));
 }

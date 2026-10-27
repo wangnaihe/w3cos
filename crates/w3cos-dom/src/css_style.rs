@@ -50,6 +50,17 @@ pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized
 /// untouched, so legacy layout never consults it. LayoutNG reads it only
 /// as a column flex container's definite block size.
 pub const ASPECT_RATIO_PROPERTY: &str = "--w3cos-internal-aspect-ratio";
+/// Present when `aspect-ratio` is `auto && <ratio>`: a non-replaced box
+/// then applies the ratio to its content box whatever `box-sizing` says
+/// (css-sizing-4 aspect-ratio).
+pub const ASPECT_RATIO_AUTO_PROPERTY: &str = "--w3cos-internal-aspect-ratio-auto";
+/// `word-break: auto-phrase` (CSS Text 4). The used `word_break` stays
+/// `normal`; the marker only suppresses hyphenation (soft hyphens).
+pub const WORD_BREAK_AUTO_PHRASE_PROPERTY: &str = "--w3cos-internal-word-break-auto-phrase";
+/// Prefix of the markers left by logical sizing properties the cascade does
+/// not resolve (`inline-size`, `block-size` and their min/max forms). The
+/// suffix is the property name; NG layout bails `sizing:logical` on them.
+pub const LOGICAL_SIZE_PROPERTY_PREFIX: &str = "--w3cos-internal-logical-size-";
 
 /// `N%`, or `calc()` of one percentage plus or minus one px length.
 fn parse_percent_gap(value: &str) -> Option<String> {
@@ -119,7 +130,7 @@ fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>
 /// `None` drops an invalid declaration. `Some(None)` is `auto` (no ratio).
 /// `Some(Some(w/h))` is a positive ratio. `0` and a zero denominator are
 /// invalid. `auto && <ratio>` is the ratio.
-fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
+fn parse_aspect_ratio(value: &str) -> Option<Option<(f32, bool)>> {
     let value = value.trim().to_ascii_lowercase();
     if value.is_empty() {
         return None;
@@ -130,9 +141,16 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
     ) {
         return Some(None);
     }
-    let value = value.strip_prefix("auto").unwrap_or(&value).trim();
+    // `auto && <ratio>`: the keyword may come first or last.
+    let (value, auto) = if let Some(rest) = value.strip_prefix("auto") {
+        (rest.trim(), true)
+    } else if let Some(rest) = value.strip_suffix("auto") {
+        (rest.trim(), true)
+    } else {
+        (value.as_str(), false)
+    };
     if value.is_empty() {
-        return Some(None);
+        return if auto { Some(None) } else { None };
     }
     let ratio = if let Some((width, height)) = value.split_once('/') {
         let width = width.trim().parse::<f32>().ok()?;
@@ -144,7 +162,7 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
     } else {
         value.parse::<f32>().ok()?
     };
-    (ratio.is_finite() && ratio > 0.0).then_some(Some(ratio))
+    (ratio.is_finite() && ratio > 0.0).then_some(Some((ratio, auto)))
 }
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
@@ -209,6 +227,13 @@ fn invalid_cssom_declaration(name: &str, value: &str) -> bool {
             keyword != "currentcolor" && Color::from_css(value).is_none()
         }
         "list-style" | "listStyle" => list_style_properties(value).is_none(),
+        // A bare number is only a valid `flex-basis` when it is zero, so
+        // `flex: 0 0 4` matches no branch of the grammar and is dropped
+        // (flexbox_flex-*-unitless-basis WPT).
+        "flex" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            parts.len() == 3 && parts[2].parse::<f32>().is_ok_and(|number| number != 0.0)
+        }
         _ => false,
     }
 }
@@ -677,6 +702,48 @@ impl CSSStyleDeclaration {
                     BoxSizing::ContentBox
                 }
             }
+            "inline-size" | "inlineSize" | "min-inline-size" | "minInlineSize"
+            | "max-inline-size" | "maxInlineSize" | "block-size" | "blockSize"
+            | "min-block-size" | "minBlockSize" | "max-block-size" | "maxBlockSize" => {
+                // Not resolved to a physical size; only recorded so layout
+                // can tell the box is sized by something it ignores.
+                let css_name: String = name
+                    .chars()
+                    .flat_map(|c| {
+                        if c.is_ascii_uppercase() {
+                            vec!['-', c.to_ascii_lowercase()]
+                        } else {
+                            vec![c]
+                        }
+                    })
+                    .collect();
+                let keyword = value.trim().to_ascii_lowercase();
+                // An intrinsic keyword on an inline size is the same keyword
+                // on the physical width in horizontal-tb, which the width
+                // keyword path already resolves.
+                let intrinsic = matches!(
+                    keyword.as_str(),
+                    "min-content" | "max-content" | "fit-content"
+                );
+                let physical = css_name
+                    .strip_suffix("inline-size")
+                    .filter(|_| intrinsic)
+                    .map(|prefix| format!("{prefix}width"));
+                // In the block axis the intrinsic keywords behave as the
+                // property's initial value for non-replaced boxes, which is
+                // what the unresolved block size already means here.
+                let initial =
+                    matches!(keyword.as_str(), "" | "auto" | "none" | "initial" | "unset")
+                        || (intrinsic && css_name.ends_with("block-size"));
+                set_marker(
+                    &mut self.inner,
+                    &format!("{LOGICAL_SIZE_PROPERTY_PREFIX}{css_name}"),
+                    (!initial && physical.is_none()).then(|| keyword.clone()),
+                );
+                if let Some(physical) = physical {
+                    self.set_property(&physical, raw_value);
+                }
+            }
             "width" => {
                 let keyword = value.trim().to_ascii_lowercase();
                 if matches!(
@@ -756,7 +823,12 @@ impl CSSStyleDeclaration {
                     set_marker(
                         &mut self.inner,
                         ASPECT_RATIO_PROPERTY,
-                        ratio.map(|ratio| ratio.to_string()),
+                        ratio.map(|(ratio, _)| ratio.to_string()),
+                    );
+                    set_marker(
+                        &mut self.inner,
+                        ASPECT_RATIO_AUTO_PROPERTY,
+                        ratio.and_then(|(_, auto)| auto.then(|| "1".to_string())),
                     );
                 }
             }
@@ -1421,7 +1493,15 @@ impl CSSStyleDeclaration {
             "font-feature-settings" | "fontFeatureSettings" => {
                 self.inner.font_feature_kern = parse_kern_feature_override(value);
             }
-            "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+            "word-break" | "wordBreak" => {
+                self.inner.word_break = parse_word_break(value);
+                let auto_phrase = value.trim().eq_ignore_ascii_case("auto-phrase");
+                set_marker(
+                    &mut self.inner,
+                    WORD_BREAK_AUTO_PHRASE_PROPERTY,
+                    auto_phrase.then(|| "1".to_string()),
+                );
+            }
             "hanging-punctuation" | "hangingPunctuation" => {
                 self.inner.hanging_punctuation_last = value
                     .split_ascii_whitespace()
@@ -6564,6 +6644,68 @@ mod tests {
     }
 
     #[test]
+    fn width_keyword_and_auto_phrase_markers() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("inline-size", "200px");
+        declaration.set_property("maxBlockSize", "10px");
+        assert_eq!(declaration.inner.width, Dimension::Auto);
+        let has = |declaration: &CSSStyleDeclaration, key: &str| {
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key(key))
+        };
+        assert!(has(
+            &declaration,
+            "--w3cos-internal-logical-size-inline-size"
+        ));
+        assert!(has(
+            &declaration,
+            "--w3cos-internal-logical-size-max-block-size"
+        ));
+        declaration.set_property("inline-size", "auto");
+        assert!(!has(
+            &declaration,
+            "--w3cos-internal-logical-size-inline-size"
+        ));
+        declaration.set_property("inline-size", "max-content");
+        assert!(!has(
+            &declaration,
+            "--w3cos-internal-logical-size-inline-size"
+        ));
+        assert!(has(&declaration, WIDTH_KEYWORD_PROPERTY));
+        declaration.set_property("block-size", "40px");
+        assert!(has(
+            &declaration,
+            "--w3cos-internal-logical-size-block-size"
+        ));
+        // Block-axis intrinsic keywords behave as the initial value.
+        declaration.set_property("block-size", "min-content");
+        assert!(!has(
+            &declaration,
+            "--w3cos-internal-logical-size-block-size"
+        ));
+        declaration.set_property("width", "max-content");
+        assert_eq!(declaration.inner.width, Dimension::Auto);
+        let marker = |declaration: &CSSStyleDeclaration, key: &str| {
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(key).cloned())
+        };
+        assert_eq!(
+            marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("max-content")
+        );
+        declaration.set_property("word-break", "auto-phrase");
+        assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_some());
+        declaration.set_property("word-break", "normal");
+        assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_none());
+    }
+
+    #[test]
     fn flex_shorthand_sets_grow_shrink_and_basis() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("flex", "1");
@@ -6575,6 +6717,16 @@ mod tests {
         assert_eq!(declaration.inner.flex_grow, 0.0);
         assert_eq!(declaration.inner.flex_shrink, 0.0);
         assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+
+        // A unitless non-zero basis is invalid and leaves the values alone.
+        declaration.set_property("flex", "2 3 4");
+        assert_eq!(declaration.inner.flex_grow, 0.0);
+        assert_eq!(declaration.inner.flex_shrink, 0.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+        declaration.set_property("flex", "2 3 0");
+        assert_eq!(declaration.inner.flex_grow, 2.0);
+        assert_eq!(declaration.inner.flex_shrink, 3.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Px(0.0));
     }
 
     #[test]
@@ -6710,12 +6862,28 @@ fn aspect_ratio_is_stored_as_a_width_over_height_marker() {
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("aspect-ratio", "1 / 1");
     assert_eq!(ratio(&declaration).as_deref(), Some("1"));
+    let auto = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key(ASPECT_RATIO_AUTO_PROPERTY))
+    };
+    assert!(!auto(&declaration));
     declaration.set_property("aspect-ratio", "auto 2 / 1");
     assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    assert!(auto(&declaration));
     declaration.set_property("aspect-ratio", "1/0");
     assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    assert!(auto(&declaration));
+    declaration.set_property("aspect-ratio", "4 / 1 auto");
+    assert_eq!(ratio(&declaration).as_deref(), Some("4"));
+    assert!(auto(&declaration));
+    declaration.set_property("aspect-ratio", "3");
+    assert!(!auto(&declaration));
     declaration.set_property("aspect-ratio", "auto");
     assert_eq!(ratio(&declaration), None);
+    assert!(!auto(&declaration));
 }
 
 #[test]

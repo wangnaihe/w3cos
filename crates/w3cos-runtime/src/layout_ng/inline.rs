@@ -220,6 +220,12 @@ fn is_soft_wrap_char(c: char) -> bool {
         || crate::text_layout::is_cjk_line_break_character(c)
 }
 
+/// `word-break: auto-phrase` suppresses hyphenation, so a soft hyphen is
+/// not a break opportunity (CSS Text 4 word-break).
+fn suppresses_hyphenation(style: &Style) -> bool {
+    has_marker(style, "--w3cos-internal-word-break-auto-phrase")
+}
+
 /// Text style requirements shared by every S2a text leaf.
 fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     // An inline-level relatively positioned leaf only moves its fragments
@@ -1265,6 +1271,13 @@ struct InlineItem {
 /// crate::line_break.
 fn internal_opportunity(content: &str, style: &Style) -> bool {
     let core = content.trim_matches(' ');
+    let unhyphenated;
+    let core = if suppresses_hyphenation(style) && core.contains('\u{ad}') {
+        unhyphenated = core.replace('\u{ad}', "");
+        unhyphenated.as_str()
+    } else {
+        core
+    };
     if core.bytes().all(|b| b.is_ascii_alphanumeric()) {
         // FillAscii: no opportunity between ASCII letters and digits.
         return false;
@@ -2855,7 +2868,9 @@ pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
         Some(max)
     } else if !forced
         && latin1(content)
-        && !content.chars().any(|c| c != ' ' && is_soft_wrap_char(c))
+        && !content.chars().any(|c| {
+            c != ' ' && is_soft_wrap_char(c) && !(c == '\u{ad}' && suppresses_hyphenation(style))
+        })
         && style.white_space != WhiteSpace::PreWrap
     {
         Some(content.split(' ').map(width).fold(0.0f32, f32::max))
