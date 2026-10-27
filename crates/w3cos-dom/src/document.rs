@@ -51,6 +51,11 @@ struct CachedComputedStyle {
     style: w3cos_std::style::Style,
 }
 
+/// Remaining stack below which DOM lowering switches to a fresh segment. It
+/// must exceed one unoptimized lowering level (node frame plus children).
+const LOWERING_STACK_RED_ZONE: usize = 1024 * 1024;
+const LOWERING_STACK_SEGMENT: usize = 16 * 1024 * 1024;
+
 struct SelectorContextCache {
     style_clock: u64,
     stylesheet_generation: u64,
@@ -6765,7 +6770,22 @@ impl Document {
             })
     }
 
+    /// Lowering recurses once per DOM level and an unoptimized
+    /// `node_to_component_frame` frame is ~180 KiB, so a workbench-depth tree
+    /// overflows an 8 MiB main-thread stack. Grow the stack on the heap
+    /// before descending instead.
     fn node_to_component(
+        &self,
+        id: NodeId,
+        ancestors: &mut Vec<stylesheet::SelectorContext>,
+        inherited: Option<&w3cos_std::style::Style>,
+    ) -> w3cos_std::Component {
+        stacker::maybe_grow(LOWERING_STACK_RED_ZONE, LOWERING_STACK_SEGMENT, || {
+            self.node_to_component_frame(id, ancestors, inherited)
+        })
+    }
+
+    fn node_to_component_frame(
         &self,
         id: NodeId,
         ancestors: &mut Vec<stylesheet::SelectorContext>,
@@ -25886,6 +25906,39 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn deep_tree_lowering_grows_the_stack_instead_of_overflowing() {
+        let depth = std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                stylesheet::clear_rules();
+                let mut document = Document::new();
+                let mut parent = document.body();
+                for _ in 0..200 {
+                    let div = document.create_element("div");
+                    parent.append_child(&mut document, div);
+                    parent = div;
+                }
+                let tree = document.to_component_tree();
+                let mut depth = 0;
+                let mut node = &tree;
+                while let Some(child) = node.children.first() {
+                    depth += 1;
+                    node = child;
+                }
+                // Release the nested tree without deep recursive drop glue.
+                let mut pending = vec![tree];
+                while let Some(mut component) = pending.pop() {
+                    pending.append(&mut component.children);
+                }
+                depth
+            })
+            .expect("spawn lowering thread")
+            .join()
+            .expect("lowering a deep tree must not overflow the stack");
+        assert!(depth >= 200, "depth {depth}");
+    }
 
     #[test]
     fn definite_text_rewrite_reuses_the_computed_style() {
