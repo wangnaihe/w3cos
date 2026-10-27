@@ -24,6 +24,11 @@ pub const HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-height-keyword";
 /// `min-width: min-content | max-content | fit-content`; `min_width` stays
 /// auto and layouts that do not resolve the keyword ignore it.
 pub const MIN_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-width-keyword";
+/// `max-width: min-content | max-content | fit-content`; `max_width` stays
+/// none and layouts that do not resolve the keyword ignore it. All three
+/// width markers also carry `fit-content(<length-percentage>)`, serialized
+/// with its argument in a canonical unit (`fit-content(100px)`).
+pub const MAX_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-width-keyword";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
@@ -737,10 +742,7 @@ impl CSSStyleDeclaration {
                 // An intrinsic keyword on an inline size is the same keyword
                 // on the physical width in horizontal-tb, which the width
                 // keyword path already resolves.
-                let intrinsic = matches!(
-                    keyword.as_str(),
-                    "min-content" | "max-content" | "fit-content"
-                );
+                let intrinsic = is_intrinsic_size_keyword(&keyword);
                 let physical = css_name
                     .strip_suffix("inline-size")
                     .filter(|_| intrinsic)
@@ -761,13 +763,11 @@ impl CSSStyleDeclaration {
                 }
             }
             "width" => {
-                let keyword = value.trim().to_ascii_lowercase();
-                if matches!(
-                    keyword.as_str(),
-                    "max-content" | "min-content" | "fit-content"
-                ) {
+                if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.width = Dimension::Auto;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
+                    // An invalid fit-content() argument drops the declaration.
                 } else if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
@@ -795,13 +795,10 @@ impl CSSStyleDeclaration {
                 }
             }
             "min-width" | "minWidth" => {
-                let keyword = value.trim().to_ascii_lowercase();
-                if matches!(
-                    keyword.as_str(),
-                    "max-content" | "min-content" | "fit-content"
-                ) {
+                if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.min_width = Dimension::Auto;
                     set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
                 } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
@@ -817,12 +814,17 @@ impl CSSStyleDeclaration {
                 }
             }
             "max-width" | "maxWidth" => {
-                if value.trim().eq_ignore_ascii_case("none") {
+                if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.max_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if value.trim().eq_ignore_ascii_case("none") {
+                    self.inner.max_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
                 } else if let Some(value) =
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
                 {
                     self.inner.max_width = value;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "max-height" | "maxHeight" => {
@@ -2680,6 +2682,36 @@ fn parse_flex_direction(value: &str) -> FlexDirection {
         "column-reverse" => FlexDirection::ColumnReverse,
         _ => FlexDirection::Column,
     }
+}
+
+/// `min-content | max-content | fit-content | fit-content(<length-percentage>)`
+/// on a width property, as the marker value layout reads. A negative or
+/// unparsable argument makes the declaration invalid (`None`).
+fn inline_size_keyword(value: &str) -> Option<String> {
+    let keyword = value.trim().to_ascii_lowercase();
+    if matches!(
+        keyword.as_str(),
+        "max-content" | "min-content" | "fit-content"
+    ) {
+        return Some(keyword);
+    }
+    let argument = keyword
+        .strip_prefix("fit-content(")?
+        .strip_suffix(')')?
+        .trim();
+    let argument = match parse_dimension_checked(argument)? {
+        Dimension::Px(n) => format!("{n}px"),
+        Dimension::Percent(n) => format!("{n}%"),
+        Dimension::Em(n) => format!("{n}em"),
+        Dimension::Rem(n) => format!("{n}rem"),
+        Dimension::Vw(n) => format!("{n}vw"),
+        Dimension::Vh(n) => format!("{n}vh"),
+        _ => return None,
+    };
+    if argument.starts_with('-') {
+        return None;
+    }
+    Some(format!("fit-content({argument})"))
 }
 
 fn is_intrinsic_size_keyword(value: &str) -> bool {
@@ -6716,6 +6748,31 @@ mod tests {
             marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
             Some("max-content")
         );
+        declaration.set_property("width", "fit-content( 50% )");
+        assert_eq!(
+            marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("fit-content(50%)")
+        );
+        declaration.set_property("width", "fit-content(-1px)");
+        assert_eq!(
+            marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("fit-content(50%)")
+        );
+        declaration.set_property("min-width", "fit-content(100px)");
+        assert_eq!(
+            marker(&declaration, MIN_WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("fit-content(100px)")
+        );
+        declaration.set_property("max-width", "200px");
+        declaration.set_property("max-width", "min-content");
+        assert_eq!(declaration.inner.max_width, Dimension::Auto);
+        assert_eq!(
+            marker(&declaration, MAX_WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("min-content")
+        );
+        declaration.set_property("max-width", "30px");
+        assert_eq!(declaration.inner.max_width, Dimension::Px(30.0));
+        assert!(marker(&declaration, MAX_WIDTH_KEYWORD_PROPERTY).is_none());
         declaration.set_property("word-break", "auto-phrase");
         assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_some());
         declaration.set_property("word-break", "normal");

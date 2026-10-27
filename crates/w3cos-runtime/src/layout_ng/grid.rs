@@ -3753,15 +3753,18 @@ fn layout_impl(
         let sizes = min_max(flat, index, space).why("grid:width-keyword")?;
         let min = sizes.min.unwrap_or(sizes.max);
         let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
-        let content = match keyword {
-            "min-content" => min,
-            "max-content" => sizes.max,
-            _ => {
-                let available =
-                    space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
-                sizes.max.min(available.max(min))
-            }
-        };
+        let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+        let content = block::keyword_content_size(
+            keyword,
+            min,
+            sizes.max,
+            Some(available),
+            Some(space.available_inline),
+            style,
+            space,
+            edges,
+        )
+        .or_else(|| super::bail("grid:width-keyword"))?;
         let mut definite = style.clone();
         definite.width = Dimension::Px(match style.box_sizing {
             BoxSizing::BorderBox => content + edges,

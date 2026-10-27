@@ -1837,6 +1837,122 @@ fn size_containment_uses_contain_intrinsic_size() {
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 0.0, 0.0));
 }
 
+/// css-sizing-3 intrinsic keywords on min-width / max-width and
+/// `fit-content(<length-percentage>)`: the argument is clamped between the
+/// box's min-content and max-content sizes (here both 60px), resolved
+/// against the containing block in layout; in an intrinsic contribution a
+/// percentage argument is cyclic and the keyword acts as its initial value.
+#[test]
+fn width_limit_keywords_and_fit_content_function() {
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let child = |w: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                ..sized(10.0)
+            },
+            vec![],
+        )
+    };
+    let boxed = |style: Style, marks: &[(&str, &str)]| {
+        let mut style = Style {
+            display: Display::Block,
+            ..style
+        };
+        mark(&mut style, marks);
+        node(style, vec![child(40.0), child(60.0)])
+    };
+    let cases: Vec<(Style, Vec<(&str, &str)>, f32)> = vec![
+        (
+            block(),
+            vec![("--w3cos-internal-max-width-keyword", "min-content")],
+            60.0,
+        ),
+        (
+            Style {
+                width: Dimension::Px(10.0),
+                ..block()
+            },
+            vec![("--w3cos-internal-min-width-keyword", "max-content")],
+            60.0,
+        ),
+        (
+            Style {
+                width: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![("--w3cos-internal-max-width-keyword", "fit-content(30%)")],
+            60.0,
+        ),
+        (
+            block(),
+            vec![("--w3cos-internal-width-keyword", "fit-content(100px)")],
+            60.0,
+        ),
+        (
+            block(),
+            vec![("--w3cos-internal-width-keyword", "fit-content(5%)")],
+            60.0,
+        ),
+        (
+            block(),
+            vec![("--w3cos-internal-max-width-keyword", "fit-content")],
+            60.0,
+        ),
+    ];
+    for (style, marks, width) in cases {
+        let root = node(block(), vec![boxed(style, &marks)]);
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "{marks:?}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1), (0.0, 0.0, width, 20.0), "{marks:?}");
+    }
+    // Contributions to a min-content parent: a 200px box limited by
+    // max-width: fit-content(100px) contributes 60px; with a cyclic
+    // fit-content(50%) the limit is max-content (60px) as well, while
+    // min-width: fit-content(50%) floors a 10px box at min-content.
+    for (width, marks) in [
+        (
+            200.0,
+            ("--w3cos-internal-max-width-keyword", "fit-content(100px)"),
+        ),
+        (
+            200.0,
+            ("--w3cos-internal-max-width-keyword", "fit-content(50%)"),
+        ),
+        (
+            10.0,
+            ("--w3cos-internal-min-width-keyword", "fit-content(50%)"),
+        ),
+    ] {
+        let mut parent = block();
+        mark(
+            &mut parent,
+            &[("--w3cos-internal-width-keyword", "min-content")],
+        );
+        let inner = boxed(
+            Style {
+                width: Dimension::Px(width),
+                ..block()
+            },
+            &[marks],
+        );
+        let root = node(block(), vec![node(parent, vec![inner])]);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1).2, 60.0, "{marks:?}");
+    }
+}
+
 /// CSS2 9.4.1: overflow other than visible is a BFC. The box sits beside
 /// a float instead of overlapping it, and a float inside it contributes
 /// to the auto height (10.6.7) without its margin escaping.
