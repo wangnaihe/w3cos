@@ -173,6 +173,7 @@ t1 ready false number true [6,[1,2],1000,1]
 t1 square 49
 t1 clone [1,"two"] bigint true true undefined true true -Infinity
 t1 clone2 true false hi true 1.5,-2 true bad true a+b gi true {"deep":[[1],{"x":null}]}
+t1 clone3 true 40000 true
 t1 exit 3 online,ready,square,clone -1
 t2 error true TypeError boom from worker
 t2 exit 1
