@@ -6420,3 +6420,144 @@ fn replaced_size_limited_by_intrinsic_min_max_keywords() {
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "max-height");
     assert_eq!(rect(&ng, 2), (0.0, 100.0, 100.0, 100.0), "min-width");
 }
+
+/// A column flex item's intrinsic `max-height` keyword caps its main size
+/// at its content block size (css-flexbox flex-item-max-height-min-content).
+#[test]
+fn column_flex_item_max_height_keyword_caps_main_size() {
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(200.0),
+        ..Style::default()
+    };
+    let item = with_markers(
+        Style {
+            flex_basis: Dimension::Px(200.0),
+            ..Style::default()
+        },
+        &[("--w3cos-internal-max-height-keyword", "min-content")],
+    );
+    let content = Style {
+        height: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![node(item, vec![node(content, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// `min-width: fit-content` contributes the box's max-content size under a
+/// max-content constraint, so a fit-content parent of a 10px box holding
+/// two 50px floats is 100px wide, and so is the box
+/// (css-sizing fit-content-min-inline-size).
+#[test]
+fn min_width_fit_content_contributes_max_content() {
+    use w3cos_std::style::Float;
+    let float = || {
+        node(
+            Style {
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(10.0),
+                float: Float::Left,
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let inner = with_markers(
+        Style {
+            width: Dimension::Px(10.0),
+            ..block()
+        },
+        &[("--w3cos-internal-min-width-keyword", "fit-content")],
+    );
+    let parent = with_markers(
+        block(),
+        &[("--w3cos-internal-width-keyword", "fit-content")],
+    );
+    let root = node(
+        block(),
+        vec![node(parent, vec![node(inner, vec![float(), float()])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0, "parent");
+    assert_eq!(rect(&ng, 2).2, 100.0, "box");
+}
+
+/// `height: fit-content` on an absolutely positioned box with both
+/// vertical insets is its content height, not the inset-stretched height;
+/// the auto margins then share the (negative) remainder
+/// (css-sizing fit-content-block-size-abspos).
+#[test]
+fn abspos_height_keyword_is_content_height() {
+    use w3cos_std::style::{Edges, Spacing};
+    let abspos = with_markers(
+        Style {
+            position: w3cos_std::style::Position::Absolute,
+            top: Dimension::Percent(50.0),
+            bottom: Dimension::Px(0.0),
+            margin: Edges {
+                top: Spacing::Auto,
+                right: Spacing::Auto,
+                bottom: Spacing::Auto,
+                left: Spacing::Auto,
+            },
+            ..block()
+        },
+        &[("--w3cos-internal-height-keyword", "fit-content")],
+    );
+    let content = Style {
+        width: Dimension::Px(50.0),
+        height: Dimension::Px(540.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(abspos, vec![node(content, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 180.0, 50.0, 540.0));
+}
+
+/// Intrinsic `max-width` keywords on a box with an aspect ratio and a
+/// definite height resolve against its transferred inline size, border-box
+/// edges included (css-sizing border-box-and-max-content-002).
+#[test]
+fn max_width_keyword_uses_aspect_ratio_size() {
+    use w3cos_std::style::{BoxSizing, Edges, Spacing};
+    let item = with_markers(
+        Style {
+            height: Dimension::Px(500.0),
+            box_sizing: BoxSizing::BorderBox,
+            padding: Edges {
+                top: Spacing::Px(10.0),
+                right: Spacing::Px(20.0),
+                bottom: Spacing::Px(10.0),
+                left: Spacing::Px(20.0),
+            },
+            ..block()
+        },
+        &[
+            ("--w3cos-internal-aspect-ratio", "1"),
+            ("--w3cos-internal-max-width-keyword", "max-content"),
+        ],
+    );
+    let wrapper = with_markers(
+        block(),
+        &[("--w3cos-internal-width-keyword", "max-content")],
+    );
+    let root = node(block(), vec![node(wrapper, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 500.0, "wrapper");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 500.0, 500.0), "item");
+}

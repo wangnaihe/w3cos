@@ -185,6 +185,9 @@ pub(super) fn layout_out_of_flow(
                 let block = length(style.height, h, style, &space)
                     .map(content_h)
                     .or_else(|| {
+                        if content_height_keyword(style) {
+                            return None;
+                        }
                         let top = length(style.top, h, style, &space)?;
                         let bottom = length(style.bottom, h, style, &space)?;
                         Some(
@@ -268,6 +271,10 @@ pub(super) fn layout_out_of_flow(
     };
     let specified_h = length(style.height, h, style, &space).map(content_h);
     let stretched = match (specified_h, top, bottom) {
+        // `height: min-content | max-content | fit-content` is the content
+        // height in the block axis (css-sizing-3), not stretched between
+        // the insets (fit-content-block-size-abspos).
+        (None, Some(_), Some(_)) if content_height_keyword(style) => None,
         (None, Some(t), Some(bo)) => {
             Some((h - t - bo - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0))
         }
@@ -358,6 +365,16 @@ pub(super) fn fixed_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'stat
         ancestor = flat[a].parent;
     }
     None
+}
+
+/// Whether an auto `height` carries an intrinsic keyword, which in the
+/// block axis means the content height.
+fn content_height_keyword(style: &Style) -> bool {
+    matches!(style.height, w3cos_std::style::Dimension::Auto)
+        && matches!(
+            super::block::marker(style, "--w3cos-internal-height-keyword"),
+            Some("min-content" | "max-content" | "fit-content")
+        )
 }
 
 pub(super) fn direction_rtl(style: &Style) -> bool {

@@ -840,6 +840,60 @@ fn column_aspect_main(style: &Style, content_width: f32) -> Option<f32> {
     Some((content_width / ratio).max(0.0))
 }
 
+/// Main-size limits of a column item after its intrinsic `min-height` /
+/// `max-height` keywords, which resolve to its auto-height content block
+/// size (all three keywords mean that in the block axis). The max is
+/// applied first and the min wins. When the item has a non-auto height
+/// (its content size would need a separate layout), the limits are kept.
+#[allow(clippy::too_many_arguments)]
+fn column_keyword_limits(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    row: bool,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    specified_height: Option<f32>,
+    cross: Option<f32>,
+    measured: Option<f32>,
+    (min, max): (f32, f32),
+) -> Option<(f32, f32)> {
+    let style = flat[child].style;
+    let min_kw = block::marker(style, block::MIN_HEIGHT_KEYWORD).is_some();
+    let max_kw = block::marker(style, block::MAX_HEIGHT_KEYWORD).is_some();
+    if row || block::is_replaced(flat[child].kind) || !(min_kw || max_kw) {
+        return Some((min, max));
+    }
+    if !matches!(style.height, Dimension::Auto) {
+        return Some((min, max));
+    }
+    let content = match measured {
+        Some(height) => height,
+        None => {
+            let laid = layout_item(
+                flat,
+                child,
+                space,
+                inner_width,
+                specified_height,
+                false,
+                None,
+                cross,
+            )?;
+            let edges = item_edges(style, space, inner_width, false);
+            (laid.fragment.height - edges).max(0.0)
+        }
+    };
+    let mut limits = (min, max);
+    if max_kw {
+        limits.1 = limits.1.min(content);
+    }
+    if min_kw {
+        limits.0 = limits.0.max(content);
+    }
+    limits.1 = limits.1.max(limits.0);
+    Some(limits)
+}
+
 /// Margin-box inline contribution of one in-flow child.
 fn inline_contribution(
     flat: &[FlatNodeInfo],
@@ -1540,6 +1594,22 @@ pub(super) fn layout(
         {
             base = stretched;
         }
+        // Intrinsic min/max-height keywords on a column item are its
+        // content block size at its used width (css-sizing-3): the max
+        // caps, the min floors its main size
+        // (flex-item-max-height-min-content).
+        let (min, max) = column_keyword_limits(
+            flat,
+            child,
+            row,
+            space,
+            inner_width,
+            specified_height,
+            cross,
+            measured,
+            (min, max),
+        )
+        .why("flex:keyword-limit")?;
         items.push(Item {
             index: child,
             order: child_style.order,

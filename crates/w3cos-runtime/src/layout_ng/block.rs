@@ -2813,17 +2813,11 @@ pub(super) fn intrinsic_sizes_at(
                 }
             }
         };
-        let (min_kw, max_kw) = keyword_inline_limits(flat, child, space, edges, None, None)?;
-        let border_box = content.map(|w| {
-            let mut w = clamp_inline_indefinite(style, space, edges, w);
-            if let Some(max) = max_kw {
-                w = w.min(max);
-            }
-            if let Some(min) = min_kw {
-                w = w.max(min);
-            }
-            w + edges
-        });
+        let limits = keyword_contribution_limits(flat, child, space, edges)?;
+        let border_box = apply_contribution_limits(content, limits, |w| {
+            clamp_inline_indefinite(style, space, edges, w)
+        })
+        .map(|w| w + edges);
         let max_contribution = if floating {
             // A float outside the content area (negative margins) adds
             // nothing.
@@ -2985,17 +2979,68 @@ pub(super) fn min_max_contribution(
             }
         }
     };
-    let (min_kw, max_kw) = keyword_inline_limits(flat, index, space, edges, None, None)?;
-    Some(content.map(|w| {
-        let mut w = clamp_inline(style, space, edges, w);
+    let limits = keyword_contribution_limits(flat, index, space, edges)?;
+    Some(
+        apply_contribution_limits(content, limits, |w| clamp_inline(style, space, edges, w))
+            .map(|w| w + edges + margins),
+    )
+}
+
+/// Content-box `min-width` / `max-width` keyword limits of an intrinsic
+/// contribution, as (min-content side, max-content side) pairs. Under a
+/// min-content constraint `fit-content` is min-content and under a
+/// max-content constraint it is max-content (css-sizing-3;
+/// fit-content-min-inline-size). Other keywords limit both sides alike.
+type ContributionLimits = (Option<(f32, f32)>, Option<(f32, f32)>);
+
+fn keyword_contribution_limits(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    edges: f32,
+) -> Option<ContributionLimits> {
+    let style = flat[index].style;
+    let (min_kw, max_kw) = (
+        marker(style, MIN_WIDTH_KEYWORD),
+        marker(style, MAX_WIDTH_KEYWORD),
+    );
+    let (min_limit, max_limit) = keyword_inline_limits(flat, index, space, edges, None, None)?;
+    let fit = |keyword: Option<&str>| matches!(keyword, Some("fit-content"));
+    let sides = if fit(min_kw) || fit(max_kw) {
+        let sizes = own_keyword_sizes(flat, index, space, edges)?;
+        let min = sizes.min.or_else(|| super::bail("width-keyword-min"))?;
+        Some((min, sizes.max.max(min)))
+    } else {
+        None
+    };
+    let pair = |keyword: Option<&str>, limit: Option<f32>| match (sides, fit(keyword)) {
+        (Some(sides), true) => Some(sides),
+        _ => limit.map(|l| (l, l)),
+    };
+    Some((pair(min_kw, min_limit), pair(max_kw, max_limit)))
+}
+
+/// Clamp a content-box contribution with `clamp`, then cap each side by
+/// its max keyword limit and floor it by its min keyword limit.
+fn apply_contribution_limits(
+    content: MinMax,
+    (min_kw, max_kw): ContributionLimits,
+    clamp: impl Fn(f32) -> f32,
+) -> MinMax {
+    let side = |w: f32, pick: fn((f32, f32)) -> f32| {
+        let mut w = clamp(w);
         if let Some(max) = max_kw {
-            w = w.min(max);
+            w = w.min(pick(max));
         }
         if let Some(min) = min_kw {
-            w = w.max(min);
+            w = w.max(pick(min));
         }
-        w + edges + margins
-    }))
+        w
+    };
+    MinMax {
+        min: content.min.map(|w| side(w, |p| p.0)),
+        max: side(content.max, |p| p.1),
+    }
 }
 
 /// The content-box contribution of a box with an intrinsic `width`
@@ -3094,6 +3139,32 @@ pub(super) fn keyword_content_size(
     }
 }
 
+/// The content-box min/max-content sizes intrinsic `min-width` /
+/// `max-width` keywords resolve against: a box with an aspect ratio and a
+/// definite height has its transferred inline size
+/// (border-box-and-max-content-002).
+fn own_keyword_sizes(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    edges: f32,
+) -> Option<MinMax> {
+    let style = flat[index].style;
+    let sizes = intrinsic_sizes(flat, index, space).why("width-keyword")?;
+    let side = |s: Spacing| match s {
+        Spacing::Auto => 0.0,
+        s => resolve_spacing_for_layout(s, 0.0, style, space.viewport_w, space.viewport_h),
+    };
+    let b = border(style);
+    let block_edges = b[0] + b[2] + side(style.padding.top) + side(style.padding.bottom);
+    Some(
+        match ratio_inline_size(flat, index, space, edges, block_edges, sizes)? {
+            Some(inline) => MinMax::exact(inline),
+            None => sizes,
+        },
+    )
+}
+
 /// Content-box `min-width` / `max-width` from intrinsic keywords (Blink
 /// ResolveMinInlineLength / ResolveMaxInlineLength). With no available
 /// size (an intrinsic contribution) a keyword that needs one behaves as
@@ -3116,7 +3187,7 @@ fn keyword_inline_limits(
     {
         return Some((None, None));
     }
-    let sizes = intrinsic_sizes(flat, index, space).why("width-keyword")?;
+    let sizes = own_keyword_sizes(flat, index, space, edges)?;
     let min = sizes.min.or_else(|| super::bail("width-keyword-min"))?;
     let max = sizes.max.max(min);
     let resolve = |keyword: &str, fallback: f32| {
