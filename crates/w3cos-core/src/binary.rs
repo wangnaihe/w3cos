@@ -865,10 +865,10 @@ fn view_for(value: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize, Kind, 
     let Some(candidate) = value.as_array() else {
         return None;
     };
+    // Collected views are swept in `new_view`; lookups stay read-only.
     VIEWS.with(|views| {
-        let mut views = views.borrow_mut();
-        views.retain(|view| view.storage.upgrade().is_some());
-        views.iter().find_map(|view| {
+        let views = views.borrow();
+        views.iter().rev().find_map(|view| {
             let storage = view.storage.upgrade()?;
             storage.ptr_eq(&candidate).then(|| {
                 (

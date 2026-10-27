@@ -150,7 +150,17 @@ function stringBytes(string, encoding) {
 
 // ── decoders: bytes [start, end) -> string ──
 
+// Native WHATWG decoder (keeps a leading BOM, like node's toString).
+const UTF8_DECODER = typeof TextDecoder === 'function'
+  ? new TextDecoder('utf-8', { ignoreBOM: true })
+  : null;
+
 function utf8Slice(buf, start, end) {
+  // Large ranges: one native decode instead of a per-byte string build,
+  // which is quadratic for multi-megabyte files.
+  if (UTF8_DECODER !== null && end - start > 64) {
+    return UTF8_DECODER.decode(start === 0 && end === buf.length ? buf : buf.subarray(start, end));
+  }
   // WHATWG UTF-8 decode: one U+FFFD per maximal invalid subpart.
   let out = '';
   let i = start;

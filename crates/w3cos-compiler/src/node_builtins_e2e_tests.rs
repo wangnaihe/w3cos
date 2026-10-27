@@ -162,6 +162,7 @@ console.log("inspect", require("util").inspect(Buffer.from("hi")), Buffer.from("
 console.log("ab", Buffer.from(new Uint8Array([1, 2, 3]).buffer, 1).toString("hex"), Buffer.from(Buffer.from("x")).toString(), Object.prototype.toString.call(b));
 console.log("fill", Buffer.alloc(4).fill("ab").toString(), Buffer.alloc(4).fill(0x41, 1, 3).toString("hex"), typeof Buffer.poolSize, require("node:buffer").kMaxLength > 0);
 const big = Buffer.concat([Buffer.alloc(300000, 1), Buffer.alloc(300000, 2)]); const cq = Buffer.alloc(4, "."); console.log("bulk", big.length, big[299999], big[300000], big[599999], Buffer.from("abcdef").copy(cq, 1, 2), cq.toString(), Buffer.from("ab").copy(cq, 9), Buffer.from("abc").copy(cq, 0, 3), Buffer.concat([Buffer.from("abc"), Buffer.from("def")], 4).toString());
+const u8big = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.alloc(200000, 0x61), Buffer.from([0xe2, 0x82, 0xac, 0xff, 0xc3])]); const us = u8big.toString(); console.log("utf8big", us.length, us.charCodeAt(0), JSON.stringify(us.slice(-4)), u8big.toString("utf8", 3, 6), JSON.stringify(u8big.toString("utf8", 200003, 200005)), typeof TextDecoder);
 "##;
 
 /// `node main.cjs` (v20.19.2).
@@ -183,6 +184,7 @@ inspect <Buffer 68 69> <Buffer 68 69>
 ab 0203 x [object Uint8Array]
 fill abab 00414100 number true
 bulk 600000 1 2 2 3 .cde 0 0 abcd
+utf8big 200004 65279 "a€��" aaa "�" function
 "##;
 
 #[test]
