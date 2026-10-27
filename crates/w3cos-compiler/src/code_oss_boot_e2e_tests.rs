@@ -32,6 +32,7 @@ lookup function true /a/b/node_modules
 builtin true true true false false true
 hooks function
 require builtin function a/b
+nsreq function true
 v8 number number function true
 perf number function function
 als undefined 7 undefined

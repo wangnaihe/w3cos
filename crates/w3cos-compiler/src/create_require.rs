@@ -57,6 +57,8 @@ pub fn find_calls(path: &Path, source: &str) -> Vec<RequireCall> {
         return Vec::new();
     };
     let mut factories = HashSet::new();
+    // Default / namespace imports of `module`: `nodeModule.createRequire(..)`.
+    let mut namespaces = HashSet::new();
     for item in &module.body {
         if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item
             && matches!(
@@ -65,6 +67,15 @@ pub fn find_calls(path: &Path, source: &str) -> Vec<RequireCall> {
             )
         {
             for specifier in &import.specifiers {
+                match specifier {
+                    ImportSpecifier::Default(default) => {
+                        namespaces.insert(default.local.sym.to_string());
+                    }
+                    ImportSpecifier::Namespace(namespace) => {
+                        namespaces.insert(namespace.local.sym.to_string());
+                    }
+                    ImportSpecifier::Named(_) => {}
+                }
                 if let ImportSpecifier::Named(named) = specifier {
                     let imported = match &named.imported {
                         Some(ModuleExportName::Ident(ident)) => ident.sym.to_string(),
@@ -78,11 +89,12 @@ pub fn find_calls(path: &Path, source: &str) -> Vec<RequireCall> {
             }
         }
     }
-    if factories.is_empty() {
+    if factories.is_empty() && namespaces.is_empty() {
         return Vec::new();
     }
     let mut bindings = Bindings {
         factories,
+        namespaces,
         requires: HashSet::new(),
     };
     module.visit_with(&mut bindings);
@@ -102,7 +114,22 @@ pub fn find_calls(path: &Path, source: &str) -> Vec<RequireCall> {
 
 struct Bindings {
     factories: HashSet<String>,
+    namespaces: HashSet<String>,
     requires: HashSet<String>,
+}
+
+impl Bindings {
+    /// `createRequire` itself, or `<module import>.createRequire`.
+    fn is_factory(&self, callee: &Expr) -> bool {
+        match callee {
+            Expr::Ident(ident) => self.factories.contains(&*ident.sym),
+            Expr::Member(member) => {
+                matches!(&*member.obj, Expr::Ident(object) if self.namespaces.contains(&*object.sym))
+                    && matches!(&member.prop, MemberProp::Ident(prop) if &*prop.sym == "createRequire")
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Visit for Bindings {
@@ -110,8 +137,7 @@ impl Visit for Bindings {
         if let (Pat::Ident(name), Some(init)) = (&declarator.name, &declarator.init)
             && let Expr::Call(call) = &**init
             && let Callee::Expr(callee) = &call.callee
-            && let Expr::Ident(ident) = &**callee
-            && self.factories.contains(&*ident.sym)
+            && self.is_factory(callee)
         {
             self.requires.insert(name.id.sym.to_string());
         }
@@ -223,6 +249,15 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("const fs = __w3cos_require_0;"));
+    }
+
+    #[test]
+    fn finds_calls_through_a_default_or_namespace_module_import() {
+        // Code-OSS extHostExtensionService: `nodeModule.createRequire(...)`.
+        let source = "import nodeModule from \"node:module\";\nimport * as m from \"module\";\nconst require2 = nodeModule.createRequire(import.meta.url);\nconst r3 = m.createRequire(import.meta.url);\nconst other = nodeModule.other(x);\nconst a = require2(\"module\");\nconst b = r3(\"fs\");\nconst c = other(\"y\");\nconst d = require2(path);\n";
+        let calls = find_calls(Path::new("ext.js"), source);
+        let specs: Vec<&str> = calls.iter().map(|c| c.specifier.as_str()).collect();
+        assert_eq!(specs, ["module", "fs"]);
     }
 
     #[test]
