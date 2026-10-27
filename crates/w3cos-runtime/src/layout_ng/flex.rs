@@ -509,16 +509,21 @@ pub(super) fn container_min_max_at(
         if oof::is_out_of_flow(flat[child].style) {
             continue;
         }
-        let item =
+        let stretched =
             match stretched_image_main(flat, child, style, space, 0.0, line).why("flex:image")? {
-                Some(main) => {
-                    let child_style = flat[child].style;
-                    let margin = spacing_px(child_style, child_style.margin.left, 0.0, space)
-                        + spacing_px(child_style, child_style.margin.right, 0.0, space);
-                    MinMax::exact(main + item_edges(child_style, space, 0.0, true) + margin)
-                }
-                None => block::min_max_contribution(flat, child, space).why("flex:intrinsic")?,
+                Some(main) => Some(main),
+                None => stretched_ratio_main(flat, child, style, space, 0.0, line)
+                    .why("flex:aspect-ratio")?,
             };
+        let item = match stretched {
+            Some(main) => {
+                let child_style = flat[child].style;
+                let margin = spacing_px(child_style, child_style.margin.left, 0.0, space)
+                    + spacing_px(child_style, child_style.margin.right, 0.0, space);
+                MinMax::exact(main + item_edges(child_style, space, 0.0, true) + margin)
+            }
+            None => block::min_max_contribution(flat, child, space).why("flex:intrinsic")?,
+        };
         count += 1;
         if !row {
             sizes.encompass(item);
@@ -669,6 +674,64 @@ fn stretched_image_cross(
     inner_width: f32,
     line: Option<f32>,
 ) -> Option<Option<f32>> {
+    if !block::is_replaced(flat[child].kind) {
+        return Some(None);
+    }
+    stretched_row_cross(flat, child, container, space, inner_width, line)
+}
+
+/// The content inline size of a non-replaced row item with a preferred
+/// aspect ratio and auto width and height, stretched in a single line
+/// whose content block size `line` is definite: the stretched block size
+/// transfers through the ratio (CSS Flexbox §9.8 item 1; Blink
+/// ComputeMinMaxInlineSizesFromAspectRatio), floored by its min-content
+/// width when its automatic minimum applies. `Some(None)` when the item
+/// is not such a box (aspect-ratio-intrinsic-size-005).
+fn stretched_ratio_main(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    let style = flat[child].style;
+    if block::is_replaced(flat[child].kind)
+        || !matches!(style.width, Dimension::Auto)
+        || block::marker(style, block::WIDTH_KEYWORD).is_some()
+    {
+        return Some(None);
+    }
+    let Some(ratio) = block::BoxAspectRatio::new(
+        style,
+        item_edges(style, space, inner_width, true),
+        item_edges(style, space, inner_width, false),
+    ) else {
+        return Some(None);
+    };
+    let Some(stretched) = stretched_row_cross(flat, child, container, space, inner_width, line)?
+    else {
+        return Some(None);
+    };
+    let mut inline = ratio.inline_from_block(stretched);
+    if matches!(style.min_width, Dimension::Auto) && !block::is_overflow_scroll_container(style) {
+        let content = content_minmax(flat, child, space).why("flex:intrinsic")?;
+        inline = inline.max(content.min.unwrap_or(content.max));
+    }
+    Some(Some(inline))
+}
+
+/// The definite stretched content block size of a row item in a
+/// single-line container whose content block size `line` is definite
+/// (CSS Flexbox §9.8 item 1). `Some(None)` when it is not stretched.
+fn stretched_row_cross(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
     let style = flat[child].style;
     let (start, end) = cross_margin_sides(style, container.flex_direction, false);
     let Some(line) = line else {
@@ -676,7 +739,6 @@ fn stretched_image_cross(
     };
     if !row_axis(container.flex_direction)
         || container.flex_wrap != FlexWrap::NoWrap
-        || !block::is_replaced(flat[child].kind)
         || !matches!(style.height, Dimension::Auto)
         || used_align(container.align_items, style.align_self) != AlignItems::Stretch
         || matches!(start, Spacing::Auto)
@@ -1427,6 +1489,18 @@ pub(super) fn layout(
         // transferred from it through the aspect ratio (§9.2.3 B, §4.5).
         let mut min = min;
         if let Some(transferred) =
+            stretched_ratio_main(flat, child, style, space, inner_width, specified_height)
+                .why("flex:aspect-ratio")?
+        {
+            if matches!(child_style.flex_basis, Dimension::Auto) {
+                base = transferred;
+            }
+            if matches!(child_style.min_width, Dimension::Auto)
+                && !block::is_overflow_scroll_container(child_style)
+            {
+                min = transferred.min(max);
+            }
+        } else if let Some(transferred) =
             stretched_image_main(flat, child, style, space, inner_width, specified_height)
                 .why("flex:image")?
         {

@@ -6180,3 +6180,44 @@ fn flex_min_width_fit_content_uses_available_width() {
         assert_eq!(rect(&ng, 2).2, expected, "outer {outer}");
     }
 }
+
+/// A `width: min-content` block holding a `height: 100%` row flex
+/// container whose only item is an empty `aspect-ratio: 1` box: the
+/// stretched item's 50px height transfers to a 50px min-content width
+/// (aspect-ratio-intrinsic-size-005).
+#[test]
+fn flex_stretched_aspect_ratio_item_min_content_width() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let mut item = Style::default();
+    item.custom_properties
+        .get_or_insert_with(Default::default)
+        .insert("--w3cos-internal-aspect-ratio".into(), "1".into());
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::NoWrap,
+        height: Dimension::Percent(100.0),
+        ..Style::default()
+    };
+    let mut wrapper = Style {
+        height: Dimension::Px(50.0),
+        ..block()
+    };
+    wrapper
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-width-keyword".into(),
+            "min-content".into(),
+        );
+    let root = node(
+        block(),
+        vec![node(wrapper, vec![node(flex, vec![node(item, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 50.0);
+    assert_eq!(rect(&ng, 2).2, 50.0);
+    assert_eq!(rect(&ng, 3), (0.0, 0.0, 50.0, 50.0));
+}
