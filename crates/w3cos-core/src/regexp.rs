@@ -662,7 +662,37 @@ fn translate_javascript_escapes(source: &str) -> String {
     output
 }
 
-fn build_regex(source: &str, flags: &str) -> Option<Regex> {
+/// Compiled-regex cache entries kept per thread before the cache is reset.
+const REGEX_CACHE_LIMIT: usize = 4096;
+
+/// Compile `source`/`flags`, reusing the program from an earlier call.
+///
+/// Every `exec`/`test`/`replace` goes through here, and compiling a Unicode
+/// case-insensitive pattern costs milliseconds (far more in debug builds), so
+/// recompiling per call turned regex-heavy startup code into a multi-minute
+/// stall. `Regex` is immutable, so sharing it is safe; failures are cached too.
+fn build_regex(source: &str, flags: &str) -> Option<Rc<Regex>> {
+    thread_local! {
+        static REGEX_CACHE: RefCell<HashMap<(String, String), Option<Rc<Regex>>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    let key = (source.to_string(), flags.to_string());
+    if let Some(hit) = REGEX_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let built = build_regex_uncached(source, flags).map(Rc::new);
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= REGEX_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key, built.clone());
+    });
+    built
+}
+
+fn build_regex_uncached(source: &str, flags: &str) -> Option<Regex> {
     let source = translate_javascript_escapes(source);
     let source = translate_unicode_sets(&source, flags.contains('v'));
     let modifiers = ['i', 'm', 's']
@@ -791,6 +821,18 @@ mod tests {
             "pattern no longer exercises the limit"
         );
         assert!(build_regex(source, "").is_some());
+    }
+
+    #[test]
+    fn repeated_builds_share_one_compiled_program() {
+        let first = build_regex(r"(?:\p{L}+)\s*(\d+)", "iu").unwrap();
+        let second = build_regex(r"(?:\p{L}+)\s*(\d+)", "iu").unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        let other_flags = build_regex(r"(?:\p{L}+)\s*(\d+)", "u").unwrap();
+        assert!(!Rc::ptr_eq(&first, &other_flags));
+        // Invalid patterns stay invalid on every call.
+        assert!(build_regex("(", "").is_none());
+        assert!(build_regex("(", "").is_none());
     }
 
     #[test]
