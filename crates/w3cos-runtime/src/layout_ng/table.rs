@@ -190,6 +190,13 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         if node.style.position == Position::Sticky {
             return Some("table:sticky");
         }
+        // A percentage block size on a cell's child resolves against the
+        // cell's final height once the table, row or cell has a definite
+        // one (Chrome lays the cell out again at its stretched height).
+        // Cells are laid out once here, with an indefinite basis.
+        if offset != 0 && percent_height(node.style) && cell_height_definite(flat, table, node) {
+            return Some("table:cell-percent-height");
+        }
         if node.style.visibility == Visibility::Collapse
             && matches!(
                 node.style.display,
@@ -210,6 +217,53 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         }
     }
     None
+}
+
+fn percent_height(style: &Style) -> bool {
+    [style.height, style.min_height, style.max_height]
+        .iter()
+        .any(|dim| matches!(dim, Dimension::Percent(_)))
+}
+
+/// Whether `node` is the in-flow child of a (possibly anonymous) cell of
+/// `table` whose cell, row, row group or table has a non-auto height.
+fn cell_height_definite(flat: &[FlatNodeInfo], table: usize, node: &FlatNodeInfo) -> bool {
+    if node.style.float != Float::None
+        || !matches!(node.style.position, Position::Static | Position::Relative)
+        || matches!(
+            node.style.display,
+            Display::TableCell
+                | Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableColumn
+                | Display::TableColumnGroup
+                | Display::TableCaption
+        )
+    {
+        return false;
+    }
+    let Some(parent) = node.parent else {
+        return false;
+    };
+    if !matches!(
+        flat[parent].style.display,
+        Display::TableCell | Display::TableRow
+    ) {
+        return false;
+    }
+    let mut at = Some(parent);
+    while let Some(index) = at {
+        if flat[index].style.height != Dimension::Auto {
+            return true;
+        }
+        if index == table {
+            break;
+        }
+        at = flat[index].parent;
+    }
+    false
 }
 
 fn snap(value: f32) -> f32 {
@@ -242,7 +296,7 @@ fn ua_cell(style: &Style) -> bool {
 
 /// Used cell padding. A definite width absorbs the UA's 1px so the outer
 /// cell matches a `cellpadding=0` reference; an auto width keeps it.
-fn cell_padding(style: &Style, space: &ConstraintSpace, collapsed: bool) -> [f32; 4] {
+fn cell_padding(style: &Style, space: &ConstraintSpace) -> [f32; 4] {
     let cb = space.available_inline;
     let mut pad = [
         spacing_px(style, style.padding.top, cb, space),
@@ -256,7 +310,10 @@ fn cell_padding(style: &Style, space: &ConstraintSpace, collapsed: bool) -> [f32
             pad[1] += UA_CELL_PADDING;
             pad[3] += UA_CELL_PADDING;
         }
-        let definite_height = !collapsed && length_px(style.height, style, None, space).is_some();
+        // A definite height absorbs the UA block padding in both border
+        // models; the collapsed model's used height then matches the
+        // separated one (`height` + the authored 1px padding).
+        let definite_height = length_px(style.height, style, None, space).is_some();
         if !definite_height {
             pad[0] += UA_CELL_PADDING;
             pad[2] += UA_CELL_PADDING;
@@ -281,7 +338,7 @@ fn border_box_of(
     basis: Option<f32>,
 ) -> Option<f32> {
     let specified = length_px(dim, style, basis, space)?;
-    let pad = cell_padding(style, space, style.border_collapse);
+    let pad = cell_padding(style, space);
     let border = border_widths(style);
     let edges = pad[1] + pad[3] + border[1] + border[3];
     Some(match style.box_sizing {
@@ -308,7 +365,7 @@ fn border_box_block(style: &Style, dim: Dimension, space: &ConstraintSpace) -> O
 
 fn content_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> Option<f32> {
     let specified = length_px(style.width, style, Some(space.available_inline), space)?;
-    let pad = cell_padding(style, space, collapsed);
+    let pad = cell_padding(style, space);
     let border = if collapsed {
         [0.0; 4]
     } else {
@@ -328,7 +385,7 @@ fn content_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool)
 
 fn max_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> Option<f32> {
     let specified = length_px(style.max_width, style, Some(space.available_inline), space)?;
-    let pad = cell_padding(style, space, collapsed);
+    let pad = cell_padding(style, space);
     let border = if collapsed {
         [0.0; 4]
     } else {
@@ -343,7 +400,7 @@ fn max_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> 
 
 fn min_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> Option<f32> {
     let specified = length_px(style.min_width, style, Some(space.available_inline), space)?;
-    let pad = cell_padding(style, space, collapsed);
+    let pad = cell_padding(style, space);
     let border = if collapsed {
         [0.0; 4]
     } else {
@@ -697,7 +754,7 @@ fn build_columns(
             continue;
         }
         let content = cell_content_minmax(flat, cell.index, space).why("table:cell")?;
-        let pad = cell_padding(style, space, collapsed);
+        let pad = cell_padding(style, space);
         let border = if collapsed {
             [0.0; 4]
         } else {
@@ -751,7 +808,7 @@ fn build_columns(
             continue;
         }
         let content = cell_content_minmax(flat, cell.index, space).why("table:cell")?;
-        let pad = cell_padding(style, space, collapsed);
+        let pad = cell_padding(style, space);
         let border = if collapsed {
             [0.0; 4]
         } else {
@@ -1379,7 +1436,19 @@ pub(super) fn intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, true)
+    intrinsic_border_box_inner(flat, index, space, true, true)
+}
+
+/// The table's min/max as a contribution to an intrinsically sized parent.
+/// A percentage `width` has no basis there and behaves as `auto`, so the
+/// contribution is the column content (Blink's block min/max treats a
+/// percentage inline size as indefinite).
+pub(super) fn contribution_border_box(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    intrinsic_border_box_inner(flat, index, space, true, false)
 }
 
 /// Column min/max without the table's own `width`. Flex uses this so a
@@ -1389,7 +1458,7 @@ pub(super) fn content_intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, false)
+    intrinsic_border_box_inner(flat, index, space, false, true)
 }
 
 fn intrinsic_border_box_inner(
@@ -1397,6 +1466,7 @@ fn intrinsic_border_box_inner(
     index: usize,
     space: &ConstraintSpace,
     include_specified: bool,
+    percent_basis: bool,
 ) -> Option<MinMax> {
     let style = flat[index].style;
     let grid = grid_of(flat, index);
@@ -1451,7 +1521,11 @@ fn intrinsic_border_box_inner(
     let mut min = min_tracks + gaps + lines;
     let mut max = max_tracks + gaps + lines;
     if include_specified
-        && let Some(specified) = border_box_size(style, space, Some(space.available_inline))
+        && let Some(specified) = border_box_size(
+            style,
+            space,
+            percent_basis.then_some(space.available_inline),
+        )
     {
         min = min.max(specified);
         max = max.max(specified);
@@ -1753,7 +1827,7 @@ pub(super) fn layout_with_block_size(
     let mut cells: Vec<CellLayout> = Vec::with_capacity(grid.cells.len());
     for cell in &grid.cells {
         let style = flat[cell.index].style;
-        let pad = cell_padding(style, space, collapsed);
+        let pad = cell_padding(style, space);
         let border = border_widths(style);
         let span = cell.column_span.max(1);
         let track: f32 = columns

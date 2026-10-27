@@ -4928,3 +4928,49 @@ fn percent_widths_do_not_size_a_shrink_to_fit_float() {
     assert_eq!(rect(&out, 2), (0.0, 0.0, 20.0, 10.0));
     assert_eq!(rect(&out, 4), (0.0, 10.0, 80.0, 10.0));
 }
+
+/// Text carries the runtime's leaf `width: 100%`, and width does not apply
+/// to a non-replaced inline box (CSS 2.1 10.3.1), so neither keeps a
+/// shrink-to-fit float's inline min/max off NG: the float sizes exactly
+/// as it does without those percentages.
+#[test]
+fn inline_min_max_ignores_text_and_inline_box_widths() {
+    use w3cos_std::style::Float;
+    let float_with = |width: Dimension| {
+        let text = |content: &str| {
+            Component::text(
+                content,
+                Style {
+                    display: Display::Inline,
+                    width,
+                    ..Style::default()
+                },
+            )
+        };
+        let span = node(
+            Style {
+                display: Display::Inline,
+                width,
+                ..Style::default()
+            },
+            vec![text("ab cd")],
+        );
+        let float = node(
+            Style {
+                float: Float::Left,
+                ..block()
+            },
+            vec![text("hi "), span],
+        );
+        node(block(), vec![float])
+    };
+    let rects = |root: &Component| {
+        let flat = pre_flatten(root);
+        let out = layout_tree(root, &flat, 800.0, 600.0).expect("inline float");
+        (rect(&out, 1), rect(&out, 2), rect(&out, 3))
+    };
+    let percent = float_with(Dimension::Percent(100.0));
+    let auto = float_with(Dimension::Auto);
+    assert!(rects(&percent).0.2 > 0.0);
+    assert_eq!(rects(&percent), rects(&auto));
+}

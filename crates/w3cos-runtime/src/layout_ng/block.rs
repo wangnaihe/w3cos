@@ -2228,6 +2228,25 @@ fn percent_inline(style: &Style) -> bool {
         || spacing(style.padding.right)
 }
 
+/// [`percent_inline`] for the box `node` generates. Text has no box of its
+/// own (its style carries the runtime's leaf width, which never applies),
+/// and width, min-width and max-width do not apply to a non-replaced
+/// inline box (CSS 2.1 10.3.1), so only its margins and padding count.
+fn box_percent_inline(flat: &[FlatNodeInfo], node: usize) -> bool {
+    let style = flat[node].style;
+    if matches!(flat[node].kind, ComponentKind::Text { .. }) {
+        return false;
+    }
+    if style.display == Display::Inline && !inline::is_atomic_inline(flat, node) {
+        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
+        return spacing(style.margin.left)
+            || spacing(style.margin.right)
+            || spacing(style.padding.left)
+            || spacing(style.padding.right);
+    }
+    percent_inline(style)
+}
+
 /// Whether a descendant that feeds `index`'s min/max-content sizes has a
 /// percentage inline size, margin or padding. Out-of-flow and
 /// `display: none` subtrees contribute nothing to intrinsic sizes (CSS
@@ -2241,10 +2260,39 @@ fn contributing_percent_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
             node = info.subtree_end.max(node + 1);
             continue;
         }
-        if percent_inline(info.style) {
+        if box_percent_inline(flat, node) {
             return true;
         }
         node += 1;
+    }
+    false
+}
+
+/// [`contributing_percent_inline`] for an inline formatting context. An
+/// atomic inline is laid out at its own shrink-to-fit width, which sizes
+/// its contents from their own intrinsic sizes (this function's block,
+/// table and inline paths), so percentages inside it resolve against that
+/// width as in layout. Only a percentage on an inline-level box itself
+/// (the atomic inline, or an inline box's margin and padding) would
+/// resolve against the probe widths of [`inline::inline_min_max`].
+fn inline_percent_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let end = flat[index].subtree_end.max(index + 1);
+    let mut node = index + 1;
+    while node < end {
+        let info = &flat[node];
+        let next = info.subtree_end.max(node + 1);
+        if info.style.display == Display::None || oof::is_out_of_flow(info.style) {
+            node = next;
+            continue;
+        }
+        if box_percent_inline(flat, node) {
+            return true;
+        }
+        node = if inline::is_atomic_inline(flat, node) {
+            next
+        } else {
+            node + 1
+        };
     }
     false
 }
@@ -2315,7 +2363,7 @@ pub(super) fn intrinsic_sizes_at(
     // padding are added back onto this content box.
     if matches!(info.style.display, Display::Table | Display::InlineTable) {
         let border_box =
-            super::table::intrinsic_border_box(flat, index, space).why("table:intrinsic")?;
+            super::table::contribution_border_box(flat, index, space).why("table:intrinsic")?;
         let style = info.style;
         let side = |s: Spacing| match s {
             Spacing::Auto => 0.0,
@@ -2334,7 +2382,7 @@ pub(super) fn intrinsic_sizes_at(
     // children below handle theirs (BlockNode::ComputeMinMaxSizes).
     let percent_below = || contributing_percent_inline(flat, index);
     if (is_author_flex(info.style) || is_author_grid(info.style)) && percent_below() {
-        return super::bail("intrinsic-percent");
+        return super::bail("intrinsic-percent:flex-grid");
     }
     if is_author_flex(info.style) {
         return super::flex::container_min_max_at(flat, index, space, block);
@@ -2386,8 +2434,8 @@ pub(super) fn intrinsic_sizes_at(
     };
     let space = &child_space;
     if inline::is_inline_container(flat, index) {
-        if percent_below() {
-            return super::bail("intrinsic-percent");
+        if inline_percent_inline(flat, index) {
+            return super::bail("intrinsic-percent:inline");
         }
         // Floats among inline content would take the float_left /
         // float_right inline sizes into InlineNode::ComputeMinMaxSizes.
@@ -2433,8 +2481,14 @@ pub(super) fn intrinsic_sizes_at(
             flat[child].kind,
             ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
         ) && !matches!(style.display, Display::Table | Display::InlineTable);
-        if !plain && percent_inline(style) {
-            return super::bail("intrinsic-percent");
+        if !plain && box_percent_inline(flat, child) {
+            return super::bail(
+                if matches!(style.display, Display::Table | Display::InlineTable) {
+                    "intrinsic-percent:table"
+                } else {
+                    "intrinsic-percent:replaced"
+                },
+            );
         }
         // Percentages have nothing to resolve against here (Blink resolves
         // percentage margins and padding against zero for min/max sizes):
@@ -3753,6 +3807,21 @@ fn layout_block_in(
         && matches!(last_baseline, LastBaseline::At(_))
     {
         first_baseline = last_baseline;
+    }
+    // A box that clips its overflow synthesizes its last baseline from its
+    // block-end margin edge (CSS 2.1 10.8.1 for an inline-block; Chrome
+    // does the same for such a block inside one, so an inline-block ending
+    // with it sits on that block's bottom margin edge). The first baseline
+    // stays the content's. Form controls such as buttons keep their
+    // content baseline.
+    if non_visible_overflow(style)
+        && style.display.establishes_overflow_clip()
+        && matches!(
+            info.kind,
+            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+        )
+    {
+        last_baseline = LastBaseline::At(height + metrics.margin[2]);
     }
     Some(LayoutResult {
         last_baseline,
