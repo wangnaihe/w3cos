@@ -2000,6 +2000,40 @@ fn width_keywords_on_flex_containers_and_grid_items() {
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         assert_eq!(rect(&ng, 1).2, width, "flex {word}");
     }
+    // A column-wrap container's max-content width sums its flex lines,
+    // broken at its max-height (col-wrap-002).
+    {
+        let mut flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            flex_wrap: FlexWrap::Wrap,
+            max_height: Dimension::Px(100.0),
+            ..Style::default()
+        };
+        mark(
+            &mut flex,
+            &[("--w3cos-internal-width-keyword", "max-content")],
+        );
+        let item = || {
+            node(
+                Style {
+                    width: Dimension::Px(50.0),
+                    height: Dimension::Auto,
+                    min_height: Dimension::Px(0.0),
+                    flex_grow: 0.0,
+                    flex_shrink: 0.0,
+                    flex_basis: Dimension::Px(100.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(flex, vec![item(), item()])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "column wrap");
+    }
     for (word, width) in [
         ("max-content", 60.0),
         ("min-content", 60.0),

@@ -491,6 +491,15 @@ impl CSSStyleDeclaration {
                         .then_some(keyword),
                 );
             }
+            "flex-flow" | "flexFlow" => {
+                // `<'flex-direction'> || <'flex-wrap'>`; an omitted
+                // longhand resets to its initial value (row, nowrap).
+                if let Some((direction, wrap)) = parse_flex_flow(value) {
+                    self.inner.flex_direction = direction;
+                    self.inner.flex_wrap = wrap;
+                    set_marker(&mut self.inner, UNRECOGNIZED_FLEX_WRAP_PROPERTY, None);
+                }
+            }
             "flex-grow" | "flexGrow" => {
                 if let Ok(v) = value.parse() {
                     self.inner.flex_grow = v
@@ -2951,6 +2960,40 @@ fn parse_align_items(value: &str) -> AlignItems {
         "baseline" => AlignItems::Baseline,
         _ => AlignItems::Stretch,
     }
+}
+
+/// `flex-flow: <'flex-direction'> || <'flex-wrap'>`, or `initial` /
+/// `unset` / `revert` for both initial values. `None` drops the
+/// declaration (an unknown or repeated component, or `inherit`, which
+/// this declaration cannot resolve).
+fn parse_flex_flow(value: &str) -> Option<(FlexDirection, FlexWrap)> {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return Some((FlexDirection::Row, FlexWrap::NoWrap));
+    }
+    let (mut direction, mut wrap) = (None, None);
+    let mut any = false;
+    for token in lower.split_ascii_whitespace() {
+        any = true;
+        match token {
+            "row" | "column" | "row-reverse" | "column-reverse" if direction.is_none() => {
+                direction = Some(parse_flex_direction(token));
+            }
+            "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => {
+                wrap = Some(parse_flex_wrap(token));
+            }
+            _ => return None,
+        }
+    }
+    any.then(|| {
+        (
+            direction.unwrap_or(FlexDirection::Row),
+            wrap.unwrap_or(FlexWrap::NoWrap),
+        )
+    })
 }
 
 fn parse_flex_wrap(value: &str) -> FlexWrap {
@@ -7141,4 +7184,24 @@ fn table_display_values_round_trip_without_falling_back_to_flex() {
         assert_eq!(declaration.inner.display, expected);
         assert_eq!(declaration.get_property("display"), value);
     }
+}
+
+#[test]
+fn flex_flow_sets_direction_and_wrap() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("flex-flow", "column wrap");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::Column);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::Wrap);
+    // An omitted longhand resets to its initial value.
+    declaration.set_property("flex-flow", "wrap-reverse");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::Row);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::WrapReverse);
+    declaration.set_property("flex-flow", "row-reverse");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
+    // Invalid declarations are dropped.
+    declaration.set_property("flex-flow", "column column");
+    declaration.set_property("flex-flow", "wrap bogus");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
 }
