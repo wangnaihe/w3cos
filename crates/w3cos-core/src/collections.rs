@@ -515,6 +515,8 @@ fn build_map_class() -> Value {
     ] {
         proto.set_property(name, Value::function(method));
     }
+    // `Map.prototype[Symbol.iterator] === Map.prototype.entries`.
+    proto.set_property("__w3cos_symbol_iterator", proto.get_property("entries"));
     // Live `size` via the getter convention (see Value::get_property).
     proto.set_property("__w3cos_getter_size", Value::function(map_proto_size));
     let proto_for_slot = proto.clone();
@@ -541,6 +543,8 @@ fn build_set_class() -> Value {
     ] {
         proto.set_property(name, Value::function(method));
     }
+    // `Set.prototype[Symbol.iterator] === Set.prototype.values`.
+    proto.set_property("__w3cos_symbol_iterator", proto.get_property("values"));
     proto.set_property("__w3cos_getter_size", Value::function(set_proto_size));
     let proto_for_slot = proto.clone();
     let class = Value::callable(HashMap::new(), move |_this, args| {
@@ -627,6 +631,26 @@ fn next_set_value(values: &Rc<RefCell<SetValues>>, index: &Cell<usize>) -> Optio
 
 /// Live iterator used by AOT and wrapped by the dynamic W3IR iterator protocol
 /// over the same backing state.
+/// [`iter_collection`] for a Map or Set whose `[Symbol.iterator]` is still
+/// the builtin one, so `for...of` skips the iterator-object protocol. `None`
+/// for anything else, including a collection with an overridden iterator.
+pub(crate) fn default_collection_iter(value: &Value) -> Option<Box<dyn Iterator<Item = Value>>> {
+    let class = if map_state_of(value).is_some() {
+        map_class()
+    } else if set_state_of(value).is_some() {
+        set_class()
+    } else {
+        return None;
+    };
+    let builtin = class
+        .get_property("prototype")
+        .get_property("__w3cos_symbol_iterator");
+    if value.get_property("__w3cos_symbol_iterator") != builtin {
+        return None;
+    }
+    iter_collection(value)
+}
+
 pub(crate) fn iter_collection(value: &Value) -> Option<Box<dyn Iterator<Item = Value>>> {
     if let Some(entries) = map_state_of(value) {
         return Some(Box::new(LiveMapIterator {
@@ -727,6 +751,48 @@ mod tests {
     /// Drain an iterator result into a comma-joined string.
     fn drained(iterator: &Value) -> String {
         Value::array(iterator.iter().collect()).to_js_string()
+    }
+
+    #[test]
+    fn map_and_set_expose_symbol_iterator_as_entries_and_values() {
+        // vs/base DisposableStore disposes through `Iterable.is(set)`, which
+        // reads `set[Symbol.iterator]` as a property.
+        let map = new_map(vec![Value::array(vec![pair(
+            Value::string("x"),
+            Value::Number(1.0),
+        )])]);
+        let map_proto = map_class().get_property("prototype");
+        assert_eq!(
+            map_proto.get_property("__w3cos_symbol_iterator"),
+            map_proto.get_property("entries")
+        );
+        let method = map.get_property("__w3cos_symbol_iterator");
+        assert!(method.is_callable());
+        assert_eq!(drained(&method.call(map.clone(), vec![])), "x,1");
+
+        let set = construct(
+            &set_class(),
+            vec![Value::array(vec![Value::string("a"), Value::string("b")])],
+        );
+        let set_proto = set_class().get_property("prototype");
+        assert_eq!(
+            set_proto.get_property("__w3cos_symbol_iterator"),
+            set_proto.get_property("values")
+        );
+        assert!(set.is_iterable());
+        let method = set.get_property("__w3cos_symbol_iterator");
+        assert_eq!(drained(&method.call(set.clone(), vec![])), "a,b");
+        assert_eq!(Value::array(set.iter().collect()).to_js_string(), "a,b");
+
+        // An own override still wins over the native fast path.
+        set.set_property(
+            "__w3cos_symbol_iterator",
+            Value::function(|_, _| {
+                Value::array(vec![Value::string("z")])
+                    .call_method("__w3cos_symbol_iterator", vec![])
+            }),
+        );
+        assert_eq!(Value::array(set.iter().collect()).to_js_string(), "z");
     }
 
     #[test]

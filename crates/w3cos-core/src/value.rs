@@ -3893,6 +3893,9 @@ impl Value {
         if let Some(values) = self.as_array() {
             return ValueIterator::new(LiveArrayIterator { values, index: 0 });
         }
+        if let Some(iterator) = crate::collections::default_collection_iter(self) {
+            return ValueIterator::boxed(iterator);
+        }
         if let Some(iterator) = acquire_custom_iterator(self, "__w3cos_symbol_iterator", vec![]) {
             return ValueIterator::new(ProtocolValueIterator {
                 iterator,
