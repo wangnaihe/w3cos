@@ -22086,28 +22086,41 @@ fn js_clear_timer(id: u32) {
 
 /// Fire all due `setTimeout`/`setInterval` callbacks. Returns the number of
 /// callbacks invoked.
+///
+/// Due timers run one at a time in deadline order (creation order breaking
+/// ties), as in Node and browsers, and each is taken from the store only when
+/// it is about to run. So after a long synchronous stretch a `setTimeout(f, 0)`
+/// still runs before an older `setTimeout(g, 1000)`, and `f` can
+/// `clearTimeout` `g` even though both are already due (vs/base/parts/ipc's
+/// ChannelServer flushes pending requests this way before their 1s
+/// "Unknown channel" timeout). Timers created or rescheduled by a callback are
+/// due no earlier than `now` and wait for the next tick.
 pub fn tick_timers() -> usize {
-    let mut fired: Vec<(Value, Vec<Value>)> = Vec::new();
-    JS_TIMERS.with(|t| {
-        let mut timers = t.borrow_mut();
-        let now = Instant::now();
-        let mut i = 0;
-        while i < timers.len() {
-            if now >= timers[i].fire_at {
-                fired.push((timers[i].callback.clone(), timers[i].args.clone()));
-                if let Some(interval) = timers[i].interval {
-                    timers[i].fire_at = now + interval;
-                    i += 1;
-                } else {
-                    timers.remove(i);
-                }
+    let now = Instant::now();
+    let mut ran = 0;
+    loop {
+        let next = JS_TIMERS.with(|t| {
+            let mut timers = t.borrow_mut();
+            let index = timers
+                .iter()
+                .enumerate()
+                .filter(|(_, timer)| timer.fire_at <= now)
+                .min_by_key(|(_, timer)| (timer.fire_at, timer.id))
+                .map(|(index, _)| index)?;
+            let timer = &mut timers[index];
+            let due = (timer.callback.clone(), timer.args.clone());
+            if let Some(interval) = timer.interval {
+                // Strictly after `now`, so it cannot run twice in this tick.
+                timer.fire_at = now + interval;
             } else {
-                i += 1;
+                timers.remove(index);
             }
-        }
-    });
-    let ran = fired.len();
-    for (cb, args) in fired {
+            Some(due)
+        });
+        let Some((cb, args)) = next else {
+            break;
+        };
+        ran += 1;
         // HTML timer initialization steps: an exception thrown by the callback
         // is reported (window `onerror`) and does not stop the other due timers
         // or the event loop. Node semantics apply when nothing handles it: a
@@ -29748,6 +29761,42 @@ try {
             ["uncaughtException no handler uncaughtException"]
         );
         win.set_property("process", saved_process);
+    }
+
+    #[test]
+    fn due_timers_fire_in_deadline_order_and_can_cancel_each_other() {
+        setup();
+        let win = window_value();
+        let log = Rc::new(RefCell::new(String::new()));
+        let slow_log = log.clone();
+        let slow = win.call_method(
+            "setTimeout",
+            vec![
+                func(move |_, _| {
+                    slow_log.borrow_mut().push('S');
+                    Value::Undefined
+                }),
+                Value::Number(5.0),
+            ],
+        );
+        let fast_log = log.clone();
+        let win_for_fast = win.clone();
+        win.call_method(
+            "setTimeout",
+            vec![
+                func(move |_, _| {
+                    fast_log.borrow_mut().push('F');
+                    win_for_fast.call_method("clearTimeout", vec![slow.clone()]);
+                    Value::Undefined
+                }),
+                Value::Number(0.0),
+            ],
+        );
+        // Both are due by now; the 0ms one must run first and cancel the 5ms one.
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(log.borrow().as_str(), "F");
+        assert!(!has_pending_work() || tick_timers() == 0);
     }
 
     #[test]
