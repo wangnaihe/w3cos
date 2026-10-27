@@ -131,3 +131,56 @@ fn computed_require_of_a_declared_module_loads_it_from_the_graph() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A CommonJS module's `require()` of a specifier its build could not link
+/// goes through `Module._load`, so a loader patched over it serves it (the
+/// Code-OSS extension host's `vscode` API interceptor); unserved, it still
+/// throws `MODULE_NOT_FOUND`.
+const UNLINKED_REQUIRE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-unlinked-require", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "modules": ["ext/out/extension.js"] } }"#,
+    ),
+    (
+        "ext/package.json",
+        r#"{ "name": "ext", "main": "./out/extension.js" }"#,
+    ),
+    (
+        "ext/out/extension.js",
+        r#"const api = require('host-api');
+exports.activate = function () {
+  try {
+    require('not-installed');
+  } catch (error) {
+    return api.greet(require('path').basename(module.filename)) + ' ' + error.code;
+  }
+};
+"#,
+    ),
+    (
+        "main.js",
+        r#"import Module, { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const load = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === 'host-api') return { greet: (name) => 'hello ' + name + ' from ' + typeof parent.filename };
+  return load.apply(this, arguments);
+};
+const extension = require('./ext/out/' + ['extension', 'js'].join('.'));
+console.log(extension.activate());
+"#,
+    ),
+];
+
+#[test]
+fn unlinked_commonjs_require_goes_through_the_runtime_module_loader() {
+    let root = write_fixture("w3cos_unlinked_require", UNLINKED_REQUIRE);
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_unlinked_require");
+    assert_eq!(
+        lines,
+        ["hello extension.js from string MODULE_NOT_FOUND"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

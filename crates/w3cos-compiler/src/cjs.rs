@@ -709,7 +709,7 @@ export function __w3cos_cjs_load(filename, dirname, factory, resolveRequire, res
   if (cached !== undefined) return cached.exports;
   const module = { id: filename, filename: filename, path: dirname, loaded: false, exports: {}, children: [], paths: [] };
   const require = function require(specifier) {
-    return resolveRequire(String(specifier));
+    return resolveRequire(String(specifier), module);
   };
   require.resolve = function resolve(specifier) {
     const resolved = resolvePath(String(specifier));
@@ -728,7 +728,15 @@ export function __w3cos_cjs_load(filename, dirname, factory, resolveRequire, res
   module.loaded = true;
   return module.exports;
 }
-export function __w3cos_cjs_missing(specifier, from) {
+export function __w3cos_cjs_missing(specifier, from, module) {
+  // Not linked at compile time: a run-time module loader (Node's `module`
+  // glue, `Module._load` and whatever patched it, e.g. the Code-OSS extension
+  // host's `vscode` API interceptor) may still serve it.
+  const loader = globalThis.__w3cos_cjs_runtime_load;
+  if (module !== undefined && typeof loader === "function") {
+    const loaded = loader(specifier, module);
+    if (loaded !== undefined) return loaded.value;
+  }
   const error = new Error("Cannot find module '" + specifier + "' from '" + from + "'");
   error.code = "MODULE_NOT_FOUND";
   throw error;
@@ -894,7 +902,7 @@ pub fn record_source_with_prelude(
         ));
     }
     out.push_str(&format!(
-        "function __w3cos_cjs_require(specifier) {{\n  switch (specifier) {{\n{require_cases}  }}\n  return __w3cos_cjs_missing(specifier, {file});\n}}\n\
+        "function __w3cos_cjs_require(specifier, module) {{\n  switch (specifier) {{\n{require_cases}  }}\n  return __w3cos_cjs_missing(specifier, {file}, module);\n}}\n\
 function __w3cos_cjs_resolve(specifier) {{\n  switch (specifier) {{\n{resolve_cases}  }}\n  return undefined;\n}}\n\
 export default function __w3cos_cjs_record() {{\n  return __w3cos_cjs_load({file}, {dir}, __w3cos_cjs_factory, __w3cos_cjs_require, __w3cos_cjs_resolve);\n}}\n\
 function __w3cos_cjs_factory(exports, require, module, __filename, __dirname) {{\n{prelude}{body}\n}}\n",
