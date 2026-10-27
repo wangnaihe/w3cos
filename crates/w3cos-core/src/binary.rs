@@ -255,8 +255,17 @@ struct View {
 
 thread_local! {
     static NEXT_BUFFER_ID: RefCell<u64> = const { RefCell::new(1) };
-    static BUFFERS: RefCell<HashMap<u64, Rc<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
+    /// Buffer id -> bytes. Weak: the ArrayBuffer object's own closures hold
+    /// the bytes strongly, so a collected buffer frees its storage.
+    static BUFFERS: RefCell<HashMap<u64, std::rc::Weak<RefCell<Vec<u8>>>>> = RefCell::new(HashMap::new());
+    /// `BUFFERS` size that triggers the next sweep of dead entries.
+    static BUFFER_SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
     static VIEWS: RefCell<Vec<View>> = const { RefCell::new(Vec::new()) };
+    /// `VIEWS` length that triggers the next sweep of collected views:
+    /// twice the live count after the previous sweep, so dead views never
+    /// outnumber live ones (plus a small floor) and sweeping stays O(1)
+    /// amortized.
+    static VIEW_SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
     /// Set once any typed array gets a custom prototype: array property
     /// reads skip the view lookup until then.
     static ANY_VIEW_PROTOTYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -276,7 +285,21 @@ fn buffer_state(value: &Value) -> Option<Rc<RefCell<Vec<u8>>>> {
     let Some(id) = object.borrow().get_direct(BUFFER_STATE_KEY).as_number() else {
         return None;
     };
-    BUFFERS.with(|buffers| buffers.borrow().get(&(id as u64)).cloned())
+    BUFFERS.with(|buffers| {
+        buffers
+            .borrow()
+            .get(&(id as u64))
+            .and_then(std::rc::Weak::upgrade)
+    })
+}
+
+/// Weak handle to an ArrayBuffer object for its own method closures, so
+/// the buffer does not keep itself alive through a reference cycle.
+fn weak_buffer(value: &Value) -> crate::value::WeakJsObject {
+    value
+        .as_object()
+        .expect("ArrayBuffer is an object")
+        .downgrade()
 }
 
 fn new_buffer_from_state_with_options(
@@ -290,7 +313,15 @@ fn new_buffer_from_state_with_options(
         *next.borrow_mut() = id + 1;
         id
     });
-    BUFFERS.with(|buffers| buffers.borrow_mut().insert(id, state.clone()));
+    BUFFERS.with(|buffers| {
+        let mut buffers = buffers.borrow_mut();
+        if buffers.len() >= BUFFER_SWEEP_AT.with(|at| at.get()) {
+            buffers.retain(|_, bytes| bytes.strong_count() > 0);
+            let next = (buffers.len() * 2).max(64);
+            BUFFER_SWEEP_AT.with(|at| at.set(next));
+        }
+        buffers.insert(id, Rc::downgrade(&state));
+    });
     let value = Value::object(HashMap::from([
         (BUFFER_STATE_KEY.to_string(), Value::Number(id as f64)),
         (SHARED_BUFFER_KEY.to_string(), Value::Bool(shared)),
@@ -306,10 +337,13 @@ fn new_buffer_from_state_with_options(
         "__w3cos_getter_byteLength",
         Value::function(move |_, _| Value::Number(state_for_length.borrow().len() as f64)),
     );
-    let value_for_maximum = value.clone();
+    let value_for_maximum = weak_buffer(&value);
     value.set_property(
         "__w3cos_getter_maxByteLength",
         Value::function(move |_, _| {
+            let Some(value_for_maximum) = value_for_maximum.upgrade_value() else {
+                binary_error("TypeError", "ArrayBuffer is no longer alive");
+            };
             Value::Number(if value_for_maximum
                 .get_property(DETACHED_BUFFER_KEY)
                 .to_bool()
@@ -320,7 +354,7 @@ fn new_buffer_from_state_with_options(
             } as f64)
         }),
     );
-    let value_for_resizable = value.clone();
+    let value_for_resizable = weak_buffer(&value);
     value.set_property(
         if shared {
             "__w3cos_getter_growable"
@@ -328,6 +362,9 @@ fn new_buffer_from_state_with_options(
             "__w3cos_getter_resizable"
         },
         Value::function(move |_, _| {
+            let Some(value_for_resizable) = value_for_resizable.upgrade_value() else {
+                binary_error("TypeError", "ArrayBuffer is no longer alive");
+            };
             Value::Bool(
                 resizable
                     && !value_for_resizable
@@ -337,10 +374,13 @@ fn new_buffer_from_state_with_options(
         }),
     );
     if !shared {
-        let value_for_detached = value.clone();
+        let value_for_detached = weak_buffer(&value);
         value.set_property(
             "__w3cos_getter_detached",
             Value::function(move |_, _| {
+                let Some(value_for_detached) = value_for_detached.upgrade_value() else {
+                    binary_error("TypeError", "ArrayBuffer is no longer alive");
+                };
                 Value::Bool(
                     value_for_detached
                         .get_property(DETACHED_BUFFER_KEY)
@@ -349,10 +389,13 @@ fn new_buffer_from_state_with_options(
             }),
         );
     }
-    let value_for_slice = value.clone();
+    let value_for_slice = weak_buffer(&value);
     value.set_property(
         "slice",
         Value::function(move |_, args| {
+            let Some(value_for_slice) = value_for_slice.upgrade_value() else {
+                binary_error("TypeError", "ArrayBuffer is no longer alive");
+            };
             if value_for_slice.get_property(DETACHED_BUFFER_KEY).to_bool() {
                 binary_error("TypeError", "ArrayBuffer is detached");
             }
@@ -402,10 +445,13 @@ fn new_buffer_from_state_with_options(
         );
     } else {
         let state_for_resize = state.clone();
-        let value_for_resize = value.clone();
+        let value_for_resize = weak_buffer(&value);
         value.set_property(
             "resize",
             Value::function(move |_, args| {
+                let Some(value_for_resize) = value_for_resize.upgrade_value() else {
+                    binary_error("TypeError", "ArrayBuffer is no longer alive");
+                };
                 if value_for_resize.get_property(DETACHED_BUFFER_KEY).to_bool() {
                     binary_error("TypeError", "ArrayBuffer is detached");
                 }
@@ -426,10 +472,13 @@ fn new_buffer_from_state_with_options(
             }),
         );
         for (name, fixed) in [("transfer", false), ("transferToFixedLength", true)] {
-            let source = value.clone();
+            let source = weak_buffer(&value);
             value.set_property(
                 name,
                 Value::function(move |_, args| {
+                    let Some(source) = source.upgrade_value() else {
+                        binary_error("TypeError", "ArrayBuffer is no longer alive");
+                    };
                     if source.get_property(DETACHED_BUFFER_KEY).to_bool() {
                         binary_error("TypeError", "ArrayBuffer is detached");
                     }
@@ -941,9 +990,12 @@ fn new_view(buffer: Value, offset: usize, length: usize, kind: Kind) -> Value {
     VIEWS.with(|views| {
         let mut views = views.borrow_mut();
         // Element writes refresh aliasing views without sweeping the list,
-        // so drop collected views here at doubling sizes (amortized O(1)).
-        if views.len() >= 64 && views.len().is_power_of_two() {
+        // so drop collected views here once the list doubles past its
+        // last live size (amortized O(1), dead views bounded by live ones).
+        if views.len() >= VIEW_SWEEP_AT.with(|at| at.get()) {
             views.retain(|view| view.storage.upgrade().is_some());
+            let next = (views.len() * 2).max(64);
+            VIEW_SWEEP_AT.with(|at| at.set(next));
         }
         views.push(View {
             storage: storage.downgrade(),
@@ -1939,6 +1991,56 @@ mod tests {
             alias.get_property(&(size - 1).to_string()).to_number(),
             ((size - 1) % 251) as f64
         );
+    }
+
+    #[test]
+    fn collected_array_buffers_release_their_bytes() {
+        let buffer = array_buffer_value(vec![7; 1 << 20]);
+        let bytes = Rc::downgrade(&buffer_state(&buffer).expect("registered"));
+        let slice = buffer.call_method("slice", vec![Value::Number(1.0), Value::Number(3.0)]);
+        assert_eq!(slice.get_property("byteLength").to_number(), 2.0);
+        drop(buffer);
+        assert!(
+            bytes.upgrade().is_none(),
+            "ArrayBuffer bytes outlived the buffer"
+        );
+
+        let typed = crate::class::construct(
+            &typed_array_class("Uint8Array"),
+            vec![Value::Number((1 << 20) as f64)],
+        );
+        let bytes =
+            Rc::downgrade(&buffer_state(&typed.get_property("buffer")).expect("registered"));
+        drop(typed);
+        for _ in 0..200 {
+            drop(crate::class::construct(
+                &typed_array_class("Uint8Array"),
+                vec![Value::Number(1.0)],
+            ));
+        }
+        assert!(
+            bytes.upgrade().is_none(),
+            "TypedArray bytes outlived the view"
+        );
+    }
+
+    #[test]
+    fn collected_views_are_swept_so_dead_views_stay_bounded() {
+        let keep =
+            crate::class::construct(&typed_array_class("Uint8Array"), vec![Value::Number(16.0)]);
+        for _ in 0..10_000 {
+            let transient = keep.call_method("subarray", vec![Value::Number(1.0)]);
+            drop(transient);
+        }
+        let (total, live) = VIEWS.with(|views| {
+            let views = views.borrow();
+            let live = views
+                .iter()
+                .filter(|view| view.storage.upgrade().is_some())
+                .count();
+            (views.len(), live)
+        });
+        assert!(total <= live * 2 + 64, "{total} views tracked, {live} live");
     }
 
     #[test]
