@@ -184,3 +184,53 @@ fn unlinked_commonjs_require_goes_through_the_runtime_module_loader() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A computed `import()` of a declared ES-module extension by `file://` URL
+/// (the Code-OSS extension host imports `"type": "module"` extensions with
+/// `import(pathToFileURL(entry).href)`) is served from the compiled graph;
+/// an undeclared file URL still rejects with `ERR_MODULE_NOT_FOUND`.
+const FILE_URL_IMPORT: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-file-url-import", "version": "0.1.0", "type": "module", "main": "main.js",
+  "w3cos": { "modules": ["ext/out/extension.js"] } }"#,
+    ),
+    (
+        "ext/package.json",
+        r#"{ "name": "ext", "type": "module", "main": "./out/extension.js" }"#,
+    ),
+    (
+        "ext/out/extension.js",
+        "console.log('esm extension evaluated');\nexport function activate() { return 'activated'; }\n",
+    ),
+    (
+        "main.js",
+        r#"const url = new URL('./ext/out/' + ['extension', 'js'].join('.'), import.meta.url).href;
+console.log(url.startsWith('file:///'));
+const ns = await import(url);
+console.log(ns.activate());
+try {
+  await import(new URL('./ext/out/' + 'missing.js', import.meta.url).href);
+} catch (error) {
+  console.log(error.code);
+}
+"#,
+    ),
+];
+
+#[test]
+fn computed_file_url_import_of_a_declared_module_loads_it_from_the_graph() {
+    let root = write_fixture("w3cos_file_url_import", FILE_URL_IMPORT);
+    let lines = compile_and_run(&root, &root.join("main.js"), "w3cos_file_url_import");
+    assert_eq!(
+        lines,
+        [
+            "true",
+            "esm extension evaluated",
+            "activated",
+            "ERR_MODULE_NOT_FOUND",
+        ],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

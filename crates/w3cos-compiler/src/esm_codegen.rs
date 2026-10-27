@@ -707,7 +707,7 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
     let mut arms = String::new();
     // A computed relative specifier resolves against its referrer.
     let mut fallback = String::from(
-        "{ let __s = __specifier.as_str(); let __abs = w3cos_core::module_registry::resolve_relative_specifier(__referrer_path, __s); let __abs = __abs.as_deref(); ",
+        "{ let __s = __specifier.as_str(); let __s = __s.strip_prefix(\"file://\").unwrap_or(__s); let __abs = w3cos_core::module_registry::resolve_relative_specifier(__referrer_path, __s); let __abs = __abs.as_deref(); ",
     );
     for edge in &bundle.dynamic_imports {
         let referrer = edge.referrer.to_string_lossy();
@@ -736,7 +736,7 @@ fn emit_dynamic_import_adapter(bundle: &EsmBundle) -> String {
     }
     // Not in the compiled graph (unlinked, or excluded via `"w3cos":
     // { "exclude": [...] }`): reject like a missing module.
-    fallback.push_str("{ return w3cos_core::intrinsics::promise_reject(vec![w3cos_core::module_registry::module_not_found(__s)]); } }");
+    fallback.push_str("{ return w3cos_core::intrinsics::promise_reject(vec![w3cos_core::module_registry::module_not_found(__specifier.as_str())]); } }");
     format!(
         " w3cos_core::host_modules::register(w3cos_core::host_modules::DYNAMIC_IMPORT_PATH, w3cos_core::Value::function(|_, arguments| {{ let __specifier = arguments.first().cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer = arguments.get(1).cloned().unwrap_or(w3cos_core::Value::Undefined).to_js_string(); let __referrer_path = __referrer.split('#').next().unwrap_or(__referrer.as_str()); let __namespace = match (__referrer_path, __specifier.as_str()) {{ {arms}_ => {fallback}, }}; w3cos_core::intrinsics::promise_resolve(vec![__namespace]) }}));"
     )
