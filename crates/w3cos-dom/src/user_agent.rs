@@ -82,6 +82,139 @@ pub(crate) fn control_appearance<'a>(
     }
 }
 
+/// True for element names that are not part of HTML, SVG or MathML, so the
+/// user agent gives them no presentation of their own.
+fn is_unknown_html_element(name: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "html",
+        "body",
+        "div",
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "ul",
+        "ol",
+        "dl",
+        "dt",
+        "dd",
+        "section",
+        "article",
+        "aside",
+        "nav",
+        "header",
+        "footer",
+        "main",
+        "address",
+        "blockquote",
+        "pre",
+        "figure",
+        "figcaption",
+        "hgroup",
+        "form",
+        "fieldset",
+        "legend",
+        "details",
+        "summary",
+        "dialog",
+        "hr",
+        "menu",
+        "center",
+        "dir",
+        "listing",
+        "plaintext",
+        "xmp",
+        "search",
+        "optgroup",
+        "option",
+        "datalist",
+        "slot",
+        "noscript",
+        "picture",
+        "map",
+        "area",
+        "audio",
+        "embed",
+        "applet",
+        "frame",
+        "frameset",
+        "marquee",
+        "meter",
+        "progress",
+        "fencedframe",
+        "source",
+        "track",
+        "math",
+        "svg",
+        "foreignobject",
+        "selectedcontent",
+        "text",
+    ];
+    // SVG/MathML descendants keep the historical block default; they are laid
+    // out by their own formatting contexts.
+    const FOREIGN: &[&str] = &[
+        "g",
+        "path",
+        "rect",
+        "circle",
+        "ellipse",
+        "line",
+        "polyline",
+        "polygon",
+        "defs",
+        "use",
+        "symbol",
+        "marker",
+        "pattern",
+        "mask",
+        "clippath",
+        "lineargradient",
+        "radialgradient",
+        "stop",
+        "filter",
+        "image",
+        "tspan",
+        "textpath",
+        "desc",
+        "switch",
+        "view",
+        "mi",
+        "mo",
+        "mn",
+        "ms",
+        "mtext",
+        "mrow",
+        "mfrac",
+        "msqrt",
+        "mroot",
+        "msub",
+        "msup",
+        "msubsup",
+        "munder",
+        "mover",
+        "munderover",
+        "mtable",
+        "mtr",
+        "mtd",
+        "mspace",
+        "mstyle",
+        "mpadded",
+        "mphantom",
+        "menclose",
+        "semantics",
+        "annotation",
+        "annotation-xml",
+        "mglyph",
+    ];
+    !name.is_empty()
+        && !KNOWN.contains(&name)
+        && !FOREIGN.contains(&name)
+        && !name.starts_with("fe")
+}
+
 /// Apply W3COS's default HTML presentation to an existing style.
 ///
 /// Call this before author styles so stylesheet and inline declarations keep
@@ -104,7 +237,9 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "base" | "head" | "link" | "meta" | "noembed" | "noframes" | "param" | "script"
         | "style" | "template" | "title" => Display::None,
         "a" | "abbr" | "b" | "bdi" | "bdo" | "br" | "code" | "del" | "em" | "i" | "iframe"
-        | "ins" | "label" | "object" | "font" | "nobr" | "small" | "span" | "strong" | "u" => {
+        | "ins" | "label" | "object" | "font" | "nobr" | "small" | "span" | "strong" | "u"
+        | "mark" | "q" | "cite" | "dfn" | "kbd" | "samp" | "sub" | "sup" | "var" | "time"
+        | "data" | "output" | "tt" | "big" | "strike" | "s" | "wbr" | "ruby" | "rt" | "rp" => {
             Display::Inline
         }
         "button" | "canvas" | "img" | "input" | "select" | "svg" | "textarea" | "video" => {
@@ -120,6 +255,9 @@ pub fn apply_html_default_style(style: &mut Style, local_name: &str) {
         "tr" => Display::TableRow,
         "td" | "th" => Display::TableCell,
         "li" => Display::ListItem,
+        // HTML's HTMLUnknownElement (e.g. VS Code's `<mnemonic>`) and valid
+        // custom elements (`my-el`) default to `display: inline`.
+        name if is_unknown_html_element(name) => Display::Inline,
         _ => Display::Block,
     };
 
@@ -293,6 +431,23 @@ pub fn html_default_style(local_name: &str) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_and_custom_elements_default_to_inline() {
+        for (tag, display) in [
+            ("mnemonic", Display::Inline),
+            ("my-widget", Display::Inline),
+            ("mark", Display::Inline),
+            ("div", Display::Block),
+            ("section", Display::Block),
+            ("path", Display::Block),
+            ("li", Display::ListItem),
+        ] {
+            let mut style = Style::default();
+            apply_html_default_style(&mut style, tag);
+            assert_eq!(style.display, display, "{tag}");
+        }
+    }
 
     #[test]
     fn nobr_is_inline_nowrap_below_author_cascade() {
