@@ -11031,14 +11031,30 @@ impl Document {
 
 fn css_property_eq(actual: &str, canonical: &str) -> bool {
     // Property names are ASCII. Skip dashes and compare without allocating a
-    // lowercased copy; computed style calls this for every declaration.
-    let mut left = actual.bytes().filter(|byte| *byte != b'-');
-    let mut right = canonical.bytes().filter(|byte| *byte != b'-');
+    // lowercased copy; computed style calls this for every declaration, so it
+    // is a plain index loop (iterator adapters made it the hottest function of
+    // the Code-OSS boot in unoptimised builds) with an exact-match fast path.
+    let (left, right) = (actual.as_bytes(), canonical.as_bytes());
+    if left == right {
+        return true;
+    }
+    let (mut i, mut j) = (0, 0);
     loop {
-        match (left.next(), right.next()) {
-            (Some(actual), Some(canonical))
-                if actual.to_ascii_lowercase() == canonical.to_ascii_lowercase() => {}
-            (None, None) => return true,
+        while i < left.len() && left[i] == b'-' {
+            i += 1;
+        }
+        while j < right.len() && right[j] == b'-' {
+            j += 1;
+        }
+        match (i < left.len(), j < right.len()) {
+            (false, false) => return true,
+            (true, true) => {
+                if left[i].to_ascii_lowercase() != right[j].to_ascii_lowercase() {
+                    return false;
+                }
+                i += 1;
+                j += 1;
+            }
             _ => return false,
         }
     }
@@ -11061,6 +11077,12 @@ mod css_property_eq_tests {
         assert!(!css_property_eq("width", "height"));
         assert!(!css_property_eq("top", "topx"));
         assert!(css_property_eq("background-color", "backgroundColor"));
+        assert!(css_property_eq("color", "color"));
+        assert!(css_property_eq("", ""));
+        assert!(css_property_eq("--", ""));
+        assert!(!css_property_eq("topx", "top"));
+        assert!(!css_property_eq("", "top"));
+        assert!(!css_property_eq("top", ""));
     }
 }
 
