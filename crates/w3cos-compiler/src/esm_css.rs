@@ -62,6 +62,9 @@ pub enum StylesheetFontSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StylesheetFontFace {
     pub family: String,
+    /// Path of the stylesheet that declared the face; relative `url()` sources
+    /// resolve against its directory.
+    pub source_path: String,
     pub sources: Vec<StylesheetFontSource>,
     pub weight: Option<String>,
     pub style: Option<String>,
@@ -615,7 +618,7 @@ fn parse_at_rule(
             }
         }
         "font-face" => {
-            if let Some(face) = parse_font_face_block(block_str, media) {
+            if let Some(face) = parse_font_face_block(block_str, media, path) {
                 font_faces.push(face);
             } else {
                 push_warning(
@@ -722,7 +725,11 @@ fn parse_import_prelude(prelude: &str) -> Option<StylesheetImport> {
     })
 }
 
-fn parse_font_face_block(block: &str, media: Option<&str>) -> Option<StylesheetFontFace> {
+fn parse_font_face_block(
+    block: &str,
+    media: Option<&str>,
+    source_path: &str,
+) -> Option<StylesheetFontFace> {
     let declarations = parse_declarations_raw(block);
     let value = |name: &str| {
         declarations
@@ -757,6 +764,7 @@ fn parse_font_face_block(block: &str, media: Option<&str>) -> Option<StylesheetF
     }
     Some(StylesheetFontFace {
         family,
+        source_path: source_path.to_string(),
         sources,
         weight: value("font-weight").map(ToString::to_string),
         style: value("font-style").map(ToString::to_string),
@@ -2350,6 +2358,7 @@ mod tests {
         );
         assert_eq!(sheet.font_faces.len(), 2);
         assert_eq!(sheet.font_faces[0].family, "Map Sans");
+        assert_eq!(sheet.font_faces[0].source_path, "fonts.css");
         assert_eq!(
             sheet.font_faces[0].sources,
             vec![

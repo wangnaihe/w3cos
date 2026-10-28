@@ -218,6 +218,47 @@ impl Default for FontFace {
     }
 }
 
+/// Register a compiled stylesheet's `@font-face` from the first readable file
+/// in `candidates` (absolute or cwd-relative paths baked in by the compiler).
+/// Descriptor strings are the raw CSS values. Returns whether a face loaded;
+/// failures are warnings, never panics, so a missing font only degrades text.
+pub fn register_stylesheet_font_file(
+    family: &str,
+    weight: Option<&str>,
+    style: Option<&str>,
+    display: Option<&str>,
+    unicode_range: Option<&str>,
+    candidates: &[&str],
+) -> bool {
+    let display = match display
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "block" => FontDisplay::Block,
+        "swap" => FontDisplay::Swap,
+        "fallback" => FontDisplay::Fallback,
+        "optional" => FontDisplay::Optional,
+        _ => FontDisplay::Auto,
+    };
+    for candidate in candidates {
+        let face = FontFace {
+            family: family.to_string(),
+            src: FontSource::Path(PathBuf::from(candidate)),
+            weight: FontWeight::from_str(weight.unwrap_or("normal")),
+            style: FontFaceStyle::from_str(style.unwrap_or("normal")),
+            display,
+            unicode_range: unicode_range.map(str::to_string),
+        };
+        match FontRegistry::global().register(face) {
+            Ok(()) => return true,
+            Err(error) => eprintln!("[w3cos] warning: @font-face {family:?} {candidate}: {error}"),
+        }
+    }
+    false
+}
+
 thread_local! {
     static FACE_HIT: RefCell<Option<(u64, LoadedFont)>> = const { RefCell::new(None) };
 }

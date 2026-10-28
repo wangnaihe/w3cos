@@ -245,7 +245,24 @@ pub fn try_generate_with_bodies_and_css(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
 ) -> Result<String, EsmCodegenError> {
-    let parts = generate_parts(bundle, css_rules)?;
+    try_generate_with_bodies_and_stylesheet_parts(bundle, css_rules, &[])
+}
+
+/// Like [`try_generate_with_bodies_and_css`], taking the whole collected
+/// stylesheet so `@font-face` faces are registered next to the rules.
+pub fn try_generate_with_bodies_and_stylesheet(
+    bundle: &EsmBundle,
+    stylesheet: &crate::esm_css::CollectedStylesheet,
+) -> Result<String, EsmCodegenError> {
+    try_generate_with_bodies_and_stylesheet_parts(bundle, &stylesheet.rules, &stylesheet.font_faces)
+}
+
+fn try_generate_with_bodies_and_stylesheet_parts(
+    bundle: &EsmBundle,
+    css_rules: &[crate::esm_css::CollectedRule],
+    font_faces: &[crate::esm_css::StylesheetFontFace],
+) -> Result<String, EsmCodegenError> {
+    let parts = generate_parts(bundle, css_rules, font_faces)?;
     let mut out = parts.header;
     for (_, code) in &parts.modules {
         out.push_str(code);
@@ -266,6 +283,7 @@ struct GeneratedParts {
 fn generate_parts(
     bundle: &EsmBundle,
     css_rules: &[crate::esm_css::CollectedRule],
+    font_faces: &[crate::esm_css::StylesheetFontFace],
 ) -> Result<GeneratedParts, EsmCodegenError> {
     let mut out = String::new();
     // Generated bundles intentionally use source-shaped JS identifiers and
@@ -292,7 +310,7 @@ fn generate_parts(
     }
     let has_async_init = !async_init_namespaces.is_empty();
 
-    out.push_str(&emit_register_styles(css_rules));
+    out.push_str(&emit_register_styles(css_rules, font_faces));
 
     let register_calls = bundle
         .modules
@@ -547,7 +565,17 @@ pub fn try_generate_split_with_bodies_and_css(
     css_rules: &[crate::esm_css::CollectedRule],
     segment_bytes: usize,
 ) -> Result<SplitBundle, EsmCodegenError> {
-    let parts = generate_parts(bundle, css_rules)?;
+    let parts = generate_parts(bundle, css_rules, &[])?;
+    Ok(split_parts(parts, segment_bytes))
+}
+
+/// Split variant of [`try_generate_with_bodies_and_stylesheet`].
+pub fn try_generate_split_with_bodies_and_stylesheet(
+    bundle: &EsmBundle,
+    stylesheet: &crate::esm_css::CollectedStylesheet,
+    segment_bytes: usize,
+) -> Result<SplitBundle, EsmCodegenError> {
+    let parts = generate_parts(bundle, &stylesheet.rules, &stylesheet.font_faces)?;
     Ok(split_parts(parts, segment_bytes))
 }
 
@@ -813,7 +841,10 @@ fn runtime_dependency_evaluations(runtime_dependencies: &[String], entry_referre
 }
 
 /// Emit the stylesheet registration function (no-op when no CSS was collected).
-fn emit_register_styles(css_rules: &[crate::esm_css::CollectedRule]) -> String {
+fn emit_register_styles(
+    css_rules: &[crate::esm_css::CollectedRule],
+    font_faces: &[crate::esm_css::StylesheetFontFace],
+) -> String {
     let mut out = String::from(
         "\n/// Stylesheet rules collected from ESM `.css` imports (baked in at compile time).\npub fn register_styles() {\n",
     );
@@ -840,8 +871,63 @@ fn emit_register_styles(css_rules: &[crate::esm_css::CollectedRule]) -> String {
             ));
         }
     }
+    for face in font_faces {
+        out.push_str(&emit_font_face_registration(face));
+    }
     out.push_str("}\n\n");
     out
+}
+
+/// Emit the `register_stylesheet_font_file` call for one `@font-face` rule.
+/// Relative `url()` sources resolve against the declaring stylesheet's
+/// directory at compile time; remote/data URLs, unsupported formats and
+/// media-conditional faces are skipped (the runtime tries the files in order
+/// and registers the first that loads).
+fn emit_font_face_registration(face: &crate::esm_css::StylesheetFontFace) -> String {
+    use crate::esm_css::StylesheetFontSource;
+    if face.media.is_some() {
+        return String::new();
+    }
+    let base = std::path::Path::new(&face.source_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let candidates = face
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let StylesheetFontSource::Url { href, format } = source else {
+                return None;
+            };
+            let supported = format.as_deref().is_none_or(|format| {
+                matches!(
+                    format.trim().to_ascii_lowercase().as_str(),
+                    "truetype" | "opentype" | "ttf" | "otf" | "woff" | "woff2"
+                )
+            });
+            let href = href.split(['?', '#']).next().unwrap_or(href);
+            let href = href.strip_prefix("./").unwrap_or(href);
+            if !supported || href.contains(':') || href.starts_with("//") {
+                return None;
+            }
+            Some(format!("{:?}", base.join(href).to_string_lossy()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let option = |value: &Option<String>| match value {
+        Some(value) => format!("Some({value:?})"),
+        None => "None".to_string(),
+    };
+    format!(
+        "    w3cos_runtime::font_face::register_stylesheet_font_file({:?}, {}, {}, {}, {}, &[{}]);\n",
+        face.family,
+        option(&face.weight),
+        option(&face.style),
+        option(&face.display),
+        option(&face.unicode_range),
+        candidates.join(", ")
+    )
 }
 
 struct GeneratedModule {
@@ -10366,6 +10452,47 @@ fn main() {
         );
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn emits_font_face_registration_for_local_font_files_only() {
+        let sheet = crate::esm_css::parse_css_source(
+            "@font-face { font-family: codicon; src: url('./codicon.ttf?x#y') format('truetype'); \
+               font-display: block; }\
+             @font-face { font-family: Remote; src: url(https://cdn.example/r.woff2) format('woff2'); }\
+             @font-face { font-family: Data; src: url(data:font/ttf;base64,AAAA); }\
+             @font-face { font-family: Plain; src: url(c.ttf); }\
+             @font-face { font-family: Late; src: url(l.eot) format('embedded-opentype'), url(l.woff2) format('woff2'); font-weight: 700; }",
+            "/assets/css/icons.css",
+        );
+        let bundle = EsmBundle::default();
+        let code = try_generate_with_bodies_and_stylesheet(&bundle, &sheet).unwrap();
+        assert!(
+            code.contains(
+                "w3cos_runtime::font_face::register_stylesheet_font_file(\"codicon\", None, None, Some(\"block\"), None, &[\"/assets/css/codicon.ttf\"]);"
+            ),
+            "codicon registration: {code}"
+        );
+        assert!(
+            code.contains("\"Late\", Some(\"700\"), None, None, None, &[\"/assets/css/l.woff2\"]"),
+            "unsupported formats are skipped: {code}"
+        );
+        assert!(
+            !code.contains("\"Remote\""),
+            "remote sources are not baked: {code}"
+        );
+        assert!(
+            !code.contains("\"Data\""),
+            "data urls are not baked: {code}"
+        );
+        assert_eq!(
+            code.matches("register_stylesheet_font_file(").count(),
+            3,
+            "{code}"
+        );
+        // Faces registered by the legacy rules-only entry points stay absent.
+        let legacy = generate_with_bodies_and_css(&bundle, &sheet.rules);
+        assert!(!legacy.contains("register_stylesheet_font_file"));
     }
 
     #[test]
