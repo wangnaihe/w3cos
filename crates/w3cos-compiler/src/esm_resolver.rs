@@ -1006,6 +1006,9 @@ impl EsmResolver {
             resolved.package_name = Some(specifier.to_string());
             return Ok(resolved);
         }
+        if specifier == "vscode" && !self.project_root.join("node_modules/vscode").exists() {
+            return vscode_module(&self.project_root);
+        }
         if crate::electron_app::is_electron_specifier(specifier) {
             let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
             self.classic_scripts.borrow_mut().extend(scripts);
@@ -2680,6 +2683,23 @@ fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModu
     Ok((resolved, scripts))
 }
 
+/// The extension host's `vscode` API. It is not a file: the host hands it out
+/// through its `require('vscode')` interceptor. A CommonJS record whose body
+/// re-exports that `require` lets ES-module extensions (`import { window }
+/// from 'vscode'`) bind it like any CommonJS dependency; left unresolved, the
+/// names were read off the browser global instead.
+fn vscode_module(project_root: &Path) -> Result<ResolvedModule> {
+    let dir = node_builtin_dir(project_root)?;
+    let path = dir.join("vscode.js");
+    install_glue_file(&path, "module.exports = require('vscode');\n")?;
+    Ok(ResolvedModule {
+        specifier: "vscode".to_string(),
+        path,
+        kind: ModuleKind::Package,
+        package_name: Some("vscode".to_string()),
+    })
+}
+
 fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
     // FNV-1a over every builtin, so edits never reuse stale glue.
     let fnv = |bytes: &mut dyn Iterator<Item = u8>| {
@@ -3575,6 +3595,36 @@ export function main() {{ bump(); return value + plugin.value; }}"#
         assert!(app.runtime_imports.iter().any(|import| {
             import.local == "plugin" && import.imported == "*" && import.specifier == specifier
         }));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn esm_import_of_vscode_binds_the_host_require_not_a_global() {
+        let root = fixture_root("w3cos_esm_import_vscode");
+        write_tree(
+            &root,
+            &[
+                ("package.json", r#"{"type":"module"}"#),
+                (
+                    "src/ext.js",
+                    "import { window, LogLevel } from 'vscode';\nexport function activate() { return window.createOutputChannel('x', { log: true }).logLevel === LogLevel.Info; }\n",
+                ),
+            ],
+        );
+        let resolver = EsmResolver::new(&root);
+        let entry = root.join("src/ext.js");
+        let graph = resolver.build_graph_from_entry(&entry).unwrap();
+        let glue = graph
+            .nodes
+            .iter()
+            .find(|node| node.module.specifier == "vscode")
+            .map(|node| node.module.path.clone())
+            .unwrap_or_else(|| panic!("vscode must link as a module: {:?}", graph.nodes.len()));
+        assert!(resolver.is_commonjs(&glue), "{}", glue.display());
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
 
         std::fs::remove_dir_all(root).ok();
     }
