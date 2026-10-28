@@ -519,6 +519,27 @@ fn build_object_value() -> Value {
             object
         }),
     );
+    // `Object` is a function, so it inherits `Function.prototype` -> `Object.prototype`:
+    // `Object.hasOwnProperty.call(obj, key)` (Code-OSS `verifyObject`) must work.
+    for method in ["hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable"] {
+        properties.insert(
+            method.into(),
+            Value::function(move |this, arguments| this.call_method(method, arguments)),
+        );
+    }
+    // ES2022 `Object.hasOwn(obj, key)`.
+    properties.insert(
+        "hasOwn".into(),
+        Value::function(|_, arguments| {
+            let target = arguments.first().cloned().unwrap_or(Value::Undefined);
+            let key = arguments
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::Undefined)
+                .to_js_string();
+            target.call_method("hasOwnProperty", vec![Value::string(&key)])
+        }),
+    );
     properties.insert(
         "getPrototypeOf".into(),
         Value::function(|_, arguments| {
@@ -3182,6 +3203,46 @@ mod tests {
         assert_eq!(
             files.get_property("0").get_property("type").to_js_string(),
             "image/png"
+        );
+    }
+
+    #[test]
+    fn object_constructor_inherits_has_own_property_and_has_own_exists() {
+        let object = object_value();
+        let target = Value::object(HashMap::from([("present".to_string(), Value::Bool(true))]));
+
+        // `Object.hasOwnProperty.call(target, key)` is used by Code-OSS `verifyObject`.
+        let inherited = object.get_property("hasOwnProperty");
+        assert!(
+            inherited.is_callable(),
+            "Object.hasOwnProperty must be inherited"
+        );
+        assert!(
+            inherited
+                .call_method("call", vec![target.clone(), Value::string("present")])
+                .to_bool()
+        );
+        assert!(
+            !inherited
+                .call_method("call", vec![target.clone(), Value::string("missing")])
+                .to_bool()
+        );
+
+        // ES2022 `Object.hasOwn`.
+        let has_own = object.get_property("hasOwn");
+        assert!(has_own.is_callable(), "Object.hasOwn must exist");
+        assert!(
+            has_own
+                .call(
+                    Value::Undefined,
+                    vec![target.clone(), Value::string("present")]
+                )
+                .to_bool()
+        );
+        assert!(
+            !has_own
+                .call(Value::Undefined, vec![target, Value::string("missing")])
+                .to_bool()
         );
     }
 
