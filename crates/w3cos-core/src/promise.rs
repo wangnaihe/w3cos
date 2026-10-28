@@ -76,6 +76,8 @@ thread_local! {
     static PROMISE_STATES: RefCell<HashMap<u64, Weak<RefCell<PromiseState>>>> =
         RefCell::new(HashMap::new());
     static NEXT_PROMISE_ID: Cell<u64> = const { Cell::new(1) };
+    /// Registry size at which the next sweep of dead entries runs.
+    static PROMISE_SWEEP_AT: Cell<usize> = const { Cell::new(PROMISE_SWEEP_MIN) };
     /// Rejected promises with no reaction yet, with their reasons
     /// (HTML's "about to be notified rejected promises list").
     static UNHANDLED_REJECTIONS: RefCell<Vec<(Weak<RefCell<PromiseState>>, Value)>> =
@@ -146,6 +148,9 @@ fn report_unhandled_rejections() {
     }
 }
 
+/// Smallest registry size that triggers a sweep of dead entries.
+const PROMISE_SWEEP_MIN: usize = 1024;
+
 fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
     let id = NEXT_PROMISE_ID.with(|counter| {
         let id = counter.get();
@@ -154,7 +159,15 @@ fn register_state(state: Rc<RefCell<PromiseState>>) -> u64 {
     });
     PROMISE_STATES.with(|registry| {
         let mut registry = registry.borrow_mut();
-        registry.retain(|_, state| state.strong_count() != 0);
+        // Sweeping dead entries on every registration made creating N live
+        // promises O(N^2) (a boot with thousands of pending promises kept the
+        // main thread saturated). Sweep when the registry has doubled since
+        // the last sweep instead: amortized O(1), and dead entries are
+        // harmless meanwhile (`Weak::upgrade` fails for them).
+        if registry.len() >= PROMISE_SWEEP_AT.with(Cell::get) {
+            registry.retain(|_, state| state.strong_count() != 0);
+            PROMISE_SWEEP_AT.with(|at| at.set((registry.len() * 2).max(PROMISE_SWEEP_MIN)));
+        }
         registry.insert(id, Rc::downgrade(&state));
     });
     id
@@ -776,6 +789,32 @@ pub fn status(value: &Value) -> Option<PromiseStatus> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn promise_registry_is_swept_in_amortized_batches() {
+        PROMISE_STATES.with(|registry| registry.borrow_mut().clear());
+        PROMISE_SWEEP_AT.with(|at| at.set(PROMISE_SWEEP_MIN));
+        // Dead promises are dropped once the registry reaches the threshold.
+        for _ in 0..(PROMISE_SWEEP_MIN * 3) {
+            drop(pending_state_registered());
+        }
+        let len = PROMISE_STATES.with(|registry| registry.borrow().len());
+        assert!(len <= PROMISE_SWEEP_MIN, "dead entries swept, len {len}");
+        // Live promises stay resolvable.
+        let live: Vec<_> = (0..50).map(|_| pending_state_registered()).collect();
+        for (state, id) in &live {
+            let found = PROMISE_STATES
+                .with(|registry| registry.borrow().get(id).and_then(Weak::upgrade))
+                .expect("live promise registered");
+            assert!(Rc::ptr_eq(&found, state));
+        }
+    }
+
+    fn pending_state_registered() -> (Rc<RefCell<PromiseState>>, u64) {
+        let state = pending_state();
+        let id = register_state(state.clone());
+        (state, id)
+    }
+
     #[test]
     fn unhandled_rejections_are_reported_at_the_microtask_checkpoint() {
         TRACK_REJECTIONS.with(|flag| flag.set(Some(true)));
