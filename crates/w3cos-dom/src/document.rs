@@ -7649,6 +7649,7 @@ impl Document {
             output: &mut String,
             first_style: &mut Option<w3cos_std::style::Style>,
             ends: &mut Vec<usize>,
+            owner_ranges: &mut Vec<(u32, usize, usize)>,
             previous_source: &mut Option<String>,
         ) -> bool {
             if component.style.float != w3cos_std::style::Float::None {
@@ -7677,7 +7678,46 @@ impl Document {
                     return false;
                 }
                 first_style.get_or_insert_with(|| (*component.style).clone());
+                let start = output.len();
+                let ranges = w3cos_std::inline_text::cssom_owner_ranges(content, &component.style);
+                let rendered = w3cos_std::style::transformed_text(
+                    content,
+                    component.style.text_transform,
+                    component
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .and_then(|properties| properties.get("--w3cos-internal-text-language"))
+                        .map(String::as_str),
+                    output
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_alphanumeric),
+                );
+                if !ranges.is_empty() && rendered.as_ref() != content {
+                    return false;
+                }
                 append_rendered_text(output, content, &component.style, ends, previous_source);
+                owner_ranges.extend(ranges.into_iter().map(|(owner, range_start, range_end)| {
+                    (owner, start + range_start, start + range_end)
+                }));
+                let end = output.len();
+                if start < end {
+                    if let Some(owner) = component
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .and_then(|properties| properties.get(SPLIT_INLINE_FRAGMENT_OWNER))
+                        .and_then(|owner| owner.parse::<u32>().ok())
+                    {
+                        owner_ranges.push((owner, start, end));
+                    }
+                    owner_ranges.extend(
+                        w3cos_std::inline_text::cssom_box_owners(&component.style)
+                            .into_iter()
+                            .map(|owner| (owner, start, end)),
+                    );
+                }
                 return true;
             }
             if component.children.is_empty() {
@@ -7696,19 +7736,30 @@ impl Document {
                         | w3cos_std::style::Display::InlineBlock
                 ) && principal_box_can_merge_generated_inline_text(&component.style);
             }
-            component.children.iter().all(|child| {
+            let start = output.len();
+            let complete = component.children.iter().all(|child| {
                 append_text(
                     child,
                     parent_style,
                     output,
                     first_style,
                     ends,
+                    owner_ranges,
                     previous_source,
                 )
-            })
+            });
+            if complete && start < output.len() {
+                owner_ranges.extend(
+                    w3cos_std::inline_text::cssom_box_owners(&component.style)
+                        .into_iter()
+                        .map(|owner| (owner, start, output.len())),
+                );
+            }
+            complete
         }
         let mut content = String::new();
         let mut ends = Vec::new();
+        let mut owner_ranges = Vec::new();
         let mut previous_source = None;
         let mut text_style = None;
         for (child_id, component) in child_ids.iter().zip(components) {
@@ -7747,15 +7798,26 @@ impl Document {
                     {
                         return None;
                     }
+                    let output_start = content.len();
                     if !append_text(
                         component,
                         parent_style,
                         &mut content,
                         &mut text_style,
                         &mut ends,
+                        &mut owner_ranges,
                         &mut previous_source,
                     ) {
                         return None;
+                    }
+                    // Coalescing removes the child's own component box.  Keep
+                    // the authored inline element as the logical owner of the
+                    // exact bytes contributed by its subtree even when that
+                    // element is not itself split.  An ancestor may still be
+                    // split around a block sibling, and CSSOM must then expose
+                    // this nested inline's physical text fragments.
+                    if output_start < content.len() {
+                        owner_ranges.push((child_id.as_u32(), output_start, content.len()));
                     }
                 }
                 _ => return None,
@@ -7773,12 +7835,23 @@ impl Document {
                 .into_iter()
                 .map(|end| collapse_css_whitespace(&content[..end], true, false).len())
                 .collect();
+            owner_ranges = owner_ranges
+                .into_iter()
+                .map(|(owner, start, end)| {
+                    (
+                        owner,
+                        collapse_css_whitespace(&content[..start], true, false).len(),
+                        collapse_css_whitespace(&content[..end], true, false).len(),
+                    )
+                })
+                .collect();
             collapse_css_whitespace(&content, true, true)
         } else {
             content
         };
         let mut style = text_style?;
         w3cos_std::inline_text::set_fragment_ends(&mut style, &content, &ends);
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut style, &content, &owner_ranges);
         style.text_transform = w3cos_std::style::TextTransform::None;
         if let Some(properties) = style.custom_properties.as_mut() {
             properties.remove("--w3cos-internal-text-transform-continues-word");
@@ -7803,6 +7876,7 @@ impl Document {
         let mut ends = Vec::new();
         let mut previous_source = None;
         let mut text_style = None;
+        let mut cssom_owner_ranges = Vec::new();
         for component in components {
             let w3cos_std::ComponentKind::Text {
                 content: component_text,
@@ -7852,6 +7926,21 @@ impl Document {
                 return None;
             }
             text_style.get_or_insert_with(|| component.style.clone());
+            let offset = content.len();
+            cssom_owner_ranges.extend(
+                w3cos_std::inline_text::cssom_owner_ranges(component_text, &component.style)
+                    .into_iter()
+                    .map(|(owner, start, end)| (owner, offset + start, offset + end)),
+            );
+            if let Some(owner) = component
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(SPLIT_INLINE_FRAGMENT_OWNER))
+                .and_then(|owner| owner.parse::<u32>().ok())
+            {
+                cssom_owner_ranges.push((owner, offset, offset + component_text.len()));
+            }
             w3cos_std::inline_text::append_source_fragment_ends(
                 &mut ends,
                 content.len(),
@@ -7863,6 +7952,7 @@ impl Document {
         }
         let mut style = text_style?;
         w3cos_std::inline_text::set_fragment_ends(&mut style, &content, &ends);
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut style, &content, &cssom_owner_ranges);
         style.white_space = parent_style.white_space;
         Some(w3cos_std::Component::text_shared(content, style))
     }
@@ -8542,6 +8632,13 @@ impl Document {
                             text
                         };
                         w3cos_std::inline_text::set_fragment_ends(&mut style, &text, &source_ends);
+                        if style.display == w3cos_std::style::Display::Inline && !text.is_empty() {
+                            w3cos_std::inline_text::set_cssom_owner_ranges(
+                                &mut style,
+                                &text,
+                                &[(id.as_u32(), 0, text.len())],
+                            );
+                        }
                         if child_ids.len() == 1 {
                             // The text-only inline fast path uses the element's
                             // principal style, but its generated words still
@@ -9490,6 +9587,34 @@ impl Document {
                     ));
                 }
                 children = fixup_css_table_children(&style, children);
+
+                // A decoration-free nested inline may already have collapsed
+                // all of its authored text children into one run before its
+                // parent lowers an enclosing block-in-inline context.  Record
+                // the nested element's logical ownership here, while its DOM
+                // identity is still available; a later parent coalescing pass
+                // can then offset and preserve the exact UTF-8 byte range.
+                if style.display == w3cos_std::style::Display::Inline
+                    && !block_in_inline
+                    && !self.events.has_listeners(id)
+                    && children.len() == 1
+                    && children[0].children.is_empty()
+                    && matches!(&children[0].kind,
+                        w3cos_std::ComponentKind::Text { content } if !content.is_empty())
+                {
+                    let content = match &children[0].kind {
+                        w3cos_std::ComponentKind::Text { content } => content.clone(),
+                        _ => unreachable!(),
+                    };
+                    let mut ranges =
+                        w3cos_std::inline_text::cssom_owner_ranges(&content, &children[0].style);
+                    ranges.push((id.as_u32(), 0, content.len()));
+                    w3cos_std::inline_text::set_cssom_owner_ranges(
+                        &mut children[0].style,
+                        &content,
+                        &ranges,
+                    );
+                }
 
                 if style.display == w3cos_std::style::Display::Inline
                     && !block_in_inline
@@ -10518,8 +10643,38 @@ impl Document {
                                         .contains_key("--w3cos-internal-split-inline-fragment")
                                 });
                             if passive_split_fragment {
+                                let fragment_owner = child
+                                    .style
+                                    .custom_properties
+                                    .as_ref()
+                                    .and_then(|properties| {
+                                        properties.get(SPLIT_INLINE_FRAGMENT_OWNER)
+                                    })
+                                    .and_then(|owner| owner.parse::<u32>().ok());
                                 let mut fragment_children = std::mem::take(&mut child.children);
                                 for fragment_child in &mut fragment_children {
+                                    if let Some(owner) = fragment_owner {
+                                        if let w3cos_std::ComponentKind::Text { content } =
+                                            &fragment_child.kind
+                                        {
+                                            let mut ranges =
+                                                w3cos_std::inline_text::cssom_owner_ranges(
+                                                    content,
+                                                    &fragment_child.style,
+                                                );
+                                            ranges.push((owner, 0, content.len()));
+                                            w3cos_std::inline_text::set_cssom_owner_ranges(
+                                                &mut fragment_child.style,
+                                                content,
+                                                &ranges,
+                                            );
+                                        } else {
+                                            w3cos_std::inline_text::append_cssom_box_owner(
+                                                &mut fragment_child.style,
+                                                owner,
+                                            );
+                                        }
+                                    }
                                     if matches!(
                                         fragment_child.kind,
                                         w3cos_std::ComponentKind::Text { .. }
@@ -13873,6 +14028,22 @@ pub const SPLIT_INLINE_FRAGMENT_OWNER: &str = "--w3cos-internal-split-inline-own
 fn mark_split_inline_fragments(id: NodeId, children: &mut [w3cos_std::Component]) {
     let owner = id.as_u32().to_string();
     for child in children {
+        if let Some(previous) = child
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(SPLIT_INLINE_FRAGMENT_OWNER))
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|previous| *previous != id.as_u32())
+        {
+            if let w3cos_std::ComponentKind::Text { content } = &child.kind {
+                let mut ranges = w3cos_std::inline_text::cssom_owner_ranges(content, &child.style);
+                ranges.push((previous, 0, content.len()));
+                w3cos_std::inline_text::set_cssom_owner_ranges(&mut child.style, content, &ranges);
+            } else {
+                w3cos_std::inline_text::append_cssom_box_owner(&mut child.style, previous);
+            }
+        }
         child
             .style
             .make_mut()
@@ -16472,7 +16643,23 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             {
                 break;
             }
-            fragment = fragment.children.remove(0);
+            let mut child = fragment.children.remove(0);
+            if let ComponentKind::Text { content } = &child.kind {
+                let mut ranges = w3cos_std::inline_text::cssom_owner_ranges(content, &child.style);
+                ranges.extend(
+                    w3cos_std::inline_text::cssom_box_owners(&fragment.style)
+                        .into_iter()
+                        .map(|owner| (owner, 0, content.len())),
+                );
+                if !ranges.is_empty() {
+                    w3cos_std::inline_text::set_cssom_owner_ranges(
+                        &mut child.style,
+                        content,
+                        &ranges,
+                    );
+                }
+            }
+            fragment = child;
         }
         let merged = coalesced.last_mut().is_some_and(|previous| {
             if [&previous.style, &fragment.style].iter().any(|style|
@@ -16525,6 +16712,18 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             let ComponentKind::Text { content } = &mut fragment.kind else {
                 return false;
             };
+            let previous_len = previous_content.len();
+            let mut owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(
+                previous_content,
+                &previous.style,
+            );
+            owner_ranges.extend(
+                w3cos_std::inline_text::cssom_owner_ranges(content, &fragment.style)
+                    .into_iter()
+                    .map(|(owner, start, end)| {
+                        (owner, previous_len + start, previous_len + end)
+                    }),
+            );
             let mut ends = Vec::new();
             let mut previous_source = None;
             w3cos_std::inline_text::append_source_fragment_ends(&mut ends, 0, previous_content, &previous.style, &mut previous_source);
@@ -16541,6 +16740,11 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             w3cos_std::inline_text::append_source_fragment_ends(&mut ends, previous_content.len(), content, &fragment.style, &mut previous_source);
             previous_content.push_str(content);
             w3cos_std::inline_text::set_fragment_ends(&mut previous.style, previous_content, &ends);
+            w3cos_std::inline_text::set_cssom_owner_ranges(
+                &mut previous.style,
+                previous_content,
+                &owner_ranges,
+            );
             // hanging-punctuation: last concerns the paragraph's final
             // character, which now comes from this fragment.
             previous.style.hanging_punctuation_last = fragment.style.hanging_punctuation_last;
