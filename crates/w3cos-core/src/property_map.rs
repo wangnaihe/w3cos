@@ -24,6 +24,8 @@
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+
+use crate::fast_hash::FastMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -71,7 +73,7 @@ fn index_key_value(key: &str) -> Option<u32> {
 
 enum Transitions {
     Few(Vec<(JsString, Rc<Shape>)>),
-    Many(HashMap<JsString, Rc<Shape>>),
+    Many(FastMap<JsString, Rc<Shape>>),
 }
 
 /// A hidden class: an ordered own-key list shared by many objects.
@@ -80,7 +82,7 @@ pub(crate) struct Shape {
     /// Insertion-ordered own keys; slot `i` of an object holds `keys[i]`.
     keys: Box<[JsString]>,
     /// Key -> slot for shapes wider than [`LINEAR_SCAN`], built on first use.
-    index: OnceCell<HashMap<JsString, u32>>,
+    index: OnceCell<FastMap<JsString, u32>>,
     /// Any key is a canonical array index (enumeration must reorder).
     has_index_key: bool,
     /// Any key is an internal `__w3cos_` marker (accessor halves etc.).
@@ -198,7 +200,7 @@ enum PropertyStore {
         slots: Vec<Value>,
     },
     Dict {
-        map: HashMap<JsString, Value>,
+        map: FastMap<JsString, Value>,
         order: Vec<JsString>,
         has_index_key: bool,
     },
@@ -233,6 +235,9 @@ impl PropertyMap {
             return out;
         }
         // Too wide or out of shape budget: dictionary from the start.
+        // `map` still holds the keys the shape walk did not consume.
+        let mut map: FastMap<JsString, Value> = map.into_iter().collect();
+        map.reserve(order.len());
         for (key, value) in order.iter().zip(slots) {
             map.insert(key.clone(), value);
         }
@@ -393,7 +398,7 @@ impl PropertyMap {
                     }
                     None => {
                         self.inner = Some(Box::new(PropertyStore::Dict {
-                            map: HashMap::new(),
+                            map: FastMap::default(),
                             order: Vec::new(),
                             has_index_key: false,
                         }));
@@ -507,7 +512,7 @@ impl PropertyStore {
     fn make_dictionary(&mut self) {
         if let PropertyStore::Shaped { shape, slots } = self {
             let slots = std::mem::take(slots);
-            let mut map = HashMap::with_capacity(slots.len() + 1);
+            let mut map = FastMap::with_capacity_and_hasher(slots.len() + 1, Default::default());
             let mut order = Vec::with_capacity(slots.len() + 1);
             for (key, value) in shape.keys.iter().zip(slots) {
                 order.push(key.clone());

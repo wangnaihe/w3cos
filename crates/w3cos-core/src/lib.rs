@@ -4,6 +4,7 @@ pub mod binary;
 mod builtins;
 pub mod class;
 pub mod collections;
+pub mod fast_hash;
 pub mod heap;
 pub mod host;
 pub mod host_modules;
