@@ -163,6 +163,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("flex:text-item");
         }
+        // Paint centres a text leaf's glyphs in its rect with no enclosing
+        // line context, so the glyphs sit where an IFC's baseline puts them
+        // only when the line box is exactly the font box (no half-leading,
+        // no rounded or fractional font leading). Otherwise the leaf lands
+        // up to a pixel off and stays on the legacy engine.
+        if let w3cos_std::ComponentKind::Text { content } = flat[child].kind
+            && !super::inline::leaf_paints_like_ifc(content, flat[child].style)
+        {
+            return Some("flex:text-leading");
+        }
         if subtree_has_float(flat, child) {
             return Some("flex:float-descendant");
         }

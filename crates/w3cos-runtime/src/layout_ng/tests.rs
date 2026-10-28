@@ -4257,4 +4257,20 @@ fn flex_text_items_match_chrome() {
     );
     let flat = pre_flatten(&root);
     assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+
+    // Text with half-leading paints without a line context (a pixel off an
+    // IFC's baseline), so it stays legacy as well.
+    let normal = Style {
+        line_height: 2.0,
+        ..item(font.clone())
+    };
+    let root = node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(300.0)),
+            vec![Component::text("XX", normal)],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
 }

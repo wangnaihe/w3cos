@@ -9192,7 +9192,21 @@ impl Document {
                 // One passive inline may contain several differently styled
                 // text runs. It still uses the enclosing block's line width;
                 // its nested runs must not become max-content atomic rows.
-                if style.display != w3cos_std::style::Display::Flex
+                // An authored `display: flex` host whose children are all
+                // plain inline text keeps its own direction, wrap and
+                // alignment (LayoutNG lays its text runs out as flex
+                // items). One with atomic inline children (inline-block,
+                // controls, images) keeps the wrapping row lowering the
+                // legacy engine's result depends on.
+                let authored_flex_of_plain_inlines = style.display
+                    == w3cos_std::style::Display::Flex
+                    && children.iter().all(|child| {
+                        matches!(
+                            child.style.display,
+                            w3cos_std::style::Display::Inline | w3cos_std::style::Display::None
+                        ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+                    });
+                if !authored_flex_of_plain_inlines
                     && (children.len() >= 2
                         || children.iter().any(|child| {
                             child.style.display == w3cos_std::style::Display::Inline
@@ -21146,16 +21160,17 @@ mod image_component_tests {
         crate::stylesheet::clear_rules();
     }
 
-    /// An authored `display: flex` host keeps its own flex-direction, wrap
-    /// and alignment: its inline-level children are flex items, so the
-    /// anonymous inline-formatting-context lowering (a wrapping baseline
-    /// row) must not rewrite it. A block host with the same children is
-    /// still lowered.
+    /// An authored `display: flex` host whose children are plain inline
+    /// text keeps its own flex-direction, wrap and alignment: its inline
+    /// children are flex items, so the anonymous inline-formatting-context
+    /// lowering (a wrapping baseline row) must not rewrite it. A block host
+    /// with the same children, and a flex host with atomic inline children
+    /// (whose legacy result depends on the row), are still lowered.
     #[test]
     fn authored_flex_host_is_not_lowered_to_an_inline_formatting_row() {
         use w3cos_std::style::{AlignItems, Display, FlexDirection, FlexWrap};
         crate::stylesheet::clear_rules();
-        let build = |display: &str| {
+        let build = |display: &str, child_display: &str| {
             let mut document = Document::new();
             let host = document.create_element("div");
             host.style_mut(&mut document)
@@ -21167,7 +21182,7 @@ mod image_component_tests {
             for word in ["one", "two"] {
                 let span = document.create_element("span");
                 span.style_mut(&mut document)
-                    .set_property("display", "inline-block");
+                    .set_property("display", child_display);
                 span.style_mut(&mut document)
                     .set_property("background-color", "white");
                 span.style_mut(&mut document).set_property("width", "8em");
@@ -21177,13 +21192,16 @@ mod image_component_tests {
             }
             document.to_component_subtree(host.id)
         };
-        let flex = build("flex");
+        let flex = build("flex", "inline");
         assert_eq!(flex.style.display, Display::Flex);
         assert_eq!(flex.style.flex_direction, FlexDirection::Column);
         assert_ne!(flex.style.flex_wrap, FlexWrap::Wrap);
         assert_ne!(flex.style.align_items, AlignItems::Baseline);
         assert_eq!(flex.children.len(), 2, "two flex items, not one text run");
-        let block = build("block");
+        let atomic = build("flex", "inline-block");
+        assert_eq!(atomic.style.flex_wrap, FlexWrap::Wrap);
+        assert_eq!(atomic.style.align_items, AlignItems::Baseline);
+        let block = build("block", "inline");
         assert_eq!(block.style.flex_wrap, FlexWrap::Wrap);
         assert_eq!(block.style.align_items, AlignItems::Baseline);
         crate::stylesheet::clear_rules();
