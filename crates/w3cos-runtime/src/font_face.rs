@@ -231,7 +231,10 @@ fn face_hit_key(family: &str, weight: FontWeight, style: FontFaceStyle) -> u64 {
 }
 
 fn clear_face_hit() {
-    FACE_HIT.with(|slot| *slot.borrow_mut() = None);
+    // `FontRegistry::clear_owner` also runs from thread-local destructors (the
+    // shared script loader drops its owners at thread exit); the cache may
+    // already be torn down by then, which is fine: nothing is left to clear.
+    let _ = FACE_HIT.try_with(|slot| *slot.borrow_mut() = None);
 }
 
 // ── Loaded font entry ──────────────────────────────────────────────────────
