@@ -1010,6 +1010,9 @@ impl EsmResolver {
             resolved.package_name = Some(specifier.to_string());
             return Ok(resolved);
         }
+        if specifier == "vscode" && !self.project_root.join("node_modules/vscode").exists() {
+            return vscode_module(&self.project_root, from_dir);
+        }
         if crate::electron_app::is_electron_specifier(specifier) {
             let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
             self.classic_scripts.borrow_mut().extend(scripts);
@@ -2715,6 +2718,42 @@ fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModu
     Ok((resolved, scripts))
 }
 
+/// The extension host's `vscode` API. It is not a file: the host hands out a
+/// *per-extension* API object through its patched `Module._load`, keyed by the
+/// requiring module's filename. A CommonJS record that asks the host on behalf
+/// of the importer's extension (nearest `package.json`) lets ES-module
+/// extensions (`import { window } from 'vscode'`) bind it like any CommonJS
+/// dependency; left unresolved, the names were read off the browser global.
+fn vscode_module(project_root: &Path, from_dir: &Path) -> Result<ResolvedModule> {
+    let owner = from_dir
+        .ancestors()
+        .find(|dir| dir.join("package.json").is_file())
+        .unwrap_or(project_root);
+    let dir = node_builtin_dir(project_root)?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in owner.to_string_lossy().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let path = dir.join(format!("vscode-{hash:016x}.js"));
+    let owner_file = crate::cjs::js_string(&owner.join("package.json").to_string_lossy());
+    // Not a literal `require('vscode')`: that would link this file to itself.
+    install_glue_file(
+        &path,
+        &format!(
+            "const loaded = globalThis.__w3cos_cjs_runtime_load('vscode', {{ id: {owner_file}, filename: {owner_file}, paths: [] }});\n\
+if (loaded === undefined) throw new Error(\"Cannot find module 'vscode'\");\n\
+module.exports = loaded.value;\n"
+        ),
+    )?;
+    Ok(ResolvedModule {
+        specifier: "vscode".to_string(),
+        path,
+        kind: ModuleKind::Package,
+        package_name: Some("vscode".to_string()),
+    })
+}
+
 fn node_builtin_dir(project_root: &Path) -> Result<PathBuf> {
     // FNV-1a over every builtin, so edits never reuse stale glue.
     let fnv = |bytes: &mut dyn Iterator<Item = u8>| {
@@ -3671,6 +3710,70 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             resolver.is_commonjs(&ext),
             "CommonJS facade must be registered during graph build"
         );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn esm_import_of_vscode_binds_the_host_require_not_a_global() {
+        let root = fixture_root("w3cos_esm_import_vscode");
+        write_tree(
+            &root,
+            &[
+                ("package.json", r#"{"type":"module"}"#),
+                ("ext/package.json", r#"{"name":"ext"}"#),
+                (
+                    "ext/src/ext.js",
+                    "import { window, LogLevel } from 'vscode';\nexport function activate() { return window.createOutputChannel('x', { log: true }).logLevel === LogLevel.Info; }\n",
+                ),
+            ],
+        );
+        let resolver = EsmResolver::new(&root);
+        let entry = root.join("ext/src/ext.js");
+        let graph = resolver.build_graph_from_entry(&entry).unwrap();
+        let glue = graph
+            .nodes
+            .iter()
+            .find(|node| node.module.specifier == "vscode")
+            .map(|node| node.module.path.clone())
+            .unwrap_or_else(|| panic!("vscode must link as a module: {:?}", graph.nodes.len()));
+        assert!(resolver.is_commonjs(&glue), "{}", glue.display());
+        let glue_source = std::fs::read_to_string(&glue).unwrap();
+        assert!(
+            glue_source.contains(&root.join("ext/package.json").to_string_lossy().into_owned()),
+            "the host is asked on behalf of the importing extension: {glue_source}"
+        );
+        let record = graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.module
+                    .path
+                    .to_string_lossy()
+                    .ends_with(".w3cos-cjs.js")
+                    && node.module.path.to_string_lossy().contains("vscode-")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no record: {:?}",
+                    graph
+                        .nodes
+                        .iter()
+                        .map(|n| (&n.module.path, &n.imports))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            record
+                .imports
+                .iter()
+                .all(|import| !import.ends_with("w3cos-cjs.js")),
+            "the glue must not link itself: {:?}",
+            record.imports
+        );
+        let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
+        let bundle = EsmBundle::build(&parsed, &resolver, &entry);
+        assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
 
         std::fs::remove_dir_all(root).ok();
     }
