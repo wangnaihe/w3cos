@@ -516,7 +516,14 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         return canvas_box_reason(flat, index);
     }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
-        if !inline::in_inline_container(flat, index) {
+        // A text run is an anonymous flex item whatever its siblings are:
+        // an inline-block text under a flex container is block text even
+        // when the container's first child is not inline-level.
+        let flex_text_item = matches!(info.kind, ComponentKind::Text { .. })
+            && info
+                .parent
+                .is_some_and(|parent| is_author_flex(flat[parent].style));
+        if !flex_text_item && !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
         }
         // Its display and vertical-align are the IFC's concern.
@@ -613,9 +620,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         }
         ComponentKind::Text { content }
             if info.style.display != Display::Inline
-                || info
-                    .parent
-                    .is_some_and(|parent| is_author_grid(flat[parent].style)) =>
+                || info.parent.is_some_and(|parent| {
+                    is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
+                }) =>
         {
             // A text grid item is an anonymous block. Its display stays
             // inline in the cascade; the grid lays it out as block text.
@@ -1385,6 +1392,9 @@ pub(super) fn intrinsic_sizes(
         // block-flow sum below. Shrink-to-fit of an auto-width grid stays
         // on the legacy engine.
         return super::bail("grid:intrinsic");
+    }
+    if is_author_flex(info.style) {
+        return super::flex::intrinsic_sizes(flat, index, space);
     }
     if let ComponentKind::Text { content } = info.kind {
         return Some(inline::text_min_max(content, info.style));

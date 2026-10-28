@@ -9192,11 +9192,12 @@ impl Document {
                 // One passive inline may contain several differently styled
                 // text runs. It still uses the enclosing block's line width;
                 // its nested runs must not become max-content atomic rows.
-                if (children.len() >= 2
-                    || children.iter().any(|child| {
-                        child.style.display == w3cos_std::style::Display::Inline
-                            && !child.children.is_empty()
-                    }))
+                if style.display != w3cos_std::style::Display::Flex
+                    && (children.len() >= 2
+                        || children.iter().any(|child| {
+                            child.style.display == w3cos_std::style::Display::Inline
+                                && !child.children.is_empty()
+                        }))
                     && children.iter().any(|component| {
                         component.style.display != w3cos_std::style::Display::None
                             && !matches!(
@@ -21142,6 +21143,49 @@ mod image_component_tests {
                 );
             }
         }
+        crate::stylesheet::clear_rules();
+    }
+
+    /// An authored `display: flex` host keeps its own flex-direction, wrap
+    /// and alignment: its inline-level children are flex items, so the
+    /// anonymous inline-formatting-context lowering (a wrapping baseline
+    /// row) must not rewrite it. A block host with the same children is
+    /// still lowered.
+    #[test]
+    fn authored_flex_host_is_not_lowered_to_an_inline_formatting_row() {
+        use w3cos_std::style::{AlignItems, Display, FlexDirection, FlexWrap};
+        crate::stylesheet::clear_rules();
+        let build = |display: &str| {
+            let mut document = Document::new();
+            let host = document.create_element("div");
+            host.style_mut(&mut document)
+                .set_property("display", display);
+            host.style_mut(&mut document)
+                .set_property("flex-direction", "column");
+            let body = document.body();
+            body.append_child(&mut document, host);
+            for word in ["one", "two"] {
+                let span = document.create_element("span");
+                span.style_mut(&mut document)
+                    .set_property("display", "inline-block");
+                span.style_mut(&mut document)
+                    .set_property("background-color", "white");
+                span.style_mut(&mut document).set_property("width", "8em");
+                let text = document.create_text_node(word);
+                span.append_child(&mut document, text);
+                host.append_child(&mut document, span);
+            }
+            document.to_component_subtree(host.id)
+        };
+        let flex = build("flex");
+        assert_eq!(flex.style.display, Display::Flex);
+        assert_eq!(flex.style.flex_direction, FlexDirection::Column);
+        assert_ne!(flex.style.flex_wrap, FlexWrap::Wrap);
+        assert_ne!(flex.style.align_items, AlignItems::Baseline);
+        assert_eq!(flex.children.len(), 2, "two flex items, not one text run");
+        let block = build("block");
+        assert_eq!(block.style.flex_wrap, FlexWrap::Wrap);
+        assert_eq!(block.style.align_items, AlignItems::Baseline);
         crate::stylesheet::clear_rules();
     }
 

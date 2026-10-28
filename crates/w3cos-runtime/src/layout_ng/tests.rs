@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::layout::pre_flatten;
-use w3cos_std::style::{BoxSizing, Dimension, Display, Edges, Spacing, Style};
+use w3cos_std::style::{BoxSizing, Dimension, Display, Edges, FlexDirection, Spacing, Style};
 
 fn block() -> Style {
     Style {
@@ -4031,4 +4031,230 @@ fn webkit_box_vertical_clamps_lines() {
         let got: Vec<&str> = texts.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(got, pieces, "case {n}");
     }
+}
+
+/// A text run directly inside a flex container is an anonymous flex item
+/// (CSS Flexbox 4); it is laid out as block text with its min-content as
+/// the automatic minimum. Border boxes measured in headless Chrome
+/// (getBoundingClientRect, Ahem 20px/1, Chrome 156) for a
+/// flex row with margins, `flex: 1 / 2` growth, shrinking to the longest word, a column
+/// and nested rows that size to the sum of their items.
+#[test]
+fn flex_text_items_match_chrome() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let flex = |direction: FlexDirection, width: Option<f32>| Style {
+        display: Display::Flex,
+        flex_direction: direction,
+        width: width.map_or(Dimension::Auto, Dimension::Px),
+        ..font.clone()
+    };
+    let item = |mut style: Style| {
+        style.display = Display::InlineBlock;
+        style
+    };
+    let case = std::cell::Cell::new(0);
+    let run = |root: Component| {
+        case.set(case.get() + 1);
+        let flat = pre_flatten(&root);
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {} stays on NG", case.get()));
+        rects
+    };
+    let check = |rects: &[(LayoutRect, usize)], expected: &[(usize, (f32, f32, f32, f32))]| {
+        for (index, want) in expected {
+            assert_eq!(rect(rects, *index), *want, "box {index}");
+        }
+    };
+
+    // row-text: margins on a text item, then a sized one that overflows.
+    let a = item(Style {
+        margin: margins(0.0, 10.0, 0.0, 10.0),
+        ..font.clone()
+    });
+    let b = item(Style {
+        width: Dimension::Px(60.0),
+        margin: Edges {
+            left: px(5.0),
+            ..margins(0.0, 0.0, 0.0, 0.0)
+        },
+        ..font.clone()
+    });
+    let rects = run(node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(300.0)),
+            vec![Component::text("XX XX", a), Component::text("YYYYYYYY", b)],
+        )],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 300.0, 20.0)),
+            (2, (10.0, 0.0, 100.0, 20.0)),
+            (3, (125.0, 0.0, 60.0, 20.0)),
+        ],
+    );
+
+    // row-shrink: the first item shrinks to its longest word and wraps.
+    let rects = run(node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(100.0)),
+            vec![
+                Component::text("XXXX XXXX", item(font.clone())),
+                Component::text("YYY", item(font.clone())),
+            ],
+        )],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 100.0, 40.0)),
+            (2, (0.0, 0.0, 80.0, 40.0)),
+            (3, (80.0, 0.0, 60.0, 40.0)),
+        ],
+    );
+
+    // row-grow: flex 1 and flex 2 over auto bases.
+    let grow = |factor: f32| Style {
+        flex_grow: factor,
+        flex_shrink: 1.0,
+        flex_basis: Dimension::Px(0.0),
+        ..item(font.clone())
+    };
+    let rects = run(node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(300.0)),
+            vec![
+                Component::text("XX", grow(1.0)),
+                Component::text("Y", Style { ..grow(2.0) }),
+            ],
+        )],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 300.0, 20.0)),
+            (2, (0.0, 0.0, 100.0, 20.0)),
+            (3, (100.0, 0.0, 200.0, 20.0)),
+        ],
+    );
+
+    // col: a column stretches text items to its width.
+    let rects = run(node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Column, Some(200.0)),
+            vec![
+                Component::text("XX XX", item(font.clone())),
+                Component::text(
+                    "YYYYYY",
+                    item(Style {
+                        width: Dimension::Px(80.0),
+                        height: Dimension::Px(50.0),
+                        ..font.clone()
+                    }),
+                ),
+            ],
+        )],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 200.0, 70.0)),
+            (2, (0.0, 0.0, 200.0, 20.0)),
+            (3, (0.0, 20.0, 80.0, 50.0)),
+        ],
+    );
+
+    // nested: a row container that is itself a flex item sizes to the SUM
+    // of its items' margin boxes (342 = 2 + 2 * (160 + 10)), not the widest.
+    let wide = |_: ()| {
+        item(Style {
+            width: Dimension::Em(8.0),
+            height: Dimension::Em(1.2),
+            margin: margins(5.0, 5.0, 5.0, 5.0),
+            ..font.clone()
+        })
+    };
+    let inner = Style {
+        border_width: 1.0,
+        ..flex(FlexDirection::Row, None)
+    };
+    let rects = run(node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(700.0)),
+            vec![node(
+                inner,
+                vec![
+                    Component::text("one", wide(())),
+                    Component::text("two", wide(())),
+                ],
+            )],
+        )],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 700.0, 36.0)),
+            (2, (0.0, 0.0, 342.0, 36.0)),
+            (3, (6.0, 6.0, 160.0, 24.0)),
+            (4, (176.0, 6.0, 160.0, 24.0)),
+        ],
+    );
+
+    // nested-auto: gap included; the sibling text item follows the row.
+    let inner = Style {
+        gap: 7.0,
+        ..flex(FlexDirection::Row, None)
+    };
+    let rects = run(node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(700.0)),
+            vec![
+                node(
+                    inner,
+                    vec![
+                        Component::text("XXX", item(font.clone())),
+                        Component::text("YY", item(font.clone())),
+                    ],
+                ),
+                Component::text("ZZZZ", item(font.clone())),
+            ],
+        )],
+    ));
+    check(
+        &rects,
+        &[
+            (2, (0.0, 0.0, 107.0, 20.0)),
+            (3, (0.0, 0.0, 60.0, 20.0)),
+            (4, (67.0, 0.0, 40.0, 20.0)),
+            (5, (107.0, 0.0, 80.0, 20.0)),
+        ],
+    );
+
+    // A text item with padding or a border stays on the legacy engine.
+    let padded = Style {
+        padding: margins(0.0, 5.0, 0.0, 5.0),
+        ..item(font.clone())
+    };
+    let root = node(
+        block(),
+        vec![node(
+            flex(FlexDirection::Row, Some(300.0)),
+            vec![Component::text("XX", padded)],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
 }

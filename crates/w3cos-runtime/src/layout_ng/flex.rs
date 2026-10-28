@@ -5,7 +5,10 @@
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
 //! lengths, alignment, line breaking). Baseline alignment, inline-flex,
-//! and an indefinite percentage basis stay on the legacy engine.
+//! and an indefinite percentage basis stay on the legacy engine. A text run
+//! is an anonymous flex item: block text with its min-content as the
+//! automatic minimum (not under an unrecognized display such as
+//! `-webkit-box`).
 //! A single-line row aligns text-free items with a definite cross size by
 //! the border-box under edge (each item's cross margin-start plus its
 //! border box). The line grows by the largest cross margin-end hanging
@@ -150,10 +153,14 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.align_self == AlignSelf::Baseline && !synthesized {
             return Some("flex:baseline");
         }
-        // A text run is an anonymous flex item. Its line breaking and
-        // white-space handling stay on the legacy engine (a real flex
-        // reference next to a fallen-back test must use the same engine).
-        if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. }) {
+        // A text run is an anonymous flex item, laid out as block text
+        // (CSS Flexbox 4). A `-webkit-box`, `run-in` or other unrecognized
+        // display that computes to flex keeps its text on the legacy engine
+        // (a line-clamp reference next to a fallen-back test must use the
+        // same engine).
+        if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
+            && has_marker(style, "--w3cos-internal-unrecognized-display")
+        {
             return Some("flex:text-item");
         }
         if subtree_has_float(flat, child) {
@@ -460,6 +467,9 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if let w3cos_std::ComponentKind::Text { content } = info.kind {
         return Some(super::inline::text_min_max(content, info.style));
     }
+    if block::is_author_flex(info.style) {
+        return intrinsic_sizes(flat, index, space);
+    }
     let mut sizes = MinMax::exact(0.0);
     let mut any = false;
     for child in rendered_children(flat, index) {
@@ -471,6 +481,55 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     }
     if !any {
         return Some(MinMax::exact(0.0));
+    }
+    Some(sizes)
+}
+
+/// Min/max-content inline size of an author flex container's content box
+/// (Blink FlexLayoutAlgorithm::ComputeMinMaxSizes). A column container is
+/// as wide as its widest item. A row adds the item contributions and the
+/// main gaps. Its min-content is that sum for one line (an item that cannot
+/// shrink contributes its max-content) and the widest item for a wrapping
+/// row, which breaks between items.
+pub(super) fn intrinsic_sizes(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    let style = flat[index].style;
+    let row = row_axis(style.flex_direction);
+    let wrap = style.flex_wrap != FlexWrap::NoWrap;
+    let mut sizes = MinMax::exact(0.0);
+    let mut count = 0usize;
+    for child in rendered_children(flat, index) {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) || child_style.float != Float::None {
+            continue;
+        }
+        count += 1;
+        let item = inline_contribution(flat, child, space).why("flex:intrinsic")?;
+        if !row {
+            sizes.encompass(item);
+            continue;
+        }
+        let item_min = if child_style.flex_shrink == 0.0 {
+            Some(item.max)
+        } else {
+            item.min
+        };
+        sizes.max += item.max;
+        sizes.min = if wrap {
+            sizes.min.zip(item_min).map(|(a, b)| a.max(b))
+        } else {
+            sizes.min.zip(item_min).map(|(a, b)| a + b)
+        };
+    }
+    if row && count > 1 {
+        let gap = style.column_gap.unwrap_or(style.gap).max(0.0) * (count - 1) as f32;
+        sizes.max += gap;
+        if !wrap {
+            sizes.min = sizes.min.map(|min| min + gap);
+        }
     }
     Some(sizes)
 }
