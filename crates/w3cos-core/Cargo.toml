@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 chrono-tz = { workspace = true }
 base64 = "0.22"
+# Fast non-DoS-resistant hasher for the interpreter's own key tables.
+rustc-hash = "2"
 regex = "1"
 fancy-regex = "0.18"
 num-bigint = "0.4"
