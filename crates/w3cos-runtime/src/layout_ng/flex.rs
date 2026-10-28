@@ -110,7 +110,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // that reftest have to stay on legacy. `max-height` and `aspect-ratio`
     // make the main size definite enough to wrap here.
     let column_wrap = style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction);
+    // `flex-line-count` also shrinks the cross space offered to the items
+    // (Flexbox 2 §6.1); only the balancing step models its line count.
+    if flex_line_count(style) > 1 && !has_marker(style, BALANCE_MARKER) {
+        return Some("flex:line-count-available");
+    }
     if column_wrap
+        && balance_min_lines(style).is_none()
         && matches!(style.height, Dimension::Auto)
         && matches!(style.max_height, Dimension::Auto)
         && !has_marker(style, "--w3cos-internal-aspect-ratio")
@@ -555,6 +561,7 @@ pub(super) fn container_min_max_at(
     };
     let mut sizes = MinMax::exact(0.0);
     let mut count = 0usize;
+    let mut row_maxes: Vec<f32> = Vec::new();
     // CSS Flexbox §9.9.1: a row whose items carry a definite `flex-basis`
     // sizes the container from the items' flex base sizes and factors.
     let mut spec_items: Vec<SpecItem> = Vec::new();
@@ -590,6 +597,7 @@ pub(super) fn container_min_max_at(
         if use_spec {
             spec_items.push(spec_item(flat, child, space, item, stretched.is_some())?);
         }
+        row_maxes.push(item.max);
         sizes.max += item.max;
         sizes.min = sizes
             .min
@@ -609,6 +617,24 @@ pub(super) fn container_min_max_at(
         if !multiline {
             sizes.min = sizes.min.map(|min| min + gaps);
         }
+        // A balanced row with a minimum flex line count is broken into
+        // that many lines at its max-content size.
+        if let Some(lines) = balance_min_lines(style) {
+            if use_spec {
+                return super::bail("flex:balance-intrinsic-basis");
+            }
+            let gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+            sizes.max = balanced_min_extent(&row_maxes, gap, lines);
+        }
+    }
+    if !row
+        && multiline
+        && column_line.is_none()
+        && count > 1
+        && let Some(lines) = balance_min_lines(style)
+    {
+        sizes.max = balanced_column_max_content(flat, index, space, lines)?.max(sizes.max);
+        return Some(sizes);
     }
     if let Some(main) = column_line
         && count > 0
@@ -748,13 +774,42 @@ fn column_wrap_max_content(
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+    let items = column_wrap_items(flat, index, space, Some(main))?;
+    let mut total = 0.0_f32;
+    let mut lines = 0usize;
+    let (mut line_main, mut line_cross) = (0.0_f32, 0.0_f32);
+    for (outer, cross) in items {
+        if lines > 0 && line_main + row_gap + outer > main + EPS {
+            total += line_cross;
+            (line_main, line_cross) = (outer, cross);
+            lines += 1;
+        } else if lines == 0 {
+            (line_main, line_cross) = (outer, cross);
+            lines = 1;
+        } else {
+            line_main += row_gap + outer;
+            line_cross = line_cross.max(cross);
+        }
+    }
+    total += line_cross;
+    Some(total + column_gap * lines.saturating_sub(1) as f32)
+}
+
+/// The hypothetical outer main size and the max-content cross
+/// contribution of each in-flow item of a column-wrap container, in
+/// `order`. `main` is the container's content block size when definite.
+fn column_wrap_items(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    main: Option<f32>,
+) -> Option<Vec<(f32, f32)>> {
+    let style = flat[index].style;
     let mut children: Vec<usize> = rendered_children(flat, index)
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
         .collect();
     children.sort_by_key(|&child| flat[child].style.order);
-    let mut total = 0.0_f32;
-    let mut lines = 0usize;
-    let (mut line_main, mut line_cross) = (0.0_f32, 0.0_f32);
+    let mut items = Vec::with_capacity(children.len());
     for child in children {
         let child_style = flat[child].style;
         let cross = block::min_max_contribution(flat, child, space)
@@ -782,7 +837,7 @@ fn column_wrap_max_content(
             child_style,
             false,
             main_edges,
-            Some(main),
+            main,
             space,
             flat,
             child,
@@ -790,31 +845,117 @@ fn column_wrap_max_content(
         )
         .why("flex:basis")?
         .max(0.0);
-        let (min, max) = resolve_main_limits(
-            child_style,
-            false,
-            main_edges,
-            Some(main),
-            space,
-            flat,
-            child,
-        )
-        .why("flex:min")?;
+        let (min, max) =
+            resolve_main_limits(child_style, false, main_edges, main, space, flat, child)
+                .why("flex:min")?;
         let outer = base.clamp(min, max.max(min)) + main_edges + main_margins;
-        if lines > 0 && line_main + row_gap + outer > main + EPS {
-            total += line_cross;
-            (line_main, line_cross) = (outer, cross);
-            lines += 1;
-        } else if lines == 0 {
-            (line_main, line_cross) = (outer, cross);
-            lines = 1;
-        } else {
-            line_main += row_gap + outer;
-            line_cross = line_cross.max(cross);
+        items.push((outer, cross));
+    }
+    Some(items)
+}
+
+/// The balancing line count of a `flex-wrap: balance` container whose
+/// `flex-line-count` exceeds one: the lines its content-based size is
+/// split into (Flexbox 2 §6.1).
+fn balance_min_lines(style: &Style) -> Option<usize> {
+    if has_marker(style, BALANCE_MARKER) {
+        Some(flex_line_count(style)).filter(|&lines| lines > 1)
+    } else {
+        None
+    }
+}
+
+/// The items' outer main sizes (floored at zero) split into at most
+/// `lines` contiguous lines, minimizing the largest line (items and
+/// gaps). Ties prefer more items on the first line, then the second, ...
+fn min_max_partition(sizes: &[f32], gap: f32, lines: usize) -> Vec<(usize, usize)> {
+    let count = sizes.len();
+    let lines = lines.min(count);
+    if lines == 0 {
+        return Vec::new();
+    }
+    let seg = |start: usize, end: usize| -> f64 {
+        sizes[start..end]
+            .iter()
+            .map(|size| f64::from(size.max(0.0)))
+            .sum::<f64>()
+            + f64::from(gap) * (end - start - 1) as f64
+    };
+    let mut best = vec![vec![f64::INFINITY; count + 1]; lines + 1];
+    best[0][count] = 0.0;
+    for k in 1..=lines {
+        for start in 0..count {
+            for end in start + 1..=count {
+                let value = seg(start, end).max(best[k - 1][end]);
+                if value < best[k][start] {
+                    best[k][start] = value;
+                }
+            }
         }
     }
-    total += line_cross;
-    Some(total + column_gap * lines.saturating_sub(1) as f32)
+    let mut ranges = Vec::with_capacity(lines);
+    let mut start = 0;
+    for k in (1..=lines).rev() {
+        let target = best[k][start];
+        let mut chosen = start + 1;
+        for end in (start + 1..=count).rev() {
+            if seg(start, end).max(best[k - 1][end]) <= target + 1e-4 {
+                chosen = end;
+                break;
+            }
+        }
+        ranges.push((start, chosen));
+        start = chosen;
+    }
+    ranges
+}
+
+/// The largest line of [`min_max_partition`].
+fn balanced_min_extent(sizes: &[f32], gap: f32, lines: usize) -> f32 {
+    min_max_partition(sizes, gap, lines)
+        .iter()
+        .map(|&(start, end)| {
+            sizes[start..end].iter().map(|s| s.max(0.0)).sum::<f32>()
+                + gap * (end - start - 1) as f32
+        })
+        .fold(0.0, f32::max)
+}
+
+/// The content block size of an automatic-height `flex-wrap: balance`
+/// column with `flex-line-count` above one: the largest line of the
+/// minimum-largest-line partition of its items.
+fn balanced_column_extent(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    lines: usize,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
+    let items = column_wrap_items(flat, index, space, None)?;
+    let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
+    Some(balanced_min_extent(&outers, row_gap, lines))
+}
+
+/// The max-content inline size of an automatic-height balanced column:
+/// the cross sizes of the lines of the minimum-largest-line partition.
+fn balanced_column_max_content(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    lines: usize,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
+    let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+    let items = column_wrap_items(flat, index, space, None)?;
+    let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
+    let ranges = min_max_partition(&outers, row_gap, lines);
+    let total: f32 = ranges
+        .iter()
+        .map(|&(start, end)| items[start..end].iter().map(|i| i.1).fold(0.0, f32::max))
+        .sum();
+    Some(total + column_gap * ranges.len().saturating_sub(1) as f32)
 }
 
 /// The content-box inline size of an image row item in a single-line
@@ -1615,6 +1756,12 @@ pub(super) fn layout(
     {
         specified_height = Some(max_main.map(|max| aspect.min(max)).unwrap_or(aspect));
     }
+    let max_main = match (max_main, balance_min_lines(style)) {
+        (None, Some(lines)) if column_wrap && specified_height.is_none() => {
+            Some(balanced_column_extent(flat, index, space, lines).why("flex:balance-extent")?)
+        }
+        (max_main, _) => max_main,
+    };
     let (inner_main, main_is_max) = if row {
         (Some(inner_width), false)
     } else if let Some(height) = specified_height {
@@ -2250,15 +2397,35 @@ pub(super) fn layout(
 pub(super) const BALANCE_MARKER: &str = "--w3cos-internal-flex-balance";
 
 /// CSS Flexbox 2 §9.7 balanced lines. The line count is the greedy break's.
+/// `flex-line-count` (initial 1).
+fn flex_line_count(style: &Style) -> usize {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(FLEX_LINE_COUNT))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
+const FLEX_LINE_COUNT: &str = "--w3cos-internal-flex-line-count";
+
 /// The items split into that many contiguous sequences, each at most the
 /// inner main size unless it is a single item, minimizing the sum of the
 /// squared differences between a line's size (items and gaps) and the inner
 /// main size. Ties prefer more items on the first line, then the second, ...
 /// Each line still flexes against the real inner size afterwards.
-fn balanced_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)> {
-    let greedy = flex_line_ranges(items, inner, gap);
-    let lines = greedy.len();
+fn balanced_line_ranges(
+    items: &[Item],
+    inner: f32,
+    gap: f32,
+    min_lines: usize,
+) -> Vec<(usize, usize)> {
+    // The outer hypothetical main sizes are floored at zero for balancing.
+    let greedy = flex_line_ranges_floored(items, inner, gap, true);
     let count = items.len();
+    // The balancing line count: the greedy count, or the minimum flex line
+    // count clamped by the number of items if that is larger.
+    let lines = greedy.len().max(min_lines.min(count));
     if lines <= 1 {
         return greedy;
     }
@@ -2316,6 +2483,15 @@ fn balanced_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usi
 }
 
 fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)> {
+    flex_line_ranges_floored(items, inner, gap, false)
+}
+
+fn flex_line_ranges_floored(
+    items: &[Item],
+    inner: f32,
+    gap: f32,
+    floor: bool,
+) -> Vec<(usize, usize)> {
     if items.is_empty() {
         return vec![(0, 0)];
     }
@@ -2323,7 +2499,11 @@ fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)>
     let mut start = 0;
     let mut used = 0.0;
     for (i, item) in items.iter().enumerate() {
-        let outer = item.outer_main();
+        let outer = if floor {
+            item.outer_main().max(0.0)
+        } else {
+            item.outer_main()
+        };
         if i > start && used + gap + outer > inner + EPS {
             lines.push((start, i));
             start = i;
@@ -2377,7 +2557,7 @@ fn layout_wrapped(
     })
     .max(0.0);
     let lines = if has_marker(style, BALANCE_MARKER) {
-        balanced_line_ranges(items, inner_main, main_gap)
+        balanced_line_ranges(items, inner_main, main_gap, flex_line_count(style))
     } else {
         flex_line_ranges(items, inner_main, main_gap)
     };
@@ -3728,6 +3908,94 @@ mod tests {
                 (4, [50.0, 20.0, 50.0, 10.0]),
             ],
         );
+    }
+
+    fn balanced(mut style: Style, line_count: Option<u32>) -> Style {
+        style.flex_wrap = FlexWrap::Wrap;
+        let mut props = w3cos_std::style::CustomProperties::default();
+        props.insert(BALANCE_MARKER.to_string(), "1".to_string());
+        if let Some(count) = line_count {
+            props.insert(FLEX_LINE_COUNT.to_string(), count.to_string());
+        }
+        style.custom_properties = Some(props);
+        style
+    }
+
+    #[test]
+    fn min_max_partition_minimizes_the_largest_line() {
+        assert_eq!(
+            min_max_partition(&[40.0, 40.0, 40.0], 20.0, 2),
+            [(0, 2), (2, 3)]
+        );
+        assert_eq!(balanced_min_extent(&[40.0, 40.0, 40.0], 20.0, 2), 100.0);
+        assert_eq!(
+            min_max_partition(&[100.0, 30.0, 30.0], 20.0, 2),
+            [(0, 1), (1, 3)]
+        );
+        assert_eq!(balanced_min_extent(&[100.0, 30.0, 30.0], 20.0, 2), 100.0);
+        assert_eq!(balanced_min_extent(&[80.0, 40.0, 40.0], 20.0, 2), 100.0);
+        // At most one line per item, and negative sizes floor at zero.
+        assert_eq!(min_max_partition(&[10.0], 5.0, 4), [(0, 1)]);
+        assert_eq!(balanced_min_extent(&[-30.0, 50.0], 0.0, 1), 50.0);
+        assert!(min_max_partition(&[], 5.0, 2).is_empty());
+    }
+
+    #[test]
+    fn flex_line_count_splits_a_balanced_row_that_fits_on_one_line() {
+        // Three 40px items with a 20px gap fit one line of 200px; a
+        // minimum flex line count of 2 balances them as [40,40] [40].
+        let mut container = balanced(flex_style(FlexDirection::Row, 200.0, None), Some(2));
+        container.column_gap = Some(20.0);
+        container.row_gap = Some(0.0);
+        let item = || leaf(fixed_item(40.0, 10.0));
+        expect(
+            &Component::boxed(container, vec![item(), item(), item()]),
+            &[
+                (1, [0.0, 0.0, 40.0, 10.0]),
+                (2, [60.0, 0.0, 40.0, 10.0]),
+                (3, [0.0, 10.0, 40.0, 10.0]),
+            ],
+        );
+        // Without the count the same row stays on one line.
+        let mut one = balanced(flex_style(FlexDirection::Row, 200.0, None), None);
+        one.column_gap = Some(20.0);
+        one.row_gap = Some(0.0);
+        expect(
+            &Component::boxed(one, vec![item(), item(), item()]),
+            &[(3, [120.0, 0.0, 40.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn balanced_line_breaking_floors_outer_main_sizes_at_zero() {
+        // The second item's outer main size is -100px; unfloored it would
+        // let the 150px item and it share a line.
+        let container = balanced(flex_style(FlexDirection::Row, 100.0, None), None);
+        let mut first = fixed_item(150.0, 20.0);
+        first.flex_grow = 0.0;
+        let mut second = fixed_item(0.0, 20.0);
+        second.margin = edges(0.0, -50.0, 0.0, -50.0);
+        expect(
+            &Component::boxed(container, vec![leaf(first), leaf(second)]),
+            &[(2, [-50.0, 20.0, 0.0, 20.0])],
+        );
+    }
+
+    #[test]
+    fn balanced_column_with_a_line_count_sizes_its_block_axis_from_the_partition() {
+        // 40px items, 20px gap, two lines: [40,40] [40]. The automatic
+        // block size is the largest line, 100px.
+        let mut container = balanced(flex_style(FlexDirection::Column, 300.0, None), Some(2));
+        container.gap = 20.0;
+        container.row_gap = Some(20.0);
+        container.column_gap = Some(20.0);
+        let item = || leaf(fixed_item(40.0, 40.0));
+        let out = lay(&Component::boxed(container, vec![item(), item(), item()]));
+        assert_eq!(rect(&out, 0)[3], 100.0);
+        assert_eq!(rect(&out, 1)[1], 0.0);
+        assert_eq!(rect(&out, 2)[1], 60.0);
+        assert_eq!(rect(&out, 3)[1], 0.0);
+        assert!(rect(&out, 3)[0] > rect(&out, 1)[0]);
     }
 
     #[test]

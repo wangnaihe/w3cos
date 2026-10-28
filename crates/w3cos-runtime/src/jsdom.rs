@@ -7963,6 +7963,12 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     if property == "tab-size" {
         return w3cos_dom::css_style::valid_tab_size_declaration(value);
     }
+    if property == "flex-wrap" {
+        return w3cos_dom::css_style::normalize_flex_wrap(value).is_some();
+    }
+    if property == "flex-line-count" {
+        return flex_line_count_valid(value);
+    }
     matches!(
         property.as_str(),
         "align-content"
@@ -13788,6 +13794,7 @@ fn is_discrete_css2_property(property: &str) -> bool {
             | "clear"
             | "empty-cells"
             | "float"
+            | "flex-wrap"
     )
 }
 
@@ -13884,6 +13891,7 @@ fn discrete_css_initial_value(property: &str) -> Option<&'static str> {
         | "float" => Some("none"),
         "border-collapse" => Some("separate"),
         "empty-cells" => Some("show"),
+        "flex-wrap" => Some("nowrap"),
         _ => None,
     }
 }
@@ -13934,8 +13942,24 @@ fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
     ))
 }
 
+fn flex_line_count_valid(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) || w3cos_dom::css_style::parse_flex_line_count(&lower).is_some()
+}
+
 fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
     let value = value.trim();
+    // `balance` and its combined forms serialize canonically; an invalid
+    // `flex-wrap` or `flex-line-count` is dropped at parse time.
+    if property == "flex-wrap" && !value.is_empty() {
+        return w3cos_dom::css_style::normalize_flex_wrap(value);
+    }
+    if property == "flex-line-count" && !value.is_empty() && !flex_line_count_valid(value) {
+        return None;
+    }
     // An invalid tab-size (negative, percentage) is dropped at parse time.
     if property == "tab-size"
         && !value.is_empty()
@@ -33561,6 +33585,32 @@ try {
                 .get_property("float"),
             Value::string("right")
         );
+    }
+
+    #[test]
+    fn allow_discrete_transition_flips_flex_wrap_at_half_progress() {
+        setup();
+        for (easing, expected) in [
+            ("steps(1, jump-end)", "nowrap"),
+            ("steps(1, jump-start)", "wrap"),
+        ] {
+            let div = create_in_body("div");
+            let style = div.get_property("style");
+            style.set_property("flexWrap", Value::string("initial"));
+            style.set_property("transitionDuration", Value::string("100s"));
+            style.set_property("transitionDelay", Value::string("-30s"));
+            style.set_property("transitionTimingFunction", Value::string(easing));
+            style.set_property("transitionProperty", Value::string("flex-wrap"));
+            style.set_property("transitionBehavior", Value::string("allow-discrete"));
+            style.set_property("flexWrap", Value::string("wrap"));
+            assert_eq!(
+                window_value()
+                    .call_method("getComputedStyle", vec![div])
+                    .get_property("flex-wrap"),
+                Value::string(expected),
+                "{easing}"
+            );
+        }
     }
 
     #[test]

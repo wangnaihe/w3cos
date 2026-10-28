@@ -12863,6 +12863,16 @@ fn declaration_value_is_valid(property: &str, value: &str) -> bool {
     if css_property_eq(property, "line-height") {
         return crate::css_style::is_valid_line_height_value(value);
     }
+    if css_property_eq(property, "flex-wrap") {
+        return crate::css_style::normalize_flex_wrap(value).is_some();
+    }
+    if css_property_eq(property, "flex-line-count") {
+        let lower = value.trim().to_ascii_lowercase();
+        return matches!(
+            lower.as_str(),
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        ) || crate::css_style::parse_flex_line_count(&lower).is_some();
+    }
     if css_property_eq(property, "tab-size") {
         return matches!(
             value.trim().to_ascii_lowercase().as_str(),

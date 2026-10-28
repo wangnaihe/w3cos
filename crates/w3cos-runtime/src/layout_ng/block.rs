@@ -156,6 +156,7 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // `flex-wrap: balance` as the NG entry patched it: the flex
             // algorithm breaks the lines evenly.
             | "flex-balance"
+            | "flex-line-count"
             // Flex reads this as a column wrap's definite block size.
             // Height stays auto, so legacy layout ignores the ratio.
             | "aspect-ratio"

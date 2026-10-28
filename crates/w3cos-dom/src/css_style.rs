@@ -91,6 +91,10 @@ pub const COLUMN_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-column-gap-perce
 /// `flex-wrap` keyword this engine does not model (`balance`, …). The used
 /// value falls through to `nowrap`.
 pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
+/// `flex-line-count`: the minimum flex line count of a balancing flex
+/// container (a positive integer). Neither layout reads it for other
+/// boxes; LayoutNG's balancing step does.
+pub const FLEX_LINE_COUNT_PROPERTY: &str = "--w3cos-internal-flex-line-count";
 /// `aspect-ratio` as a width/height number. The dimension fields stay
 /// untouched, so legacy layout never consults it. LayoutNG reads it only
 /// as a column flex container's definite block size.
@@ -717,14 +721,28 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => self.inner.align_items = parse_align_items(value),
             "flex-wrap" | "flexWrap" => {
-                self.inner.flex_wrap = parse_flex_wrap(value);
+                // An invalid value is dropped at parse time.
+                if let Some(keyword) = normalize_flex_wrap(value) {
+                    self.inner.flex_wrap = parse_flex_wrap(&keyword);
+                    set_marker(
+                        &mut self.inner,
+                        UNRECOGNIZED_FLEX_WRAP_PROPERTY,
+                        (!css_wide_keyword(&keyword) && !is_known_flex_wrap(&keyword))
+                            .then_some(keyword),
+                    );
+                }
+            }
+            "flex-line-count" | "flexLineCount" => {
                 let keyword = value.trim().to_ascii_lowercase();
-                set_marker(
-                    &mut self.inner,
-                    UNRECOGNIZED_FLEX_WRAP_PROPERTY,
-                    (!css_wide_keyword(&keyword) && !is_known_flex_wrap(&keyword))
-                        .then_some(keyword),
-                );
+                if css_wide_keyword(&keyword) {
+                    set_marker(&mut self.inner, FLEX_LINE_COUNT_PROPERTY, None);
+                } else if let Some(count) = parse_flex_line_count(&keyword) {
+                    set_marker(
+                        &mut self.inner,
+                        FLEX_LINE_COUNT_PROPERTY,
+                        Some(count.to_string()),
+                    );
+                }
             }
             "flex-flow" | "flexFlow" => {
                 // `<'flex-direction'> || <'flex-wrap'>`; an omitted
@@ -2414,6 +2432,27 @@ impl CSSStyleDeclaration {
             "flex-direction" | "flexDirection" => {
                 format!("{:?}", self.inner.flex_direction).to_lowercase()
             }
+            "flex-wrap" | "flexWrap" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| {
+                    match self.inner.flex_wrap {
+                        FlexWrap::NoWrap => "nowrap",
+                        FlexWrap::Wrap => "wrap",
+                        FlexWrap::WrapReverse => "wrap-reverse",
+                    }
+                    .to_string()
+                }),
+            "flex-line-count" | "flexLineCount" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(FLEX_LINE_COUNT_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| "1".into()),
             "justify-content" | "justifyContent" => {
                 format!("{:?}", self.inner.justify_content).to_lowercase()
             }
@@ -3006,6 +3045,180 @@ fn is_known_display(value: &str) -> bool {
             | "contents"
             | "none"
     )
+}
+
+/// `<integer [1,∞]>`: an integer literal of at least one, or a math
+/// function resolving to a number, which rounds to an integer and clamps
+/// to one (`calc(NaN)` computes to 1).
+pub fn parse_flex_line_count(value: &str) -> Option<u32> {
+    let value = value.trim().to_ascii_lowercase();
+    let digits = value.strip_prefix('+').unwrap_or(&value);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        return digits.parse::<u32>().ok().filter(|count| *count >= 1);
+    }
+    if !(value.starts_with("calc(") || value.starts_with("round(")) {
+        return None;
+    }
+    let mut parser = MathNumber {
+        text: value.as_bytes(),
+        pos: 0,
+    };
+    let result = parser.sum()?;
+    parser.skip_space();
+    if parser.pos != parser.text.len() {
+        return None;
+    }
+    if result.is_nan() {
+        return Some(1);
+    }
+    Some(result.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+}
+
+/// A unitless `calc()` / `round()` expression (CSS Values 4 §10).
+struct MathNumber<'a> {
+    text: &'a [u8],
+    pos: usize,
+}
+
+impl MathNumber<'_> {
+    fn skip_space(&mut self) {
+        while self.text.get(self.pos).is_some_and(u8::is_ascii_whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        self.skip_space();
+        if self.text.get(self.pos) == Some(&byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn word(&mut self, word: &str) -> bool {
+        self.skip_space();
+        if self.text[self.pos..].starts_with(word.as_bytes()) {
+            self.pos += word.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sum(&mut self) -> Option<f64> {
+        let mut total = self.product()?;
+        loop {
+            self.skip_space();
+            if self.eat(b'+') {
+                total += self.product()?;
+            } else if self.eat(b'-') {
+                total -= self.product()?;
+            } else {
+                return Some(total);
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<f64> {
+        let mut total = self.factor()?;
+        loop {
+            if self.eat(b'*') {
+                total *= self.factor()?;
+            } else if self.eat(b'/') {
+                total /= self.factor()?;
+            } else {
+                return Some(total);
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<f64> {
+        self.skip_space();
+        if self.word("calc(") {
+            let value = self.sum()?;
+            return self.eat(b')').then_some(value);
+        }
+        if self.eat(b'(') {
+            let value = self.sum()?;
+            return self.eat(b')').then_some(value);
+        }
+        if self.word("round(") {
+            let strategy = ["nearest", "up", "down", "to-zero"]
+                .into_iter()
+                .find(|name| self.word(name));
+            if strategy.is_some() && !self.eat(b',') {
+                return None;
+            }
+            let value = self.sum()?;
+            let step = if self.eat(b',') { self.sum()? } else { 1.0 };
+            if !self.eat(b')') {
+                return None;
+            }
+            let quotient = value / step;
+            let rounded = match strategy.unwrap_or("nearest") {
+                "up" => quotient.ceil(),
+                "down" => quotient.floor(),
+                "to-zero" => quotient.trunc(),
+                _ => quotient.round(),
+            };
+            return Some(rounded * step);
+        }
+        if self.word("nan") {
+            return Some(f64::NAN);
+        }
+        if self.word("infinity") {
+            return Some(f64::INFINITY);
+        }
+        if self.word("-infinity") {
+            return Some(f64::NEG_INFINITY);
+        }
+        let start = self.pos;
+        if matches!(self.text.get(self.pos), Some(b'+' | b'-')) {
+            self.pos += 1;
+        }
+        while self
+            .text
+            .get(self.pos)
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+        {
+            self.pos += 1;
+        }
+        std::str::from_utf8(&self.text[start..self.pos])
+            .ok()?
+            .parse::<f64>()
+            .ok()
+    }
+}
+
+/// `flex-wrap: <'flex-wrap'>` after CSS Flexbox 2: `nowrap | wrap |
+/// wrap-reverse | balance | [wrap | wrap-reverse] && balance`, serialized
+/// as `balance` or `wrap-reverse balance` for the combined forms. CSS-wide
+/// keywords pass through. `None` for an invalid value.
+pub fn normalize_flex_wrap(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if css_wide_keyword(&value) {
+        return Some(value);
+    }
+    let words: Vec<&str> = value.split_ascii_whitespace().collect();
+    match words.as_slice() {
+        ["nowrap" | "wrap" | "wrap-reverse" | "balance"] => Some(value),
+        [a, b] => {
+            let (wrap, balance) = match (*a, *b) {
+                ("balance", wrap) | (wrap, "balance") => (wrap, true),
+                (wrap, _) => (wrap, false),
+            };
+            (balance && matches!(wrap, "wrap" | "wrap-reverse")).then(|| {
+                if wrap == "wrap-reverse" {
+                    "wrap-reverse balance".to_string()
+                } else {
+                    "balance".to_string()
+                }
+            })
+        }
+        _ => None,
+    }
 }
 
 fn is_known_flex_wrap(value: &str) -> bool {
@@ -8205,6 +8418,87 @@ fn unrecognized_display_and_flex_wrap_keep_a_marker() {
             .as_ref()
             .is_none_or(|props| !props.contains_key(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
     );
+}
+
+#[test]
+fn flex_line_count_stores_a_positive_integer_marker() {
+    let mut declaration = CSSStyleDeclaration::new();
+    let marker = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(FLEX_LINE_COUNT_PROPERTY))
+            .cloned()
+    };
+    declaration.set_property("flex-line-count", "3");
+    assert_eq!(marker(&declaration).as_deref(), Some("3"));
+    declaration.set_property("flex-line-count", "+2");
+    assert_eq!(marker(&declaration).as_deref(), Some("2"));
+    // Invalid values (zero, negative, fractional, keywords) are ignored.
+    for value in ["0", "-1", "1.5", "auto", "wrap"] {
+        declaration.set_property("flex-line-count", value);
+        assert_eq!(marker(&declaration).as_deref(), Some("2"), "{value}");
+    }
+    declaration.set_property("flex-line-count", "initial");
+    assert_eq!(marker(&declaration), None);
+}
+
+#[test]
+fn flex_wrap_balance_forms_normalize_and_serialize() {
+    for (value, expected) in [
+        ("nowrap", "nowrap"),
+        ("wrap", "wrap"),
+        ("wrap-reverse", "wrap-reverse"),
+        ("balance", "balance"),
+        ("wrap balance", "balance"),
+        ("balance wrap", "balance"),
+        ("wrap-reverse balance", "wrap-reverse balance"),
+        ("balance wrap-reverse", "wrap-reverse balance"),
+    ] {
+        assert_eq!(
+            normalize_flex_wrap(value).as_deref(),
+            Some(expected),
+            "{value}"
+        );
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("flex-wrap", value);
+        assert_eq!(declaration.get_property("flex-wrap"), expected, "{value}");
+    }
+    for value in [
+        "auto",
+        "nowrap wrap",
+        "wrap wrap",
+        "balance balance",
+        "balance nowrap",
+        "nowrap balance",
+        "wrap balance wrap",
+        "wrap 2 balance",
+        "balance 0",
+    ] {
+        assert_eq!(normalize_flex_wrap(value), None, "{value}");
+    }
+    // An invalid declaration leaves the previous value alone.
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("flex-wrap", "wrap");
+    declaration.set_property("flex-wrap", "auto");
+    assert_eq!(declaration.get_property("flex-wrap"), "wrap");
+}
+
+#[test]
+fn flex_line_count_math_functions_round_and_clamp() {
+    assert_eq!(parse_flex_line_count("2"), Some(2));
+    assert_eq!(parse_flex_line_count("round(up, calc(7/2))"), Some(4));
+    assert_eq!(parse_flex_line_count("calc(NaN)"), Some(1));
+    assert_eq!(parse_flex_line_count("calc(0)"), Some(1));
+    assert_eq!(parse_flex_line_count("calc(1 + 2 * 3)"), Some(7));
+    for value in ["0", "-1", "1.5", "auto", "wrap", "calc(", "round(up)x"] {
+        assert_eq!(parse_flex_line_count(value), None, "{value}");
+    }
+    let mut declaration = CSSStyleDeclaration::new();
+    assert_eq!(declaration.get_property("flex-line-count"), "1");
+    declaration.set_property("flex-line-count", "round(up, calc(7/2))");
+    assert_eq!(declaration.get_property("flex-line-count"), "4");
 }
 
 #[test]
