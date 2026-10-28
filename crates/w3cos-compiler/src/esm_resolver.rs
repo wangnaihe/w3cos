@@ -2691,7 +2691,12 @@ fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModu
 fn vscode_module(project_root: &Path) -> Result<ResolvedModule> {
     let dir = node_builtin_dir(project_root)?;
     let path = dir.join("vscode.js");
-    install_glue_file(&path, "module.exports = require('vscode');\n")?;
+    // `require` through an alias: a literal `require('vscode')` would link
+    // this very file as its own dependency instead of reaching the host.
+    install_glue_file(
+        &path,
+        "const hostRequire = require;\nmodule.exports = hostRequire('vscode');\n",
+    )?;
     Ok(ResolvedModule {
         specifier: "vscode".to_string(),
         path,
@@ -3622,6 +3627,28 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             .map(|node| node.module.path.clone())
             .unwrap_or_else(|| panic!("vscode must link as a module: {:?}", graph.nodes.len()));
         assert!(resolver.is_commonjs(&glue), "{}", glue.display());
+        let record = graph
+            .nodes
+            .iter()
+            .find(|node| node.module.path.ends_with("vscode.js.w3cos-cjs.js"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no record: {:?}",
+                    graph
+                        .nodes
+                        .iter()
+                        .map(|n| (&n.module.path, &n.imports))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            record
+                .imports
+                .iter()
+                .all(|import| !import.ends_with("w3cos-cjs.js")),
+            "the glue must not link itself: {:?}",
+            record.imports
+        );
         let parsed = resolver.parse_graph_from_entry(&entry).unwrap();
         let bundle = EsmBundle::build(&parsed, &resolver, &entry);
         assert!(bundle.is_fully_resolved(), "{:?}", bundle.unresolved);
