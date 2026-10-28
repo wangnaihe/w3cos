@@ -7629,3 +7629,115 @@ fn calc_padding_resolves_percent_and_floors_at_zero() {
     assert_eq!(y, 0.0, "100 - 200 floors at zero");
     assert_eq!(w, 290.0);
 }
+
+/// An absolutely positioned canvas is a replaced box: it takes its natural
+/// size (or the other axis through its ratio), is never stretched between
+/// its insets, and `stretch` fills the space between them and the margins
+/// (CSS 2.1 10.3.8 and 10.6.5; css-sizing/stretch/positioned-replaced-*).
+/// An element whose only child is that canvas makes no line box, so the
+/// canvas sits at the static position of a zero-sized line.
+#[test]
+fn abspos_replaced_canvas_sizes_and_stretch() {
+    use w3cos_std::style::Position;
+    let holder = |canvas_style: Style| {
+        node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(200.0),
+                height: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    margin: w3cos_std::style::Edges {
+                        left: Spacing::Px(10.0),
+                        top: Spacing::Px(20.0),
+                        ..Default::default()
+                    },
+                    ..block()
+                },
+                vec![Component::canvas(
+                    50,
+                    25,
+                    Style {
+                        position: Position::Absolute,
+                        display: Display::Inline,
+                        ..canvas_style
+                    },
+                )],
+            )],
+        )
+    };
+    let natural = holder(block());
+    let both_insets = holder(Style {
+        left: Dimension::Px(5.0),
+        right: Dimension::Px(5.0),
+        ..block()
+    });
+    let width_only = holder(Style {
+        width: Dimension::Px(100.0),
+        ..block()
+    });
+    let stretched = holder(stretch(
+        "w,h",
+        Style {
+            left: Dimension::Px(50.0),
+            top: Dimension::Px(50.0),
+            right: Dimension::Px(50.0),
+            bottom: Dimension::Px(50.0),
+            ..block()
+        },
+    ));
+    let static_stretch = holder(stretch("w,h", block()));
+    let root = node(
+        block(),
+        vec![natural, both_insets, width_only, stretched, static_stretch],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 800.0).expect("ng");
+    // Per holder: [holder, wrapper, canvas].
+    let canvas = |i: usize| rect(&ng, 1 + 3 * i + 2);
+    assert_eq!(canvas(0).2, 50.0, "natural width");
+    assert_eq!(canvas(0).3, 25.0, "natural height");
+    assert_eq!(canvas(1).2, 50.0, "not stretched between the insets");
+    assert_eq!(canvas(2).2, 100.0);
+    assert_eq!(canvas(2).3, 50.0, "height through the ratio");
+    assert_eq!((canvas(3).2, canvas(3).3), (100.0, 100.0), "stretched");
+    // Static position: below the wrapper's top margin, after its left margin.
+    assert_eq!(canvas(4).2, 190.0, "stretch from the static left, no inset");
+    assert_eq!(rect(&ng, 2).3, 0.0, "the wrapper makes no line box");
+}
+
+/// A canvas beside text in its parent is an OOF item of an inline
+/// formatting context, which stays on the legacy path.
+#[test]
+fn abspos_replaced_canvas_beside_text_falls_back() {
+    use w3cos_std::style::Position;
+    let root = node(
+        block(),
+        vec![node(
+            block(),
+            vec![
+                Component::text(
+                    "hi",
+                    Style {
+                        display: Display::Inline,
+                        ..Style::default()
+                    },
+                ),
+                Component::canvas(
+                    50,
+                    25,
+                    Style {
+                        position: Position::Absolute,
+                        display: Display::Inline,
+                        ..block()
+                    },
+                ),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(!block::unsupported_reasons(&flat).is_empty());
+}

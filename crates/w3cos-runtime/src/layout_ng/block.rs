@@ -636,7 +636,11 @@ pub(super) fn inline_level_oof(flat: &[FlatNodeInfo], index: usize) -> bool {
         && matches!(info.style.display, Display::Inline | Display::InlineBlock)
         && matches!(
             info.kind,
-            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+            ComponentKind::Box
+                | ComponentKind::Column
+                | ComponentKind::Row
+                | ComponentKind::Image { .. }
+                | ComponentKind::Canvas { .. }
         )
 }
 
@@ -979,13 +983,23 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
     }
     // min/max constraints: `constrained_replaced_size` (Blink
     // ComputeReplacedSizeInternal).
-    if style.float != Float::None
-        || matches!(
-            style.position,
-            Position::Absolute | Position::Fixed | Position::Sticky
-        )
-    {
+    if style.float != Float::None || style.position == Position::Sticky {
         return Some("image:float-or-oof");
+    }
+    // An out-of-flow replaced box is sized by `oof::layout_out_of_flow`
+    // (CSS 2.1 10.3.8, 10.6.5); in a flex or grid container the container
+    // places it, which stays on legacy.
+    if oof::is_out_of_flow(style) {
+        if info.parent.is_none_or(|parent| {
+            is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+        }) {
+            return Some("image:float-or-oof");
+        }
+        return unsupported_box_style(
+            style,
+            &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+            false,
+        );
     }
     // A flex item is sized by the flex algorithm (`layout_block_in` takes
     // its used content box). Grid items stay on legacy.
@@ -1044,13 +1058,23 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
     if style.box_sizing == BoxSizing::BorderBox || size_contained(style) {
         return Some("canvas:border-box-or-contain");
     }
-    if style.float != Float::None
-        || matches!(
-            style.position,
-            Position::Absolute | Position::Fixed | Position::Sticky
-        )
-    {
+    if style.float != Float::None || style.position == Position::Sticky {
         return Some("canvas:float-or-oof");
+    }
+    // An out-of-flow replaced box is sized by `oof::layout_out_of_flow`
+    // (CSS 2.1 10.3.8, 10.6.5); in a flex or grid container the container
+    // places it, which stays on legacy.
+    if oof::is_out_of_flow(style) {
+        if info.parent.is_none_or(|parent| {
+            is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+        }) {
+            return Some("canvas:float-or-oof");
+        }
+        return unsupported_box_style(
+            style,
+            &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+            false,
+        );
     }
     // Like an image (Blink LayoutHTMLCanvas is a LayoutReplaced): a flex
     // item is sized by the flex algorithm and its inline-level display is
@@ -1792,7 +1816,7 @@ fn contained_replaced_size(style: &Style) -> Option<(f32, f32)> {
 /// fit-content all mean the size it would have with that axis auto (its
 /// natural size, or the other axis transferred through its ratio;
 /// css-sizing-3 for replaced elements).
-fn replaced_size_with_keyword_limits(
+pub(super) fn replaced_size_with_keyword_limits(
     kind: &ComponentKind,
     style: &Style,
     space: &ConstraintSpace,

@@ -197,6 +197,47 @@ pub(super) fn layout_out_of_flow(
             let bottom = length(style.bottom, h, style, &space)?;
             Some((h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0))
         });
+    // A replaced box has no shrink-to-fit width and is not stretched between
+    // its insets: auto sizes are its natural size (or the other axis through
+    // its ratio), CSS 2.1 10.3.8 and 10.6.5 (Blink ComputeReplacedSize).
+    // `stretch` fills the space between the insets and margins.
+    let replaced_dims = if super::block::is_replaced(flat[index].kind) {
+        let top = length(style.top, h, style, &space);
+        let bottom = length(style.bottom, h, style, &space);
+        let top = if top.is_none() && bottom.is_none() {
+            Some(candidate.static_block - cb.y)
+        } else {
+            top
+        };
+        let mut sized = style.clone();
+        let border_box = |avail: f32, edges: f32| match style.box_sizing {
+            BoxSizing::BorderBox => avail.max(0.0),
+            BoxSizing::ContentBox => (avail - edges).max(0.0),
+        };
+        if stretch_w {
+            let avail = w
+                - left.unwrap_or(0.0)
+                - right.unwrap_or(0.0)
+                - ml.unwrap_or(0.0)
+                - mr.unwrap_or(0.0);
+            sized.width = Dimension::Px(border_box(avail, edges_h));
+        }
+        if stretch_h {
+            let avail = h
+                - top.unwrap_or(0.0)
+                - bottom.unwrap_or(0.0)
+                - mt.unwrap_or(0.0)
+                - mb.unwrap_or(0.0);
+            sized.height = Dimension::Px(border_box(avail, edges_v));
+        }
+        Some(super::block::replaced_size_with_keyword_limits(
+            &flat[index].kind,
+            &sized,
+            &space,
+        )?)
+    } else {
+        None
+    };
     // An intrinsic `width` keyword (css-sizing-3) is the box's own
     // min/max-content size, or for fit-content the available size clamped
     // between them, whatever its insets.
@@ -205,7 +246,9 @@ pub(super) fn layout_out_of_flow(
             && !super::block::is_replaced(flat[index].kind)
             && !super::block::size_contained(style)
     });
-    let width = if stretch_w {
+    let width = if let Some((replaced_w, _)) = replaced_dims {
+        replaced_w
+    } else if stretch_w {
         clamp_inline_size(
             style,
             &space,
@@ -276,16 +319,20 @@ pub(super) fn layout_out_of_flow(
         - ml.unwrap_or(0.0)
         - mr.unwrap_or(0.0)
         - edges_h;
-    let width = super::block::keyword_limited_inline(
-        flat,
-        index,
-        &space,
-        edges_h,
-        width,
-        available.max(0.0),
-        w,
-    )
-    .why("oof-width-keyword")?;
+    let width = if replaced_dims.is_some() {
+        width
+    } else {
+        super::block::keyword_limited_inline(
+            flat,
+            index,
+            &space,
+            edges_h,
+            width,
+            available.max(0.0),
+            w,
+        )
+        .why("oof-width-keyword")?
+    };
     let border_w = width + edges_h;
     let (margin_left, x) = match (left, right) {
         (Some(l), Some(r)) => {
@@ -356,11 +403,16 @@ pub(super) fn layout_out_of_flow(
         }
         _ => None,
     };
-    let mut fixed_h = specified_h.or(stretched);
+    let mut fixed_h = match replaced_dims {
+        Some((_, replaced_h)) => Some(replaced_h),
+        None => specified_h.or(stretched),
+    };
     // An intrinsic min-height / max-height keyword is the content height
     // (css-sizing-3); a specified or stretched height is limited by it.
-    let min_keyword = super::block::marker(style, super::block::MIN_HEIGHT_KEYWORD).is_some();
-    let max_keyword = super::block::marker(style, super::block::MAX_HEIGHT_KEYWORD).is_some();
+    let min_keyword = replaced_dims.is_none()
+        && super::block::marker(style, super::block::MIN_HEIGHT_KEYWORD).is_some();
+    let max_keyword = replaced_dims.is_none()
+        && super::block::marker(style, super::block::MAX_HEIGHT_KEYWORD).is_some();
     if let Some(fixed) = fixed_h.filter(|_| min_keyword || max_keyword) {
         let auto =
             layout_block_sized(flat, index, &space, true, Some((width, None))).why("oof-layout")?;

@@ -867,6 +867,12 @@ pub(super) fn is_inline_container(flat: &[FlatNodeInfo], index: usize) -> bool {
     if !inline_level_child(flat, first) {
         return false;
     }
+    // Only out-of-flow boxes: no line box is made (an empty line is not
+    // laid out), so the box is a block container whose OOF children have
+    // the static position of a zero-sized line.
+    if rendered_children(flat, index).all(|child| super::oof::is_out_of_flow(flat[child].style)) {
+        return false;
+    }
     // A table cell whose later child is a block (or a nested table) is a
     // block container. The first-child check would call it an IFC, and the
     // line breaker then bails `ifc:atomic-or-span`, sending the whole page
