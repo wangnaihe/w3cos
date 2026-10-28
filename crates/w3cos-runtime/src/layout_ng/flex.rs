@@ -19,11 +19,10 @@
 //! item inline size is the fit-content size against the container's inner
 //! width. A column wrap whose block size is still automatic and that has
 //! a gap stays on legacy (`flex:wrap-column`): its reference uses logical
-//! margins and a writing mode this engine does not store. A definite-height
-//! row wrap with a gap and auto-height items stays there too
-//! (`flex-wrap: balance` is unrecognized, and its wrap reference must
-//! use the same engine). An item whose fit-content size cannot be measured
-//! stays on legacy (`flex:wrap-column-auto-cross`).
+//! margins and a writing mode this engine does not store. `flex-wrap:
+//! balance` breaks the greedy line count's lines evenly
+//! (`balanced_line_ranges`). An item whose fit-content
+//! size cannot be measured stays on legacy (`flex:wrap-column-auto-cross`).
 //!
 //! A text run is an anonymous flex item laid out as block text: its flex
 //! base size is its max-content width in a row, its automatic minimum
@@ -120,23 +119,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             || style.column_gap.unwrap_or(0.0) > 0.0)
     {
         return Some("flex:wrap-column");
-    }
-    // `flex-wrap: balance` stays on legacy (the keyword is unrecognized).
-    // Its reference is an ordinary wrap with a gap and a definite height,
-    // and legacy leaves those auto-height items at 0 while NG would
-    // stretch them to the line. Both sides of that reftest have to stay
-    // on legacy. A wrap whose items have a specified cross size, or whose
-    // container height is auto, still wraps here.
-    if style.flex_wrap == FlexWrap::Wrap
-        && row_axis(style.flex_direction)
-        && !matches!(style.height, Dimension::Auto)
-        && (style.gap > 0.0
-            || style.row_gap.unwrap_or(0.0) > 0.0
-            || style.column_gap.unwrap_or(0.0) > 0.0)
-        && rendered_children(flat, index)
-            .all(|child| matches!(flat[child].style.height, Dimension::Auto))
-    {
-        return Some("flex:wrap-gap");
     }
     // A nowrap row aligns first baselines below. Anything else with
     // `align-items: baseline` stays here, ahead of the later reasons.
@@ -2263,6 +2245,76 @@ pub(super) fn layout(
 
 /// Flex lines from hypothetical outer main sizes (Flexbox §9.3). A line
 /// keeps at least one item, even when that item is wider than the container.
+/// Marker the NG entry sets on a flex container whose `flex-wrap` is
+/// `balance` (with its wrap direction already stored in `flex_wrap`).
+pub(super) const BALANCE_MARKER: &str = "--w3cos-internal-flex-balance";
+
+/// CSS Flexbox 2 §9.7 balanced lines. The line count is the greedy break's.
+/// The items split into that many contiguous sequences, each at most the
+/// inner main size unless it is a single item, minimizing the sum of the
+/// squared differences between a line's size (items and gaps) and the inner
+/// main size. Ties prefer more items on the first line, then the second, ...
+/// Each line still flexes against the real inner size afterwards.
+fn balanced_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)> {
+    let greedy = flex_line_ranges(items, inner, gap);
+    let lines = greedy.len();
+    let count = items.len();
+    if lines <= 1 {
+        return greedy;
+    }
+    let size = |start: usize, end: usize| -> f64 {
+        let sum: f64 = items[start..end]
+            .iter()
+            .map(|i| f64::from(i.outer_main().max(0.0)))
+            .sum();
+        sum + f64::from(gap) * (end - start - 1) as f64
+    };
+    let fits =
+        |start: usize, end: usize| end - start == 1 || size(start, end) <= f64::from(inner) + 1e-4;
+    // best[j][i]: least error placing items i.. on j lines (INFINITY: none).
+    let mut best = vec![vec![f64::INFINITY; count + 1]; lines + 1];
+    best[0][count] = 0.0;
+    for j in 1..=lines {
+        for start in 0..count {
+            for end in start + 1..=count {
+                if !fits(start, end) || !best[j - 1][end].is_finite() {
+                    continue;
+                }
+                let error = (f64::from(inner) - size(start, end)).powi(2) + best[j - 1][end];
+                if error < best[j][start] {
+                    best[j][start] = error;
+                }
+            }
+        }
+    }
+    if !best[lines][0].is_finite() {
+        return greedy;
+    }
+    let mut ranges = Vec::with_capacity(lines);
+    let mut start = 0;
+    for j in (1..=lines).rev() {
+        // The largest end that still reaches the minimum (start bias).
+        let target = best[j][start];
+        let mut chosen = None;
+        for end in (start + 1..=count).rev() {
+            if fits(start, end)
+                && best[j - 1][end].is_finite()
+                && ((f64::from(inner) - size(start, end)).powi(2) + best[j - 1][end] - target).abs()
+                    <= 1e-6 * target.max(1.0)
+            {
+                chosen = Some(end);
+                break;
+            }
+        }
+        let Some(end) = chosen else {
+            return greedy;
+        };
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
 fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)> {
     if items.is_empty() {
         return vec![(0, 0)];
@@ -2324,7 +2376,11 @@ fn layout_wrapped(
         style.column_gap.unwrap_or(style.gap)
     })
     .max(0.0);
-    let lines = flex_line_ranges(items, inner_main, main_gap);
+    let lines = if has_marker(style, BALANCE_MARKER) {
+        balanced_line_ranges(items, inner_main, main_gap)
+    } else {
+        flex_line_ranges(items, inner_main, main_gap)
+    };
     for &(start, end) in &lines {
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
@@ -3613,21 +3669,65 @@ mod tests {
     }
 
     #[test]
-    fn definite_height_wrap_with_gap_and_auto_items_stays_on_legacy() {
+    fn definite_height_wrap_with_gap_stretches_auto_height_lines() {
+        // gap-008-ltr shape: height 100, `gap: 40px 20px`, two 40px items
+        // per line. The two empty lines share the free 60px and the
+        // auto-height items stretch to 30px (align-content: stretch,
+        // align-items: stretch).
         let mut container = flex_style(FlexDirection::Row, 100.0, Some(100.0));
+        container.flex_wrap = FlexWrap::Wrap;
+        container.row_gap = Some(40.0);
+        container.column_gap = Some(20.0);
+        let item = || {
+            let mut style = block_box(Some(40.0), None);
+            style.flex_grow = 0.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = Dimension::Px(40.0);
+            leaf(style)
+        };
+        expect(
+            &Component::boxed(container, vec![item(), item(), item(), item()]),
+            &[
+                (1, [0.0, 0.0, 40.0, 30.0]),
+                (2, [60.0, 0.0, 40.0, 30.0]),
+                (3, [0.0, 70.0, 40.0, 30.0]),
+                (4, [60.0, 70.0, 40.0, 30.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn balanced_wrap_minimizes_squared_line_error_with_greedy_line_count() {
+        // Items 30/20/20/30, width 100, gap 10. Greedy: [30,20,20] [30]
+        // (two lines). The even split is [30,20] [20,30] (sizes 60/60);
+        // each line flexes (grow 1) against the real 100px: 50/40, 40/50.
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(30.0));
         container.flex_wrap = FlexWrap::Wrap;
         container.gap = 10.0;
         container.row_gap = Some(10.0);
         container.column_gap = Some(10.0);
-        let root = Component::boxed(
-            container,
-            vec![
-                leaf(block_box(Some(50.0), None)),
-                leaf(block_box(Some(40.0), None)),
+        let mut props = w3cos_std::style::CustomProperties::default();
+        props.insert(BALANCE_MARKER.to_string(), "1".to_string());
+        container.custom_properties = Some(props);
+        let item = |width: f32| {
+            let mut style = block_box(Some(width), Some(10.0));
+            style.flex_grow = 1.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = Dimension::Px(width);
+            leaf(style)
+        };
+        expect(
+            &Component::boxed(
+                container,
+                vec![item(30.0), item(20.0), item(20.0), item(30.0)],
+            ),
+            &[
+                (1, [0.0, 0.0, 50.0, 10.0]),
+                (2, [60.0, 0.0, 40.0, 10.0]),
+                (3, [0.0, 20.0, 40.0, 10.0]),
+                (4, [50.0, 20.0, 50.0, 10.0]),
             ],
         );
-        let flat = pre_flatten(&root);
-        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
     }
 
     #[test]

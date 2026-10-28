@@ -286,6 +286,67 @@ pub(crate) fn layout_tree_with_text(
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
+    // `flex-wrap: balance` is stored by the cascade as `nowrap` plus a
+    // marker (legacy keeps it unrecognized); this engine reads it as a
+    // balanced wrap.
+    let _ = root;
+    let balanced = balanced_wrap_styles(flat);
+    if balanced.is_empty() {
+        return layout_logical(flat, viewport_w, viewport_h);
+    }
+    let patched = run_in_patched(flat, &balanced);
+    layout_logical(&patched, viewport_w, viewport_h)
+}
+
+/// The styles of flex containers with `flex-wrap: balance`, as `wrap` (or
+/// `wrap-reverse`) with the balance marker, keyed by flat index.
+fn balanced_wrap_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, w3cos_std::style::Style)> {
+    use w3cos_std::style::{Display, FlexWrap};
+    flat.iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let style = node.style;
+            if !matches!(style.display, Display::Flex) {
+                return None;
+            }
+            let properties = style.custom_properties.as_ref()?;
+            // A `-webkit-box` is a legacy flex box that ignores `flex-wrap`.
+            if properties
+                .get("--w3cos-internal-unrecognized-display")
+                .is_some()
+            {
+                return None;
+            }
+            let value = properties.get("--w3cos-internal-unrecognized-flex-wrap")?;
+            let mut wrap = FlexWrap::Wrap;
+            let mut balance = false;
+            for word in value.split_ascii_whitespace() {
+                match word {
+                    "balance" => balance = true,
+                    "wrap" => {}
+                    "wrap-reverse" => wrap = FlexWrap::WrapReverse,
+                    _ => return None,
+                }
+            }
+            if !balance {
+                return None;
+            }
+            let mut style = style.clone();
+            style.flex_wrap = wrap;
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove("--w3cos-internal-unrecognized-flex-wrap");
+                properties.insert(flex::BALANCE_MARKER.to_string(), "1".to_string());
+            }
+            Some((index, style))
+        })
+        .collect()
+}
+
+fn layout_logical(
+    flat: &[FlatNodeInfo],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
     // Logical properties (`inline-size`, `block-size`, block-axis margins and
     // padding) resolved per writing mode apply to this engine only; the
     // declared style stays what the legacy engine reads.
@@ -314,17 +375,7 @@ pub(crate) fn layout_tree_with_text(
     if declared_tree_unsupported(flat) {
         return layout_with_run_in(flat, viewport_w, viewport_h);
     }
-    let mut resolved = logical.iter().peekable();
-    let logical_flat: Vec<FlatNodeInfo> = flat
-        .iter()
-        .enumerate()
-        .map(|(index, node)| FlatNodeInfo {
-            style: resolved
-                .next_if(|(at, _)| *at == index)
-                .map_or(node.style, |(_, style)| style),
-            ..*node
-        })
-        .collect();
+    let logical_flat = run_in_patched(flat, &logical);
     layout_with_run_in(&logical_flat, viewport_w, viewport_h)
 }
 

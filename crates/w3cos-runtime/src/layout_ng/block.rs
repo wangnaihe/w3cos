@@ -153,6 +153,9 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // Flex reads this for `align-content: safe …` overflow.
             // The used align-content enum stays the legacy parse.
             | "safe-align-content"
+            // `flex-wrap: balance` as the NG entry patched it: the flex
+            // algorithm breaks the lines evenly.
+            | "flex-balance"
             // Flex reads this as a column wrap's definite block size.
             // Height stays auto, so legacy layout ignores the ratio.
             | "aspect-ratio"
