@@ -3615,7 +3615,6 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
             [text] if matches!(text.kind, ComponentKind::Text { .. }) => {
                 text.style.display == Display::Inline
             }
-            _ if !run_in => false,
             _ => children.iter().all(|child| {
                 matches!(
                     child.style.display,
@@ -3712,6 +3711,7 @@ pub(super) fn layout_root(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        fixed_block_indefinite: false,
     };
     let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
@@ -4027,6 +4027,8 @@ fn layout_block_in(
         // containing block (CSS 2.1 10.5).
         percentage_block: if anonymous_block {
             space.percentage_block
+        } else if space.fixed_block_indefinite && matches!(sized, Some((_, Some(_)))) {
+            None
         } else {
             specified_height.or(ratio_height).map(clamp_h)
         },
@@ -4039,6 +4041,7 @@ fn layout_block_in(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        fixed_block_indefinite: false,
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;

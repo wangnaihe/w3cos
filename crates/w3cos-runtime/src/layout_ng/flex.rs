@@ -180,11 +180,27 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         // A container with a definite (length) height is a basis for the
         // item's own percentages; only a percentage further down, which
         // resolves against the item's flexed size, still cycles.
-        if !row
-            && column_percent_size(flat, child)
-            && (!matches!(style.height, Dimension::Px(_)) || column_percent_descendant(flat, child))
-        {
-            return Some("flex:column-percent");
+        if !row && column_percent_size(flat, child) {
+            let definite = matches!(style.height, Dimension::Px(_));
+            let blocked = if definite {
+                column_percent_descendant(flat, child)
+            } else {
+                // An indefinite container: the item's flexed size is not a
+                // percentage basis (`fixed_block_indefinite`), so descendant
+                // percentages are auto. The item's own percentages and its
+                // automatic minimum stay on legacy.
+                percent_block_size(child_style)
+                    || child_style.min_height == Dimension::Auto
+                    || super::block::is_author_flex(child_style)
+                    || super::block::is_author_grid(child_style)
+                    || matches!(
+                        child_style.display,
+                        w3cos_std::style::Display::Table | w3cos_std::style::Display::InlineTable
+                    )
+            };
+            if blocked {
+                return Some("flex:column-percent");
+            }
         }
         let (cross_start, cross_end) = cross_margin_sides(
             child_style,
@@ -1148,11 +1164,19 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
         return Some((laid.fragment.height - edges).max(0.0));
     }
     let mut sum = 0.0;
+    // Adjacent inline text nodes share a line (`XXX` followed by a
+    // whitespace node is one line, not two).
+    let mut after_inline_text = false;
     for child in rendered_children(flat, index) {
         if oof::is_out_of_flow(flat[child].style) || flat[child].style.float != Float::None {
             continue;
         }
-        sum += block_contribution(flat, child, space).why("flex:block-min")?;
+        let inline_text = matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
+            && flat[child].style.display == Display::Inline;
+        if !(inline_text && after_inline_text) {
+            sum += block_contribution(flat, child, space).why("flex:block-min")?;
+        }
+        after_inline_text = inline_text;
     }
     Some(sum.max(0.0))
 }
@@ -1276,7 +1300,14 @@ fn flex_base(
         Dimension::Auto => property,
         other => other,
     };
-    match definite(basis, inner, style, space).why("flex:percent")? {
+    // A percentage flex-basis against an indefinite container main size
+    // behaves as `content` (css-flexbox §7.2.1; percentage-heights-017).
+    let resolved = if !row && inner.is_none() && matches!(basis, Dimension::Percent(_)) {
+        Some(None)
+    } else {
+        definite(basis, inner, style, space)
+    };
+    match resolved.why("flex:percent")? {
         Some(size) => Some(to_content(style, edges, size)),
         None => {
             if row {
@@ -1528,6 +1559,19 @@ fn layout_item(
     let mut nested = *space;
     nested.available_inline = container_inner_width;
     nested.percentage_block = container_inner_height;
+    // Blink `IsFixedBlockSizeIndefinite`: a column item's flexed size is not
+    // a percentage basis when the container height is indefinite, unless the
+    // size is definite without layout: a fully inflexible item with a length
+    // basis (percentage-heights-007), or one whose height transfers from an
+    // aspect ratio (flex-aspect-ratio-032).
+    let style = flat[index].style;
+    let inflexible_length = style.flex_grow <= 0.0
+        && style.flex_shrink <= 0.0
+        && matches!(style.flex_basis, Dimension::Px(_));
+    nested.fixed_block_indefinite = !row
+        && container_inner_height.is_none()
+        && !inflexible_length
+        && !has_marker(style, "--w3cos-internal-aspect-ratio");
     nested.rtl = false;
     nested.bfc_x = 0.0;
     nested.bfc_y = 0.0;
@@ -1704,8 +1748,11 @@ pub(super) fn layout(
                 .why("flex:cross")?,
             );
         }
-        let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
-            && matches!(child_style.height, Dimension::Auto);
+        let basis_auto = (matches!(child_style.flex_basis, Dimension::Auto)
+            && matches!(child_style.height, Dimension::Auto))
+            // A percentage basis with an indefinite main size is `content`.
+            || (inner_main.is_none()
+                && matches!(child_style.flex_basis, Dimension::Percent(_)));
         let measured = if !row && basis_auto {
             let laid = layout_item(
                 flat,

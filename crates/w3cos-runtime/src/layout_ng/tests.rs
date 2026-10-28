@@ -7176,3 +7176,133 @@ fn webkit_box_vertical_clamps_lines() {
         assert_eq!(got, pieces, "case {n}");
     }
 }
+
+/// A column flex item's flexed size is not a percentage basis for its
+/// children while the container's height is indefinite
+/// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.
+#[test]
+fn indefinite_column_item_children_percent_is_auto() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let item = Style {
+        height: Dimension::Px(100.0),
+        min_height: Dimension::Px(0.0),
+        ..block()
+    };
+    let green = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let red = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(100.0),
+        ..block()
+    };
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            col,
+            vec![node(item, vec![node(green, vec![]), node(red, vec![])])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(flex::container_reason(&flat, 1), None);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (_, _, _, h) = rect(&ng, 2);
+    assert_eq!(h, 100.0, "the item keeps its specified height");
+    let (_, y, _, h) = rect(&ng, 4);
+    assert_eq!((y, h), (100.0, 0.0), "the percentage is auto");
+}
+
+/// A vertical `-webkit-box` whose children are all in-flow blocks is the
+/// block flow root its legacy lowering (a flex row of one item) paints the
+/// same way (webkit-line-clamp-039). The clamp reaches only its own lines.
+#[test]
+fn vertical_webkit_box_with_block_child_is_a_flow_root() {
+    use w3cos_std::style::CustomProperties;
+    let mut boxed = Style {
+        display: Display::Flex,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    boxed.custom_properties = Some(CustomProperties::from_iter([
+        (
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "-webkit-box".to_string(),
+        ),
+        (
+            "--w3cos-internal-webkit-box-orient".to_string(),
+            "vertical".to_string(),
+        ),
+        (
+            "--w3cos-internal-webkit-line-clamp".to_string(),
+            "5".to_string(),
+        ),
+    ]));
+    let child = Style {
+        height: Dimension::Px(30.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(boxed, vec![node(child, vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 200.0, 30.0));
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 200.0, 30.0));
+}
+
+/// A column item's automatic minimum counts adjacent inline text nodes as one
+/// line, so `XXX` followed by a whitespace text node does not double the
+/// nested column's height (flex-direction-column-overlap-001).
+#[test]
+fn column_item_min_content_counts_adjacent_text_nodes_as_one_line() {
+    use w3cos_std::style::FlexDirection;
+    let txt = |s: &str| {
+        Component::text(
+            s,
+            Style {
+                display: Display::Inline,
+                font_size: 18.0,
+                font_family: Some("serif".into()),
+                ..Style::default()
+            },
+        )
+    };
+    let mk = |st: Style| {
+        with_markers(
+            st,
+            &[("--w3cos-internal-inline-formatting-context", "true")],
+        )
+    };
+    let col = || Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        font_size: 18.0,
+        ..block()
+    };
+    let flex = Style {
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        flex_basis: Dimension::Percent(0.0),
+        min_height: Dimension::Px(0.0),
+        font_size: 18.0,
+        ..block()
+    };
+    let inner = node(
+        col(),
+        vec![
+            node(mk(flex), vec![txt("XXX"), txt(" ")]),
+            node(mk(block()), vec![txt("YYY")]),
+        ],
+    );
+    let root = node(block(), vec![node(col(), vec![inner])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert!((rect(&ng, 3).3 - 21.6).abs() < 0.1, "{:?}", rect(&ng, 3));
+    assert!((rect(&ng, 2).3 - 43.2).abs() < 0.2, "{:?}", rect(&ng, 2));
+}

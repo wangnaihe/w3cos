@@ -105,6 +105,11 @@ pub(crate) struct ConstraintSpace {
     /// which floats were placed while our BFC block offset is still
     /// unresolved (the margin strut that started at `margin_base`).
     pub adjoining_from: usize,
+    /// Blink's `IsFixedBlockSizeIndefinite`: the box is laid out at a
+    /// fixed block size (a column flex item's flexed main size) that is
+    /// not definite for its children's percentages, because the flex
+    /// container's main size is indefinite (css-flexbox "definite sizes").
+    pub fixed_block_indefinite: bool,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.
