@@ -211,7 +211,33 @@ fn paints_nothing(style: &Style) -> bool {
         && style.text_decoration == w3cos_std::style::TextDecoration::None
 }
 
+/// A spacing LayoutNG's inline items can read without a percentage basis.
+fn basis_free_spacing(s: w3cos_std::style::Spacing) -> bool {
+    use w3cos_std::style::Spacing;
+    match s {
+        Spacing::Percent(p) => p == 0.0,
+        Spacing::Calc { percent, .. } | Spacing::PaddingCalc { percent, .. } => percent == 0.0,
+        _ => true,
+    }
+}
+
 fn zero_edges(style: &Style) -> bool {
+    // A percentage edge needs the containing block's width, which inline
+    // items do not carry; it is not zero, and inline_edges_supported
+    // sends it to legacy.
+    if ![
+        style.padding.top,
+        style.padding.right,
+        style.padding.bottom,
+        style.padding.left,
+        style.margin.left,
+        style.margin.right,
+    ]
+    .into_iter()
+    .all(basis_free_spacing)
+    {
+        return false;
+    }
     let padding = style.padding_lengths();
     let margin = style.margin_lengths();
     [padding.top, padding.right, padding.bottom, padding.left]
@@ -566,7 +592,10 @@ pub(super) fn block_text_content_reason(content: &str, style: &Style) -> Option<
 /// at inline box boundaries; forced breaks inside are left to legacy.
 fn inline_edges_supported(content: &str, style: &Style) -> bool {
     use w3cos_std::style::Spacing;
-    let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
+    let absolute = |s: Spacing| {
+        matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_))
+            || matches!(s, Spacing::Calc { percent, .. } | Spacing::PaddingCalc { percent, .. } if percent == 0.0)
+    };
     let m = style.margin_lengths();
     let edges = InlineEdges::of(style);
     [
@@ -944,7 +973,10 @@ fn inline_box_reason(
     ) {
         return Some("vertical-align-text-edge-box");
     }
-    let absolute = |s: Spacing| matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_));
+    let absolute = |s: Spacing| {
+        matches!(s, Spacing::Px(_) | Spacing::Em(_) | Spacing::Rem(_))
+            || matches!(s, Spacing::Calc { percent, .. } | Spacing::PaddingCalc { percent, .. } if percent == 0.0)
+    };
     let m = style.margin_lengths();
     if ![
         style.padding.top,

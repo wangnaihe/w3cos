@@ -3844,7 +3844,7 @@ fn for_each_cb_child(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usiz
 /// `ignore_top` / `ignore_bottom`: the container has no top (bottom)
 /// border or padding and is not a BFC root, so the child's block margin
 /// on that side does not take part in the block size.
-fn stretch_child_styles(
+pub(super) fn stretch_child_styles(
     flat: &[FlatNodeInfo],
     index: usize,
     cb: &ConstraintSpace,
@@ -3935,7 +3935,7 @@ fn stretch_child_styles(
 }
 
 /// `flat` with the styles of `patched` boxes replaced.
-fn flat_with_styles<'a>(
+pub(super) fn flat_with_styles<'a>(
     flat: &'a [FlatNodeInfo<'a>],
     patched: &'a [(usize, Style)],
 ) -> Vec<FlatNodeInfo<'a>> {
@@ -4211,6 +4211,11 @@ fn layout_block_in(
         !bfc_root && bt == 0.0 && pt == 0.0,
         !bfc_root && bb == 0.0 && pb == 0.0,
     );
+    let orig_flat = flat;
+    let mut container_has_float = false;
+    for_each_cb_child(flat, index, &mut |child| {
+        container_has_float |= flat[child].style.float != Float::None;
+    });
     let stretched_flat;
     let flat = if stretch_styles.is_empty() {
         flat
@@ -4683,7 +4688,18 @@ fn layout_block_in(
             (resolved, cleared) = (again, c);
         }
         let mut x = x;
-        if is_bfc_root(child_info.style) && !exclusions.is_empty() {
+        // A BFC root whose inline `stretch` was left unresolved because a
+        // float in this container may take part of the line (see
+        // stretch_child_styles): its width comes from the opportunity.
+        let stretch_tokens = marker(child_info.style, STRETCH).filter(|tokens| {
+            container_has_float
+                && child_info.style.float == Float::None
+                && is_bfc_root(child_info.style)
+                && tokens
+                    .split(',')
+                    .any(|t| matches!(t, "w" | "minw" | "maxw"))
+        });
+        if (is_bfc_root(child_info.style) && !exclusions.is_empty()) || stretch_tokens.is_some() {
             // NGBlockLayoutAlgorithm::HandleNewFormattingContext: the BFC
             // root's border box goes into the first layout opportunity at
             // or below its position where it fits for its whole height.
@@ -4738,7 +4754,32 @@ fn layout_block_in(
                     let narrowed = l.is_some() || r.is_some();
                     let start = l.map_or(line_start, |l| l.max(line_start));
                     let end = r.map_or(line_end, |r| r.min(line_end));
-                    let content = if style.width == Dimension::Auto {
+                    let opportunity = (end - start - edges).max(0.0);
+                    let content = if let Some(tokens) = stretch_tokens {
+                        let orig = orig_flat[child].style;
+                        let has = |t: &str| tokens.split(',').any(|x| x == t);
+                        let mut c = if has("w") {
+                            clamp_inline(orig, &child_space, edges, opportunity)
+                        } else {
+                            match orig.width {
+                                Dimension::Auto => {
+                                    clamp_inline(orig, &child_space, edges, opportunity)
+                                }
+                                Dimension::Px(w) => match orig.box_sizing {
+                                    BoxSizing::BorderBox => (w - edges).max(0.0),
+                                    BoxSizing::ContentBox => w,
+                                },
+                                _ => return super::bail("stretch-bfc-width"),
+                            }
+                        };
+                        if has("minw") {
+                            c = c.max(opportunity);
+                        }
+                        if has("maxw") {
+                            c = c.min(opportunity);
+                        }
+                        c
+                    } else if style.width == Dimension::Auto {
                         clamp_inline(style, &child_space, edges, (end - start - edges).max(0.0))
                     } else {
                         m.content_width

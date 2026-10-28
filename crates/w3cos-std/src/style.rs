@@ -1487,6 +1487,10 @@ impl Edges {
             used_box_spacing(match value {
                 Spacing::Em(value) => value * style.font_size,
                 Spacing::Ch(value) => value * style.ch_advance(),
+                // A calc() with a zero percentage does not depend on the
+                // percentage basis (inline-intrinsic-size-calc).
+                Spacing::Calc { percent, px } if percent == 0.0 => px,
+                Spacing::PaddingCalc { percent, px } if percent == 0.0 => px.max(0.0),
                 other => other.resolve(insets),
             })
         };

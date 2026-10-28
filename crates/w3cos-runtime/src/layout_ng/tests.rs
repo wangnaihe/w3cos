@@ -7398,11 +7398,11 @@ fn stretch_sizes_block_children_against_the_content_box() {
     assert_eq!(rect(&out, 1).2, 100.0);
 }
 
-/// Flex items do not resolve `stretch` (it stays auto, as before the
-/// keyword was parsed), and a flow-root box beside a float keeps its auto
-/// width, the space the float leaves.
+/// A flex item's `width: stretch` fills the container's content box, and a
+/// flow-root box beside a float stretches into the space the float leaves
+/// (also for `min-width` / `max-width`).
 #[test]
-fn stretch_is_not_resolved_for_flex_items_or_boxes_beside_floats() {
+fn stretch_sizes_flex_items_and_boxes_beside_floats() {
     let root = node(
         Style {
             display: Display::Flex,
@@ -7414,7 +7414,49 @@ fn stretch_is_not_resolved_for_flex_items_or_boxes_beside_floats() {
     );
     let flat = pre_flatten(&root);
     let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
-    assert_eq!(rect(&out, 1).2, 0.0);
+    assert_eq!(rect(&out, 1).2, 100.0);
+
+    let beside = |axes: &str, width: Dimension| {
+        node(
+            Style {
+                width: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![
+                node(
+                    Style {
+                        float: w3cos_std::style::Float::Left,
+                        width: Dimension::Px(100.0),
+                        height: Dimension::Px(10.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+                node(
+                    stretch(
+                        axes,
+                        Style {
+                            display: Display::FlowRoot,
+                            width,
+                            height: Dimension::Px(10.0),
+                            ..block()
+                        },
+                    ),
+                    vec![],
+                ),
+            ],
+        )
+    };
+    for (axes, width) in [
+        ("minw", Dimension::Px(0.0)),
+        ("maxw", Dimension::Px(1000.0)),
+        ("w", Dimension::Auto),
+    ] {
+        let root = beside(axes, width);
+        let flat = pre_flatten(&root);
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&out, 2), (100.0, 0.0, 100.0, 10.0), "{axes}");
+    }
 
     let root = node(
         Style {

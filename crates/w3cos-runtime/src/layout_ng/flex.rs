@@ -1649,6 +1649,22 @@ pub(super) fn layout(
     }
     .max(0.0);
 
+    // CSS Sizing 4 stretch-fit sizing: an item's `stretch` sizes resolve
+    // against this container's content box (as for block children).
+    let item_space = ConstraintSpace {
+        available_inline: inner_width,
+        percentage_block: specified_height,
+        ..*space
+    };
+    let stretch_styles = block::stretch_child_styles(flat, index, &item_space, false, false);
+    let stretched_flat;
+    let flat = if stretch_styles.is_empty() {
+        flat
+    } else {
+        stretched_flat = block::flat_with_styles(flat, &stretch_styles);
+        &stretched_flat[..]
+    };
+
     let mut items = Vec::new();
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
