@@ -401,7 +401,7 @@ fn component_rect_independent(component: &w3cos_std::Component) -> bool {
             style.padding.left,
         ]
         .into_iter()
-        .any(|edge| matches!(edge, Spacing::Percent(_)));
+        .any(|edge| matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. }));
         let background_image = style.background_image.as_deref().is_some_and(|value| {
             value.split(',').any(|layer| {
                 let layer = layer.trim();

@@ -84,16 +84,24 @@ fn spacing_px(style: &Style, spacing: Spacing, cb: f32, space: &ConstraintSpace)
     }
 }
 
-fn percent_block(style: &Style) -> bool {
+/// A percentage `height` resolves against the item's grid area once the
+/// rows are sized; it is auto for track sizing (css-grid-1 6.2 / Blink
+/// grid layout algorithm).
+fn percent_height(style: &Style) -> bool {
     matches!(style.height, Dimension::Percent(_) | Dimension::Calc { .. })
-        || matches!(
-            style.min_height,
-            Dimension::Percent(_) | Dimension::Calc { .. }
-        )
-        || matches!(
-            style.max_height,
-            Dimension::Percent(_) | Dimension::Calc { .. }
-        )
+        && !has_marker(style, HEIGHT_KEYWORD)
+}
+
+/// A percentage `min-height` / `max-height` still bails: its area-relative
+/// clamp is not modelled.
+fn percent_block(style: &Style) -> bool {
+    matches!(
+        style.min_height,
+        Dimension::Percent(_) | Dimension::Calc { .. }
+    ) || matches!(
+        style.max_height,
+        Dimension::Percent(_) | Dimension::Calc { .. }
+    )
 }
 
 fn inset_set(style: &Style) -> bool {
@@ -3211,6 +3219,8 @@ struct Item {
     auto_margin: [bool; 4],
     edges_v: f32,
     stretch_block: bool,
+    /// A percentage `height`: laid out again against the grid area.
+    percent_h: bool,
     specified_content_h: Option<f32>,
     inline_pack: Pack,
     block_pack: Pack,
@@ -3223,8 +3233,10 @@ fn layout_item(
     area: f32,
     content_width: f32,
     content_height: Option<f32>,
+    percentage_block: Option<f32>,
 ) -> Option<LayoutResult> {
     let mut nested = *space;
+    nested.percentage_block = percentage_block;
     nested.available_inline = area;
     nested.rtl = false;
     nested.bfc_x = 0.0;
@@ -4280,7 +4292,8 @@ fn layout_impl(
         let content_width = block::clamp_inline_size(child_style, &item_space, edges_h, raw)
             .max(keyword_floor)
             .max(0.0);
-        let specified_content_h = if has_marker(child_style, HEIGHT_KEYWORD) {
+        let percent_h = percent_height(child_style);
+        let specified_content_h = if has_marker(child_style, HEIGHT_KEYWORD) || percent_h {
             None
         } else {
             resolve_block(child_style.height, None, child_style, space, edges_v)
@@ -4288,6 +4301,7 @@ fn layout_impl(
         };
         let stretch_block = align == Pack::Stretch
             && specified_content_h.is_none()
+            && !percent_h
             && !has_marker(child_style, HEIGHT_KEYWORD)
             && !auto_margin[0]
             && !auto_margin[2];
@@ -4303,6 +4317,7 @@ fn layout_impl(
             auto_margin,
             edges_v,
             stretch_block,
+            percent_h,
             specified_content_h,
             inline_pack: justify,
             block_pack: align,
@@ -4345,6 +4360,11 @@ fn layout_impl(
             }),
             item.content_width,
             item.specified_content_h,
+            if item.percent_h {
+                None
+            } else {
+                space.percentage_block
+            },
         )?;
         if let Some(content) = take_content_rows(item.index) {
             if content.len() != item.row_span {
@@ -4563,8 +4583,39 @@ fn layout_impl(
                 }),
                 item.content_width,
                 Some(from_units(target_content)),
+                space.percentage_block,
             )?;
         }
+    }
+    // A percentage height resolves against the grid area, whose height is
+    // the sum of the spanned rows and gaps.
+    for (item, fragment) in built.iter().zip(fragments.iter_mut()) {
+        if !item.percent_h || rows.is_empty() {
+            continue;
+        }
+        let area_block = from_units(span_sum(
+            &rows,
+            &row_collapsed,
+            item.row,
+            item.row_span,
+            row_gap_u,
+        ));
+        *fragment = layout_item(
+            flat,
+            item.index,
+            space,
+            inline_of(&Placed {
+                index: item.index,
+                col: item.col,
+                row: item.row,
+                col_span: item.col_span,
+                row_span: item.row_span,
+                source: item.source,
+            }),
+            item.content_width,
+            None,
+            Some(area_block),
+        )?;
     }
 
     let row_sum: i64 = rows.iter().sum();
@@ -5912,6 +5963,33 @@ mod tests {
                 (2, [0.0, 30.0, 20.0, 30.0]),
                 (3, [20.0, 0.0, 20.0, 30.0]),
                 (4, [20.0, 30.0, 20.0, 30.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn percentage_height_items_resolve_against_the_grid_area() {
+        // `height: 100%` is auto for track sizing and the 55px / 66px row
+        // (plus the 5px gap for a two-row span) afterwards.
+        let mut style = grid_style(200.0, None, Some("77px 88px"));
+        style.grid_ng_mut().grid_template_rows = Some("55px 66px".to_string());
+        style.row_gap = Some(5.0);
+        let tall = || {
+            leaf(Style {
+                height: Dimension::Percent(100.0),
+                ..block_box(None, None)
+            })
+        };
+        let half = leaf(Style {
+            height: Dimension::Percent(50.0),
+            ..block_box(None, None)
+        });
+        expect(
+            &Component::boxed(style, vec![tall(), tall(), half]),
+            &[
+                (1, [0.0, 0.0, 77.0, 55.0]),
+                (2, [77.0, 0.0, 88.0, 55.0]),
+                (3, [0.0, 60.0, 77.0, 33.0]),
             ],
         );
     }

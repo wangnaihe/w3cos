@@ -7507,3 +7507,33 @@ fn stretch_fills_an_absolute_box_between_insets() {
     assert_eq!(rect(&out, 4).2, 50.0);
     assert_eq!(rect(&out, 6).2, 45.0);
 }
+
+/// A mixed `calc()` padding resolves its percentage against the containing
+/// block's width and floors at zero (css-sizing/dynamic-change-inline-size,
+/// css-tables/tentative/padding-percentage).
+#[test]
+fn calc_padding_resolves_percent_and_floors_at_zero() {
+    let mut padded = block();
+    padded.padding.left = Spacing::PaddingCalc {
+        percent: 25.0,
+        px: 10.0,
+    };
+    padded.padding.top = Spacing::PaddingCalc {
+        percent: -50.0,
+        px: 100.0,
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![node(padded, vec![node(sized(20.0), vec![])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (x, y, w, _) = rect(&ng, 2);
+    assert_eq!(x, 110.0, "25% of 400 + 10");
+    assert_eq!(y, 0.0, "100 - 200 floors at zero");
+    assert_eq!(w, 290.0);
+}

@@ -1361,6 +1361,13 @@ pub enum Spacing {
         percent: f32,
         px: f32,
     },
+    /// `calc(P% + Xpx)` on a padding side: the same sum, floored at zero
+    /// (padding cannot be negative). Only LayoutNG resolves it; legacy
+    /// layout reads it as zero, as it did when the declaration was dropped.
+    PaddingCalc {
+        percent: f32,
+        px: f32,
+    },
     /// `env(keyboard-inset-height)` — virtual keyboard occlusion (logical px).
     KeyboardInsetHeight,
     /// `calc(Npx + env(...))` — one optional `safe-area` and/or `keyboard-inset` term.
@@ -1381,7 +1388,10 @@ impl Spacing {
     pub fn resolve_env(&self, insets: &SafeAreaInsets, keyboard_bottom: f32) -> f32 {
         match self {
             Spacing::Px(v) => *v,
-            Spacing::Percent(_) | Spacing::Calc { .. } | Spacing::Auto => 0.0,
+            Spacing::Percent(_)
+            | Spacing::Calc { .. }
+            | Spacing::PaddingCalc { .. }
+            | Spacing::Auto => 0.0,
             Spacing::Rem(v) => *v * 16.0,
             Spacing::Em(v) => *v * 16.0,
             Spacing::Ch(v) => *v * 8.0,

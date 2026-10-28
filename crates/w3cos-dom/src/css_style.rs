@@ -2466,6 +2466,9 @@ fn apply_background_shorthand(style: &mut Style, value: &str) {
 
 fn parse_padding_spacing(value: &str) -> Option<Spacing> {
     let value = value.trim();
+    if let Some(calc) = parse_padding_calc(value) {
+        return Some(calc);
+    }
     let environments = [
         ("env(safe-area-inset-top)", SafeAreaEdge::Top),
         ("env(safe-area-inset-right)", SafeAreaEdge::Right),
@@ -3445,6 +3448,18 @@ fn parse_margin_calc(value: &str) -> Option<Spacing> {
         (false, _) => Spacing::Px(px),
         (true, false) => Spacing::Percent(percent),
         (true, true) => Spacing::Calc { percent, px },
+    })
+}
+
+/// A padding `calc()` of absolute lengths and one percentage. Padding
+/// cannot be negative, so a pure length or percentage is floored at zero
+/// here and a mix keeps its sum for LayoutNG to floor once the basis is known.
+fn parse_padding_calc(value: &str) -> Option<Spacing> {
+    let (percent, px, has_percent, has_px) = parse_calc_length(value)?;
+    Some(match (has_percent, has_px) {
+        (false, _) => Spacing::Px(px.max(0.0)),
+        (true, false) => Spacing::Percent(percent.max(0.0)),
+        (true, true) => Spacing::PaddingCalc { percent, px },
     })
 }
 
@@ -5601,6 +5616,43 @@ mod font_shorthand_tests {
             Spacing::Calc {
                 percent: 5.0,
                 px: 10.0
+            }
+        );
+    }
+
+    /// Padding keeps a mixed `calc()` (floored at zero once resolved) and
+    /// floors a pure length or percentage straight away.
+    #[test]
+    fn padding_calc_parses_percent_and_px() {
+        use w3cos_std::style::Spacing;
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("padding-left", "calc(25% + 10px)");
+        declaration.set_property("padding-top", "calc(100px - 50%)");
+        declaration.set_property("padding-right", "calc(5px - 20px)");
+        declaration.set_property("padding-bottom", "calc(10% * 2)");
+        let style = declaration.inner.clone();
+        assert_eq!(
+            style.padding.left,
+            Spacing::PaddingCalc {
+                percent: 25.0,
+                px: 10.0
+            }
+        );
+        assert_eq!(
+            style.padding.top,
+            Spacing::PaddingCalc {
+                percent: -50.0,
+                px: 100.0
+            }
+        );
+        assert_eq!(style.padding.right, Spacing::Px(0.0));
+        assert_eq!(style.padding.bottom, Spacing::Percent(20.0));
+        declaration.set_property("padding", "calc(10% + 5px) 0");
+        assert_eq!(
+            declaration.inner.padding.bottom,
+            Spacing::PaddingCalc {
+                percent: 10.0,
+                px: 5.0
             }
         );
     }

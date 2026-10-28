@@ -33,8 +33,9 @@ fn supported_spacing(s: Spacing, allow_auto: bool) -> bool {
         | Spacing::Ch(_)
         | Spacing::Vw(_)
         | Spacing::Vh(_) => true,
-        // Padding is parsed without calc, so only margins reach this.
+        // A margin calc() may be negative; padding has its own variant.
         Spacing::Calc { .. } => allow_auto,
+        Spacing::PaddingCalc { .. } => !allow_auto,
         Spacing::Auto => allow_auto,
         // env() insets depend on host state the legacy path owns.
         _ => false,
@@ -2608,7 +2609,12 @@ pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
 /// percentages): such subtrees stay on legacy.
 fn percent_inline(style: &Style) -> bool {
     let dim = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
-    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
+    let spacing = |s: Spacing| {
+        matches!(
+            s,
+            Spacing::Percent(_) | Spacing::Calc { .. } | Spacing::PaddingCalc { .. }
+        )
+    };
     dim(style.width)
         || dim(style.min_width)
         || dim(style.max_width)
@@ -2632,7 +2638,12 @@ fn compressible_replaced_content(
 ) -> Option<Option<MinMax>> {
     let style = flat[child].style;
     let pct = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
-    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
+    let spacing = |s: Spacing| {
+        matches!(
+            s,
+            Spacing::Percent(_) | Spacing::Calc { .. } | Spacing::PaddingCalc { .. }
+        )
+    };
     let applies = is_replaced(flat[child].kind)
         && (pct(style.width) || pct(style.max_width))
         && !pct(style.min_width)
@@ -2678,7 +2689,12 @@ fn box_percent_inline(flat: &[FlatNodeInfo], node: usize) -> bool {
         return false;
     }
     if style.display == Display::Inline && !inline::is_atomic_inline(flat, node) {
-        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
+        let spacing = |s: Spacing| {
+            matches!(
+                s,
+                Spacing::Percent(_) | Spacing::Calc { .. } | Spacing::PaddingCalc { .. }
+            )
+        };
         return spacing(style.margin.left)
             || spacing(style.margin.right)
             || spacing(style.padding.left)
@@ -2721,7 +2737,12 @@ fn flex_percent_below(flat: &[FlatNodeInfo], index: usize) -> bool {
             return false;
         }
         let dim = |d: Dimension| matches!(d, Dimension::Percent(_) | Dimension::Calc { .. });
-        let spacing = |s: Spacing| matches!(s, Spacing::Percent(_) | Spacing::Calc { .. });
+        let spacing = |s: Spacing| {
+            matches!(
+                s,
+                Spacing::Percent(_) | Spacing::Calc { .. } | Spacing::PaddingCalc { .. }
+            )
+        };
         dim(style.width)
             || dim(style.min_width)
             || dim(style.max_width)

@@ -577,7 +577,9 @@ fn spacing_css(s: Spacing) -> String {
         Spacing::Vw(v) => format!("{v}vw"),
         Spacing::Vh(v) => format!("{v}vh"),
         Spacing::Auto => "auto".to_string(),
-        Spacing::Calc { percent, px } => format!("calc({percent}% + {px}px)"),
+        Spacing::Calc { percent, px } | Spacing::PaddingCalc { percent, px } => {
+            format!("calc({percent}% + {px}px)")
+        }
         Spacing::SafeAreaInset(SafeAreaEdge::Top) => "env(safe-area-inset-top)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Right) => "env(safe-area-inset-right)".to_string(),
         Spacing::SafeAreaInset(SafeAreaEdge::Bottom) => "env(safe-area-inset-bottom)".to_string(),

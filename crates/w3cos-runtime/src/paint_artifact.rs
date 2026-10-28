@@ -2441,7 +2441,7 @@ impl PaintArtifact {
                 node.style.padding.left,
             ]
             .into_iter()
-            .any(|edge| matches!(edge, Spacing::Percent(_)));
+            .any(|edge| matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. }));
         }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
@@ -2491,8 +2491,14 @@ impl PaintArtifact {
                     &mut style.padding.bottom,
                     &mut style.padding.left,
                 ] {
-                    if let Spacing::Percent(percent) = *edge {
-                        *edge = Spacing::Px(basis * percent / 100.0);
+                    match *edge {
+                        Spacing::Percent(percent) => {
+                            *edge = Spacing::Px(basis * percent / 100.0);
+                        }
+                        Spacing::PaddingCalc { percent, px } => {
+                            *edge = Spacing::Px((basis * percent / 100.0 + px).max(0.0));
+                        }
+                        _ => {}
                     }
                 }
                 child_bases[index] = if matches!(style.display, Display::Inline | Display::Contents)

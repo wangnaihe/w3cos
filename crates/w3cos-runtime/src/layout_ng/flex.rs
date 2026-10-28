@@ -551,7 +551,7 @@ pub(super) fn container_min_max_at(
             Some(size) => {
                 if [style.padding.top, style.padding.bottom]
                     .iter()
-                    .any(|side| matches!(side, Spacing::Percent(_)))
+                    .any(|side| matches!(side, Spacing::Percent(_) | Spacing::PaddingCalc { .. }))
                 {
                     return super::bail("flex:intrinsic-percent-padding");
                 }

@@ -3975,6 +3975,11 @@ pub(crate) fn resolve_spacing_for_layout(
         WSpacing::Calc { percent, px } => {
             percentage_spacing_for_layout(percentage_basis, percent) + px
         }
+        // A padding `calc()` is floored at zero (CSS Box 3: negative
+        // padding is invalid, so a used negative sum clamps).
+        WSpacing::PaddingCalc { percent, px } => {
+            (percentage_spacing_for_layout(percentage_basis, percent) + px).max(0.0)
+        }
         WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
         WSpacing::Em(value) => value * font_style.font_size,
         WSpacing::Ch(value) => value * font_style.ch_advance(),
@@ -26533,6 +26538,8 @@ fn to_taffy_spacing(
 ) -> LengthPercentage {
     match spacing {
         WSpacing::Percent(v) => LengthPercentage::percent(v / 100.0),
+        // Legacy keeps reading a mixed calc() padding as zero.
+        WSpacing::PaddingCalc { .. } => LengthPercentage::length(0.0),
         other => LengthPercentage::length(resolve_spacing_for_layout(
             other, 0.0, font_style, viewport_w, viewport_h,
         )),
