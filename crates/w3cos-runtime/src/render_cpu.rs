@@ -1819,10 +1819,27 @@ fn draw_rect(
                     clip_mask,
                 );
             }
+        } else if sk_rect.left().fract() != 0.0 && sk_rect.right().fract() != 0.0 {
+            // tiny-skia's anti-aliased rect scan converter debug-asserts when
+            // both horizontal edges are fractional and the rect covers no whole
+            // pixel column (e.g. x = 0.5..1.2). Filling the equivalent path
+            // gives the same coverage without that assertion.
+            fill_rect_as_path(pixmap, sk_rect, &paint, clip_mask);
         } else {
             pixmap.fill_rect(sk_rect, &paint, Transform::identity(), clip_mask);
         }
     }
+}
+
+fn fill_rect_as_path(pixmap: &mut Pixmap, rect: Rect, paint: &Paint, clip_mask: Option<&Mask>) {
+    let path = PathBuilder::from_rect(rect);
+    pixmap.fill_path(
+        &path,
+        paint,
+        FillRule::Winding,
+        Transform::identity(),
+        clip_mask,
+    );
 }
 
 fn draw_border(
@@ -3711,5 +3728,20 @@ mod font_cjk_tests {
             !super::rects_intersect(super::paint_influence_bounds(filter_rect, &filtered), clip),
             "the filter box itself is outside the clip; the escape check keeps it"
         );
+    }
+
+    #[test]
+    fn fractional_rect_spanning_two_partial_pixels_does_not_trip_tiny_skia() {
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        let rect = LayoutRect {
+            x: 0.5,
+            y: 2.0,
+            width: 0.7,
+            height: 3.0,
+        };
+        super::draw_rect(&mut pixmap, rect, Color::rgb(255, 0, 0), 0.0, None);
+        assert!(pixmap.pixel(0, 3).unwrap().red() > 0);
+        assert!(pixmap.pixel(1, 3).unwrap().red() > 0);
+        assert_eq!(pixmap.pixel(2, 3).unwrap().red(), 0);
     }
 }
