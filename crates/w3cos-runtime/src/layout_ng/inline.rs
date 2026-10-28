@@ -57,6 +57,21 @@ pub(super) const ANONYMOUS_BLOCK_MARKER: &str = "--w3cos-internal-anonymous-bloc
 const QUIRKS_MARKER: &str = "--w3cos-internal-quirks-mode";
 /// A `<br>` the cascade keeps as its own leaf (Blink NGInlineItem kControl).
 const FORCED_BREAK: &str = "\u{2028}";
+/// Line count of a `-webkit-line-clamp` box (`block::webkit_box_styles`
+/// sets it on the block-flow `-webkit-box` it lays out).
+pub(super) const CLAMP_MARKER: &str = "--w3cos-internal-clamp-lines";
+
+fn clamp_lines(style: &Style) -> Option<usize> {
+    marker_value(style, CLAMP_MARKER)?.parse().ok()
+}
+
+fn marker_value<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
+    style
+        .custom_properties
+        .as_ref()?
+        .get(key)
+        .map(String::as_str)
+}
 /// The cascade's UAX #9 pass (reorder_explicit_bidi_*) replaces a bidi
 /// paragraph's text by visual-order fragments: ltr, already reversed and
 /// mirrored, ordered for the lines it estimated.
@@ -1993,6 +2008,9 @@ fn layout_lines(
         };
         let (height, single, ascent, y, rect_height) =
             paragraph_box(content, available, style, container, quirks);
+        if !single && clamp_lines(container).is_some() {
+            return super::bail("clamp-paragraph");
+        }
         if floats.is_some_and(|f| {
             f.exclusions
                 .overlaps(f.x, f.y, f.x + available, f.y + height)
@@ -2016,6 +2034,7 @@ fn layout_lines(
                 BoxFragment {
                     index: child,
                     text_range: None,
+                    ellipsis: false,
                     width: available,
                     height: rect_height,
                     children: Vec::new(),
@@ -2050,7 +2069,51 @@ fn layout_lines(
         let (line, baseline) = text_line_metrics(content, style);
         let ascent = strut_ascent.max(baseline);
         let single = ascent + strut_descent.max(line - baseline);
-        let lines = content.split('\n').count() as f32;
+        let line_count = content.split('\n').count();
+        if let Some(n) = clamp_lines(container).filter(|&n| n < line_count) {
+            // `-webkit-line-clamp`: one piece per kept line, the last one
+            // followed by the block ellipsis.
+            if floats.is_some() || style.white_space != WhiteSpace::Pre {
+                return super::bail("clamp-text");
+            }
+            let ellipsis = text_intrinsic_size("\u{2026}", style).0;
+            let top = ascent - inline_font_content_ascent(style);
+            let mut pieces = Vec::with_capacity(n);
+            let mut widest = 0.0f32;
+            let mut start = 0;
+            for (k, text) in content.split('\n').take(n).enumerate() {
+                let last = k + 1 == n;
+                let mut width = text_intrinsic_size(text, style).0;
+                if last {
+                    width += ellipsis;
+                    if width > available + EPSILON {
+                        return super::bail("clamp-ellipsis");
+                    }
+                }
+                widest = widest.max(width);
+                pieces.push((
+                    align_offset(container, available - width),
+                    top + k as f32 * single,
+                    BoxFragment {
+                        index: child,
+                        text_range: Some((start, start + text.len())),
+                        ellipsis: last,
+                        width,
+                        height: inline_font_height(style),
+                        children: Vec::new(),
+                    },
+                ));
+                start += text.len() + 1;
+            }
+            return Some(InlineResult {
+                height: single * n as f32,
+                max_line_width: widest,
+                last_baseline: LastBaseline::At(ascent + single * (n - 1) as f32),
+                first_baseline: LastBaseline::At(ascent),
+                children: pieces,
+            });
+        }
+        let lines = line_count as f32;
         if floats.is_some_and(|f| {
             f.exclusions
                 .overlaps(f.x, f.y, f.x + available, f.y + single * lines)
@@ -2068,6 +2131,7 @@ fn layout_lines(
                 BoxFragment {
                     index: child,
                     text_range: None,
+                    ellipsis: false,
                     width,
                     height: inline_font_height(style),
                     children: Vec::new(),
@@ -2678,6 +2742,48 @@ fn layout_lines(
         });
     }
 
+    // `-webkit-line-clamp`: keep the first N lines; the last kept line's final
+    // text item takes the ellipsis.  Items on dropped lines keep empty
+    // placeholder rects (the engine lays out every node).
+    let mut dropped: Vec<usize> = Vec::new();
+    let mut ellipsis_item = None;
+    let mut ellipsis_width = 0.0f32;
+    if let Some(n) = clamp_lines(container).filter(|&n| n < built.len()) {
+        if floats.is_some() || has_boxes || reorder || preserve || !can_wrap {
+            return super::bail("clamp-ifc");
+        }
+        dropped = built[n..]
+            .iter()
+            .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+            .collect();
+        built.truncate(n);
+        let last = &built[n - 1];
+        let k = last
+            .items
+            .iter()
+            .rev()
+            .map(|&(k, ..)| k)
+            .find(|&k| !items[k].forced)
+            .why("clamp-ifc")?;
+        let item = &items[k];
+        let ComponentKind::Text { content } = flat[item.index].kind else {
+            return super::bail("clamp-ifc");
+        };
+        // Paint draws a piece verbatim: single spaces between words only.
+        if item.atomic.is_some()
+            || !zero_edges(flat[item.index].style)
+            || content.contains(|c: char| c.is_whitespace() && c != ' ')
+            || content.contains("  ")
+            || (item.range.is_none() && (item.starts_space || item.ends_space))
+        {
+            return super::bail("clamp-ifc");
+        }
+        ellipsis_width = text_intrinsic_size("\u{2026}", flat[item.index].style).0;
+        if last.width + ellipsis_width > last.available + EPSILON {
+            return super::bail("clamp-ellipsis");
+        }
+        ellipsis_item = Some(k);
+    }
     let mut top = 0.0f32;
     let mut first_line_baseline = None;
     let mut last_line_baseline = None;
@@ -2730,6 +2836,7 @@ fn layout_lines(
                     BoxFragment {
                         index: item.index,
                         text_range: None,
+                        ellipsis: false,
                         width: available,
                         height: 0.0,
                         children: Vec::new(),
@@ -2755,19 +2862,45 @@ fn layout_lines(
             // The engine's rect is the item's border box: margins excluded,
             // block-axis padding/border around the font content box.
             let e = item.edges;
+            let clamped = ellipsis_item == Some(k);
             out.push((
                 offset + x + item.box_start + e.margin_start,
                 baseline - item.content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
-                    text_range: item.range,
-                    width: width - item.box_start - item.box_end - e.margin_start - e.margin_end,
+                    text_range: match (item.range, clamped, flat[item.index].kind) {
+                        (None, true, ComponentKind::Text { content }) => Some((0, content.len())),
+                        (range, ..) => range,
+                    },
+                    ellipsis: clamped,
+                    width: if clamped { ellipsis_width } else { 0.0 } + width
+                        - item.box_start
+                        - item.box_end
+                        - e.margin_start
+                        - e.margin_end,
                     height: item.font_height + e.top + e.bottom,
                     children: Vec::new(),
                 },
             ));
         }
         top += line.ascent + line.descent;
+    }
+    for k in dropped {
+        let index = items[k].index;
+        if out.iter().all(|(_, _, f)| f.index != index) {
+            out.push((
+                0.0,
+                top,
+                BoxFragment {
+                    index,
+                    text_range: (!items[k].forced).then_some((0, 0)),
+                    ellipsis: false,
+                    width: 0.0,
+                    height: 0.0,
+                    children: Vec::new(),
+                },
+            ));
+        }
     }
     // Inline box fragments (NGInlineBoxState::CreateBoxFragment): the border
     // box from the first to the last item's edges, block-axis padding and
@@ -2819,6 +2952,7 @@ fn layout_lines(
                         BoxFragment {
                             index: b,
                             text_range: None,
+                            ellipsis: false,
                             width: x1 - x0,
                             height: bottom_baseline - ascent + inline_font_height(style) - y0,
                             children: Vec::new(),
@@ -2834,6 +2968,7 @@ fn layout_lines(
                     BoxFragment {
                         index: b,
                         text_range: None,
+                        ellipsis: false,
                         width: end - start,
                         height: inline_font_height(style) + e.top + e.bottom,
                         children: Vec::new(),

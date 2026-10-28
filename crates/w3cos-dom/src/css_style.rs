@@ -118,6 +118,13 @@ fn update_percent_gap_values(style: &mut Style, row: Option<&str>, column: Optio
         );
     }
 }
+/// `-webkit-box-orient`: `vertical` (`block-axis`) or `horizontal`
+/// (`inline-axis`). Legacy keeps the `-webkit-box` row it already lays out;
+/// LayoutNG reads this for a block-flow `-webkit-box`.
+pub const WEBKIT_BOX_ORIENT_PROPERTY: &str = "--w3cos-internal-webkit-box-orient";
+/// `-webkit-line-clamp`: a positive line count. Legacy ignores it.
+/// (The standard `line-clamp` is not stored: NG does not model it.)
+pub const WEBKIT_LINE_CLAMP_PROPERTY: &str = "--w3cos-internal-webkit-line-clamp";
 
 fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>) {
     let current = style
@@ -527,6 +534,36 @@ impl CSSStyleDeclaration {
                     self.inner.flex_direction = direction;
                     self.inner.flex_wrap = wrap;
                     set_marker(&mut self.inner, UNRECOGNIZED_FLEX_WRAP_PROPERTY, None);
+                }
+            }
+            "-webkit-box-orient" | "webkit-box-orient" | "webkitBoxOrient" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                match keyword.as_str() {
+                    "vertical" | "block-axis" => set_marker(
+                        &mut self.inner,
+                        WEBKIT_BOX_ORIENT_PROPERTY,
+                        Some("vertical".into()),
+                    ),
+                    "horizontal" | "inline-axis" => set_marker(
+                        &mut self.inner,
+                        WEBKIT_BOX_ORIENT_PROPERTY,
+                        Some("horizontal".into()),
+                    ),
+                    _ if css_wide_keyword(&keyword) => {
+                        set_marker(&mut self.inner, WEBKIT_BOX_ORIENT_PROPERTY, None)
+                    }
+                    _ => {}
+                }
+            }
+            "-webkit-line-clamp" | "webkit-line-clamp" | "webkitLineClamp" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                let marker = match keyword.parse::<u32>() {
+                    Ok(lines) if lines > 0 => Some(Some(lines.to_string())),
+                    _ if keyword == "none" || css_wide_keyword(&keyword) => Some(None),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    set_marker(&mut self.inner, WEBKIT_LINE_CLAMP_PROPERTY, marker);
                 }
             }
             "flex-grow" | "flexGrow" => {
@@ -7525,6 +7562,50 @@ fn run_in_records_an_earlier_block() {
     declaration.set_property("display", "inline-grid");
     declaration.set_property("display", "run-in");
     assert!(!run_in_block(&declaration));
+}
+
+#[test]
+fn webkit_box_orient_and_line_clamp_keep_markers() {
+    let marker = |declaration: &CSSStyleDeclaration, key: &str| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(key))
+            .cloned()
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("-webkit-box-orient", "vertical");
+    declaration.set_property("-webkit-line-clamp", "3");
+    assert_eq!(
+        marker(&declaration, WEBKIT_BOX_ORIENT_PROPERTY).as_deref(),
+        Some("vertical")
+    );
+    assert_eq!(
+        marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY).as_deref(),
+        Some("3")
+    );
+    // Invalid values keep the declared one; `none` and `initial` clear it.
+    for invalid in ["0", "-5", "auto", "1 ~", "2.5"] {
+        declaration.set_property("-webkit-line-clamp", invalid);
+        assert_eq!(
+            marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY).as_deref(),
+            Some("3")
+        );
+    }
+    declaration.set_property("-webkit-box-orient", "inline-axis");
+    assert_eq!(
+        marker(&declaration, WEBKIT_BOX_ORIENT_PROPERTY).as_deref(),
+        Some("horizontal")
+    );
+    declaration.set_property("-webkit-line-clamp", "none");
+    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
+    declaration.set_property("-webkit-line-clamp", "2");
+    declaration.set_property("-webkit-line-clamp", "initial");
+    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
+    // The standard `line-clamp` is not modeled and leaves no marker.
+    declaration.set_property("line-clamp", "2");
+    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
 }
 
 #[test]

@@ -7064,3 +7064,115 @@ fn border_box_image_sizes_include_border_and_padding() {
     let (_, _, w, h) = rect(&ng, 2);
     assert_eq!((w, h), (60.0, 120.0));
 }
+
+/// `display: -webkit-box; -webkit-box-orient: vertical` lays out as a block
+/// flow root, and `-webkit-line-clamp: N` keeps its first N lines with an
+/// ellipsis on the last. Expected border boxes measured in headless Chrome
+/// (tools/layout-ng chrome-boxes, Ahem 20px/1, width 240px): the box is
+/// 40px (wrap, 2 of 3 lines), 60px (no clamp, clamp 3), 40px (pre, 2 of 4),
+/// 80px (pre, clamp 5 over 4 lines), 20px (pre, 1 of 2); the next block
+/// follows at the box's height.
+#[test]
+fn webkit_box_vertical_clamps_lines() {
+    use w3cos_std::style::{CustomProperties, WhiteSpace};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    // (content, pre, clamp, orient, Chrome height, kept pieces)
+    let cases: [(&str, bool, Option<&str>, &str, f32, &[&str]); 7] = [
+        (
+            "XXXX XXXX XXXX XXXX XXXX",
+            false,
+            Some("2"),
+            "vertical",
+            40.0,
+            &["XXXX XXXX ", "XXXX XXXX…"],
+        ),
+        (
+            "XXXX XXXX XXXX XXXX XXXX",
+            false,
+            None,
+            "vertical",
+            60.0,
+            &["XXXX XXXX ", "XXXX XXXX ", "XXXX"],
+        ),
+        (
+            "A\nB\nC\nD",
+            true,
+            Some("2"),
+            "vertical",
+            40.0,
+            &["A", "B…"],
+        ),
+        ("A\nB\nC\nD", true, Some("5"), "vertical", 80.0, &[]),
+        (
+            "XXXX XXXX XXXX XXXX XXXX",
+            false,
+            Some("3"),
+            "vertical",
+            60.0,
+            &["XXXX XXXX ", "XXXX XXXX ", "XXXX"],
+        ),
+        ("AA\nBB", true, Some("1"), "vertical", 20.0, &["AA…"]),
+        // A horizontal box is the flex row the engine already lays out.
+        ("XXXX XXXX", false, Some("1"), "horizontal", 20.0, &[]),
+    ];
+    for (n, (content, pre, clamp, orient, height, pieces)) in cases.into_iter().enumerate() {
+        let mut markers = vec![
+            (
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "-webkit-box".to_string(),
+            ),
+            (
+                "--w3cos-internal-webkit-box-orient".to_string(),
+                orient.to_string(),
+            ),
+        ];
+        if let Some(lines) = clamp {
+            markers.push((
+                "--w3cos-internal-webkit-line-clamp".to_string(),
+                lines.to_string(),
+            ));
+        }
+        let white_space = if pre {
+            WhiteSpace::Pre
+        } else {
+            WhiteSpace::Normal
+        };
+        let boxed = Style {
+            display: Display::Flex,
+            width: Dimension::Px(240.0),
+            white_space,
+            custom_properties: Some(CustomProperties::from_iter(markers)),
+            ..font.clone()
+        };
+        let text_style = Style {
+            display: Display::Inline,
+            white_space,
+            ..font.clone()
+        };
+        // 0 root, 1 box, 2 text, 3 next block.
+        let root = node(
+            block(),
+            vec![
+                node(boxed, vec![Component::text(content, text_style)]),
+                node(sized(10.0), vec![]),
+            ],
+        );
+        let flat = pre_flatten(&root);
+        let Some((rects, texts)) = layout_tree_with_text(&root, &flat, 800.0, 600.0) else {
+            // (The horizontal box keeps its flex-row rejection of text.)
+            assert_eq!(orient, "horizontal", "case {n}");
+            continue;
+        };
+        assert_eq!(rect(&rects, 1), (0.0, 0.0, 240.0, height), "case {n}");
+        assert_eq!(rect(&rects, 3), (0.0, height, 800.0, 10.0), "case {n}");
+        let got: Vec<&str> = texts.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(got, pieces, "case {n}");
+    }
+}

@@ -2184,6 +2184,7 @@ pub(super) fn layout(
             width: border_width,
             height: border_height,
             text_range: None,
+            ellipsis: false,
             children,
         },
         last_baseline: container_baseline,
@@ -2631,6 +2632,7 @@ fn layout_wrapped(
             width: border_width,
             height: border_height,
             text_range: None,
+            ellipsis: false,
             children,
         },
         // As in the single-line path, the first baseline is reported for

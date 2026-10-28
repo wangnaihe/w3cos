@@ -1468,6 +1468,7 @@ fn append_text_leaf_line(
             width: advance,
             height: font_height,
             text_range: Some((0, content.len())),
+            ellipsis: false,
             children: Vec::new(),
         },
     ));
@@ -2556,6 +2557,7 @@ pub(super) fn layout_with_block_size(
         BoxFragment {
             index,
             text_range: None,
+            ellipsis: false,
             width: rect.2,
             height: rect.3,
             children,
