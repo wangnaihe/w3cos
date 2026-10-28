@@ -25,11 +25,7 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 
-/// Hash map for the engine's own key tables: keys are script property names
-/// hashed on every lookup, so use the fast Fx hasher instead of SipHash. These
-/// tables are never exposed to attacker-chosen hasher state, and a collision
-/// only costs lookup time.
-type FastMap<K, V> = HashMap<K, V, rustc_hash::FxBuildHasher>;
+use crate::fast_hash::FastMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
