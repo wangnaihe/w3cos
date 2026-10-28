@@ -1302,7 +1302,7 @@ fn layout_cell_fragment(
     // line box, so paint would center the glyphs in the whole cell. An
     // inline child of a real cell is a line box; match that.
     if let ComponentKind::Text { content } = &flat[index].kind {
-        append_text_leaf_line(
+        let _ = append_text_leaf_line(
             &mut result,
             flat[index].style,
             content,
@@ -1315,24 +1315,24 @@ fn layout_cell_fragment(
 
 /// One font-content box for a single-line text-leaf cell, in the cell's
 /// border-box coordinates. Wrapped or bidi leaves stay unfragmented.
-fn append_text_leaf_line(
+pub(super) fn append_text_leaf_line(
     result: &mut LayoutResult,
     style: &Style,
     content: &str,
     content_width: f32,
     space: &ConstraintSpace,
-) {
+) -> bool {
     if content.is_empty()
         || style
             .custom_properties
             .as_ref()
             .is_some_and(|props| props.contains_key("--w3cos-internal-bidi-logical-order"))
     {
-        return;
+        return false;
     }
     let (_, baseline) = inline::block_text_layout(content, content_width.max(0.0), style);
     let LastBaseline::At(ascent) = baseline else {
-        return;
+        return false;
     };
     let content_ascent = crate::layout::inline_font_content_ascent(style);
     let font_height = crate::layout::inline_font_height(style);
@@ -1356,6 +1356,7 @@ fn append_text_leaf_line(
             children: Vec::new(),
         },
     ));
+    true
 }
 
 fn content_extent(fragment: &BoxFragment, border_bottom: f32, pad_bottom: f32) -> f32 {

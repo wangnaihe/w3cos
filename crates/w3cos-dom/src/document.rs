@@ -927,6 +927,33 @@ mod replaced_table_tests;
 #[path = "document/form_control_tests.rs"]
 mod form_control_tests;
 
+/// An authored `display: flex` host whose children are all text runs (a
+/// styled `inline-block` span folds into one).
+fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Component]) -> bool {
+    style.display == w3cos_std::style::Display::Flex
+        && children.iter().all(|child| {
+            matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                && matches!(
+                    child.style.display,
+                    w3cos_std::style::Display::Inline
+                        | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::None
+                )
+        })
+}
+
+/// Whether the opt-in LayoutNG engine is requested (`W3COS_LAYOUT_NG`, or
+/// its verify mode). Mirrors `layout_ng::mode()`; the DOM crate cannot see
+/// the runtime crate.
+fn layout_ng_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        ["W3COS_LAYOUT_NG", "W3COS_LAYOUT_NG_VERIFY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| value != "0"))
+    })
+}
+
 impl Document {
     /// The element's own inline style sets a transition.
     pub fn inline_declares_transition(&self, id: NodeId) -> bool {
@@ -9205,7 +9232,13 @@ impl Document {
                             child.style.display,
                             w3cos_std::style::Display::Inline | w3cos_std::style::Display::None
                         ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
-                    });
+                    })
+                    // LayoutNG (opt-in, `W3COS_LAYOUT_NG`) also lays out a
+                    // host whose children are all text runs (a styled
+                    // `inline-block` span folds into one) as real flex
+                    // items. The legacy engine keeps the wrapping row
+                    // lowering its results depend on, so this is NG-only.
+                    || (layout_ng_requested() && is_flex_host_of_text_runs(&style, &children));
                 if !authored_flex_of_plain_inlines
                     && (children.len() >= 2
                         || children.iter().any(|child| {
@@ -21201,9 +21234,12 @@ mod image_component_tests {
         let atomic = build("flex", "inline-block");
         assert_eq!(atomic.style.flex_wrap, FlexWrap::Wrap);
         assert_eq!(atomic.style.align_items, AlignItems::Baseline);
+        // LayoutNG's NG-only widening: the lowered text runs are text kind.
+        assert!(is_flex_host_of_text_runs(&atomic.style, &atomic.children));
         let block = build("block", "inline");
         assert_eq!(block.style.flex_wrap, FlexWrap::Wrap);
         assert_eq!(block.style.align_items, AlignItems::Baseline);
+        assert!(!is_flex_host_of_text_runs(&block.style, &block.children));
         crate::stylesheet::clear_rules();
     }
 

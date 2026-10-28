@@ -4258,11 +4258,13 @@ fn flex_text_items_match_chrome() {
     let flat = pre_flatten(&root);
     assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
 
-    // Text with half-leading paints without a line context (a pixel off an
-    // IFC's baseline), so it stays legacy as well.
+    // A text run paints from the top of its rect with no line context, so a
+    // single line carries the font-content-box fragment an IFC line would
+    // (half-leading above the glyphs): 20px Ahem in a 40px line sits at y=10.
     let normal = Style {
         line_height: 2.0,
-        ..item(font.clone())
+        display: Display::Inline,
+        ..font.clone()
     };
     let root = node(
         block(),
@@ -4272,5 +4274,20 @@ fn flex_text_items_match_chrome() {
         )],
     );
     let flat = pre_flatten(&root);
-    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+        .expect("a single-line text item lays out in NG");
+    check(&rects, &[(2, (0.0, 0.0, 40.0, 40.0))]);
+    let piece = texts
+        .iter()
+        .find(|piece| piece.index == 2)
+        .expect("text item has a line fragment");
+    assert_eq!(
+        (
+            piece.rect.x,
+            piece.rect.y,
+            piece.rect.width,
+            piece.rect.height
+        ),
+        (0.0, 10.0, 40.0, 20.0)
+    );
 }

@@ -163,16 +163,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("flex:text-item");
         }
-        // Paint centres a text leaf's glyphs in its rect with no enclosing
-        // line context, so the glyphs sit where an IFC's baseline puts them
-        // only when the line box is exactly the font box (no half-leading,
-        // no rounded or fractional font leading). Otherwise the leaf lands
-        // up to a pixel off and stays on the legacy engine.
-        if let w3cos_std::ComponentKind::Text { content } = flat[child].kind
-            && !super::inline::leaf_paints_like_ifc(content, flat[child].style)
-        {
-            return Some("flex:text-leading");
-        }
         if subtree_has_float(flat, child) {
             return Some("flex:float-descendant");
         }
@@ -913,7 +903,33 @@ fn layout_item(
     } else {
         (cross.why("flex:cross")?, main)
     };
-    block::layout_block_sized(flat, index, &nested, false, Some((width, height))).why("flex:item")
+    let mut laid = block::layout_block_sized(flat, index, &nested, false, Some((width, height)))
+        .why("flex:item")?;
+    // An anonymous text run paints its glyphs from the top of its rect (an
+    // inline leaf has no half-leading of its own), while an IFC places them
+    // on the line's baseline. Give a single-line run the font-content-box
+    // fragment its line box would have; a wrapped or bidi run that paint
+    // would misplace stays on the legacy engine.
+    if let w3cos_std::ComponentKind::Text { content } = flat[index].kind {
+        let style = flat[index].style;
+        if style.display == w3cos_std::style::Display::Inline {
+            let border = block::border_widths(style);
+            let pad = |spacing| spacing_px(style, spacing, 0.0, space);
+            let edges = border[1] + border[3] + pad(style.padding.left) + pad(style.padding.right);
+            let content_width = (laid.fragment.width - edges).max(0.0);
+            if !super::table::append_text_leaf_line(
+                &mut laid,
+                style,
+                content,
+                content_width,
+                &nested,
+            ) && !super::inline::leaf_paints_like_ifc(content, style)
+            {
+                return super::bail("flex:text-leading");
+            }
+        }
+    }
+    Some(laid)
 }
 
 /// Lay out one nowrap flex container. `sized` is the content box a float,
