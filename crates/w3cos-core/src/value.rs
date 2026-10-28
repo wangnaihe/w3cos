@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -615,12 +615,24 @@ impl Value {
     }
 }
 
+/// Elements decoded on first generic access (typed-array views, whose bytes
+/// are the source of truth): 1 byte of Uint8Array otherwise cost a 16-byte
+/// `Value` slot as well.
+struct LazyElements {
+    len: usize,
+    decode: Box<dyn FnOnce() -> Vec<Value>>,
+}
+
 /// Shared backing storage for [`Value::Array`].
 ///
 /// Construction remains centralized through [`Value::array`] so heap
 /// accounting cannot be bypassed.
 pub struct ArrayStorage {
-    values: Vec<Value>,
+    // `values` is empty while `lazy` is set; the first `Deref`/mutable access
+    // decodes it (no reference to the empty vector can outlive that point,
+    // every borrower goes through `vec`/`vec_mut`).
+    values: UnsafeCell<Vec<Value>>,
+    lazy: UnsafeCell<Option<Box<LazyElements>>>,
     allocation: HeapAllocation,
 }
 
@@ -634,7 +646,70 @@ impl ArrayStorage {
                     .saturating_mul(std::mem::size_of::<Value>()),
             ),
         );
-        Self { values, allocation }
+        Self {
+            values: UnsafeCell::new(values),
+            lazy: UnsafeCell::new(None),
+            allocation,
+        }
+    }
+
+    /// A storage of `len` elements produced by `decode` on first generic
+    /// access. `len()`/`is_empty()` do not trigger it.
+    pub fn new_lazy(len: usize, decode: impl FnOnce() -> Vec<Value> + 'static) -> Self {
+        let allocation = HeapAllocation::new(HeapKind::Array, std::mem::size_of::<Self>());
+        Self {
+            values: UnsafeCell::new(Vec::new()),
+            lazy: UnsafeCell::new(Some(Box::new(LazyElements {
+                len,
+                decode: Box::new(decode),
+            }))),
+            allocation,
+        }
+    }
+
+    /// True while the elements have not been decoded yet.
+    pub fn is_lazy(&self) -> bool {
+        // SAFETY: single-threaded interior state, no reference escapes.
+        unsafe { (*self.lazy.get()).is_some() }
+    }
+
+    fn materialize(&self) {
+        // SAFETY: while `lazy` is set `values` is empty and never borrowed
+        // (all access goes through `vec`/`vec_mut`, which call this first).
+        unsafe {
+            if let Some(lazy) = (*self.lazy.get()).take() {
+                let decoded = (lazy.decode)();
+                *self.values.get() = decoded;
+                self.refresh_heap_accounting();
+            }
+        }
+    }
+
+    #[inline]
+    fn vec(&self) -> &Vec<Value> {
+        self.materialize();
+        // SAFETY: see `materialize`.
+        unsafe { &*self.values.get() }
+    }
+
+    #[inline]
+    fn vec_mut(&mut self) -> &mut Vec<Value> {
+        self.materialize();
+        self.values.get_mut()
+    }
+
+    pub fn len(&self) -> usize {
+        // SAFETY: see `materialize`.
+        unsafe {
+            match &*self.lazy.get() {
+                Some(lazy) => lazy.len,
+                None => (*self.values.get()).len(),
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     #[inline]
@@ -643,69 +718,75 @@ impl ArrayStorage {
     }
 
     pub(crate) fn refresh_heap_accounting(&self) {
+        // SAFETY: reads the capacity only.
+        let capacity = unsafe { (*self.values.get()).capacity() };
         self.allocation.set_bytes(
-            std::mem::size_of::<Self>().saturating_add(
-                self.values
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Value>()),
-            ),
+            std::mem::size_of::<Self>()
+                .saturating_add(capacity.saturating_mul(std::mem::size_of::<Value>())),
         );
     }
 
     pub fn replace_values(&mut self, values: Vec<Value>) {
-        self.values = values;
+        *self.lazy.get_mut() = None;
+        *self.values.get_mut() = values;
         self.refresh_heap_accounting();
     }
 
     /// Overwrite one existing slot; out-of-range indexes are ignored. The
-    /// capacity is unchanged, so heap accounting needs no refresh.
+    /// capacity is unchanged, so heap accounting needs no refresh. A lazy
+    /// storage ignores it: its bytes are authoritative and decode later.
     pub(crate) fn set_value(&mut self, index: usize, value: Value) {
-        if let Some(slot) = self.values.get_mut(index) {
+        if self.lazy.get_mut().is_some() {
+            return;
+        }
+        if let Some(slot) = self.values.get_mut().get_mut(index) {
             *slot = value;
         }
     }
 
     pub(crate) fn push(&mut self, value: Value) {
-        self.values.push(value);
+        self.vec_mut().push(value);
         self.refresh_heap_accounting();
     }
 
     /// Grow once toward `min_capacity` instead of doubling through every
     /// power of two. Create loops push thousands of handles.
     pub(crate) fn push_reserved(&mut self, value: Value, min_capacity: usize) {
-        if self.values.len() >= 16 && self.values.capacity() < min_capacity {
-            self.values.reserve(min_capacity - self.values.capacity());
+        let values = self.vec_mut();
+        if values.len() >= 16 && values.capacity() < min_capacity {
+            values.reserve(min_capacity - values.capacity());
         }
         self.push(value);
     }
 
     pub(crate) fn pop(&mut self) -> Option<Value> {
-        self.values.pop()
+        self.vec_mut().pop()
     }
 
     pub(crate) fn remove(&mut self, index: usize) -> Value {
-        self.values.remove(index)
+        self.vec_mut().remove(index)
     }
 
     pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
-        self.values.split_off(at)
+        self.vec_mut().split_off(at)
     }
 
     pub(crate) fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> Value) {
-        self.values.resize_with(new_len, f);
+        self.vec_mut().resize_with(new_len, f);
         self.refresh_heap_accounting();
     }
 
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
-        self.values.get_mut(index)
+        self.vec_mut().get_mut(index)
     }
 
     pub(crate) fn clear(&mut self) {
-        self.values.clear();
+        *self.lazy.get_mut() = None;
+        self.values.get_mut().clear();
     }
 
     pub(crate) fn reverse(&mut self) {
-        self.values.reverse();
+        self.vec_mut().reverse();
     }
 }
 
@@ -713,13 +794,13 @@ impl Deref for ArrayStorage {
     type Target = Vec<Value>;
 
     fn deref(&self) -> &Self::Target {
-        &self.values
+        self.vec()
     }
 }
 
 impl Extend<Value> for ArrayStorage {
     fn extend<T: IntoIterator<Item = Value>>(&mut self, iter: T) {
-        self.values.extend(iter);
+        self.vec_mut().extend(iter);
         self.refresh_heap_accounting();
     }
 }
@@ -731,7 +812,7 @@ where
     type Output = I::Output;
 
     fn index(&self, index: I) -> &Self::Output {
-        &self.values[index]
+        &self.vec()[index]
     }
 }
 
@@ -740,13 +821,13 @@ where
     I: SliceIndex<[Value]>,
 {
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
-        &mut self.values[index]
+        &mut self.vec_mut()[index]
     }
 }
 
 impl fmt::Debug for ArrayStorage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.values.fmt(formatter)
+        self.vec().fmt(formatter)
     }
 }
 
@@ -2900,7 +2981,16 @@ impl Value {
     }
 
     pub fn array(items: Vec<Value>) -> Self {
-        match crate::page_arena::alloc_array(ArrayStorage::new(items)) {
+        Self::array_from_storage(ArrayStorage::new(items))
+    }
+
+    /// An array of `len` elements decoded by `decode` on first generic access.
+    pub fn lazy_array(len: usize, decode: impl FnOnce() -> Vec<Value> + 'static) -> Self {
+        Self::array_from_storage(ArrayStorage::new_lazy(len, decode))
+    }
+
+    fn array_from_storage(storage: ArrayStorage) -> Self {
+        match crate::page_arena::alloc_array(storage) {
             Ok(handle) => Value::Imm(Immediate::from_array_handle(handle)),
             Err(storage) => Value::Array(Rc::new(RefCell::new(storage))),
         }
@@ -4294,7 +4384,7 @@ fn array_call_method(
         }
         "unshift" => {
             let mut values = values.borrow_mut();
-            values.values.splice(0..0, args.iter().cloned());
+            values.vec_mut().splice(0..0, args.iter().cloned());
             values.refresh_heap_accounting();
             Value::Number(values.len() as f64)
         }
@@ -4530,7 +4620,7 @@ fn array_call_method(
                 _ => left.to_js_string().cmp(&right.to_js_string()),
             });
             let mut values = values.borrow_mut();
-            values.values = sorted;
+            values.replace_values(sorted);
             values.refresh_heap_accounting();
             this.clone()
         }
@@ -7367,7 +7457,7 @@ pub(crate) mod leak_edges {
 
     impl ArrayStorage {
         pub(crate) fn leak_edges(&self, out: &mut Vec<(String, LeakTarget)>) {
-            for (index, value) in self.values.iter().enumerate() {
+            for (index, value) in self.vec().iter().enumerate() {
                 push_value(out, format!("[{index}]"), value);
             }
         }
