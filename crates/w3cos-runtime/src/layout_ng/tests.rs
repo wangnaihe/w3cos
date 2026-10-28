@@ -7550,6 +7550,56 @@ fn stretch_fills_an_absolute_box_between_insets() {
     assert_eq!(rect(&out, 6).2, 45.0);
 }
 
+/// Inline edges written as `calc(0% + <len>)` are plain lengths: NG lays the
+/// text out with the same box as the `px` edge. An edge with a real
+/// percentage basis is no longer read as zero, so the run is rejected for
+/// the legacy path instead of being laid out without its padding
+/// (css-sizing/inline-intrinsic-size-calc).
+#[test]
+fn inline_zero_percent_calc_edges_are_lengths_and_real_percentages_fall_back() {
+    let inline_text = |left: Spacing, right: Spacing| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        style.padding.left = left;
+        style.margin.right = right;
+        node(block(), vec![Component::text("hi", style)])
+    };
+    let calc0 = inline_text(
+        Spacing::PaddingCalc {
+            percent: 0.0,
+            px: 30.0,
+        },
+        Spacing::Calc {
+            percent: 0.0,
+            px: 12.0,
+        },
+    );
+    let plain = inline_text(Spacing::Px(30.0), Spacing::Px(12.0));
+    for root in [&calc0, &plain] {
+        let flat = pre_flatten(root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    }
+    let calc_out = ng_rects(&calc0);
+    let plain_out = ng_rects(&plain);
+    assert_eq!(rect(&calc_out, 1), rect(&plain_out, 1));
+    assert!(rect(&calc_out, 1).2 >= 30.0, "the 30px padding is laid out");
+
+    let real = inline_text(
+        Spacing::PaddingCalc {
+            percent: 10.0,
+            px: 30.0,
+        },
+        Spacing::Px(0.0),
+    );
+    let flat = pre_flatten(&real);
+    assert!(
+        !block::unsupported_reasons(&flat).is_empty(),
+        "a percentage inline edge must not lay out as zero"
+    );
+}
+
 /// A mixed `calc()` padding resolves its percentage against the containing
 /// block's width and floors at zero (css-sizing/dynamic-change-inline-size,
 /// css-tables/tentative/padding-percentage).

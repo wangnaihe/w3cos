@@ -9953,6 +9953,23 @@ fn offset_parent_node(node: u32) -> Option<u32> {
     None
 }
 
+/// Used border widths (left, top, right, bottom) of an element; a border
+/// whose style is `none`/`hidden` is zero.
+fn used_border_insets(node: u32) -> (f32, f32, f32, f32) {
+    if dom::node_type(node) != 1 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut style =
+        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)).clone());
+    style.resolve_used_border_widths();
+    (
+        style.border_left_width.unwrap_or(style.border_width),
+        style.border_top_width.unwrap_or(style.border_width),
+        style.border_right_width.unwrap_or(style.border_width),
+        style.border_bottom_width.unwrap_or(style.border_width),
+    )
+}
+
 fn offset_position(node: u32) -> (f32, f32) {
     let rect = forced_bounding_rect(node);
     let Some(parent) = offset_parent_node(node) else {
@@ -11332,14 +11349,48 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "getClientRects" => func(move |_, _| {
             crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
         }),
-        "offsetWidth" | "clientWidth" => Value::Number(forced_bounding_rect(node).width as f64),
-        "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
-        "scrollWidth" => Value::Number(forced_scroll_size(node).0),
-        "scrollHeight" => Value::Number(forced_scroll_size(node).1),
+        "offsetWidth" => Value::Number(forced_bounding_rect(node).width as f64),
+        "offsetHeight" => Value::Number(forced_bounding_rect(node).height as f64),
+        // CSSOM View: the padding box, so the used borders come off.
+        "clientWidth" => {
+            let (left, _, right, _) = used_border_insets(node);
+            Value::Number((forced_bounding_rect(node).width - left - right).max(0.0) as f64)
+        }
+        "clientHeight" => {
+            let (_, top, _, bottom) = used_border_insets(node);
+            Value::Number((forced_bounding_rect(node).height - top - bottom).max(0.0) as f64)
+        }
+        // The scrolling area starts at the padding edge and is never
+        // smaller than the padding box (CSSOM View), like clientWidth.
+        "scrollWidth" => {
+            let (left, _, right, _) = used_border_insets(node);
+            let client = (forced_bounding_rect(node).width - left - right).max(0.0) as f64;
+            let (extent, border_box) =
+                (forced_scroll_size(node).0, forced_bounding_rect(node).width);
+            Value::Number(if extent > border_box as f64 {
+                (extent - left as f64).max(client)
+            } else {
+                client
+            })
+        }
+        "scrollHeight" => {
+            let (_, top, _, bottom) = used_border_insets(node);
+            let client = (forced_bounding_rect(node).height - top - bottom).max(0.0) as f64;
+            let (extent, border_box) = (
+                forced_scroll_size(node).1,
+                forced_bounding_rect(node).height,
+            );
+            Value::Number(if extent > border_box as f64 {
+                (extent - top as f64).max(client)
+            } else {
+                client
+            })
+        }
         "offsetTop" => Value::Number(offset_position(node).1 as f64),
         "offsetLeft" => Value::Number(offset_position(node).0 as f64),
         "offsetParent" => element_or_null(offset_parent_node(node)),
-        "clientTop" | "clientLeft" => Value::Number(0.0),
+        "clientLeft" => Value::Number(used_border_insets(node).0 as f64),
+        "clientTop" => Value::Number(used_border_insets(node).1 as f64),
         "scrollTop" => Value::Number(dom::get_scroll_offset(node).1 as f64),
         "scrollLeft" => Value::Number(dom::get_scroll_offset(node).0 as f64),
         "scrollIntoView" => func(move |_, args| {
@@ -33567,6 +33618,31 @@ try {
         div.set_property("scrollLeft", Value::Number(123_456.0));
         assert_eq!(div.get_property("scrollTop").to_number(), 300.0);
         assert_eq!(div.get_property("scrollLeft").to_number(), 200.0);
+    }
+
+    #[test]
+    fn client_and_scroll_sizes_are_the_padding_box_inside_borders() {
+        setup();
+        let container = create_in_body("div");
+        let style = container.get_property("style");
+        style.set_property("border", Value::string("3px solid black"));
+        let container_id = node_id_of(&container).unwrap();
+        dom::with_document_mut(|document| {
+            document.set_layout_rect(
+                NodeId::from_u32(container_id),
+                w3cos_dom::DOMRect::new(0.0, 0.0, 106.0, 56.0),
+            );
+        });
+        dom::clear_document_dirty();
+        assert_eq!(container.get_property("offsetWidth").to_number(), 106.0);
+        assert_eq!(container.get_property("offsetHeight").to_number(), 56.0);
+        assert_eq!(container.get_property("clientWidth").to_number(), 100.0);
+        assert_eq!(container.get_property("clientHeight").to_number(), 50.0);
+        assert_eq!(container.get_property("clientLeft").to_number(), 3.0);
+        assert_eq!(container.get_property("clientTop").to_number(), 3.0);
+        // Without overflow the scrolling area is the padding box.
+        assert_eq!(container.get_property("scrollWidth").to_number(), 100.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 50.0);
     }
 
     #[test]
