@@ -1085,7 +1085,7 @@ pub enum Dimension {
     Vw(f32),
     Vh(f32),
     /// A `calc()` expression reduced to a linear combination of units.
-    Calc(CalcLength),
+    Calc(CalcId),
 }
 
 /// A `calc()` length reduced to `px + percent% + em*font + vw + vh`.
@@ -1135,6 +1135,90 @@ impl CalcLength {
             + font_size * self.em
             + viewport_w * self.vw / 100.0
             + viewport_h * self.vh / 100.0
+    }
+}
+
+/// Interned handle to a [`CalcLength`].
+///
+/// `Dimension` appears many times in every `Style` and the layout code recurses
+/// deeply, so `Dimension` must stay 8 bytes. Five `f32` coefficients would
+/// double it, hence calc values are interned once and referenced by index.
+/// The handle dereferences to the `CalcLength` and serializes as its value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CalcId(u32);
+
+struct CalcTable {
+    values: Vec<&'static CalcLength>,
+    index: std::collections::HashMap<[u32; 5], u32>,
+}
+
+fn calc_table() -> &'static std::sync::RwLock<CalcTable> {
+    static TABLE: std::sync::OnceLock<std::sync::RwLock<CalcTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::sync::RwLock::new(CalcTable {
+            values: Vec::new(),
+            index: std::collections::HashMap::new(),
+        })
+    })
+}
+
+impl CalcId {
+    pub fn new(length: CalcLength) -> Self {
+        let key = [
+            length.px.to_bits(),
+            length.percent.to_bits(),
+            length.em.to_bits(),
+            length.vw.to_bits(),
+            length.vh.to_bits(),
+        ];
+        if let Some(id) = calc_table().read().unwrap().index.get(&key) {
+            return Self(*id);
+        }
+        let mut table = calc_table().write().unwrap();
+        if let Some(id) = table.index.get(&key) {
+            return Self(*id);
+        }
+        let id = table.values.len() as u32;
+        table.values.push(Box::leak(Box::new(length)));
+        table.index.insert(key, id);
+        Self(id)
+    }
+
+    pub fn get(self) -> CalcLength {
+        *self
+    }
+}
+
+impl std::ops::Deref for CalcId {
+    type Target = CalcLength;
+
+    fn deref(&self) -> &CalcLength {
+        calc_table().read().unwrap().values[self.0 as usize]
+    }
+}
+
+impl std::fmt::Debug for CalcId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CalcId").field(&**self).finish()
+    }
+}
+
+impl Serialize for CalcId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (**self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CalcId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        CalcLength::deserialize(deserializer).map(Self::new)
+    }
+}
+
+impl Dimension {
+    /// A `calc()` dimension with the given linear terms.
+    pub fn calc(length: CalcLength) -> Self {
+        Dimension::Calc(CalcId::new(length))
     }
 }
 

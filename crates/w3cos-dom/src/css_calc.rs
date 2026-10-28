@@ -68,7 +68,7 @@ pub(crate) fn calc_to_dimension(length: CalcLength) -> Dimension {
     } else if only(false, false, false, false, true) {
         Dimension::Vh(length.vh)
     } else {
-        Dimension::Calc(length)
+        Dimension::calc(length)
     }
 }
 

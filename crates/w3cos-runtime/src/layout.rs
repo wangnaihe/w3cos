@@ -37838,7 +37838,7 @@ mod tests {
     fn calc_lengths_resolve_percentages_against_the_containing_block() {
         use w3cos_std::style::CalcLength;
         let calc = |percent: f32, px: f32| {
-            WDim::Calc(CalcLength {
+            WDim::calc(CalcLength {
                 percent,
                 px,
                 ..CalcLength::default()
@@ -37865,7 +37865,7 @@ mod tests {
                     Component::boxed(
                         Style {
                             display: WDisp::Block,
-                            width: WDim::Calc(CalcLength {
+                            width: WDim::calc(CalcLength {
                                 px: 120.0,
                                 ..CalcLength::default()
                             }),
@@ -37913,7 +37913,7 @@ mod tests {
                 vec![Component::boxed(
                     Style {
                         position: WPos::Absolute,
-                        left: WDim::Calc(CalcLength {
+                        left: WDim::calc(CalcLength {
                             percent: 50.0,
                             px: 10.0,
                             ..CalcLength::default()
