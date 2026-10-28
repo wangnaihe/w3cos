@@ -1133,6 +1133,23 @@ pub fn selector_matches_node_with_target(
     if selector.is_empty() || selector.starts_with(',') || selector.ends_with(',') {
         return Err(());
     }
+    // The overwhelmingly common DOM `matches()` input is one selector. Avoid
+    // allocating a one-element selector-group Vec and owned String before the
+    // cached parse. A literal comma is a conservative gate: commas nested in
+    // attributes/functions take the existing group-aware path, while a true
+    // selector list still preserves its parsing and short-circuit semantics.
+    if !selector.contains(',') {
+        let parsed = parse_selector_chain_cached(selector).ok_or(())?;
+        return Ok(matches_chain_node(
+            document,
+            node,
+            &parsed.chain,
+            &parsed.combinators,
+            parsed.chain.len() - 1,
+            target_id,
+            None,
+        ));
+    }
     let parsed = split_selector_group(selector)
         .into_iter()
         .map(|single| parse_selector_chain_cached(&single))
