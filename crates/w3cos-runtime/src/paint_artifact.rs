@@ -450,6 +450,9 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
         Some(w3cos_std::style::Dimension::Vw(value)) => value * rect.width / 100.0,
         Some(w3cos_std::style::Dimension::Vh(value)) => value * rect.height / 100.0,
         Some(w3cos_std::style::Dimension::Percent(value)) => value * auto / 100.0,
+        Some(w3cos_std::style::Dimension::Calc(calc)) => {
+            calc.resolve(auto, style.font_size, rect.width, rect.height)
+        }
         Some(w3cos_std::style::Dimension::Auto) | None => auto,
     };
     let top = resolve(clip.top, 0.0);

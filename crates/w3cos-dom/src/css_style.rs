@@ -2000,6 +2000,16 @@ fn parse_spacing(value: &str) -> Option<Spacing> {
             return Some(constructor(number));
         }
     }
+    if let Some(calc) = crate::css_calc::parse_calc_length(value) {
+        return match crate::css_calc::calc_to_dimension(calc) {
+            Dimension::Px(v) => Some(Spacing::Px(v)),
+            Dimension::Percent(v) => Some(Spacing::Percent(v)),
+            Dimension::Em(v) => Some(Spacing::Em(v)),
+            Dimension::Vw(v) => Some(Spacing::Vw(v)),
+            Dimension::Vh(v) => Some(Spacing::Vh(v)),
+            _ => None,
+        };
+    }
     parse_px(value).map(Spacing::Px)
 }
 
@@ -2073,6 +2083,39 @@ pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Ch(v) => format!("{v}ch"),
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
+        w3cos_std::style::Dimension::Calc(calc) => {
+            let mut terms = Vec::new();
+            for (value, unit) in [
+                (calc.percent, "%"),
+                (calc.px, "px"),
+                (calc.em, "em"),
+                (calc.vw, "vw"),
+                (calc.vh, "vh"),
+            ] {
+                if value != 0.0 {
+                    terms.push(format!("{value}{unit}"));
+                }
+            }
+            let mut out = String::from("calc(");
+            for (index, term) in terms.iter().enumerate() {
+                match (index, term.strip_prefix('-')) {
+                    (0, _) => out.push_str(term),
+                    (_, Some(negative)) => {
+                        out.push_str(" - ");
+                        out.push_str(negative);
+                    }
+                    _ => {
+                        out.push_str(" + ");
+                        out.push_str(term);
+                    }
+                }
+            }
+            if terms.is_empty() {
+                out.push_str("0px");
+            }
+            out.push(')');
+            out
+        }
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
     }
 }
@@ -2446,6 +2489,9 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     if let Some(px) = parse_px(v) {
         return Some(Dimension::Px(px));
     }
+    if let Some(calc) = crate::css_calc::parse_calc_length(v) {
+        return Some(crate::css_calc::calc_to_dimension(calc));
+    }
     None
 }
 
@@ -2459,6 +2505,9 @@ fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
         | Dimension::Ch(value)
         | Dimension::Vw(value)
         | Dimension::Vh(value) => value >= 0.0,
+        // A negative used size clamps to zero, so a calc that may go
+        // negative is still a valid declaration.
+        Dimension::Calc(_) => true,
     }
 }
 

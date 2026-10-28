@@ -924,6 +924,12 @@ impl Style {
             Dimension::Ch(value) => value * self.ch_advance(),
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
+            Dimension::Calc(calc) => calc.resolve(
+                containing_width,
+                self.font_size,
+                viewport_width,
+                viewport_height,
+            ),
             Dimension::Auto => 0.0,
         }
     }
@@ -1078,6 +1084,58 @@ pub enum Dimension {
     Ch(f32),
     Vw(f32),
     Vh(f32),
+    /// A `calc()` expression reduced to a linear combination of units.
+    Calc(CalcLength),
+}
+
+/// A `calc()` length reduced to `px + percent% + em*font + vw + vh`.
+///
+/// Every term is linear, so `+`, `-`, `* <number>` and `/ <number>` fold the
+/// expression into five coefficients at parse time and resolution needs only
+/// the containing block, font size and viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct CalcLength {
+    pub px: f32,
+    /// Percentage points (`50` means `50%`).
+    pub percent: f32,
+    pub em: f32,
+    pub vw: f32,
+    pub vh: f32,
+}
+
+impl CalcLength {
+    pub fn is_absolute(&self) -> bool {
+        self.percent == 0.0
+    }
+
+    pub fn add(self, other: Self) -> Self {
+        Self {
+            px: self.px + other.px,
+            percent: self.percent + other.percent,
+            em: self.em + other.em,
+            vw: self.vw + other.vw,
+            vh: self.vh + other.vh,
+        }
+    }
+
+    pub fn scale(self, factor: f32) -> Self {
+        Self {
+            px: self.px * factor,
+            percent: self.percent * factor,
+            em: self.em * factor,
+            vw: self.vw * factor,
+            vh: self.vh * factor,
+        }
+    }
+
+    /// Resolve against a percentage basis, font size and viewport.
+    pub fn resolve(&self, basis: f32, font_size: f32, viewport_w: f32, viewport_h: f32) -> f32 {
+        self.px
+            + basis * self.percent / 100.0
+            + font_size * self.em
+            + viewport_w * self.vw / 100.0
+            + viewport_h * self.vh / 100.0
+    }
 }
 
 /// CSS length for padding/margin.
@@ -1993,6 +2051,9 @@ impl Dimension {
             Dimension::Ch(v) => Some(*v * local_font_size * 0.5),
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
+            Dimension::Calc(calc) => {
+                Some(calc.resolve(parent_size, local_font_size, viewport_w, viewport_h))
+            }
         }
     }
 }
