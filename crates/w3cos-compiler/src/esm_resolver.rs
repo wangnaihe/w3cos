@@ -2718,6 +2718,54 @@ fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModu
     Ok((resolved, scripts))
 }
 
+/// Top-level value exports of the `vscode` API (`vscode.d.ts`). A namespace
+/// import (`import * as vscode`) that is handed on whole cannot be scanned for
+/// the members its consumers read, so the glue declares them all.
+const VSCODE_API_NAMES: &str = "\
+    BranchCoverage Breakpoint CallHierarchyIncomingCall CallHierarchyItem \
+    CallHierarchyOutgoingCall CancellationError CancellationTokenSource ChatRequestTurn \
+    ChatResponseAnchorPart ChatResponseCommandButtonPart ChatResponseFileTreePart \
+    ChatResponseMarkdownPart ChatResponseProgressPart ChatResponseReferencePart \
+    ChatResponseTurn ChatResultFeedbackKind CodeAction CodeActionKind CodeActionTriggerKind \
+    CodeLens Color ColorInformation ColorPresentation ColorThemeKind CommentMode \
+    CommentThreadCollapsibleState CommentThreadState CompletionItem CompletionItemKind \
+    CompletionItemTag CompletionList CompletionTriggerKind ConfigurationTarget CustomExecution \
+    DataTransfer DataTransferItem DebugAdapterExecutable DebugAdapterInlineImplementation \
+    DebugAdapterNamedPipeServer DebugAdapterServer DebugConfigurationProviderTriggerKind \
+    DebugConsoleMode DebugStackFrame DebugThread DeclarationCoverage DecorationRangeBehavior \
+    Diagnostic DiagnosticRelatedInformation DiagnosticSeverity DiagnosticTag Disposable \
+    DocumentDropEdit DocumentDropOrPasteEditKind DocumentHighlight DocumentHighlightKind \
+    DocumentLink DocumentPasteEdit DocumentPasteTriggerKind DocumentSymbol EndOfLine \
+    EnvironmentVariableMutatorType EvaluatableExpression EventEmitter ExtensionKind \
+    ExtensionMode FileChangeType FileCoverage FileDecoration FilePermission FileSystemError \
+    FileType FoldingRange FoldingRangeKind FunctionBreakpoint Hover IndentAction InlayHint \
+    InlayHintKind InlayHintLabelPart InlineCompletionItem InlineCompletionList \
+    InlineCompletionTriggerKind InlineValueEvaluatableExpression InlineValueText \
+    InlineValueVariableLookup InputBoxValidationSeverity LanguageModelChatMessage \
+    LanguageModelChatMessageRole LanguageModelChatToolMode LanguageModelDataPart \
+    LanguageModelError LanguageModelPromptTsxPart LanguageModelTextPart \
+    LanguageModelToolCallPart LanguageModelToolResult LanguageModelToolResultPart \
+    LanguageStatusSeverity LinkedEditingRanges Location LogLevel MarkdownString \
+    McpHttpServerDefinition McpStdioServerDefinition NotebookCellData NotebookCellKind \
+    NotebookCellOutput NotebookCellOutputItem NotebookCellStatusBarAlignment \
+    NotebookCellStatusBarItem NotebookControllerAffinity NotebookData NotebookEdit \
+    NotebookEditorRevealType NotebookRange OverviewRulerLane ParameterInformation Position \
+    ProcessExecution ProgressLocation QuickInputButtonLocation QuickInputButtons \
+    QuickPickItemKind Range RelativePattern Selection SelectionRange SemanticTokens \
+    SemanticTokensBuilder SemanticTokensEdit SemanticTokensEdits SemanticTokensLegend \
+    ShellExecution ShellQuoting SignatureHelp SignatureHelpTriggerKind SignatureInformation \
+    SnippetString SnippetTextEdit SourceBreakpoint StatementCoverage StatusBarAlignment \
+    SymbolInformation SymbolKind SymbolTag SyntaxTokenType TabInputCustom TabInputNotebook \
+    TabInputNotebookDiff TabInputTerminal TabInputText TabInputTextDiff TabInputWebview Task \
+    TaskGroup TaskPanelKind TaskRevealKind TaskScope TelemetryTrustedValue TerminalExitReason \
+    TerminalLink TerminalLocation TerminalProfile TerminalShellExecutionCommandLineConfidence \
+    TestCoverageCount TestMessage TestMessageStackFrame TestRunProfileKind TestRunRequest \
+    TestTag TextDocumentChangeReason TextDocumentSaveReason TextEdit TextEditorCursorStyle \
+    TextEditorLineNumbersStyle TextEditorRevealType TextEditorSelectionChangeKind ThemeColor \
+    ThemeIcon TreeItem TreeItemCheckboxState TreeItemCollapsibleState TypeHierarchyItem UIKind \
+    Uri ViewColumn WorkspaceEdit authentication chat commands comments debug env extensions \
+    l10n languages lm notebooks scm tasks tests version window workspace";
+
 /// The extension host's `vscode` API. It is not a file: the host hands out a
 /// *per-extension* API object through its patched `Module._load`, keyed by the
 /// requiring module's filename. A CommonJS record that asks the host on behalf
@@ -2737,11 +2785,17 @@ fn vscode_module(project_root: &Path, from_dir: &Path) -> Result<ResolvedModule>
     }
     let path = dir.join(format!("vscode-{hash:016x}.js"));
     let owner_file = crate::cjs::js_string(&owner.join("package.json").to_string_lossy());
+    // Lexer-visible names (`exports.X = void 0`, as tsc emits): the importer's
+    // facade exports them; `module.exports = api` below replaces the object.
+    let declared: String = VSCODE_API_NAMES
+        .split_whitespace()
+        .map(|name| format!("exports.{name} = void 0;\n"))
+        .collect();
     // Not a literal `require('vscode')`: that would link this file to itself.
     install_glue_file(
         &path,
         &format!(
-            "const loaded = globalThis.__w3cos_cjs_runtime_load('vscode', {{ id: {owner_file}, filename: {owner_file}, paths: [] }});\n\
+            "{declared}const loaded = globalThis.__w3cos_cjs_runtime_load('vscode', {{ id: {owner_file}, filename: {owner_file}, paths: [] }});\n\
 if (loaded === undefined) throw new Error(\"Cannot find module 'vscode'\");\n\
 module.exports = loaded.value;\n"
         ),
@@ -3739,6 +3793,11 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             .unwrap_or_else(|| panic!("vscode must link as a module: {:?}", graph.nodes.len()));
         assert!(resolver.is_commonjs(&glue), "{}", glue.display());
         let glue_source = std::fs::read_to_string(&glue).unwrap();
+        let facade = module_source::read(&glue).unwrap();
+        assert!(
+            facade.contains("export const EventEmitter =") && facade.contains("export const env ="),
+            "a namespace import of the host API sees every member: {facade}"
+        );
         assert!(
             glue_source.contains(&root.join("ext/package.json").to_string_lossy().into_owned()),
             "the host is asked on behalf of the importing extension: {glue_source}"
