@@ -431,7 +431,7 @@ fn build_esm_artifacts(entry_path: &std::path::Path) -> Result<EsmArtifacts> {
 
     // Only generate bundle code if there are symbols to compile.
     let bundle_code = if bundle.symbol_count() > 0 {
-        let generated = esm_codegen::try_generate_with_bodies_and_css(&bundle, &css.rules)?;
+        let generated = esm_codegen::try_generate_with_bodies_and_stylesheet(&bundle, &css)?;
         // Vite prebundles into a process-specific temporary directory. Those
         // absolute paths are valid module identities, but retaining the random
         // prefix makes byte-identical UI builds look changed to rustc and
