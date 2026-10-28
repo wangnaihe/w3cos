@@ -951,8 +951,13 @@ fn button_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
 fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     let style = info.style;
-    if style.box_sizing == BoxSizing::BorderBox {
-        return Some("image:border-box");
+    // A border-box image is sized through its content box
+    // (`replaced_content_size`). A CSS `aspect-ratio` relates the
+    // border boxes then, which stays on legacy.
+    if style.box_sizing == BoxSizing::BorderBox
+        && marker(style, "--w3cos-internal-aspect-ratio").is_some()
+    {
+        return Some("image:border-box-ratio");
     }
     // min/max constraints: `constrained_replaced_size` (Blink
     // ComputeReplacedSizeInternal).
@@ -1551,7 +1556,44 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
 /// replaced-size function. `None` when a percentage has no basis.
 fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> Option<(f32, f32)> {
     if style.box_sizing == BoxSizing::BorderBox {
-        return super::bail("image");
+        // Border-box lengths are reduced by border and padding to content
+        // lengths (never below zero); the size then resolves as for a
+        // content box. A length with no basis stays unresolved and bails.
+        if marker(style, "--w3cos-internal-aspect-ratio").is_some() {
+            return super::bail("image");
+        }
+        let spacing = |s: Spacing| {
+            resolve_spacing_for_layout(
+                s,
+                space.available_inline,
+                style,
+                space.viewport_w,
+                space.viewport_h,
+            )
+        };
+        let b = border(style);
+        let inline_edges = b[1] + b[3] + spacing(style.padding.left) + spacing(style.padding.right);
+        let block_edges = b[0] + b[2] + spacing(style.padding.top) + spacing(style.padding.bottom);
+        let reduce = |dim: Dimension, basis: Option<f32>, edges: f32| -> Option<Dimension> {
+            match dim {
+                Dimension::Auto => Some(Dimension::Auto),
+                other => resolve_dim(other, basis, style, space)
+                    .map(|size| Dimension::Px((size - edges).max(0.0))),
+            }
+        };
+        let mut content = style.clone();
+        content.box_sizing = BoxSizing::ContentBox;
+        content.width = reduce(style.width, Some(space.available_inline), inline_edges)?;
+        content.height = reduce(
+            used_height(style, space),
+            space.percentage_block,
+            block_edges,
+        )?;
+        content.min_width = reduce(style.min_width, Some(space.available_inline), inline_edges)?;
+        content.max_width = reduce(style.max_width, Some(space.available_inline), inline_edges)?;
+        content.min_height = reduce(style.min_height, space.percentage_block, block_edges)?;
+        content.max_height = reduce(style.max_height, space.percentage_block, block_edges)?;
+        return replaced_content_size(src, &content, space);
     }
     let mut definite = style.clone();
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {

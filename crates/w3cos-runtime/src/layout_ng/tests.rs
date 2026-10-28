@@ -7020,3 +7020,47 @@ fn column_item_automatic_minimum_counts_child_min_height() {
     assert_eq!(rect(&ng, 2).3, 0.0);
     assert_eq!(rect(&ng, 3).3, 100.0);
 }
+
+/// A border-box image's lengths include its border and padding
+/// (box-sizing-replaced-001, flex-aspect-ratio-img-row-005).
+#[test]
+fn border_box_image_sizes_include_border_and_padding() {
+    use w3cos_std::style::{BoxSizing, Display, Spacing};
+    let base = Style {
+        display: Display::Block,
+        box_sizing: BoxSizing::BorderBox,
+        padding: w3cos_std::style::Edges {
+            top: Spacing::Px(5.0),
+            right: Spacing::Px(5.0),
+            bottom: Spacing::Px(5.0),
+            left: Spacing::Px(5.0),
+        },
+        ..block()
+    };
+    let plain = Style {
+        width: Dimension::Px(150.0),
+        height: Dimension::Px(100.0),
+        ..base.clone()
+    };
+    let limited = Style {
+        width: Dimension::Px(150.0),
+        height: Dimension::Px(100.0),
+        max_width: Dimension::Px(60.0),
+        min_height: Dimension::Px(120.0),
+        ..base.clone()
+    };
+    let root = node(
+        block(),
+        vec![
+            Component::image("missing.png", plain),
+            Component::image("missing.png", limited),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (_, _, w, h) = rect(&ng, 1);
+    assert_eq!((w, h), (150.0, 100.0));
+    let (_, _, w, h) = rect(&ng, 2);
+    assert_eq!((w, h), (60.0, 120.0));
+}
