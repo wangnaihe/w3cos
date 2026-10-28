@@ -1634,7 +1634,7 @@ fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
-        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc(_) => None,
     };
     let constraint_border_box = |dimension| {
         intrinsic_constraint(dimension).map(|width| {
@@ -3505,7 +3505,8 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Em(_)
         | WDim::Ch(_)
         | WDim::Vw(_)
-        | WDim::Vh(_) => None,
+        | WDim::Vh(_)
+        | WDim::Calc(_) => None,
     }
 }
 
@@ -4022,6 +4023,14 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
+            WDim::Calc(calc) => (
+                8,
+                [calc.px, calc.percent, calc.em, calc.vw, calc.vh]
+                    .iter()
+                    .fold(0_u32, |hash, part| {
+                        hash.rotate_left(5) ^ part.to_bits().wrapping_mul(0x9E37_79B1)
+                    }),
+            ),
         },
         padding_top: padding.top.to_bits(),
         padding_right: padding.right.to_bits(),
@@ -19986,6 +19995,14 @@ fn build_taffy_tree(
     };
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
+    apply_calc_percent_overrides(
+        &mut style,
+        &comp.style,
+        containing_width,
+        definite_height_basis,
+        viewport_w,
+        viewport_h,
+    );
     if comp.style.float != WFloat::None && style.display == Display::Block {
         // CSS floats establish a BFC, even with authored overflow:visible.
         // Taffy's block interface has no float/BFC flag; its non-scrolling
@@ -20067,6 +20084,11 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
+        WDim::Calc(calc) if calc.is_absolute() => {
+            Some(calc.resolve(0.0, comp.style.font_size, viewport_w, viewport_h))
+        }
+        WDim::Calc(calc) => definite_height_basis
+            .map(|basis| calc.resolve(basis, comp.style.font_size, viewport_w, viewport_h)),
         WDim::Auto | WDim::Ch(_) | WDim::Vw(_) => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
@@ -20413,7 +20435,10 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
-        WDim::Auto | WDim::Percent(_) => None,
+        WDim::Calc(calc) if calc.is_absolute() => {
+            Some(calc.resolve(0.0, comp.style.font_size, viewport_w, viewport_h))
+        }
+        WDim::Auto | WDim::Percent(_) | WDim::Calc(_) => None,
     };
     let absorbs_ua_inline_padding =
         uses_ua_table_cell_padding && absolute_dimension(comp.style.width).is_some();
@@ -24043,9 +24068,14 @@ fn collect_layouts_fast(
                         || relative_containing_block_height_definite)
             }
             WDim::Percent(_) => relative_containing_block_height_definite,
-            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Ch(_) | WDim::Vw(_) | WDim::Vh(_) => {
-                true
-            }
+            WDim::Calc(calc) if !calc.is_absolute() => relative_containing_block_height_definite,
+            WDim::Calc(_)
+            | WDim::Px(_)
+            | WDim::Rem(_)
+            | WDim::Em(_)
+            | WDim::Ch(_)
+            | WDim::Vw(_)
+            | WDim::Vh(_) => true,
         });
 
     for &child in tree.children(node).unwrap().iter() {
@@ -25326,6 +25356,12 @@ fn to_taffy_dim(
         WDim::Ch(v) => Dimension::length(v * font_style.ch_advance()),
         WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
         WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
+        // Percentage terms need the containing block, which
+        // `apply_calc_percent_overrides` supplies while the tree is built.
+        WDim::Calc(calc) if calc.is_absolute() => {
+            Dimension::length(calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h))
+        }
+        WDim::Calc(_) => Dimension::auto(),
     }
 }
 
@@ -25344,6 +25380,13 @@ fn to_taffy_auto(
         WDim::Ch(v) => LengthPercentageAuto::length(v * font_style.ch_advance()),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
+        WDim::Calc(calc) if calc.is_absolute() => LengthPercentageAuto::length(calc.resolve(
+            0.0,
+            font_style.font_size,
+            viewport_w,
+            viewport_h,
+        )),
+        WDim::Calc(_) => LengthPercentageAuto::auto(),
     }
 }
 
@@ -25360,6 +25403,64 @@ fn to_taffy_inset(
         LengthPercentageAuto::auto()
     } else {
         to_taffy_auto(dimension, font_style, viewport_w, viewport_h)
+    }
+}
+
+/// Resolve percentage-bearing `calc()` sizes and insets against the
+/// containing block known while the tree is built. Taffy's tree has no calc
+/// resolver, so these were left automatic by `to_taffy_dim`/`to_taffy_auto`.
+fn apply_calc_percent_overrides(
+    style: &mut taffy::Style,
+    authored: &w3cos_std::style::Style,
+    width_basis: f32,
+    height_basis: Option<f32>,
+    viewport_w: f32,
+    viewport_h: f32,
+) {
+    let font_size = authored.font_size;
+    let horizontal = |dimension: WDim| match dimension {
+        WDim::Calc(calc) if !calc.is_absolute() => {
+            Some(calc.resolve(width_basis, font_size, viewport_w, viewport_h))
+        }
+        _ => None,
+    };
+    let vertical = |dimension: WDim| match dimension {
+        WDim::Calc(calc) if !calc.is_absolute() => {
+            height_basis.map(|basis| calc.resolve(basis, font_size, viewport_w, viewport_h))
+        }
+        _ => None,
+    };
+    if let Some(value) = horizontal(authored.width) {
+        style.size.width = Dimension::length(value.max(0.0));
+    }
+    if let Some(value) = horizontal(authored.min_width) {
+        style.min_size.width = Dimension::length(value.max(0.0));
+    }
+    if let Some(value) = horizontal(authored.max_width) {
+        style.max_size.width = Dimension::length(value.max(0.0));
+    }
+    if let Some(value) = vertical(authored.height) {
+        style.size.height = Dimension::length(value.max(0.0));
+    }
+    if let Some(value) = vertical(authored.min_height) {
+        style.min_size.height = Dimension::length(value.max(0.0));
+    }
+    if let Some(value) = vertical(authored.max_height) {
+        style.max_size.height = Dimension::length(value.max(0.0));
+    }
+    if !matches!(authored.position, WPos::Static) {
+        if let Some(value) = horizontal(authored.left) {
+            style.inset.left = LengthPercentageAuto::length(value);
+        }
+        if let Some(value) = horizontal(authored.right) {
+            style.inset.right = LengthPercentageAuto::length(value);
+        }
+        if let Some(value) = vertical(authored.top) {
+            style.inset.top = LengthPercentageAuto::length(value);
+        }
+        if let Some(value) = vertical(authored.bottom) {
+            style.inset.bottom = LengthPercentageAuto::length(value);
+        }
     }
 }
 
@@ -37731,6 +37832,106 @@ mod tests {
         let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(parent.width, 144.0);
         assert_eq!(child.x, 96.0);
+    }
+
+    #[test]
+    fn calc_lengths_resolve_percentages_against_the_containing_block() {
+        use w3cos_std::style::CalcLength;
+        let calc = |percent: f32, px: f32| {
+            WDim::calc(CalcLength {
+                percent,
+                px,
+                ..CalcLength::default()
+            })
+        };
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    width: WDim::Px(400.0),
+                    height: WDim::Px(200.0),
+                    ..Style::default()
+                },
+                vec![
+                    Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            width: calc(100.0, -60.0),
+                            height: WDim::Px(20.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    ),
+                    Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            width: WDim::calc(CalcLength {
+                                px: 120.0,
+                                ..CalcLength::default()
+                            }),
+                            height: calc(50.0, -10.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    ),
+                    Component::boxed(
+                        Style {
+                            display: WDisp::Block,
+                            width: WDim::Px(10.0),
+                            height: WDim::Px(10.0),
+                            max_width: calc(50.0, 0.0),
+                            ..Style::default()
+                        },
+                        Vec::new(),
+                    ),
+                ],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+
+        let find = |index: usize| layout.iter().find(|(_, i)| *i == index).unwrap().0;
+        assert_eq!(find(1).width, 340.0);
+        assert_eq!(find(2).width, 120.0);
+        assert_eq!(find(2).height, 90.0);
+        assert_eq!(find(3).width, 10.0);
+    }
+
+    #[test]
+    fn calc_insets_position_absolute_boxes_from_the_containing_block() {
+        use w3cos_std::style::CalcLength;
+        let layout = compute(
+            &Component::boxed(
+                Style {
+                    display: WDisp::Block,
+                    position: WPos::Relative,
+                    width: WDim::Px(400.0),
+                    height: WDim::Px(100.0),
+                    ..Style::default()
+                },
+                vec![Component::boxed(
+                    Style {
+                        position: WPos::Absolute,
+                        left: WDim::calc(CalcLength {
+                            percent: 50.0,
+                            px: 10.0,
+                            ..CalcLength::default()
+                        }),
+                        top: WDim::Px(0.0),
+                        width: WDim::Px(20.0),
+                        height: WDim::Px(20.0),
+                        ..Style::default()
+                    },
+                    Vec::new(),
+                )],
+            ),
+            800.0,
+            600.0,
+        )
+        .unwrap();
+        let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
+        assert_eq!(child.x, 210.0);
     }
 
     #[test]

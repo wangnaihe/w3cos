@@ -1,5 +1,6 @@
 pub mod atom;
 pub mod canvas;
+mod css_calc;
 pub mod css_style;
 pub mod document;
 pub mod dom_rect;
@@ -3852,6 +3853,25 @@ mod tests {
         assert!(matches!(style.inner.width, Dimension::Vw(50.0)));
         style.set_property("width", "25vh");
         assert!(matches!(style.inner.width, Dimension::Vh(25.0)));
+    }
+
+    #[test]
+    fn test_css_parse_dimension_calc() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("width", "calc(60px * 2)");
+        assert!(matches!(style.inner.width, Dimension::Px(120.0)));
+        style.set_property("width", "calc(100% - 32px)");
+        assert!(matches!(
+            style.inner.width,
+            Dimension::Calc(c) if c.percent == 100.0 && c.px == -32.0
+        ));
+        style.set_property("height", "calc(50% / 2)");
+        assert!(matches!(style.inner.height, Dimension::Percent(25.0)));
+        style.set_property("width", "calc(10px * 2px)");
+        assert!(matches!(
+            style.inner.width,
+            Dimension::Calc(c) if c.percent == 100.0
+        ));
     }
 
     #[test]

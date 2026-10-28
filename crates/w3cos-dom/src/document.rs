@@ -8651,7 +8651,10 @@ impl Document {
                             w3cos_std::style::Dimension::Vh(value) => {
                                 w3cos_std::style::Spacing::Vh(value)
                             }
-                            w3cos_std::style::Dimension::Auto => w3cos_std::style::Spacing::Px(0.0),
+                            w3cos_std::style::Dimension::Auto
+                            | w3cos_std::style::Dimension::Calc(_) => {
+                                w3cos_std::style::Spacing::Px(0.0)
+                            }
                         };
                         if indent_spacing != w3cos_std::style::Spacing::Px(0.0) {
                             // `text-indent` moves the first in-flow inline box,
@@ -13117,7 +13120,7 @@ fn normalize_single_inline_text_indent(component: &mut w3cos_std::Component) {
         Dimension::Ch(value) => Spacing::Ch(value),
         Dimension::Vw(value) => Spacing::Vw(value),
         Dimension::Vh(value) => Spacing::Vh(value),
-        Dimension::Auto => return,
+        Dimension::Auto | Dimension::Calc(_) => return,
     };
     let margin = match component.style.direction {
         TextDirection::Ltr => &mut child.style.margin.left,
