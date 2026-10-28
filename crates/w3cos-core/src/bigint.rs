@@ -52,7 +52,11 @@ pub fn get(value: &Value) -> Option<BigInt> {
     let Some(object) = value.as_object() else {
         return None;
     };
-    let encoded = object.borrow().get_direct(VALUE);
+    // `from_bigint` stores the encoded text as an *own* property, so look at
+    // the object's own properties only. `get` runs on every `===`, SameValueZero
+    // and primitive conversion of an object; `get_direct` would walk the whole
+    // prototype chain (and check accessors) on each of those misses.
+    let encoded = object.borrow().properties.get(VALUE).cloned()?;
     if encoded.is_undefined() {
         None
     } else {
@@ -298,6 +302,18 @@ fn to_u64_wrapping(value: BigInt) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_own_encoded_objects_are_bigints() {
+        let plain = Value::object(HashMap::from([("a".into(), Value::Number(1.0))]));
+        assert!(get(&plain).is_none());
+        assert_eq!(equals(&plain, &plain.clone()), None);
+        assert_eq!(equals(&plain, &parse("1")), Some(false));
+        assert_eq!(equals(&parse("12"), &parse("12")), Some(true));
+        assert_eq!(equals(&parse("12"), &parse("13")), Some(false));
+        assert!(get(&Value::Number(1.0)).is_none());
+        assert_eq!(get(&parse("-7")).map(|v| v.to_string()), Some("-7".into()));
+    }
 
     #[test]
     fn parses_arbitrary_precision_and_formats_radices() {
