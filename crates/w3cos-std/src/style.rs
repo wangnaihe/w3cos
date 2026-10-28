@@ -471,6 +471,13 @@ pub struct Style {
     /// the physical axes only for `horizontal-tb` (CSS Writing Modes 4).
     #[serde(default)]
     pub writing_mode: WritingMode,
+    /// Physical values the element's logical properties (`inline-size`,
+    /// `block-size`, `margin-block-start`, ...) resolve to for the layout
+    /// engine that models them. The fields above keep the declarations
+    /// exactly as the engine that ignores them reads them; see
+    /// [`LogicalOverrides`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_overrides: Option<Box<LogicalOverrides>>,
     #[serde(default)]
     pub unicode_bidi: UnicodeBidi,
 
@@ -640,6 +647,7 @@ impl Default for Style {
             hanging_punctuation_last: false,
             direction: TextDirection::Ltr,
             writing_mode: WritingMode::HorizontalTb,
+            logical_overrides: None,
             unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
             contain: Contain::None,
@@ -818,6 +826,7 @@ impl Style {
             direction,
             unicode_bidi,
             writing_mode,
+            logical_overrides,
             custom_properties,
             contain,
             will_change,
@@ -945,6 +954,7 @@ impl Style {
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
             writing_mode: writing_mode_b,
+            logical_overrides: logical_overrides_b,
             custom_properties: custom_properties_b,
             contain: contain_b,
             will_change: will_change_b,
@@ -1070,6 +1080,7 @@ impl Style {
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
             && writing_mode == writing_mode_b
+            && logical_overrides == logical_overrides_b
             && custom_properties == custom_properties_b
             && contain == contain_b
             && will_change == will_change_b
@@ -1946,6 +1957,85 @@ impl WritingMode {
             "sideways-lr" => WritingMode::SidewaysLr,
             _ => return None,
         })
+    }
+}
+
+/// The physical values an element's logical properties resolve to, kept
+/// beside the declared style. The declared fields stay what the engine that
+/// ignores logical properties reads, so a reftest whose test and reference
+/// both relied on that keeps rendering the same; the engine that models them
+/// applies these on top (`apply`) and falls back, with both sides of a
+/// reftest, for the features it does not lay out.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LogicalOverrides {
+    pub width: Option<Dimension>,
+    pub height: Option<Dimension>,
+    pub min_width: Option<Dimension>,
+    pub min_height: Option<Dimension>,
+    pub max_width: Option<Dimension>,
+    pub max_height: Option<Dimension>,
+    /// Top, right, bottom, left.
+    pub margin: [Option<Spacing>; 4],
+    pub padding: [Option<Spacing>; 4],
+    /// Internal marker properties that differ: `None` removes the marker.
+    pub markers: Vec<(String, Option<String>)>,
+}
+
+impl LogicalOverrides {
+    /// The style as the engine that models logical properties reads it.
+    pub fn apply(&self, style: &mut Style) {
+        style.logical_overrides = None;
+        if let Some(v) = self.width {
+            style.width = v;
+        }
+        if let Some(v) = self.height {
+            style.height = v;
+        }
+        if let Some(v) = self.min_width {
+            style.min_width = v;
+        }
+        if let Some(v) = self.min_height {
+            style.min_height = v;
+        }
+        if let Some(v) = self.max_width {
+            style.max_width = v;
+        }
+        if let Some(v) = self.max_height {
+            style.max_height = v;
+        }
+        for (edge, value) in self.margin.iter().enumerate() {
+            let Some(v) = *value else { continue };
+            match edge {
+                0 => style.margin.top = v,
+                1 => style.margin.right = v,
+                2 => style.margin.bottom = v,
+                _ => style.margin.left = v,
+            }
+        }
+        for (edge, value) in self.padding.iter().enumerate() {
+            let Some(v) = *value else { continue };
+            match edge {
+                0 => style.padding.top = v,
+                1 => style.padding.right = v,
+                2 => style.padding.bottom = v,
+                _ => style.padding.left = v,
+            }
+        }
+        for (key, value) in &self.markers {
+            match value {
+                Some(value) => {
+                    style
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(key.clone(), value.clone());
+                }
+                None => {
+                    if let Some(properties) = style.custom_properties.as_mut() {
+                        properties.remove(key);
+                    }
+                }
+            }
+        }
     }
 }
 

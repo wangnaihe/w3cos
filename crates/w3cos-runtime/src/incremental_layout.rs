@@ -604,6 +604,7 @@ fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::S
         && old.letter_spacing == new.letter_spacing
         && old.direction == new.direction
         && old.writing_mode == new.writing_mode
+        && old.logical_overrides == new.logical_overrides
 }
 
 fn assign_layout_style(

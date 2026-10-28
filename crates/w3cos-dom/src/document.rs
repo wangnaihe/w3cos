@@ -3042,6 +3042,10 @@ impl Document {
         let mut declaration = CSSStyleDeclaration {
             inner: (*base).clone(),
             inline_declarations: Vec::new(),
+            map_logical: false,
+            map_block_axis: false,
+            shadow_logical: false,
+            shadow: None,
         };
         let animated =
             crate::animation::animated_declarations(id.0, base.animation.as_ref(), &|property| {
@@ -3213,6 +3217,7 @@ impl Document {
         author_declarations.extend(important);
         let mut merged =
             CSSStyleDeclaration::from_style(user_agent::html_default_style(&node.tag.as_static()));
+        merged.shadow_logical = true;
         // Textfield UA borders remain inset when author backgrounds disable
         // automatic theme painting. Do not apply textfield geometry to other
         // input types; author border declarations below still take precedence.
@@ -3573,6 +3578,7 @@ impl Document {
         merged.inner.custom_properties =
             (!custom_properties.is_empty()).then_some(custom_properties);
         let mut style = merged.to_style();
+        style.logical_overrides = merged.logical_overrides().map(Box::new);
 
         let control_tag = node.tag.as_static();
         let control_appearance = user_agent::control_appearance(
@@ -8052,6 +8058,40 @@ impl Document {
                 }
                 style.height = w3cos_std::style::Dimension::Auto;
             }
+        }
+        // The same used-value rules for a `block-size` percentage the engine
+        // that models logical properties reads.
+        if let Some(overrides) = style.logical_overrides.as_ref()
+            && let Some(w3cos_std::style::Dimension::Percent(value)) = overrides.height
+        {
+            let collapses = !matches!(
+                style.position,
+                w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+            ) && inherited.is_some_and(|parent| {
+                matches!(parent.height, w3cos_std::style::Dimension::Auto)
+                    && matches!(
+                        parent.display,
+                        w3cos_std::style::Display::Block
+                            | w3cos_std::style::Display::InlineBlock
+                            | w3cos_std::style::Display::ListItem
+                            | w3cos_std::style::Display::TableCell
+                            | w3cos_std::style::Display::TableCaption
+                    )
+            });
+            let mut overrides = overrides.clone();
+            if self.quirks_mode {
+                overrides.markers.push((
+                    "--w3cos-internal-quirks-percentage-height".to_string(),
+                    Some("1".to_string()),
+                ));
+            } else if collapses {
+                overrides.markers.push((
+                    "--w3cos-internal-computed-height-percent".to_string(),
+                    Some(format!("{value}")),
+                ));
+                overrides.height = Some(w3cos_std::style::Dimension::Auto);
+            }
+            style.logical_overrides = Some(overrides);
         }
         let qualified_tag = node.tag.as_str();
         let tag = qualified_tag.rsplit_once(':').map_or_else(
@@ -14243,6 +14283,7 @@ fn equivalent_text_paint_style(
         && left.direction == right.direction
         && left.unicode_bidi == right.unicode_bidi
         && left.writing_mode == right.writing_mode
+        && left.logical_overrides == right.logical_overrides
         && left.visibility == right.visibility
 }
 
@@ -29551,17 +29592,28 @@ mod computed_style_cache_tests {
         document.body().append_child(&mut document, vertical);
         use w3cos_std::style::{Dimension, WritingMode};
         let style = |id: NodeId| document.computed_style_for(id);
-        if crate::css_style::MAP_LOGICAL_PROPERTIES {
-            assert_eq!(style(horizontal_child.id).width, Dimension::Px(100.0));
-        }
+        // The declared width ignores `inline-size`; the override maps it.
+        let resolved = |id: NodeId| {
+            let mut style = document.computed_style_for(id);
+            if let Some(overrides) = style.logical_overrides.clone() {
+                overrides.apply(&mut style);
+            }
+            style
+        };
+        assert_eq!(style(horizontal_child.id).width, Dimension::Auto);
+        assert_eq!(resolved(horizontal_child.id).width, Dimension::Px(100.0));
+        assert!(style(inherits.id).logical_overrides.is_none());
         assert_eq!(style(vertical.id).writing_mode, WritingMode::VerticalRl);
         assert_eq!(style(inherits.id).writing_mode, WritingMode::VerticalRl);
         assert_eq!(style(inherits.id).width, Dimension::Auto);
         assert_eq!(style(late.id).writing_mode, WritingMode::VerticalLr);
         assert_eq!(style(late.id).width, Dimension::Auto);
         assert_eq!(style(reset.id).writing_mode, WritingMode::HorizontalTb);
-        if crate::css_style::MAP_LOGICAL_PROPERTIES {
-            assert_eq!(style(reset.id).height, Dimension::Px(30.0));
+        assert_eq!(style(reset.id).height, Dimension::Auto);
+        if crate::css_style::NG_BLOCK_AXIS_LOGICAL_PROPERTIES {
+            assert_eq!(resolved(reset.id).height, Dimension::Px(30.0));
+        } else {
+            assert_eq!(resolved(reset.id).height, Dimension::Auto);
         }
         assert_eq!(style(explicit.id).writing_mode, WritingMode::VerticalRl);
         assert_eq!(style(explicit.id).width, Dimension::Auto);

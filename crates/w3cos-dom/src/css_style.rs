@@ -8,14 +8,26 @@ use w3cos_std::style::{
 
 /// The one switch for resolving logical properties to physical ones by the
 /// element's `writing-mode` (`inline-size`/`block-size` and their min/max,
-/// `margin-block-start/end`, `padding-block-start/end`). While it is off,
-/// the cascade keeps the previous behaviour (the logical sizes are only
-/// recorded as markers, the block longhands are ignored) so the reftests
-/// whose reference and test both relied on that keep rendering the same.
-/// It is turned on once the features those pages need (grid baseline
-/// `align-content`, `text-box-trim` in multicol, `text-group-align`, ...)
-/// lay out correctly, or both sides are kept on one engine.
-pub const MAP_LOGICAL_PROPERTIES: bool = false;
+/// `margin-block-start/end`, `padding-block-start/end`).
+///
+/// The declared style (`Style::width`, `margin`, ...) always keeps the
+/// logical properties as the legacy layout engine reads them (the sizes are
+/// markers, the block longhands are ignored), so the reftests whose test and
+/// reference both relied on that keep rendering the same there. While this
+/// switch is on, the cascade also resolves them per writing mode into
+/// `Style::logical_overrides`, which only the engine that lays the logical
+/// axes out applies. That engine falls back, with both sides of a reftest,
+/// for the features it does not lay out.
+pub const NG_LOGICAL_PROPERTIES: bool = true;
+
+/// Whether the resolution also covers the block axis (`block-size`, its
+/// min/max, `margin-block-start/end`, `padding-block-start/end`) or only the
+/// inline axis. Reftests rely on block-axis spacers to place features the
+/// layout engine does not lay out yet (`text-box-trim`, `text-spacing-trim`,
+/// grid-lanes `flow-tolerance`, text-group-align, grid baseline
+/// `align-content`); resolving the spacers exposes those features, so the
+/// block axis follows once they are laid out.
+pub const NG_BLOCK_AXIS_LOGICAL_PROPERTIES: bool = false;
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
@@ -316,6 +328,15 @@ pub struct CSSStyleDeclaration {
     /// Document merges these with stylesheet rules using importance and
     /// inline precedence; raw values retain their priority markers.
     pub inline_declarations: Vec<(String, String)>,
+    /// Resolve logical properties to physical ones in `inner` (the shadow of
+    /// a cascade declaration does; the declared style does not).
+    pub map_logical: bool,
+    /// With `map_logical`: also resolve the block axis.
+    pub map_block_axis: bool,
+    /// The cascade's declaration keeps a shadow of itself that maps logical
+    /// properties, created at the first logical declaration.
+    pub shadow_logical: bool,
+    pub(crate) shadow: Option<Box<CSSStyleDeclaration>>,
 }
 
 /// CSSOM ignores a declaration whose value is not valid for the property.
@@ -361,6 +382,10 @@ impl CSSStyleDeclaration {
                 ..Style::default()
             },
             inline_declarations: Vec::new(),
+            map_logical: false,
+            map_block_axis: false,
+            shadow_logical: false,
+            shadow: None,
         }
     }
 
@@ -383,6 +408,10 @@ impl CSSStyleDeclaration {
         Self {
             inner: style,
             inline_declarations: Vec::new(),
+            map_logical: false,
+            map_block_axis: false,
+            shadow_logical: false,
+            shadow: None,
         }
     }
 
@@ -424,7 +453,108 @@ impl CSSStyleDeclaration {
         true
     }
 
+    /// Whether the property is one `map_logical` resolves per writing mode.
+    fn is_mapped_logical_property(name: &str) -> bool {
+        matches!(
+            name,
+            "inline-size"
+                | "inlineSize"
+                | "min-inline-size"
+                | "minInlineSize"
+                | "max-inline-size"
+                | "maxInlineSize"
+                | "block-size"
+                | "blockSize"
+                | "min-block-size"
+                | "minBlockSize"
+                | "max-block-size"
+                | "maxBlockSize"
+                | "margin-block-start"
+                | "marginBlockStart"
+                | "margin-block-end"
+                | "marginBlockEnd"
+                | "padding-block-start"
+                | "paddingBlockStart"
+                | "padding-block-end"
+                | "paddingBlockEnd"
+        )
+    }
+
     pub fn set_property(&mut self, name: &str, value: &str) {
+        if NG_LOGICAL_PROPERTIES
+            && self.shadow_logical
+            && self.shadow.is_none()
+            && Self::is_mapped_logical_property(name)
+        {
+            let mut shadow = self.clone();
+            shadow.map_logical = true;
+            shadow.map_block_axis = NG_BLOCK_AXIS_LOGICAL_PROPERTIES;
+            shadow.shadow_logical = false;
+            self.shadow = Some(Box::new(shadow));
+        }
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.set_property_unshadowed(name, value);
+        }
+        self.set_property_unshadowed(name, value);
+    }
+
+    /// The physical values the logical properties resolve to, where they
+    /// differ from the declared style (see `Style::logical_overrides`).
+    pub fn logical_overrides(&self) -> Option<w3cos_std::style::LogicalOverrides> {
+        let shadow = self.shadow.as_ref()?;
+        let (a, b) = (&self.inner, &shadow.inner);
+        let diff = |declared: Dimension, mapped: Dimension| (declared != mapped).then_some(mapped);
+        let edge = |declared: Spacing, mapped: Spacing| (declared != mapped).then_some(mapped);
+        let mut overrides = w3cos_std::style::LogicalOverrides {
+            width: diff(a.width, b.width),
+            height: diff(a.height, b.height),
+            min_width: diff(a.min_width, b.min_width),
+            min_height: diff(a.min_height, b.min_height),
+            max_width: diff(a.max_width, b.max_width),
+            max_height: diff(a.max_height, b.max_height),
+            margin: [
+                edge(a.margin.top, b.margin.top),
+                edge(a.margin.right, b.margin.right),
+                edge(a.margin.bottom, b.margin.bottom),
+                edge(a.margin.left, b.margin.left),
+            ],
+            padding: [
+                edge(a.padding.top, b.padding.top),
+                edge(a.padding.right, b.padding.right),
+                edge(a.padding.bottom, b.padding.bottom),
+                edge(a.padding.left, b.padding.left),
+            ],
+            markers: Vec::new(),
+        };
+        let marker = |properties: &Option<w3cos_std::style::CustomProperties>, key: &str| {
+            properties.as_ref().and_then(|p| p.get(key)).cloned()
+        };
+        let mut keys: Vec<&String> = Vec::new();
+        for properties in [&a.custom_properties, &b.custom_properties]
+            .into_iter()
+            .flatten()
+        {
+            keys.extend(
+                properties
+                    .keys()
+                    .filter(|key| key.starts_with("--w3cos-internal-")),
+            );
+        }
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            let (declared, mapped) = (
+                marker(&a.custom_properties, key),
+                marker(&b.custom_properties, key),
+            );
+            if declared != mapped {
+                overrides.markers.push((key.clone(), mapped));
+            }
+        }
+        (overrides != w3cos_std::style::LogicalOverrides::default()).then_some(overrides)
+    }
+
+    fn set_property_unshadowed(&mut self, name: &str, value: &str) {
         if self.replace_existing_inset(name, value) {
             return;
         }
@@ -853,7 +983,9 @@ impl CSSStyleDeclaration {
             // vertical-rl / sideways-rl and the left edge in vertical-lr /
             // sideways-lr. Layout only models the horizontal box, but the
             // edge sizes themselves are the same in every mode.
-            "margin-block-start" | "marginBlockStart" if MAP_LOGICAL_PROPERTIES => {
+            "margin-block-start" | "marginBlockStart"
+                if self.map_logical && self.map_block_axis =>
+            {
                 if let Some(v) = parse_margin_spacing(value) {
                     match self.inner.writing_mode.block_start_side() {
                         PhysicalSide::Top => self.inner.margin.top = v,
@@ -862,7 +994,7 @@ impl CSSStyleDeclaration {
                     }
                 }
             }
-            "margin-block-end" | "marginBlockEnd" if MAP_LOGICAL_PROPERTIES => {
+            "margin-block-end" | "marginBlockEnd" if self.map_logical && self.map_block_axis => {
                 if let Some(v) = parse_margin_spacing(value) {
                     match self.inner.writing_mode.block_start_side() {
                         PhysicalSide::Top => self.inner.margin.bottom = v,
@@ -871,7 +1003,9 @@ impl CSSStyleDeclaration {
                     }
                 }
             }
-            "padding-block-start" | "paddingBlockStart" if MAP_LOGICAL_PROPERTIES => {
+            "padding-block-start" | "paddingBlockStart"
+                if self.map_logical && self.map_block_axis =>
+            {
                 if let Some(v) = parse_padding_spacing(value) {
                     match self.inner.writing_mode.block_start_side() {
                         PhysicalSide::Top => self.inner.padding.top = v,
@@ -880,7 +1014,7 @@ impl CSSStyleDeclaration {
                     }
                 }
             }
-            "padding-block-end" | "paddingBlockEnd" if MAP_LOGICAL_PROPERTIES => {
+            "padding-block-end" | "paddingBlockEnd" if self.map_logical && self.map_block_axis => {
                 if let Some(v) = parse_padding_spacing(value) {
                     match self.inner.writing_mode.block_start_side() {
                         PhysicalSide::Top => self.inner.padding.bottom = v,
@@ -917,7 +1051,9 @@ impl CSSStyleDeclaration {
                 // included. Other writing modes are not modelled by layout:
                 // the size is only recorded so layout can tell the box is
                 // sized by something it ignores.
-                let horizontal = MAP_LOGICAL_PROPERTIES && self.inner.writing_mode.is_horizontal();
+                let horizontal = self.map_logical
+                    && self.inner.writing_mode.is_horizontal()
+                    && (self.map_block_axis || !name.to_ascii_lowercase().contains("block"));
                 let css_name: String = name
                     .chars()
                     .flat_map(|c| {
@@ -7386,16 +7522,30 @@ mod tests {
 
     #[test]
     fn block_axis_margin_and_padding_longhands_follow_the_writing_mode() {
-        if !MAP_LOGICAL_PROPERTIES {
-            // Off: the longhands are ignored like before the model existed.
-            let mut declaration = CSSStyleDeclaration::new();
-            declaration.set_property("margin-block-start", "40px");
-            declaration.set_property("padding-block-end", "4px");
-            assert_eq!(declaration.inner.margin.top, Spacing::Px(0.0));
-            assert_eq!(declaration.inner.padding.bottom, Spacing::Px(0.0));
-            return;
+        // The declared style ignores the longhands, like before the model
+        // existed; the shadow of a cascade declaration maps them.
+        let mut declared = CSSStyleDeclaration::new();
+        declared.shadow_logical = true;
+        declared.set_property("margin-block-start", "40px");
+        declared.set_property("padding-block-end", "4px");
+        assert_eq!(declared.inner.margin.top, Spacing::Px(0.0));
+        assert_eq!(declared.inner.padding.bottom, Spacing::Px(0.0));
+        if NG_BLOCK_AXIS_LOGICAL_PROPERTIES {
+            let overrides = declared.logical_overrides().expect("overrides");
+            assert_eq!(overrides.margin[0], Some(Spacing::Px(40.0)));
+            assert_eq!(overrides.padding[2], Some(Spacing::Px(4.0)));
+            assert_eq!(overrides.margin[2], None);
+            let mut resolved = declared.to_style();
+            overrides.apply(&mut resolved);
+            assert_eq!(resolved.margin.top, Spacing::Px(40.0));
+            assert_eq!(resolved.padding.bottom, Spacing::Px(4.0));
+        } else {
+            assert!(declared.logical_overrides().is_none());
         }
+
         let mut declaration = CSSStyleDeclaration::new();
+        declaration.map_logical = true;
+        declaration.map_block_axis = true;
         declaration.set_property("margin-block-start", "40px");
         declaration.set_property("marginBlockEnd", "6px");
         declaration.set_property("padding-block-start", "3px");
@@ -7406,6 +7556,8 @@ mod tests {
         assert_eq!(declaration.inner.padding.bottom, Spacing::Px(4.0));
 
         let mut vertical = CSSStyleDeclaration::new();
+        vertical.map_logical = true;
+        vertical.map_block_axis = true;
         vertical.set_property("writing-mode", "vertical-rl");
         vertical.set_property("margin-block-start", "40px");
         vertical.set_property("padding-block-end", "4px");
@@ -7415,6 +7567,8 @@ mod tests {
         assert_eq!(vertical.inner.padding.left, Spacing::Px(4.0));
 
         let mut lr = CSSStyleDeclaration::new();
+        lr.map_logical = true;
+        lr.map_block_axis = true;
         lr.set_property("writing-mode", "vertical-lr");
         lr.set_property("margin-block-start", "7px");
         lr.set_property("padding-block-end", "5px");
@@ -7426,7 +7580,9 @@ mod tests {
     fn writing_mode_parses_and_logical_sizes_map_in_horizontal_tb_only() {
         let mut declaration = CSSStyleDeclaration::new();
         assert_eq!(declaration.inner.writing_mode, WritingMode::HorizontalTb);
-        if MAP_LOGICAL_PROPERTIES {
+        declaration.map_logical = true;
+        declaration.map_block_axis = true;
+        {
             declaration.set_property("inline-size", "200px");
             declaration.set_property("maxBlockSize", "10px");
             declaration.set_property("min-inline-size", "5px");
@@ -7458,19 +7614,36 @@ mod tests {
                     .map(String::as_str),
                 Some("max-content")
             );
-        } else {
-            // Off: horizontal-tb records the marker like any other mode.
-            declaration.set_property("inline-size", "200px");
-            assert_eq!(declaration.inner.width, Dimension::Auto);
-            assert!(
-                declaration
-                    .inner
-                    .custom_properties
-                    .as_ref()
-                    .is_some_and(|properties| properties
-                        .contains_key("--w3cos-internal-logical-size-inline-size"))
-            );
         }
+        // The declared style (no mapping) records the marker like any other
+        // mode, and the cascade's shadow carries the physical value.
+        let mut declared = CSSStyleDeclaration::new();
+        declared.shadow_logical = true;
+        declared.set_property("inline-size", "200px");
+        declared.set_property("block-size", "30px");
+        assert_eq!(declared.inner.width, Dimension::Auto);
+        assert!(
+            declared
+                .inner
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties
+                    .contains_key("--w3cos-internal-logical-size-inline-size"))
+        );
+        let overrides = declared.logical_overrides().expect("overrides");
+        assert_eq!(overrides.width, Some(Dimension::Px(200.0)));
+        assert_eq!(
+            overrides.height,
+            NG_BLOCK_AXIS_LOGICAL_PROPERTIES.then_some(Dimension::Px(30.0))
+        );
+        assert!(overrides.markers.iter().any(|(key, value)| key
+            == "--w3cos-internal-logical-size-inline-size"
+            && value.is_none()));
+        // No logical property, no shadow.
+        let mut plain = CSSStyleDeclaration::new();
+        plain.shadow_logical = true;
+        plain.set_property("width", "10px");
+        assert!(plain.logical_overrides().is_none());
         for (keyword, mode) in [
             ("vertical-rl", WritingMode::VerticalRl),
             ("vertical-lr", WritingMode::VerticalLr),
