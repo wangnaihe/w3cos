@@ -51,6 +51,8 @@ const SIZE_CONTAINMENT: &str = "--w3cos-internal-size-containment";
 const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width is auto).
 pub(super) const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
+/// `stretch` on a size property (see the DOM marker): the axes that carry it.
+pub(super) const STRETCH: &str = "--w3cos-internal-stretch";
 pub(super) const MIN_WIDTH_KEYWORD: &str = "--w3cos-internal-min-width-keyword";
 /// `min-height` / `max-height` intrinsic keywords (the limit stays auto /
 /// none in the style). Block flow resolves them to the content height;
@@ -324,6 +326,10 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                     // them (keyword_inline_size), flex containers through
                     // apply_width_keywords.
                     && key != WIDTH_KEYWORD
+                    // `stretch`: block containers resolve it for their
+                    // children (stretch_child_styles); flex, grid and
+                    // table containers fall back when a child has it.
+                    && key != STRETCH
                     // Blocks and grid items resolve min-width keywords and
                     // blocks max-width keywords; elsewhere the limit stays
                     // auto / none, as before the cascade kept them.
@@ -3794,6 +3800,136 @@ pub(super) fn layout_block_sized(
     )
 }
 
+/// Visits the boxes whose containing block is `index`'s content box: its
+/// rendered children, looking through synthetic float rows.
+fn for_each_cb_child(flat: &[FlatNodeInfo], index: usize, f: &mut dyn FnMut(usize)) {
+    let end = flat[index].subtree_end;
+    let mut child = index + 1;
+    while child < end {
+        let next = flat[child].subtree_end.max(child + 1);
+        if flat[child].style.display != Display::None {
+            if is_float_group(flat[child].style) {
+                for_each_cb_child(flat, child, f);
+            } else {
+                f(child);
+            }
+        }
+        child = next;
+    }
+}
+
+/// Replacement styles for the in-flow and floated children of block
+/// container `index` that carry `stretch`; `cb` is its content box.
+/// `ignore_top` / `ignore_bottom`: the container has no top (bottom)
+/// border or padding and is not a BFC root, so the child's block margin
+/// on that side does not take part in the block size.
+fn stretch_child_styles(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    cb: &ConstraintSpace,
+    ignore_top: bool,
+    ignore_bottom: bool,
+) -> Vec<(usize, Style)> {
+    let mut out = Vec::new();
+    // A box that establishes a formatting context beside a float is sized
+    // against the space the float leaves; that avoidance is not modelled,
+    // so its inline `stretch` stays auto (as for flex, grid and table
+    // items, which do not resolve the keyword either).
+    let mut has_float = false;
+    for_each_cb_child(flat, index, &mut |child| {
+        has_float |= flat[child].style.float != Float::None;
+    });
+    for_each_cb_child(flat, index, &mut |child| {
+        let style = flat[child].style;
+        let Some(tokens) = marker(style, STRETCH) else {
+            return;
+        };
+        if oof::is_out_of_flow(style) {
+            return;
+        }
+        let side = |s: Spacing| match s {
+            Spacing::Auto => 0.0,
+            s => resolve_spacing_for_layout(
+                s,
+                cb.available_inline,
+                style,
+                cb.viewport_w,
+                cb.viewport_h,
+            ),
+        };
+        let border = border(style);
+        let edges_h = border[1] + border[3] + side(style.padding.left) + side(style.padding.right);
+        let edges_v = border[0] + border[2] + side(style.padding.top) + side(style.padding.bottom);
+        let in_flow_block = style.float == Float::None && !inline::is_atomic_inline(flat, child);
+        let to_content = |size: f32, edges: f32| match style.box_sizing {
+            BoxSizing::BorderBox => size.max(0.0),
+            BoxSizing::ContentBox => (size - edges).max(0.0),
+        };
+        let inline_size = to_content(
+            cb.available_inline - side(style.margin.left) - side(style.margin.right),
+            edges_h,
+        );
+        let block_size = cb.percentage_block.map(|available| {
+            let top = if in_flow_block && ignore_top {
+                0.0
+            } else {
+                side(style.margin.top)
+            };
+            let bottom = if in_flow_block && ignore_bottom {
+                0.0
+            } else {
+                side(style.margin.bottom)
+            };
+            to_content(available - top - bottom, edges_v)
+        });
+        let mut patched = style.clone();
+        for token in tokens.split(',') {
+            match token {
+                "w" | "minw" | "maxw"
+                    if has_float && style.float == Float::None && is_bfc_root(style) => {}
+                "w" => patched.width = Dimension::Px(inline_size),
+                "minw" => patched.min_width = Dimension::Px(inline_size),
+                "maxw" => patched.max_width = Dimension::Px(inline_size),
+                "h" => {
+                    if let Some(size) = block_size {
+                        patched.height = Dimension::Px(size);
+                    }
+                }
+                "minh" => {
+                    if let Some(size) = block_size {
+                        patched.min_height = Dimension::Px(size);
+                    }
+                }
+                "maxh" => {
+                    if let Some(size) = block_size {
+                        patched.max_height = Dimension::Px(size);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push((child, patched));
+    });
+    out
+}
+
+/// `flat` with the styles of `patched` boxes replaced.
+fn flat_with_styles<'a>(
+    flat: &'a [FlatNodeInfo<'a>],
+    patched: &'a [(usize, Style)],
+) -> Vec<FlatNodeInfo<'a>> {
+    flat.iter()
+        .enumerate()
+        .map(|(i, node)| {
+            let mut node = node.clone();
+            if let Some((_, style)) = patched.iter().find(|(j, _)| *j == i) {
+                node.style = style;
+            }
+            node
+        })
+        .collect()
+}
+
 /// NGBlockLayoutAlgorithm in a block formatting context whose exclusion
 /// space is `exclusions` (a BFC root starts its own).
 fn layout_block_in(
@@ -4044,6 +4180,23 @@ fn layout_block_in(
         fixed_block_indefinite: false,
     };
 
+    // CSS Sizing 4 stretch-fit sizing: a child's `stretch` sizes resolve
+    // against this box's content box. Block margins that would collapse
+    // with ours are ignored for the block size.
+    let stretch_styles = stretch_child_styles(
+        flat,
+        index,
+        &child_space,
+        !bfc_root && bt == 0.0 && pt == 0.0,
+        !bfc_root && bb == 0.0 && pb == 0.0,
+    );
+    let stretched_flat;
+    let flat = if stretch_styles.is_empty() {
+        flat
+    } else {
+        stretched_flat = flat_with_styles(flat, &stretch_styles);
+        &stretched_flat[..]
+    };
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;
     // Past clearance our top is resolved: margins that would collapse
     // through it resolve at our border box instead.

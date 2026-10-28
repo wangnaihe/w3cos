@@ -7306,3 +7306,204 @@ fn column_item_min_content_counts_adjacent_text_nodes_as_one_line() {
     assert!((rect(&ng, 3).3 - 21.6).abs() < 0.1, "{:?}", rect(&ng, 3));
     assert!((rect(&ng, 2).3 - 43.2).abs() < 0.2, "{:?}", rect(&ng, 2));
 }
+
+fn stretch(axes: &str, style: Style) -> Style {
+    with_markers(style, &[("--w3cos-internal-stretch", axes)])
+}
+
+/// `width: stretch` fills the containing block's content box minus the
+/// margins (CSS Sizing 4 stretch-fit sizing); `min-width: stretch` lifts a
+/// narrower `width`; the block size is the containing block's definite
+/// height, ignoring block margins that collapse with the parent's.
+#[test]
+fn stretch_sizes_block_children_against_the_content_box() {
+    let child = |axes: &str, style: Style| node(stretch(axes, style), vec![]);
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![child(
+                "w,h",
+                Style {
+                    margin: margins(10.0, 20.0, 10.0, 10.0),
+                    border_width: 2.0,
+                    padding: margins(3.0, 3.0, 3.0, 3.0),
+                    ..block()
+                },
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // 100 - 10 - 20 wide; the block margins collapse through the parent.
+    assert_eq!(rect(&out, 2), (10.0, 10.0, 70.0, 100.0));
+
+    // A parent bottom border keeps the child's bottom margin in the size.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                border_bottom_width: Some(5.0),
+                ..block()
+            },
+            vec![child(
+                "h",
+                Style {
+                    margin: margins(10.0, 0.0, 10.0, 0.0),
+                    ..block()
+                },
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 2).3, 90.0);
+
+    // An indefinite containing block height leaves `height: stretch` auto.
+    let root = node(
+        Style {
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(stretch("h", block()), vec![node(sized(20.0), vec![])])],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 1).3, 20.0);
+
+    // `min-width: stretch` beats a narrower `width`.
+    let root = node(
+        Style {
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![child(
+            "minw",
+            Style {
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(10.0),
+                ..block()
+            },
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 1).2, 100.0);
+}
+
+/// Flex items do not resolve `stretch` (it stays auto, as before the
+/// keyword was parsed), and a flow-root box beside a float keeps its auto
+/// width, the space the float leaves.
+#[test]
+fn stretch_is_not_resolved_for_flex_items_or_boxes_beside_floats() {
+    let root = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: w3cos_std::style::FlexDirection::Row,
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(stretch("w", block()), vec![])],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 1).2, 0.0);
+
+    let root = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    float: w3cos_std::style::Float::Left,
+                    width: Dimension::Px(100.0),
+                    height: Dimension::Px(100.0),
+                    ..block()
+                },
+                vec![],
+            ),
+            node(
+                stretch(
+                    "w",
+                    Style {
+                        display: Display::FlowRoot,
+                        height: Dimension::Px(100.0),
+                        ..block()
+                    },
+                ),
+                vec![],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 2), (100.0, 0.0, 100.0, 100.0));
+}
+
+/// An absolutely positioned `width: stretch` fills the padding box between
+/// its insets; with no insets it starts at its static position.
+#[test]
+fn stretch_fills_an_absolute_box_between_insets() {
+    let abs = |style: Style| {
+        node(
+            stretch(
+                "w",
+                Style {
+                    position: w3cos_std::style::Position::Absolute,
+                    height: Dimension::Px(10.0),
+                    margin: margins(0.0, 3.0, 0.0, 2.0),
+                    ..style
+                },
+            ),
+            vec![],
+        )
+    };
+    let holder = |inner: Component| {
+        node(
+            Style {
+                position: w3cos_std::style::Position::Relative,
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(40.0),
+                padding: Edges {
+                    left: px(5.0),
+                    right: px(5.0),
+                    ..margins(0.0, 0.0, 0.0, 0.0)
+                },
+                ..block()
+            },
+            vec![inner],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            holder(abs(Style {
+                left: Dimension::Px(0.0),
+                right: Dimension::Px(0.0),
+                ..block()
+            })),
+            holder(abs(block())),
+            holder(abs(Style {
+                right: Dimension::Px(10.0),
+                ..block()
+            })),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Padding box 60 wide: 60 - 5 margins, then minus the 5px start padding
+    // for the static position, then minus a 10px inset.
+    assert_eq!(rect(&out, 2).2, 55.0);
+    assert_eq!(rect(&out, 4).2, 50.0);
+    assert_eq!(rect(&out, 6).2, 45.0);
+}

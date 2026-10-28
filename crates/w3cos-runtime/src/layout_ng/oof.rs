@@ -144,6 +144,18 @@ pub(super) fn layout_out_of_flow(
         spacing(style.margin.left),
     );
 
+    // `stretch` fills the containing block's padding box between the
+    // insets (an auto inset is zero unless both are auto, which places the
+    // box at its static position). Its min/max forms stay on legacy.
+    let stretch = super::block::marker(style, super::block::STRETCH).unwrap_or("");
+    if stretch
+        .split(',')
+        .any(|t| matches!(t, "minw" | "maxw" | "minh" | "maxh"))
+    {
+        return super::bail("oof-stretch-limit");
+    }
+    let stretch_w = stretch.split(',').any(|t| t == "w");
+    let stretch_h = stretch.split(',').any(|t| t == "h");
     // CSS2 10.3.7.
     let mut left = length(style.left, w, style, &space);
     let mut right = length(style.right, w, style, &space);
@@ -169,6 +181,15 @@ pub(super) fn layout_out_of_flow(
     let block = length(style.height, h, style, &space)
         .map(content_h)
         .or_else(|| {
+            if stretch_h {
+                // Both insets resolve below; here only whether the block
+                // size is definite for the content.
+                let top = length(style.top, h, style, &space).unwrap_or(0.0);
+                let bottom = length(style.bottom, h, style, &space).unwrap_or(0.0);
+                return Some(
+                    content_h(h - top - bottom - mt.unwrap_or(0.0) - mb.unwrap_or(0.0)).max(0.0),
+                );
+            }
             if content_height_keyword(style) {
                 return None;
             }
@@ -184,7 +205,20 @@ pub(super) fn layout_out_of_flow(
             && !super::block::is_replaced(flat[index].kind)
             && !super::block::size_contained(style)
     });
-    let width = if let Some(keyword) = width_keyword {
+    let width = if stretch_w {
+        clamp_inline_size(
+            style,
+            &space,
+            edges_h,
+            content_w(
+                w - left.unwrap_or(0.0)
+                    - right.unwrap_or(0.0)
+                    - ml.unwrap_or(0.0)
+                    - mr.unwrap_or(0.0),
+            )
+            .max(0.0),
+        )
+    } else if let Some(keyword) = width_keyword {
         let available = w
             - left.unwrap_or(0.0)
             - right.unwrap_or(0.0)
@@ -299,7 +333,19 @@ pub(super) fn layout_out_of_flow(
         BoxSizing::BorderBox => (v - edges_v).max(0.0),
         BoxSizing::ContentBox => v,
     };
-    let specified_h = length(style.height, h, style, &space).map(content_h);
+    let specified_h = length(style.height, h, style, &space)
+        .map(content_h)
+        .or_else(|| {
+            stretch_h.then(|| {
+                content_h(
+                    h - top.unwrap_or(0.0)
+                        - bottom.unwrap_or(0.0)
+                        - mt.unwrap_or(0.0)
+                        - mb.unwrap_or(0.0),
+                )
+                .max(0.0)
+            })
+        });
     let stretched = match (specified_h, top, bottom) {
         // `height: min-content | max-content | fit-content` is the content
         // height in the block axis (css-sizing-3), not stretched between

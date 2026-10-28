@@ -1183,6 +1183,7 @@ pub struct ScrollExtent {
 // FlatNodeInfo — O(1) indexed access to tree data (replaces O(n) recursive lookups)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct FlatNodeInfo<'a> {
     /// Stable identity for this compiled tree slot across reactive rebuilds.
     /// The compiler keeps conditional branches mounted and only toggles
@@ -1330,7 +1331,9 @@ pub(crate) fn image_intrinsic_size(
     let decoded = crate::image_loader::dimensions(src)
         .map(|(width, height)| (width as f32, height as f32))
         .unwrap_or_else(|| {
-            if crate::image_loader::is_reserved_browser_source(src) {
+            // A missing `src` never starts a request, so there is nothing
+            // to wait for: the box is 0x0, as in browsers.
+            if src.trim().is_empty() || crate::image_loader::is_reserved_browser_source(src) {
                 (0.0, 0.0)
             } else {
                 (200.0, 200.0)
@@ -38177,6 +38180,12 @@ mod tests {
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (200.0, 200.0));
         crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn image_without_a_source_is_empty() {
+        let kind = ComponentKind::Image { src: String::new() };
+        assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (0.0, 0.0));
     }
 
     #[test]

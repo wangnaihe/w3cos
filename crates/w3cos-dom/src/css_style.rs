@@ -36,6 +36,12 @@ pub const MIN_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-height-keywo
 /// `max-height: min-content | max-content | fit-content`; `max_height`
 /// stays `Auto` (none).
 pub const MAX_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-height-keyword";
+/// `width | height | min-/max-` set to `stretch` (or `-webkit-fill-available`):
+/// a comma list of the axes that carry it (`w`, `h`, `minw`, `minh`, `maxw`,
+/// `maxh`). The dimension stays auto / none; LayoutNG resolves the keyword
+/// against the containing block (CSS Sizing 4 stretch-fit sizing) and
+/// layouts that do not leave it as the initial value.
+pub const STRETCH_PROPERTY: &str = "--w3cos-internal-stretch";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
@@ -188,7 +194,59 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<(f32, bool)>> {
     (ratio.is_finite() && ratio > 0.0).then_some(Some((ratio, auto)))
 }
 
+/// `stretch` token of the size property a keyword marker belongs to.
+fn stretch_token_of(key: &str) -> Option<&'static str> {
+    Some(match key {
+        WIDTH_KEYWORD_PROPERTY => "w",
+        HEIGHT_KEYWORD_PROPERTY => "h",
+        MIN_WIDTH_KEYWORD_PROPERTY => "minw",
+        MIN_HEIGHT_KEYWORD_PROPERTY => "minh",
+        MAX_WIDTH_KEYWORD_PROPERTY => "maxw",
+        MAX_HEIGHT_KEYWORD_PROPERTY => "maxh",
+        _ => return None,
+    })
+}
+
+fn is_stretch_keyword(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("stretch") || value.eq_ignore_ascii_case("-webkit-fill-available")
+}
+
+/// Adds or removes one axis of the `stretch` marker.
+fn set_stretch(style: &mut Style, token: &str, on: bool) {
+    let current = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(STRETCH_PROPERTY))
+        .cloned()
+        .unwrap_or_default();
+    let mut tokens: Vec<&str> = current
+        .split(',')
+        .filter(|t| !t.is_empty() && *t != token)
+        .collect();
+    if on {
+        tokens.push(token);
+    }
+    let joined = tokens.join(",");
+    match style.custom_properties.as_mut() {
+        Some(props) if joined.is_empty() => {
+            props.remove(STRETCH_PROPERTY);
+        }
+        _ if joined.is_empty() => {}
+        _ => {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(STRETCH_PROPERTY.to_string(), joined);
+        }
+    }
+}
+
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
+    // A later size declaration of the same property replaces `stretch`.
+    if let Some(token) = stretch_token_of(key) {
+        set_stretch(style, token, false);
+    }
     match value {
         Some(value) => {
             style
@@ -838,7 +896,11 @@ impl CSSStyleDeclaration {
                 }
             }
             "width" => {
-                if let Some(keyword) = inline_size_keyword(value) {
+                if is_stretch_keyword(value) {
+                    self.inner.width = Dimension::Auto;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "w", true);
+                } else if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.width = Dimension::Auto;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, Some(keyword));
                 } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
@@ -856,7 +918,11 @@ impl CSSStyleDeclaration {
             }
             "height" => {
                 let keyword = value.trim().to_ascii_lowercase();
-                if is_intrinsic_size_keyword(&keyword) {
+                if is_stretch_keyword(value) {
+                    self.inner.height = Dimension::Auto;
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "h", true);
+                } else if is_intrinsic_size_keyword(&keyword) {
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, Some(keyword));
                 } else if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
@@ -870,7 +936,11 @@ impl CSSStyleDeclaration {
                 }
             }
             "min-width" | "minWidth" => {
-                if let Some(keyword) = inline_size_keyword(value) {
+                if is_stretch_keyword(value) {
+                    self.inner.min_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "minw", true);
+                } else if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.min_width = Dimension::Auto;
                     set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, Some(keyword));
                 } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
@@ -883,7 +953,11 @@ impl CSSStyleDeclaration {
             }
             "min-height" | "minHeight" => {
                 let keyword = value.trim().to_ascii_lowercase();
-                if is_intrinsic_size_keyword(&keyword) {
+                if is_stretch_keyword(value) {
+                    self.inner.min_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "minh", true);
+                } else if is_intrinsic_size_keyword(&keyword) {
                     self.inner.min_height = Dimension::Auto;
                     set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
                 } else if let Some(value) = parse_size_calc(value).or_else(|| {
@@ -894,7 +968,11 @@ impl CSSStyleDeclaration {
                 }
             }
             "max-width" | "maxWidth" => {
-                if let Some(keyword) = inline_size_keyword(value) {
+                if is_stretch_keyword(value) {
+                    self.inner.max_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "maxw", true);
+                } else if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.max_width = Dimension::Auto;
                     set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, Some(keyword));
                 } else if value.trim().eq_ignore_ascii_case("none") {
@@ -909,7 +987,11 @@ impl CSSStyleDeclaration {
             }
             "max-height" | "maxHeight" => {
                 let keyword = value.trim().to_ascii_lowercase();
-                if is_intrinsic_size_keyword(&keyword) {
+                if is_stretch_keyword(value) {
+                    self.inner.max_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "maxh", true);
+                } else if is_intrinsic_size_keyword(&keyword) {
                     self.inner.max_height = Dimension::Auto;
                     set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
                 } else if value.trim().eq_ignore_ascii_case("none") {
@@ -7268,6 +7350,38 @@ mod tests {
         assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_some());
         declaration.set_property("word-break", "normal");
         assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_none());
+    }
+
+    #[test]
+    fn stretch_keyword_sets_and_clears_axis_tokens() {
+        let mut declaration = CSSStyleDeclaration::new();
+        let token = |declaration: &CSSStyleDeclaration| {
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(STRETCH_PROPERTY).cloned())
+                .unwrap_or_default()
+        };
+        declaration.set_property("width", "stretch");
+        declaration.set_property("height", "-WEBKIT-fill-available");
+        assert_eq!(declaration.inner.width, Dimension::Auto);
+        assert_eq!(declaration.inner.height, Dimension::Auto);
+        let mut tokens: Vec<String> = token(&declaration).split(',').map(String::from).collect();
+        tokens.sort();
+        assert_eq!(tokens, ["h", "w"]);
+        declaration.set_property("min-width", "stretch");
+        declaration.set_property("max-height", "stretch");
+        assert!(token(&declaration).contains("minw"));
+        assert!(token(&declaration).contains("maxh"));
+        // A later size replaces stretch; an invalid value keeps it.
+        declaration.set_property("width", "10px");
+        assert_eq!(declaration.inner.width, Dimension::Px(10.0));
+        assert!(!token(&declaration).split(',').any(|t| t == "w"));
+        declaration.set_property("height", "bogus");
+        assert!(token(&declaration).split(',').any(|t| t == "h"));
+        declaration.set_property("height", "min-content");
+        assert!(!token(&declaration).split(',').any(|t| t == "h"));
     }
 
     #[test]
