@@ -861,6 +861,9 @@ pub struct EsmResolver {
     /// Packages the app keeps out of the compiled graph (`package.json`
     /// `"w3cos": { "exclude": [...] }`); see [`Self::is_excluded_dynamic_import`].
     excluded_packages: std::cell::OnceCell<Vec<String>>,
+    /// Directories under a skipped top-level tree (`extensions/<name>`) that
+    /// hold an app-declared run-time root; see [`Self::link_declared_roots`].
+    declared_root_dirs: RefCell<Vec<PathBuf>>,
 }
 
 impl EsmResolver {
@@ -880,6 +883,7 @@ impl EsmResolver {
             esm_worker_entries: RefCell::new(Vec::new()),
             classic_scripts: RefCell::new(HashSet::new()),
             excluded_packages: std::cell::OnceCell::new(),
+            declared_root_dirs: RefCell::new(Vec::new()),
         }
     }
 
@@ -1101,6 +1105,20 @@ impl EsmResolver {
         let root = self.project_root.clone();
         for (key, worker) in [("workers", true), ("modules", false)] {
             for specifier in list(key) {
+                // `extensions/` is normally not walked (see
+                // `should_skip_graph_path`), but a declared root there (a
+                // built-in extension's `out/extension.js`) must be linked
+                // like any other module: as CommonJS, with its own
+                // `require()` graph. Otherwise it compiles as a plain ES
+                // module with empty exports and no `activate`.
+                if let Ok(resolved) = self.resolve(&specifier, &root) {
+                    if let Some(dir) = self.skipped_tree_dir(&resolved.path) {
+                        let mut dirs = self.declared_root_dirs.borrow_mut();
+                        if !dirs.contains(&dir) {
+                            dirs.push(dir);
+                        }
+                    }
+                }
                 let edges_before = self.dynamic_imports.borrow().len();
                 self.link_dynamic_import(entry, &specifier, &root, visited, graph);
                 let linked = self.dynamic_imports.borrow().get(edges_before).cloned();
@@ -1816,6 +1834,18 @@ impl EsmResolver {
     /// under `out/`, not `src/`.
     /// Build/test tooling and TypeScript sources are not part of the Electron
     /// `out/` runtime graph; following them pulls thousands of dead modules.
+    /// `<root>/extensions/<name>` for a path inside an extension directory.
+    fn skipped_tree_dir(&self, path: &Path) -> Option<PathBuf> {
+        let rel = path.strip_prefix(&self.project_root).ok()?;
+        let mut components = rel.components();
+        let first = components.next()?;
+        if first.as_os_str().to_str() != Some("extensions") {
+            return None;
+        }
+        let name = components.next()?;
+        Some(self.project_root.join("extensions").join(name))
+    }
+
     fn should_skip_graph_path(&self, path: &Path) -> bool {
         let Some(entry) = self.entry.borrow().clone() else {
             return false;
@@ -1835,7 +1865,12 @@ impl EsmResolver {
         if matches!(
             first,
             "build" | "test" | "src" | "extensions" | ".eslintplugin" | "scripts"
-        ) {
+        ) && !self
+            .declared_root_dirs
+            .borrow()
+            .iter()
+            .any(|dir| path.starts_with(dir))
+        {
             return true;
         }
         // Unit-test trees live under out/vs/**/test/** (and *.test.js). Following
@@ -3575,6 +3610,67 @@ export function main() {{ bump(); return value + plugin.value; }}"#
         assert!(app.runtime_imports.iter().any(|import| {
             import.local == "plugin" && import.imported == "*" && import.specifier == specifier
         }));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn declared_extension_roots_link_as_commonjs_with_their_own_graph() {
+        let root = fixture_root("w3cos_declared_extension_roots");
+        write_tree(
+            &root,
+            &[
+                (
+                    "package.json",
+                    r#"{"type":"module","w3cos":{"modules":["extensions/ext/out/extension.js"]}}"#,
+                ),
+                ("out/main.js", "export const boot = 1;\n"),
+                (
+                    "extensions/ext/out/extension.js",
+                    "const util = require('./util');\nexports.activate = function () { return util.x; };\n",
+                ),
+                (
+                    "extensions/ext/package.json",
+                    r#"{"name":"ext","main":"./out/extension"}"#,
+                ),
+                ("extensions/ext/out/util.js", "exports.x = 1;\n"),
+                (
+                    "extensions/other/out/extension.js",
+                    "exports.activate = 1;\n",
+                ),
+            ],
+        );
+        let resolver = EsmResolver::new(&root);
+        let graph = resolver
+            .build_graph_from_entry(&root.join("out/main.js"))
+            .unwrap();
+        let paths: Vec<&Path> = graph
+            .nodes
+            .iter()
+            .map(|n| n.module.path.as_path())
+            .collect();
+        let ext = root.join("extensions/ext/out/extension.js");
+        assert!(paths.contains(&ext.as_path()), "{paths:?}");
+        assert!(
+            paths.contains(
+                &root
+                    .join("extensions/ext/out/util.js.w3cos-cjs.js")
+                    .as_path()
+            ),
+            "the extension's require() graph must be linked: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&root.join("extensions/other/out/extension.js").as_path()),
+            "undeclared extensions stay out of the graph"
+        );
+        assert!(
+            resolver.prepare_commonjs(&ext).unwrap(),
+            "a declared extension root is CommonJS (exports.activate), not an empty ES module"
+        );
+        assert!(
+            resolver.is_commonjs(&ext),
+            "CommonJS facade must be registered during graph build"
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
