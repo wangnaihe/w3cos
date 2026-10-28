@@ -108,6 +108,11 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stored; only a grid container consults the marker.
             | "grid-lanes"
             | "percent-gap"
+            // `-webkit-box` reads these (webkit_box_styles); on any other
+            // box they have no effect.
+            | "webkit-box-orient"
+            | "webkit-line-clamp"
+            | "clamp-lines"
             // Read with the run-in display marker (run_in_block_styles).
             | "run-in-block"
     ) || name.starts_with("decoration-owner")
@@ -554,7 +559,13 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 // marker, so a line-clamp reference does not switch engines
                 // alone. `-webkit-box-orient` is not stored, so a vertical
                 // box stays the row the legacy engine already paints.
-                let flex_reason = super::flex::container_reason(flat, index);
+                let flex_reason = super::flex::container_reason(flat, index).or_else(|| {
+                    // (A vertical box that run_in_block_styles left alone
+                    // is no row.)
+                    (marker(info.style, "--w3cos-internal-webkit-box-orient") == Some("vertical")
+                        && is_legacy_webkit_box(info.style))
+                    .then_some("webkit-box-vertical")
+                });
                 let allowed: &[&str] = if (is_run_in(info.style)
                     || is_legacy_webkit_box(info.style))
                     && flex_reason.is_none()
@@ -1564,7 +1575,10 @@ fn is_run_in(style: &Style) -> bool {
 pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
     let mut styles = Vec::new();
     for (index, info) in flat.iter().enumerate() {
-        if !is_run_in(info.style) || marker(info.style, "--w3cos-internal-run-in-block").is_none() {
+        let run_in = is_run_in(info.style) && marker(info.style, RUN_IN_BLOCK).is_some();
+        if matches!(info.kind, ComponentKind::Text { .. })
+            || (!run_in && !is_vertical_webkit_box(info.style))
+        {
             continue;
         }
         let children: Vec<&FlatNodeInfo> = flat[index + 1..info.subtree_end]
@@ -1576,6 +1590,7 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
             [text] if matches!(text.kind, ComponentKind::Text { .. }) => {
                 text.style.display == Display::Inline
             }
+            _ if !run_in => false,
             _ => children.iter().all(|child| {
                 matches!(
                     child.style.display,
@@ -1587,10 +1602,19 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
         };
         if contents {
             let mut style = info.style.clone();
-            style.display = Display::Block;
+            style.display = if run_in {
+                Display::Block
+            } else {
+                Display::FlowRoot
+            };
             if let Some(properties) = style.custom_properties.as_mut() {
                 properties.remove("--w3cos-internal-unrecognized-display");
-                properties.remove("--w3cos-internal-run-in-block");
+                properties.remove(RUN_IN_BLOCK);
+                properties.remove("--w3cos-internal-webkit-box-orient");
+                // `-webkit-line-clamp` counts the box's lines (inline.rs).
+                if let Some(lines) = properties.remove("--w3cos-internal-webkit-line-clamp") {
+                    properties.insert(inline::CLAMP_MARKER.into(), lines);
+                }
                 if properties.is_empty() {
                     style.custom_properties = None;
                 }
@@ -1605,6 +1629,16 @@ pub(super) fn run_in_block_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> 
 /// `display: flex` plus the unrecognized marker, so NG off is unchanged.
 /// `-webkit-inline-box` is not an inline-flex: the used value is the
 /// block flex box the legacy engine already paints.
+const RUN_IN_BLOCK: &str = "--w3cos-internal-run-in-block";
+
+/// A `-webkit-box` with `-webkit-box-orient: vertical` stacks its in-flow
+/// children as a block flow root; the legacy engine lays out the flex row.
+fn is_vertical_webkit_box(style: &Style) -> bool {
+    unrecognized_display(style).is_some_and(|value| value == "-webkit-box")
+        && marker(style, "--w3cos-internal-webkit-box-orient") == Some("vertical")
+        && style.direction == TextDirection::Ltr
+}
+
 fn is_legacy_webkit_box(style: &Style) -> bool {
     unrecognized_display(style)
         .is_some_and(|value| matches!(value, "-webkit-box" | "-webkit-inline-box"))
@@ -2023,6 +2057,7 @@ fn layout_block_in(
                     BoxFragment {
                         index: child,
                         text_range: None,
+                        ellipsis: false,
                         width,
                         height: (bottom - y0).max(0.0),
                         children: placed
@@ -2624,6 +2659,7 @@ fn layout_block_in(
         fragment: BoxFragment {
             index,
             text_range: None,
+            ellipsis: false,
             width,
             height,
             children,
