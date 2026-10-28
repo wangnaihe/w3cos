@@ -761,7 +761,7 @@ pub enum RequireTarget {
     Builtin(String),
 }
 
-fn js_string(value: &str) -> String {
+pub(crate) fn js_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization cannot fail")
 }
 

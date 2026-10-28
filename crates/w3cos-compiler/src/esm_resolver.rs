@@ -1011,7 +1011,7 @@ impl EsmResolver {
             return Ok(resolved);
         }
         if specifier == "vscode" && !self.project_root.join("node_modules/vscode").exists() {
-            return vscode_module(&self.project_root);
+            return vscode_module(&self.project_root, from_dir);
         }
         if crate::electron_app::is_electron_specifier(specifier) {
             let (resolved, scripts) = electron_module(specifier, &self.project_root)?;
@@ -2718,19 +2718,33 @@ fn electron_module(specifier: &str, project_root: &Path) -> Result<(ResolvedModu
     Ok((resolved, scripts))
 }
 
-/// The extension host's `vscode` API. It is not a file: the host hands it out
-/// through its `require('vscode')` interceptor. A CommonJS record whose body
-/// re-exports that `require` lets ES-module extensions (`import { window }
-/// from 'vscode'`) bind it like any CommonJS dependency; left unresolved, the
-/// names were read off the browser global instead.
-fn vscode_module(project_root: &Path) -> Result<ResolvedModule> {
+/// The extension host's `vscode` API. It is not a file: the host hands out a
+/// *per-extension* API object through its patched `Module._load`, keyed by the
+/// requiring module's filename. A CommonJS record that asks the host on behalf
+/// of the importer's extension (nearest `package.json`) lets ES-module
+/// extensions (`import { window } from 'vscode'`) bind it like any CommonJS
+/// dependency; left unresolved, the names were read off the browser global.
+fn vscode_module(project_root: &Path, from_dir: &Path) -> Result<ResolvedModule> {
+    let owner = from_dir
+        .ancestors()
+        .find(|dir| dir.join("package.json").is_file())
+        .unwrap_or(project_root);
     let dir = node_builtin_dir(project_root)?;
-    let path = dir.join("vscode.js");
-    // `require` through an alias: a literal `require('vscode')` would link
-    // this very file as its own dependency instead of reaching the host.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in owner.to_string_lossy().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let path = dir.join(format!("vscode-{hash:016x}.js"));
+    let owner_file = crate::cjs::js_string(&owner.join("package.json").to_string_lossy());
+    // Not a literal `require('vscode')`: that would link this file to itself.
     install_glue_file(
         &path,
-        "const hostRequire = require;\nmodule.exports = hostRequire('vscode');\n",
+        &format!(
+            "const loaded = globalThis.__w3cos_cjs_runtime_load('vscode', {{ id: {owner_file}, filename: {owner_file}, paths: [] }});\n\
+if (loaded === undefined) throw new Error(\"Cannot find module 'vscode'\");\n\
+module.exports = loaded.value;\n"
+        ),
     )?;
     Ok(ResolvedModule {
         specifier: "vscode".to_string(),
@@ -3707,14 +3721,15 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             &root,
             &[
                 ("package.json", r#"{"type":"module"}"#),
+                ("ext/package.json", r#"{"name":"ext"}"#),
                 (
-                    "src/ext.js",
+                    "ext/src/ext.js",
                     "import { window, LogLevel } from 'vscode';\nexport function activate() { return window.createOutputChannel('x', { log: true }).logLevel === LogLevel.Info; }\n",
                 ),
             ],
         );
         let resolver = EsmResolver::new(&root);
-        let entry = root.join("src/ext.js");
+        let entry = root.join("ext/src/ext.js");
         let graph = resolver.build_graph_from_entry(&entry).unwrap();
         let glue = graph
             .nodes
@@ -3723,10 +3738,21 @@ export function main() {{ bump(); return value + plugin.value; }}"#
             .map(|node| node.module.path.clone())
             .unwrap_or_else(|| panic!("vscode must link as a module: {:?}", graph.nodes.len()));
         assert!(resolver.is_commonjs(&glue), "{}", glue.display());
+        let glue_source = std::fs::read_to_string(&glue).unwrap();
+        assert!(
+            glue_source.contains(&root.join("ext/package.json").to_string_lossy().into_owned()),
+            "the host is asked on behalf of the importing extension: {glue_source}"
+        );
         let record = graph
             .nodes
             .iter()
-            .find(|node| node.module.path.ends_with("vscode.js.w3cos-cjs.js"))
+            .find(|node| {
+                node.module
+                    .path
+                    .to_string_lossy()
+                    .ends_with(".w3cos-cjs.js")
+                    && node.module.path.to_string_lossy().contains("vscode-")
+            })
             .unwrap_or_else(|| {
                 panic!(
                     "no record: {:?}",
