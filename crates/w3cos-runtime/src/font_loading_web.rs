@@ -493,26 +493,38 @@ pub(crate) fn register_stylesheet_font_face(
 }
 
 pub(crate) fn clear_stylesheet_font_owner(owner: u64) {
-    let removed = STYLESHEET_FONT_FACES.with(|faces| faces.borrow_mut().remove(&owner));
+    // Runs from `ScriptLoaderInner::drop`, which thread-local destruction can
+    // reach after these registries are already gone; `try_with` makes that a
+    // no-op instead of an abort.
+    let Ok(removed) = STYLESHEET_FONT_FACES.try_with(|faces| faces.borrow_mut().remove(&owner))
+    else {
+        return;
+    };
     let Some(removed) = removed else {
         return;
     };
-    FONT_FACES.with(|faces| {
+    let _ = FONT_FACES.try_with(|faces| {
         faces
             .borrow_mut()
             .retain(|face| !removed.iter().any(|removed| removed == face));
     });
-    JS_FAMILIES.with(|families| {
-        let remaining = FONT_FACES.with(|faces| {
-            faces
-                .borrow()
-                .iter()
-                .map(|face| face.get_property("family").to_js_string())
-                .collect()
-        });
+    let _ = JS_FAMILIES.try_with(|families| {
+        let remaining = FONT_FACES
+            .try_with(|faces| {
+                faces
+                    .borrow()
+                    .iter()
+                    .map(|face| face.get_property("family").to_js_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         *families.borrow_mut() = remaining;
     });
-    if let Some(set) = FONT_FACE_SET_VALUE.with(|slot| slot.borrow().clone()) {
+    if let Some(set) = FONT_FACE_SET_VALUE
+        .try_with(|slot| slot.borrow().clone())
+        .ok()
+        .flatten()
+    {
         update_size(&set);
     }
 }

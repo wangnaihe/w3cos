@@ -5523,13 +5523,53 @@ impl ScriptLoader {
                     if !supported_stylesheet_font_format(format.as_deref()) {
                         continue;
                     }
-                    let Some(url) = Url::parse(&load.base_url)
-                        .ok()
+                    let base = Url::parse(&load.base_url).ok();
+                    let Some(url) = base
+                        .as_ref()
                         .and_then(|base| base.join(&href).ok())
-                        .filter(|url| matches!(url.scheme(), "http" | "https"))
+                        .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
                     else {
                         continue;
                     };
+                    if url.scheme() == "file" {
+                        // Local documents (file:// base) load sibling font files
+                        // directly from disk; a remote document may not read them.
+                        if base.as_ref().map(Url::scheme) != Some("file") {
+                            continue;
+                        }
+                        let Some(bytes) = url
+                            .to_file_path()
+                            .ok()
+                            .and_then(|path| std::fs::read(path).ok())
+                        else {
+                            eprintln!(
+                                "[w3cos] warning: @font-face source {url} failed: not readable"
+                            );
+                            continue;
+                        };
+                        let native = native_stylesheet_font_face(
+                            &load.face,
+                            crate::font_face::FontSource::Bytes(bytes),
+                        );
+                        match crate::font_face::FontRegistry::global()
+                            .register_for_owner(owner, native)
+                        {
+                            Ok(()) => {
+                                if let Some(face) = &load.js_face {
+                                    face.set_property("status", Value::string("loaded"));
+                                }
+                                self.advance_stylesheet_graph(graph);
+                                return;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[w3cos] warning: @font-face registration failed for {:?}: {error}",
+                                    load.face.family
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     self.start_stylesheet_font_request(graph, load, sources, url.as_str());
                     return;
                 }
@@ -16544,6 +16584,43 @@ window.__dynamicInlineHandler = dynamicInlineResult;
                 )
                 .is_some()
         );
+    }
+
+    #[test]
+    fn stylesheet_font_face_loads_sibling_file_scheme_fonts() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let directory = tempfile::tempdir().expect("file font directory");
+        std::fs::write(
+            directory.path().join("inter.ttf"),
+            include_bytes!("../assets/Inter-Regular.ttf"),
+        )
+        .unwrap();
+        let html = r#"<!doctype html><style>
+            @font-face { font-family: 'W3COS File Font'; src: url('./inter.ttf') format('truetype'); }
+            span { font-family: 'W3COS File Font'; }
+            </style><span id="s">hello</span>"#;
+        let url = Url::from_file_path(directory.path().join("index.html")).unwrap();
+        load_html_on_shared_vm(html, url.as_str()).unwrap();
+        let registry = crate::font_face::FontRegistry::global();
+        for _ in 0..2_000 {
+            crate::jsdom::document_value()
+                .get_property("fonts")
+                .get_property("ready");
+            if registry
+                .resolve(
+                    "W3COS File Font",
+                    crate::font_face::FontWeight::NORMAL,
+                    crate::font_face::FontFaceStyle::Normal,
+                )
+                .is_some()
+            {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("file:// @font-face source was not registered");
     }
 
     #[test]
