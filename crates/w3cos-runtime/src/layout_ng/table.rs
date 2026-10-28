@@ -1946,7 +1946,14 @@ pub(super) fn layout_with_block_size(
             .iter()
             .map(|(_, y, child)| y + child.height)
             .fold(0.0f32, f32::max);
-        let stretched = specified > 0.0 && content_bottom > 0.0 && content_bottom + 0.5 < extent;
+        // The cell is stretched only when its specified height is what
+        // sizes the box. A height smaller than the content-sized box is just
+        // the row minimum: the box is sized by its content and borders, and
+        // the children stay where block layout put them.
+        let stretched = specified > 0.0
+            && specified + 0.5 >= extent
+            && content_bottom > 0.0
+            && content_bottom + 0.5 < extent;
         let content_height = if collapsed {
             (extent - border[0] - border[2]).max(0.0)
         } else if stretched {

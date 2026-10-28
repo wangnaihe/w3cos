@@ -603,6 +603,7 @@ fn geometry_only_change(old: &w3cos_std::style::Style, new: &w3cos_std::style::S
         && old.word_break == new.word_break
         && old.letter_spacing == new.letter_spacing
         && old.direction == new.direction
+        && old.writing_mode == new.writing_mode
 }
 
 fn assign_layout_style(

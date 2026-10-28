@@ -3466,6 +3466,42 @@ impl Document {
         } else {
             author_declarations
         };
+        // `writing-mode` is inherited and decides how the element's logical
+        // properties map to physical ones (Blink resolves it first in
+        // ComputedStyle). Settle the final mode before the declarations that
+        // depend on it are applied. `inherit` and `unset` take the parent's.
+        merged.inner.writing_mode = inherited
+            .map(|parent| parent.writing_mode)
+            .unwrap_or_default();
+        for (prop, value, _specificity) in &author_declarations {
+            if !css_property_eq(prop, "writing-mode") {
+                continue;
+            }
+            let resolved;
+            let value = if value.contains("var(") {
+                resolved = resolve_css_variables(value, &custom_properties);
+                resolved.as_str()
+            } else {
+                value.as_str()
+            };
+            let value = value.trim().to_ascii_lowercase();
+            let value = value.trim_end_matches("!important").trim();
+            match value {
+                "inherit" | "unset" => {
+                    merged.inner.writing_mode = inherited
+                        .map(|parent| parent.writing_mode)
+                        .unwrap_or_default();
+                }
+                "initial" => {
+                    merged.inner.writing_mode = w3cos_std::style::WritingMode::HorizontalTb
+                }
+                _ => {
+                    if let Some(mode) = w3cos_std::style::WritingMode::from_keyword(value) {
+                        merged.inner.writing_mode = mode;
+                    }
+                }
+            }
+        }
         for (prop, value, _specificity) in &author_declarations {
             if !prop.starts_with("--") {
                 // The loop above already substituted `var()`. Calling
@@ -3479,6 +3515,10 @@ impl Document {
                 } else {
                     value.as_str()
                 };
+                if css_property_eq(prop, "writing-mode") {
+                    // Resolved above.
+                    continue;
+                }
                 if declaration_value_is_valid(prop, &value) {
                     merged.set_property(prop, &value);
                     if css_property_eq(prop, "text-decoration-color")
@@ -14202,6 +14242,7 @@ fn equivalent_text_paint_style(
         && left.line_break == right.line_break
         && left.direction == right.direction
         && left.unicode_bidi == right.unicode_bidi
+        && left.writing_mode == right.writing_mode
         && left.visibility == right.visibility
 }
 
@@ -29436,6 +29477,94 @@ mod computed_style_cache_tests {
                 "style={line_style}"
             );
         }
+        crate::stylesheet::clear_rules();
+    }
+
+    /// `writing-mode` is inherited and settles before the element's logical
+    /// sizes map: horizontal-tb maps them to the physical axes, other modes
+    /// keep the recorded marker whatever the declaration order.
+    #[test]
+    fn inline_style_vertical_parent_keeps_child_logical_sizes_unmapped() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent
+            .style_mut(&mut document)
+            .set_property("writing-mode", "vertical-lr");
+        let child = document.create_element("div");
+        child
+            .style_mut(&mut document)
+            .set_property("inline-size", "stretch");
+        child
+            .style_mut(&mut document)
+            .set_property("block-size", "100px");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+        use w3cos_std::style::{Dimension, WritingMode};
+        assert_eq!(
+            document.computed_style_for(parent.id).writing_mode,
+            WritingMode::VerticalLr
+        );
+        let style = document.computed_style_for(child.id);
+        assert_eq!(style.writing_mode, WritingMode::VerticalLr);
+        assert_eq!(style.height, Dimension::Auto);
+    }
+
+    #[test]
+    fn writing_mode_inherits_and_decides_logical_size_mapping() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#vertical", &[("writing-mode", "vertical-rl")]);
+        crate::stylesheet::register_rule("#inherits", &[("inline-size", "100px")]);
+        crate::stylesheet::register_rule(
+            "#late",
+            &[("inline-size", "100px"), ("writing-mode", "vertical-lr")],
+        );
+        crate::stylesheet::register_rule(
+            "#reset",
+            &[("writing-mode", "horizontal-tb"), ("block-size", "30px")],
+        );
+        crate::stylesheet::register_rule(
+            "#explicit",
+            &[("writing-mode", "inherit"), ("inline-size", "50px")],
+        );
+        let mut document = Document::new();
+        let mk = |document: &mut Document, id: &str| {
+            let element = document.create_element("div");
+            element.set_attribute(document, "id", id);
+            element
+        };
+        let horizontal_parent = mk(&mut document, "horizontal");
+        let horizontal_child = mk(&mut document, "inherits");
+        horizontal_parent.append_child(&mut document, horizontal_child);
+        let vertical = mk(&mut document, "vertical");
+        let inherits = mk(&mut document, "inherits");
+        let late = mk(&mut document, "late");
+        let reset = mk(&mut document, "reset");
+        let explicit = mk(&mut document, "explicit");
+        vertical.append_child(&mut document, inherits);
+        vertical.append_child(&mut document, late);
+        vertical.append_child(&mut document, reset);
+        vertical.append_child(&mut document, explicit);
+        document
+            .body()
+            .append_child(&mut document, horizontal_parent);
+        document.body().append_child(&mut document, vertical);
+        use w3cos_std::style::{Dimension, WritingMode};
+        let style = |id: NodeId| document.computed_style_for(id);
+        if crate::css_style::MAP_LOGICAL_PROPERTIES {
+            assert_eq!(style(horizontal_child.id).width, Dimension::Px(100.0));
+        }
+        assert_eq!(style(vertical.id).writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style(inherits.id).writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style(inherits.id).width, Dimension::Auto);
+        assert_eq!(style(late.id).writing_mode, WritingMode::VerticalLr);
+        assert_eq!(style(late.id).width, Dimension::Auto);
+        assert_eq!(style(reset.id).writing_mode, WritingMode::HorizontalTb);
+        if crate::css_style::MAP_LOGICAL_PROPERTIES {
+            assert_eq!(style(reset.id).height, Dimension::Px(30.0));
+        }
+        assert_eq!(style(explicit.id).writing_mode, WritingMode::VerticalRl);
+        assert_eq!(style(explicit.id).width, Dimension::Auto);
         crate::stylesheet::clear_rules();
     }
 

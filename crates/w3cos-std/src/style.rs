@@ -466,6 +466,11 @@ pub struct Style {
     pub hanging_punctuation_last: bool,
     #[serde(default)]
     pub direction: TextDirection,
+    /// CSS `writing-mode` (inherited). Blink keeps it in ComputedStyle and
+    /// derives the logical axes from it; the cascade maps logical sizes to
+    /// the physical axes only for `horizontal-tb` (CSS Writing Modes 4).
+    #[serde(default)]
+    pub writing_mode: WritingMode,
     #[serde(default)]
     pub unicode_bidi: UnicodeBidi,
 
@@ -634,6 +639,7 @@ impl Default for Style {
             line_break: LineBreak::Auto,
             hanging_punctuation_last: false,
             direction: TextDirection::Ltr,
+            writing_mode: WritingMode::HorizontalTb,
             unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
             contain: Contain::None,
@@ -811,6 +817,7 @@ impl Style {
             break_spaces,
             direction,
             unicode_bidi,
+            writing_mode,
             custom_properties,
             contain,
             will_change,
@@ -937,6 +944,7 @@ impl Style {
             break_spaces: break_spaces_b,
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
+            writing_mode: writing_mode_b,
             custom_properties: custom_properties_b,
             contain: contain_b,
             will_change: will_change_b,
@@ -1061,6 +1069,7 @@ impl Style {
             && break_spaces == break_spaces_b
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
+            && writing_mode == writing_mode_b
             && custom_properties == custom_properties_b
             && contain == contain_b
             && will_change == will_change_b
@@ -1904,6 +1913,61 @@ pub enum TextDirection {
     #[default]
     Ltr,
     Rtl,
+}
+
+/// CSS `writing-mode` (CSS Writing Modes 4). The sideways values are the
+/// vertical modes whose lines run top to bottom with rotated glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WritingMode {
+    #[default]
+    HorizontalTb,
+    VerticalRl,
+    VerticalLr,
+    SidewaysRl,
+    SidewaysLr,
+}
+
+impl WritingMode {
+    /// Block flow is top to bottom and lines are horizontal: the inline size
+    /// is the physical width.
+    pub fn is_horizontal(self) -> bool {
+        self == WritingMode::HorizontalTb
+    }
+
+    /// Parse a computed `writing-mode` keyword, including the SVG 1.1 names
+    /// Blink still accepts (`lr`, `lr-tb`, `rl`, `rl-tb` are horizontal-tb;
+    /// `tb` and `tb-rl` are vertical-rl). `None` for anything else.
+    pub fn from_keyword(value: &str) -> Option<WritingMode> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "horizontal-tb" | "lr" | "lr-tb" | "rl" | "rl-tb" => WritingMode::HorizontalTb,
+            "vertical-rl" | "tb" | "tb-rl" => WritingMode::VerticalRl,
+            "vertical-lr" => WritingMode::VerticalLr,
+            "sideways-rl" => WritingMode::SidewaysRl,
+            "sideways-lr" => WritingMode::SidewaysLr,
+            _ => return None,
+        })
+    }
+}
+
+/// The physical edge a logical block-start edge resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalSide {
+    Top,
+    Right,
+    Left,
+}
+
+impl WritingMode {
+    /// Block-start edge (CSS Writing Modes): top in horizontal-tb, right in
+    /// vertical-rl and sideways-rl, left in vertical-lr and sideways-lr. The
+    /// block-end edge is the opposite one.
+    pub fn block_start_side(self) -> PhysicalSide {
+        match self {
+            WritingMode::HorizontalTb => PhysicalSide::Top,
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => PhysicalSide::Right,
+            WritingMode::VerticalLr | WritingMode::SidewaysLr => PhysicalSide::Left,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

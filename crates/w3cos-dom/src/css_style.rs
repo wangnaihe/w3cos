@@ -2,9 +2,20 @@ use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, BoxSizing, Clear, ColumnFill, Contain, CssClipRect, Dimension, Display, Edges,
-    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style,
-    TextDirection, UnicodeBidi, WillChange, parse_css_integer_clamped,
+    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, PhysicalSide, Position, Spacing,
+    Style, TextDirection, UnicodeBidi, WillChange, WritingMode, parse_css_integer_clamped,
 };
+
+/// The one switch for resolving logical properties to physical ones by the
+/// element's `writing-mode` (`inline-size`/`block-size` and their min/max,
+/// `margin-block-start/end`, `padding-block-start/end`). While it is off,
+/// the cascade keeps the previous behaviour (the logical sizes are only
+/// recorded as markers, the block longhands are ignored) so the reftests
+/// whose reference and test both relied on that keep rendering the same.
+/// It is turned on once the features those pages need (grid baseline
+/// `align-content`, `text-box-trim` in multicol, `text-group-align`, ...)
+/// lay out correctly, or both sides are kept on one engine.
+pub const MAP_LOGICAL_PROPERTIES: bool = false;
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
@@ -837,6 +848,47 @@ impl CSSStyleDeclaration {
                     self.inner.margin.right = v
                 }
             }
+            // The block axis follows the writing mode (CSS Writing Modes):
+            // block-start is the top edge in horizontal-tb, the right edge in
+            // vertical-rl / sideways-rl and the left edge in vertical-lr /
+            // sideways-lr. Layout only models the horizontal box, but the
+            // edge sizes themselves are the same in every mode.
+            "margin-block-start" | "marginBlockStart" if MAP_LOGICAL_PROPERTIES => {
+                if let Some(v) = parse_margin_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.margin.top = v,
+                        PhysicalSide::Right => self.inner.margin.right = v,
+                        PhysicalSide::Left => self.inner.margin.left = v,
+                    }
+                }
+            }
+            "margin-block-end" | "marginBlockEnd" if MAP_LOGICAL_PROPERTIES => {
+                if let Some(v) = parse_margin_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.margin.bottom = v,
+                        PhysicalSide::Right => self.inner.margin.left = v,
+                        PhysicalSide::Left => self.inner.margin.right = v,
+                    }
+                }
+            }
+            "padding-block-start" | "paddingBlockStart" if MAP_LOGICAL_PROPERTIES => {
+                if let Some(v) = parse_padding_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.padding.top = v,
+                        PhysicalSide::Right => self.inner.padding.right = v,
+                        PhysicalSide::Left => self.inner.padding.left = v,
+                    }
+                }
+            }
+            "padding-block-end" | "paddingBlockEnd" if MAP_LOGICAL_PROPERTIES => {
+                if let Some(v) = parse_padding_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.padding.bottom = v,
+                        PhysicalSide::Right => self.inner.padding.left = v,
+                        PhysicalSide::Left => self.inner.padding.right = v,
+                    }
+                }
+            }
             "margin-block" | "marginBlock" => {
                 let values = split_css_whitespace(value);
                 if let Some(start) = values.first().and_then(|value| parse_margin_spacing(value)) {
@@ -859,8 +911,13 @@ impl CSSStyleDeclaration {
             "inline-size" | "inlineSize" | "min-inline-size" | "minInlineSize"
             | "max-inline-size" | "maxInlineSize" | "block-size" | "blockSize"
             | "min-block-size" | "minBlockSize" | "max-block-size" | "maxBlockSize" => {
-                // Not resolved to a physical size; only recorded so layout
-                // can tell the box is sized by something it ignores.
+                // In horizontal-tb the logical axes are the physical ones
+                // (inline-size is width, block-size is height) and the
+                // property takes the physical value grammar, keywords
+                // included. Other writing modes are not modelled by layout:
+                // the size is only recorded so layout can tell the box is
+                // sized by something it ignores.
+                let horizontal = MAP_LOGICAL_PROPERTIES && self.inner.writing_mode.is_horizontal();
                 let css_name: String = name
                     .chars()
                     .flat_map(|c| {
@@ -871,6 +928,18 @@ impl CSSStyleDeclaration {
                         }
                     })
                     .collect();
+                if horizontal {
+                    let physical = css_name
+                        .replace("inline-size", "width")
+                        .replace("block-size", "height");
+                    // The CSSOM declaration list keeps the logical name only:
+                    // an extra physical entry would be replayed by the
+                    // cascade even where the element turns out to be vertical.
+                    let declarations = self.inline_declarations.clone();
+                    self.set_property(&physical, raw_value);
+                    self.inline_declarations = declarations;
+                    return;
+                }
                 let keyword = value.trim().to_ascii_lowercase();
                 // An intrinsic keyword on an inline size is the same keyword
                 // on the physical width in horizontal-tb, which the width
@@ -923,6 +992,9 @@ impl CSSStyleDeclaration {
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                     set_stretch(&mut self.inner, "h", true);
                 } else if is_intrinsic_size_keyword(&keyword) {
+                    // Block-axis intrinsic keywords behave as `auto`; an
+                    // earlier fixed height does not survive them.
+                    self.inner.height = Dimension::Auto;
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, Some(keyword));
                 } else if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
@@ -1716,6 +1788,16 @@ impl CSSStyleDeclaration {
                     "anywhere" => LineBreak::Anywhere,
                     _ => LineBreak::Auto,
                 };
+            }
+            "writing-mode" | "writingMode" => {
+                // `inherit` and `unset` are resolved against the parent by
+                // the cascade before the declarations are applied.
+                let value = value.trim().to_ascii_lowercase();
+                if value == "initial" {
+                    self.inner.writing_mode = WritingMode::HorizontalTb;
+                } else if let Some(mode) = WritingMode::from_keyword(&value) {
+                    self.inner.writing_mode = mode;
+                }
             }
             "direction" => {
                 self.inner.direction = if value.trim().eq_ignore_ascii_case("rtl") {
@@ -7303,8 +7385,133 @@ mod tests {
     }
 
     #[test]
+    fn block_axis_margin_and_padding_longhands_follow_the_writing_mode() {
+        if !MAP_LOGICAL_PROPERTIES {
+            // Off: the longhands are ignored like before the model existed.
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("margin-block-start", "40px");
+            declaration.set_property("padding-block-end", "4px");
+            assert_eq!(declaration.inner.margin.top, Spacing::Px(0.0));
+            assert_eq!(declaration.inner.padding.bottom, Spacing::Px(0.0));
+            return;
+        }
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("margin-block-start", "40px");
+        declaration.set_property("marginBlockEnd", "6px");
+        declaration.set_property("padding-block-start", "3px");
+        declaration.set_property("paddingBlockEnd", "4px");
+        assert_eq!(declaration.inner.margin.top, Spacing::Px(40.0));
+        assert_eq!(declaration.inner.margin.bottom, Spacing::Px(6.0));
+        assert_eq!(declaration.inner.padding.top, Spacing::Px(3.0));
+        assert_eq!(declaration.inner.padding.bottom, Spacing::Px(4.0));
+
+        let mut vertical = CSSStyleDeclaration::new();
+        vertical.set_property("writing-mode", "vertical-rl");
+        vertical.set_property("margin-block-start", "40px");
+        vertical.set_property("padding-block-end", "4px");
+        assert_eq!(vertical.inner.margin.top, Spacing::Px(0.0));
+        assert_eq!(vertical.inner.margin.right, Spacing::Px(40.0));
+        assert_eq!(vertical.inner.padding.bottom, Spacing::Px(0.0));
+        assert_eq!(vertical.inner.padding.left, Spacing::Px(4.0));
+
+        let mut lr = CSSStyleDeclaration::new();
+        lr.set_property("writing-mode", "vertical-lr");
+        lr.set_property("margin-block-start", "7px");
+        lr.set_property("padding-block-end", "5px");
+        assert_eq!(lr.inner.margin.left, Spacing::Px(7.0));
+        assert_eq!(lr.inner.padding.right, Spacing::Px(5.0));
+    }
+
+    #[test]
+    fn writing_mode_parses_and_logical_sizes_map_in_horizontal_tb_only() {
+        let mut declaration = CSSStyleDeclaration::new();
+        assert_eq!(declaration.inner.writing_mode, WritingMode::HorizontalTb);
+        if MAP_LOGICAL_PROPERTIES {
+            declaration.set_property("inline-size", "200px");
+            declaration.set_property("maxBlockSize", "10px");
+            declaration.set_property("min-inline-size", "5px");
+            declaration.set_property("minBlockSize", "7px");
+            declaration.set_property("max-inline-size", "50%");
+            declaration.set_property("block-size", "40px");
+            let style = &declaration.inner;
+            assert_eq!(style.width, Dimension::Px(200.0));
+            assert_eq!(style.max_height, Dimension::Px(10.0));
+            assert_eq!(style.min_width, Dimension::Px(5.0));
+            assert_eq!(style.min_height, Dimension::Px(7.0));
+            assert_eq!(style.max_width, Dimension::Percent(50.0));
+            assert_eq!(style.height, Dimension::Px(40.0));
+            assert!(style.custom_properties.as_ref().is_none_or(|properties| {
+                properties
+                    .keys()
+                    .all(|key| !key.starts_with(LOGICAL_SIZE_PROPERTY_PREFIX))
+            }));
+            // Keywords take the physical grammar: an inline-size keyword is the
+            // width keyword.
+            declaration.set_property("inline-size", "max-content");
+            assert_eq!(declaration.inner.width, Dimension::Auto);
+            assert_eq!(
+                declaration
+                    .inner
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|properties| properties.get(WIDTH_KEYWORD_PROPERTY))
+                    .map(String::as_str),
+                Some("max-content")
+            );
+        } else {
+            // Off: horizontal-tb records the marker like any other mode.
+            declaration.set_property("inline-size", "200px");
+            assert_eq!(declaration.inner.width, Dimension::Auto);
+            assert!(
+                declaration
+                    .inner
+                    .custom_properties
+                    .as_ref()
+                    .is_some_and(|properties| properties
+                        .contains_key("--w3cos-internal-logical-size-inline-size"))
+            );
+        }
+        for (keyword, mode) in [
+            ("vertical-rl", WritingMode::VerticalRl),
+            ("vertical-lr", WritingMode::VerticalLr),
+            ("sideways-rl", WritingMode::SidewaysRl),
+            ("sideways-lr", WritingMode::SidewaysLr),
+            ("tb-rl", WritingMode::VerticalRl),
+            ("lr-tb", WritingMode::HorizontalTb),
+            ("horizontal-tb", WritingMode::HorizontalTb),
+        ] {
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("writing-mode", keyword);
+            assert_eq!(declaration.inner.writing_mode, mode, "{keyword}");
+        }
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("writing-mode", "vertical-rl");
+        declaration.set_property("writing-mode", "nonsense");
+        assert_eq!(declaration.inner.writing_mode, WritingMode::VerticalRl);
+        declaration.set_property("writing-mode", "initial");
+        assert_eq!(declaration.inner.writing_mode, WritingMode::HorizontalTb);
+
+        // Vertical modes keep the recorded marker and leave the physical
+        // axes alone.
+        let mut vertical = CSSStyleDeclaration::new();
+        vertical.inner.writing_mode = WritingMode::VerticalLr;
+        vertical.set_property("block-size", "40px");
+        assert_eq!(vertical.inner.height, Dimension::Auto);
+        assert!(
+            vertical
+                .inner
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties
+                    .contains_key("--w3cos-internal-logical-size-block-size"))
+        );
+    }
+
+    #[test]
     fn width_keyword_and_auto_phrase_markers() {
         let mut declaration = CSSStyleDeclaration::new();
+        // Logical sizes are only recorded outside horizontal-tb.
+        declaration.inner.writing_mode = WritingMode::VerticalRl;
         declaration.set_property("inline-size", "200px");
         declaration.set_property("maxBlockSize", "10px");
         assert_eq!(declaration.inner.width, Dimension::Auto);
