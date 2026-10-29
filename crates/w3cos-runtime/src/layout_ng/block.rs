@@ -763,11 +763,21 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         Display::Block | Display::FlowRoot => {
             unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
         }
-        // The UA display is `inline-block`. The line box under this font
-        // is 24.1875px for a 20px canvas; Chrome's is 24px. A block
-        // reference of the same border box would be one-sided, so inline
-        // canvases stay `kind:other`.
-        Display::Inline | Display::InlineBlock => Some("kind:other"),
+        // The UA display is `inline-block`. A canvas is an atomic inline of
+        // its IFC (NGInlineItem kAtomicInline) like an inline `<img>`: its
+        // margin box sits on the baseline with the bottom margin edge as
+        // its baseline (CSS 2.1 10.8.1), laid out through `layout_block`.
+        Display::Inline | Display::InlineBlock => {
+            if !inline::is_atomic_inline(flat, index) || !inline::in_inline_container(flat, index) {
+                return Some("kind:other");
+            }
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
         _ => Some("kind:other"),
     }
 }
