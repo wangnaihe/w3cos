@@ -161,7 +161,7 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     }
     // Positioned block-level boxes are checked by node_reason
     // (position_reason); atomics and sticky stay on legacy.
-    if style.position != Position::Static && (atomic || style.position == Position::Sticky) {
+    if style.position != Position::Static && atomic {
         return Some("position");
     }
     // Floats and clearance of block-level boxes are checked by node_reason
@@ -454,11 +454,11 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     let info = &flat[index];
     let style = info.style;
     match style.position {
-        Position::Static | Position::Sticky => None,
+        Position::Static => None,
         _ if inline::is_atomic_inline(flat, index) || style.display == Display::Inline => {
             Some("position:inline")
         }
-        Position::Relative => None,
+        Position::Relative | Position::Sticky => None,
         Position::Absolute | Position::Fixed => {
             if !matches!(style.display, Display::Block | Display::FlowRoot) {
                 return Some("position:display");

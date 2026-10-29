@@ -4500,3 +4500,99 @@ fn scroll_containers_match_chrome() {
     let (scrollable, _, _) = extents(&root);
     assert_eq!(scrollable, vec![(1, 40.0, 0.0)]);
 }
+
+/// `position: sticky` boxes keep their static position in layout: the
+/// sticky offset is a paint-time constraint applied against the nearest
+/// scroll container (`scroll_ancestor`), so insets never move the layout
+/// box, not even at scroll 0 (testdata/chrome-sticky.json).
+#[test]
+fn sticky_keeps_static_position_like_chrome() {
+    use crate::layout::scroll_containers_from_layout;
+    use w3cos_std::style::{Overflow, Position};
+    let sticky = |style: Style| Style {
+        position: Position::Sticky,
+        ..style
+    };
+
+    // sticky-top: top/left insets do not move the box; its scroll ancestor
+    // is the overflow:auto parent.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(50.0),
+                overflow: Overflow::Auto,
+                ..block()
+            },
+            vec![
+                node(sized(20.0), vec![]),
+                node(
+                    sticky(Style {
+                        top: Dimension::Px(10.0),
+                        left: Dimension::Px(5.0),
+                        ..sized(20.0)
+                    }),
+                    vec![],
+                ),
+                node(sized(100.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 20.0));
+    close(rect(&out, 3), (0.0, 20.0, 100.0, 20.0));
+    close(rect(&out, 4), (0.0, 40.0, 100.0, 100.0));
+    let flat = pre_flatten(&root);
+    let (_, _, ancestor) = scroll_containers_from_layout(&out, &flat);
+    assert_eq!(ancestor[3], Some(1));
+
+    // sticky-flow: margin and a child inside a sticky box in normal flow.
+    let root = node(
+        block(),
+        vec![
+            node(sized(10.0), vec![]),
+            node(
+                sticky(Style {
+                    top: Dimension::Px(0.0),
+                    width: Dimension::Px(60.0),
+                    margin: margins(0.0, 0.0, 0.0, 15.0),
+                    ..sized(20.0)
+                }),
+                vec![node(sized(5.0), vec![])],
+            ),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (15.0, 10.0, 60.0, 20.0));
+    close(rect(&out, 3), (15.0, 10.0, 60.0, 5.0));
+    close(rect(&out, 4), (0.0, 30.0, 800.0, 10.0));
+
+    // sticky-bottom-short: bottom:0 does not move the layout box either.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(30.0),
+                overflow: Overflow::Auto,
+                ..block()
+            },
+            vec![
+                node(
+                    sticky(Style {
+                        bottom: Dimension::Px(0.0),
+                        ..sized(20.0)
+                    }),
+                    vec![],
+                ),
+                node(sized(80.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 20.0));
+    close(rect(&out, 3), (0.0, 20.0, 100.0, 80.0));
+}
