@@ -677,15 +677,6 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
     if style.box_sizing == BoxSizing::BorderBox {
         return Some("image");
     }
-    // min/max recompute the intrinsic ratio (CSS 2.1 10.4). That path does
-    // not match the legacy used size yet.
-    if !matches!(style.min_width, Dimension::Auto)
-        || !matches!(style.max_width, Dimension::Auto)
-        || !matches!(style.min_height, Dimension::Auto)
-        || !matches!(style.max_height, Dimension::Auto)
-    {
-        return Some("image");
-    }
     if style.float != Float::None
         || matches!(
             style.position,
@@ -989,9 +980,14 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     let mut definite = style.clone();
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
         match dim {
-            Dimension::Percent(_) | Dimension::Vw(_) | Dimension::Vh(_) => {
-                resolve_dim(dim, basis, style, space).map(Dimension::Px)
-            }
+            // (image_intrinsic_size ignores font-relative min/max clamps; the
+            // legacy engine applied them afterwards through taffy.)
+            Dimension::Percent(_)
+            | Dimension::Vw(_)
+            | Dimension::Vh(_)
+            | Dimension::Em(_)
+            | Dimension::Rem(_)
+            | Dimension::Ch(_) => resolve_dim(dim, basis, style, space).map(Dimension::Px),
             other => Some(other),
         }
     };
@@ -1001,6 +997,14 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     definite.max_width = sub(style.max_width, Some(space.available_inline))?;
     definite.min_height = sub(style.min_height, space.percentage_block)?;
     definite.max_height = sub(style.max_height, space.percentage_block)?;
+    // CSS 2.1 10.4: a max below the min is raised to the min. The shared
+    // ratio scaling would otherwise scale by max / size and collapse to 0.
+    if let (Dimension::Px(min), Dimension::Px(max)) = (definite.min_width, definite.max_width) {
+        definite.max_width = Dimension::Px(max.max(min));
+    }
+    if let (Dimension::Px(min), Dimension::Px(max)) = (definite.min_height, definite.max_height) {
+        definite.max_height = Dimension::Px(max.max(min));
+    }
     // Legacy passes the content-box available width only for a block
     // replaced element with an auto width (the SVG ratio branch).
     let containing = if style.display == Display::Block && style.width == Dimension::Auto {
@@ -1019,9 +1023,28 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     } else {
         Some(space.available_inline)
     };
-    Some(crate::layout::image_intrinsic_size(
-        src, &definite, containing,
-    ))
+    let (mut width, mut height) = crate::layout::image_intrinsic_size(src, &definite, containing);
+    // The shared function only scales by the ratio when both sizes are auto
+    // (CSS 2.1 10.4 without its constraint-violation table); the used size
+    // is then clamped per axis, the larger min winning, which is what the
+    // legacy engine's taffy node does afterwards.
+    let px = |d: Dimension| match d {
+        Dimension::Px(v) => Some(v.max(0.0)),
+        _ => None,
+    };
+    if let Some(max) = px(definite.max_width) {
+        width = width.min(max);
+    }
+    if let Some(min) = px(definite.min_width) {
+        width = width.max(min);
+    }
+    if let Some(max) = px(definite.max_height) {
+        height = height.min(max);
+    }
+    if let Some(min) = px(definite.min_height) {
+        height = height.max(min);
+    }
+    Some((width, height))
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either
