@@ -1082,6 +1082,25 @@ fn text_line_metrics(content: &str, style: &Style) -> (f32, f32) {
     (height, baseline)
 }
 
+/// Whether a text leaf painted alone in its rect (no inline line context)
+/// puts its glyphs on the baseline `text_line_metrics` gives an IFC: the
+/// line box is the font box, so paint's centring has nothing to offset.
+pub(super) fn leaf_paints_like_ifc(content: &str, style: &Style) -> bool {
+    #[cfg(feature = "skia")]
+    {
+        let Some(font) = crate::render_skia::resolved_font_geometry(style) else {
+            return false;
+        };
+        let (line, _) = text_line_metrics(content, style);
+        font.line_gap.abs() < 0.01 && (line - font.height()).abs() < 0.01
+    }
+    #[cfg(not(feature = "skia"))]
+    {
+        let _ = (content, style);
+        true
+    }
+}
+
 /// NGLineHeightMetrics of the root inline box (the block's strut).
 fn strut(style: &Style) -> (f32, f32) {
     let height = inline_used_line_height(inline_style_line_height(style));
