@@ -697,6 +697,10 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
         // kind of item.
         return inline_block || flat[index].style.display == Display::Inline;
     }
+    if matches!(flat[index].kind, ComponentKind::SvgDocument { .. }) {
+        // An `<svg>` root is a replaced atomic inline as well.
+        return inline_block || flat[index].style.display == Display::Inline;
+    }
     matches!(
         flat[index].kind,
         ComponentKind::Box

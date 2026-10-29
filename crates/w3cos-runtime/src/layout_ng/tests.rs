@@ -4291,3 +4291,254 @@ fn flex_text_items_match_chrome() {
         (0.0, 10.0, 40.0, 20.0)
     );
 }
+
+/// Inline and block `<svg>` roots (CSS 2.1 10.3.2). Expected rectangles
+/// measured in headless Chrome 156 (getBoundingClientRect, Ahem 20px/1,
+/// 300px wide unless noted; testdata/chrome-svg.json). The `width` and
+/// `height` attributes are presentation hints, so each axis is the CSS
+/// value else the attribute, and min/max clamp per axis (no ratio).
+#[test]
+fn inline_svgs_match_chrome() {
+    use w3cos_std::style::{AlignSelf, CustomProperties, Spacing};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let svg = |w: u32, h: u32, extra: Style| {
+        Component::svg_document(
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"></svg>"
+            ),
+            w,
+            h,
+            Style {
+                display: Display::Inline,
+                font_family: font.font_family.clone(),
+                font_size: 20.0,
+                line_height: 1.0,
+                line_height_is_normal: false,
+                ..extra
+            },
+        )
+    };
+    let top = || {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-vertical-align-keyword".to_string(),
+            "top".to_string(),
+        )]))
+    };
+    let run = |n: usize, width: f32, children: Vec<Component>| {
+        let parent = Style {
+            width: Dimension::Px(width),
+            ..font.clone()
+        };
+        let root = node(block(), vec![node(parent, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "case {n}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {n} stays on NG"));
+        rects
+    };
+    let xx = || Component::text("XX", text_style.clone());
+    let px = Dimension::Px;
+
+    // sv1: the UA display is inline; it sits on the baseline between text.
+    let r = run(1, 300.0, vec![xx(), svg(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // sv2: vertical-align: middle.
+    let r = run(
+        2,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                30,
+                40,
+                Style {
+                    align_self: AlignSelf::Center,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // sv3: alone, with margins.
+    let r = run(
+        3,
+        300.0,
+        vec![svg(
+            30,
+            10,
+            Style {
+                margin: margins(5.0, 3.0, 5.0, 3.0),
+                ..Style::default()
+            },
+        )],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 2), (3.0, 5.0, 30.0, 10.0));
+    // sv4: max-width clamps the width only (the height attribute stays);
+    // a top-aligned one.
+    let r = run(
+        4,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                100,
+                20,
+                Style {
+                    max_width: px(60.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+            svg(
+                10,
+                10,
+                Style {
+                    align_self: AlignSelf::FlexStart,
+                    custom_properties: top(),
+                    ..Style::default()
+                },
+            ),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 60.0, 20.0));
+    assert_eq!(rect(&r, 5), (140.0, 0.0, 10.0, 10.0));
+    // sv5: a CSS width replaces the width attribute only; no ratio.
+    let r = run(
+        5,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                60,
+                30,
+                Style {
+                    width: px(30.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 30.0));
+    // sv6: in a 50px box the second text wraps, the svg is on line 2.
+    let r = run(6, 50.0, vec![xx(), svg(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 50.0, 64.0));
+    assert_eq!(rect(&r, 3), (0.0, 20.0, 30.0, 20.0));
+    // sv7: inline-block is the same atomic inline.
+    let r = run(
+        7,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                30,
+                20,
+                Style {
+                    display: Display::InlineBlock,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // sv8: a block svg with auto side margins is centered.
+    let mut centered = Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    centered.margin.left = Spacing::Auto;
+    centered.margin.right = Spacing::Auto;
+    let r = run(8, 300.0, vec![svg(60, 20, centered)]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(rect(&r, 2), (120.0, 0.0, 60.0, 20.0));
+    // sv10: min-width raises the width only.
+    let r = run(
+        10,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                60,
+                30,
+                Style {
+                    min_width: px(90.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 90.0, 30.0));
+
+    // A viewBox with an auto axis derives from the ratio in Chrome, and the
+    // lowering cannot tell which attributes were authored: legacy keeps it.
+    let viewbox = Component::svg_document(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"60\" height=\"30\" viewBox=\"0 0 60 30\"></svg>",
+        60,
+        30,
+        Style {
+            display: Display::Inline,
+            height: px(20.0),
+            ..font.clone()
+        },
+    );
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: px(300.0),
+                ..font.clone()
+            },
+            vec![xx(), viewbox, xx()],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    // A percentage width attribute, a float and a flex item stay on legacy.
+    let percent = Component::svg_document(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"50%\" height=\"30\"></svg>",
+        150,
+        30,
+        Style {
+            display: Display::Inline,
+            ..font.clone()
+        },
+    );
+    let root = node(block(), vec![node(font.clone(), vec![xx(), percent, xx()])]);
+    let flat = pre_flatten(&root);
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    let floated = svg(
+        30,
+        20,
+        Style {
+            float: w3cos_std::style::Float::Left,
+            ..Style::default()
+        },
+    );
+    let flat = pre_flatten(&node(block(), vec![node(font.clone(), vec![floated])]));
+    assert_eq!(block::unsupported_reasons(&flat), vec!["kind:other"]);
+}
