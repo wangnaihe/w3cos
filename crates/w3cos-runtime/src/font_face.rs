@@ -504,6 +504,54 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
     })
 }
 
+/// The physical font box used by a resolved text run, excluding CSS
+/// line-height leading. CSSOM text fragments expose this box while their line
+/// origins still advance by the used `line-height`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FontBoxMetrics {
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+impl FontBoxMetrics {
+    pub fn height(self) -> f32 {
+        self.ascent + self.descent
+    }
+}
+
+pub(crate) fn font_box_metrics_for_text(
+    style: &w3cos_std::style::Style,
+    text: &str,
+) -> Option<FontBoxMetrics> {
+    let runs = FontRegistry::global().resolve_style_runs(style, text);
+    let mut ascent = 0.0_f32;
+    let mut descent = 0.0_f32;
+    let mut found = false;
+    for run in runs {
+        let font = run.font.and_then(|font| font.parsed());
+        let font = font
+            .as_deref()
+            .unwrap_or_else(|| host_ui_font().font.as_ref());
+        let metrics = font.horizontal_line_metrics(style.font_size)?;
+        // CSS inline boxes use the face's rounded ascent/descent, while the
+        // CSS line box keeps its fractional used line-height.  This mirrors
+        // the physical font-box contract used by the shaping renderer and
+        // leaves the remaining fraction in lower leading.
+        ascent = ascent.max(metrics.ascent.max(0.0).round());
+        descent = descent.max((-metrics.descent).max(0.0).round());
+        found = true;
+    }
+    if !found {
+        let metrics = host_ui_font()
+            .font
+            .horizontal_line_metrics(style.font_size)?;
+        ascent = metrics.ascent.max(0.0).round();
+        descent = (-metrics.descent).max(0.0).round();
+    }
+    let metrics = FontBoxMetrics { ascent, descent };
+    (metrics.height().is_finite() && metrics.height() > 0.0).then_some(metrics)
+}
+
 fn finish_host_font(family: String, data: Arc<Vec<u8>>, index: u32) -> HostUiFont {
     // Collection index 0 shares `cached_parsed_font` with `@font-face`,
     // so a page that names the host face does not parse those bytes twice.

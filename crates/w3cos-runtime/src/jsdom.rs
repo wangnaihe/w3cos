@@ -32956,11 +32956,15 @@ try {
             1
         );
         host.call_method("appendChild", vec![block]);
+        let reappended = host.call_method("getClientRects", vec![]);
+        assert_eq!(reappended.get_property("length").to_u32(), 3);
         assert_eq!(
-            host.call_method("getClientRects", vec![])
-                .get_property("length")
-                .to_u32(),
-            2
+            reappended
+                .get_property("2")
+                .get_property("width")
+                .to_number(),
+            0.0,
+            "a block appended after the trailing text retains Chrome's trailing split edge"
         );
         let old_host = node_id_of(&host).unwrap();
         setup();
@@ -33358,12 +33362,25 @@ try {
     fn nested_block_in_inline_owner_ranges_follow_physical_line_wrapping() {
         setup();
         set_viewport(800.0, 600.0);
+        let family = "W3cosNestedTinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register the same deterministic face used by the Chrome control");
         w3cos_dom::stylesheet::register_rule(".cold", &[("display", "block"), ("height", "12px")]);
         w3cos_dom::stylesheet::register_rule(".hot", &[("display", "block"), ("height", "14px")]);
         let document = document_value();
         let root = create_in_body("div");
-        root.get_property("style")
-            .set_property("width", Value::string("130px"));
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("130px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
         let outer = document.call_method("createElement", vec![Value::string("span")]);
         let inner = document.call_method("createElement", vec![Value::string("span")]);
         let block = document.call_method("createElement", vec![Value::string("div")]);
@@ -33392,7 +33409,7 @@ try {
         );
         outer.call_method("appendChild", vec![inner.clone()]);
         outer.call_method("appendChild", vec![outer_block]);
-        root.call_method("appendChild", vec![outer]);
+        root.call_method("appendChild", vec![outer.clone()]);
 
         let rects = inner.call_method("getClientRects", vec![]);
         let rects = (0..rects.get_property("length").to_u32())
@@ -33430,18 +33447,83 @@ try {
                 );
                 assert!(
                     (width - expected_width).abs() < 0.001,
-                    "width={width}, expected={expected_width}"
+                    "width={width}, expected={expected_width}, rects={actual:?}"
                 );
             }
         };
         assert_inline_geometry(
             &rects,
             &[
-                (61.65625, 36.71875),
-                (8.0, 120.859375),
-                (8.0, 88.171875),
+                (8.0, 103.984375),
+                (8.0, 110.1875),
                 (8.0, 130.0),
-                (8.0, 114.59375),
+                (8.0, 100.421875),
+            ],
+        );
+        let outer_rects = outer.call_method("getClientRects", vec![]);
+        let outer_rects = (0..outer_rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = outer_rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_inline_geometry(
+            &outer_rects,
+            &[
+                (8.0, 120.84375),
+                (8.0, 103.984375),
+                (8.0, 110.1875),
+                (8.0, 130.0),
+                (8.0, 100.421875),
+                (8.0, 130.0),
+                (8.0, 0.0),
+            ],
+        );
+        let assert_full_geometry =
+            |actual: &[(f64, f64, f64, f64)], expected: &[(f64, f64, f64, f64)]| {
+                assert_eq!(actual.len(), expected.len(), "rects={actual:?}");
+                for (actual_rect, expected_rect) in actual.iter().zip(expected) {
+                    for (actual_value, expected_value) in
+                        [actual_rect.0, actual_rect.1, actual_rect.2, actual_rect.3]
+                            .into_iter()
+                            .zip([
+                                expected_rect.0,
+                                expected_rect.1,
+                                expected_rect.2,
+                                expected_rect.3,
+                            ])
+                    {
+                        assert!(
+                            (actual_value - expected_value).abs() < 0.001,
+                            "actual={actual_value}, expected={expected_value}, rects={actual:?}"
+                        );
+                    }
+                }
+            };
+        assert_full_geometry(
+            &outer_rects,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 12.0),
+                (8.0, 78.609375, 100.421875, 17.0),
+                (8.0, 96.8125, 130.0, 11.0),
+                (8.0, 107.8125, 0.0, 0.0),
+            ],
+        );
+        assert_full_geometry(
+            &rects,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 12.0),
+                (8.0, 78.609375, 100.421875, 17.0),
             ],
         );
 
@@ -33461,11 +33543,10 @@ try {
         assert_inline_geometry(
             &restyled,
             &[
-                (61.65625, 36.71875),
-                (8.0, 120.859375),
-                (8.0, 88.171875),
+                (8.0, 103.984375),
+                (8.0, 110.1875),
                 (8.0, 130.0),
-                (8.0, 114.59375),
+                (8.0, 100.421875),
             ],
         );
         assert!(restyled.iter().any(|(_, _, width, height)| {
@@ -33487,12 +33568,7 @@ try {
             .collect::<Vec<_>>();
         assert_inline_geometry(
             &removed,
-            &[
-                (61.65625, 36.71875),
-                (8.0, 120.859375),
-                (8.0, 88.171875),
-                (8.0, 114.59375),
-            ],
+            &[(8.0, 103.984375), (8.0, 110.1875), (8.0, 100.421875)],
         );
     }
 

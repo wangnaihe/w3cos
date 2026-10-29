@@ -516,15 +516,45 @@ fn publish_client_rects(
     }
     let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
     let mut owners_with_inline_fragments = HashSet::new();
+    let mut first_fragment_is_block = HashMap::new();
+    let mut last_fragment_is_block = HashMap::new();
+    let synthetic_inline = |info: &crate::layout::FlatNodeInfo<'_>| {
+        info.style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-split-inline-edge")
+                    || properties.contains_key("--w3cos-internal-split-inline-fragment")
+            })
+    };
+    let mut inherited_text_owners = vec![Vec::new(); flat.len()];
+    let mut text_line_owners = HashSet::new();
     for (index, info) in flat.iter().enumerate() {
+        if !info.component.is_some_and(|component| {
+            matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
+        }) {
+            continue;
+        }
+        let mut parent = info.parent;
+        while let Some(parent_index) = parent {
+            let Some(ancestor) = flat.get(parent_index) else {
+                break;
+            };
+            if synthetic_inline(ancestor)
+                && let Some(owner) = split_inline_owner(ancestor)
+                && !inherited_text_owners[index].contains(&owner)
+            {
+                inherited_text_owners[index].push(owner);
+                text_line_owners.insert(owner);
+            }
+            parent = ancestor.parent;
+        }
+    }
+    for (index, info) in flat.iter().enumerate() {
+        let synthetic_inline = synthetic_inline(info);
         let Some(mut rect) = by_index.get(index).copied().flatten() else {
             continue;
         };
-        let properties = info.style.custom_properties.as_ref();
-        let synthetic_inline = properties.is_some_and(|properties| {
-            properties.contains_key("--w3cos-internal-split-inline-edge")
-                || properties.contains_key("--w3cos-internal-split-inline-fragment")
-        });
         if synthetic_inline {
             // Taffy lays an anonymous inline carrier out at the containing
             // block's available width. CSSOM exposes the physical inline
@@ -555,10 +585,33 @@ fn publish_client_rects(
             if synthetic_inline {
                 owners_with_inline_fragments.insert(owner);
             }
-            published.entry(owner).or_default().push(physical);
+            let text_range_will_publish = info.component.is_some_and(|component| {
+                let w3cos_std::ComponentKind::Text { content } = &component.kind else {
+                    return false;
+                };
+                w3cos_std::inline_text::cssom_owner_ranges(content, info.style)
+                    .iter()
+                    .any(|(range_owner, _, _)| *range_owner == owner)
+            });
+            // Once physical text lines have been published for a split inline,
+            // suppress only its positive-size anonymous inline carrier.  Real
+            // block fragments and the zero-size split edge remain observable
+            // CSSOM fragments and must keep their original ordering entries.
+            let replaced_by_text_lines = synthetic_inline
+                && text_line_owners.contains(&owner)
+                && physical.width > 0.0
+                && physical.height > 0.0;
+            if !text_range_will_publish && !replaced_by_text_lines {
+                published.entry(owner).or_default().push(physical);
+                let is_block = !synthetic_inline;
+                first_fragment_is_block.entry(owner).or_insert(is_block);
+                last_fragment_is_block.insert(owner, is_block);
+            }
         }
         for owner in w3cos_std::inline_text::cssom_box_owners(info.style) {
             published.entry(owner).or_default().push(physical);
+            first_fragment_is_block.entry(owner).or_insert(true);
+            last_fragment_is_block.insert(owner, true);
         }
         let Some(component) = info.component else {
             continue;
@@ -576,6 +629,7 @@ fn publish_client_rects(
                 style.clone().into(),
             ))
         };
+        let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
         let lines = crate::text_layout::wrap_text_with_run_width(
             content,
             line_box.width.max(1.0),
@@ -588,8 +642,16 @@ fn publish_client_rects(
                 .as_ref()
                 .and_then(|styles| styles.get(line_index))
                 .unwrap_or(info.style);
-            for (owner, start, end) in w3cos_std::inline_text::cssom_owner_ranges(line, line_style)
-            {
+            let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(line, line_style);
+            let explicit_owners = owner_ranges
+                .iter()
+                .map(|(owner, _, _)| *owner)
+                .collect::<HashSet<_>>();
+            for (owner, start, end) in owner_ranges {
+                // Explicit owner subranges retain the same independently
+                // measured physical widths that layout used before coalescing.
+                // The inherited outer owner below owns the whole line and is
+                // snapped once at that line's cumulative endpoint.
                 let prefix_width = measure(&line[..start], line_style);
                 let width = measure(&line[start..end], line_style);
                 let x = match line_style.direction {
@@ -598,18 +660,79 @@ fn publish_client_rects(
                         line_box.x + line_box.width - prefix_width - width
                     }
                 };
-                let line_height = line_style.font_size * line_style.line_height;
+                let line_height = crate::layout::inline_style_line_height(line_style);
+                let font_box = crate::font_face::font_box_metrics_for_text(
+                    line_style,
+                    line.get(start..end).unwrap_or(line),
+                );
+                let font_height = font_box.map_or(line_height, |metrics| metrics.height());
+                let font_top = crate::layout::inline_upper_leading(line_height, font_height);
                 owners_with_inline_fragments.insert(owner);
                 published
                     .entry(owner)
                     .or_default()
                     .push(w3cos_dom::DOMRect::new(
                         x,
-                        line_box.y + line_index as f32 * line_height,
+                        line_box.y + line_index as f32 * line_height + font_top,
                         width,
-                        line_height,
+                        font_height,
                     ));
+                first_fragment_is_block.entry(owner).or_insert(false);
+                last_fragment_is_block.insert(owner, false);
             }
+            for owner in inherited_text_owners[index]
+                .iter()
+                .copied()
+                .filter(|owner| !explicit_owners.contains(owner))
+            {
+                let width = physical_advance(line, line_style);
+                let x = match line_style.direction {
+                    w3cos_std::style::TextDirection::Ltr => line_box.x,
+                    w3cos_std::style::TextDirection::Rtl => line_box.x + line_box.width - width,
+                };
+                let line_height = crate::layout::inline_style_line_height(line_style);
+                let font_box = crate::font_face::font_box_metrics_for_text(line_style, line);
+                let font_height = font_box.map_or(line_height, |metrics| metrics.height());
+                let font_top = crate::layout::inline_upper_leading(line_height, font_height);
+                owners_with_inline_fragments.insert(owner);
+                published
+                    .entry(owner)
+                    .or_default()
+                    .push(w3cos_dom::DOMRect::new(
+                        x,
+                        line_box.y + line_index as f32 * line_height + font_top,
+                        width,
+                        font_height,
+                    ));
+                first_fragment_is_block.entry(owner).or_insert(false);
+                last_fragment_is_block.insert(owner, false);
+            }
+        }
+    }
+    for owner in owners_with_inline_fragments.iter().copied() {
+        let Some(rects) = published.get_mut(&owner) else {
+            continue;
+        };
+        if rects.is_empty() {
+            continue;
+        }
+        let left = rects
+            .iter()
+            .map(|rect| rect.x)
+            .fold(f32::INFINITY, f32::min);
+        let top = rects
+            .iter()
+            .map(|rect| rect.y)
+            .fold(f32::INFINITY, f32::min);
+        let bottom = rects
+            .iter()
+            .map(|rect| rect.y + rect.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if first_fragment_is_block.get(&owner) == Some(&true) {
+            rects.insert(0, w3cos_dom::DOMRect::new(left, top, 0.0, 0.0));
+        }
+        if last_fragment_is_block.get(&owner) == Some(&true) {
+            rects.push(w3cos_dom::DOMRect::new(left, bottom, 0.0, 0.0));
         }
     }
     for (owner, rects) in &mut published {
