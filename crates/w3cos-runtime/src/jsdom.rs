@@ -33546,18 +33546,39 @@ try {
                 )
             })
             .collect::<Vec<_>>();
-        assert_inline_geometry(
+        let restyled_outer = outer.call_method("getClientRects", vec![]);
+        let restyled_outer = (0..restyled_outer.get_property("length").to_u32())
+            .map(|index| {
+                let rect = restyled_outer.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_full_geometry(
             &restyled,
             &[
-                (8.0, 103.984375),
-                (8.0, 110.1875),
-                (8.0, 130.0),
-                (8.0, 100.421875),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 14.0),
+                (8.0, 80.609375, 100.421875, 17.0),
             ],
         );
-        assert!(restyled.iter().any(|(_, _, width, height)| {
-            (*width - 130.0).abs() < 0.001 && (*height - 14.0).abs() < 0.001
-        }));
+        assert_full_geometry(
+            &restyled_outer,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 14.0),
+                (8.0, 80.609375, 100.421875, 17.0),
+                (8.0, 98.8125, 130.0, 11.0),
+                (8.0, 109.8125, 0.0, 0.0),
+            ],
+        );
 
         inner.call_method("removeChild", vec![block]);
         let removed = inner.call_method("getClientRects", vec![]);
@@ -33572,9 +33593,36 @@ try {
                 )
             })
             .collect::<Vec<_>>();
-        assert_inline_geometry(
+        let removed_outer = outer.call_method("getClientRects", vec![]);
+        let removed_outer = (0..removed_outer.get_property("length").to_u32())
+            .map(|index| {
+                let rect = removed_outer.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_full_geometry(
             &removed,
-            &[(8.0, 103.984375), (8.0, 110.1875), (8.0, 100.421875)],
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 66.609375, 100.421875, 17.0),
+            ],
+        );
+        assert_full_geometry(
+            &removed_outer,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 66.609375, 100.421875, 17.0),
+                (8.0, 84.8125, 130.0, 11.0),
+                (8.0, 95.8125, 0.0, 0.0),
+            ],
         );
     }
 
