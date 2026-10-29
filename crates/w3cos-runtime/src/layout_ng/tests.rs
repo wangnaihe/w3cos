@@ -4496,3 +4496,51 @@ fn floated_flex_and_grid_containers_match_chrome() {
         ],
     );
 }
+
+/// Cross-axis `center` and `flex-end` alignment is unsafe: an item taller
+/// than the 70px line overflows it (headless Chrome, 110px border box at
+/// y=-20 for `center` and y=-40 for `flex-end`; the 20px sibling sits at
+/// y=25 and y=50). Measured in testdata/chrome-center-overflow.json.
+#[test]
+fn cross_alignment_overflow_is_unsafe_like_chrome() {
+    use w3cos_std::style::{AlignItems, FlexDirection, Overflow};
+    let run = |align: AlignItems, overflow: Overflow| {
+        let container = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: align,
+            width: Dimension::Px(70.0),
+            height: Dimension::Px(70.0),
+            overflow,
+            ..Style::default()
+        };
+        let big = Style {
+            flex_grow: 3.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            height: Dimension::Px(110.0),
+            ..block()
+        };
+        let small = Style {
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            height: Dimension::Px(20.0),
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                container,
+                vec![node(big, vec![]), node(small, vec![])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+        (rect(&out, 2).1, rect(&out, 3).1)
+    };
+    assert_eq!(run(AlignItems::Center, Overflow::Visible), (-20.0, 25.0));
+    assert_eq!(run(AlignItems::Center, Overflow::Hidden), (-20.0, 25.0));
+    assert_eq!(run(AlignItems::FlexEnd, Overflow::Visible), (-40.0, 50.0));
+}
