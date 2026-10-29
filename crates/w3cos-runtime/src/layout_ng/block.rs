@@ -908,10 +908,11 @@ fn non_visible_overflow(style: &Style) -> bool {
         || style.resolved_overflow_y() != Overflow::Visible
 }
 
-/// Overflow shapes that still disagree with the legacy engine: scrollports
-/// (`scroll` / `auto`), a flex or grid item (automatic minimum), a negative
-/// margin, or a float/clear inside the box. `hidden` on a block that only
-/// establishes a BFC stays here.
+/// Overflow shapes that still disagree with the legacy engine: a flex or
+/// grid item (automatic minimum), a negative margin, or a float/clear inside
+/// the box. Scrollports (`hidden`, `scroll`, `auto`) are laid out here as BFC
+/// roots without scrollbar space; the scroll containers themselves are
+/// derived from the result by `layout::scroll_containers_from_layout`.
 fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
@@ -920,10 +921,6 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if flat[index].parent.is_some_and(|parent| {
         is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
     }) {
-        return Some("overflow");
-    }
-    let scrollish = |overflow: Overflow| matches!(overflow, Overflow::Scroll | Overflow::Auto);
-    if scrollish(style.resolved_overflow_x()) || scrollish(style.resolved_overflow_y()) {
         return Some("overflow");
     }
     let negative = |spacing: Spacing| match spacing {
@@ -2589,17 +2586,6 @@ fn layout_block_in(
         auto_content
     };
     let content_height = clamp_h(specified_height.unwrap_or(auto_content));
-    // A definite block size that clips overflowing content is a scrollport.
-    // Scroll offsets stay on the legacy engine. An auto-height BFC does not.
-    if non_visible_overflow(style)
-        && !is_author_flex(style)
-        && !is_author_grid(style)
-        && style.display != Display::FlowRoot
-        && specified_height.is_some()
-        && auto_content > content_height + 1.0 / 128.0
-    {
-        return super::bail("overflow-scroll");
-    }
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
     // computed height is auto, whatever max-height does to the used height
     // (margin-collapse-038; Blink's FinishLayout drops the strut whenever

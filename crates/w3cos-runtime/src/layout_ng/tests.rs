@@ -4291,3 +4291,185 @@ fn flex_text_items_match_chrome() {
         (0.0, 10.0, 40.0, 20.0)
     );
 }
+
+/// `overflow: auto | scroll` boxes lay out like `overflow: hidden` ones: a
+/// BFC whose scrollbars take no space (the legacy engine reserves none, and
+/// the headless Chrome these boxes were measured in uses overlay scrollbars).
+/// Border boxes measured in headless Chrome (body margin 0); the scroll
+/// containers report their scrollable extent from the NG rects
+/// (testdata/chrome-scroll.json).
+#[test]
+fn scroll_containers_match_chrome() {
+    use crate::layout::scroll_containers_from_layout;
+    use w3cos_std::style::{Float, Overflow, Position};
+    let scroller = |overflow: Overflow, width: f32, height: Option<f32>| Style {
+        width: Dimension::Px(width),
+        height: height.map_or(Dimension::Auto, Dimension::Px),
+        overflow,
+        ..block()
+    };
+    let boxed = |width: f32, height: f32| Style {
+        width: Dimension::Px(width),
+        ..sized(height)
+    };
+    let extents = |root: &Component| {
+        let flat = pre_flatten(root);
+        let rects = ng_rects(root);
+        let (scrollable, clip_only, ancestor) = scroll_containers_from_layout(&rects, &flat);
+        (
+            scrollable
+                .iter()
+                .map(|(i, _, e)| (*i, e.max_x, e.max_y))
+                .collect::<Vec<_>>(),
+            clip_only.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            ancestor,
+        )
+    };
+
+    // scroll-block: an auto-width child fills the scroller (no gutter).
+    let root = node(
+        block(),
+        vec![
+            node(
+                scroller(Overflow::Auto, 100.0, Some(50.0)),
+                vec![node(sized(200.0), vec![])],
+            ),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 200.0));
+    close(rect(&out, 3), (0.0, 50.0, 800.0, 10.0));
+    let (scrollable, clip_only, ancestor) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 0.0, 150.0)]);
+    assert!(clip_only.is_empty());
+    assert_eq!(ancestor, vec![None, None, Some(1), None]);
+
+    // scroll-both: overflow in both axes.
+    let tall_gap = Style {
+        margin: margins(20.0, 0.0, 0.0, 0.0),
+        ..sized(10.0)
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                scroller(Overflow::Scroll, 100.0, Some(50.0)),
+                vec![node(boxed(300.0, 30.0), vec![]), node(tall_gap, vec![])],
+            ),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 300.0, 30.0));
+    close(rect(&out, 3), (0.0, 50.0, 100.0, 10.0));
+    close(rect(&out, 4), (0.0, 50.0, 800.0, 10.0));
+    assert_eq!(extents(&root).0, vec![(1, 200.0, 10.0)]);
+
+    // scroll-auto-height: a BFC beside a float takes the remaining width.
+    let float = Style {
+        float: Float::Left,
+        ..boxed(60.0, 40.0)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![
+                node(float, vec![]),
+                node(
+                    Style {
+                        overflow: Overflow::Auto,
+                        ..block()
+                    },
+                    vec![node(sized(20.0), vec![])],
+                ),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (0.0, 0.0, 60.0, 40.0));
+    close(rect(&out, 3), (60.0, 0.0, 140.0, 20.0));
+    close(rect(&out, 4), (60.0, 0.0, 140.0, 20.0));
+    let (scrollable, clip_only, _) = extents(&root);
+    assert!(scrollable.is_empty());
+    assert_eq!(clip_only, vec![3]);
+
+    // scroll-abs: the scroller is the containing block of the absolute box.
+    let corner = |position: Position, left: f32, top: f32, width: f32, height: f32| Style {
+        position,
+        left: Dimension::Px(left),
+        top: Dimension::Px(top),
+        ..boxed(width, height)
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                Style {
+                    position: Position::Relative,
+                    ..scroller(Overflow::Auto, 100.0, Some(50.0))
+                },
+                vec![
+                    node(corner(Position::Absolute, 0.0, 0.0, 20.0, 300.0), vec![]),
+                    node(sized(80.0), vec![]),
+                ],
+            ),
+            node(corner(Position::Absolute, 5.0, 5.0, 10.0, 10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 20.0, 300.0));
+    close(rect(&out, 3), (0.0, 0.0, 100.0, 80.0));
+    close(rect(&out, 4), (5.0, 5.0, 10.0, 10.0));
+    let (scrollable, _, ancestor) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 0.0, 250.0)]);
+    assert_eq!(ancestor, vec![None, None, Some(1), Some(1), None]);
+
+    // scroll-nested: the inner scroller keeps its own overflow.
+    let inner = Style {
+        margin: margins(4.0, 4.0, 4.0, 4.0),
+        ..scroller(Overflow::Auto, 60.0, Some(40.0))
+    };
+    let root = node(
+        block(),
+        vec![node(
+            scroller(Overflow::Scroll, 120.0, Some(80.0)),
+            vec![
+                node(inner, vec![node(boxed(100.0, 100.0), vec![])]),
+                node(sized(200.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 120.0, 80.0));
+    close(rect(&out, 2), (4.0, 4.0, 60.0, 40.0));
+    close(rect(&out, 3), (4.0, 4.0, 100.0, 100.0));
+    close(rect(&out, 4), (0.0, 48.0, 120.0, 200.0));
+    let (scrollable, _, ancestor) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 0.0, 168.0), (2, 40.0, 60.0)]);
+    assert_eq!(ancestor, vec![None, None, Some(1), Some(2), Some(1)]);
+
+    // scroll-x-only: overflow-x:auto computes overflow-y to auto too.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                overflow: Overflow::Visible,
+                overflow_x: Some(Overflow::Auto),
+                ..scroller(Overflow::Visible, 100.0, None)
+            },
+            vec![node(boxed(300.0, 20.0), vec![]), node(sized(15.0), vec![])],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 35.0));
+    close(rect(&out, 2), (0.0, 0.0, 300.0, 20.0));
+    close(rect(&out, 3), (0.0, 20.0, 100.0, 15.0));
+}
