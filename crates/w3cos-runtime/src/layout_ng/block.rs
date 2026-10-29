@@ -353,11 +353,14 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if !blockified && (inline::is_atomic_inline(flat, index) || style.display == Display::Inline) {
         return Some("float:inline");
     }
+    // A float blockifies its display, so a floated flex or grid container is
+    // a block-level flex/grid box that shrink-wraps like any float.
     if !blockified
         && !matches!(
             style.display,
             Display::Block | Display::FlowRoot | Display::Table
         )
+        && !(is_author_flex(style) || style.display == Display::Grid)
     {
         return Some("float:display");
     }
