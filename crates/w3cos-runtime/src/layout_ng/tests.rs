@@ -4472,4 +4472,31 @@ fn scroll_containers_match_chrome() {
     close(rect(&out, 1), (0.0, 0.0, 100.0, 35.0));
     close(rect(&out, 2), (0.0, 0.0, 300.0, 20.0));
     close(rect(&out, 3), (0.0, 20.0, 100.0, 15.0));
+
+    // scroll-transform: scrollable overflow is measured on the transformed
+    // boxes (Chrome: b (40,0,100,30), c (-150,30,200,10)). b pushes the
+    // overflow 40px right; c is moved back inside and adds none.
+    let shifted = |dx: f32, width: f32, height: f32| Style {
+        transform: w3cos_std::style::Transform2D {
+            translate_x: dx,
+            ..w3cos_std::style::Transform2D::IDENTITY
+        },
+        ..boxed(width, height)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            scroller(Overflow::Hidden, 100.0, Some(50.0)),
+            vec![
+                node(shifted(40.0, 100.0, 30.0), vec![]),
+                node(shifted(-150.0, 200.0, 10.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 30.0));
+    close(rect(&out, 3), (0.0, 30.0, 200.0, 10.0));
+    let (scrollable, _, _) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 40.0, 0.0)]);
 }
