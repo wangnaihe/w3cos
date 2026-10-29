@@ -716,11 +716,21 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
         Display::Block | Display::FlowRoot => {
             unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
         }
-        // An inline replaced box sits on the font strut. Legacy then runs
-        // `project_single_baseline_replaced_image` and
-        // `align_inline_block_last_line_baselines`. That line box is still
-        // taller than the NG line, so inline images stay on legacy.
-        Display::Inline | Display::InlineBlock => Some("image"),
+        // An inline replaced box is an atomic inline of its IFC (NGInlineItem
+        // kAtomicInline): its margin box sits on the baseline with the
+        // bottom margin edge as its baseline (CSS 2.1 10.8.1). The IFC lays
+        // it out through `layout_block` and aligns it like an inline-block.
+        Display::Inline | Display::InlineBlock => {
+            if !inline::is_atomic_inline(flat, index) || !inline::in_inline_container(flat, index) {
+                return Some("image");
+            }
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
         _ => Some("image"),
     }
 }
