@@ -866,23 +866,26 @@ fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f
         && used_width > 0.0
         && used_height > 0.0
     {
-        let mut scale_min = 0.0_f32;
-        let mut scale_max = f32::INFINITY;
+        // f64: 100 * (60 / 100) in f32 is 60.000004, which LayoutUnit then
+        // snaps up a 1/64 px step.
+        let (w, h) = (f64::from(used_width), f64::from(used_height));
+        let mut scale_min = 0.0_f64;
+        let mut scale_max = f64::INFINITY;
         if let Some(value) = min_width {
-            scale_min = scale_min.max(value / used_width);
+            scale_min = scale_min.max(f64::from(value) / w);
         }
         if let Some(value) = min_height {
-            scale_min = scale_min.max(value / used_height);
+            scale_min = scale_min.max(f64::from(value) / h);
         }
         if let Some(value) = max_width {
-            scale_max = scale_max.min(value / used_width);
+            scale_max = scale_max.min(f64::from(value) / w);
         }
         if let Some(value) = max_height {
-            scale_max = scale_max.min(value / used_height);
+            scale_max = scale_max.min(f64::from(value) / h);
         }
-        let scale = 1.0_f32.max(scale_min).min(scale_max);
-        used_width *= scale;
-        used_height *= scale;
+        let scale = 1.0_f64.max(scale_min).min(scale_max);
+        used_width = (w * scale) as f32;
+        used_height = (h * scale) as f32;
     } else {
         if let Some(value) = min_width {
             used_width = used_width.max(value);

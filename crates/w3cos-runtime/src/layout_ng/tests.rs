@@ -3632,8 +3632,8 @@ fn definite_canvas_matches_chrome() {
     ));
     assert_eq!(at(&out, 1), (0.0, 0.0, 90.0, 50.0));
 
-    // Inline-block stays on legacy: the NG line is 24.1875px and Chrome's
-    // is 24px, so a block reference of the same border box would be one-sided.
+    // An inline-block canvas outside any IFC text is an atomic inline of
+    // its block parent (see inline_canvases_match_chrome).
     let inline = node(
         block(),
         vec![canvas(
@@ -3646,10 +3646,193 @@ fn definite_canvas_matches_chrome() {
         )],
     );
     let flat = pre_flatten(&inline);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    // A border-box canvas still takes legacy.
+    let border_box = node(
+        block(),
+        vec![block_canvas(
+            40,
+            20,
+            Style {
+                box_sizing: w3cos_std::style::BoxSizing::BorderBox,
+                ..Style::default()
+            },
+        )],
+    );
+    let flat = pre_flatten(&border_box);
     assert_eq!(
         block::unsupported_reasons(&flat),
         vec!["kind:other".to_string()]
     );
+}
+
+/// An inline `<canvas>` is an atomic inline in the line box (CSS 2.1
+/// 10.8.1: its baseline is the bottom margin edge). Border boxes measured
+/// in headless Chrome 156 (getBoundingClientRect, Ahem 20px/1, 300px wide
+/// unless noted; testdata/chrome-canvas.json).
+#[test]
+fn inline_canvases_match_chrome() {
+    use w3cos_std::style::{AlignSelf, CustomProperties};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let cv = |w: u32, h: u32, extra: Style| {
+        Component::canvas(
+            w,
+            h,
+            Style {
+                display: Display::InlineBlock,
+                font_family: font.font_family.clone(),
+                font_size: 20.0,
+                line_height: 1.0,
+                line_height_is_normal: false,
+                ..extra
+            },
+        )
+    };
+    let top = || {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-vertical-align-keyword".to_string(),
+            "top".to_string(),
+        )]))
+    };
+    let run = |n: usize, width: f32, children: Vec<Component>| {
+        let parent = Style {
+            width: Dimension::Px(width),
+            ..font.clone()
+        };
+        let root = node(block(), vec![node(parent, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "case {n}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {n} stays on NG"));
+        rects
+    };
+    let xx = || Component::text("XX", text_style.clone());
+    let px = Dimension::Px;
+
+    // cv1: on the baseline between text; the line is 24px.
+    let r = run(1, 300.0, vec![xx(), cv(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // cv2: vertical-align: middle (align_self Center in the cascade form).
+    let r = run(
+        2,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                30,
+                40,
+                Style {
+                    align_self: AlignSelf::Center,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // cv3: alone, with margins.
+    let r = run(
+        3,
+        300.0,
+        vec![cv(
+            30,
+            10,
+            Style {
+                margin: margins(5.0, 3.0, 5.0, 3.0),
+                ..Style::default()
+            },
+        )],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 2), (3.0, 5.0, 30.0, 10.0));
+    // cv4: max-width scales the canvas by its ratio; a top-aligned one.
+    let r = run(
+        4,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                100,
+                20,
+                Style {
+                    max_width: px(60.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+            cv(
+                10,
+                10,
+                Style {
+                    align_self: AlignSelf::FlexStart,
+                    custom_properties: top(),
+                    ..Style::default()
+                },
+            ),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    close(rect(&r, 3), (40.0, 4.0, 60.0, 12.0));
+    assert_eq!(rect(&r, 5), (140.0, 0.0, 10.0, 10.0));
+    // cv5: a specified width keeps the attribute ratio.
+    let r = run(
+        5,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                60,
+                30,
+                Style {
+                    width: px(30.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(rect(&r, 3), (40.0, 1.0, 30.0, 15.0));
+    // cv7: author display:inline is the same atomic inline.
+    let r = run(
+        7,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                30,
+                20,
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // cv8: in a 50px box the second text wraps, the canvas is on line 2.
+    let r = run(8, 50.0, vec![xx(), cv(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 50.0, 64.0));
+    assert_eq!(rect(&r, 3), (0.0, 20.0, 30.0, 20.0));
 }
 
 #[test]
