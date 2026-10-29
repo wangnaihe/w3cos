@@ -3690,7 +3690,13 @@ fn inline_canvases_match_chrome() {
             w,
             h,
             Style {
-                display: Display::InlineBlock,
+                // The default display (flex) means "the UA's inline-block";
+                // a case that passes its own display keeps it.
+                display: if extra.display == Display::Flex {
+                    Display::InlineBlock
+                } else {
+                    extra.display
+                },
                 font_family: font.font_family.clone(),
                 font_size: 20.0,
                 line_height: 1.0,
