@@ -4103,6 +4103,40 @@ fn cascade_measure_width(text: &str, style: &w3cos_std::style::Style) -> f32 {
         .sum()
 }
 
+/// Physical advances for adjacent fragments that share one layout text run.
+/// The GPU/Skia path shapes the concatenated run and partitions its clusters;
+/// the Vello-only path mirrors its current fontdue layout contract, whose
+/// advances are per character and whose authored fragments are consumed at
+/// separate LayoutUnit endpoints.
+pub(crate) fn physical_text_fragment_advances(
+    fragments: &[&str],
+    style: &w3cos_std::style::Style,
+) -> Option<Vec<f32>> {
+    if fragments.is_empty() {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    let mut advances = crate::render_skia::measure_skia_cssom_fragment_advances(fragments, style)?;
+    #[cfg(not(feature = "skia"))]
+    let advances = fragments
+        .iter()
+        .map(|fragment| text_layout::inline_layout_advance(cascade_measure_width(fragment, style)))
+        .collect::<Vec<_>>();
+
+    #[cfg(feature = "skia")]
+    {
+        let total = advances.iter().sum::<f32>();
+        let snapped = text_layout::inline_layout_advance(total);
+        if let Some(last) = advances.last_mut() {
+            *last += snapped - total;
+        }
+    }
+    advances
+        .iter()
+        .all(|advance| advance.is_finite() && *advance >= 0.0)
+        .then_some(advances)
+}
+
 fn cascade_line_height(text: &str, style: &w3cos_std::style::Style) -> f32 {
     if style.line_height_computed_px.is_some() {
         return crate::layout::inline_style_line_height(style);
@@ -54076,6 +54110,22 @@ mod tests {
             let actual = inline_font_baseline_from_line_top(&style, line_height);
             assert_eq!(actual, baseline);
             assert_eq!(line_height - actual, descent);
+        }
+    }
+
+    #[test]
+    fn physical_text_fragments_match_the_layout_backend_endpoints() {
+        let style = Style {
+            display: WDisp::Inline,
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let fragments = ["outer ", "inner", " tail"];
+        let advances = physical_text_fragment_advances(&fragments, &style).unwrap();
+        assert_eq!(advances.len(), fragments.len());
+        assert!(advances.iter().all(|advance| *advance >= 0.0));
+        for (fragment, advance) in fragments.into_iter().zip(advances) {
+            assert_eq!(advance, text_intrinsic_size(fragment, &style).0);
         }
     }
 

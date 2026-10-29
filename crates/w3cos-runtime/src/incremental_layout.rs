@@ -504,6 +504,62 @@ fn split_inline_owner(info: &crate::layout::FlatNodeInfo<'_>) -> Option<u32> {
         .ok()
 }
 
+/// Physical advances for one shaped line at every authored owner boundary.
+/// This is produced during layout writeback and consumed by the retained
+/// CSSOM rectangle map; later `getClientRects()` calls only read that map.
+struct PhysicalTextLine {
+    boundaries: Vec<usize>,
+    positions: Vec<f32>,
+}
+
+impl PhysicalTextLine {
+    fn advance(&self, start: usize, end: usize) -> Option<(f32, f32)> {
+        let start_index = self.boundaries.binary_search(&start).ok()?;
+        let end_index = self.boundaries.binary_search(&end).ok()?;
+        let start_position = *self.positions.get(start_index)?;
+        let end_position = *self.positions.get(end_index)?;
+        Some((start_position, (end_position - start_position).max(0.0)))
+    }
+
+    fn total(&self) -> Option<f32> {
+        self.positions.last().copied()
+    }
+}
+
+fn physical_text_line(
+    line: &str,
+    style: &w3cos_std::Style,
+    owner_ranges: &[(u32, usize, usize)],
+) -> Option<PhysicalTextLine> {
+    let mut boundaries = Vec::with_capacity(owner_ranges.len() * 2 + 2);
+    boundaries.extend([0, line.len()]);
+    for &(_, start, end) in owner_ranges {
+        if start <= end
+            && end <= line.len()
+            && line.is_char_boundary(start)
+            && line.is_char_boundary(end)
+        {
+            boundaries.extend([start, end]);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let fragments = boundaries
+        .windows(2)
+        .map(|range| line.get(range[0]..range[1]))
+        .collect::<Option<Vec<_>>>()?;
+    let advances = crate::layout::physical_text_fragment_advances(&fragments, style)?;
+    let mut positions = Vec::with_capacity(advances.len() + 1);
+    positions.push(0.0);
+    for advance in advances {
+        positions.push(positions.last().copied().unwrap_or(0.0) + advance);
+    }
+    (positions.len() == boundaries.len()).then_some(PhysicalTextLine {
+        boundaries,
+        positions,
+    })
+}
+
 fn publish_client_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
@@ -643,17 +699,26 @@ fn publish_client_rects(
                 .and_then(|styles| styles.get(line_index))
                 .unwrap_or(info.style);
             let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(line, line_style);
+            let physical_line = physical_text_line(line, line_style, &owner_ranges);
             let explicit_owners = owner_ranges
                 .iter()
                 .map(|(owner, _, _)| *owner)
                 .collect::<HashSet<_>>();
             for (owner, start, end) in owner_ranges {
-                // Explicit owner subranges retain the same independently
-                // measured physical widths that layout used before coalescing.
-                // The inherited outer owner below owns the whole line and is
-                // snapped once at that line's cumulative endpoint.
-                let prefix_width = measure(&line[..start], line_style);
-                let width = measure(&line[start..end], line_style);
+                // Resolve every owner boundary together during layout
+                // writeback. Contextual backends shape one physical run and
+                // assign a crossing cluster to its start owner; the current
+                // Vello/fontdue backend preserves its authored-fragment
+                // LayoutUnit endpoints without later CSSOM remeasurement.
+                let (prefix_width, width) = physical_line
+                    .as_ref()
+                    .and_then(|physical| physical.advance(start, end))
+                    .unwrap_or_else(|| {
+                        (
+                            measure(&line[..start], line_style),
+                            measure(&line[start..end], line_style),
+                        )
+                    });
                 let x = match line_style.direction {
                     w3cos_std::style::TextDirection::Ltr => line_box.x + prefix_width,
                     w3cos_std::style::TextDirection::Rtl => {
@@ -685,7 +750,10 @@ fn publish_client_rects(
                 .copied()
                 .filter(|owner| !explicit_owners.contains(owner))
             {
-                let width = physical_advance(line, line_style);
+                let width = physical_line
+                    .as_ref()
+                    .and_then(PhysicalTextLine::total)
+                    .unwrap_or_else(|| physical_advance(line, line_style));
                 let x = match line_style.direction {
                     w3cos_std::style::TextDirection::Ltr => line_box.x,
                     w3cos_std::style::TextDirection::Rtl => line_box.x + line_box.width - width,

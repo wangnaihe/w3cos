@@ -33327,8 +33327,14 @@ try {
         assert_eq!(inner_rects[1], outer_rects[1]);
         assert_eq!(inner_rects[2].1, outer_rects[2].1);
         assert_eq!(inner_rects[2].3, outer_rects[2].3);
-        assert!((inner_rects[0].2 - 94.71875).abs() < 0.001);
-        assert!((inner_rects[2].2 - 81.703125).abs() < 0.001);
+        assert!(
+            (inner_rects[0].2 - 94.71875).abs() < 0.001,
+            "unexpected leading inner fragment: {inner_rects:?}"
+        );
+        assert!(
+            (inner_rects[2].2 - 81.703125).abs() < 0.001,
+            "unexpected trailing inner fragment: {inner_rects:?}"
+        );
         assert!(outer_owners > 0, "outer split owner must survive lowering");
         assert!(inner_owners > 0, "inner split owner must survive lowering");
 

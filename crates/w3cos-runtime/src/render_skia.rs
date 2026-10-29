@@ -5989,6 +5989,26 @@ pub(crate) fn measure_skia_inline_fragment_advances(
     fragments: &[&str],
     style: &Style,
 ) -> Option<Vec<f32>> {
+    measure_skia_fragment_advances(fragments, style, false)
+}
+
+/// Partition one physical shaping run for CSSOM inline-owner rectangles.
+/// A cluster that crosses an authored owner boundary belongs to the fragment
+/// containing its logical start. Chrome exposes the same contract for a
+/// ligature split across two otherwise identical inline elements: the first
+/// element owns the cluster advance and the second element has zero width.
+pub(crate) fn measure_skia_cssom_fragment_advances(
+    fragments: &[&str],
+    style: &Style,
+) -> Option<Vec<f32>> {
+    measure_skia_fragment_advances(fragments, style, true)
+}
+
+fn measure_skia_fragment_advances(
+    fragments: &[&str],
+    style: &Style,
+    assign_crossing_cluster_to_start: bool,
+) -> Option<Vec<f32>> {
     if fragments.is_empty() || style_uses_ahem(style) {
         return None;
     }
@@ -6033,7 +6053,8 @@ pub(crate) fn measure_skia_inline_fragment_advances(
                     .partition_point(|boundary| *boundary <= run_offset + start)
                     .checked_sub(1)?;
                 if fragment >= fragments.len()
-                    || run_offset + end > boundaries[fragment + 1]
+                    || (!assign_crossing_cluster_to_start
+                        && run_offset + end > boundaries[fragment + 1])
                     || !advance.is_finite()
                 {
                     return None;
@@ -13208,6 +13229,35 @@ mod tests {
             together < separate - 0.5,
             "font positioning must affect the inline advance: together={together}, separate={separate}"
         );
+    }
+
+    #[test]
+    fn cssom_owner_boundary_assigns_a_crossing_ligature_to_its_start_fragment() {
+        let family = "W3cosCssomLigatureNotoSerif";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/NotoSerif-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register the ligature-capable Chrome control face");
+        let style = Style {
+            font_family: Some(family.into()),
+            font_size: 64.0,
+            ..Style::default()
+        };
+        let split = measure_skia_cssom_fragment_advances(&["f", "i"], &style)
+            .expect("shape one physical run across the owner boundary");
+        let whole = measure_skia_text_intrinsic_size("fi", &style).0;
+        assert_eq!(split.len(), 2);
+        assert!(
+            (split.iter().sum::<f32>() - whole).abs() < 0.001,
+            "split={split:?}, whole={whole}"
+        );
+        assert!(split[0] > 0.0, "the cluster start owns its advance");
+        assert_eq!(split[1], 0.0, "the continuation owner is zero-width");
     }
 
     #[test]
