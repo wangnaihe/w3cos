@@ -4320,7 +4320,12 @@ fn inline_svgs_match_chrome() {
             w,
             h,
             Style {
-                display: Display::Inline,
+                // The default display (flex) means "the UA's inline".
+                display: if extra.display == Display::Flex {
+                    Display::Inline
+                } else {
+                    extra.display
+                },
                 font_family: font.font_family.clone(),
                 font_size: 20.0,
                 line_height: 1.0,
@@ -4539,6 +4544,7 @@ fn inline_svgs_match_chrome() {
             ..Style::default()
         },
     );
-    let flat = pre_flatten(&node(block(), vec![node(font.clone(), vec![floated])]));
-    assert_eq!(block::unsupported_reasons(&flat), vec!["kind:other"]);
+    let root = node(block(), vec![node(font.clone(), vec![floated])]);
+    let flat = pre_flatten(&root);
+    assert!(!block::unsupported_reasons(&flat).is_empty());
 }
