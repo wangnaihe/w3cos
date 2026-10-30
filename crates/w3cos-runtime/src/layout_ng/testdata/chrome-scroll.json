@@ -1,0 +1,191 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "scroll-block",
+   "html": "<div id=a style='width:100px;height:50px;overflow:auto;background:teal'><div id=b style='height:200px'></div></div><div id=c style='height:10px'></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "b": [
+     0,
+     0,
+     100,
+     200
+    ],
+    "c": [
+     0,
+     50,
+     800,
+     10
+    ]
+   }
+  },
+  {
+   "name": "scroll-both",
+   "html": "<div id=a style='width:100px;height:50px;overflow:scroll'><div id=b style='width:300px;height:30px'></div><div id=c style='height:10px;margin-top:20px'></div></div><div id=d style='height:10px'></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "b": [
+     0,
+     0,
+     300,
+     30
+    ],
+    "c": [
+     0,
+     50,
+     100,
+     10
+    ],
+    "d": [
+     0,
+     50,
+     800,
+     10
+    ]
+   }
+  },
+  {
+   "name": "scroll-auto-height",
+   "html": "<div style='width:200px'><div id=f style='float:left;width:60px;height:40px'></div><div id=a style='overflow:auto;margin:0'><div id=b style='height:20px'></div></div></div>",
+   "rects": {
+    "f": [
+     0,
+     0,
+     60,
+     40
+    ],
+    "a": [
+     60,
+     0,
+     140,
+     20
+    ],
+    "b": [
+     60,
+     0,
+     140,
+     20
+    ]
+   }
+  },
+  {
+   "name": "scroll-abs",
+   "html": "<div id=a style='position:relative;width:100px;height:50px;overflow:auto'><div id=b style='position:absolute;left:0;top:0;width:20px;height:300px'></div><div id=c style='height:80px'></div></div><div id=d style='position:absolute;left:5px;top:5px;width:10px;height:10px'></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "b": [
+     0,
+     0,
+     20,
+     300
+    ],
+    "c": [
+     0,
+     0,
+     100,
+     80
+    ],
+    "d": [
+     5,
+     5,
+     10,
+     10
+    ]
+   }
+  },
+  {
+   "name": "scroll-nested",
+   "html": "<div id=a style='width:120px;height:80px;overflow:scroll'><div id=b style='width:60px;height:40px;overflow:auto;margin:4px'><div id=c style='width:100px;height:100px'></div></div><div id=d style='height:200px'></div></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     120,
+     80
+    ],
+    "b": [
+     4,
+     4,
+     60,
+     40
+    ],
+    "c": [
+     4,
+     4,
+     100,
+     100
+    ],
+    "d": [
+     0,
+     48,
+     120,
+     200
+    ]
+   }
+  },
+  {
+   "name": "scroll-x-only",
+   "html": "<div id=a style='width:100px;overflow-x:auto'><div id=b style='width:300px;height:20px'></div><div id=c style='height:15px'></div></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     35
+    ],
+    "b": [
+     0,
+     0,
+     300,
+     20
+    ],
+    "c": [
+     0,
+     20,
+     100,
+     15
+    ]
+   }
+  },
+  {
+   "name": "scroll-transform",
+   "html": "<div id=a style='width:100px;height:50px;overflow:hidden'><div id=b style='width:100px;height:30px;transform:translateX(40px)'></div><div id=c style='width:200px;height:10px;transform:translateX(-150px)'></div></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "b": [
+     40,
+     0,
+     100,
+     30
+    ],
+    "c": [
+     -150,
+     30,
+     200,
+     10
+    ]
+   }
+  }
+ ]
+}
