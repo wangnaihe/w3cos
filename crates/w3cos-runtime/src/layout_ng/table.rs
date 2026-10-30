@@ -1278,6 +1278,27 @@ fn layout_cell_fragment(
     content_width: f32,
     space: &ConstraintSpace,
 ) -> Option<LayoutResult> {
+    // A cell is laid out once at its natural height and stretched to the
+    // row afterwards, so a percentage block size below it stays auto. Where
+    // the cell, its row or section, or the table has a specified height,
+    // Chrome resolves it against the stretched cell (css-sizing/
+    // table-child-percentage-height-with-border-box); that needs a second
+    // pass, so such tables stay on the legacy engine.
+    if flat[index + 1..flat[index].subtree_end]
+        .iter()
+        .any(|node| matches!(node.style.height, Dimension::Percent(_)))
+    {
+        let mut ancestor = Some(index);
+        while let Some(node) = ancestor {
+            if !matches!(flat[node].style.height, Dimension::Auto) {
+                return super::bail("table-cell-percent-height");
+            }
+            if flat[node].style.display == Display::Table {
+                break;
+            }
+            ancestor = flat[node].parent;
+        }
+    }
     let mut nested = *space;
     nested.available_inline = content_width.max(0.0);
     nested.percentage_block = None;
