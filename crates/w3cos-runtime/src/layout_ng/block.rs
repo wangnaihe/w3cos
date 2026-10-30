@@ -336,6 +336,7 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
             info.kind,
             ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
         )
+        && !matches!(info.kind, ComponentKind::SvgDocument { .. })
 }
 
 /// Floats of block-level boxes in a block container (S3b).  Floats among
@@ -517,6 +518,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     }
     if matches!(info.kind, ComponentKind::Canvas { .. }) {
         return canvas_box_reason(flat, index);
+    }
+    if matches!(info.kind, ComponentKind::SvgDocument { .. }) {
+        return svg_box_reason(flat, index);
     }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
         // A text run is an anonymous flex item whatever its siblings are:
@@ -786,6 +790,118 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
     }
 }
 
+/// A replaced `<svg>` root (CSS 2.1 10.3.2 / 10.4): the same placement
+/// rules as `<canvas>`. Inline and inline-block roots are atomic inlines.
+fn svg_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if style.box_sizing == BoxSizing::BorderBox || size_contained(style) {
+        return Some("kind:other");
+    }
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some("kind:other");
+    }
+    if info.parent.is_some_and(|parent| {
+        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+    }) {
+        return Some("kind:other");
+    }
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("kind:other");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => {
+            unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
+        }
+        Display::Inline | Display::InlineBlock => {
+            if !inline::in_inline_container(flat, index) {
+                return Some("kind:other");
+            }
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
+        _ => Some("kind:other"),
+    }
+}
+
+/// Content-box size of an `<svg>` root. In HTML the root's `width` and
+/// `height` attributes are presentation hints for the CSS properties, so
+/// each axis is the CSS value, else the attribute, and `min`/`max` clamp
+/// per axis with no ratio scaling (checked in Chrome). The DOM lowering
+/// writes both attributes, filling a missing one from the `viewBox` or
+/// 300x150; the serialized root cannot say which were authored. With a
+/// `viewBox` the auto axes would derive from its ratio in Chrome, so
+/// those, percentage or missing lengths, `preserveAspectRatio="none"`
+/// and a CSS `aspect-ratio` keep the legacy path.
+fn svg_content_size(source: &str, style: &Style, space: &ConstraintSpace) -> Option<(f32, f32)> {
+    use crate::image_loader::SvgIntrinsicLength;
+    let intrinsic = crate::image_loader::parse_svg_intrinsic_size(source.as_bytes());
+    if intrinsic.preserve_aspect_ratio_none
+        || style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key("--w3cos-internal-aspect-ratio"))
+    {
+        return super::bail("kind:other");
+    }
+    let (SvgIntrinsicLength::Px(width), SvgIntrinsicLength::Px(height)) =
+        (intrinsic.width, intrinsic.height)
+    else {
+        return super::bail("kind:other");
+    };
+    if intrinsic.ratio.is_some()
+        && (matches!(style.width, Dimension::Auto) || matches!(style.height, Dimension::Auto))
+    {
+        return super::bail("kind:other");
+    }
+    replaced_attr_content_size(width, height, style, space, svg_used_size)
+}
+
+/// Per-axis used size of an `<svg>` root (see `svg_content_size`).
+fn svg_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f32) {
+    let axis = |value: Option<f32>, attr: f32, min: Dimension, max: Dimension| {
+        let mut used = value.unwrap_or(attr);
+        if let Some(max) = canvas_axis_px(max, style) {
+            used = used.min(max.max(0.0));
+        }
+        if let Some(min) = canvas_axis_px(min, style) {
+            used = used.max(min.max(0.0));
+        }
+        used.max(0.0)
+    };
+    (
+        axis(
+            canvas_axis_px(style.width, style),
+            attr_width,
+            style.min_width,
+            style.max_width,
+        ),
+        axis(
+            canvas_axis_px(style.height, style),
+            attr_height,
+            style.min_height,
+            style.max_height,
+        ),
+    )
+}
+
 /// Content-box size of a canvas. `None` when a percentage has no basis
 /// or `box-sizing` is `border-box` (that used size stays on legacy).
 fn canvas_content_size(
@@ -793,6 +909,22 @@ fn canvas_content_size(
     attr_height: u32,
     style: &Style,
     space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    replaced_attr_content_size(
+        attr_width as f32,
+        attr_height as f32,
+        style,
+        space,
+        canvas_used_size,
+    )
+}
+
+fn replaced_attr_content_size(
+    attr_width: f32,
+    attr_height: f32,
+    style: &Style,
+    space: &ConstraintSpace,
+    used_size: fn(f32, f32, &Style) -> (f32, f32),
 ) -> Option<(f32, f32)> {
     if style.box_sizing == BoxSizing::BorderBox {
         return super::bail("kind:other");
@@ -822,11 +954,7 @@ fn canvas_content_size(
     definite.max_width = sub(style.max_width, Some(space.available_inline))?;
     definite.min_height = sub(style.min_height, space.percentage_block)?;
     definite.max_height = sub(style.max_height, space.percentage_block)?;
-    Some(canvas_used_size(
-        attr_width as f32,
-        attr_height as f32,
-        &definite,
-    ))
+    Some(used_size(attr_width, attr_height, &definite))
 }
 
 fn canvas_axis_px(dim: Dimension, style: &Style) -> Option<f32> {
@@ -1454,6 +1582,10 @@ pub(super) fn intrinsic_sizes(
             canvas_content_size(*width, *height, info.style, space).why("kind:other")?;
         return Some(MinMax::exact(width));
     }
+    if let ComponentKind::SvgDocument { source, .. } = info.kind {
+        let (width, _) = svg_content_size(source, info.style, space).why("kind:other")?;
+        return Some(MinMax::exact(width));
+    }
     if size_contained(info.style) {
         // Size containment: intrinsic sizes ignore the contents.
         return Some(MinMax::exact(contain_intrinsic_size(info.style).0));
@@ -1857,6 +1989,8 @@ fn layout_block_in(
         Some(replaced_content_size(src, style, space).why("image")?)
     } else if let ComponentKind::Canvas { width, height } = info.kind {
         Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
+    } else if let ComponentKind::SvgDocument { source, .. } = info.kind {
+        Some(svg_content_size(source, style, space).why("kind:other")?)
     } else {
         None
     };
@@ -2221,6 +2355,15 @@ fn layout_block_in(
         } else if let ComponentKind::Canvas { width, height } = child_info.kind {
             let (width, _) = canvas_content_size(*width, *height, child_info.style, &child_space)
                 .why("kind:other")?;
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
+        } else if let ComponentKind::SvgDocument { source, .. } = child_info.kind {
+            let (width, _) =
+                svg_content_size(source, child_info.style, &child_space).why("kind:other")?;
             let mut definite = child_info.style.clone();
             definite.width = Dimension::Px(width);
             definite.min_width = Dimension::Auto;
