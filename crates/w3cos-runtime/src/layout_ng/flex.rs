@@ -1107,7 +1107,43 @@ pub(super) fn layout(
             measured,
         )
         .why("flex:basis")?;
-        let base = base.max(0.0);
+        let mut base = base.max(0.0);
+        let mut min = min;
+        // A replaced item stretched on its cross axis (auto size, nowrap)
+        // has a definite cross size, so its main size is transferred
+        // through the intrinsic ratio (CSS Flexbox 9.8.2, Sizing 4 5.1);
+        // the automatic minimum is that transferred size.
+        if block::is_replaced_item(flat, child)
+            && style.flex_wrap == FlexWrap::NoWrap
+            && matches!(child_style.width, Dimension::Auto)
+            && matches!(child_style.height, Dimension::Auto)
+            && matches!(child_style.min_width, Dimension::Auto)
+            && matches!(child_style.min_height, Dimension::Auto)
+            && matches!(child_style.flex_basis, Dimension::Auto)
+            && used_align(style.align_items, child_style.align_self) == AlignItems::Stretch
+        {
+            if let Some(Some((w, h))) = block::replaced_item_size(flat, child, space)
+                && w > 0.0
+                && h > 0.0
+            {
+                let cross_definite = if row {
+                    specified_height.map(|height| {
+                        (height - margin_cross_start - margin_cross_end - cross_edges).max(0.0)
+                    })
+                } else {
+                    cross
+                };
+                if let Some(cross_size) = cross_definite {
+                    let used = if row {
+                        w * cross_size / h
+                    } else {
+                        h * cross_size / w
+                    };
+                    base = used;
+                    min = min.max(used.min(max));
+                }
+            }
+        }
         items.push(Item {
             index: child,
             order: child_style.order,

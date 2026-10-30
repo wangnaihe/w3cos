@@ -5237,9 +5237,8 @@ fn replaced_flex_grid_items_match_chrome() {
         66, 171, 248, 180, 117, 0, 222, 94, 0, 178, 95, 2, 159, 24, 0, 0, 0, 0, 73, 69, 78, 68,
         174, 66, 96, 130,
     ];
-    let path = std::env::temp_dir().join("w3cos-ng-replaced-items-50x25.png");
-    std::fs::write(&path, PNG).expect("write png");
-    let src = path.to_string_lossy().to_string();
+    let src = "w3cos-ng-replaced-items-50x25.png".to_string();
+    crate::image_loader::decode_and_install(&src, PNG).expect("decode png");
     // The UA display of an <img> is inline; the item is blockified.
     let img = |extra: Style| {
         Component::image(
@@ -5302,6 +5301,12 @@ fn replaced_flex_grid_items_match_chrome() {
     );
     assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
     let r = run(
+        "fr-stretch",
+        flex(FlexDirection::Row, 200.0, Some(60.0)),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 120.0, 60.0));
+    let r = run(
         "fc-width",
         flex(FlexDirection::Column, 100.0, None),
         vec![img(Style::default())],
@@ -5311,7 +5316,7 @@ fn replaced_flex_grid_items_match_chrome() {
 
     let grid = |align: AlignItems, markers: &[&str]| {
         let mut style = Style {
-            display: Display::Flex,
+            display: Display::Grid,
             width: Dimension::Px(100.0),
             height: Dimension::Px(100.0),
             align_items: align,
