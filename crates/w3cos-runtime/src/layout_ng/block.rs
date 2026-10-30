@@ -1044,17 +1044,17 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     ))
 }
 
-/// Used content-box height of a replaced item (`None`: not a replaced item;
+/// Used content-box size of a replaced item (`None`: not a replaced item;
 /// `Some(None)`: the size is not known here).
-pub(super) fn replaced_item_height(
+pub(super) fn replaced_item_size(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
-) -> Option<Option<f32>> {
+) -> Option<Option<(f32, f32)>> {
     let ComponentKind::Image { src } = flat[index].kind else {
         return None;
     };
-    Some(replaced_content_size(src, flat[index].style, space).map(|(_, height)| height))
+    Some(replaced_content_size(src, flat[index].style, space))
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either

@@ -470,6 +470,11 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if block::is_author_flex(info.style) {
         return intrinsic_sizes(flat, index, space);
     }
+    // A replaced item has no children; its content size is the replaced
+    // width, both as min-content and as max-content.
+    if let Some(size) = block::replaced_item_size(flat, index, space) {
+        return Some(MinMax::exact(size.why("flex:replaced")?.0));
+    }
     let mut sizes = MinMax::exact(0.0);
     let mut any = false;
     for child in rendered_children(flat, index) {
@@ -618,8 +623,8 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
         return Some(line.max(0.0));
     }
     // A replaced item's min-content block size is its used replaced height.
-    if let Some(height) = block::replaced_item_height(flat, index, space) {
-        return Some(height?);
+    if let Some(size) = block::replaced_item_size(flat, index, space) {
+        return Some(size?.1);
     }
     let mut sum = 0.0;
     for child in rendered_children(flat, index) {
