@@ -5520,9 +5520,21 @@ fn unicode_breakable_spaces_in_text_match_chrome() {
     let cases: [(&str, &str, (f32, f32, f32, f32)); 5] = [
         ("n1 ideographic", "XX\u{3000}XX", (0.0, 0.0, 50.0, 10.0)),
         ("n2 zwsp", "XX\u{200b}XX", (0.0, 0.0, 40.0, 10.0)),
-        ("n3 trailing ideographic", "X\u{3000}", (0.0, 0.0, 20.0, 10.0)),
-        ("n4 leading ideographic", "\u{3000}XX", (0.0, 0.0, 30.0, 10.0)),
-        ("n5 mixed", "XX\u{3000}\u{3000}XX\u{200b}X", (0.0, 0.0, 70.0, 10.0)),
+        (
+            "n3 trailing ideographic",
+            "X\u{3000}",
+            (0.0, 0.0, 20.0, 10.0),
+        ),
+        (
+            "n4 leading ideographic",
+            "\u{3000}XX",
+            (0.0, 0.0, 30.0, 10.0),
+        ),
+        (
+            "n5 mixed",
+            "XX\u{3000}\u{3000}XX\u{200b}X",
+            (0.0, 0.0, 70.0, 10.0),
+        ),
     ];
     let mut bad = Vec::new();
     for (name, text, want) in cases {
