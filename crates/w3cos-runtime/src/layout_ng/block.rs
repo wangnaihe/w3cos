@@ -1334,8 +1334,22 @@ fn percent_inline(style: &Style) -> bool {
 }
 
 /// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
-fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, mut width: f32) -> f32 {
-    let cb = Some(space.available_inline);
+fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, width: f32) -> f32 {
+    clamp_inline_in(style, space, edges, width, Some(space.available_inline))
+}
+
+/// `clamp_inline` against an explicit containing-block inline size. A
+/// `None` basis (an intrinsic-size computation: the containing block is
+/// not sized yet) leaves percentage min-width / max-width unresolved, so
+/// they clamp nothing (CSS Sizing 3 5.2.1, Blink's indefinite-size
+/// ResolveMinInlineLength / ResolveMaxInlineLength).
+fn clamp_inline_in(
+    style: &Style,
+    space: &ConstraintSpace,
+    edges: f32,
+    mut width: f32,
+    cb: Option<f32>,
+) -> f32 {
     let to_content = |w: f32| match style.box_sizing {
         BoxSizing::BorderBox => (w - edges).max(0.0),
         BoxSizing::ContentBox => w,
@@ -1379,13 +1393,6 @@ pub(super) fn intrinsic_sizes(
             b[1] + b[3] + side(style.padding.left) + side(style.padding.right)
         };
         return Some(border_box.map(|width| (width - edges).max(0.0)));
-    }
-    if subtree
-        .iter()
-        .filter(rendered)
-        .any(|node| percent_inline(node.style))
-    {
-        return super::bail("intrinsic-percent");
     }
     if is_author_grid(info.style) {
         // A grid's min/max-content size is the sum of its tracks, not the
@@ -1463,7 +1470,7 @@ pub(super) fn intrinsic_sizes(
             }),
             None => intrinsic_sizes(flat, child, space).why("intrinsic")?,
         };
-        let border_box = content.map(|w| clamp_inline(style, space, edges, w) + edges);
+        let border_box = content.map(|w| clamp_inline_in(style, space, edges, w, None) + edges);
         let max_contribution = if floating {
             // A float outside the content area (negative margins) adds
             // nothing.
