@@ -5495,11 +5495,51 @@ fn scroll_container_baseline_is_the_margin_edge_like_chrome() {
     // (name, inner display, inner text, inner margin-bottom, outer rect,
     //  inner rect, trailing text y)
     #[allow(clippy::type_complexity)]
-    let cases: [(&str, Display, &str, f32, (f32, f32, f32, f32), (f32, f32, f32, f32), f32); 4] = [
-        ("b2", Display::Block, "", 0.0, (0.0, 0.0, 30.0, 50.0), (0.0, 0.0, 30.0, 30.0), 22.0),
-        ("b3", Display::Block, "XX", 0.0, (0.0, 0.0, 30.0, 50.0), (0.0, 0.0, 30.0, 30.0), 22.0),
-        ("b4", Display::InlineBlock, "XX", 30.0, (0.0, 0.0, 30.0, 82.0), (0.0, 0.0, 30.0, 30.0), 52.0),
-        ("b5", Display::Block, "XX", 30.0, (0.0, 0.0, 30.0, 80.0), (0.0, 0.0, 30.0, 30.0), 52.0),
+    let cases: [(
+        &str,
+        Display,
+        &str,
+        f32,
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        f32,
+    ); 4] = [
+        (
+            "b2",
+            Display::Block,
+            "",
+            0.0,
+            (0.0, 0.0, 30.0, 50.0),
+            (0.0, 0.0, 30.0, 30.0),
+            22.0,
+        ),
+        (
+            "b3",
+            Display::Block,
+            "XX",
+            0.0,
+            (0.0, 0.0, 30.0, 50.0),
+            (0.0, 0.0, 30.0, 30.0),
+            22.0,
+        ),
+        (
+            "b4",
+            Display::InlineBlock,
+            "XX",
+            30.0,
+            (0.0, 0.0, 30.0, 82.0),
+            (0.0, 0.0, 30.0, 30.0),
+            52.0,
+        ),
+        (
+            "b5",
+            Display::Block,
+            "XX",
+            30.0,
+            (0.0, 0.0, 30.0, 80.0),
+            (0.0, 0.0, 30.0, 30.0),
+            52.0,
+        ),
     ];
     let mut bad = Vec::new();
     for (name, display, text, margin_bottom, want_outer, want_inner, want_y) in cases {
@@ -5723,19 +5763,13 @@ fn collapsed_outer_borders_from_any_table_part_match_chrome() {
         vec![
             table(
                 mix(Style::default()),
-                vec![row(
-                    plain(Display::TableRow),
-                    vec![cell(Style::default())],
-                )],
+                vec![row(plain(Display::TableRow), vec![cell(Style::default())])],
             ),
             table(
                 Style::default(),
                 vec![node(
                     mix(plain(Display::TableRowGroup)),
-                    vec![row(
-                        plain(Display::TableRow),
-                        vec![cell(Style::default())],
-                    )],
+                    vec![row(plain(Display::TableRow), vec![cell(Style::default())])],
                 )],
             ),
             table(

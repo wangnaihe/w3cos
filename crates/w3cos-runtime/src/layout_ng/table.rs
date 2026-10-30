@@ -1497,9 +1497,7 @@ fn intrinsic_border_box_inner(
     }
     let mut min = min_tracks + gaps + lines;
     let mut max = max_tracks + gaps + lines;
-    if include_specified
-        && let Some(specified) = border_box_size(style, space, specified_basis)
-    {
+    if include_specified && let Some(specified) = border_box_size(style, space, specified_basis) {
         min = min.max(specified);
         max = max.max(specified);
     }

@@ -1865,7 +1865,11 @@ pub(super) fn layout_inline_beside(
             let side = |m| {
                 crate::layout::resolve_spacing_for_layout(
                     m,
-                    if space.percent_unresolved { 0.0 } else { available },
+                    if space.percent_unresolved {
+                        0.0
+                    } else {
+                        available
+                    },
                     style,
                     space.viewport_w,
                     space.viewport_h,

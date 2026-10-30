@@ -405,7 +405,11 @@ fn layout_float(
         Spacing::Auto => 0.0,
         s => resolve_spacing_for_layout(
             s,
-            if space.percent_unresolved { 0.0 } else { space.available_inline },
+            if space.percent_unresolved {
+                0.0
+            } else {
+                space.available_inline
+            },
             style,
             space.viewport_w,
             space.viewport_h,
