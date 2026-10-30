@@ -1393,7 +1393,18 @@ pub(super) fn intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, true)
+    intrinsic_border_box_inner(flat, index, space, true, Some(space.available_inline))
+}
+
+/// The table's min/max-content contribution to its parent: like
+/// `intrinsic_border_box`, but a percentage `width` is cyclic (the parent
+/// is being sized) and counts as auto, CSS Sizing 3 5.2.1.
+pub(super) fn contribution_border_box(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    intrinsic_border_box_inner(flat, index, space, true, None)
 }
 
 /// Column min/max without the table's own `width`. Flex uses this so a
@@ -1403,7 +1414,7 @@ pub(super) fn content_intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, false)
+    intrinsic_border_box_inner(flat, index, space, false, Some(space.available_inline))
 }
 
 fn intrinsic_border_box_inner(
@@ -1411,6 +1422,7 @@ fn intrinsic_border_box_inner(
     index: usize,
     space: &ConstraintSpace,
     include_specified: bool,
+    specified_basis: Option<f32>,
 ) -> Option<MinMax> {
     let style = flat[index].style;
     let grid = grid_of(flat, index);
@@ -1465,7 +1477,7 @@ fn intrinsic_border_box_inner(
     let mut min = min_tracks + gaps + lines;
     let mut max = max_tracks + gaps + lines;
     if include_specified
-        && let Some(specified) = border_box_size(style, space, Some(space.available_inline))
+        && let Some(specified) = border_box_size(style, space, specified_basis)
     {
         min = min.max(specified);
         max = max.max(specified);

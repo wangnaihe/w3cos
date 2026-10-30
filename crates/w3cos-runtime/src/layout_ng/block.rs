@@ -1390,7 +1390,7 @@ pub(super) fn intrinsic_sizes(
     // padding are added back onto this content box.
     if matches!(info.style.display, Display::Table | Display::InlineTable) {
         let border_box =
-            super::table::intrinsic_border_box(flat, index, space).why("table:intrinsic")?;
+            super::table::contribution_border_box(flat, index, space).why("table:intrinsic")?;
         let style = info.style;
         let side = |s: Spacing| match s {
             Spacing::Auto => 0.0,
