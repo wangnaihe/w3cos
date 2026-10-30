@@ -1001,9 +1001,10 @@ fn floated_inline_block_and_list_item_match_chrome() {
         )],
     );
     assert!(
-        block::unsupported_reasons(&pre_flatten(&flex))
+        !block::unsupported_reasons(&pre_flatten(&flex))
             .iter()
-            .any(|reason| reason == "float:display")
+            .any(|reason| reason == "float:display"),
+        "a floated flex container is blockified and supported"
     );
     let grid = node(
         block(),
@@ -1019,9 +1020,10 @@ fn floated_inline_block_and_list_item_match_chrome() {
         )],
     );
     assert!(
-        block::unsupported_reasons(&pre_flatten(&grid))
+        !block::unsupported_reasons(&pre_flatten(&grid))
             .iter()
-            .any(|reason| reason == "float:display")
+            .any(|reason| reason == "float:display"),
+        "a floated grid container is blockified and supported"
     );
     let inline_parent = node(
         block(),
@@ -3477,18 +3479,18 @@ fn replaced_content_box_matches_legacy() {
     );
     let out = parity(&block_image);
     assert_eq!(rect(&out, 1), (60.0, 0.0, 80.0, 40.0));
-    let inline_image = node(
+    // An inline image is an atomic inline in the line box (see
+    // inline_images_match_chrome); a border-box image still takes legacy.
+    let mut border_box = image(Display::Block, Spacing::Px(0.0), Spacing::Px(0.0));
+    border_box.style.box_sizing = w3cos_std::style::BoxSizing::BorderBox;
+    let root = node(
         Style {
             display: Display::Block,
             ..Style::default()
         },
-        vec![image(
-            Display::InlineBlock,
-            Spacing::Px(0.0),
-            Spacing::Px(0.0),
-        )],
+        vec![border_box],
     );
-    let flat = pre_flatten(&inline_image);
+    let flat = pre_flatten(&root);
     assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
 }
 
@@ -3632,8 +3634,8 @@ fn definite_canvas_matches_chrome() {
     ));
     assert_eq!(at(&out, 1), (0.0, 0.0, 90.0, 50.0));
 
-    // Inline-block stays on legacy: the NG line is 24.1875px and Chrome's
-    // is 24px, so a block reference of the same border box would be one-sided.
+    // An inline-block canvas outside any IFC text is an atomic inline of
+    // its block parent (see inline_canvases_match_chrome).
     let inline = node(
         block(),
         vec![canvas(
@@ -3646,10 +3648,199 @@ fn definite_canvas_matches_chrome() {
         )],
     );
     let flat = pre_flatten(&inline);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    // A border-box canvas still takes legacy.
+    let border_box = node(
+        block(),
+        vec![block_canvas(
+            40,
+            20,
+            Style {
+                box_sizing: w3cos_std::style::BoxSizing::BorderBox,
+                ..Style::default()
+            },
+        )],
+    );
+    let flat = pre_flatten(&border_box);
     assert_eq!(
         block::unsupported_reasons(&flat),
         vec!["kind:other".to_string()]
     );
+}
+
+/// An inline `<canvas>` is an atomic inline in the line box (CSS 2.1
+/// 10.8.1: its baseline is the bottom margin edge). Border boxes measured
+/// in headless Chrome 156 (getBoundingClientRect, Ahem 20px/1, 300px wide
+/// unless noted; testdata/chrome-canvas.json).
+#[test]
+fn inline_canvases_match_chrome() {
+    use w3cos_std::style::{AlignSelf, CustomProperties};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let cv = |w: u32, h: u32, extra: Style| {
+        Component::canvas(
+            w,
+            h,
+            Style {
+                // The default display (flex) means "the UA's inline-block";
+                // a case that passes its own display keeps it.
+                display: if extra.display == Display::Flex {
+                    Display::InlineBlock
+                } else {
+                    extra.display
+                },
+                font_family: font.font_family.clone(),
+                font_size: 20.0,
+                line_height: 1.0,
+                line_height_is_normal: false,
+                ..extra
+            },
+        )
+    };
+    let top = || {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-vertical-align-keyword".to_string(),
+            "top".to_string(),
+        )]))
+    };
+    let run = |n: usize, width: f32, children: Vec<Component>| {
+        let parent = Style {
+            width: Dimension::Px(width),
+            ..font.clone()
+        };
+        let root = node(block(), vec![node(parent, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "case {n}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {n} stays on NG"));
+        rects
+    };
+    let xx = || Component::text("XX", text_style.clone());
+    let px = Dimension::Px;
+
+    // cv1: on the baseline between text; the line is 24px.
+    let r = run(1, 300.0, vec![xx(), cv(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // cv2: vertical-align: middle (align_self Center in the cascade form).
+    let r = run(
+        2,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                30,
+                40,
+                Style {
+                    align_self: AlignSelf::Center,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // cv3: alone, with margins.
+    let r = run(
+        3,
+        300.0,
+        vec![cv(
+            30,
+            10,
+            Style {
+                margin: margins(5.0, 3.0, 5.0, 3.0),
+                ..Style::default()
+            },
+        )],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 2), (3.0, 5.0, 30.0, 10.0));
+    // cv4: max-width scales the canvas by its ratio; a top-aligned one.
+    let r = run(
+        4,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                100,
+                20,
+                Style {
+                    max_width: px(60.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+            cv(
+                10,
+                10,
+                Style {
+                    align_self: AlignSelf::FlexStart,
+                    custom_properties: top(),
+                    ..Style::default()
+                },
+            ),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    close(rect(&r, 3), (40.0, 4.0, 60.0, 12.0));
+    assert_eq!(rect(&r, 5), (140.0, 0.0, 10.0, 10.0));
+    // cv5: a specified width keeps the attribute ratio.
+    let r = run(
+        5,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                60,
+                30,
+                Style {
+                    width: px(30.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(rect(&r, 3), (40.0, 1.0, 30.0, 15.0));
+    // cv7: author display:inline is the same atomic inline.
+    let r = run(
+        7,
+        300.0,
+        vec![
+            xx(),
+            cv(
+                30,
+                20,
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // cv8: in a 50px box the second text wraps, the canvas is on line 2.
+    let r = run(8, 50.0, vec![xx(), cv(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 50.0, 64.0));
+    assert_eq!(rect(&r, 3), (0.0, 20.0, 30.0, 20.0));
 }
 
 #[test]
@@ -4068,9 +4259,12 @@ fn flex_text_items_match_chrome() {
         rects
     };
     let check = |rects: &[(LayoutRect, usize)], expected: &[(usize, (f32, f32, f32, f32))]| {
-        for (index, want) in expected {
-            assert_eq!(rect(rects, *index), *want, "box {index}");
-        }
+        let bad: Vec<String> = expected
+            .iter()
+            .filter(|(index, want)| rect(rects, *index) != *want)
+            .map(|(index, want)| format!("box {index}: {:?} want {want:?}", rect(rects, *index)))
+            .collect();
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     };
 
     // row-text: margins on a text item, then a sized one that overflows.
@@ -4290,6 +4484,997 @@ fn flex_text_items_match_chrome() {
         ),
         (0.0, 10.0, 40.0, 20.0)
     );
+}
+
+/// `overflow: auto | scroll` boxes lay out like `overflow: hidden` ones: a
+/// BFC whose scrollbars take no space (the legacy engine reserves none, and
+/// the headless Chrome these boxes were measured in uses overlay scrollbars).
+/// Border boxes measured in headless Chrome (body margin 0); the scroll
+/// containers report their scrollable extent from the NG rects
+/// (testdata/chrome-scroll.json).
+#[test]
+fn scroll_containers_match_chrome() {
+    use crate::layout::scroll_containers_from_layout;
+    use w3cos_std::style::{Float, Overflow, Position};
+    let scroller = |overflow: Overflow, width: f32, height: Option<f32>| Style {
+        width: Dimension::Px(width),
+        height: height.map_or(Dimension::Auto, Dimension::Px),
+        overflow,
+        ..block()
+    };
+    let boxed = |width: f32, height: f32| Style {
+        width: Dimension::Px(width),
+        ..sized(height)
+    };
+    let extents = |root: &Component| {
+        let flat = pre_flatten(root);
+        let rects = ng_rects(root);
+        let (scrollable, clip_only, ancestor) = scroll_containers_from_layout(&rects, &flat);
+        (
+            scrollable
+                .iter()
+                .map(|(i, _, e)| (*i, e.max_x, e.max_y))
+                .collect::<Vec<_>>(),
+            clip_only.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            ancestor,
+        )
+    };
+
+    // scroll-block: an auto-width child fills the scroller (no gutter).
+    let root = node(
+        block(),
+        vec![
+            node(
+                scroller(Overflow::Auto, 100.0, Some(50.0)),
+                vec![node(sized(200.0), vec![])],
+            ),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 200.0));
+    close(rect(&out, 3), (0.0, 50.0, 800.0, 10.0));
+    let (scrollable, clip_only, ancestor) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 0.0, 150.0)]);
+    assert!(clip_only.is_empty());
+    assert_eq!(ancestor, vec![None, None, Some(1), None]);
+
+    // scroll-both: overflow in both axes.
+    let tall_gap = Style {
+        margin: margins(20.0, 0.0, 0.0, 0.0),
+        ..sized(10.0)
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                scroller(Overflow::Scroll, 100.0, Some(50.0)),
+                vec![node(boxed(300.0, 30.0), vec![]), node(tall_gap, vec![])],
+            ),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 300.0, 30.0));
+    close(rect(&out, 3), (0.0, 50.0, 100.0, 10.0));
+    close(rect(&out, 4), (0.0, 50.0, 800.0, 10.0));
+    assert_eq!(extents(&root).0, vec![(1, 200.0, 10.0)]);
+
+    // scroll-auto-height: a BFC beside a float takes the remaining width.
+    let float = Style {
+        float: Float::Left,
+        ..boxed(60.0, 40.0)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![
+                node(float, vec![]),
+                node(
+                    Style {
+                        overflow: Overflow::Auto,
+                        ..block()
+                    },
+                    vec![node(sized(20.0), vec![])],
+                ),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (0.0, 0.0, 60.0, 40.0));
+    close(rect(&out, 3), (60.0, 0.0, 140.0, 20.0));
+    close(rect(&out, 4), (60.0, 0.0, 140.0, 20.0));
+    let (scrollable, clip_only, _) = extents(&root);
+    assert!(scrollable.is_empty());
+    assert_eq!(clip_only, vec![3]);
+
+    // scroll-abs: the scroller is the containing block of the absolute box.
+    let corner = |position: Position, left: f32, top: f32, width: f32, height: f32| Style {
+        position,
+        left: Dimension::Px(left),
+        top: Dimension::Px(top),
+        ..boxed(width, height)
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                Style {
+                    position: Position::Relative,
+                    ..scroller(Overflow::Auto, 100.0, Some(50.0))
+                },
+                vec![
+                    node(corner(Position::Absolute, 0.0, 0.0, 20.0, 300.0), vec![]),
+                    node(sized(80.0), vec![]),
+                ],
+            ),
+            node(corner(Position::Absolute, 5.0, 5.0, 10.0, 10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 20.0, 300.0));
+    close(rect(&out, 3), (0.0, 0.0, 100.0, 80.0));
+    close(rect(&out, 4), (5.0, 5.0, 10.0, 10.0));
+    let (scrollable, _, ancestor) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 0.0, 250.0)]);
+    assert_eq!(ancestor, vec![None, None, Some(1), Some(1), None]);
+
+    // scroll-nested: the inner scroller keeps its own overflow.
+    let inner = Style {
+        margin: margins(4.0, 4.0, 4.0, 4.0),
+        ..scroller(Overflow::Auto, 60.0, Some(40.0))
+    };
+    let root = node(
+        block(),
+        vec![node(
+            scroller(Overflow::Scroll, 120.0, Some(80.0)),
+            vec![
+                node(inner, vec![node(boxed(100.0, 100.0), vec![])]),
+                node(sized(200.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 120.0, 80.0));
+    close(rect(&out, 2), (4.0, 4.0, 60.0, 40.0));
+    close(rect(&out, 3), (4.0, 4.0, 100.0, 100.0));
+    close(rect(&out, 4), (0.0, 48.0, 120.0, 200.0));
+    let (scrollable, _, ancestor) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 0.0, 168.0), (2, 40.0, 60.0)]);
+    assert_eq!(ancestor, vec![None, None, Some(1), Some(2), Some(1)]);
+
+    // scroll-x-only: overflow-x:auto computes overflow-y to auto too.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                overflow: Overflow::Visible,
+                overflow_x: Some(Overflow::Auto),
+                ..scroller(Overflow::Visible, 100.0, None)
+            },
+            vec![node(boxed(300.0, 20.0), vec![]), node(sized(15.0), vec![])],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 35.0));
+    close(rect(&out, 2), (0.0, 0.0, 300.0, 20.0));
+    close(rect(&out, 3), (0.0, 20.0, 100.0, 15.0));
+
+    // scroll-transform: scrollable overflow is measured on the transformed
+    // boxes (Chrome: b (40,0,100,30), c (-150,30,200,10)). b pushes the
+    // overflow 40px right; c is moved back inside and adds none.
+    let shifted = |dx: f32, width: f32, height: f32| Style {
+        transform: w3cos_std::style::Transform2D {
+            translate_x: dx,
+            ..w3cos_std::style::Transform2D::IDENTITY
+        },
+        ..boxed(width, height)
+    };
+    let root = node(
+        block(),
+        vec![node(
+            scroller(Overflow::Hidden, 100.0, Some(50.0)),
+            vec![
+                node(shifted(40.0, 100.0, 30.0), vec![]),
+                node(shifted(-150.0, 200.0, 10.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 30.0));
+    close(rect(&out, 3), (0.0, 30.0, 200.0, 10.0));
+    let (scrollable, _, _) = extents(&root);
+    assert_eq!(scrollable, vec![(1, 40.0, 0.0)]);
+}
+
+/// `position: sticky` boxes keep their static position in layout: the
+/// sticky offset is a paint-time constraint applied against the nearest
+/// scroll container (`scroll_ancestor`), so insets never move the layout
+/// box, not even at scroll 0 (testdata/chrome-sticky.json).
+#[test]
+fn sticky_keeps_static_position_like_chrome() {
+    use crate::layout::scroll_containers_from_layout;
+    use w3cos_std::style::{Overflow, Position};
+    let sticky = |style: Style| Style {
+        position: Position::Sticky,
+        ..style
+    };
+
+    // sticky-top: top/left insets do not move the box; its scroll ancestor
+    // is the overflow:auto parent.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(50.0),
+                overflow: Overflow::Auto,
+                ..block()
+            },
+            vec![
+                node(sized(20.0), vec![]),
+                node(
+                    sticky(Style {
+                        top: Dimension::Px(10.0),
+                        left: Dimension::Px(5.0),
+                        ..sized(20.0)
+                    }),
+                    vec![],
+                ),
+                node(sized(100.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 20.0));
+    close(rect(&out, 3), (0.0, 20.0, 100.0, 20.0));
+    close(rect(&out, 4), (0.0, 40.0, 100.0, 100.0));
+    let flat = pre_flatten(&root);
+    let (_, _, ancestor) = scroll_containers_from_layout(&out, &flat);
+    assert_eq!(ancestor[3], Some(1));
+
+    // sticky-flow: margin and a child inside a sticky box in normal flow.
+    let root = node(
+        block(),
+        vec![
+            node(sized(10.0), vec![]),
+            node(
+                sticky(Style {
+                    top: Dimension::Px(0.0),
+                    width: Dimension::Px(60.0),
+                    margin: margins(0.0, 0.0, 0.0, 15.0),
+                    ..sized(20.0)
+                }),
+                vec![node(sized(5.0), vec![])],
+            ),
+            node(sized(10.0), vec![]),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (15.0, 10.0, 60.0, 20.0));
+    close(rect(&out, 3), (15.0, 10.0, 60.0, 5.0));
+    close(rect(&out, 4), (0.0, 30.0, 800.0, 10.0));
+
+    // sticky-bottom-short: bottom:0 does not move the layout box either.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(30.0),
+                overflow: Overflow::Auto,
+                ..block()
+            },
+            vec![
+                node(
+                    sticky(Style {
+                        bottom: Dimension::Px(0.0),
+                        ..sized(20.0)
+                    }),
+                    vec![],
+                ),
+                node(sized(80.0), vec![]),
+            ],
+        )],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (0.0, 0.0, 100.0, 20.0));
+    close(rect(&out, 3), (0.0, 20.0, 100.0, 80.0));
+}
+
+/// Floated flex and grid containers shrink-wrap like any float (CSS 2.1
+/// 9.7 blockifies the display; 10.3.5 shrink-to-fit). Border boxes measured
+/// in headless Chrome (testdata/chrome-float-flexgrid.json).
+#[test]
+fn floated_flex_and_grid_containers_match_chrome() {
+    use w3cos_std::style::{Clear, FlexDirection, Float};
+    let sized = |w: f32, h: f32| Style {
+        width: Dimension::Px(w),
+        height: Dimension::Px(h),
+        ..block()
+    };
+    let flex_float = |float: Float| Style {
+        display: Display::Flex,
+        float,
+        flex_direction: FlexDirection::Row,
+        ..Style::default()
+    };
+    let run = |root: Component| {
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        layout_tree(&root, &flat, 800.0, 600.0).expect("stays on NG")
+    };
+    let check = |rects: &[(LayoutRect, usize)], expected: &[(usize, (f32, f32, f32, f32))]| {
+        let bad: Vec<String> = expected
+            .iter()
+            .filter(|(index, want)| rect(rects, *index) != *want)
+            .map(|(index, want)| format!("box {index}: {:?} want {want:?}", rect(rects, *index)))
+            .collect();
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    };
+
+    // fl-row: padded, bordered, margined float with two items, a second
+    // float beside it, and a clearing block.
+    let a = Style {
+        margin: margins(3.0, 3.0, 3.0, 3.0),
+        padding: margins(2.0, 2.0, 2.0, 2.0),
+        border_width: 1.0,
+        ..flex_float(Float::Left)
+    };
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(700.0),
+            ..block()
+        },
+        vec![
+            node(
+                a,
+                vec![
+                    node(sized(30.0, 10.0), vec![]),
+                    node(
+                        Style {
+                            margin: margins(0.0, 0.0, 0.0, 4.0),
+                            ..sized(50.0, 20.0)
+                        },
+                        vec![],
+                    ),
+                ],
+            ),
+            node(
+                Style {
+                    height: Dimension::Px(15.0),
+                    ..flex_float(Float::Left)
+                },
+                vec![node(sized(40.0, 5.0), vec![])],
+            ),
+            node(
+                Style {
+                    clear: Clear::Both,
+                    height: Dimension::Px(7.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[
+            (0, (0.0, 0.0, 700.0, 39.0)),
+            (1, (3.0, 3.0, 90.0, 26.0)),
+            (2, (6.0, 6.0, 30.0, 10.0)),
+            (3, (40.0, 6.0, 50.0, 20.0)),
+            (4, (96.0, 0.0, 40.0, 15.0)),
+            (5, (96.0, 0.0, 40.0, 5.0)),
+            (6, (0.0, 32.0, 700.0, 7.0)),
+        ],
+    );
+
+    // fl-col-right: a column flex float on the right shrink-wraps to its
+    // widest item.
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(500.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    ..flex_float(Float::Right)
+                },
+                vec![
+                    node(sized(20.0, 10.0), vec![]),
+                    node(sized(60.0, 12.0), vec![]),
+                ],
+            ),
+            node(
+                Style {
+                    height: Dimension::Px(30.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (440.0, 0.0, 60.0, 22.0)),
+            (2, (440.0, 0.0, 20.0, 10.0)),
+            (3, (440.0, 10.0, 60.0, 12.0)),
+            (4, (0.0, 0.0, 500.0, 30.0)),
+        ],
+    );
+
+    // fl-wrap: two floats that do not fit side by side stack.
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(800.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    width: Dimension::Px(450.0),
+                    height: Dimension::Px(10.0),
+                    ..flex_float(Float::Left)
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    width: Dimension::Px(400.0),
+                    height: Dimension::Px(12.0),
+                    ..flex_float(Float::Left)
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[(1, (0.0, 0.0, 450.0, 10.0)), (2, (0.0, 10.0, 400.0, 12.0))],
+    );
+
+    // fl-grid: a definite-width floated grid.
+    let mut grid = Style {
+        display: Display::Grid,
+        float: Float::Left,
+        width: Dimension::Px(100.0),
+        grid_template_columns: Some("40px 1fr".to_string()),
+        ..Style::default()
+    };
+    grid.grid_ng_mut().grid_template_rows = Some("10px 20px".to_string());
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(500.0),
+            ..block()
+        },
+        vec![
+            node(
+                grid,
+                vec![
+                    node(block(), vec![]),
+                    node(block(), vec![]),
+                    node(block(), vec![]),
+                ],
+            ),
+            node(
+                Style {
+                    clear: Clear::Left,
+                    height: Dimension::Px(5.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 100.0, 30.0)),
+            (2, (0.0, 0.0, 40.0, 10.0)),
+            (3, (40.0, 0.0, 60.0, 10.0)),
+            (4, (0.0, 10.0, 40.0, 20.0)),
+            (5, (0.0, 30.0, 500.0, 5.0)),
+        ],
+    );
+}
+
+/// Cross-axis `center` and `flex-end` alignment is unsafe: an item taller
+/// than the 70px line overflows it (headless Chrome, 110px border box at
+/// y=-20 for `center` and y=-40 for `flex-end`; the 20px sibling sits at
+/// y=25 and y=50). Measured in testdata/chrome-center-overflow.json.
+#[test]
+fn cross_alignment_overflow_is_unsafe_like_chrome() {
+    use w3cos_std::style::{AlignItems, FlexDirection, Overflow};
+    let run = |align: AlignItems, overflow: Overflow| {
+        let container = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: align,
+            width: Dimension::Px(70.0),
+            height: Dimension::Px(70.0),
+            overflow,
+            ..Style::default()
+        };
+        let big = Style {
+            flex_grow: 3.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            height: Dimension::Px(110.0),
+            ..block()
+        };
+        let small = Style {
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            height: Dimension::Px(20.0),
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                container,
+                vec![node(big, vec![]), node(small, vec![])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+        (rect(&out, 2).1, rect(&out, 3).1)
+    };
+    assert_eq!(run(AlignItems::Center, Overflow::Visible), (-20.0, 25.0));
+    assert_eq!(run(AlignItems::Center, Overflow::Hidden), (-20.0, 25.0));
+    assert_eq!(run(AlignItems::FlexEnd, Overflow::Visible), (-40.0, 50.0));
+}
+
+/// Inline `<img>` is an atomic inline in the line box (CSS 2.1 10.8.1:
+/// its baseline is the bottom margin edge), and min/max clamp the used
+/// size. Border boxes measured in headless Chrome 156 (getBoundingClientRect,
+/// Ahem 20px/1, 300px wide; testdata/chrome-image.json). Images carry an
+/// explicit width and height so the missing file's size does not matter.
+#[test]
+fn inline_images_match_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let img = |extra: Style| {
+        Component::image(
+            "missing.png",
+            Style {
+                display: Display::Inline,
+                ..extra
+            },
+        )
+    };
+    let px = Dimension::Px;
+    // (vertical-align: middle is the align_self Center cascade form with no
+    // keyword marker; top / bottom carry the marker.)
+    let top = || {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-vertical-align-keyword".to_string(),
+            "top".to_string(),
+        )]))
+    };
+    let sized_img = |w: f32, h: f32| Style {
+        width: px(w),
+        height: px(h),
+        ..font.clone()
+    };
+    let run = |n: usize, children: Vec<Component>| {
+        let parent = Style {
+            width: px(300.0),
+            ..font.clone()
+        };
+        let root = node(block(), vec![node(parent, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "case {n}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {n} stays on NG"));
+        rects
+    };
+    let xx = || Component::text("XX", text_style.clone());
+
+    // img1: on the baseline between text; the line is 24px (4px descent).
+    let r = run(1, vec![xx(), img(sized_img(30.0, 20.0)), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // img2: taller than the strut ascent: the line grows to 44px.
+    let r = run(2, vec![xx(), img(sized_img(30.0, 40.0)), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 44.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // img3: vertical-align: middle.
+    let r = run(
+        3,
+        vec![
+            xx(),
+            img(Style {
+                align_self: w3cos_std::style::AlignSelf::Center,
+                ..sized_img(30.0, 40.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // img4: inline-block image with margins; the margin box is 30px.
+    let r = run(
+        4,
+        vec![
+            xx(),
+            img(Style {
+                display: Display::InlineBlock,
+                margin: margins(5.0, 3.0, 5.0, 3.0),
+                ..sized_img(30.0, 20.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (43.0, 5.0, 30.0, 20.0));
+    // img5: alone, it sits on the strut's baseline (16px ascent).
+    let r = run(5, vec![img(sized_img(30.0, 10.0))]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(rect(&r, 2), (0.0, 6.0, 30.0, 10.0));
+    // img6: max-width clamps the width.
+    let r = run(
+        6,
+        vec![
+            xx(),
+            img(Style {
+                max_width: px(60.0),
+                ..sized_img(100.0, 20.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 60.0, 20.0));
+    // img7: min-height and a min-width in em raise the specified size.
+    let r = run(
+        7,
+        vec![
+            xx(),
+            img(Style {
+                min_height: px(30.0),
+                min_width: Dimension::Em(3.0),
+                ..sized_img(20.0, 10.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 60.0, 30.0));
+    // img8: max-width in em; a second image aligned to the line top.
+    let r = run(
+        8,
+        vec![
+            xx(),
+            img(Style {
+                max_width: Dimension::Em(2.0),
+                ..sized_img(100.0, 20.0)
+            }),
+            xx(),
+            img(Style {
+                custom_properties: top(),
+                align_self: w3cos_std::style::AlignSelf::FlexStart,
+                ..sized_img(10.0, 10.0)
+            }),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 40.0, 20.0));
+    assert_eq!(rect(&r, 5), (120.0, 0.0, 10.0, 10.0));
+}
+
+/// A block image whose max-width is below its min-width: the min wins
+/// (CSS 2.1 10.4) and the ratio is kept, as in Chrome (WPT
+/// css-sizing/aspect-ratio/replaced-element-041; 60x60 image in a 0px box,
+/// min-width 100px, max-width 100%).
+#[test]
+fn replaced_min_over_max_keeps_min() {
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(0.0),
+                ..block()
+            },
+            vec![Component::image(
+                "missing.png",
+                Style {
+                    display: Display::Block,
+                    min_width: Dimension::Px(100.0),
+                    max_width: Dimension::Percent(1.0),
+                    ..Style::default()
+                },
+            )],
+        )],
+    );
+    let out = ng_rects(&root);
+    assert_eq!(rect(&out, 2).2, 100.0);
+}
+
+/// Inline and block `<svg>` roots (CSS 2.1 10.3.2). Expected rectangles
+/// measured in headless Chrome 156 (getBoundingClientRect, Ahem 20px/1,
+/// 300px wide unless noted; testdata/chrome-svg.json). The `width` and
+/// `height` attributes are presentation hints, so each axis is the CSS
+/// value else the attribute, and min/max clamp per axis (no ratio).
+#[test]
+fn inline_svgs_match_chrome() {
+    use w3cos_std::style::{AlignSelf, CustomProperties, Spacing};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let svg = |w: u32, h: u32, extra: Style| {
+        Component::svg_document(
+            format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"></svg>"
+            ),
+            w,
+            h,
+            Style {
+                // The default display (flex) means "the UA's inline".
+                display: if extra.display == Display::Flex {
+                    Display::Inline
+                } else {
+                    extra.display
+                },
+                font_family: font.font_family.clone(),
+                font_size: 20.0,
+                line_height: 1.0,
+                line_height_is_normal: false,
+                ..extra
+            },
+        )
+    };
+    let top = || {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-vertical-align-keyword".to_string(),
+            "top".to_string(),
+        )]))
+    };
+    let run = |n: usize, width: f32, children: Vec<Component>| {
+        let parent = Style {
+            width: Dimension::Px(width),
+            ..font.clone()
+        };
+        let root = node(block(), vec![node(parent, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "case {n}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {n} stays on NG"));
+        rects
+    };
+    let xx = || Component::text("XX", text_style.clone());
+    let px = Dimension::Px;
+
+    // sv1: the UA display is inline; it sits on the baseline between text.
+    let r = run(1, 300.0, vec![xx(), svg(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // sv2: vertical-align: middle.
+    let r = run(
+        2,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                30,
+                40,
+                Style {
+                    align_self: AlignSelf::Center,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // sv3: alone, with margins.
+    let r = run(
+        3,
+        300.0,
+        vec![svg(
+            30,
+            10,
+            Style {
+                margin: margins(5.0, 3.0, 5.0, 3.0),
+                ..Style::default()
+            },
+        )],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 2), (3.0, 5.0, 30.0, 10.0));
+    // sv4: max-width clamps the width only (the height attribute stays);
+    // a top-aligned one.
+    let r = run(
+        4,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                100,
+                20,
+                Style {
+                    max_width: px(60.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+            svg(
+                10,
+                10,
+                Style {
+                    align_self: AlignSelf::FlexStart,
+                    custom_properties: top(),
+                    ..Style::default()
+                },
+            ),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 60.0, 20.0));
+    assert_eq!(rect(&r, 5), (140.0, 0.0, 10.0, 10.0));
+    // sv5: a CSS width replaces the width attribute only; no ratio.
+    let r = run(
+        5,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                60,
+                30,
+                Style {
+                    width: px(30.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 30.0));
+    // sv6: in a 50px box the second text wraps, the svg is on line 2.
+    let r = run(6, 50.0, vec![xx(), svg(30, 20, Style::default()), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 50.0, 64.0));
+    assert_eq!(rect(&r, 3), (0.0, 20.0, 30.0, 20.0));
+    // sv7: inline-block is the same atomic inline.
+    let r = run(
+        7,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                30,
+                20,
+                Style {
+                    display: Display::InlineBlock,
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // sv8: a block svg with auto side margins is centered.
+    let mut centered = Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    centered.margin.left = Spacing::Auto;
+    centered.margin.right = Spacing::Auto;
+    let r = run(8, 300.0, vec![svg(60, 20, centered)]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(rect(&r, 2), (120.0, 0.0, 60.0, 20.0));
+    // sv10: min-width raises the width only.
+    let r = run(
+        10,
+        300.0,
+        vec![
+            xx(),
+            svg(
+                60,
+                30,
+                Style {
+                    min_width: px(90.0),
+                    ..Style::default()
+                },
+            ),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 90.0, 30.0));
+
+    // A viewBox with an auto axis derives from the ratio in Chrome, and the
+    // lowering cannot tell which attributes were authored: legacy keeps it.
+    let viewbox = Component::svg_document(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"60\" height=\"30\" viewBox=\"0 0 60 30\"></svg>",
+        60,
+        30,
+        Style {
+            display: Display::Inline,
+            height: px(20.0),
+            ..font.clone()
+        },
+    );
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: px(300.0),
+                ..font.clone()
+            },
+            vec![xx(), viewbox, xx()],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    // A percentage width attribute, a float and a flex item stay on legacy.
+    let percent = Component::svg_document(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"50%\" height=\"30\"></svg>",
+        150,
+        30,
+        Style {
+            display: Display::Inline,
+            ..font.clone()
+        },
+    );
+    let root = node(block(), vec![node(font.clone(), vec![xx(), percent, xx()])]);
+    let flat = pre_flatten(&root);
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    let floated = svg(
+        30,
+        20,
+        Style {
+            float: w3cos_std::style::Float::Left,
+            ..Style::default()
+        },
+    );
+    let root = node(block(), vec![node(font.clone(), vec![floated])]);
+    let flat = pre_flatten(&root);
+    assert!(!block::unsupported_reasons(&flat).is_empty());
 }
 
 /// Ideographic and zero width spaces in one inline-block's text, against

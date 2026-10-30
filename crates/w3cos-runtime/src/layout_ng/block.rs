@@ -161,7 +161,7 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     }
     // Positioned block-level boxes are checked by node_reason
     // (position_reason); atomics and sticky stay on legacy.
-    if style.position != Position::Static && (atomic || style.position == Position::Sticky) {
+    if style.position != Position::Static && atomic {
         return Some("position");
     }
     // Floats and clearance of block-level boxes are checked by node_reason
@@ -336,6 +336,7 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
             info.kind,
             ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
         )
+        && !matches!(info.kind, ComponentKind::SvgDocument { .. })
 }
 
 /// Floats of block-level boxes in a block container (S3b).  Floats among
@@ -353,11 +354,14 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if !blockified && (inline::is_atomic_inline(flat, index) || style.display == Display::Inline) {
         return Some("float:inline");
     }
+    // A float blockifies its display, so a floated flex or grid container is
+    // a block-level flex/grid box that shrink-wraps like any float.
     if !blockified
         && !matches!(
             style.display,
             Display::Block | Display::FlowRoot | Display::Table
         )
+        && !(is_author_flex(style) || style.display == Display::Grid)
     {
         return Some("float:display");
     }
@@ -454,11 +458,11 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     let info = &flat[index];
     let style = info.style;
     match style.position {
-        Position::Static | Position::Sticky => None,
+        Position::Static => None,
         _ if inline::is_atomic_inline(flat, index) || style.display == Display::Inline => {
             Some("position:inline")
         }
-        Position::Relative => None,
+        Position::Relative | Position::Sticky => None,
         Position::Absolute | Position::Fixed => {
             if !matches!(style.display, Display::Block | Display::FlowRoot) {
                 return Some("position:display");
@@ -514,6 +518,9 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     }
     if matches!(info.kind, ComponentKind::Canvas { .. }) {
         return canvas_box_reason(flat, index);
+    }
+    if matches!(info.kind, ComponentKind::SvgDocument { .. }) {
+        return svg_box_reason(flat, index);
     }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
         // A text run is an anonymous flex item whatever its siblings are:
@@ -677,15 +684,6 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
     if style.box_sizing == BoxSizing::BorderBox {
         return Some("image");
     }
-    // min/max recompute the intrinsic ratio (CSS 2.1 10.4). That path does
-    // not match the legacy used size yet.
-    if !matches!(style.min_width, Dimension::Auto)
-        || !matches!(style.max_width, Dimension::Auto)
-        || !matches!(style.min_height, Dimension::Auto)
-        || !matches!(style.max_height, Dimension::Auto)
-    {
-        return Some("image");
-    }
     if style.float != Float::None
         || matches!(
             style.position,
@@ -716,11 +714,21 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
         Display::Block | Display::FlowRoot => {
             unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
         }
-        // An inline replaced box sits on the font strut. Legacy then runs
-        // `project_single_baseline_replaced_image` and
-        // `align_inline_block_last_line_baselines`. That line box is still
-        // taller than the NG line, so inline images stay on legacy.
-        Display::Inline | Display::InlineBlock => Some("image"),
+        // An inline replaced box is an atomic inline of its IFC (NGInlineItem
+        // kAtomicInline): its margin box sits on the baseline with the
+        // bottom margin edge as its baseline (CSS 2.1 10.8.1). The IFC lays
+        // it out through `layout_block` and aligns it like an inline-block.
+        Display::Inline | Display::InlineBlock => {
+            if !inline::is_atomic_inline(flat, index) || !inline::in_inline_container(flat, index) {
+                return Some("image");
+            }
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
         _ => Some("image"),
     }
 }
@@ -763,13 +771,135 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         Display::Block | Display::FlowRoot => {
             unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
         }
-        // The UA display is `inline-block`. The line box under this font
-        // is 24.1875px for a 20px canvas; Chrome's is 24px. A block
-        // reference of the same border box would be one-sided, so inline
-        // canvases stay `kind:other`.
-        Display::Inline | Display::InlineBlock => Some("kind:other"),
+        // The UA display is `inline-block`. A canvas is an atomic inline of
+        // its IFC (NGInlineItem kAtomicInline) like an inline `<img>`: its
+        // margin box sits on the baseline with the bottom margin edge as
+        // its baseline (CSS 2.1 10.8.1), laid out through `layout_block`.
+        Display::Inline | Display::InlineBlock => {
+            if !inline::is_atomic_inline(flat, index) || !inline::in_inline_container(flat, index) {
+                return Some("kind:other");
+            }
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
         _ => Some("kind:other"),
     }
+}
+
+/// A replaced `<svg>` root (CSS 2.1 10.3.2 / 10.4): the same placement
+/// rules as `<canvas>`. Inline and inline-block roots are atomic inlines.
+fn svg_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let style = info.style;
+    if style.box_sizing == BoxSizing::BorderBox || size_contained(style) {
+        return Some("kind:other");
+    }
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some("kind:other");
+    }
+    if info.parent.is_some_and(|parent| {
+        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+    }) {
+        return Some("kind:other");
+    }
+    if matches!(style.display, Display::Block | Display::FlowRoot)
+        && info.parent.is_some_and(|parent| {
+            inline::rendered_children(flat, parent).any(|child| {
+                child != index
+                    && flat[child].style.float != Float::None
+                    && !oof::is_out_of_flow(flat[child].style)
+            })
+        })
+    {
+        return Some("kind:other");
+    }
+    match style.display {
+        Display::Block | Display::FlowRoot => {
+            unsupported_box_style(style, &[inline::VALIGN_MARKER], false)
+        }
+        Display::Inline | Display::InlineBlock => {
+            if !inline::in_inline_container(flat, index) {
+                return Some("kind:other");
+            }
+            unsupported_box_style(
+                style,
+                &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
+                true,
+            )
+            .or_else(|| inline::atomic_inline_reason(style))
+        }
+        _ => Some("kind:other"),
+    }
+}
+
+/// Content-box size of an `<svg>` root. In HTML the root's `width` and
+/// `height` attributes are presentation hints for the CSS properties, so
+/// each axis is the CSS value, else the attribute, and `min`/`max` clamp
+/// per axis with no ratio scaling (checked in Chrome). The DOM lowering
+/// writes both attributes, filling a missing one from the `viewBox` or
+/// 300x150; the serialized root cannot say which were authored. With a
+/// `viewBox` the auto axes would derive from its ratio in Chrome, so
+/// those, percentage or missing lengths, `preserveAspectRatio="none"`
+/// and a CSS `aspect-ratio` keep the legacy path.
+fn svg_content_size(source: &str, style: &Style, space: &ConstraintSpace) -> Option<(f32, f32)> {
+    use crate::image_loader::SvgIntrinsicLength;
+    let intrinsic = crate::image_loader::parse_svg_intrinsic_size(source.as_bytes());
+    if intrinsic.preserve_aspect_ratio_none
+        || style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key("--w3cos-internal-aspect-ratio"))
+    {
+        return super::bail("kind:other");
+    }
+    let (SvgIntrinsicLength::Px(width), SvgIntrinsicLength::Px(height)) =
+        (intrinsic.width, intrinsic.height)
+    else {
+        return super::bail("kind:other");
+    };
+    if intrinsic.ratio.is_some()
+        && (matches!(style.width, Dimension::Auto) || matches!(style.height, Dimension::Auto))
+    {
+        return super::bail("kind:other");
+    }
+    replaced_attr_content_size(width, height, style, space, svg_used_size)
+}
+
+/// Per-axis used size of an `<svg>` root (see `svg_content_size`).
+fn svg_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f32) {
+    let axis = |value: Option<f32>, attr: f32, min: Dimension, max: Dimension| {
+        let mut used = value.unwrap_or(attr);
+        if let Some(max) = canvas_axis_px(max, style) {
+            used = used.min(max.max(0.0));
+        }
+        if let Some(min) = canvas_axis_px(min, style) {
+            used = used.max(min.max(0.0));
+        }
+        used.max(0.0)
+    };
+    (
+        axis(
+            canvas_axis_px(style.width, style),
+            attr_width,
+            style.min_width,
+            style.max_width,
+        ),
+        axis(
+            canvas_axis_px(style.height, style),
+            attr_height,
+            style.min_height,
+            style.max_height,
+        ),
+    )
 }
 
 /// Content-box size of a canvas. `None` when a percentage has no basis
@@ -779,6 +909,22 @@ fn canvas_content_size(
     attr_height: u32,
     style: &Style,
     space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    replaced_attr_content_size(
+        attr_width as f32,
+        attr_height as f32,
+        style,
+        space,
+        canvas_used_size,
+    )
+}
+
+fn replaced_attr_content_size(
+    attr_width: f32,
+    attr_height: f32,
+    style: &Style,
+    space: &ConstraintSpace,
+    used_size: fn(f32, f32, &Style) -> (f32, f32),
 ) -> Option<(f32, f32)> {
     if style.box_sizing == BoxSizing::BorderBox {
         return super::bail("kind:other");
@@ -808,11 +954,7 @@ fn canvas_content_size(
     definite.max_width = sub(style.max_width, Some(space.available_inline))?;
     definite.min_height = sub(style.min_height, space.percentage_block)?;
     definite.max_height = sub(style.max_height, space.percentage_block)?;
-    Some(canvas_used_size(
-        attr_width as f32,
-        attr_height as f32,
-        &definite,
-    ))
+    Some(used_size(attr_width, attr_height, &definite))
 }
 
 fn canvas_axis_px(dim: Dimension, style: &Style) -> Option<f32> {
@@ -856,23 +998,26 @@ fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f
         && used_width > 0.0
         && used_height > 0.0
     {
-        let mut scale_min = 0.0_f32;
-        let mut scale_max = f32::INFINITY;
+        // f64: 100 * (60 / 100) in f32 is 60.000004, which LayoutUnit then
+        // snaps up a 1/64 px step.
+        let (w, h) = (f64::from(used_width), f64::from(used_height));
+        let mut scale_min = 0.0_f64;
+        let mut scale_max = f64::INFINITY;
         if let Some(value) = min_width {
-            scale_min = scale_min.max(value / used_width);
+            scale_min = scale_min.max(f64::from(value) / w);
         }
         if let Some(value) = min_height {
-            scale_min = scale_min.max(value / used_height);
+            scale_min = scale_min.max(f64::from(value) / h);
         }
         if let Some(value) = max_width {
-            scale_max = scale_max.min(value / used_width);
+            scale_max = scale_max.min(f64::from(value) / w);
         }
         if let Some(value) = max_height {
-            scale_max = scale_max.min(value / used_height);
+            scale_max = scale_max.min(f64::from(value) / h);
         }
-        let scale = 1.0_f32.max(scale_min).min(scale_max);
-        used_width *= scale;
-        used_height *= scale;
+        let scale = 1.0_f64.max(scale_min).min(scale_max);
+        used_width = (w * scale) as f32;
+        used_height = (h * scale) as f32;
     } else {
         if let Some(value) = min_width {
             used_width = used_width.max(value);
@@ -908,10 +1053,11 @@ fn non_visible_overflow(style: &Style) -> bool {
         || style.resolved_overflow_y() != Overflow::Visible
 }
 
-/// Overflow shapes that still disagree with the legacy engine: scrollports
-/// (`scroll` / `auto`), a flex or grid item (automatic minimum), a negative
-/// margin, or a float/clear inside the box. `hidden` on a block that only
-/// establishes a BFC stays here.
+/// Overflow shapes that still disagree with the legacy engine: a flex or
+/// grid item (automatic minimum), a negative margin, or a float/clear inside
+/// the box. Scrollports (`hidden`, `scroll`, `auto`) are laid out here as BFC
+/// roots without scrollbar space; the scroll containers themselves are
+/// derived from the result by `layout::scroll_containers_from_layout`.
 fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
@@ -920,10 +1066,6 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if flat[index].parent.is_some_and(|parent| {
         is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
     }) {
-        return Some("overflow");
-    }
-    let scrollish = |overflow: Overflow| matches!(overflow, Overflow::Scroll | Overflow::Auto);
-    if scrollish(style.resolved_overflow_x()) || scrollish(style.resolved_overflow_y()) {
         return Some("overflow");
     }
     let negative = |spacing: Spacing| match spacing {
@@ -979,9 +1121,14 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     let mut definite = style.clone();
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
         match dim {
-            Dimension::Percent(_) | Dimension::Vw(_) | Dimension::Vh(_) => {
-                resolve_dim(dim, basis, style, space).map(Dimension::Px)
-            }
+            // (image_intrinsic_size ignores font-relative min/max clamps; the
+            // legacy engine applied them afterwards through taffy.)
+            Dimension::Percent(_)
+            | Dimension::Vw(_)
+            | Dimension::Vh(_)
+            | Dimension::Em(_)
+            | Dimension::Rem(_)
+            | Dimension::Ch(_) => resolve_dim(dim, basis, style, space).map(Dimension::Px),
             other => Some(other),
         }
     };
@@ -991,6 +1138,14 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     definite.max_width = sub(style.max_width, Some(space.available_inline))?;
     definite.min_height = sub(style.min_height, space.percentage_block)?;
     definite.max_height = sub(style.max_height, space.percentage_block)?;
+    // CSS 2.1 10.4: a max below the min is raised to the min. The shared
+    // ratio scaling would otherwise scale by max / size and collapse to 0.
+    if let (Dimension::Px(min), Dimension::Px(max)) = (definite.min_width, definite.max_width) {
+        definite.max_width = Dimension::Px(max.max(min));
+    }
+    if let (Dimension::Px(min), Dimension::Px(max)) = (definite.min_height, definite.max_height) {
+        definite.max_height = Dimension::Px(max.max(min));
+    }
     // Legacy passes the content-box available width only for a block
     // replaced element with an auto width (the SVG ratio branch).
     let containing = if style.display == Display::Block && style.width == Dimension::Auto {
@@ -1009,9 +1164,28 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     } else {
         Some(space.available_inline)
     };
-    Some(crate::layout::image_intrinsic_size(
-        src, &definite, containing,
-    ))
+    let (mut width, mut height) = crate::layout::image_intrinsic_size(src, &definite, containing);
+    // The shared function only scales by the ratio when both sizes are auto
+    // (CSS 2.1 10.4 without its constraint-violation table); the used size
+    // is then clamped per axis, the larger min winning, which is what the
+    // legacy engine's taffy node does afterwards.
+    let px = |d: Dimension| match d {
+        Dimension::Px(v) => Some(v.max(0.0)),
+        _ => None,
+    };
+    if let Some(max) = px(definite.max_width) {
+        width = width.min(max);
+    }
+    if let Some(min) = px(definite.min_width) {
+        width = width.max(min);
+    }
+    if let Some(max) = px(definite.max_height) {
+        height = height.min(max);
+    }
+    if let Some(min) = px(definite.min_height) {
+        height = height.max(min);
+    }
+    Some((width, height))
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either
@@ -1406,6 +1580,10 @@ pub(super) fn intrinsic_sizes(
     if let ComponentKind::Canvas { width, height } = info.kind {
         let (width, _) =
             canvas_content_size(*width, *height, info.style, space).why("kind:other")?;
+        return Some(MinMax::exact(width));
+    }
+    if let ComponentKind::SvgDocument { source, .. } = info.kind {
+        let (width, _) = svg_content_size(source, info.style, space).why("kind:other")?;
         return Some(MinMax::exact(width));
     }
     if size_contained(info.style) {
@@ -1811,6 +1989,8 @@ fn layout_block_in(
         Some(replaced_content_size(src, style, space).why("image")?)
     } else if let ComponentKind::Canvas { width, height } = info.kind {
         Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
+    } else if let ComponentKind::SvgDocument { source, .. } = info.kind {
+        Some(svg_content_size(source, style, space).why("kind:other")?)
     } else {
         None
     };
@@ -2175,6 +2355,15 @@ fn layout_block_in(
         } else if let ComponentKind::Canvas { width, height } = child_info.kind {
             let (width, _) = canvas_content_size(*width, *height, child_info.style, &child_space)
                 .why("kind:other")?;
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
+        } else if let ComponentKind::SvgDocument { source, .. } = child_info.kind {
+            let (width, _) =
+                svg_content_size(source, child_info.style, &child_space).why("kind:other")?;
             let mut definite = child_info.style.clone();
             definite.width = Dimension::Px(width);
             definite.min_width = Dimension::Auto;
@@ -2589,17 +2778,6 @@ fn layout_block_in(
         auto_content
     };
     let content_height = clamp_h(specified_height.unwrap_or(auto_content));
-    // A definite block size that clips overflowing content is a scrollport.
-    // Scroll offsets stay on the legacy engine. An auto-height BFC does not.
-    if non_visible_overflow(style)
-        && !is_author_flex(style)
-        && !is_author_grid(style)
-        && style.display != Display::FlowRoot
-        && specified_height.is_some()
-        && auto_content > content_height + 1.0 / 128.0
-    {
-        return super::bail("overflow-scroll");
-    }
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
     // computed height is auto, whatever max-height does to the used height
     // (margin-collapse-038; Blink's FinishLayout drops the strut whenever
