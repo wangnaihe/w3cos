@@ -1334,21 +1334,6 @@ impl MinMax {
 /// Blink's line breaker).
 pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
 
-/// Percentages in the inline axis resolve against the containing block,
-/// which intrinsic sizing has not sized yet (CSS Sizing 3 5.2.1 cyclic
-/// percentages): such subtrees stay on legacy.
-fn percent_inline(style: &Style) -> bool {
-    let dim = |d: Dimension| matches!(d, Dimension::Percent(_));
-    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
-    dim(style.width)
-        || dim(style.min_width)
-        || dim(style.max_width)
-        || spacing(style.margin.left)
-        || spacing(style.margin.right)
-        || spacing(style.padding.left)
-        || spacing(style.padding.right)
-}
-
 /// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
 fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, width: f32) -> f32 {
     clamp_inline_in(style, space, edges, width, Some(space.available_inline))
