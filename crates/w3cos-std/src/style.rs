@@ -344,6 +344,18 @@ pub struct Style {
     pub overflow_x: Option<Overflow>,
     #[serde(default)]
     pub overflow_y: Option<Overflow>,
+    /// CSS Overflow 3 `overflow: clip` per axis. Clip is not a scroll
+    /// container and lays out like `visible`, so the axis keeps its
+    /// `Overflow::Visible` value for layout; these flags only add a paint clip.
+    #[serde(default)]
+    pub overflow_clip_x: bool,
+    #[serde(default)]
+    pub overflow_clip_y: bool,
+    /// `overflow-clip-margin`: the reference box (0 padding-box, 1
+    /// content-box, 2 border-box) and the distance the `overflow: clip` edge
+    /// is moved outward from it.
+    #[serde(default)]
+    pub overflow_clip_margin: (u8, f32),
     /// CSS Overscroll Behavior Level 1, block-axis subset.
     #[serde(default)]
     pub overscroll_behavior: OverscrollBehavior,
@@ -590,6 +602,9 @@ impl Default for Style {
             clip: None,
             overflow_x: None,
             overflow_y: None,
+            overflow_clip_x: false,
+            overflow_clip_y: false,
+            overflow_clip_margin: (0, 0.0),
             overscroll_behavior: OverscrollBehavior::Auto,
             scroll_initial_target: ScrollInitialTarget::None,
             overflow_anchor: true,
@@ -768,6 +783,9 @@ impl Style {
             clip,
             overflow_x,
             overflow_y,
+            overflow_clip_x,
+            overflow_clip_y,
+            overflow_clip_margin,
             overscroll_behavior,
             scroll_initial_target,
             overflow_anchor,
@@ -896,6 +914,9 @@ impl Style {
             clip: clip_b,
             overflow_x: overflow_x_b,
             overflow_y: overflow_y_b,
+            overflow_clip_x: overflow_clip_x_b,
+            overflow_clip_y: overflow_clip_y_b,
+            overflow_clip_margin: overflow_clip_margin_b,
             overscroll_behavior: overscroll_behavior_b,
             scroll_initial_target: scroll_initial_target_b,
             overflow_anchor: overflow_anchor_b,
@@ -1022,6 +1043,9 @@ impl Style {
             && clip == clip_b
             && overflow_x == overflow_x_b
             && overflow_y == overflow_y_b
+            && overflow_clip_x == overflow_clip_x_b
+            && overflow_clip_y == overflow_clip_y_b
+            && overflow_clip_margin == overflow_clip_margin_b
             && overscroll_behavior == overscroll_behavior_b
             && scroll_initial_target == scroll_initial_target_b
             && overflow_anchor == overflow_anchor_b

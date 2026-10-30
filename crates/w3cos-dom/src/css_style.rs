@@ -1285,7 +1285,32 @@ impl CSSStyleDeclaration {
                 }
             }
 
-            "overflow" => self.inner.overflow = parse_overflow(value),
+            "overflow" => {
+                let tokens: Vec<&str> = value.split_whitespace().collect();
+                if tokens.len() == 2 && tokens.iter().all(|token| is_overflow_keyword(token)) {
+                    let (x, clip_x) = parse_overflow_axis(tokens[0]);
+                    let (y, clip_y) = parse_overflow_axis(tokens[1]);
+                    self.inner.overflow = x;
+                    self.inner.overflow_x = Some(x);
+                    self.inner.overflow_y = Some(y);
+                    self.inner.overflow_clip_x = clip_x;
+                    self.inner.overflow_clip_y = clip_y;
+                } else if tokens.len() <= 1 {
+                    let (overflow, clip) = parse_overflow_axis(value);
+                    self.inner.overflow = overflow;
+                    if clip || self.inner.overflow_clip_x || self.inner.overflow_clip_y {
+                        self.inner.overflow_x = None;
+                        self.inner.overflow_y = None;
+                    }
+                    self.inner.overflow_clip_x = clip;
+                    self.inner.overflow_clip_y = clip;
+                }
+            }
+            "overflow-clip-margin" => {
+                if let Some(margin) = parse_overflow_clip_margin(value) {
+                    self.inner.overflow_clip_margin = margin;
+                }
+            }
             "resize" => {
                 let value = value.trim().to_ascii_lowercase();
                 self.inner
@@ -1305,8 +1330,16 @@ impl CSSStyleDeclaration {
                     self.inner.clip = clip;
                 }
             }
-            "overflow-x" | "overflowX" => self.inner.overflow_x = Some(parse_overflow(value)),
-            "overflow-y" | "overflowY" => self.inner.overflow_y = Some(parse_overflow(value)),
+            "overflow-x" | "overflowX" => {
+                let (overflow, clip) = parse_overflow_axis(value);
+                self.inner.overflow_x = Some(overflow);
+                self.inner.overflow_clip_x = clip;
+            }
+            "overflow-y" | "overflowY" => {
+                let (overflow, clip) = parse_overflow_axis(value);
+                self.inner.overflow_y = Some(overflow);
+                self.inner.overflow_clip_y = clip;
+            }
             "overflow-anchor" | "overflowAnchor" => {
                 self.inner.overflow_anchor = !value.trim().eq_ignore_ascii_case("none")
             }
@@ -2220,6 +2253,23 @@ impl CSSStyleDeclaration {
         self.inline_declarations.push((name.to_string(), value));
     }
 
+    fn overflow_axis_keyword(&self, y: bool) -> String {
+        let clip = if y {
+            self.inner.overflow_clip_y
+        } else {
+            self.inner.overflow_clip_x
+        };
+        if clip {
+            return "clip".to_string();
+        }
+        let overflow = if y {
+            self.inner.resolved_overflow_y()
+        } else {
+            self.inner.resolved_overflow_x()
+        };
+        format!("{overflow:?}").to_lowercase()
+    }
+
     pub fn get_property(&self, name: &str) -> String {
         match name {
             "text-decoration-color" | "textDecorationColor" => self
@@ -2457,6 +2507,16 @@ impl CSSStyleDeclaration {
                 format!("{:?}", self.inner.justify_content).to_lowercase()
             }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
+            "overflow"
+                if self.inner.overflow_clip_x
+                    || self.inner.overflow_clip_y
+                    || self.inner.overflow_x.is_some()
+                    || self.inner.overflow_y.is_some() =>
+            {
+                let x = self.overflow_axis_keyword(false);
+                let y = self.overflow_axis_keyword(true);
+                if x == y { x } else { format!("{x} {y}") }
+            }
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
             "resize" => self
                 .inner
@@ -2488,12 +2548,8 @@ impl CSSStyleDeclaration {
                     )
                 },
             ),
-            "overflow-x" | "overflowX" => {
-                format!("{:?}", self.inner.resolved_overflow_x()).to_lowercase()
-            }
-            "overflow-y" | "overflowY" => {
-                format!("{:?}", self.inner.resolved_overflow_y()).to_lowercase()
-            }
+            "overflow-x" | "overflowX" => self.overflow_axis_keyword(false),
+            "overflow-y" | "overflowY" => self.overflow_axis_keyword(true),
             "box-sizing" | "boxSizing" => match self.inner.box_sizing {
                 BoxSizing::ContentBox => "content-box".to_string(),
                 BoxSizing::BorderBox => "border-box".to_string(),
@@ -3613,6 +3669,58 @@ fn parse_flex_wrap(value: &str) -> FlexWrap {
         "wrap" => FlexWrap::Wrap,
         "wrap-reverse" => FlexWrap::WrapReverse,
         _ => FlexWrap::NoWrap,
+    }
+}
+
+/// `overflow-clip-margin: [<visual-box> || <length [0,∞)>]`; `None` when
+/// the value is invalid.
+fn parse_overflow_clip_margin(value: &str) -> Option<(u8, f32)> {
+    let mut visual_box = None;
+    let mut length = None;
+    for token in value.split_whitespace() {
+        let token = token.to_ascii_lowercase();
+        let parsed_box = match token.as_str() {
+            "padding-box" => Some(0),
+            "content-box" => Some(1),
+            "border-box" => Some(2),
+            _ => None,
+        };
+        if let Some(parsed_box) = parsed_box {
+            visual_box.replace(parsed_box).is_none().then_some(())?;
+        } else {
+            let px = match token.strip_suffix("px") {
+                Some(number) => number.parse::<f32>().ok()?,
+                None => {
+                    let zero = token.parse::<f32>().ok()?;
+                    (zero == 0.0).then_some(zero)?
+                }
+            };
+            if px < 0.0 || !px.is_finite() {
+                return None;
+            }
+            length.replace(px).is_none().then_some(())?;
+        }
+    }
+    if visual_box.is_none() && length.is_none() {
+        return None;
+    }
+    Some((visual_box.unwrap_or(0), length.unwrap_or(0.0)))
+}
+
+fn is_overflow_keyword(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "visible" | "hidden" | "scroll" | "auto" | "clip"
+    )
+}
+
+/// Parses one overflow axis. `clip` keeps the `Visible` layout value and
+/// reports the paint-only clip flag separately.
+fn parse_overflow_axis(value: &str) -> (Overflow, bool) {
+    if value.trim().eq_ignore_ascii_case("clip") {
+        (Overflow::Visible, true)
+    } else {
+        (parse_overflow(value), false)
     }
 }
 
@@ -8442,6 +8550,43 @@ fn flex_line_count_stores_a_positive_integer_marker() {
     }
     declaration.set_property("flex-line-count", "initial");
     assert_eq!(marker(&declaration), None);
+}
+
+#[test]
+fn overflow_clip_margin_parses_box_and_length() {
+    let mut style = CSSStyleDeclaration::new();
+    style.set_property("overflow-clip-margin", "content-box 12px");
+    assert_eq!(style.inner.overflow_clip_margin, (1, 12.0));
+    style.set_property("overflow-clip-margin", "border-box");
+    assert_eq!(style.inner.overflow_clip_margin, (2, 0.0));
+    style.set_property("overflow-clip-margin", "5");
+    style.set_property("overflow-clip-margin", "-3px");
+    assert_eq!(style.inner.overflow_clip_margin, (2, 0.0));
+    style.set_property("overflow-clip-margin", "7px");
+    assert_eq!(style.inner.overflow_clip_margin, (0, 7.0));
+}
+
+#[test]
+fn overflow_clip_is_a_paint_only_flag_per_axis() {
+    let mut style = CSSStyleDeclaration::new();
+    style.set_property("overflow", "clip");
+    assert_eq!(style.get_property("overflow"), "clip");
+    assert_eq!(style.get_property("overflow-x"), "clip");
+    assert!(style.inner.overflow_clip_x && style.inner.overflow_clip_y);
+    assert_eq!(style.inner.resolved_overflow_x(), Overflow::Visible);
+
+    style.set_property("overflow-y", "hidden");
+    assert_eq!(style.get_property("overflow"), "clip hidden");
+    assert!(style.inner.overflow_clip_x && !style.inner.overflow_clip_y);
+
+    style.set_property("overflow", "visible clip");
+    assert_eq!(style.get_property("overflow-x"), "visible");
+    assert_eq!(style.get_property("overflow-y"), "clip");
+    assert!(!style.inner.overflow_clip_x && style.inner.overflow_clip_y);
+
+    style.set_property("overflow", "scroll");
+    assert!(!style.inner.overflow_clip_x && !style.inner.overflow_clip_y);
+    assert_eq!(style.get_property("overflow-x"), "scroll");
 }
 
 #[test]

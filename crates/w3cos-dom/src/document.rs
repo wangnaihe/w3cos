@@ -343,6 +343,7 @@ fn is_known_non_inherited_property(property: &str) -> bool {
             | "overflow"
             | "overflow-x"
             | "overflow-y"
+            | "overflow-clip-margin"
             | "box-shadow"
             | "filter"
             | "will-change"
@@ -3552,6 +3553,22 @@ impl Document {
                                 color.r, color.g, color.b, color.a
                             ),
                         );
+                    }
+                    if css_property_eq(prop, "overflow-clip-margin")
+                        && value.trim().eq_ignore_ascii_case("inherit")
+                    {
+                        // Not an inherited property: explicit `inherit`
+                        // copies the parent's computed value.
+                        merged.inner.overflow_clip_margin = inherited
+                            .map(|parent| parent.overflow_clip_margin)
+                            .unwrap_or((0, 0.0));
+                    } else if css_property_eq(prop, "overflow-clip-margin")
+                        && matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "initial" | "unset"
+                        )
+                    {
+                        merged.inner.overflow_clip_margin = (0, 0.0);
                     }
                     if css_property_eq(prop, "list-style")
                         || css_property_eq(prop, "list-style-image")

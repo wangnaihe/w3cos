@@ -8046,6 +8046,7 @@ fn css_property_supported(property: &str, value: &str) -> bool {
             | "overflow"
             | "overflow-x"
             | "overflow-y"
+            | "overflow-clip-margin"
             | "padding"
             | "padding-bottom"
             | "padding-left"
@@ -9555,8 +9556,14 @@ fn scroll_container_axes(node: u32) -> (bool, bool) {
     dom::with_document(|document| {
         let style = Element::new(NodeId::from_u32(node)).get_computed_style(document);
         (
-            style.get_property("overflow-x") != "visible",
-            style.get_property("overflow-y") != "visible",
+            !matches!(
+                style.get_property("overflow-x").as_str(),
+                "visible" | "clip"
+            ),
+            !matches!(
+                style.get_property("overflow-y").as_str(),
+                "visible" | "clip"
+            ),
         )
     })
 }

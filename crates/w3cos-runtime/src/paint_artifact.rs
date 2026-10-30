@@ -7,7 +7,7 @@
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{
-    Display, Overflow, Position, Spacing, Style, Transform2D, Visibility, WhiteSpace,
+    Contain, Display, Overflow, Position, Spacing, Style, Transform2D, Visibility, WhiteSpace,
 };
 
 use crate::layout::LayoutRect;
@@ -2921,15 +2921,29 @@ impl PaintArtifact {
         // clip below do apply to the box itself, so each refreshes this value.
         let mut self_clip = properties.clip;
         let mut overflow_clip = None;
-        if establishes_overflow_clip(node.style.display)
-            && (matches!(
-                overflow_x,
+        // `hidden`/`scroll`/`auto` on either axis clips both (the other axis
+        // computes to a scroll container too); `clip` bounds only its axis.
+        let clips_content = |overflow| {
+            matches!(
+                overflow,
                 Overflow::Hidden | Overflow::Scroll | Overflow::Auto
-            ) || matches!(
-                overflow_y,
-                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
-            ))
-        {
+            )
+        };
+        let scroll_clip = clips_content(overflow_x) || clips_content(overflow_y);
+        // A document element's `clip` and the `clip` of a body that
+        // propagates to the viewport apply to the viewport, not to the box.
+        let propagates_to_viewport = index == 0
+            || (Some(index) == self.body_index
+                && node.style.contain == Contain::None
+                && self.nodes.first().is_some_and(|root| {
+                    root.style.resolved_overflow_x() == Overflow::Visible
+                        && root.style.resolved_overflow_y() == Overflow::Visible
+                        && !root.style.overflow_clip_x
+                        && !root.style.overflow_clip_y
+                }));
+        let clips_x = (node.style.overflow_clip_x && !propagates_to_viewport) || scroll_clip;
+        let clips_y = (node.style.overflow_clip_y && !propagates_to_viewport) || scroll_clip;
+        if establishes_overflow_clip(node.style.display) && (clips_x || clips_y) {
             properties.clip = self.properties.clips.len();
             overflow_clip = Some(properties.clip);
             self.properties.clips.push(ClipNode {
@@ -2944,7 +2958,47 @@ impl PaintArtifact {
                     // not the wrapper's descendant overflow clip. Chrome clips
                     // grid descendants against the wrapper padding box while
                     // captions retain their separate inherited clip chain.
-                    overflow_clip_rect(&node.style, rect)
+                    let mut clip = overflow_clip_rect(&node.style, rect);
+                    // `overflow-clip-margin` moves the edge of an
+                    // `overflow: clip` axis outward from its reference box.
+                    let (visual_box, margin) = node.style.overflow_clip_margin;
+                    if !scroll_clip
+                        && (node.style.overflow_clip_x || node.style.overflow_clip_y)
+                        && (visual_box != 0 || margin > 0.0)
+                    {
+                        let base = match visual_box {
+                            2 => rect,
+                            1 => {
+                                let padding = node.style.padding_lengths();
+                                LayoutRect {
+                                    x: clip.x + padding.left,
+                                    y: clip.y + padding.top,
+                                    width: (clip.width - padding.left - padding.right).max(0.0),
+                                    height: (clip.height - padding.top - padding.bottom).max(0.0),
+                                }
+                            }
+                            _ => clip,
+                        };
+                        if node.style.overflow_clip_x {
+                            clip.x = base.x - margin;
+                            clip.width = base.width + 2.0 * margin;
+                        }
+                        if node.style.overflow_clip_y {
+                            clip.y = base.y - margin;
+                            clip.height = base.height + 2.0 * margin;
+                        }
+                    }
+                    // A single-axis `overflow: clip` leaves the other axis
+                    // unbounded.
+                    if !clips_x {
+                        clip.x = -1.0e7;
+                        clip.width = 2.0e7;
+                    }
+                    if !clips_y {
+                        clip.y = -1.0e7;
+                        clip.height = 2.0e7;
+                    }
+                    clip
                 }),
             });
         }
@@ -5381,6 +5435,88 @@ mod tests {
         assert_eq!(artifact.node_properties[2].clip, 0);
         assert_ne!(artifact.node_properties[1].scroll, 0);
         assert_eq!(artifact.node_properties[2].scroll, 0);
+    }
+
+    #[test]
+    fn overflow_clip_clips_paint_without_becoming_a_scroll_container() {
+        let node = |parent, style| PaintNode {
+            kind: ComponentKind::Box,
+            style,
+            parent,
+            sticky_counter_signal: None,
+        };
+        let nodes = vec![
+            node(None, Style::default()),
+            node(
+                Some(0),
+                Style {
+                    overflow_clip_x: true,
+                    ..Style::default()
+                },
+            ),
+        ];
+        let artifact = PaintArtifact::build(nodes, &[(rect(0.0), 0), (rect(0.0), 1)], 1);
+
+        let clip = artifact.node_properties[1].clip;
+        assert_ne!(clip, 0);
+        assert_eq!(artifact.node_properties[1].scroll, 0);
+        let rect = artifact.properties.clips[clip].rect.unwrap();
+        assert!(
+            rect.y <= -1.0e6 && rect.height >= 1.0e6,
+            "y stays unbounded"
+        );
+        assert!(rect.width < 1.0e6, "x is clipped");
+    }
+
+    #[test]
+    fn overflow_clip_margin_moves_the_clip_edge_and_body_clip_propagates() {
+        let node = |parent, style| PaintNode {
+            kind: ComponentKind::Box,
+            style,
+            parent,
+            sticky_counter_signal: None,
+        };
+        let nodes = vec![
+            node(None, Style::default()),
+            node(Some(0), Style::default()),
+            node(
+                Some(1),
+                Style {
+                    overflow_clip_x: true,
+                    overflow_clip_y: true,
+                    overflow_clip_margin: (2, 10.0),
+                    ..Style::default()
+                },
+            ),
+        ];
+        let artifact =
+            PaintArtifact::build(nodes, &[(rect(0.0), 0), (rect(0.0), 1), (rect(50.0), 2)], 1);
+        let clip = artifact.node_properties[2].clip;
+        assert_ne!(clip, 0);
+        let clip_rect = artifact.properties.clips[clip].rect.unwrap();
+        let border = artifact.rect_by_index[2].unwrap();
+        assert_eq!(clip_rect.x, border.x - 10.0);
+        assert_eq!(clip_rect.width, border.width + 20.0);
+
+        // A body whose overflow propagates to the viewport does not clip.
+        let nodes = vec![
+            node(None, Style::default()),
+            node(
+                Some(0),
+                Style {
+                    overflow_clip_x: true,
+                    overflow_clip_y: true,
+                    ..Style::default()
+                },
+            ),
+        ];
+        let artifact = PaintArtifact::build_with_body_background(
+            nodes,
+            &[(rect(0.0), 0), (rect(0.0), 1)],
+            1,
+            Some(1),
+        );
+        assert_eq!(artifact.node_properties[1].clip, 0);
     }
 
     #[test]
