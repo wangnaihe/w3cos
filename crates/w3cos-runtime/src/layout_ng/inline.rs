@@ -691,10 +691,13 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
         flat[index].style.display,
         Display::InlineBlock | Display::InlineTable
     );
-    if matches!(flat[index].kind, ComponentKind::Image { .. }) {
+    if matches!(
+        flat[index].kind,
+        ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+    ) {
         // Replaced elements are atomic inlines (CSS 2.1 10.3.2). The UA
-        // sheet gives img `inline-block`; an author `inline` is the same
-        // kind of item.
+        // sheet gives img and canvas `inline-block`; an author `inline` is
+        // the same kind of item.
         return inline_block || flat[index].style.display == Display::Inline;
     }
     matches!(
