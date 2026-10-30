@@ -401,7 +401,7 @@ fn layout_float(
         Spacing::Auto => 0.0,
         s => resolve_spacing_for_layout(
             s,
-            space.available_inline,
+            if space.percent_unresolved { 0.0 } else { space.available_inline },
             style,
             space.viewport_w,
             space.viewport_h,
@@ -1200,8 +1200,18 @@ pub(super) struct BoxMetrics {
 /// CSS2 10.3.3 (+10.4) used width and horizontal margins.
 pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     let cb = space.available_inline;
-    let spacing =
-        |s: Spacing| resolve_spacing_for_layout(s, cb, style, space.viewport_w, space.viewport_h);
+    // Cyclic inline percentages (an intrinsic probe): zero margins and
+    // padding, auto width, no min/max-width.
+    let pct_cb = (!space.percent_unresolved).then_some(cb);
+    let spacing = |s: Spacing| {
+        resolve_spacing_for_layout(
+            s,
+            pct_cb.unwrap_or(0.0),
+            style,
+            space.viewport_w,
+            space.viewport_h,
+        )
+    };
     let border = border(style);
     let padding = [
         spacing(style.padding.top),
@@ -1225,15 +1235,15 @@ pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetri
     let specified = if marker(style, WIDTH_KEYWORD).is_some() && size_contained(style) {
         Some(contain_intrinsic_size(style).0)
     } else {
-        resolve_dim(style.width, Some(cb), style, space).map(to_content)
+        resolve_dim(style.width, pct_cb, style, space).map(to_content)
     };
     let mut content_width = specified
         .unwrap_or(cb - margin[1] - margin[3] - edges)
         .max(0.0);
-    if let Some(max) = resolve_dim(style.max_width, Some(cb), style, space).map(to_content) {
+    if let Some(max) = resolve_dim(style.max_width, pct_cb, style, space).map(to_content) {
         content_width = content_width.min(max);
     }
-    if let Some(min) = resolve_dim(style.min_width, Some(cb), style, space).map(to_content) {
+    if let Some(min) = resolve_dim(style.min_width, pct_cb, style, space).map(to_content) {
         content_width = content_width.max(min);
     }
     // Inline-start / inline-end sides in the containing block's direction.
@@ -1536,7 +1546,8 @@ fn shrink_to_fit(
         None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
         None => return super::bail("shrink-min"),
     };
-    Some(clamp_inline(style, space, edges, width.max(0.0)))
+    let cb = (!space.percent_unresolved).then_some(space.available_inline);
+    Some(clamp_inline_in(style, space, edges, width.max(0.0), cb))
 }
 
 /// Author `display:flex`. Synthetic boxes stay on their own algorithms:
@@ -1704,6 +1715,7 @@ pub(super) fn layout_root(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        percent_unresolved: false,
     };
     let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
@@ -1912,6 +1924,7 @@ fn layout_block_in(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        percent_unresolved: false,
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;

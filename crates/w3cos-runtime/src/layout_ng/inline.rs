@@ -1858,7 +1858,7 @@ pub(super) fn layout_inline_beside(
             let side = |m| {
                 crate::layout::resolve_spacing_for_layout(
                     m,
-                    available,
+                    if space.percent_unresolved { 0.0 } else { available },
                     style,
                     space.viewport_w,
                     space.viewport_h,
@@ -2596,6 +2596,7 @@ pub(super) fn inline_min_max(
             &ConstraintSpace {
                 available_inline: available,
                 percentage_block: None,
+                percent_unresolved: true,
                 ..*space
             },
         )
