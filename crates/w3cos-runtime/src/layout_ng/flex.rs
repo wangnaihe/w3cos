@@ -1079,6 +1079,16 @@ pub(super) fn layout(
                 .why("flex:cross")?,
             );
         }
+        if !row && block::is_replaced_item(flat, child) {
+            // A definite replaced width still honours min/max-width.
+            cross = match cross {
+                Some(size) => Some(
+                    clamp_cross(child_style, false, cross_edges, size, Some(inner_width), space)
+                        .why("flex:cross")?,
+                ),
+                None => None,
+            };
+        }
         let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
             && matches!(child_style.height, Dimension::Auto);
         let measured = if !row && basis_auto {
@@ -1115,21 +1125,33 @@ pub(super) fn layout(
         // the automatic minimum is that transferred size.
         if block::is_replaced_item(flat, child)
             && style.flex_wrap == FlexWrap::NoWrap
-            && matches!(child_style.width, Dimension::Auto)
             && matches!(child_style.height, Dimension::Auto)
-            && matches!(child_style.min_width, Dimension::Auto)
             && matches!(child_style.min_height, Dimension::Auto)
+            && matches!(child_style.max_height, Dimension::Auto)
             && matches!(child_style.flex_basis, Dimension::Auto)
-            && used_align(style.align_items, child_style.align_self) == AlignItems::Stretch
         {
-            if let Some(Some((w, h))) = block::replaced_item_size(flat, child, space)
+            let stretched = used_align(style.align_items, child_style.align_self)
+                == AlignItems::Stretch
+                && matches!(child_style.width, Dimension::Auto)
+                && matches!(child_style.min_width, Dimension::Auto);
+            if let Some((w, h)) = block::replaced_intrinsic_size(flat, child, space)
                 && w > 0.0
                 && h > 0.0
             {
                 let cross_definite = if row {
-                    specified_height.map(|height| {
-                        (height - margin_cross_start - margin_cross_end - cross_edges).max(0.0)
-                    })
+                    // Row: only a stretched auto-size item takes the
+                    // container's definite height through the ratio.
+                    if stretched
+                        && matches!(child_style.width, Dimension::Auto)
+                        && matches!(child_style.min_width, Dimension::Auto)
+                    {
+                        specified_height.map(|height| {
+                            (height - margin_cross_start - margin_cross_end - cross_edges)
+                                .max(0.0)
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     cross
                 };

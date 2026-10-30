@@ -5228,7 +5228,7 @@ fn replaced_min_over_max_keeps_min() {
 /// (testdata/chrome-replaced-items.json).
 #[test]
 fn replaced_flex_grid_items_match_chrome() {
-    use w3cos_std::style::{AlignItems, AlignSelf, CustomProperties};
+    use w3cos_std::style::{AlignItems, AlignSelf, CustomProperties, Position};
     const PNG: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 50, 0, 0, 0, 25,
         8, 2, 0, 0, 0, 252, 54, 234, 19, 0, 0, 0, 55, 73, 68, 65, 84, 120, 156, 237, 206, 177,
@@ -5381,4 +5381,60 @@ fn replaced_flex_grid_items_match_chrome() {
         vec![img(Style::default())],
     );
     assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 100.0));
+    // WPT pages that regressed in the first gate (ratio 2:1 here): the
+    // min/max-width clamp applies to a definite replaced width, and the
+    // transferred height follows the clamped width.
+    let r = run(
+        "col-max-width",
+        flex(FlexDirection::Column, 100.0, None),
+        vec![img(Style {
+            width: Dimension::Px(500.0),
+            max_width: Dimension::Percent(100.0),
+            min_height: Dimension::Px(0.0),
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+    let r = run(
+        "col-min-width",
+        flex(FlexDirection::Column, 100.0, Some(0.0)),
+        vec![img(Style {
+            width: Dimension::Px(0.0),
+            min_width: Dimension::Px(100.0),
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+    // A percentage size in an auto grid track, and an abspos flex container
+    // with an inset-derived height, stay on the legacy engine.
+    for (name, container, child) in [
+        (
+            "grid-max-width",
+            Style {
+                display: Display::Grid,
+                width: Dimension::Px(100.0),
+                ..Style::default()
+            },
+            img(Style {
+                width: Dimension::Px(200.0),
+                max_width: Dimension::Percent(100.0),
+                ..Style::default()
+            }),
+        ),
+        (
+            "abspos-flex",
+            Style {
+                display: Display::Flex,
+                position: Position::Absolute,
+                top: Dimension::Px(0.0),
+                bottom: Dimension::Px(0.0),
+                ..Style::default()
+            },
+            img(Style::default()),
+        ),
+    ] {
+        let root = node(block(), vec![node(container, vec![child])]);
+        let flat = pre_flatten(&root);
+        assert!(!block::supports_tree(&flat), "{name} must fall back");
+    }
 }

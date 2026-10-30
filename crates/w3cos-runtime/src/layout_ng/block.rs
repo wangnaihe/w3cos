@@ -705,6 +705,20 @@ fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str>
         {
             return Some("image");
         }
+        let parent = flat[index].parent.map(|parent| flat[parent].style);
+        // A percentage size in an automatic grid track is cyclic (the track
+        // sizes from the item's contribution, CSS Sizing 3 5.2.2), and an
+        // out-of-flow flex/grid container with an inset-derived height does
+        // not give its items a definite cross size here.
+        if parent.is_some_and(|parent| {
+            (is_author_grid(parent)
+                && [style.width, style.min_width, style.max_width]
+                    .iter()
+                    .any(|dim| matches!(dim, Dimension::Percent(_))))
+                || (oof::is_out_of_flow(parent) && matches!(parent.height, Dimension::Auto))
+        }) {
+            return Some("image");
+        }
         return unsupported_box_style(style, &[inline::VALIGN_MARKER], true);
     }
     if style.box_sizing == BoxSizing::BorderBox {
@@ -1101,6 +1115,26 @@ pub(super) fn replaced_item_size(
         return None;
     };
     Some(replaced_content_size(src, flat[index].style, space))
+}
+
+/// Natural content size of a replaced item with every authored size and
+/// min/max dropped (its intrinsic size and ratio).
+pub(super) fn replaced_intrinsic_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    let mut natural = flat[index].style.clone();
+    natural.width = Dimension::Auto;
+    natural.height = Dimension::Auto;
+    natural.min_width = Dimension::Auto;
+    natural.max_width = Dimension::Auto;
+    natural.min_height = Dimension::Auto;
+    natural.max_height = Dimension::Auto;
+    replaced_content_size(src, &natural, space)
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either
@@ -1903,8 +1937,21 @@ fn layout_block_in(
             // automatic height follows the intrinsic ratio (CSS Sizing 4
             // transferred size), a stretched height arrives in `sized`.
             Some((sized_width, sized_height)) if is_replaced_item(flat, index) => {
-                let derived = if style.height == Dimension::Auto && width > 0.0 {
-                    height * sized_width / width
+                let derived = if style.height == Dimension::Auto {
+                    let (natural_w, natural_h) =
+                        replaced_intrinsic_size(flat, index, space).why("image")?;
+                    let mut used = if natural_w > 0.0 {
+                        natural_h * sized_width / natural_w
+                    } else {
+                        height
+                    };
+                    if let Dimension::Px(max) = style.max_height {
+                        used = used.min(max.max(0.0));
+                    }
+                    if let Dimension::Px(min) = style.min_height {
+                        used = used.max(min.max(0.0));
+                    }
+                    used
                 } else {
                     height
                 };
