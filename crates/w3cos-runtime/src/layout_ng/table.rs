@@ -268,7 +268,7 @@ fn cell_padding(style: &Style, space: &ConstraintSpace, collapsed: bool) -> [f32
             pad[1] += UA_CELL_PADDING;
             pad[3] += UA_CELL_PADDING;
         }
-        let definite_height = !collapsed && length_px(style.height, style, None, space).is_some();
+        let definite_height = length_px(style.height, style, None, space).is_some();
         if !definite_height {
             pad[0] += UA_CELL_PADDING;
             pad[2] += UA_CELL_PADDING;
