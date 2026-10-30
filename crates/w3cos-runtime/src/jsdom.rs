@@ -33173,6 +33173,16 @@ try {
     fn nested_block_in_inline_owners_survive_restyle_and_inner_removal() {
         setup();
         set_viewport(800.0, 600.0);
+        let family = "W3cosOwnerTinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register a deterministic face for owner geometry");
         w3cos_dom::stylesheet::register_rule(
             ".cold",
             &[("display", "block"), ("width", "20px"), ("height", "10px")],
@@ -33183,8 +33193,11 @@ try {
         );
         let document = document_value();
         let root = create_in_body("div");
-        root.get_property("style")
-            .set_property("width", Value::string("400px"));
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("400px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
         let outer = document.call_method("createElement", vec![Value::string("span")]);
         let inner = document.call_method("createElement", vec![Value::string("span")]);
         let inner_block = document.call_method("createElement", vec![Value::string("div")]);
@@ -33328,11 +33341,11 @@ try {
         assert_eq!(inner_rects[2].1, outer_rects[2].1);
         assert_eq!(inner_rects[2].3, outer_rects[2].3);
         assert!(
-            (inner_rects[0].2 - 94.71875).abs() < 0.001,
+            (inner_rects[0].2 - 78.7421875).abs() < 0.001,
             "unexpected leading inner fragment: {inner_rects:?}"
         );
         assert!(
-            (inner_rects[2].2 - 81.703125).abs() < 0.001,
+            (inner_rects[2].2 - 67.1875).abs() < 0.001,
             "unexpected trailing inner fragment: {inner_rects:?}"
         );
         assert!(outer_owners > 0, "outer split owner must survive lowering");
@@ -33630,10 +33643,23 @@ try {
     fn nested_owner_ranges_preserve_utf8_and_collapsed_whitespace() {
         setup();
         set_viewport(800.0, 600.0);
+        let family = "W3cosUtf8Tinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register a deterministic face for UTF-8 owner geometry");
         let document = document_value();
         let root = create_in_body("div");
-        root.get_property("style")
-            .set_property("width", Value::string("105px"));
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("105px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
         let outer = document.call_method("createElement", vec![Value::string("span")]);
         let inner = document.call_method("createElement", vec![Value::string("span")]);
         let block = document.call_method("createElement", vec![Value::string("div")]);
@@ -33670,13 +33696,12 @@ try {
             })
             .collect::<Vec<_>>();
         let expected = [
-            (55.296875, 53.875),
-            (8.0, 66.09375),
-            (8.0, 36.25),
+            (50.203125, 62.640625),
+            (8.0, 75.09375),
             (8.0, 105.0),
-            (8.0, 22.484375),
+            (8.0, 20.4375),
         ];
-        assert_eq!(rects.len(), expected.len());
+        assert_eq!(rects.len(), expected.len(), "rects={rects:?}");
         for ((x, width), (expected_x, expected_width)) in rects.iter().zip(expected) {
             assert!(
                 (x - expected_x).abs() < 0.5,

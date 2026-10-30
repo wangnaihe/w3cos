@@ -54124,9 +54124,16 @@ mod tests {
         let advances = physical_text_fragment_advances(&fragments, &style).unwrap();
         assert_eq!(advances.len(), fragments.len());
         assert!(advances.iter().all(|advance| *advance >= 0.0));
+        #[cfg(not(feature = "skia"))]
         for (fragment, advance) in fragments.into_iter().zip(advances) {
             assert_eq!(advance, text_intrinsic_size(fragment, &style).0);
         }
+        #[cfg(feature = "skia")]
+        assert_eq!(
+            advances.iter().sum::<f32>(),
+            text_intrinsic_size(&fragments.concat(), &style).0,
+            "Skia partitions a single contextually shaped run, so its fragment endpoints must sum to the combined run rather than independent substring widths"
+        );
     }
 
     #[test]
