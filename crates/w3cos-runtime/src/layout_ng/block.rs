@@ -97,6 +97,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stays the enum flex already uses.
             | "height-keyword"
             | "justify-content"
+            // Grid reads these: a replaced item stretches only for the
+            // authored `stretch` keyword, not for `normal`.
+            | "align-items-stretch"
+            | "justify-items-stretch"
             // Flex reads this for `align-content: safe …` overflow.
             // The used align-content enum stays the legacy parse.
             | "safe-align-content"
@@ -1847,7 +1851,21 @@ fn layout_block_in(
     // new formatting contexts; a replaced box keeps its own width and the
     // overlap check sends a float collision back to legacy.
     let image_size = if let ComponentKind::Image { src } = info.kind {
-        Some(replaced_content_size(src, style, space).why("image")?)
+        let (width, height) = replaced_content_size(src, style, space).why("image")?;
+        match sized {
+            // A flex or grid item takes the container-resolved width; an
+            // automatic height follows the intrinsic ratio (CSS Sizing 4
+            // transferred size), a stretched height arrives in `sized`.
+            Some((sized_width, sized_height)) if is_replaced_item(flat, index) => {
+                let derived = if style.height == Dimension::Auto && width > 0.0 {
+                    height * sized_width / width
+                } else {
+                    height
+                };
+                Some((sized_width, sized_height.unwrap_or(derived)))
+            }
+            _ => Some((width, height)),
+        }
     } else if let ComponentKind::Canvas { width, height } = info.kind {
         Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
     } else {

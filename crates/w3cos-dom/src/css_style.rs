@@ -21,6 +21,12 @@ pub const HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-height-keyword";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
+/// Authored `align-items` / `justify-items: stretch`. The enum folds
+/// `normal` into `stretch`, but a replaced grid item behaves as `start`
+/// for `normal` and stretches only for the explicit keyword. Present only
+/// when the keyword is exactly `stretch`.
+pub const ALIGN_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-align-items-stretch";
+pub const JUSTIFY_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-justify-items-stretch";
 /// A display keyword this engine does not model (`inline-grid`,
 /// `-webkit-box`, …). The used display falls through to `flex`; LayoutNG
 /// must not treat that box as an author flex container.
@@ -402,7 +408,14 @@ impl CSSStyleDeclaration {
                     (!css_wide_keyword(&keyword)).then_some(keyword),
                 );
             }
-            "align-items" | "alignItems" => self.inner.align_items = parse_align_items(value),
+            "align-items" | "alignItems" => {
+                self.inner.align_items = parse_align_items(value);
+                set_marker(
+                    &mut self.inner,
+                    ALIGN_ITEMS_STRETCH_PROPERTY,
+                    (value.trim() == "stretch").then(|| "stretch".to_string()),
+                );
+            }
             "flex-wrap" | "flexWrap" => {
                 self.inner.flex_wrap = parse_flex_wrap(value);
                 let keyword = value.trim().to_ascii_lowercase();
@@ -1511,7 +1524,14 @@ impl CSSStyleDeclaration {
                 );
             }
             "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
-            "justify-items" | "justifyItems" => self.inner.justify_items = parse_align_items(value),
+            "justify-items" | "justifyItems" => {
+                self.inner.justify_items = parse_align_items(value);
+                set_marker(
+                    &mut self.inner,
+                    JUSTIFY_ITEMS_STRETCH_PROPERTY,
+                    (value.trim() == "stretch").then(|| "stretch".to_string()),
+                );
+            }
             "place-items" | "placeItems" => {
                 let mut values = value.split_whitespace();
                 if let Some(align) = values.next() {
