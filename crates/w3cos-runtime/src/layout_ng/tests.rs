@@ -4484,3 +4484,102 @@ fn percentages_in_intrinsic_contributions_resolve_afterwards_like_chrome() {
     assert_eq!(rect(&out, 4), (0.0, 0.0, 200.0, 20.0));
     assert_eq!(rect(&out, 5), (0.0, 20.0, 150.0, 20.0));
 }
+
+/// css/css-tables/border-writing-mode-dynamic-001 (horizontal state):
+/// collapsed outer borders of 10/20/30/40px come from the table, a row
+/// group, a row or a cell and all give a 172x132 table border box.
+/// Measured in headless Chrome 156.
+#[test]
+fn collapsed_outer_borders_from_any_table_part_match_chrome() {
+    use w3cos_std::style::BorderLineStyle;
+    let mix = |style: Style| Style {
+        border_top_width: Some(10.0),
+        border_bottom_width: Some(20.0),
+        border_left_width: Some(30.0),
+        border_right_width: Some(40.0),
+        border_styles: [Some(BorderLineStyle::Solid); 4],
+        ..style
+    };
+    let plain = |display: Display| Style {
+        display,
+        ..Style::default()
+    };
+    let cell = |style: Style| {
+        node(
+            Style {
+                display: Display::TableCell,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                padding: margins(1.0, 1.0, 1.0, 1.0),
+                ..style
+            },
+            vec![Component::text(
+                "TABLE",
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            )],
+        )
+    };
+    let table = |style: Style, children: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Table,
+                border_collapse: true,
+                ..style
+            },
+            children,
+        )
+    };
+    let row = |style: Style, cells: Vec<Component>| node(style, cells);
+    let root = node(
+        block(),
+        vec![
+            table(
+                mix(Style::default()),
+                vec![row(
+                    plain(Display::TableRow),
+                    vec![cell(Style::default())],
+                )],
+            ),
+            table(
+                Style::default(),
+                vec![node(
+                    mix(plain(Display::TableRowGroup)),
+                    vec![row(
+                        plain(Display::TableRow),
+                        vec![cell(Style::default())],
+                    )],
+                )],
+            ),
+            table(
+                Style::default(),
+                vec![row(
+                    mix(plain(Display::TableRow)),
+                    vec![cell(Style::default())],
+                )],
+            ),
+            table(
+                Style::default(),
+                vec![row(
+                    plain(Display::TableRow),
+                    vec![cell(mix(Style::default()))],
+                )],
+            ),
+        ],
+    );
+    let out = ng_rects(&root);
+    let tables = [1usize, 5, 10, 14];
+    let got: Vec<_> = tables.iter().map(|i| rect(&out, *i)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (0.0, 0.0, 172.0, 132.0),
+            (0.0, 132.0, 172.0, 132.0),
+            (0.0, 264.0, 172.0, 132.0),
+            (0.0, 396.0, 172.0, 132.0),
+        ],
+        "table, tbody, tr, td"
+    );
+}
