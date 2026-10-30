@@ -1001,9 +1001,10 @@ fn floated_inline_block_and_list_item_match_chrome() {
         )],
     );
     assert!(
-        block::unsupported_reasons(&pre_flatten(&flex))
+        !block::unsupported_reasons(&pre_flatten(&flex))
             .iter()
-            .any(|reason| reason == "float:display")
+            .any(|reason| reason == "float:display"),
+        "a floated flex container is blockified and supported"
     );
     let grid = node(
         block(),
@@ -1019,9 +1020,10 @@ fn floated_inline_block_and_list_item_match_chrome() {
         )],
     );
     assert!(
-        block::unsupported_reasons(&pre_flatten(&grid))
+        !block::unsupported_reasons(&pre_flatten(&grid))
             .iter()
-            .any(|reason| reason == "float:display")
+            .any(|reason| reason == "float:display"),
+        "a floated grid container is blockified and supported"
     );
     let inline_parent = node(
         block(),
@@ -4068,9 +4070,12 @@ fn flex_text_items_match_chrome() {
         rects
     };
     let check = |rects: &[(LayoutRect, usize)], expected: &[(usize, (f32, f32, f32, f32))]| {
-        for (index, want) in expected {
-            assert_eq!(rect(rects, *index), *want, "box {index}");
-        }
+        let bad: Vec<String> = expected
+            .iter()
+            .filter(|(index, want)| rect(rects, *index) != *want)
+            .map(|(index, want)| format!("box {index}: {:?} want {want:?}", rect(rects, *index)))
+            .collect();
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     };
 
     // row-text: margins on a text item, then a sized one that overflows.
@@ -4290,6 +4295,254 @@ fn flex_text_items_match_chrome() {
         ),
         (0.0, 10.0, 40.0, 20.0)
     );
+}
+
+/// Floated flex and grid containers shrink-wrap like any float (CSS 2.1
+/// 9.7 blockifies the display; 10.3.5 shrink-to-fit). Border boxes measured
+/// in headless Chrome (testdata/chrome-float-flexgrid.json).
+#[test]
+fn floated_flex_and_grid_containers_match_chrome() {
+    use w3cos_std::style::{Clear, FlexDirection, Float};
+    let sized = |w: f32, h: f32| Style {
+        width: Dimension::Px(w),
+        height: Dimension::Px(h),
+        ..block()
+    };
+    let flex_float = |float: Float| Style {
+        display: Display::Flex,
+        float,
+        flex_direction: FlexDirection::Row,
+        ..Style::default()
+    };
+    let run = |root: Component| {
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        layout_tree(&root, &flat, 800.0, 600.0).expect("stays on NG")
+    };
+    let check = |rects: &[(LayoutRect, usize)], expected: &[(usize, (f32, f32, f32, f32))]| {
+        let bad: Vec<String> = expected
+            .iter()
+            .filter(|(index, want)| rect(rects, *index) != *want)
+            .map(|(index, want)| format!("box {index}: {:?} want {want:?}", rect(rects, *index)))
+            .collect();
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    };
+
+    // fl-row: padded, bordered, margined float with two items, a second
+    // float beside it, and a clearing block.
+    let a = Style {
+        margin: margins(3.0, 3.0, 3.0, 3.0),
+        padding: margins(2.0, 2.0, 2.0, 2.0),
+        border_width: 1.0,
+        ..flex_float(Float::Left)
+    };
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(700.0),
+            ..block()
+        },
+        vec![
+            node(
+                a,
+                vec![
+                    node(sized(30.0, 10.0), vec![]),
+                    node(
+                        Style {
+                            margin: margins(0.0, 0.0, 0.0, 4.0),
+                            ..sized(50.0, 20.0)
+                        },
+                        vec![],
+                    ),
+                ],
+            ),
+            node(
+                Style {
+                    height: Dimension::Px(15.0),
+                    ..flex_float(Float::Left)
+                },
+                vec![node(sized(40.0, 5.0), vec![])],
+            ),
+            node(
+                Style {
+                    clear: Clear::Both,
+                    height: Dimension::Px(7.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[
+            (0, (0.0, 0.0, 700.0, 39.0)),
+            (1, (3.0, 3.0, 90.0, 26.0)),
+            (2, (6.0, 6.0, 30.0, 10.0)),
+            (3, (40.0, 6.0, 50.0, 20.0)),
+            (4, (96.0, 0.0, 40.0, 15.0)),
+            (5, (96.0, 0.0, 40.0, 5.0)),
+            (6, (0.0, 32.0, 700.0, 7.0)),
+        ],
+    );
+
+    // fl-col-right: a column flex float on the right shrink-wraps to its
+    // widest item.
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(500.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    ..flex_float(Float::Right)
+                },
+                vec![
+                    node(sized(20.0, 10.0), vec![]),
+                    node(sized(60.0, 12.0), vec![]),
+                ],
+            ),
+            node(
+                Style {
+                    height: Dimension::Px(30.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (440.0, 0.0, 60.0, 22.0)),
+            (2, (440.0, 0.0, 20.0, 10.0)),
+            (3, (440.0, 10.0, 60.0, 12.0)),
+            (4, (0.0, 0.0, 500.0, 30.0)),
+        ],
+    );
+
+    // fl-wrap: two floats that do not fit side by side stack.
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(800.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    width: Dimension::Px(450.0),
+                    height: Dimension::Px(10.0),
+                    ..flex_float(Float::Left)
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    width: Dimension::Px(400.0),
+                    height: Dimension::Px(12.0),
+                    ..flex_float(Float::Left)
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[(1, (0.0, 0.0, 450.0, 10.0)), (2, (0.0, 10.0, 400.0, 12.0))],
+    );
+
+    // fl-grid: a definite-width floated grid.
+    let mut grid = Style {
+        display: Display::Grid,
+        float: Float::Left,
+        width: Dimension::Px(100.0),
+        grid_template_columns: Some("40px 1fr".to_string()),
+        ..Style::default()
+    };
+    grid.grid_ng_mut().grid_template_rows = Some("10px 20px".to_string());
+    let rects = run(node(
+        Style {
+            width: Dimension::Px(500.0),
+            ..block()
+        },
+        vec![
+            node(
+                grid,
+                vec![
+                    node(block(), vec![]),
+                    node(block(), vec![]),
+                    node(block(), vec![]),
+                ],
+            ),
+            node(
+                Style {
+                    clear: Clear::Left,
+                    height: Dimension::Px(5.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    ));
+    check(
+        &rects,
+        &[
+            (1, (0.0, 0.0, 100.0, 30.0)),
+            (2, (0.0, 0.0, 40.0, 10.0)),
+            (3, (40.0, 0.0, 60.0, 10.0)),
+            (4, (0.0, 10.0, 40.0, 20.0)),
+            (5, (0.0, 30.0, 500.0, 5.0)),
+        ],
+    );
+}
+
+/// Cross-axis `center` and `flex-end` alignment is unsafe: an item taller
+/// than the 70px line overflows it (headless Chrome, 110px border box at
+/// y=-20 for `center` and y=-40 for `flex-end`; the 20px sibling sits at
+/// y=25 and y=50). Measured in testdata/chrome-center-overflow.json.
+#[test]
+fn cross_alignment_overflow_is_unsafe_like_chrome() {
+    use w3cos_std::style::{AlignItems, FlexDirection, Overflow};
+    let run = |align: AlignItems, overflow: Overflow| {
+        let container = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: align,
+            width: Dimension::Px(70.0),
+            height: Dimension::Px(70.0),
+            overflow,
+            ..Style::default()
+        };
+        let big = Style {
+            flex_grow: 3.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            height: Dimension::Px(110.0),
+            ..block()
+        };
+        let small = Style {
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            height: Dimension::Px(20.0),
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                container,
+                vec![node(big, vec![]), node(small, vec![])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+        (rect(&out, 2).1, rect(&out, 3).1)
+    };
+    assert_eq!(run(AlignItems::Center, Overflow::Visible), (-20.0, 25.0));
+    assert_eq!(run(AlignItems::Center, Overflow::Hidden), (-20.0, 25.0));
+    assert_eq!(run(AlignItems::FlexEnd, Overflow::Visible), (-40.0, 50.0));
 }
 
 /// A scroll container's baseline is its bottom margin edge, in an
