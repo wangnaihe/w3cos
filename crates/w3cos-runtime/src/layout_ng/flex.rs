@@ -1292,7 +1292,10 @@ pub(super) fn layout(
         };
         let main = unit(main);
         let margin_box = item.margin_box_cross();
-        let extra = (line_inner - margin_box).max(0.0);
+        // Unsafe overflow alignment, as Chrome does by default: an item
+        // larger than the line overflows both sides of `center` and the
+        // start side of `flex-end`, so the slack may be negative.
+        let extra = line_inner - margin_box;
         // A definite cross size does not stretch; it aligns as flex-start.
         let from_start = match item.align {
             AlignItems::FlexEnd => extra,
@@ -1629,7 +1632,8 @@ fn layout_wrapped(
             };
             let main = unit(main);
             let margin_box = item.margin_box_cross();
-            let extra = (line_size - margin_box).max(0.0);
+            // Unsafe overflow alignment: the slack may be negative.
+            let extra = line_size - margin_box;
             let from_cross_start = match item.align {
                 AlignItems::FlexEnd => extra,
                 AlignItems::Center => extra / 2.0,
