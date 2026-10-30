@@ -1,0 +1,269 @@
+{
+ "browser": "Google Chrome 156.0.8078.79",
+ "cases": [
+  {
+   "name": "fr-minw",
+   "html": "<div style='display:flex;width:10px'><img id=i src=IMG></div>",
+   "rects": {
+    "i": [
+     0,
+     0,
+     50,
+     25
+    ]
+   }
+  },
+  {
+   "name": "fr-grow",
+   "html": "<div style='display:flex;width:200px'><img id=i style='flex:1 0 auto' src=IMG><div id=d style='flex:1 0 1px'></div></div>",
+   "rects": {
+    "i": [
+     0,
+     0,
+     124.5,
+     62.25
+    ],
+    "d": [
+     124.5,
+     0,
+     75.5,
+     62.25
+    ]
+   }
+  },
+  {
+   "name": "fr-stretch",
+   "html": "<div id=p style='display:flex;width:200px;height:60px'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "i": [
+     0,
+     0,
+     120,
+     60
+    ]
+   }
+  },
+  {
+   "name": "fc-minh",
+   "html": "<div id=p style='display:flex;flex-direction:column;height:10px;width:100px'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     10
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ]
+   }
+  },
+  {
+   "name": "fc-minh-start",
+   "html": "<div id=p style='display:flex;flex-direction:column;align-items:flex-start;height:10px;width:100px'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     10
+    ],
+    "i": [
+     0,
+     0,
+     50,
+     25
+    ]
+   }
+  },
+  {
+   "name": "fc-width",
+   "html": "<div id=p style='display:flex;flex-direction:column;width:100px'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ]
+   }
+  },
+  {
+   "name": "g-normal",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     50,
+     25
+    ]
+   }
+  },
+  {
+   "name": "g-both",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px'><img id=i style='align-self:stretch;justify-self:stretch' src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     100
+    ]
+   }
+  },
+  {
+   "name": "g-inline",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px'><img id=i style='justify-self:stretch' src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ]
+   }
+  },
+  {
+   "name": "g-block",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px'><img id=i style='align-self:stretch' src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     200,
+     100
+    ]
+   }
+  },
+  {
+   "name": "g-items-stretch",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px;align-items:stretch'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     200,
+     100
+    ]
+   }
+  },
+  {
+   "name": "g-items-normal",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px;align-items:normal;justify-items:normal'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     50,
+     25
+    ]
+   }
+  },
+  {
+   "name": "g-both-items",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px;align-items:stretch;justify-items:stretch'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     100
+    ]
+   }
+  },
+  {
+   "name": "g-end",
+   "html": "<div id=p style='display:grid;grid-template:100px/100px;width:100px;height:100px;align-items:end;justify-items:end'><img id=i src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     50,
+     75,
+     50,
+     25
+    ]
+   }
+  },
+  {
+   "name": "g-small",
+   "html": "<div id=p style='display:grid;grid-template:20px/30px;width:30px;height:20px'><img id=i style='align-self:stretch' src=IMG></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     30,
+     20
+    ],
+    "i": [
+     0,
+     0,
+     40,
+     20
+    ]
+   }
+  }
+ ]
+}
