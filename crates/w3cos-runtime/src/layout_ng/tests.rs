@@ -3479,18 +3479,18 @@ fn replaced_content_box_matches_legacy() {
     );
     let out = parity(&block_image);
     assert_eq!(rect(&out, 1), (60.0, 0.0, 80.0, 40.0));
-    let inline_image = node(
+    // An inline image is an atomic inline in the line box (see
+    // inline_images_match_chrome); a border-box image still takes legacy.
+    let mut border_box = image(Display::Block, Spacing::Px(0.0), Spacing::Px(0.0));
+    border_box.style.box_sizing = w3cos_std::style::BoxSizing::BorderBox;
+    let root = node(
         Style {
             display: Display::Block,
             ..Style::default()
         },
-        vec![image(
-            Display::InlineBlock,
-            Spacing::Px(0.0),
-            Spacing::Px(0.0),
-        )],
+        vec![border_box],
     );
-    let flat = pre_flatten(&inline_image);
+    let flat = pre_flatten(&root);
     assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
 }
 
@@ -5037,4 +5037,185 @@ fn cross_alignment_overflow_is_unsafe_like_chrome() {
     assert_eq!(run(AlignItems::Center, Overflow::Visible), (-20.0, 25.0));
     assert_eq!(run(AlignItems::Center, Overflow::Hidden), (-20.0, 25.0));
     assert_eq!(run(AlignItems::FlexEnd, Overflow::Visible), (-40.0, 50.0));
+}
+
+/// Inline `<img>` is an atomic inline in the line box (CSS 2.1 10.8.1:
+/// its baseline is the bottom margin edge), and min/max clamp the used
+/// size. Border boxes measured in headless Chrome 156 (getBoundingClientRect,
+/// Ahem 20px/1, 300px wide; testdata/chrome-image.json). Images carry an
+/// explicit width and height so the missing file's size does not matter.
+#[test]
+fn inline_images_match_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        ..font.clone()
+    };
+    let img = |extra: Style| {
+        Component::image(
+            "missing.png",
+            Style {
+                display: Display::Inline,
+                ..extra
+            },
+        )
+    };
+    let px = Dimension::Px;
+    // (vertical-align: middle is the align_self Center cascade form with no
+    // keyword marker; top / bottom carry the marker.)
+    let top = || {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-vertical-align-keyword".to_string(),
+            "top".to_string(),
+        )]))
+    };
+    let sized_img = |w: f32, h: f32| Style {
+        width: px(w),
+        height: px(h),
+        ..font.clone()
+    };
+    let run = |n: usize, children: Vec<Component>| {
+        let parent = Style {
+            width: px(300.0),
+            ..font.clone()
+        };
+        let root = node(block(), vec![node(parent, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "case {n}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("case {n} stays on NG"));
+        rects
+    };
+    let xx = || Component::text("XX", text_style.clone());
+
+    // img1: on the baseline between text; the line is 24px (4px descent).
+    let r = run(1, vec![xx(), img(sized_img(30.0, 20.0)), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 20.0));
+    // img2: taller than the strut ascent: the line grows to 44px.
+    let r = run(2, vec![xx(), img(sized_img(30.0, 40.0)), xx()]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 44.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // img3: vertical-align: middle.
+    let r = run(
+        3,
+        vec![
+            xx(),
+            img(Style {
+                align_self: w3cos_std::style::AlignSelf::Center,
+                ..sized_img(30.0, 40.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 30.0, 40.0));
+    // img4: inline-block image with margins; the margin box is 30px.
+    let r = run(
+        4,
+        vec![
+            xx(),
+            img(Style {
+                display: Display::InlineBlock,
+                margin: margins(5.0, 3.0, 5.0, 3.0),
+                ..sized_img(30.0, 20.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (43.0, 5.0, 30.0, 20.0));
+    // img5: alone, it sits on the strut's baseline (16px ascent).
+    let r = run(5, vec![img(sized_img(30.0, 10.0))]);
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(rect(&r, 2), (0.0, 6.0, 30.0, 10.0));
+    // img6: max-width clamps the width.
+    let r = run(
+        6,
+        vec![
+            xx(),
+            img(Style {
+                max_width: px(60.0),
+                ..sized_img(100.0, 20.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 60.0, 20.0));
+    // img7: min-height and a min-width in em raise the specified size.
+    let r = run(
+        7,
+        vec![
+            xx(),
+            img(Style {
+                min_height: px(30.0),
+                min_width: Dimension::Em(3.0),
+                ..sized_img(20.0, 10.0)
+            }),
+            xx(),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 60.0, 30.0));
+    // img8: max-width in em; a second image aligned to the line top.
+    let r = run(
+        8,
+        vec![
+            xx(),
+            img(Style {
+                max_width: Dimension::Em(2.0),
+                ..sized_img(100.0, 20.0)
+            }),
+            xx(),
+            img(Style {
+                custom_properties: top(),
+                align_self: w3cos_std::style::AlignSelf::FlexStart,
+                ..sized_img(10.0, 10.0)
+            }),
+        ],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 24.0));
+    assert_eq!(rect(&r, 3), (40.0, 0.0, 40.0, 20.0));
+    assert_eq!(rect(&r, 5), (120.0, 0.0, 10.0, 10.0));
+}
+
+/// A block image whose max-width is below its min-width: the min wins
+/// (CSS 2.1 10.4) and the ratio is kept, as in Chrome (WPT
+/// css-sizing/aspect-ratio/replaced-element-041; 60x60 image in a 0px box,
+/// min-width 100px, max-width 100%).
+#[test]
+fn replaced_min_over_max_keeps_min() {
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(0.0),
+                ..block()
+            },
+            vec![Component::image(
+                "missing.png",
+                Style {
+                    display: Display::Block,
+                    min_width: Dimension::Px(100.0),
+                    max_width: Dimension::Percent(1.0),
+                    ..Style::default()
+                },
+            )],
+        )],
+    );
+    let out = ng_rects(&root);
+    assert_eq!(rect(&out, 2).2, 100.0);
 }
