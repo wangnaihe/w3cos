@@ -502,6 +502,16 @@ fn anonymous_block_text(flat: &[FlatNodeInfo], index: usize) -> bool {
     )
 }
 
+/// An `<img>` that is a flex or grid item. The item is blockified (Flexbox
+/// 4, Grid 6.1), so its UA `inline`/`inline-block` display is not an atomic
+/// inline of an IFC; the container sizes it from its replaced size.
+pub(super) fn is_replaced_item(flat: &[FlatNodeInfo], index: usize) -> bool {
+    matches!(flat[index].kind, ComponentKind::Image { .. })
+        && flat[index].parent.is_some_and(|parent| {
+            is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+        })
+}
+
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     // Table, row, and cell boxes. The grid is laid out here; other
@@ -518,7 +528,10 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if matches!(info.kind, ComponentKind::Canvas { .. }) {
         return canvas_box_reason(flat, index);
     }
-    if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
+    if !is_replaced_item(flat, index)
+        && inline::is_atomic_inline(flat, index)
+        && !is_blockified_float(flat, index)
+    {
         // A text run is an anonymous flex item whatever its siblings are:
         // an inline-block text under a flex container is block text even
         // when the container's first child is not inline-level.
@@ -677,6 +690,19 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
 fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     let style = info.style;
+    if is_replaced_item(flat, index) {
+        // Floats do not apply to flex and grid items, and an abspos child
+        // is not an item; both keep the legacy path.
+        if style.float != Float::None
+            || matches!(
+                style.position,
+                Position::Absolute | Position::Fixed | Position::Sticky
+            )
+        {
+            return Some("image");
+        }
+        return unsupported_box_style(style, &[inline::VALIGN_MARKER], true);
+    }
     if style.box_sizing == BoxSizing::BorderBox {
         return Some("image");
     }
@@ -1012,6 +1038,19 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     Some(crate::layout::image_intrinsic_size(
         src, &definite, containing,
     ))
+}
+
+/// Used content-box height of a replaced item (`None`: not a replaced item;
+/// `Some(None)`: the size is not known here).
+pub(super) fn replaced_item_height(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<Option<f32>> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    Some(replaced_content_size(src, flat[index].style, space).map(|(_, height)| height))
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either

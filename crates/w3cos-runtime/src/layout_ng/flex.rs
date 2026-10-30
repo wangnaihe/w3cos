@@ -617,6 +617,10 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
         let line = info.style.font_size * info.style.line_height.max(1.0);
         return Some(line.max(0.0));
     }
+    // A replaced item's min-content block size is its used replaced height.
+    if let Some(height) = block::replaced_item_height(flat, index, space) {
+        return Some(height?);
+    }
     let mut sum = 0.0;
     for child in rendered_children(flat, index) {
         if oof::is_out_of_flow(flat[child].style) || flat[child].style.float != Float::None {
