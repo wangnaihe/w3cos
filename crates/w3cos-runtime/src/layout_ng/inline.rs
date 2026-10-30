@@ -1872,6 +1872,7 @@ pub(super) fn layout_inline_beside(
             ];
             let height = margin[0] + result.fragment.height + margin[2];
             let ascent = match result.last_baseline {
+                _ if super::block::baseline_is_margin_edge(style) => height,
                 LastBaseline::At(b) => margin[0] + b,
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),

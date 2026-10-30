@@ -903,6 +903,12 @@ fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f
 }
 
 /// Either axis computes to something other than visible (CSS2 11.1.1).
+/// CSS 2.1 10.8.1: a box whose overflow clips (a scroll container) has
+/// its bottom margin edge as baseline, instead of a line box's.
+pub(super) fn baseline_is_margin_edge(style: &Style) -> bool {
+    non_visible_overflow(style) && style.display.establishes_overflow_clip()
+}
+
 fn non_visible_overflow(style: &Style) -> bool {
     style.resolved_overflow_x() != Overflow::Visible
         || style.resolved_overflow_y() != Overflow::Visible
@@ -2514,13 +2520,22 @@ fn layout_block_in(
             pending = result.end_strut;
             at_top = false;
         }
-        if result.last_baseline != LastBaseline::NoLines {
-            last_baseline = result.last_baseline.offset(bt + pt + y);
+        // A scroll container block child exposes its bottom margin edge as
+        // its baseline, whatever lines it holds (css/CSS2/linebox/
+        // baseline-block-with-overflow-001, measured in Chrome).
+        let (child_last, child_first) = if baseline_is_margin_edge(child_info.style) {
+            let edge = LastBaseline::At(result.fragment.height + child_metrics.margin[2]);
+            (edge, edge)
+        } else {
+            (result.last_baseline, result.first_baseline)
+        };
+        if child_last != LastBaseline::NoLines {
+            last_baseline = child_last.offset(bt + pt + y);
         }
         if !matches!(first_baseline, LastBaseline::At(_)) {
-            let candidate = match result.first_baseline {
-                LastBaseline::At(_) => result.first_baseline,
-                _ => result.last_baseline,
+            let candidate = match child_first {
+                LastBaseline::At(_) => child_first,
+                _ => child_last,
             };
             if matches!(candidate, LastBaseline::At(_)) {
                 first_baseline = candidate.offset(bt + pt + y);
