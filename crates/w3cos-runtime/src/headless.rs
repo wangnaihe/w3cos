@@ -298,13 +298,14 @@ fn finish_headless_frame(
     let scroll_offsets = layout_results
         .scrollable_nodes
         .iter()
-        .filter_map(|(index, _, _)| {
+        .filter_map(|(index, _, extent)| {
             let w3cos_std::EventAction::NativeHost { id, .. } = flat[*index].on_click else {
                 return None;
             };
-            u32::try_from(*id)
-                .ok()
-                .map(|node| (*index, crate::dom::get_scroll_offset(node)))
+            u32::try_from(*id).ok().map(|node| {
+                let (x, y) = crate::dom::get_scroll_offset(node);
+                (*index, clamp_scroll_offset_ng(x, y, extent))
+            })
         })
         .collect::<HashMap<_, _>>();
     let scroll_info = crate::window::build_headless_scroll_info(
@@ -487,13 +488,14 @@ fn paint_retained_artifact(
     let scroll_offsets = layout_results
         .scrollable_nodes
         .iter()
-        .filter_map(|(index, _, _)| {
+        .filter_map(|(index, _, extent)| {
             let w3cos_std::EventAction::NativeHost { id, .. } = flat[*index].on_click else {
                 return None;
             };
-            u32::try_from(*id)
-                .ok()
-                .map(|node| (*index, crate::dom::get_scroll_offset(node)))
+            u32::try_from(*id).ok().map(|node| {
+                let (x, y) = crate::dom::get_scroll_offset(node);
+                (*index, clamp_scroll_offset_ng(x, y, extent))
+            })
         })
         .collect::<HashMap<_, _>>();
     let scroll_info = crate::window::build_headless_scroll_info(
@@ -929,4 +931,18 @@ mod tests {
             &after.rgba[pixel..pixel + 4]
         );
     }
+}
+
+/// A scroll offset cannot exceed the scrollable overflow. LayoutNG computes
+/// that extent itself, so an offset script set past it (`scrollLeft = 100` on
+/// a box with no overflow) is clamped as a browser does. The legacy path keeps
+/// applying offsets unclamped, as it always has.
+fn clamp_scroll_offset_ng(x: f32, y: f32, extent: &crate::layout::ScrollExtent) -> (f32, f32) {
+    if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
+        return (x, y);
+    }
+    (
+        x.clamp(0.0, extent.max_x.max(0.0)),
+        y.clamp(0.0, extent.max_y.max(0.0)),
+    )
 }
