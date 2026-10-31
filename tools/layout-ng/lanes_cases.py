@@ -18,16 +18,16 @@ def case(name, template, items, **container):
     return {"name": name, "container": {"template": template, **container}, "items": items}
 
 
-def it(id, h=None, w=None, text=None, place=None, order=None, margin=None):
+def it(id, h=None, w=None, text=None, place=None, order=None, margin=None, self_=None):
     d = {"id": id}
-    for k, v in (("h", h), ("w", w), ("text", text), ("place", place), ("order", order), ("margin", margin)):
+    for k, v in (("h", h), ("w", w), ("text", text), ("place", place), ("order", order), ("margin", margin), ("self", self_)):
         if v is not None:
             d[k] = v
     return d
 
 
 H = [30, 10, 20, 40, 10, 10, 25]
-IDS = "abcdefg"
+IDS = "abcdefghi"
 def stack(n=7):
     return [it(IDS[i], h=H[i]) for i in range(n)]
 
@@ -75,6 +75,29 @@ CASES = [
     case("rev-rows-span", "20px 20px 20px", [it("a", w=50, h=10), it("b", w=40, h=10, place="span 2"), it("c", w=30, h=10), it("d", w=60, h=10)], axis="row fill-reverse"),]
 
 
+def al_items():
+    hs = [70, 40, 120, 60, 50, 80, None, None, None]
+    return [it(IDS[i], h=h) for i, h in enumerate(hs)]
+
+
+def al_rows():
+    ws = [60, None, 40, None, 50, None, 20]
+    texts = [None, "XX", None, "XXXX", None, "X", None]
+    return [it(IDS[i], w=w, h=10, text=t) for i, (w, t) in enumerate(zip(ws, texts))]
+
+
+for rev in ("", " fill-reverse"):
+    tag = "rev" if rev else "fwd"
+    for al in ("start", "center", "end", "stretch"):
+        CASES.append(case(f"al-{tag}-cols-{al}", "80px 80px 80px", al_items(), gap=[5, 5], align=al, axis="column" + rev))
+        CASES.append(case(f"al-{tag}-cols-{al}-h", "80px 80px 80px", al_items(), gap=[5, 5], align=al, axis="column" + rev, height=300))
+    CASES.append(case(f"al-{tag}-cols-span", "80px 80px 80px", [it("a", h=40, place="span 2"), it("b", h=60), it("c", h=50, place="span 3"), it("d", h=30), it("e", h=60), it("f", place="span 2"), it("g")], gap=[5, 5], align="center", axis="column" + rev, height=300))
+    CASES.append(case(f"al-{tag}-cols-self", "80px 80px 80px", [it("a", h=40), it("b", h=60, self_="end"), it("c", h=20), it("d", h=30), it("e", h=10, self_="center"), it("f", h=25), it("g", h=15)], gap=[5, 5], axis="column" + rev, height=200))
+    CASES.append(case(f"al-{tag}-cols-self-auto", "80px 80px 80px", [it("a", h=40), it("b", h=60, self_="end"), it("c", h=20), it("d", h=30), it("e", h=10, self_="center"), it("f", h=25), it("g", h=15)], gap=[5, 5], axis="column" + rev))
+    for al in ("center", "end", "stretch"):
+        CASES.append(case(f"al-{tag}-rows-{al}", "20px 20px 20px", al_rows(), gap=[5, 5], align=al, axis="row" + rev))
+
+
 def html(c):
     k = c["container"]
     # The axis follows the template that is set, or the direction keyword.
@@ -84,6 +107,8 @@ def html(c):
     style.append(f"{prop}:{k['template']}")
     if k.get("axis"):
         style.append(f"grid-lanes-direction:{k['axis']}")
+    if k.get("align"):
+        style.append(f"{'justify-items' if rows_axis else 'align-items'}:{k['align']}")
     if k.get("tolerance"):
         style.append(f"flow-tolerance:{k['tolerance']}")
     if k.get("gap"):
@@ -102,6 +127,8 @@ def html(c):
             s.append(f"{'grid-row' if rows_axis else 'grid-column'}:{i['place']}")
         if "order" in i:
             s.append(f"order:{i['order']}")
+        if "self" in i:
+            s.append(f"{'justify-self' if rows_axis else 'align-self'}:{i['self']}")
         if "margin" in i:
             s.append(f"margin:{i['margin']}px;padding:2px;border:1px solid")
         kids.append(f"<div id={c['name']}-{i['id']} style='{';'.join(s)}'>{i.get('text', '')}</div>")

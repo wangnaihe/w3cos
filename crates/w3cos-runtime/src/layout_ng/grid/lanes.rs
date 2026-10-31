@@ -10,7 +10,7 @@
 use super::{
     Breadth, Dimension, EPS, FlatNodeInfo, INF, Pack, Spec, Style, align_pack, axis_offset,
     column_pack, columns_spec, expand_auto, finalize, from_units, gap_sum, grow, has_marker,
-    inline_minmax, is_baseline, is_subgrid_axis, layout_item, marker, pack_gap, parse_axis_syntax,
+    explicit_stretch, inline_minmax, is_baseline, is_subgrid_axis, layout_item, marker, pack_gap, parse_axis_syntax,
     parse_flow, parse_template, placement, positions, repeat_basis, resolve_axis, resolve_block,
     row_pack, spacing_px, span_sum, to_content, track_from_spec, units, used_item_align,
 };
@@ -20,7 +20,7 @@ use crate::layout_ng::oof::{self, OofCandidate};
 use crate::layout_ng::{
     BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStrut, Why,
 };
-use w3cos_std::style::{Position, Spacing, TextDirection};
+use w3cos_std::style::{AlignItems, Position, Spacing, TextDirection};
 
 const LANES: &str = "--w3cos-internal-grid-lanes";
 const TOLERANCE: &str = "--w3cos-internal-flow-tolerance";
@@ -441,6 +441,7 @@ pub(super) fn layout(
             font,
             reverse,
             &used_of,
+            min_h.is_some() || max_h.is_some(),
         )?
     } else {
         stack_rows(
@@ -543,6 +544,108 @@ struct Prepared {
     specified_content_h: Option<f32>,
     justify: Pack,
     align: Pack,
+    /// Alignment on the stacking axis (`align-items` for column lanes).
+    stack: StackAlign,
+}
+
+/// Item alignment on the stacking axis. `Normal` is the unset value,
+/// which differs from `Start` once another item sets an alignment.
+#[derive(Clone, Copy, PartialEq)]
+enum StackAlign {
+    Normal,
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+fn stack_align(style: &Style, child: &Style, columns: bool) -> StackAlign {
+    let (items, own) = if columns {
+        (style.align_items, child.align_self)
+    } else {
+        (style.justify_items, child.justify_self)
+    };
+    match used_item_align(items, own) {
+        AlignItems::Stretch if explicit_stretch(style, own, columns) => StackAlign::Stretch,
+        AlignItems::Stretch => StackAlign::Normal,
+        AlignItems::FlexEnd => StackAlign::End,
+        AlignItems::Center => StackAlign::Center,
+        AlignItems::FlexStart | AlignItems::Baseline => StackAlign::Start,
+    }
+}
+
+/// A placed item before the stacking-axis alignment pass.
+struct Record {
+    source: usize,
+    index: usize,
+    /// Grid-axis offset (columns: x; rows: y), already aligned.
+    cross: f32,
+    /// Stacking-axis position of the margin box start.
+    at: i64,
+    before: i64,
+    after: i64,
+    dx: f32,
+    dy: f32,
+    fragment: BoxFragment,
+    oof: Vec<OofCandidate>,
+    prepared: Prepared,
+    area: i64,
+}
+
+/// Tracks the free stacking-axis space after each item (Blink track
+/// openings): the gap to the next item in the lane, or to the container
+/// end, whichever lane of the span is tighter.
+struct Openings {
+    space: Vec<i64>,
+    last: Vec<Option<usize>>,
+}
+
+impl Openings {
+    fn new(lanes: usize) -> Self {
+        Self {
+            space: Vec::new(),
+            last: vec![None; lanes],
+        }
+    }
+
+    fn place(&mut self, running: &Running, start: usize, span: usize, at: i64) {
+        let item = self.space.len();
+        self.space.push(i64::MAX);
+        for lane in start..start + span {
+            if let Some(previous) = self.last[lane] {
+                let opening = (at - running.positions[lane]).max(0);
+                self.space[previous] = self.space[previous].min(opening);
+            }
+            self.last[lane] = Some(item);
+        }
+    }
+
+    fn finish(&mut self, running: &Running, gap: i64, end: i64) {
+        for (lane, last) in self.last.iter().enumerate() {
+            if let Some(item) = *last {
+                let opening = end - (running.positions[lane] - gap);
+                self.space[item] = self.space[item].min(opening);
+            }
+        }
+    }
+}
+
+/// Offset along the stacking axis and whether the item stretches. In
+/// `fill-reverse` the layout is mirrored afterwards, so the alignment
+/// swaps `start` and `end` (Blink ApplyStackingAxisAlignment).
+fn stack_shift(align: StackAlign, fill_reverse: bool, space: i64) -> (i64, bool) {
+    let align = match (align, fill_reverse) {
+        (StackAlign::Stretch, _) => return (0, true),
+        (StackAlign::Normal | StackAlign::Start, false) => StackAlign::Start,
+        (StackAlign::Normal | StackAlign::Start, true) => StackAlign::End,
+        (StackAlign::End, true) => StackAlign::Start,
+        (other, _) => other,
+    };
+    match align {
+        StackAlign::End => (space, false),
+        StackAlign::Center => (space / 2, false),
+        _ => (0, false),
+    }
 }
 
 /// Item inline and block metrics inside `area` (a track span for column
@@ -610,6 +713,7 @@ fn prepare(
         specified_content_h,
         justify,
         align,
+        stack: stack_align(style, child_style, columns),
     })
 }
 
@@ -626,6 +730,7 @@ fn stack_columns(
     font: f32,
     reverse: Reverse,
     used_of: &dyn Fn(i64) -> i64,
+    clamped: bool,
 ) -> Option<Stacked> {
     let lanes = specs.len();
     let mut col_min = vec![0_i64; lanes];
@@ -672,7 +777,8 @@ fn stack_columns(
     let mut running = Running::new(lanes, tolerance);
     let mut placed = Vec::with_capacity(entries.len());
     let mut extent = 0_i64;
-    let mut margins = Vec::with_capacity(entries.len());
+    let mut records = Vec::with_capacity(entries.len());
+    let mut openings = Openings::new(lanes);
     for entry in entries {
         let explicit = entry
             .start
@@ -714,14 +820,26 @@ fn stack_columns(
         );
         let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
         let x = from_units(column_x[track] + ml + inline_offset);
-        let y = from_units(at + mt);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
+        openings.place(&running, start, entry.span, at);
         running.place(start, entry.span, at + contribution);
         if entry.start.is_none() {
             running.cursor = start + entry.span;
         }
-        margins.push((at, mb, units(fragment.height), dy));
-        placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
+        records.push(Record {
+            source: entry.source,
+            index: entry.index,
+            cross: x,
+            at,
+            before: mt,
+            after: mb,
+            dx,
+            dy,
+            fragment,
+            oof: item_oof,
+            prepared,
+            area,
+        });
     }
     for position in &running.positions {
         extent = extent.max(*position);
@@ -731,17 +849,58 @@ fn stack_columns(
     } else {
         (extent - row_gap_u).max(0)
     };
-    if reverse.fill {
-        // Items stack from the end of the container: the block axis is
-        // mirrored once its used size is known.
-        let used = used_of(extent);
-        if used < extent {
-            return crate::layout_ng::bail("lanes:fill-reverse-overflow");
+    let used = used_of(extent);
+    let aligned = records
+        .iter()
+        .any(|record| record.prepared.stack != StackAlign::Normal);
+    if (reverse.fill && used < extent) || (aligned && (used < extent || clamped)) {
+        return crate::layout_ng::bail("lanes:stacking-overflow");
+    }
+    openings.finish(&running, row_gap_u, used);
+    for (record, room) in records.into_iter().zip(openings.space) {
+        let Record {
+            source,
+            index,
+            cross,
+            at,
+            before,
+            after,
+            dx,
+            dy,
+            mut fragment,
+            mut oof,
+            prepared,
+            area,
+        } = record;
+        let mut at = at;
+        if aligned {
+            let (shift, stretch) = stack_shift(prepared.stack, reverse.fill, room);
+            at += shift;
+            let child = flat[index].style;
+            let explicit = !matches!(child.height, Dimension::Auto)
+                || has_marker(child, super::HEIGHT_KEYWORD);
+            if stretch && !explicit && room > 0 {
+                let target = units(fragment.height) + room - units(prepared.edges_v);
+                let laid = layout_item(
+                    flat,
+                    index,
+                    space,
+                    from_units(area),
+                    prepared.content_width,
+                    Some(from_units(target.max(0))),
+                )?;
+                fragment = laid.fragment;
+                oof = laid.oof;
+            }
         }
-        for (item, (at, mb, height, dy)) in placed.iter_mut().zip(&margins) {
-            // The margin box mirrors; margins keep their physical sides.
-            item.2 = from_units(used - at - height - mb) + dy;
-        }
+        let y = if reverse.fill {
+            // Items stack from the end of the container: the margin box
+            // mirrors; margins keep their physical sides.
+            used - at - units(fragment.height) - after
+        } else {
+            at + before
+        };
+        placed.push((source, cross + dx, from_units(y) + dy, fragment, oof));
     }
     placed.sort_by_key(|item| item.0);
     Some(unzip_placed(placed, extent))
@@ -873,6 +1032,8 @@ fn stack_rows(
     let tolerance = tolerance_units(style, used);
     let mut running = Running::new(lanes, tolerance);
     let mut placed = Vec::with_capacity(entries.len());
+    let mut records = Vec::with_capacity(entries.len());
+    let mut openings = Openings::new(lanes);
     for (entry, (prepared, mut fragment, mut item_oof)) in entries.iter().zip(measured) {
         let explicit = entry
             .start
@@ -914,22 +1075,86 @@ fn stack_rows(
             prepared.align,
         );
         let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
-        let mut x = from_units(at + ml);
-        if reverse.fill {
-            // Items stack from the inline end: the margin box mirrors.
-            let end = at + ml + units(fragment.width) + mr;
-            if end > inner_u {
-                return crate::layout_ng::bail("lanes:fill-reverse-overflow");
-            }
-            x = from_units(inner_u - at - units(fragment.width) - mr);
-        }
         let y = from_units(row_y[track] + mt + block_offset);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
+        openings.place(&running, start, entry.span, at);
         running.place(start, entry.span, at + contribution);
         if entry.start.is_none() {
             running.cursor = start + entry.span;
         }
-        placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
+        records.push(Record {
+            source: entry.source,
+            index: entry.index,
+            cross: y,
+            at,
+            before: ml,
+            after: mr,
+            dx,
+            dy,
+            fragment,
+            oof: item_oof,
+            prepared,
+            area: 0,
+        });
+    }
+    let extent = running
+        .positions
+        .iter()
+        .map(|position| position - column_gap_u)
+        .max()
+        .unwrap_or(0);
+    let aligned = records
+        .iter()
+        .any(|record| record.prepared.stack != StackAlign::Normal);
+    if (reverse.fill || aligned) && !records.is_empty() && extent > inner_u {
+        return crate::layout_ng::bail("lanes:stacking-overflow");
+    }
+    openings.finish(&running, column_gap_u, inner_u);
+    for (record, room) in records.into_iter().zip(openings.space) {
+        let Record {
+            source,
+            index,
+            cross,
+            at,
+            before,
+            after,
+            dx,
+            dy,
+            mut fragment,
+            mut oof,
+            prepared,
+            ..
+        } = record;
+        let mut at = at;
+        if aligned {
+            let (shift, stretch) = stack_shift(prepared.stack, reverse.fill, room);
+            at += shift;
+            let child = flat[index].style;
+            let explicit = !matches!(child.width, Dimension::Auto)
+                || has_marker(child, block::WIDTH_KEYWORD);
+            if stretch && !explicit && room > 0 {
+                let edges_h = units(fragment.width) - units(prepared.content_width);
+                let width = units(fragment.width) + room - edges_h;
+                let content_h = units(fragment.height) - units(prepared.edges_v);
+                let laid = layout_item(
+                    flat,
+                    index,
+                    space,
+                    inner,
+                    from_units(width.max(0)),
+                    Some(from_units(content_h.max(0))),
+                )?;
+                fragment = laid.fragment;
+                oof = laid.oof;
+            }
+        }
+        let x = if reverse.fill {
+            // Items stack from the inline end: the margin box mirrors.
+            inner_u - at - units(fragment.width) - after
+        } else {
+            at + before
+        };
+        placed.push((source, from_units(x) + dx, cross + dy, fragment, oof));
     }
     placed.sort_by_key(|item| item.0);
     Some(unzip_placed(placed, used))
