@@ -206,7 +206,8 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     // An author `display:flex` (no marker) is a flex container (S5).
     let lowered_ifc = matches!(style.display, Display::Flex | Display::InlineFlex)
         && marker(style, inline::IFC_MARKER).is_some();
-    let author_flex = style.display == Display::Flex && !lowered_ifc;
+    let author_flex =
+        (style.display == Display::Flex && !lowered_ifc) || is_author_inline_flex(style);
     // `display:grid` is a grid container when `grid::container_reason` accepts
     // the template. `inline-grid` keeps `display: flex` for legacy and is a
     // grid here (`is_author_grid`).
@@ -781,6 +782,13 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 true,
             ),
         };
+        // An atomic `inline-flex` meets the same container limits as a
+        // block-level flex line (rtl, baseline groups, containment, ...).
+        let own = own.or_else(|| {
+            is_author_inline_flex(info.style)
+                .then(|| super::flex::container_reason(flat, index))
+                .flatten()
+        });
         return own.or_else(|| inline::atomic_inline_reason(info.style));
     }
     match info.kind {
@@ -3849,11 +3857,25 @@ fn is_legacy_webkit_box(style: &Style) -> bool {
 }
 
 pub(super) fn is_author_flex(style: &Style) -> bool {
-    style.display == Display::Flex
+    (style.display == Display::Flex
+        && marker(style, inline::IFC_MARKER).is_none()
+        && !is_float_group(style)
+        && !is_grid_lanes(style)
+        && !is_inline_grid(style))
+        || is_author_inline_flex(style)
+}
+
+/// An author `display: inline-flex`: a flex container that is an atomic
+/// inline in its parent's IFC (CSS Flexbox §3). A flex or grid item, a
+/// float and an out-of-flow box are blockified to `flex` by the cascade;
+/// a DOM-lowered IFC row carries the IFC marker.
+pub(super) fn is_author_inline_flex(style: &Style) -> bool {
+    style.display == Display::InlineFlex
         && marker(style, inline::IFC_MARKER).is_none()
         && !is_float_group(style)
         && !is_grid_lanes(style)
         && !is_inline_grid(style)
+        && unrecognized_display(style).is_none()
 }
 
 pub(super) fn is_author_grid(style: &Style) -> bool {
@@ -4120,6 +4142,18 @@ fn layout_block_in(
     // NGFlexLayoutAlgorithm. Lowered IFC rows and synthetic float groups
     // stay on the paths below.
     if is_author_flex(style) {
+        // An atomic `inline-flex` with an auto width is fit-content wide
+        // (CSS 2.1 10.3.9); a float passes its own shrink-to-fit size.
+        let sized =
+            if sized.is_none() && is_author_inline_flex(style) && style.width == Dimension::Auto {
+                let metrics = resolve_inline(style, space);
+                Some((
+                    shrink_to_fit(flat, index, space, &metrics).why("inline-flex:shrink")?,
+                    None,
+                ))
+            } else {
+                sized
+            };
         return super::flex::layout(flat, index, space, sized);
     }
     if is_author_grid(style) {

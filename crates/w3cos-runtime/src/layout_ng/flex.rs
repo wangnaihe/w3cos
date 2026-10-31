@@ -250,6 +250,17 @@ fn unexported_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
 /// Why baseline alignment stays on legacy, if it does. A row aligns
 /// first baselines per line (FlexLayoutAlgorithm::BaselineAscent). Column
 /// baseline groups are not done here yet.
+/// A scroll container's flex baseline stays inside its border box, so
+/// overflowing content does not move the line (flex-baseline-overflow-hidden).
+fn clamp_scroll_baseline(style: &Style, baseline: LastBaseline, height: f32) -> LastBaseline {
+    match baseline {
+        LastBaseline::At(b) if super::block::baseline_is_margin_edge(style) => {
+            LastBaseline::At(b.clamp(0.0, height))
+        }
+        other => other,
+    }
+}
+
 fn baseline_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !row_axis(style.flex_direction) {
@@ -2372,12 +2383,13 @@ pub(super) fn layout(
     }
 
     // A row's major baseline is the line's largest ascent; otherwise the
-    // fallback item's baseline (FlexLayoutAlgorithm FirstBaseline). A
-    // column keeps reporting none, as before.
+    // fallback item's baseline (FlexLayoutAlgorithm FirstBaseline).
     let container_baseline = match (row, max_ascent) {
         (true, Some(ascent)) => LastBaseline::At(bt + pt + ascent),
         (true, None) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
-        (false, _) => LastBaseline::NoLines,
+        // A column's first baseline is its first item's (CSS Flexbox 8.5);
+        // an `inline-flex` aligns on it.
+        (false, _) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
     };
     let content_main = if row {
         inner_width
@@ -2447,8 +2459,8 @@ pub(super) fn layout(
             ellipsis: false,
             children,
         },
-        last_baseline: container_baseline,
-        first_baseline: container_baseline,
+        last_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
+        first_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -3004,8 +3016,16 @@ fn layout_wrapped(
         },
         // As in the single-line path, the first baseline is reported for
         // both: an inline-flex uses its first baseline.
-        last_baseline: container_baseline.unwrap_or(LastBaseline::NoLines),
-        first_baseline: container_baseline.unwrap_or(LastBaseline::NoLines),
+        last_baseline: clamp_scroll_baseline(
+            style,
+            container_baseline.unwrap_or(LastBaseline::NoLines),
+            border_height,
+        ),
+        first_baseline: clamp_scroll_baseline(
+            style,
+            container_baseline.unwrap_or(LastBaseline::NoLines),
+            border_height,
+        ),
         start_strut,
         end_strut,
         self_collapsing: false,

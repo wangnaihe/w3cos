@@ -842,7 +842,7 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
             | ComponentKind::Column
             | ComponentKind::Row
             | ComponentKind::Text { .. }
-    ) && inline_block
+    ) && (inline_block || super::block::is_author_inline_flex(flat[index].style))
         // An absolutely positioned inline-block is blockified (CSS2 9.7).
         && !super::block::inline_level_oof(flat, index)
 }
