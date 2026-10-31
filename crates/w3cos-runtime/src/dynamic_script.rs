@@ -10415,6 +10415,7 @@ mod tests {
         (format!("http://{address}/dependency.js"), handle)
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
     #[test]
     fn text_only_flex_item_min_width_does_not_collapse_content_width() {
         // `h3.title { min-width: 3ch }` in a flex pane header: the authored
