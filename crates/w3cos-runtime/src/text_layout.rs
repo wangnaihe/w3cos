@@ -481,6 +481,24 @@ fn merge_orphan_punctuation_lines(lines: &mut Vec<String>) {
     }
 }
 
+/// Byte index of the last ASCII space in `current` when overflowing `next`
+/// would otherwise split a Latin-style word. Returns `None` when the break
+/// falls on whitespace or CJK (already a break opportunity) or the line holds a
+/// single unbroken word, which keeps the character-level fallback.
+fn word_break_split(current: &str, next: char) -> Option<usize> {
+    let last = current.chars().last()?;
+    if next.is_whitespace()
+        || last.is_whitespace()
+        || is_cjk_line_break_character(next)
+        || is_cjk_line_break_character(last)
+    {
+        return None;
+    }
+    let split = current.rfind(' ')?;
+    (split + 1 < current.len() && current[..split].chars().any(|c| !c.is_whitespace()))
+        .then_some(split)
+}
+
 fn wrap_greedy<F>(
     text: &str,
     max_width: f32,
@@ -549,6 +567,17 @@ where
                 flush(&mut lines, &mut current, &mut current_w);
                 current.push(last);
                 current_w = char_width(last);
+            } else if let Some(split) = word_break_split(&current, ch) {
+                // Wrapping mid-word is only a last resort: move the partial
+                // word to the next line when an earlier space allows it.
+                let remainder = current[split + 1..].to_string();
+                current.truncate(split);
+                while current.ends_with(' ') {
+                    current.pop();
+                }
+                flush(&mut lines, &mut current, &mut current_w);
+                current_w = remainder.chars().map(&mut char_width).sum();
+                current = remainder;
             } else {
                 flush(&mut lines, &mut current, &mut current_w);
             }
@@ -2038,6 +2067,17 @@ mod tests {
                 .iter()
                 .all(|line| line.chars().count() as f32 <= max_width)
         );
+    }
+
+    #[test]
+    fn char_width_wrap_moves_a_split_word_to_the_next_line() {
+        let lines = wrap_text_with_char_width("aa bb cc", 5.0, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(lines, vec!["aa bb", "cc"]);
+        let lines = wrap_text_with_char_width("aa bbbb", 5.0, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(lines, vec!["aa", "bbbb"]);
+        // A single over-long word still falls back to character breaks.
+        let lines = wrap_text_with_char_width("abcdefgh", 3.0, WhiteSpace::Normal, |_| 1.0);
+        assert_eq!(lines, vec!["abc", "def", "gh"]);
     }
 
     #[test]
