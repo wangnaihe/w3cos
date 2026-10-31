@@ -844,6 +844,21 @@ impl CSSStyleDeclaration {
             // Transform
             "transform" => {
                 self.inner.transform = parse_transform(value);
+                // Percentage translations resolve against the element's own
+                // border box, which only layout knows. Park them in an
+                // internal property; layout applies them after sizing.
+                let (pct_x, pct_y) = parse_transform_translate_percent(value);
+                if pct_x != 0.0 || pct_y != 0.0 {
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(
+                            TRANSLATE_PERCENT_PROPERTY.to_string(),
+                            format!("{pct_x},{pct_y}"),
+                        );
+                } else if let Some(properties) = self.inner.custom_properties.as_mut() {
+                    properties.remove(TRANSLATE_PERCENT_PROPERTY);
+                }
             }
 
             // Compositor hints (standard CSS — UA picks GPU/CPU internally)
@@ -3053,6 +3068,42 @@ fn parse_transform(value: &str) -> w3cos_std::style::Transform2D {
     t
 }
 
+/// Internal custom property carrying `translate*()` percentages as `"x,y"`.
+pub const TRANSLATE_PERCENT_PROPERTY: &str = "--w3cos-internal-translate-pct";
+
+/// Sum the percentage components of `translateX/Y/translate()` functions in a
+/// `transform` value. Non-percentage components are handled by
+/// `parse_transform`.
+pub fn parse_transform_translate_percent(value: &str) -> (f32, f32) {
+    let mut x = 0.0;
+    let mut y = 0.0;
+    let mut rest = value.trim();
+    let pct = |s: &str| -> Option<f32> { s.trim().strip_suffix('%')?.trim().parse::<f32>().ok() };
+    while let Some(open) = rest.find('(') {
+        let name = rest[..open]
+            .trim()
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or("");
+        let Some(close) = rest[open..].find(')') else {
+            break;
+        };
+        let args = &rest[open + 1..open + close];
+        match name.to_ascii_lowercase().as_str() {
+            "translatex" => x += pct(args).unwrap_or(0.0),
+            "translatey" => y += pct(args).unwrap_or(0.0),
+            "translate" => {
+                let mut parts = args.split(',');
+                x += parts.next().and_then(pct).unwrap_or(0.0);
+                y += parts.next().and_then(pct).unwrap_or(0.0);
+            }
+            _ => {}
+        }
+        rest = &rest[open + close + 1..];
+    }
+    (x, y)
+}
+
 fn extract_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let start = s.find(name)?;
     let rest = &s[start + name.len()..];
@@ -4708,6 +4759,26 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transform_translate_percentages_are_parked_for_layout() {
+        assert_eq!(
+            parse_transform_translate_percent("translateY(-50%)"),
+            (0.0, -50.0)
+        );
+        assert_eq!(
+            parse_transform_translate_percent("translate(-50%, -50%)"),
+            (-50.0, -50.0)
+        );
+        assert_eq!(
+            parse_transform_translate_percent("translateX(10px) translateY(25%)"),
+            (0.0, 25.0)
+        );
+        assert_eq!(
+            parse_transform_translate_percent("translate(5px, 6px)"),
+            (0.0, 0.0)
+        );
+    }
+
     #[test]
     fn resize_keywords_round_trip_and_invalid_values_keep_the_valid_declaration() {
         let mut declaration = super::CSSStyleDeclaration::new();

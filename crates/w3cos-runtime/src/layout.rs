@@ -4660,6 +4660,7 @@ impl LayoutEngine {
 
         if self.skip_projections {
             results.extend(fixed_results);
+            project_percent_translate(&mut results, root);
             return Ok(LayoutResults {
                 layout_cache: results,
                 scrollable_nodes: scrollable,
@@ -4807,6 +4808,7 @@ impl LayoutEngine {
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
         results.extend(fixed_results);
+        project_percent_translate(&mut results, root);
 
         Ok(LayoutResults {
             layout_cache: results,
@@ -5088,12 +5090,66 @@ pub fn compute_with_scroll_details(
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
 
     results.extend(fixed_results);
+    project_percent_translate(&mut results, root);
     Ok(LayoutResults {
         layout_cache: results,
         scrollable_nodes: scrollable,
         clip_only_nodes: clip_only,
         scroll_ancestor,
     })
+}
+
+/// Resolve `transform: translate*(<percentage>)` against each element's own
+/// border box. The DOM layer parks the percentages in
+/// `--w3cos-internal-translate-pct` (`"x,y"`); here the box and its whole
+/// subtree move by the resolved offset, which is what `top: 50%` +
+/// `translateY(-50%)` centering relies on.
+fn project_percent_translate(layouts: &mut [(LayoutRect, usize)], root: &Component) {
+    fn percent(style: &w3cos_std::style::Style) -> Option<(f32, f32)> {
+        let value = style
+            .custom_properties
+            .as_ref()?
+            .get("--w3cos-internal-translate-pct")?;
+        let (x, y) = value.split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
+    }
+    fn any(component: &Component) -> bool {
+        percent(&component.style).is_some() || component.children.iter().any(any)
+    }
+    if !any(root) {
+        return;
+    }
+    let layout_position = layouts
+        .iter()
+        .enumerate()
+        .map(|(position, (_, index))| (*index, position))
+        .collect::<HashMap<_, _>>();
+    fn visit(
+        component: &Component,
+        index: usize,
+        layouts: &mut [(LayoutRect, usize)],
+        layout_position: &HashMap<usize, usize>,
+    ) {
+        if let Some((pct_x, pct_y)) = percent(&component.style)
+            && let Some(position) = layout_position.get(&index).copied()
+        {
+            let rect = layouts[position].0;
+            let dx = rect.width * pct_x / 100.0;
+            let dy = rect.height * pct_y / 100.0;
+            for node in index..index + count_nodes(component) {
+                if let Some(position) = layout_position.get(&node).copied() {
+                    layouts[position].0.x += dx;
+                    layouts[position].0.y += dy;
+                }
+            }
+        }
+        let mut child_index = index + 1;
+        for child in &component.children {
+            visit(child, child_index, layouts, layout_position);
+            child_index += count_nodes(child);
+        }
+    }
+    visit(root, 0, layouts, &layout_position);
 }
 
 /// Resolve terminal preformatted tab runs against the actual block content
@@ -60635,5 +60691,57 @@ mod tests {
         // Two CI runs of this tree measured 8086µs and 8089µs. 9ms still
         // rejects a real regression and covers that host plus the 8197µs flake.
         assert!(best_us < 9_000, "layout avg {best_us}µs exceeds 9ms budget");
+    }
+
+    #[test]
+    fn percent_translate_centers_absolute_box_and_moves_its_subtree() {
+        let mut props = w3cos_std::style::CustomProperties::default();
+        props.insert(
+            "--w3cos-internal-translate-pct".to_string(),
+            "0,-50".to_string(),
+        );
+        let child = Component::boxed(
+            Style {
+                width: WDim::Px(10.0),
+                height: WDim::Px(10.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let chip = Component::boxed(
+            Style {
+                position: WPos::Absolute,
+                top: WDim::Percent(50.0),
+                left: WDim::Px(2.0),
+                width: WDim::Px(40.0),
+                height: WDim::Px(24.0),
+                custom_properties: Some(props),
+                ..Style::default()
+            },
+            vec![child],
+        );
+        let tree = Component::boxed(
+            Style {
+                position: WPos::Relative,
+                width: WDim::Px(100.0),
+                height: WDim::Px(32.0),
+                ..Style::default()
+            },
+            vec![chip],
+        );
+        let flat = pre_flatten(&tree);
+        let mut engine = LayoutEngine::new();
+        let results = engine.compute(&tree, &flat, 400.0, 300.0).unwrap();
+        let rect = |index: usize| {
+            results
+                .layout_cache
+                .iter()
+                .find(|(_, i)| *i == index)
+                .unwrap()
+                .0
+        };
+        // top:50% of 32 = 16, then translateY(-50%) of its own 24px = -12.
+        assert_eq!(rect(1).y - rect(0).y, 4.0);
+        assert_eq!(rect(2).y - rect(1).y, 0.0, "descendants move with the box");
     }
 }
