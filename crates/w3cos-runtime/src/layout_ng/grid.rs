@@ -238,7 +238,12 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("grid:contain");
     }
-    if has_marker(style, "--w3cos-internal-width-keyword") {
+    // A subgrid item's tracks come from this grid's own sizing, which the
+    // keyword resolves against; that cycle stays on the legacy engine.
+    if has_marker(style, "--w3cos-internal-width-keyword")
+        && (!block::intrinsic_keyword_applies(flat, index)
+            || rendered_children(flat, index).any(|child| subgrid_style(flat[child].style)))
+    {
         return Some("grid:width-keyword");
     }
     if style.grid_areas().is_some() {
@@ -3255,6 +3260,29 @@ pub(super) fn layout(
         );
         inner_u = inner_u.clamp(min, max);
         inner_width = from_units(inner_u);
+        shrink_intrinsic_columns = inner_u < max;
+    }
+    if sized.is_none() && block::intrinsic_keyword_applies(flat, index) {
+        // CSS Sizing 3 5.1: `width: min-content | max-content | fit-content`
+        // is the track-sized min / max-content size (Blink
+        // NGGridLayoutAlgorithm::ComputeMinMaxSizes), fit-content clamping
+        // the available inline size between the two.
+        let (min, max) = intrinsic_tracks(
+            &column_specs,
+            &col_min,
+            &col_max,
+            &collapsed,
+            column_gap_u,
+            font,
+        );
+        inner_u = match block::marker(style, block::WIDTH_KEYWORD) {
+            Some("max-content") => max,
+            Some("min-content") => min,
+            _ => inner_u.clamp(min, max),
+        };
+        let edges = bl + br + pl + pr;
+        inner_width = block::clamp_inline(style, space, edges, from_units(inner_u));
+        inner_u = units(inner_width);
         shrink_intrinsic_columns = inner_u < max;
     }
     let column_tracks: Vec<Track> = column_specs

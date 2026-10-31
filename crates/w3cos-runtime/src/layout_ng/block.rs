@@ -48,9 +48,9 @@ const SIZE_CONTAINMENT: &str = "--w3cos-internal-size-containment";
 /// `contain-intrinsic-size` per axis: "<w> <h>", px or `none`.
 const CONTAIN_INTRINSIC_SIZE: &str = "--w3cos-internal-contain-intrinsic-size";
 /// `width: max-content | min-content | fit-content` (width is auto).
-const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
+pub(super) const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 
-fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
+pub(super) fn marker<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
         .custom_properties
         .as_ref()
@@ -1590,7 +1590,7 @@ impl MinMax {
 pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
 
 /// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
-fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, width: f32) -> f32 {
+pub(super) fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, width: f32) -> f32 {
     clamp_inline_in(style, space, edges, width, Some(space.available_inline))
 }
 
@@ -1766,6 +1766,63 @@ pub(super) fn intrinsic_sizes(
         }
     }
     Some(sizes)
+}
+
+/// Whether `width: min-content | max-content | fit-content` applies to a
+/// block-level in-flow box of a block container (flex and grid items,
+/// floats, abspos and atomic inlines size themselves elsewhere).
+pub(super) fn intrinsic_keyword_applies(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let info = &flat[index];
+    let style = info.style;
+    marker(style, WIDTH_KEYWORD).is_some()
+        && !size_contained(style)
+        && (matches!(
+            style.display,
+            Display::Block | Display::FlowRoot | Display::Flex | Display::Grid
+        ))
+        && matches!(
+            info.kind,
+            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+        )
+        && style.float == Float::None
+        && !oof::is_out_of_flow(style)
+        && !inline::is_atomic_inline(flat, index)
+        && info.parent.is_some_and(|parent| {
+            !is_author_flex(flat[parent].style)
+                && !is_author_grid(flat[parent].style)
+                && !inline::is_inline_container(flat, parent)
+        })
+}
+
+/// CSS Sizing 3 5.1 / Blink ComputeInlineSizeForFragment: the content-box
+/// width of an in-flow block box with an intrinsic width keyword
+/// (`Some(None)`: no keyword; `None`: this stage cannot size it).
+fn intrinsic_keyword_width(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<Option<f32>> {
+    // A grid sizes its own tracks (`grid::layout`).
+    if !intrinsic_keyword_applies(flat, index) || is_author_grid(flat[index].style) {
+        return Some(None);
+    }
+    let style = flat[index].style;
+    let keyword = marker(style, WIDTH_KEYWORD)?;
+    if space.percent_unresolved {
+        return super::bail("width-keyword:percent");
+    }
+    let metrics = resolve_inline(style, space);
+    let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+    let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+    let sizes = intrinsic_sizes(flat, index, space).why("width-keyword:intrinsic")?;
+    let width = match (keyword, sizes.min) {
+        ("max-content", _) => sizes.max,
+        ("min-content", Some(min)) => min,
+        ("fit-content", Some(min)) => sizes.max.min(available.max(min)),
+        ("fit-content", None) if sizes.max <= available + 1.0 / 128.0 => sizes.max,
+        _ => return super::bail("width-keyword:min"),
+    };
+    Some(Some(clamp_inline(style, space, edges, width.max(0.0))))
 }
 
 /// CSS2 10.3.9 shrink-to-fit width of an inline-block's content box:
@@ -2060,6 +2117,12 @@ fn layout_block_in(
 ) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
+    let keyword_sized = if sized.is_none() {
+        intrinsic_keyword_width(flat, index, space)?.map(|width| (width, None))
+    } else {
+        None
+    };
+    let sized = sized.or(keyword_sized);
     // NGFlexLayoutAlgorithm. Lowered IFC rows and synthetic float groups
     // stay on the paths below.
     if is_author_flex(style) {
@@ -2489,7 +2552,23 @@ fn layout_block_in(
             definite.max_width = Dimension::Auto;
             definite.box_sizing = BoxSizing::ContentBox;
             resolve_inline(&definite, &child_space)
+        } else if let Some(width) = intrinsic_keyword_width(flat, child, &child_space)? {
+            // An intrinsic width keyword is a definite width, so auto
+            // margins center the box against it (CSS2 10.3.3).
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
         } else {
+            if intrinsic_keyword_applies(flat, child)
+                && (child_info.style.margin.left == Spacing::Auto
+                    || child_info.style.margin.right == Spacing::Auto)
+            {
+                // A grid sizes its own tracks, so its width is not known here.
+                return super::bail("width-keyword:grid-auto-margin");
+            }
             resolve_inline(child_info.style, &child_space)
         };
         let x = bl + pl + child_metrics.margin[3];

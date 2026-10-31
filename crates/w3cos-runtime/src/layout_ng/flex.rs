@@ -82,7 +82,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("flex:contain");
     }
-    if has_marker(style, "--w3cos-internal-width-keyword") {
+    if has_marker(style, "--w3cos-internal-width-keyword")
+        && !block::intrinsic_keyword_applies(flat, index)
+    {
         return Some("flex:width-keyword");
     }
     // An automatic column block size is one flex line, except when a gap
