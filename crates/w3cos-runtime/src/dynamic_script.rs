@@ -10416,6 +10416,57 @@ mod tests {
     }
 
     #[test]
+    fn min_max_height_block_grows_with_inline_block_line_settlement() {
+        // Welcome page `.start-container { min-height: 156px }` holds a list of
+        // `li > button` rows. The rows grow after baseline settlement; the
+        // container must follow (it used to stay short and the next section
+        // overlapped the last row) whether or not it has a min/max-height.
+        let list = r#"<ul style="list-style:none;margin:0;padding:0;line-height:24px">
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">New</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">Open</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">Clone</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">Connect</button></li>
+              <li style="padding:6px 0"><button style="display:inline-block;line-height:24px">More</button></li>
+            </ul>"#;
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0"><div style="width:231px">
+            <div id="plain"><h2 style="margin:0 0 5px;line-height:22px">Start</h2><div id="plain-s" style="position:relative;overflow:hidden">{list}</div></div>
+            <div id="plain-next">Recent</div>
+            <div id="min" style="min-height:156px"><h2 style="margin:0 0 5px;line-height:22px">Start</h2><div id="min-s" style="position:relative;overflow:hidden">{list}</div></div>
+            <div id="min-next">Recent</div>
+            <div id="max" style="max-height:900px"><h2 style="margin:0 0 5px;line-height:22px">Start</h2><div id="max-s" style="position:relative;overflow:hidden">{list}</div></div>
+            <div id="max-next">Recent</div>
+            <div id="pinned" style="min-height:400px"><h2 style="margin:0">Start</h2></div>
+            </div></body></html>"#
+        );
+        load_html_on_shared_vm(&html, "https://minheight.w3cos.local/page.html").unwrap();
+        crate::headless::render_document_rgba_cpu(400, 1200).unwrap();
+        let rect = |id: &str| {
+            let node = crate::dom::query_selector_all(&format!("#{id}"))[0];
+            crate::dom::bounding_rect(node)
+        };
+        for name in ["plain", "min", "max"] {
+            let owner = rect(name);
+            let scroller = rect(&format!("{name}-s"));
+            let next = rect(&format!("{name}-next"));
+            assert!(
+                owner.y + owner.height >= scroller.y + scroller.height - 0.5,
+                "#{name} height {} ends before its content ({} + {})",
+                owner.height,
+                scroller.y,
+                scroller.height
+            );
+            assert!(
+                next.y >= scroller.y + scroller.height - 0.5,
+                "#{name}-next at {} overlaps content ending {}",
+                next.y,
+                scroller.y + scroller.height
+            );
+        }
+        assert!((rect("pinned").height - 400.0).abs() < 0.5);
+    }
+
+    #[test]
     fn load_html_on_shared_vm_runs_inline_script() {
         let html = r#"<!doctype html><html><body>
             <h1 id="msg">page loading</h1>

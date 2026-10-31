@@ -17858,12 +17858,37 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
                 delta += layouts[*position].0.height - original.height;
             }
             if component.style.height == WDim::Auto
-                && component.style.min_height == WDim::Auto
-                && component.style.max_height == WDim::Auto
                 && delta.abs() > 0.01
                 && let Some(position) = positions.get(&component_index)
             {
-                layouts[*position].0.height += delta;
+                let absolute = |dimension: WDim| match dimension {
+                    WDim::Auto => Some(None),
+                    WDim::Px(value) => Some(Some(value)),
+                    WDim::Em(value) => Some(Some(value * component.style.font_size)),
+                    WDim::Rem(value) => Some(Some(value * ROOT_FONT_SIZE)),
+                    _ => None,
+                };
+                // A min/max-height only constrains the grown size when the
+                // box was content-sized before the baseline settlement; a box
+                // already pinned at its limit keeps that limit.
+                if let (Some(minimum), Some(maximum)) = (
+                    absolute(component.style.min_height),
+                    absolute(component.style.max_height),
+                ) {
+                    let height = layouts[*position].0.height;
+                    let pinned = minimum.is_some_and(|min| height <= min + 0.01)
+                        || maximum.is_some_and(|max| height >= max - 0.01);
+                    if !pinned {
+                        let mut grown = height + delta;
+                        if let Some(max) = maximum {
+                            grown = grown.min(max);
+                        }
+                        if let Some(min) = minimum {
+                            grown = grown.max(min);
+                        }
+                        layouts[*position].0.height = grown;
+                    }
+                }
             }
         }
 
