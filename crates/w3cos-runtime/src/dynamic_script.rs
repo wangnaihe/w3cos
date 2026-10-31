@@ -10415,6 +10415,7 @@ mod tests {
         (format!("http://{address}/dependency.js"), handle)
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
     #[test]
     fn min_max_height_block_grows_with_inline_block_line_settlement() {
         // Welcome page `.start-container { min-height: 156px }` holds a list of
