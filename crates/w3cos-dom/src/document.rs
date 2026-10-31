@@ -2888,6 +2888,24 @@ impl Document {
             style.color = w3cos_std::Color::BLACK;
             style.color_rgba = None;
         }
+        // Form controls keep their UA text color unless the author asks for
+        // inheritance (`button { color: inherit }`, Code-OSS's welcome page
+        // cards). `inherit_text_style` skips controls entirely, so apply the
+        // explicit keyword here.
+        if let Some(parent) = inherited
+            && ["button", "input", "select", "textarea"]
+                .iter()
+                .any(|tag| node.tag.as_str() == *tag)
+            && declared_value(&["color"]).is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "inherit" | "unset"
+                ) && declaration_value_is_valid("color", value)
+            })
+        {
+            style.color = parent.color;
+            style.color_rgba = parent.color_rgba;
+        }
         let declared_property_value = |properties: &[&str]| {
             author_declarations
                 .iter()

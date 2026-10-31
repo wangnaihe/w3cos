@@ -1358,14 +1358,45 @@ fn resolve_system_font_uncached(name: &str) -> Option<Vec<u8>> {
 ///
 /// Supports: `font-family`, `src: url(...)`, `src: local(...)`,
 /// `font-weight`, `font-style`, `font-display`, `unicode-range`.
+/// Map `vscode-file://vscode-app/<abs path>` and `file://` URLs to a path.
+fn font_url_to_path(url: &str) -> String {
+    for prefix in ["vscode-file://vscode-app", "file://"] {
+        if let Some(path) = url.strip_prefix(prefix)
+            && path.starts_with('/')
+        {
+            return path.to_string();
+        }
+    }
+    url.to_string()
+}
+
 fn parse_one_src(val: &str) -> Option<FontSource> {
     let val = val.trim().trim_end_matches(';');
-    if let Some(inner) = val
-        .strip_prefix("url(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        let url = inner.trim().trim_matches('"').trim_matches('\'');
-        return Some(FontSource::Path(url.into()));
+    if let Some(rest) = val.strip_prefix("url(") {
+        // Stop at the `)` that closes `url(`, so a trailing `format('woff')`
+        // is not swallowed into the path.
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+        let mut end = rest.len();
+        for (index, ch) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if let Some(open) = quote {
+                if ch == open {
+                    quote = None;
+                }
+            } else if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+            } else if ch == ')' {
+                end = index;
+                break;
+            }
+        }
+        let url = rest[..end].trim().trim_matches('"').trim_matches('\'');
+        let url = w3cos_dom::stylesheet::css_unescape(url).unwrap_or_else(|| url.to_string());
+        return Some(FontSource::Path(font_url_to_path(&url).into()));
     }
     if let Some(inner) = val
         .strip_prefix("local(")
@@ -1472,6 +1503,21 @@ fn strip_property<'a>(line: &'a str, prop: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn src_url_with_css_escapes_format_hint_and_vscode_file_scheme() {
+        let list = parse_src_list(
+            r"url('vscode-file\:\/\/vscode-app\/tmp\/icons\/seti\.woff') format('woff'), local(Foo)",
+        );
+        assert_eq!(list.len(), 2);
+        match &list[0] {
+            FontSource::Path(path) => {
+                assert_eq!(path.to_str(), Some("/tmp/icons/seti.woff"))
+            }
+            _ => panic!("expected a path source"),
+        }
+        assert!(matches!(&list[1], FontSource::Local(name) if name == "Foo"));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

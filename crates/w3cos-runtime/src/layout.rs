@@ -66,6 +66,17 @@ impl TextMeasureCache {
 }
 
 thread_local! {
+    /// Grid tracks are unknown while the Taffy tree is built, so a relative
+    /// `calc()` inside a grid item would resolve against the grid container.
+    /// The first solve records each grid item's used width; a second build
+    /// uses it as the item's containing width.
+    static GRID_ITEM_IDS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static GRID_ITEM_HINTS: RefCell<Option<HashMap<usize, f32>>> = const { RefCell::new(None) };
+    static GRID_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static GRID_CALC_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
     /// Blink keeps font metrics and shaped text runs across layout passes. This
     /// bounded per-UI-thread cache provides the same retained-measure behavior
     /// without coupling the layout engine to a particular application tree.
@@ -4320,6 +4331,69 @@ fn pre_flatten_recursive<'a>(
 // LayoutEngine — persistent TaffyTree for incremental layout
 // ---------------------------------------------------------------------------
 
+fn begin_grid_calc_probe() {
+    GRID_ITEM_IDS.with(|ids| ids.borrow_mut().clear());
+    GRID_ITEM_HINTS.with(|hints| *hints.borrow_mut() = None);
+    GRID_DEPTH.with(|depth| depth.set(0));
+    GRID_CALC_SEEN.with(|seen| seen.set(false));
+}
+
+/// Rebuild and re-solve when a relative `calc()` was resolved inside a grid
+/// item against the grid container instead of the item's track. Returns the
+/// new root node, or `None` when no second pass was needed.
+fn rebuild_for_grid_item_calc(
+    tree: &mut TaffyTree<usize>,
+    root_node: taffy::NodeId,
+    layout_root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+    space: Size<AvailableSpace>,
+) -> Result<Option<taffy::NodeId>, taffy::TaffyError> {
+    if !GRID_CALC_SEEN.with(|seen| seen.replace(false)) {
+        return Ok(None);
+    }
+    let nodes = index_taffy_nodes(tree, root_node);
+    let ids = GRID_ITEM_IDS.with(|ids| std::mem::take(&mut *ids.borrow_mut()));
+    let mut hints = HashMap::new();
+    for idx in ids {
+        if let Some(node) = nodes.get(idx)
+            && let Ok(layout) = tree.layout(*node)
+            && layout.size.width.is_finite()
+        {
+            hints.insert(idx, layout.size.width);
+        }
+    }
+    GRID_ITEM_HINTS.with(|slot| *slot.borrow_mut() = Some(hints));
+    tree.clear();
+    let mut idx = 0;
+    let rebuilt = build_taffy_tree(
+        tree,
+        layout_root,
+        &mut idx,
+        None,
+        None,
+        None,
+        None,
+        viewport_w,
+        viewport_h,
+        viewport_w,
+        viewport_w,
+        Some(viewport_h),
+        Some(viewport_h),
+        None,
+        false,
+        None,
+        None,
+        false,
+        None,
+    );
+    GRID_ITEM_HINTS.with(|slot| *slot.borrow_mut() = None);
+    GRID_CALC_SEEN.with(|seen| seen.set(false));
+    let rebuilt = rebuilt?;
+    tree.compute_layout(rebuilt, space)?;
+    Ok(Some(rebuilt))
+}
+
 fn index_taffy_nodes(tree: &TaffyTree<usize>, root: taffy::NodeId) -> Vec<taffy::NodeId> {
     let mut indexed: Vec<Option<taffy::NodeId>> = Vec::new();
     let mut stack = vec![root];
@@ -4461,6 +4535,7 @@ impl LayoutEngine {
                 layout_root
             });
             let layout_root = prepared.as_ref().unwrap_or(root);
+            begin_grid_calc_probe();
             self.root_node = Some(build_taffy_tree(
                 &mut self.tree,
                 layout_root,
@@ -4488,7 +4563,7 @@ impl LayoutEngine {
             }
         }
 
-        let root_node = self.root_node.unwrap();
+        let mut root_node = self.root_node.unwrap();
         let root_margins = root_used_margins(
             flat.first().map(|entry| entry.style),
             viewport_w,
@@ -4510,6 +4585,27 @@ impl LayoutEngine {
             )?;
         }
         self.tree.compute_layout(root_node, space)?;
+        if GRID_CALC_SEEN.with(|seen| seen.get()) {
+            let prepared = component_needs_table_prep(root).then(|| {
+                let mut layout_root = root.clone();
+                resolve_collapsed_table_layout_borders(&mut layout_root);
+                crate::table_grid::annotate(&mut layout_root);
+                layout_root
+            });
+            let layout_root = prepared.as_ref().unwrap_or(root);
+            if let Some(rebuilt) = rebuild_for_grid_item_calc(
+                &mut self.tree,
+                root_node,
+                layout_root,
+                viewport_w,
+                viewport_h,
+                space,
+            )? {
+                root_node = rebuilt;
+                self.root_node = Some(root_node);
+                self.node_index = index_taffy_nodes(&self.tree, root_node);
+            }
+        }
         self.last_compute_layout_passes = 1;
         // Definite flex/grid/block trees already have border boxes. Measuring
         // text leaves and solving again dominates repeated offsetHeight.
@@ -4800,7 +4896,8 @@ pub fn compute_with_scroll_details(
     tree.disable_rounding();
     let mut node_index: usize = 0;
 
-    let root_node = build_taffy_tree(
+    begin_grid_calc_probe();
+    let mut root_node = build_taffy_tree(
         &mut tree,
         &layout_root,
         &mut node_index,
@@ -4831,6 +4928,16 @@ pub fn compute_with_scroll_details(
         height: AvailableSpace::Definite(viewport_h),
     };
     tree.compute_layout(root_node, space)?;
+    if let Some(rebuilt) = rebuild_for_grid_item_calc(
+        &mut tree,
+        root_node,
+        &layout_root,
+        viewport_w,
+        viewport_h,
+        space,
+    )? {
+        root_node = rebuilt;
+    }
     if update_text_leaf_heights(&mut tree, root_node, &flat, None)? {
         tree.compute_layout(root_node, space)?;
     }
@@ -17858,12 +17965,37 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
                 delta += layouts[*position].0.height - original.height;
             }
             if component.style.height == WDim::Auto
-                && component.style.min_height == WDim::Auto
-                && component.style.max_height == WDim::Auto
                 && delta.abs() > 0.01
                 && let Some(position) = positions.get(&component_index)
             {
-                layouts[*position].0.height += delta;
+                let absolute = |dimension: WDim| match dimension {
+                    WDim::Auto => Some(None),
+                    WDim::Px(value) => Some(Some(value)),
+                    WDim::Em(value) => Some(Some(value * component.style.font_size)),
+                    WDim::Rem(value) => Some(Some(value * ROOT_FONT_SIZE)),
+                    _ => None,
+                };
+                // A min/max-height only constrains the grown size when the
+                // box was content-sized before the baseline settlement; a box
+                // already pinned at its limit keeps that limit.
+                if let (Some(minimum), Some(maximum)) = (
+                    absolute(component.style.min_height),
+                    absolute(component.style.max_height),
+                ) {
+                    let height = layouts[*position].0.height;
+                    let pinned = minimum.is_some_and(|min| height <= min + 0.01)
+                        || maximum.is_some_and(|max| height >= max - 0.01);
+                    if !pinned {
+                        let mut grown = height + delta;
+                        if let Some(max) = maximum {
+                            grown = grown.min(max);
+                        }
+                        if let Some(min) = minimum {
+                            grown = grown.max(min);
+                        }
+                        layouts[*position].0.height = grown;
+                    }
+                }
             }
         }
 
@@ -20003,6 +20135,13 @@ fn build_taffy_tree(
         viewport_w,
         viewport_h,
     );
+    if GRID_DEPTH.with(|depth| depth.get()) > 0
+        && [comp.style.width, comp.style.min_width, comp.style.max_width]
+            .iter()
+            .any(|value| matches!(value, WDim::Calc(calc) if !calc.is_absolute()))
+    {
+        GRID_CALC_SEEN.with(|seen| seen.set(true));
+    }
     if comp.style.float != WFloat::None && style.display == Display::Block {
         // CSS floats establish a BFC, even with authored overflow:visible.
         // Taffy's block interface has no float/BFC flag; its non-scrolling
@@ -22079,6 +22218,27 @@ fn build_taffy_tree(
                 } else {
                     child_containing_width
                 };
+                let is_grid_item = comp.style.display == WDisplay::Grid;
+                let child_available_width = if is_grid_item {
+                    GRID_ITEM_IDS.with(|ids| ids.borrow_mut().push(*idx));
+                    GRID_ITEM_HINTS
+                        .with(|hints| {
+                            hints
+                                .borrow()
+                                .as_ref()
+                                .and_then(|map| map.get(&*idx).copied())
+                        })
+                        .filter(|_| {
+                            matches!(c.style.width, WDim::Auto)
+                                && matches!(c.style.position, WPos::Static | WPos::Relative)
+                        })
+                        .unwrap_or(child_available_width)
+                } else {
+                    child_available_width
+                };
+                if is_grid_item {
+                    GRID_DEPTH.with(|depth| depth.set(depth.get() + 1));
+                }
                 let node = build_taffy_tree(
                     tree,
                     c,
@@ -22128,7 +22288,11 @@ fn build_taffy_tree(
                                     | WDisplay::TableFooterGroup
                             )),
                     active_border_spacing,
-                )?;
+                );
+                if is_grid_item {
+                    GRID_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+                }
+                let node = node?;
                 if anonymous_block_line
                     && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
                     && (c.style.display != WDisplay::Inline
@@ -37428,6 +37592,51 @@ mod tests {
             (btn.width - 338.0).abs() < 4.0,
             "button should stretch to inner column width, got {}",
             btn.width
+        );
+    }
+
+    #[test]
+    fn relative_calc_width_in_grid_item_resolves_against_its_track() {
+        // Welcome page cards use `width: calc(100% - 16px)` inside a grid
+        // column. The percentage base is the track, not the grid container.
+        let calc = WDim::Calc(w3cos_std::style::CalcId::new(
+            w3cos_std::style::CalcLength {
+                px: -16.0,
+                percent: 100.0,
+                ..Default::default()
+            },
+        ));
+        let card = Component::column(
+            Style {
+                width: calc,
+                ..Style::default()
+            },
+            vec![],
+        );
+        let column = Component::column(Style::default(), vec![card]);
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisp::Grid,
+                    width: WDim::Px(1000.0),
+                    grid_template_columns: Some("100px 400px".to_string()),
+                    ..Style::default()
+                },
+                vec![Component::column(Style::default(), vec![]), column],
+            ),
+            1200.0,
+            800.0,
+        )
+        .unwrap();
+        let card = layout
+            .iter()
+            .find(|(_, index)| *index == 3)
+            .map(|(rect, _)| rect)
+            .expect("card layout");
+        assert!(
+            (card.width - 384.0).abs() < 0.5,
+            "card should be its 400px track minus 16px, got {}",
+            card.width
         );
     }
 

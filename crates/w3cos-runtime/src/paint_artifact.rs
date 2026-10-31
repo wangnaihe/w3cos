@@ -2082,6 +2082,35 @@ impl PaintArtifact {
         false
     }
 
+    /// Opacity applies to a whole subtree, but the CPU rasterizer applies each
+    /// node's own opacity only. Approximate group opacity by folding the
+    /// product of the ancestors' fractional opacities into every descendant's
+    /// style (exact unless siblings overlap). Indexed by node; `None` means
+    /// the node paints with its own style. Empty when no node is fractional.
+    pub(crate) fn ancestor_faded_styles(&self) -> Vec<Option<Style>> {
+        let fractional = |style: &Style| style.opacity > 0.0 && style.opacity < 0.999;
+        if !self.nodes.iter().any(|node| fractional(&node.style)) {
+            return Vec::new();
+        }
+        (0..self.nodes.len())
+            .map(|index| {
+                let mut factor = 1.0f32;
+                let mut current = self.nodes.get(index).and_then(|node| node.parent);
+                while let Some(parent) = current {
+                    let node = self.nodes.get(parent)?;
+                    factor *= node.style.opacity.clamp(0.0, 1.0);
+                    current = node.parent;
+                }
+                if factor >= 0.999 {
+                    return None;
+                }
+                let mut style = self.nodes[index].style.clone();
+                style.opacity *= factor;
+                Some(style)
+            })
+            .collect()
+    }
+
     /// Applied decoration belongs to the originating box, not the child's
     /// computed property. Atomic inline and out-of-flow boxes isolate their
     /// contents, but an isolating box's own decoration still reaches them.
