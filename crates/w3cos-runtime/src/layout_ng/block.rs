@@ -111,6 +111,9 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // marker and lays the box out as a grid. Percent gaps are not
             // stored; only a grid container consults the marker.
             | "grid-lanes"
+            | "flow-tolerance"
+            | "grid-lanes-direction"
+            | "grid-lanes-pack"
             | "percent-gap"
             // `-webkit-box` reads these (webkit_box_styles); on any other
             // box they have no effect.

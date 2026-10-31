@@ -35,6 +35,13 @@ pub const UNRECOGNIZED_DISPLAY_PROPERTY: &str = "--w3cos-internal-unrecognized-d
 /// out). LayoutNG treats the marker as a grid when the subset matches an
 /// ordinary grid reference.
 pub const GRID_LANES_PROPERTY: &str = "--w3cos-internal-grid-lanes";
+/// `flow-tolerance`, `grid-lanes-direction` and `grid-lanes-pack`: read only
+/// by LayoutNG's grid-lanes placement (legacy lays the box out as flex and
+/// ignores them). The value is the lower-cased declaration, `initial` and the
+/// other CSS-wide keywords removing the marker.
+pub const FLOW_TOLERANCE_PROPERTY: &str = "--w3cos-internal-flow-tolerance";
+pub const GRID_LANES_DIRECTION_PROPERTY: &str = "--w3cos-internal-grid-lanes-direction";
+pub const GRID_LANES_PACK_PROPERTY: &str = "--w3cos-internal-grid-lanes-pack";
 /// `display: run-in` over an earlier `block`. Chrome rejects `run-in` as an
 /// invalid declaration, so the earlier value applies. Legacy keeps the
 /// unrecognized `flex`; LayoutNG reads this and lays the box out as a block.
@@ -390,6 +397,19 @@ impl CSSStyleDeclaration {
                     &mut self.inner,
                     GRID_LANES_PROPERTY,
                     grid_lanes.then_some("1".to_string()),
+                );
+            }
+            "flow-tolerance" | "grid-lanes-direction" | "grid-lanes-pack" => {
+                let key = match name {
+                    "flow-tolerance" => FLOW_TOLERANCE_PROPERTY,
+                    "grid-lanes-direction" => GRID_LANES_DIRECTION_PROPERTY,
+                    _ => GRID_LANES_PACK_PROPERTY,
+                };
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    key,
+                    (!keyword.is_empty() && !css_wide_keyword(&keyword)).then_some(keyword),
                 );
             }
             "position" => self.inner.position = parse_position(value),
