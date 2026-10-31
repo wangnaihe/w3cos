@@ -150,6 +150,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stays the enum flex already uses.
             | "height-keyword"
             | "justify-content"
+            // Grid reads these: a replaced item stretches only for the
+            // authored `stretch` keyword, not for `normal`.
+            | "align-items-stretch"
+            | "justify-items-stretch"
             // Flex reads this for `align-content: safe …` overflow.
             // The used align-content enum stays the legacy parse.
             | "safe-align-content"
@@ -234,11 +238,10 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     }
     // Positioned block-level boxes are checked by node_reason
     // (position_reason); relatively positioned atomics move with their
-    // line (inline::relative_inline_offsets), other atomics and sticky
-    // stay on legacy.
-    if (atomic && !matches!(style.position, Position::Static | Position::Relative))
-        || style.position == Position::Sticky
-    {
+    // line (inline::relative_inline_offsets), other atomics stay on
+    // legacy. A sticky block-level box is laid out as a static one (its
+    // insets only move it at paint time); see position_reason.
+    if atomic && !matches!(style.position, Position::Static | Position::Relative) {
         return Some("position");
     }
     // Floats and clearance of block-level boxes are checked by node_reason
@@ -434,6 +437,7 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
                 | ComponentKind::TextInput { .. }
                 | ComponentKind::SvgDocument { .. }
         )
+        && !matches!(info.kind, ComponentKind::SvgDocument { .. })
 }
 
 /// Floats of block-level boxes in a block container (S3b).  Floats among
@@ -461,6 +465,7 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             style.display,
             Display::Block | Display::FlowRoot | Display::Table
         )
+        && !(is_author_flex(style) || style.display == Display::Grid)
     {
         return Some("float:display");
     }
@@ -479,12 +484,6 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             box_parent = up;
         }
         if flat[box_parent].style.clear != Clear::None {
-            return Some("float:display");
-        }
-        // flexbox-overflow-horiz-001-ref sizes its floats with
-        // `calc(100% - 10px)`, which the style system drops to `auto`, so
-        // its test (scrolling flex floats) stays on legacy with it.
-        if is_scroll_container(style) {
             return Some("float:display");
         }
     }
@@ -525,7 +524,11 @@ fn layout_float(
         Spacing::Auto => 0.0,
         s => resolve_spacing_for_layout(
             s,
-            space.available_inline,
+            if space.percent_unresolved {
+                0.0
+            } else {
+                space.available_inline
+            },
             style,
             space.viewport_w,
             space.viewport_h,
@@ -578,7 +581,14 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     let info = &flat[index];
     let style = info.style;
     match style.position {
-        Position::Static | Position::Sticky => None,
+        Position::Static => None,
+        Position::Sticky => {
+            if inline::is_atomic_inline(flat, index) || style.display == Display::Inline {
+                Some("position:inline")
+            } else {
+                None
+            }
+        }
         // An inline-level relatively positioned box in an IFC moves its
         // fragments after line layout (inline::relative_inline_offsets).
         Position::Relative
@@ -700,6 +710,16 @@ fn anonymous_block_text(flat: &[FlatNodeInfo], index: usize) -> bool {
     )
 }
 
+/// An `<img>` that is a flex or grid item. The item is blockified (Flexbox
+/// 4, Grid 6.1), so its UA `inline`/`inline-block` display is not an atomic
+/// inline of an IFC; the container sizes it from its replaced size.
+pub(super) fn is_replaced_item(flat: &[FlatNodeInfo], index: usize) -> bool {
+    matches!(flat[index].kind, ComponentKind::Image { .. })
+        && flat[index].parent.is_some_and(|parent| {
+            is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+        })
+}
+
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     // Table, row, and cell boxes. The grid is laid out here; other
@@ -726,7 +746,14 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         return button_box_reason(flat, index);
     }
     if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
-        if !inline::in_inline_container(flat, index) {
+        // A text run is an anonymous flex item whatever its siblings are:
+        // an inline-block text under a flex container is block text even
+        // when the container's first child is not inline-level.
+        let flex_text_item = matches!(info.kind, ComponentKind::Text { .. })
+            && info
+                .parent
+                .is_some_and(|parent| is_author_flex(flat[parent].style));
+        if !flex_text_item && !inline::in_inline_container(flat, index) {
             return Some("display:inline-block");
         }
         // Its display and vertical-align are the IFC's concern.
@@ -977,6 +1004,32 @@ fn button_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
 fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     let style = info.style;
+    if is_replaced_item(flat, index) {
+        // Floats do not apply to flex and grid items, and an abspos child
+        // is not an item; both keep the legacy path.
+        if style.float != Float::None
+            || matches!(
+                style.position,
+                Position::Absolute | Position::Fixed | Position::Sticky
+            )
+        {
+            return Some("image");
+        }
+        let parent = flat[index].parent.map(|parent| flat[parent].style);
+        // A percentage size in an automatic grid track is cyclic (the track
+        // sizes from the item's contribution, CSS Sizing 3 5.2.2). An
+        // out-of-flow flex container's inset-derived height is transferred
+        // through the item's ratio by `flex::layout`.
+        if parent.is_some_and(|parent| {
+            is_author_grid(parent)
+                && [style.width, style.min_width, style.max_width]
+                    .iter()
+                    .any(|dim| matches!(dim, Dimension::Percent(_)))
+        }) {
+            return Some("image");
+        }
+        return unsupported_box_style(style, &[inline::VALIGN_MARKER], true);
+    }
     // A border-box image is sized through its content box
     // (`replaced_content_size`). A CSS `aspect-ratio` relates the
     // border boxes then, which stays on legacy.
@@ -1379,6 +1432,22 @@ fn canvas_content_size(
     style: &Style,
     space: &ConstraintSpace,
 ) -> Option<(f32, f32)> {
+    replaced_attr_content_size(
+        attr_width as f32,
+        attr_height as f32,
+        style,
+        space,
+        canvas_used_size,
+    )
+}
+
+fn replaced_attr_content_size(
+    attr_width: f32,
+    attr_height: f32,
+    style: &Style,
+    space: &ConstraintSpace,
+    used_size: fn(f32, f32, &Style) -> (f32, f32),
+) -> Option<(f32, f32)> {
     if style.box_sizing == BoxSizing::BorderBox {
         return super::bail("canvas:size");
     }
@@ -1408,11 +1477,7 @@ fn canvas_content_size(
     definite.max_width = sub(style.max_width, Some(space.available_inline))?;
     definite.min_height = sub(style.min_height, space.percentage_block)?;
     definite.max_height = sub(style.max_height, space.percentage_block)?;
-    Some(canvas_used_size(
-        attr_width as f32,
-        attr_height as f32,
-        &definite,
-    ))
+    Some(used_size(attr_width, attr_height, &definite))
 }
 
 fn canvas_axis_px(dim: Dimension, style: &Style) -> Option<f32> {
@@ -1456,23 +1521,26 @@ fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f
         && used_width > 0.0
         && used_height > 0.0
     {
-        let mut scale_min = 0.0_f32;
-        let mut scale_max = f32::INFINITY;
+        // f64: 100 * (60 / 100) in f32 is 60.000004, which LayoutUnit then
+        // snaps up a 1/64 px step.
+        let (w, h) = (f64::from(used_width), f64::from(used_height));
+        let mut scale_min = 0.0_f64;
+        let mut scale_max = f64::INFINITY;
         if let Some(value) = min_width {
-            scale_min = scale_min.max(value / used_width);
+            scale_min = scale_min.max(f64::from(value) / w);
         }
         if let Some(value) = min_height {
-            scale_min = scale_min.max(value / used_height);
+            scale_min = scale_min.max(f64::from(value) / h);
         }
         if let Some(value) = max_width {
-            scale_max = scale_max.min(value / used_width);
+            scale_max = scale_max.min(f64::from(value) / w);
         }
         if let Some(value) = max_height {
-            scale_max = scale_max.min(value / used_height);
+            scale_max = scale_max.min(f64::from(value) / h);
         }
-        let scale = 1.0_f32.max(scale_min).min(scale_max);
-        used_width *= scale;
-        used_height *= scale;
+        let scale = 1.0_f64.max(scale_min).min(scale_max);
+        used_width = (w * scale) as f32;
+        used_height = (h * scale) as f32;
     } else {
         if let Some(value) = min_width {
             used_width = used_width.max(value);
@@ -1513,6 +1581,12 @@ fn is_scroll_container(style: &Style) -> bool {
 }
 
 /// Either axis computes to something other than visible (CSS2 11.1.1).
+/// CSS 2.1 10.8.1: a box whose overflow clips (a scroll container) has
+/// its bottom margin edge as baseline, instead of a line box's.
+pub(super) fn baseline_is_margin_edge(style: &Style) -> bool {
+    non_visible_overflow(style) && style.display.establishes_overflow_clip()
+}
+
 fn non_visible_overflow(style: &Style) -> bool {
     style.resolved_overflow_x() != Overflow::Visible
         || style.resolved_overflow_y() != Overflow::Visible
@@ -1538,10 +1612,33 @@ pub(super) fn scrolls_in_axis(style: &Style, inline: bool) -> bool {
     overflow != Overflow::Visible && style.display.establishes_overflow_clip()
 }
 
-/// Overflow shapes that still disagree with the legacy engine: scrollports
-/// (`scroll` / `auto`), a negative
-/// margin, or a float/clear inside the box. `hidden` on a block that only
-/// establishes a BFC stays here.
+/// Like `scrolls_in_axis`, but a `visible` axis beside a scrollable one
+/// counts (it computes to `auto`, css-overflow-3 §3.1); flex items use it.
+pub(super) fn computed_scrolls_in_axis(style: &Style, inline: bool) -> bool {
+    let (this, other, clipped) = if inline {
+        (
+            style.resolved_overflow_x(),
+            style.resolved_overflow_y(),
+            style.overflow_clip_x,
+        )
+    } else {
+        (
+            style.resolved_overflow_y(),
+            style.resolved_overflow_x(),
+            style.overflow_clip_y,
+        )
+    };
+    // A `visible` axis next to a scrollable one computes to `auto`
+    // (css-overflow-3 §3.1), but an explicit `clip` stays `clip`.
+    (this != Overflow::Visible || (other != Overflow::Visible && !clipped))
+        && style.display.establishes_overflow_clip()
+}
+
+/// Overflow shapes that still disagree with the legacy engine: a flex or
+/// grid item (automatic minimum), a negative margin, or a float/clear inside
+/// the box. Scrollports (`hidden`, `scroll`, `auto`) are laid out here as BFC
+/// roots without scrollbar space; the scroll containers themselves are
+/// derived from the result by `layout::scroll_containers_from_layout`.
 fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
@@ -1692,6 +1789,39 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
     Some(constrained_replaced_size(
         src, &definite, containing, limits,
     ))
+}
+
+/// Used content-box size of a replaced item (`None`: not a replaced item;
+/// `Some(None)`: the size is not known here).
+pub(super) fn replaced_item_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<Option<(f32, f32)>> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    Some(replaced_content_size(src, flat[index].style, space))
+}
+
+/// Natural content size of a replaced item with every authored size and
+/// min/max dropped (its intrinsic size and ratio).
+pub(super) fn replaced_intrinsic_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    let mut natural = flat[index].style.clone();
+    natural.width = Dimension::Auto;
+    natural.height = Dimension::Auto;
+    natural.min_width = Dimension::Auto;
+    natural.max_width = Dimension::Auto;
+    natural.min_height = Dimension::Auto;
+    natural.max_height = Dimension::Auto;
+    replaced_content_size(src, &natural, space)
 }
 
 /// Inline size of a replaced box whose block size is `height` (a flex
@@ -2514,8 +2644,18 @@ impl BoxAspectRatio {
 
 pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     let cb = space.available_inline;
-    let spacing =
-        |s: Spacing| resolve_spacing_for_layout(s, cb, style, space.viewport_w, space.viewport_h);
+    // Cyclic inline percentages (an intrinsic probe): zero margins and
+    // padding, auto width, no min/max-width.
+    let pct_cb = (!space.percent_unresolved).then_some(cb);
+    let spacing = |s: Spacing| {
+        resolve_spacing_for_layout(
+            s,
+            pct_cb.unwrap_or(0.0),
+            style,
+            space.viewport_w,
+            space.viewport_h,
+        )
+    };
     let border = border(style);
     let padding = [
         spacing(style.padding.top),
@@ -2539,15 +2679,15 @@ pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetri
     let specified = if marker(style, WIDTH_KEYWORD).is_some() && size_contained(style) {
         Some(contain_intrinsic_size(style).0)
     } else {
-        resolve_dim(style.width, Some(cb), style, space).map(to_content)
+        resolve_dim(style.width, pct_cb, style, space).map(to_content)
     };
     let mut content_width = specified
         .unwrap_or(cb - margin[1] - margin[3] - edges)
         .max(0.0);
-    if let Some(max) = resolve_dim(style.max_width, Some(cb), style, space).map(to_content) {
+    if let Some(max) = resolve_dim(style.max_width, pct_cb, style, space).map(to_content) {
         content_width = content_width.min(max);
     }
-    if let Some(min) = resolve_dim(style.min_width, Some(cb), style, space).map(to_content) {
+    if let Some(min) = resolve_dim(style.min_width, pct_cb, style, space).map(to_content) {
         content_width = content_width.max(min);
     }
     // Inline-start / inline-end sides in the containing block's direction.
@@ -2809,30 +2949,23 @@ fn inline_percent_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     false
 }
 
-/// [`clamp_inline`] with no containing block width: percentage
-/// min-width / max-width do not apply.
-fn clamp_inline_indefinite(
+/// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
+fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, width: f32) -> f32 {
+    clamp_inline_in(style, space, edges, width, Some(space.available_inline))
+}
+
+/// `clamp_inline` against an explicit containing-block inline size. A
+/// `None` basis (an intrinsic-size computation: the containing block is
+/// not sized yet) leaves percentage min-width / max-width unresolved, so
+/// they clamp nothing (CSS Sizing 3 5.2.1, Blink's indefinite-size
+/// ResolveMinInlineLength / ResolveMaxInlineLength).
+fn clamp_inline_in(
     style: &Style,
     space: &ConstraintSpace,
     edges: f32,
     mut width: f32,
+    cb: Option<f32>,
 ) -> f32 {
-    let to_content = |w: f32| match style.box_sizing {
-        BoxSizing::BorderBox => (w - edges).max(0.0),
-        BoxSizing::ContentBox => w,
-    };
-    if let Some(max) = resolve_dim(style.max_width, None, style, space).map(to_content) {
-        width = width.min(max);
-    }
-    if let Some(min) = resolve_dim(style.min_width, None, style, space).map(to_content) {
-        width = width.max(min);
-    }
-    width
-}
-
-/// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
-fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, mut width: f32) -> f32 {
-    let cb = Some(space.available_inline);
     let to_content = |w: f32| match style.box_sizing {
         BoxSizing::BorderBox => (w - edges).max(0.0),
         BoxSizing::ContentBox => w,
@@ -2954,9 +3087,6 @@ pub(super) fn intrinsic_sizes_at(
     };
     let space = &child_space;
     if inline::is_inline_container(flat, index) {
-        if inline_percent_inline(flat, index) {
-            return super::bail("intrinsic-percent:inline");
-        }
         // Floats among inline content would take the float_left /
         // float_right inline sizes into InlineNode::ComputeMinMaxSizes.
         if subtree
@@ -2995,21 +3125,15 @@ pub(super) fn intrinsic_sizes_at(
         }
         // A replaced child sizes a percentage against its own containing
         // block, and its min-content contribution would drop to zero
-        // (compressible replaced elements). A table with a percentage width
-        // has its own intrinsic rules. Neither is modelled yet.
+        // (compressible replaced elements); not modelled yet. A table's
+        // percentage is resolved afterwards (percent_unresolved).
         let plain = matches!(
             flat[child].kind,
             ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
-        ) && !matches!(style.display, Display::Table | Display::InlineTable);
+        );
         let compressible = compressible_replaced_content(flat, child, space)?;
         if !plain && compressible.is_none() && box_percent_inline(flat, child) {
-            return super::bail(
-                if matches!(style.display, Display::Table | Display::InlineTable) {
-                    "intrinsic-percent:table"
-                } else {
-                    "intrinsic-percent:replaced"
-                },
-            );
+            return super::bail("intrinsic-percent:replaced");
         }
         // Percentages have nothing to resolve against here (Blink resolves
         // percentage margins and padding against zero for min/max sizes):
@@ -3045,7 +3169,7 @@ pub(super) fn intrinsic_sizes_at(
         };
         let limits = keyword_contribution_limits(flat, child, space, edges)?;
         let border_box = apply_contribution_limits(content, limits, |w| {
-            clamp_inline_indefinite(style, space, edges, w)
+            clamp_inline_in(style, space, edges, w, None)
         })
         .map(|w| w + edges);
         let max_contribution = if floating {
@@ -3599,7 +3723,8 @@ fn shrink_to_fit(
         None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
         None => return super::bail("shrink-min"),
     };
-    Some(clamp_inline(style, space, edges, width.max(0.0)))
+    let cb = (!space.percent_unresolved).then_some(space.available_inline);
+    Some(clamp_inline_in(style, space, edges, width.max(0.0), cb))
 }
 
 /// Author `display:flex`. Synthetic boxes stay on their own algorithms:
@@ -3767,6 +3892,7 @@ pub(super) fn layout_root(
         forced_bfc: false,
         adjoining_from: 0,
         fixed_block_indefinite: false,
+        percent_unresolved: false,
     };
     let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
@@ -4021,7 +4147,24 @@ fn layout_block_in(
                 override_replaced_axis(&mut definite, true);
                 definite.min_width = Dimension::Auto;
                 definite.max_width = Dimension::Auto;
-                (width, replaced_size(info.kind, &definite, space)?.1)
+                let mut height = replaced_size(info.kind, &definite, space)?.1;
+                // An image with no known ratio (not decoded: the 200x200
+                // placeholder) that a flex item's max-width or shrinking
+                // made narrower than its natural width scales both axes,
+                // as the min/max constraint table does (CSS 2.1 10.4),
+                // instead of keeping the natural height
+                // (flex-item auto-min-size-001).
+                if matches!(style.height, Dimension::Auto)
+                    && matches!(style.width, Dimension::Auto)
+                    && matches!(info.kind, ComponentKind::Image { src } if crate::layout::image_intrinsic_ratio(src).is_none())
+                    && let Some((natural_width, natural_height)) =
+                        replaced_intrinsic_size(flat, index, space)
+                    && natural_width > width
+                    && width >= 0.0
+                {
+                    height = natural_height * width / natural_width;
+                }
+                (width, height)
             }
             None => replaced_size_with_keyword_limits(info.kind, style, space)?,
         })
@@ -4227,6 +4370,7 @@ fn layout_block_in(
         forced_bfc: false,
         adjoining_from: 0,
         fixed_block_indefinite: false,
+        percent_unresolved: false,
     };
 
     // CSS Sizing 4 stretch-fit sizing: a child's `stretch` sizes resolve
@@ -4586,6 +4730,15 @@ fn layout_block_in(
             definite.max_width = Dimension::Auto;
             definite.box_sizing = BoxSizing::ContentBox;
             resolve_inline(&definite, &child_space)
+        } else if let ComponentKind::SvgDocument { source, .. } = child_info.kind {
+            let (width, _) =
+                svg_content_size(source, child_info.style, &child_space).why("kind:other")?;
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
         } else {
             resolve_inline(child_info.style, &child_space)
         };
@@ -4937,16 +5090,29 @@ fn layout_block_in(
             pending = result.end_strut;
             at_top = false;
         }
-        if result.last_baseline != LastBaseline::NoLines {
-            last_baseline = result.last_baseline.offset(bt + pt + y);
+        // A scroll container block child exposes its bottom margin edge as
+        // its baseline, whatever lines it holds (css/CSS2/linebox/
+        // baseline-block-with-overflow-001, measured in Chrome).
+        let (child_last, child_first) = if baseline_is_margin_edge(child_info.style)
+            && !matches!(child_info.kind, ComponentKind::Button { .. })
+        {
+            let edge = LastBaseline::At(result.fragment.height + child_metrics.margin[2]);
+            // The first baseline stays the content's (a flex item's
+            // baseline, align-items-baseline-overflow-non-visible).
+            (edge, result.first_baseline)
+        } else {
+            (result.last_baseline, result.first_baseline)
+        };
+        if child_last != LastBaseline::NoLines {
+            last_baseline = child_last.offset(bt + pt + y);
         }
         // A fieldset's rendered legend sits outside its anonymous content
         // box, whose baseline is the fieldset's (Blink
         // FieldsetLayoutAlgorithm).
         if !matches!(first_baseline, LastBaseline::At(_)) && !is_rendered_legend(child_info.style) {
-            let candidate = match result.first_baseline {
-                LastBaseline::At(_) => result.first_baseline,
-                _ => result.last_baseline,
+            let candidate = match child_first {
+                LastBaseline::At(_) => child_first,
+                _ => child_last,
             };
             if matches!(candidate, LastBaseline::At(_)) {
                 first_baseline = candidate.offset(bt + pt + y);
@@ -5065,23 +5231,6 @@ fn layout_block_in(
     } else {
         content_height
     };
-    // A definite block size that clips overflowing content is a scrollport.
-    // Scroll offsets stay on the legacy engine. An auto-height BFC does not.
-    if non_visible_overflow(style)
-        && !is_author_flex(style)
-        && !is_author_grid(style)
-        && style.display != Display::FlowRoot
-        && (specified_height.is_some() || ratio_height.is_some())
-        && auto_content > content_height + 1.0 / 128.0
-    {
-        return super::bail("overflow-scroll");
-    }
-    // A scroll container (`auto` / `scroll`) whose content overflows its
-    // block size, whatever clamps it (max-height too), has a scroll range;
-    // sticky descendants and scroll offsets stay on the legacy engine.
-    if is_scroll_container(style) && auto_content > content_height + 1.0 / 128.0 {
-        return super::bail("overflow-scroll");
-    }
     // CSS2.1 8.3.1: the last child's bottom margin adjoins ours when our
     // computed height is auto, whatever max-height does to the used height
     // (margin-collapse-038; Blink's FinishLayout drops the strut whenever

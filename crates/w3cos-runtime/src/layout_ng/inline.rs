@@ -473,10 +473,19 @@ fn supported_script_in(content: &str, reordered: bool) -> bool {
         let bidi_control = matches!(u, 0x061C | 0x200E | 0x200F)
             || (0x202A..=0x202E).contains(&u)
             || (0x2066..=0x2069).contains(&u);
-        let other_space = matches!(u, 0x1680 | 0x180E | 0x205F | 0x3000)
-            || (0x2000..=0x200D).contains(&u)
-            || u == 0x202F
-            || (0x2060..=0x2064).contains(&u);
+        // The ideographic space and the zero width space are break
+        // opportunities the NG breaker knows (`is_soft_wrap_char`), and
+        // their width matches Chrome when no line needs the break (see
+        // `unicode_breakable_spaces_in_text_match_chrome`). The other spaces
+        // (U+2000..U+200A, 202F, 205F, 1680, 180E), the joiners and the
+        // word joiner need break, no-break or intrinsic-size rules the
+        // breaker does not have, so they stay on legacy.
+        let breakable_space = matches!(u, 0x3000 | 0x200B);
+        let other_space = !breakable_space
+            && (matches!(u, 0x1680 | 0x180E | 0x205F)
+                || (0x2000..=0x200D).contains(&u)
+                || u == 0x202F
+                || (0x2060..=0x2064).contains(&u));
         let special = (0xD800..=0xDFFF).contains(&u) || (0xFFF0..=0xFFFF).contains(&u);
         !((rtl && !reordered) || bidi_control || other_space || special)
     })
@@ -1263,6 +1272,25 @@ fn text_line_metrics(content: &str, style: &Style) -> (f32, f32) {
     }
     let _ = content;
     (height, baseline)
+}
+
+/// Whether a text leaf painted alone in its rect (no inline line context)
+/// puts its glyphs on the baseline `text_line_metrics` gives an IFC: the
+/// line box is the font box, so paint's centring has nothing to offset.
+pub(super) fn leaf_paints_like_ifc(content: &str, style: &Style) -> bool {
+    #[cfg(feature = "skia")]
+    {
+        let Some(font) = crate::render_skia::resolved_font_geometry(style) else {
+            return false;
+        };
+        let (line, _) = text_line_metrics(content, style);
+        font.line_gap.abs() < 0.01 && (line - font.height()).abs() < 0.01
+    }
+    #[cfg(not(feature = "skia"))]
+    {
+        let _ = (content, style);
+        true
+    }
 }
 
 /// NGLineHeightMetrics of the root inline box (the block's strut).
@@ -2220,7 +2248,11 @@ fn layout_lines(
             let side = |m| {
                 crate::layout::resolve_spacing_for_layout(
                     m,
-                    available,
+                    if space.percent_unresolved {
+                        0.0
+                    } else {
+                        available
+                    },
                     style,
                     space.viewport_w,
                     space.viewport_h,
@@ -2234,6 +2266,12 @@ fn layout_lines(
             ];
             let height = margin[0] + result.fragment.height + margin[2];
             let ascent = match result.last_baseline {
+                // (A button keeps its content baseline, as in block.rs.)
+                _ if super::block::baseline_is_margin_edge(style)
+                    && !matches!(flat[child].kind, ComponentKind::Button { .. }) =>
+                {
+                    height
+                }
                 LastBaseline::At(b) => margin[0] + b,
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),
@@ -3077,6 +3115,7 @@ pub(super) fn inline_min_max(
             index,
             &ConstraintSpace {
                 available_inline: available,
+                percent_unresolved: true,
                 ..*space
             },
         )

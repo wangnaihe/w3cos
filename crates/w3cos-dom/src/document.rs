@@ -932,6 +932,33 @@ mod form_control_tests;
 #[path = "document/flex_item_lowering_tests.rs"]
 mod flex_item_lowering_tests;
 
+/// An authored `display: flex` host whose children are all text runs (a
+/// styled `inline-block` span folds into one).
+fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Component]) -> bool {
+    style.display == w3cos_std::style::Display::Flex
+        && children.iter().all(|child| {
+            matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                && matches!(
+                    child.style.display,
+                    w3cos_std::style::Display::Inline
+                        | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::None
+                )
+        })
+}
+
+/// Whether the opt-in LayoutNG engine is requested (`W3COS_LAYOUT_NG`, or
+/// its verify mode). Mirrors `layout_ng::mode()`; the DOM crate cannot see
+/// the runtime crate.
+fn layout_ng_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        ["W3COS_LAYOUT_NG", "W3COS_LAYOUT_NG_VERIFY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| value != "0"))
+    })
+}
+
 impl Document {
     /// The element's own inline style sets a transition.
     pub fn inline_declares_transition(&self, id: NodeId) -> bool {
@@ -9403,7 +9430,28 @@ impl Document {
                         }
                         _ => false,
                     };
+                // An authored `display: flex` host whose children are all
+                // plain inline text keeps its own direction, wrap and
+                // alignment (LayoutNG lays its text runs out as flex
+                // items). One with atomic inline children (inline-block,
+                // controls, images) keeps the wrapping row lowering the
+                // legacy engine's result depends on.
+                let authored_flex_of_plain_inlines = style.display
+                    == w3cos_std::style::Display::Flex
+                    && children.iter().all(|child| {
+                        matches!(
+                            child.style.display,
+                            w3cos_std::style::Display::Inline | w3cos_std::style::Display::None
+                        ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
+                    })
+                    // LayoutNG (opt-in, `W3COS_LAYOUT_NG`) also lays out a
+                    // host whose children are all text runs (a styled
+                    // `inline-block` span folds into one) as real flex
+                    // items. The legacy engine keeps the wrapping row
+                    // lowering its results depend on, so this is NG-only.
+                    || (layout_ng_requested() && is_flex_host_of_text_runs(&style, &children));
                 if !blockified_atomic_items
+                    && !authored_flex_of_plain_inlines
                     && (children.len() >= 2
                         || children.iter().any(|child| {
                             child.style.display == w3cos_std::style::Display::Inline
@@ -21505,6 +21553,60 @@ mod image_component_tests {
                 );
             }
         }
+        crate::stylesheet::clear_rules();
+    }
+
+    /// An authored `display: flex` host whose children are plain inline
+    /// text keeps its own flex-direction, wrap and alignment: its inline
+    /// children are flex items, so the anonymous inline-formatting-context
+    /// lowering (a wrapping baseline row) must not rewrite it. A block host
+    /// with the same children, and a flex host with atomic inline children
+    /// (whose legacy result depends on the row), are still lowered.
+    #[test]
+    fn authored_flex_host_is_not_lowered_to_an_inline_formatting_row() {
+        use w3cos_std::style::{AlignItems, Display, FlexDirection, FlexWrap};
+        crate::stylesheet::clear_rules();
+        let build = |display: &str, child_display: &str| {
+            let mut document = Document::new();
+            let host = document.create_element("div");
+            host.style_mut(&mut document)
+                .set_property("display", display);
+            host.style_mut(&mut document)
+                .set_property("flex-direction", "column");
+            let body = document.body();
+            body.append_child(&mut document, host);
+            for word in ["one", "two"] {
+                let span = document.create_element("span");
+                span.style_mut(&mut document)
+                    .set_property("display", child_display);
+                span.style_mut(&mut document)
+                    .set_property("background-color", "white");
+                span.style_mut(&mut document).set_property("width", "8em");
+                let text = document.create_text_node(word);
+                span.append_child(&mut document, text);
+                host.append_child(&mut document, span);
+            }
+            document.to_component_subtree(host.id)
+        };
+        let flex = build("flex", "inline");
+        assert_eq!(flex.style.display, Display::Flex);
+        assert_eq!(flex.style.flex_direction, FlexDirection::Column);
+        assert_ne!(flex.style.flex_wrap, FlexWrap::Wrap);
+        assert_ne!(flex.style.align_items, AlignItems::Baseline);
+        assert_eq!(flex.children.len(), 2, "two flex items, not one text run");
+        // Atomic inline children of a flex host are blockified items
+        // (`blockified_atomic_items`): the host keeps its authored
+        // alignment, where main's version of this test kept the wrapping
+        // row lowering.
+        let atomic = build("flex", "inline-block");
+        assert_ne!(atomic.style.flex_wrap, FlexWrap::Wrap);
+        assert_ne!(atomic.style.align_items, AlignItems::Baseline);
+        // LayoutNG's NG-only widening: the lowered text runs are text kind.
+        assert!(is_flex_host_of_text_runs(&atomic.style, &atomic.children));
+        let block = build("block", "inline");
+        assert_eq!(block.style.flex_wrap, FlexWrap::Wrap);
+        assert_eq!(block.style.align_items, AlignItems::Baseline);
+        assert!(!is_flex_host_of_text_runs(&block.style, &block.children));
         crate::stylesheet::clear_rules();
     }
 

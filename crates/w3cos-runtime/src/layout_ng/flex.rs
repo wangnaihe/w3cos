@@ -153,6 +153,17 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         }
         // A text run is an anonymous flex item (CSS Flexbox §4), laid out
         // as block text (`block::node_box_reason` validates its content). A
+        // `-webkit-box`, `run-in` or other unrecognized display that
+        // computes to flex keeps its text on the legacy engine (a
+        // line-clamp reference next to a fallen-back test must use the
+        // same engine).
+        if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
+            && has_marker(style, "--w3cos-internal-unrecognized-display")
+        {
+            return Some("flex:text-item");
+        }
+        // A text run is an anonymous flex item (CSS Flexbox §4), laid out
+        // as block text (`block::node_box_reason` validates its content). A
         // run of only white space is not rendered; the DOM is expected to
         // drop it, so one that reaches layout stays on the legacy engine.
         if let w3cos_std::ComponentKind::Text { content } = flat[child].kind
@@ -1033,7 +1044,7 @@ fn stretched_ratio_main(
         return Some(None);
     };
     let mut inline = ratio.inline_from_block(stretched);
-    if matches!(style.min_width, Dimension::Auto) && !block::is_overflow_scroll_container(style) {
+    if matches!(style.min_width, Dimension::Auto) && !block::computed_scrolls_in_axis(style, true) {
         let content = content_minmax(flat, child, space).why("flex:intrinsic")?;
         inline = inline.max(content.min.unwrap_or(content.max));
     }
@@ -1344,7 +1355,7 @@ fn resolve_main_limits(
     } else {
         (style.min_height, style.max_height, style.height)
     };
-    let min = if matches!(min_dim, Dimension::Auto) && block::is_overflow_scroll_container(style) {
+    let min = if matches!(min_dim, Dimension::Auto) && block::computed_scrolls_in_axis(style, row) {
         // CSS Flexbox §4.5: the automatic minimum size applies only to items
         // that are not scroll containers; for those `min-*: auto` is 0
         // (FlexLayoutAlgorithm::ShouldApplyMinSizeAutoForChild).
@@ -1893,6 +1904,23 @@ pub(super) fn layout(
                 .why("flex:cross")?,
             );
         }
+        if !row && block::is_replaced_item(flat, child) {
+            // A definite replaced width still honours min/max-width.
+            cross = match cross {
+                Some(size) => Some(
+                    clamp_cross(
+                        child_style,
+                        false,
+                        cross_edges,
+                        size,
+                        Some(inner_width),
+                        space,
+                    )
+                    .why("flex:cross")?,
+                ),
+                None => None,
+            };
+        }
         let basis_auto = (matches!(child_style.flex_basis, Dimension::Auto)
             && matches!(child_style.height, Dimension::Auto))
             // A percentage basis with an indefinite main size is `content`.
@@ -1929,7 +1957,7 @@ pub(super) fn layout(
                 if block::is_replaced(kind)
                     && !row
                     && matches!(child_style.min_height, Dimension::Auto)
-                    && !block::is_overflow_scroll_container(child_style) =>
+                    && !block::computed_scrolls_in_axis(child_style, false) =>
             {
                 height.min(max)
             }
@@ -1960,7 +1988,7 @@ pub(super) fn layout(
                 base = transferred;
             }
             if matches!(child_style.min_width, Dimension::Auto)
-                && !block::is_overflow_scroll_container(child_style)
+                && !block::computed_scrolls_in_axis(child_style, true)
             {
                 min = transferred.min(max);
             }
@@ -1972,12 +2000,12 @@ pub(super) fn layout(
                 base = transferred;
             }
             if matches!(child_style.min_width, Dimension::Auto)
-                && !block::is_overflow_scroll_container(child_style)
+                && !block::computed_scrolls_in_axis(child_style, true)
             {
                 min = transferred.min(max);
             }
         } else if matches!(child_style.min_width, Dimension::Auto)
-            && !block::is_overflow_scroll_container(child_style)
+            && !block::computed_scrolls_in_axis(child_style, true)
         {
             // With a specified width the content size suggestion is still
             // the image's min-content width at the stretched height, and

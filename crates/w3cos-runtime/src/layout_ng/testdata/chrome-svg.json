@@ -1,0 +1,191 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "sv1",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=30 height=20></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "sv2",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=30 height=40 style='vertical-align:middle'></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     40
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     40
+    ]
+   }
+  },
+  {
+   "name": "sv3",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'><svg id=i width=30 height=10 style='margin:5px 3px'></svg></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     3,
+     5,
+     30,
+     10
+    ]
+   }
+  },
+  {
+   "name": "sv4",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=100 height=20 style='max-width:60px'></svg>XX<svg id=j width=10 height=10 style='vertical-align:top'></svg></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     60,
+     20
+    ],
+    "j": [
+     140,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  {
+   "name": "sv5",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=60 height=30 style='width:30px'></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     34
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     30
+    ]
+   }
+  },
+  {
+   "name": "sv6",
+   "html": "<div id=p style='font:20px/1 Ahem;width:50px'>XX<svg id=i width=30 height=20></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     50,
+     64
+    ],
+    "i": [
+     0,
+     20,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "sv7",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=30 height=20 style='display:inline-block'></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "sv8",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'><svg id=i width=60 height=20 style='display:block;margin:0 auto'></svg></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     20
+    ],
+    "i": [
+     120,
+     0,
+     60,
+     20
+    ]
+   }
+  },
+  {
+   "name": "sv9",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=60 height=30 viewBox='0 0 60 30' style='height:20px'></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     60,
+     20
+    ]
+   }
+  },
+  {
+   "name": "sv10",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<svg id=i width=60 height=30 style='min-width:90px'></svg>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     34
+    ],
+    "i": [
+     40,
+     0,
+     90,
+     30
+    ]
+   }
+  }
+ ]
+}

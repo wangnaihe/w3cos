@@ -1394,6 +1394,27 @@ fn layout_cell_fragment(
     content_width: f32,
     space: &ConstraintSpace,
 ) -> Option<LayoutResult> {
+    // A cell is laid out once at its natural height and stretched to the
+    // row afterwards, so a percentage block size below it stays auto. Where
+    // the cell, its row or section, or the table has a specified height,
+    // Chrome resolves it against the stretched cell (css-sizing/
+    // table-child-percentage-height-with-border-box); that needs a second
+    // pass, so such tables stay on the legacy engine.
+    if flat[index + 1..flat[index].subtree_end]
+        .iter()
+        .any(|node| matches!(node.style.height, Dimension::Percent(_)))
+    {
+        let mut ancestor = Some(index);
+        while let Some(node) = ancestor {
+            if !matches!(flat[node].style.height, Dimension::Auto) {
+                return super::bail("table-cell-percent-height");
+            }
+            if flat[node].style.display == Display::Table {
+                break;
+            }
+            ancestor = flat[node].parent;
+        }
+    }
     let mut nested = *space;
     nested.available_inline = content_width.max(0.0);
     nested.percentage_block = None;
@@ -1418,7 +1439,7 @@ fn layout_cell_fragment(
     // line box, so paint would center the glyphs in the whole cell. An
     // inline child of a real cell is a line box; match that.
     if let ComponentKind::Text { content } = &flat[index].kind {
-        append_text_leaf_line(
+        let _ = append_text_leaf_line(
             &mut result,
             flat[index].style,
             content,
@@ -1431,24 +1452,24 @@ fn layout_cell_fragment(
 
 /// One font-content box for a single-line text-leaf cell, in the cell's
 /// border-box coordinates. Wrapped or bidi leaves stay unfragmented.
-fn append_text_leaf_line(
+pub(super) fn append_text_leaf_line(
     result: &mut LayoutResult,
     style: &Style,
     content: &str,
     content_width: f32,
     space: &ConstraintSpace,
-) {
+) -> bool {
     if content.is_empty()
         || style
             .custom_properties
             .as_ref()
             .is_some_and(|props| props.contains_key("--w3cos-internal-bidi-logical-order"))
     {
-        return;
+        return false;
     }
     let (_, baseline) = inline::block_text_layout(content, content_width.max(0.0), style);
     let LastBaseline::At(ascent) = baseline else {
-        return;
+        return false;
     };
     let content_ascent = crate::layout::inline_font_content_ascent(style);
     let font_height = crate::layout::inline_font_height(style);
@@ -1472,6 +1493,7 @@ fn append_text_leaf_line(
             children: Vec::new(),
         },
     ));
+    true
 }
 
 fn content_extent(fragment: &BoxFragment, border_bottom: f32, pad_bottom: f32) -> f32 {
@@ -1508,19 +1530,18 @@ pub(super) fn intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, true, true)
+    intrinsic_border_box_inner(flat, index, space, true, Some(space.available_inline))
 }
 
-/// The table's min/max as a contribution to an intrinsically sized parent.
-/// A percentage `width` has no basis there and behaves as `auto`, so the
-/// contribution is the column content (Blink's block min/max treats a
-/// percentage inline size as indefinite).
+/// The table's min/max-content contribution to its parent: like
+/// `intrinsic_border_box`, but a percentage `width` is cyclic (the parent
+/// is being sized) and counts as auto, CSS Sizing 3 5.2.1.
 pub(super) fn contribution_border_box(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, true, false)
+    intrinsic_border_box_inner(flat, index, space, true, None)
 }
 
 /// Column min/max without the table's own `width`. Flex uses this so a
@@ -1530,7 +1551,7 @@ pub(super) fn content_intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, false, true)
+    intrinsic_border_box_inner(flat, index, space, false, Some(space.available_inline))
 }
 
 fn intrinsic_border_box_inner(
@@ -1538,7 +1559,7 @@ fn intrinsic_border_box_inner(
     index: usize,
     space: &ConstraintSpace,
     include_specified: bool,
-    percent_basis: bool,
+    specified_basis: Option<f32>,
 ) -> Option<MinMax> {
     let style = flat[index].style;
     let grid = grid_of(flat, index);
@@ -1592,13 +1613,7 @@ fn intrinsic_border_box_inner(
     }
     let mut min = min_tracks + gaps + lines;
     let mut max = max_tracks + gaps + lines;
-    if include_specified
-        && let Some(specified) = border_box_size(
-            style,
-            space,
-            percent_basis.then_some(space.available_inline),
-        )
-    {
+    if include_specified && let Some(specified) = border_box_size(style, space, specified_basis) {
         min = min.max(specified);
         max = max.max(specified);
     }

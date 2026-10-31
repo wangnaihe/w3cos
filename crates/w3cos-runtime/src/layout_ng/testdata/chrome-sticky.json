@@ -1,0 +1,89 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "sticky-top",
+   "html": "<div id=a style='width:100px;height:50px;overflow:auto'><div id=b style='height:20px'></div><div id=c style='position:sticky;top:10px;left:5px;height:20px'></div><div id=d style='height:100px'></div></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "b": [
+     0,
+     0,
+     100,
+     20
+    ],
+    "c": [
+     0,
+     20,
+     100,
+     20
+    ],
+    "d": [
+     0,
+     40,
+     100,
+     100
+    ]
+   }
+  },
+  {
+   "name": "sticky-flow",
+   "html": "<div id=a style='height:10px'></div><div id=b style='position:sticky;top:0;width:60px;height:20px;margin-left:15px'><div id=c style='height:5px'></div></div><div id=d style='height:10px'></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     800,
+     10
+    ],
+    "b": [
+     15,
+     10,
+     60,
+     20
+    ],
+    "c": [
+     15,
+     10,
+     60,
+     5
+    ],
+    "d": [
+     0,
+     30,
+     800,
+     10
+    ]
+   }
+  },
+  {
+   "name": "sticky-bottom-short",
+   "html": "<div id=a style='width:100px;height:30px;overflow:auto'><div id=b style='position:sticky;bottom:0;height:20px'></div><div id=c style='height:80px'></div></div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     100,
+     30
+    ],
+    "b": [
+     0,
+     0,
+     100,
+     20
+    ],
+    "c": [
+     0,
+     20,
+     100,
+     80
+    ]
+   }
+  }
+ ]
+}

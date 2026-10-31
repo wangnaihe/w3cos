@@ -118,6 +118,7 @@ pub(super) fn layout_out_of_flow(
         forced_bfc: false,
         adjoining_from: 0,
         fixed_block_indefinite: false,
+        percent_unresolved: false,
     };
     let (w, h) = (cb.width, cb.height);
     let spacing = |s: Spacing| match s {

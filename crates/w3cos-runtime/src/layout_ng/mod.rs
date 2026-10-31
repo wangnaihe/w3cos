@@ -110,6 +110,14 @@ pub(crate) struct ConstraintSpace {
     /// not definite for its children's percentages, because the flex
     /// container's main size is indefinite (css-flexbox "definite sizes").
     pub fixed_block_indefinite: bool,
+    /// An intrinsic-size measurement (min/max-content of an inline
+    /// formatting context): `available_inline` is a probe (0 or
+    /// indefinite), not a containing-block size, so inline percentages of
+    /// the boxes laid out against it are cyclic. They resolve as zero
+    /// (margins, padding), auto (width) and none (min/max-width), CSS
+    /// Sizing 3 5.2.1; the final layout re-resolves them against the real
+    /// containing block.
+    pub percent_unresolved: bool,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.

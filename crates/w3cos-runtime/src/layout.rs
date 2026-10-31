@@ -4837,11 +4837,13 @@ impl LayoutEngine {
                     Some((layout_cache, text_fragments)) => {
                         // The legacy Taffy tree no longer matches this output.
                         self.tree_valid = false;
+                        let (scrollable_nodes, clip_only_nodes, scroll_ancestor) =
+                            scroll_containers_from_layout(&layout_cache, flat);
                         Ok(LayoutResults {
                             layout_cache,
-                            scrollable_nodes: Vec::new(),
-                            clip_only_nodes: Vec::new(),
-                            scroll_ancestor: vec![None; flat.len()],
+                            scrollable_nodes,
+                            clip_only_nodes,
+                            scroll_ancestor,
                             text_fragments,
                         })
                     }
@@ -20551,6 +20553,149 @@ fn refresh_scroll_container_rects(
             *rect = *final_rect;
         }
     }
+}
+
+/// Scroll containers of a LayoutNG result. Every box whose `overflow`
+/// clips (CSS Overflow 3: hidden, scroll, auto on a box that establishes an
+/// overflow clip) is a scrollport; its scrollable extent is the farthest
+/// descendant border-box edge past its own border box, as in the legacy
+/// collector. Scrollbars take no space (the legacy engine reserves none).
+pub(crate) fn scroll_containers_from_layout(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    let rects = layouts
+        .iter()
+        .map(|(rect, index)| (*index, *rect))
+        .collect::<HashMap<_, _>>();
+    // `inherited[i]`: the scroll container that clips `i`'s children.
+    let mut inherited: Vec<Option<usize>> = vec![None; flat.len()];
+    let mut scroll_ancestor: Vec<Option<usize>> = vec![None; flat.len()];
+    let mut scrollable = Vec::new();
+    let mut hidden_clip = vec![false; flat.len()];
+    // Translation accumulated from the transforms of the boxes between a box
+    // and its scroll container (the container's own transform moves the
+    // container, not its contents). Scrollable overflow is measured on the
+    // transformed boxes (CSS Overflow 3), so a descendant that a transform
+    // moves back into the scrollport adds no overflow.
+    let mut content_shift: Vec<(f32, f32)> = vec![(0.0, 0.0); flat.len()];
+    let mut shifted_layouts = layouts.to_vec();
+    let layout_slot = layouts
+        .iter()
+        .enumerate()
+        .map(|(slot, (_, index))| (*index, slot))
+        .collect::<HashMap<_, _>>();
+    let body_host = crate::dom::body_id();
+    let root_overflow_visible = flat.first().is_some_and(|root| {
+        root.style.resolved_overflow_x() == WOverflow::Visible
+            && root.style.resolved_overflow_y() == WOverflow::Visible
+    });
+    for index in 0..flat.len() {
+        let info = &flat[index];
+        let current = info.parent.and_then(|parent| inherited[parent]);
+        let mut effective = current;
+        if matches!(info.style.position, WPos::Absolute) {
+            // An absolutely positioned box escapes the scroll containers
+            // between it and its containing block.
+            let mut ancestor = info.parent;
+            let mut positioned = None;
+            while let Some(parent) = ancestor {
+                if !matches!(flat[parent].style.position, WPos::Static) {
+                    positioned = Some(parent);
+                    break;
+                }
+                ancestor = flat[parent].parent;
+            }
+            while let Some(clip) = effective {
+                let mut candidate = positioned;
+                let mut inside = false;
+                while let Some(at) = candidate {
+                    if at == clip {
+                        inside = true;
+                        break;
+                    }
+                    candidate = flat[at].parent;
+                }
+                if inside {
+                    break;
+                }
+                effective = scroll_ancestor[clip];
+            }
+        }
+        scroll_ancestor[index] = effective;
+        inherited[index] = effective;
+        let parent_shift = info
+            .parent
+            .map_or((0.0, 0.0), |parent| content_shift[parent]);
+        let own_shift = (
+            parent_shift.0 + info.style.transform.translate_x,
+            parent_shift.1 + info.style.transform.translate_y,
+        );
+        content_shift[index] = own_shift;
+        if (own_shift.0 != 0.0 || own_shift.1 != 0.0)
+            && let Some(slot) = layout_slot.get(&index)
+        {
+            shifted_layouts[*slot].0.x += own_shift.0;
+            shifted_layouts[*slot].0.y += own_shift.1;
+        }
+        let overflow_x = info.style.resolved_overflow_x();
+        let overflow_y = info.style.resolved_overflow_y();
+        let clips = |o: WOverflow| matches!(o, WOverflow::Hidden);
+        let scrolls = |o: WOverflow| matches!(o, WOverflow::Scroll | WOverflow::Auto);
+        // The root and a body whose overflow propagates to the viewport do
+        // not clip at their own boxes; the viewport does, so a hidden/clip
+        // value there is no scroll container. Scrolling values stay (the
+        // painter treats those hosts as the viewport).
+        let viewport_host = index == 0
+            || (root_overflow_visible
+                && matches!(
+                    info.on_click,
+                    EventAction::NativeHost { id, .. } if *id == u64::from(body_host)
+                ));
+        if viewport_host && !(scrolls(overflow_x) || scrolls(overflow_y)) {
+            continue;
+        }
+        if info.style.display.establishes_overflow_clip()
+            && (clips(overflow_x)
+                || clips(overflow_y)
+                || scrolls(overflow_x)
+                || scrolls(overflow_y))
+        {
+            inherited[index] = Some(index);
+            content_shift[index] = (0.0, 0.0);
+            if let Some(rect) = rects.get(&index) {
+                scrollable.push((
+                    index,
+                    *rect,
+                    ScrollExtent {
+                        max_x: 0.0,
+                        max_y: 0.0,
+                    },
+                ));
+                hidden_clip[index] = clips(overflow_x) || clips(overflow_y);
+            }
+        }
+    }
+    extend_scroll_extents_from_descendants(
+        &shifted_layouts,
+        flat,
+        &scroll_ancestor,
+        &mut scrollable,
+    );
+    let mut clip_only = Vec::new();
+    scrollable.retain(|(index, rect, extent)| {
+        if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden_clip[*index] {
+            true
+        } else {
+            clip_only.push((*index, *rect));
+            false
+        }
+    });
+    (scrollable, clip_only, scroll_ancestor)
 }
 
 fn extend_scroll_extents_from_descendants(

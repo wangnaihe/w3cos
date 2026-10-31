@@ -2929,7 +2929,7 @@ impl PaintArtifact {
                 Overflow::Hidden | Overflow::Scroll | Overflow::Auto
             )
         };
-        let scroll_clip = clips_content(overflow_x) || clips_content(overflow_y);
+        let scroll_overflow = clips_content(overflow_x) || clips_content(overflow_y);
         // A document element's `clip` and the `clip` of a body that
         // propagates to the viewport apply to the viewport, not to the box.
         let propagates_to_viewport = index == 0
@@ -2941,6 +2941,9 @@ impl PaintArtifact {
                         && !root.style.overflow_clip_x
                         && !root.style.overflow_clip_y
                 }));
+        // The overflow of the document element (and of a propagating body)
+        // belongs to the viewport: no clip at the box (CSS Overflow 3 3.3).
+        let scroll_clip = scroll_overflow && !(propagates_to_viewport && self.body_index.is_some());
         let clips_x = (node.style.overflow_clip_x && !propagates_to_viewport) || scroll_clip;
         let clips_y = (node.style.overflow_clip_y && !propagates_to_viewport) || scroll_clip;
         if establishes_overflow_clip(node.style.display) && (clips_x || clips_y) {

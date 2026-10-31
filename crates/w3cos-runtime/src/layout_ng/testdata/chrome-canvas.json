@@ -1,0 +1,155 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "cv1",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<canvas id=i width=30 height=20></canvas>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "cv2",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<canvas id=i width=30 height=40 style='vertical-align:middle'></canvas>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     40
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     40
+    ]
+   }
+  },
+  {
+   "name": "cv3",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'><canvas id=i width=30 height=10 style='margin:5px 3px'></canvas></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     3,
+     5,
+     30,
+     10
+    ]
+   }
+  },
+  {
+   "name": "cv4",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<canvas id=i width=100 height=20 style='max-width:60px'></canvas>XX<canvas id=j width=10 height=10 style='vertical-align:top'></canvas></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     20
+    ],
+    "i": [
+     40,
+     4,
+     60,
+     12
+    ],
+    "j": [
+     140,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  {
+   "name": "cv5",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<canvas id=i width=60 height=30 style='width:30px'></canvas>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     20
+    ],
+    "i": [
+     40,
+     1,
+     30,
+     15
+    ]
+   }
+  },
+  {
+   "name": "cv6",
+   "html": "<div id=p style='width:300px'><canvas id=i width=40 height=20></canvas></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     25
+    ],
+    "i": [
+     0,
+     0,
+     40,
+     20
+    ]
+   }
+  },
+  {
+   "name": "cv7",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<canvas id=i width=30 height=20 style='display:inline'></canvas>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "cv8",
+   "html": "<div id=p style='font:20px/1 Ahem;width:50px'>XX<canvas id=i width=30 height=20></canvas>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     50,
+     64
+    ],
+    "i": [
+     0,
+     20,
+     30,
+     20
+    ]
+   }
+  }
+ ]
+}
