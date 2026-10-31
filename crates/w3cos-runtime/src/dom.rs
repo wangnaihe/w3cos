@@ -541,6 +541,7 @@ fn inline_style_change_is_local(prop: &str) -> bool {
             | "grid-template-areas"
             | "grid-column"
             | "grid-row"
+            | "grid-area"
             | "grid-auto-flow"
             | "grid-auto-columns"
             | "grid-auto-rows"
