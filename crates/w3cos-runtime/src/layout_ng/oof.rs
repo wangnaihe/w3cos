@@ -117,6 +117,7 @@ pub(super) fn layout_out_of_flow(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        percent_unresolved: false,
     };
     let (w, h) = (cb.width, cb.height);
     let spacing = |s: Spacing| match s {

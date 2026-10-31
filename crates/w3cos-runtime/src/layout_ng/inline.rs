@@ -417,10 +417,19 @@ fn supported_script_in(content: &str, reordered: bool) -> bool {
         let bidi_control = matches!(u, 0x061C | 0x200E | 0x200F)
             || (0x202A..=0x202E).contains(&u)
             || (0x2066..=0x2069).contains(&u);
-        let other_space = matches!(u, 0x1680 | 0x180E | 0x205F | 0x3000)
-            || (0x2000..=0x200D).contains(&u)
-            || u == 0x202F
-            || (0x2060..=0x2064).contains(&u);
+        // The ideographic space and the zero width space are break
+        // opportunities the NG breaker knows (`is_soft_wrap_char`), and
+        // their width matches Chrome when no line needs the break (see
+        // `unicode_breakable_spaces_in_text_match_chrome`). The other spaces
+        // (U+2000..U+200A, 202F, 205F, 1680, 180E), the joiners and the
+        // word joiner need break, no-break or intrinsic-size rules the
+        // breaker does not have, so they stay on legacy.
+        let breakable_space = matches!(u, 0x3000 | 0x200B);
+        let other_space = !breakable_space
+            && (matches!(u, 0x1680 | 0x180E | 0x205F)
+                || (0x2000..=0x200D).contains(&u)
+                || u == 0x202F
+                || (0x2060..=0x2064).contains(&u));
         let special = (0xD800..=0xDFFF).contains(&u) || (0xFFF0..=0xFFFF).contains(&u);
         !((rtl && !reordered) || bidi_control || other_space || special)
     })
@@ -1865,7 +1874,11 @@ pub(super) fn layout_inline_beside(
             let side = |m| {
                 crate::layout::resolve_spacing_for_layout(
                     m,
-                    available,
+                    if space.percent_unresolved {
+                        0.0
+                    } else {
+                        available
+                    },
                     style,
                     space.viewport_w,
                     space.viewport_h,
@@ -1879,6 +1892,7 @@ pub(super) fn layout_inline_beside(
             ];
             let height = margin[0] + result.fragment.height + margin[2];
             let ascent = match result.last_baseline {
+                _ if super::block::baseline_is_margin_edge(style) => height,
                 LastBaseline::At(b) => margin[0] + b,
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),
@@ -2603,6 +2617,7 @@ pub(super) fn inline_min_max(
             &ConstraintSpace {
                 available_inline: available,
                 percentage_block: None,
+                percent_unresolved: true,
                 ..*space
             },
         )
