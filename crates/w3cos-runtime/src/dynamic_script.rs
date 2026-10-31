@@ -10416,6 +10416,27 @@ mod tests {
     }
 
     #[test]
+    fn opacity_zero_ancestor_hides_descendant_paint() {
+        // Code-OSS hides idle scrollbars with `.invisible { opacity: 0 }`; the
+        // slider child must not paint through its transparent parent.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div style="position:absolute;left:0;top:0;width:50px;height:50px;opacity:0">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:50px;height:50px">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://opacity.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_ne!(pixel(5, 5), [0, 255, 0], "child painted through opacity:0");
+        assert_eq!(pixel(105, 5), [0, 255, 0], "visible control child missing");
+    }
+
+    #[test]
     fn load_html_on_shared_vm_runs_inline_script() {
         let html = r#"<!doctype html><html><body>
             <h1 id="msg">page loading</h1>
