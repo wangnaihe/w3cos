@@ -1592,13 +1592,14 @@ mod tests {
         doc.body().append_child(&mut doc, link);
 
         let tree = doc.to_component_tree();
-        let link = &tree.children[0];
-        assert_eq!(link.style.display, w3cos_std::style::Display::Block);
-        assert_eq!(link.children.len(), 1);
         assert_eq!(
-            link.children[0].style.display,
-            w3cos_std::style::Display::Block
+            tree.children.len(),
+            3,
+            "the split inline keeps empty leading/trailing CSSOM fragments"
         );
+        let block = &tree.children[1];
+        assert_eq!(block.style.display, w3cos_std::style::Display::Block);
+        assert_eq!(block.children.len(), 1);
         crate::stylesheet::clear_rules();
     }
 
