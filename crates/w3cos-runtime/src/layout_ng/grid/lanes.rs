@@ -476,6 +476,7 @@ fn prepare(
     child: usize,
     area: f32,
     columns: bool,
+    margin_box: Option<i64>,
 ) -> Option<Prepared> {
     let child_style = flat[child].style;
     let justify = if columns {
@@ -509,7 +510,7 @@ fn prepare(
     } else if width_auto {
         let (min_c, max_c) = inline_minmax(flat, child, space).why("lanes:intrinsic")?;
         let available = units(area);
-        let margin_box = max_c.min(available.max(min_c));
+        let margin_box = margin_box.unwrap_or_else(|| max_c.min(available.max(min_c)));
         (from_units(margin_box) - ml - mr - edges_h).max(0.0)
     } else {
         let specified = block::resolve_length(child_style.width, Some(area), child_style, space)
@@ -590,7 +591,15 @@ fn stack_columns(
             None => running.first_eligible(entry.span),
         };
         let area = span_sum(&sizes, &collapsed, start, entry.span, between);
-        let prepared = prepare(flat, style, space, entry.index, from_units(area), true)?;
+        let prepared = prepare(
+            flat,
+            style,
+            space,
+            entry.index,
+            from_units(area),
+            true,
+            None,
+        )?;
         let laid = layout_item(
             flat,
             entry.index,
@@ -657,7 +666,7 @@ fn stack_rows(
     let mut row_min = vec![0_i64; lanes];
     let mut row_max = vec![0_i64; lanes];
     for entry in entries {
-        let prepared = prepare(flat, style, space, entry.index, inner, false)?;
+        let prepared = prepare(flat, style, space, entry.index, inner, false, None)?;
         let laid = layout_item(
             flat,
             entry.index,
@@ -667,7 +676,29 @@ fn stack_rows(
             prepared.specified_content_h,
         )?;
         let [mt, _, mb, _] = prepared.margin.map(units);
-        let margin_box = units(laid.fragment.height) + mt + mb;
+        let block_of = |fragment: &BoxFragment| units(fragment.height) + mt + mb;
+        // The track's minimum contribution is the block size at the
+        // item's min-content width, its maximum at the max-content width
+        // (the inline size is indefinite while the lanes are sized).
+        let (mut min_block, mut max_block) = (block_of(&laid.fragment), block_of(&laid.fragment));
+        if matches!(flat[entry.index].style.width, Dimension::Auto) {
+            let (min_c, max_c) = inline_minmax(flat, entry.index, space).why("lanes:intrinsic")?;
+            let mut at = |width: i64| -> Option<i64> {
+                let sized = prepare(flat, style, space, entry.index, inner, false, Some(width))?;
+                let laid = layout_item(
+                    flat,
+                    entry.index,
+                    space,
+                    inner,
+                    sized.content_width,
+                    sized.specified_content_h,
+                )?;
+                Some(block_of(&laid.fragment))
+            };
+            min_block = at(min_c)?;
+            max_block = at(max_c)?;
+        }
+        let (min_block, max_block) = (min_block, max_block.max(min_block));
         let starts = match entry.start {
             Some(start) => start..=start,
             None => 0..=lanes - entry.span,
@@ -678,8 +709,8 @@ fn stack_rows(
                 &mut row_max,
                 start,
                 entry.span,
-                margin_box,
-                margin_box,
+                min_block,
+                max_block,
             );
         }
         measured.push((prepared, laid.fragment));
