@@ -857,6 +857,11 @@ fn render_node(
     if style.opacity <= 0.0 {
         return;
     }
+    // `visibility: hidden` keeps layout but paints nothing for this box;
+    // descendants carry their own (inherited or overridden) computed value.
+    if style.visibility == w3cos_std::style::Visibility::Hidden {
+        return;
+    }
     // Apply transform offset
     let tx = style.transform.translate_x;
     let ty = style.transform.translate_y;
