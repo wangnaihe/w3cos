@@ -5150,7 +5150,9 @@ mod tests {
         )]));
         let root = Component::boxed(lanes, vec![leaf(block_box(None, Some(10.0)))]);
         let flat = pre_flatten(&root);
-        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+        // Real grid-lanes sizes its lanes from the items, so an indefinite
+        // height no longer needs the legacy path.
+        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
 
         let mut gapped = grid_style(100.0, None, None);
         gapped.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());
