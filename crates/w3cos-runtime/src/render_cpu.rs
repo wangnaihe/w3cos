@@ -1955,7 +1955,7 @@ fn draw_text_ink_in_box(
     draw_text_line(pixmap, x, y, text, font_size, color, font, style, clip_mask);
 }
 
-fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
+fn single_line_h_align(style: &Style, _box_w: f32, _ink_w: f32) -> TextAlign {
     if style.display == w3cos_std::style::Display::Inline {
         return TextAlign::Left;
     }
@@ -1968,14 +1968,6 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     };
     match text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
-        TextAlign::Left
-            if matches!(
-                style.white_space,
-                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre
-            ) && box_w > ink_w + 1.5 =>
-        {
-            TextAlign::Center
-        }
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => TextAlign::Left,
     }
 }
@@ -3748,5 +3740,28 @@ mod font_cjk_tests {
         assert!(pixmap.pixel(0, 3).unwrap().red() > 0);
         assert!(pixmap.pixel(1, 3).unwrap().red() > 0);
         assert_eq!(pixmap.pixel(2, 3).unwrap().red(), 0);
+    }
+
+    #[test]
+    fn nowrap_and_pre_block_text_is_not_centered_by_default() {
+        for white_space in [
+            w3cos_std::style::WhiteSpace::NoWrap,
+            w3cos_std::style::WhiteSpace::Pre,
+        ] {
+            let style = Style {
+                white_space,
+                ..Style::default()
+            };
+            assert_eq!(single_line_h_align(&style, 500.0, 100.0), TextAlign::Left);
+        }
+        let centered = Style {
+            white_space: w3cos_std::style::WhiteSpace::NoWrap,
+            text_align: TextAlign::Center,
+            ..Style::default()
+        };
+        assert_eq!(
+            single_line_h_align(&centered, 500.0, 100.0),
+            TextAlign::Center
+        );
     }
 }
