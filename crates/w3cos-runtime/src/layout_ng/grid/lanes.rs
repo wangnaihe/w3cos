@@ -16,11 +16,11 @@ use super::{
 };
 use crate::layout_ng::block::{self, BoxMetrics};
 use crate::layout_ng::inline::rendered_children;
-use crate::layout_ng::oof;
+use crate::layout_ng::oof::{self, OofCandidate};
 use crate::layout_ng::{
     BoxFragment, ConstraintSpace, LastBaseline, LayoutResult, MarginStrut, Why,
 };
-use w3cos_std::style::{Spacing, TextDirection};
+use w3cos_std::style::{Position, Spacing, TextDirection};
 
 const LANES: &str = "--w3cos-internal-grid-lanes";
 const TOLERANCE: &str = "--w3cos-internal-flow-tolerance";
@@ -70,10 +70,13 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         return Some("lanes:none");
     }
     let columns = lane_columns(style)?;
-    if marker(style, PACK).is_some_and(|pack| pack != "normal") {
+    if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
+        return Some("lanes:size-keyword");
+    }
+    if marker(style, PACK).is_some_and(|pack| pack != "normal" && pack != "dense") {
         return Some("lanes:pack");
     }
-    if parse_flow(style.grid_flow()).is_none_or(|flow| flow.dense || flow.column) {
+    if parse_flow(style.grid_flow()).is_none_or(|flow| flow.column) {
         return Some("lanes:flow");
     }
     if style.direction == TextDirection::Rtl || has_marker(style, "--w3cos-internal-percent-gap") {
@@ -155,6 +158,12 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             .any(|side| matches!(side, Spacing::Auto | Spacing::Percent(_)))
         {
             return Some("lanes:margin");
+        }
+        if is_dense(style)
+            && placement(child_style, !columns)
+                .is_some_and(|value| value.contains("span") || value.contains('/'))
+        {
+            return Some("lanes:dense-span");
         }
         for row in [false, true] {
             if placement(child_style, row).is_some_and(|value| parse_axis_syntax(value).is_none()) {
@@ -368,9 +377,14 @@ pub(super) fn layout(
             span: place.span,
         });
     }
+    // Dense packing only refills openings left by spanning items, so with
+    // single-lane items it places exactly like the default pack.
+    if is_dense(style) && entries.iter().any(|entry| entry.span > 1) {
+        return crate::layout_ng::bail("lanes:dense-span");
+    }
     entries.sort_by_key(|entry| (entry.order, entry.source));
 
-    let (children, stacking_extent) = if columns {
+    let (children, mut pending_oof, stacking_extent) = if columns {
         stack_columns(
             flat,
             style,
@@ -428,10 +442,33 @@ pub(super) fn layout(
     let border_width = inner_width + bl + br + pl + pr;
     let border_height = height + bt + bb + pt + pb;
     let (ox, oy) = (from_units(origin_x), from_units(origin_y));
-    let children = children
+    let mut children: Vec<(f32, f32, BoxFragment)> = children
         .into_iter()
         .map(|(x, y, fragment)| (x + ox, y + oy, fragment))
         .collect();
+    for candidate in &mut pending_oof {
+        *candidate = candidate.translated(ox, oy);
+    }
+    if style.position != Position::Static && !pending_oof.is_empty() {
+        let cb = oof::ContainingBlock {
+            x: bl,
+            y: bt,
+            width: border_width - bl - br,
+            height: border_height - bt - bb,
+            rtl: false,
+        };
+        let (placed, rest) = oof::resolve(
+            flat,
+            std::mem::take(&mut pending_oof),
+            &cb,
+            false,
+            space.viewport_w,
+            space.viewport_h,
+        )
+        .why("lanes:oof-resolve")?;
+        children.extend(placed);
+        pending_oof = rest;
+    }
     let mut start_strut = MarginStrut::default();
     start_strut.append(metrics.margin[0]);
     let mut end_strut = MarginStrut::default();
@@ -450,13 +487,14 @@ pub(super) fn layout(
         start_strut,
         end_strut,
         self_collapsing: false,
-        oof: Vec::new(),
+        oof: pending_oof,
         bfc_dependent: false,
         float_overlap: false,
     })
 }
 
 type Placed = Vec<(f32, f32, BoxFragment)>;
+type Stacked = (Placed, Vec<OofCandidate>, i64);
 
 struct Prepared {
     content_width: f32,
@@ -546,7 +584,7 @@ fn stack_columns(
     column_gap_u: i64,
     row_gap_u: i64,
     font: f32,
-) -> Option<(Placed, i64)> {
+) -> Option<Stacked> {
     let lanes = specs.len();
     let mut col_min = vec![0_i64; lanes];
     let mut col_max = vec![0_i64; lanes];
@@ -609,6 +647,7 @@ fn stack_columns(
             prepared.specified_content_h,
         )?;
         let fragment = laid.fragment;
+        let item_oof = laid.oof;
         let [mt, mr, mb, ml] = prepared.margin.map(units);
         let (ml, _mr, inline_offset) = axis_offset(
             area,
@@ -627,7 +666,7 @@ fn stack_columns(
         if entry.start.is_none() {
             running.cursor = start + entry.span;
         }
-        placed.push((entry.source, x + dx, y + dy, fragment));
+        placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
     }
     for position in &running.positions {
         extent = extent.max(*position);
@@ -638,10 +677,7 @@ fn stack_columns(
         (extent - row_gap_u).max(0)
     };
     placed.sort_by_key(|item| item.0);
-    Some((
-        placed.into_iter().map(|(_, x, y, f)| (x, y, f)).collect(),
-        extent,
-    ))
+    Some(unzip_placed(placed, extent))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,7 +693,7 @@ fn stack_rows(
     definite_block: Option<i64>,
     specified_block: Option<i64>,
     font: f32,
-) -> Option<(Placed, i64)> {
+) -> Option<Stacked> {
     let lanes = specs.len();
     let inner = from_units(inner_u);
     // Items do not depend on the lane in the inline axis, so each one is
@@ -713,7 +749,7 @@ fn stack_rows(
                 max_block,
             );
         }
-        measured.push((prepared, laid.fragment));
+        measured.push((prepared, laid.fragment, laid.oof));
     }
     let stretch_rows = row_pack(style) == Pack::Stretch;
     let collapsed = vec![false; lanes];
@@ -766,7 +802,7 @@ fn stack_rows(
     let tolerance = tolerance_units(style, used);
     let mut running = Running::new(lanes, tolerance);
     let mut placed = Vec::with_capacity(entries.len());
-    for (entry, (prepared, mut fragment)) in entries.iter().zip(measured) {
+    for (entry, (prepared, mut fragment, mut item_oof)) in entries.iter().zip(measured) {
         let (start, at) = match entry.start {
             Some(start) => (start, running.span_max(start, entry.span)),
             None => running.first_eligible(entry.span),
@@ -781,15 +817,16 @@ fn stack_rows(
             let target_content = (target_border - units(prepared.edges_v)).max(0);
             let measured_content = units(fragment.height) - units(prepared.edges_v);
             if target_content > measured_content {
-                fragment = layout_item(
+                let relaid = layout_item(
                     flat,
                     entry.index,
                     space,
                     inner,
                     prepared.content_width,
                     Some(from_units(target_content)),
-                )?
-                .fragment;
+                )?;
+                fragment = relaid.fragment;
+                item_oof = relaid.oof;
             }
         }
         let (mt, _, block_offset) = axis_offset(
@@ -809,11 +846,26 @@ fn stack_rows(
         if entry.start.is_none() {
             running.cursor = start + entry.span;
         }
-        placed.push((entry.source, x + dx, y + dy, fragment));
+        placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
     }
     placed.sort_by_key(|item| item.0);
-    Some((
-        placed.into_iter().map(|(_, x, y, f)| (x, y, f)).collect(),
-        used,
-    ))
+    Some(unzip_placed(placed, used))
+}
+
+fn unzip_placed(
+    placed: Vec<(usize, f32, f32, BoxFragment, Vec<OofCandidate>)>,
+    extent: i64,
+) -> Stacked {
+    let mut children = Vec::with_capacity(placed.len());
+    let mut oof = Vec::new();
+    for (_, x, y, fragment, item_oof) in placed {
+        oof.extend(item_oof.iter().map(|candidate| candidate.translated(x, y)));
+        children.push((x, y, fragment));
+    }
+    (children, oof, extent)
+}
+
+fn is_dense(style: &Style) -> bool {
+    marker(style, PACK) == Some("dense")
+        || parse_flow(style.grid_flow()).is_some_and(|flow| flow.dense)
 }
