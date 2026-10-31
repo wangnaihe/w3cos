@@ -268,7 +268,7 @@ fn cell_padding(style: &Style, space: &ConstraintSpace, collapsed: bool) -> [f32
             pad[1] += UA_CELL_PADDING;
             pad[3] += UA_CELL_PADDING;
         }
-        let definite_height = !collapsed && length_px(style.height, style, None, space).is_some();
+        let definite_height = length_px(style.height, style, None, space).is_some();
         if !definite_height {
             pad[0] += UA_CELL_PADDING;
             pad[2] += UA_CELL_PADDING;
@@ -1278,6 +1278,27 @@ fn layout_cell_fragment(
     content_width: f32,
     space: &ConstraintSpace,
 ) -> Option<LayoutResult> {
+    // A cell is laid out once at its natural height and stretched to the
+    // row afterwards, so a percentage block size below it stays auto. Where
+    // the cell, its row or section, or the table has a specified height,
+    // Chrome resolves it against the stretched cell (css-sizing/
+    // table-child-percentage-height-with-border-box); that needs a second
+    // pass, so such tables stay on the legacy engine.
+    if flat[index + 1..flat[index].subtree_end]
+        .iter()
+        .any(|node| matches!(node.style.height, Dimension::Percent(_)))
+    {
+        let mut ancestor = Some(index);
+        while let Some(node) = ancestor {
+            if !matches!(flat[node].style.height, Dimension::Auto) {
+                return super::bail("table-cell-percent-height");
+            }
+            if flat[node].style.display == Display::Table {
+                break;
+            }
+            ancestor = flat[node].parent;
+        }
+    }
     let mut nested = *space;
     nested.available_inline = content_width.max(0.0);
     nested.percentage_block = None;
@@ -1393,7 +1414,18 @@ pub(super) fn intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, true)
+    intrinsic_border_box_inner(flat, index, space, true, Some(space.available_inline))
+}
+
+/// The table's min/max-content contribution to its parent: like
+/// `intrinsic_border_box`, but a percentage `width` is cyclic (the parent
+/// is being sized) and counts as auto, CSS Sizing 3 5.2.1.
+pub(super) fn contribution_border_box(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    intrinsic_border_box_inner(flat, index, space, true, None)
 }
 
 /// Column min/max without the table's own `width`. Flex uses this so a
@@ -1403,7 +1435,7 @@ pub(super) fn content_intrinsic_border_box(
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
-    intrinsic_border_box_inner(flat, index, space, false)
+    intrinsic_border_box_inner(flat, index, space, false, Some(space.available_inline))
 }
 
 fn intrinsic_border_box_inner(
@@ -1411,6 +1443,7 @@ fn intrinsic_border_box_inner(
     index: usize,
     space: &ConstraintSpace,
     include_specified: bool,
+    specified_basis: Option<f32>,
 ) -> Option<MinMax> {
     let style = flat[index].style;
     let grid = grid_of(flat, index);
@@ -1464,9 +1497,7 @@ fn intrinsic_border_box_inner(
     }
     let mut min = min_tracks + gaps + lines;
     let mut max = max_tracks + gaps + lines;
-    if include_specified
-        && let Some(specified) = border_box_size(style, space, Some(space.available_inline))
-    {
+    if include_specified && let Some(specified) = border_box_size(style, space, specified_basis) {
         min = min.max(specified);
         max = max.max(specified);
     }

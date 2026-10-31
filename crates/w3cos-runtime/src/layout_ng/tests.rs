@@ -5477,6 +5477,332 @@ fn inline_svgs_match_chrome() {
     assert!(!block::unsupported_reasons(&flat).is_empty());
 }
 
+/// A scroll container's baseline is its bottom margin edge, in an
+/// inline-block and as a block child of one (css/CSS2/linebox/
+/// baseline-block-with-overflow-001). Border boxes and the trailing text's
+/// y measured in headless Chrome 156 (Ahem 10px, line-height 1).
+#[test]
+fn scroll_container_baseline_is_the_margin_edge_like_chrome() {
+    use w3cos_std::style::Overflow;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    // (name, inner display, inner text, inner margin-bottom, outer rect,
+    //  inner rect, trailing text y)
+    #[allow(clippy::type_complexity)]
+    let cases: [(
+        &str,
+        Display,
+        &str,
+        f32,
+        (f32, f32, f32, f32),
+        (f32, f32, f32, f32),
+        f32,
+    ); 4] = [
+        (
+            "b2",
+            Display::Block,
+            "",
+            0.0,
+            (0.0, 0.0, 30.0, 50.0),
+            (0.0, 0.0, 30.0, 30.0),
+            22.0,
+        ),
+        (
+            "b3",
+            Display::Block,
+            "XX",
+            0.0,
+            (0.0, 0.0, 30.0, 50.0),
+            (0.0, 0.0, 30.0, 30.0),
+            22.0,
+        ),
+        (
+            "b4",
+            Display::InlineBlock,
+            "XX",
+            30.0,
+            (0.0, 0.0, 30.0, 82.0),
+            (0.0, 0.0, 30.0, 30.0),
+            52.0,
+        ),
+        (
+            "b5",
+            Display::Block,
+            "XX",
+            30.0,
+            (0.0, 0.0, 30.0, 80.0),
+            (0.0, 0.0, 30.0, 30.0),
+            52.0,
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (name, display, text, margin_bottom, want_outer, want_inner, want_y) in cases {
+        let inner_style = Style {
+            display,
+            width: Dimension::Px(30.0),
+            height: Dimension::Px(30.0),
+            overflow: Overflow::Hidden,
+            margin: margins(0.0, 0.0, margin_bottom, 0.0),
+            ..font.clone()
+        };
+        let inner_children = if text.is_empty() {
+            vec![]
+        } else {
+            vec![Component::text(
+                text,
+                Style {
+                    display: Display::Inline,
+                    ..font.clone()
+                },
+            )]
+        };
+        let outer_style = Style {
+            display: Display::InlineBlock,
+            padding: margins(0.0, 0.0, 20.0, 0.0),
+            ..font.clone()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                font.clone(),
+                vec![
+                    node(outer_style, vec![node(inner_style, inner_children)]),
+                    Component::text(
+                        " XX",
+                        Style {
+                            display: Display::Inline,
+                            ..font.clone()
+                        },
+                    ),
+                ],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        let reasons = block::unsupported_reasons(&flat);
+        if !reasons.is_empty() {
+            bad.push(format!("{name}: bails {reasons:?}"));
+            continue;
+        }
+        let Some((rects, _)) = layout_tree_with_text(&root, &flat, 800.0, 600.0) else {
+            bad.push(format!("{name}: no NG layout"));
+            continue;
+        };
+        let (outer, inner) = (rect(&rects, 2), rect(&rects, 3));
+        let last = rects.iter().map(|(_, i)| *i).max().unwrap();
+        let trailing = Some(rect(&rects, last).1);
+        if outer != want_outer || inner != want_inner || trailing != Some(want_y) {
+            bad.push(format!(
+                "{name}: outer {outer:?} inner {inner:?} text y {trailing:?}; want {want_outer:?} {want_inner:?} {want_y}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Percentages are cyclic inside an intrinsic-size probe: they count as
+/// auto in the min/max-content contribution and resolve afterwards.
+/// Border boxes measured in headless Chrome 156 (css/CSS2/normal-flow/
+/// intrinsic-size-with-negative-margins and css/CSS2/floats/
+/// floats-wrap-bfc-005).
+#[test]
+fn percentages_in_intrinsic_contributions_resolve_afterwards_like_chrome() {
+    use w3cos_std::style::Float;
+    // A shrink-to-fit inline-block whose child's `margin-right: -100%`
+    // resolved against the indefinite probe would have shrunk it to nothing.
+    let ib = Style {
+        display: Display::InlineBlock,
+        line_height: 0.0,
+        ..block()
+    };
+    let root = node(
+        Style {
+            line_height: 0.0,
+            ..block()
+        },
+        vec![node(
+            Style {
+                border_width: 25.0,
+                ..ib.clone()
+            },
+            vec![node(
+                Style {
+                    width: Dimension::Px(50.0),
+                    height: Dimension::Px(50.0),
+                    margin: Edges {
+                        right: Spacing::Percent(-100.0),
+                        ..Edges::default()
+                    },
+                    ..ib.clone()
+                },
+                vec![],
+            )],
+        )],
+    );
+    let out = ng_rects(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (25.0, 25.0, 50.0, 50.0));
+
+    // A nested table's 50% width is not scaled inside the outer table's
+    // contribution; it is 50% of the 300px cell afterwards.
+    let table = |width: Dimension, rows: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Table,
+                width,
+                ..Style::default()
+            },
+            rows,
+        )
+    };
+    let row = |cells: Vec<Component>| {
+        node(
+            Style {
+                display: Display::TableRow,
+                ..Style::default()
+            },
+            cells,
+        )
+    };
+    let cell = |children: Vec<Component>| {
+        node(
+            Style {
+                display: Display::TableCell,
+                ..Style::default()
+            },
+            children,
+        )
+    };
+    let float = node(
+        Style {
+            display: Display::Block,
+            float: Float::Left,
+            width: Dimension::Px(200.0),
+            height: Dimension::Px(20.0),
+            ..Style::default()
+        },
+        vec![],
+    );
+    let inner = node(
+        Style {
+            display: Display::Table,
+            width: Dimension::Percent(50.0),
+            height: Dimension::Px(20.0),
+            ..Style::default()
+        },
+        vec![row(vec![cell(vec![])])],
+    );
+    let root = node(
+        block(),
+        vec![table(
+            Dimension::Px(300.0),
+            vec![row(vec![cell(vec![float, inner])])],
+        )],
+    );
+    let out = ng_rects(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 300.0, 40.0));
+    assert_eq!(rect(&out, 4), (0.0, 0.0, 200.0, 20.0));
+    assert_eq!(rect(&out, 5), (0.0, 20.0, 150.0, 20.0));
+}
+
+/// css/css-tables/border-writing-mode-dynamic-001 (horizontal state):
+/// collapsed outer borders of 10/20/30/40px come from the table, a row
+/// group, a row or a cell and all give a 172x132 table border box.
+/// Measured in headless Chrome 156.
+#[test]
+fn collapsed_outer_borders_from_any_table_part_match_chrome() {
+    use w3cos_std::style::BorderLineStyle;
+    let mix = |style: Style| Style {
+        border_top_width: Some(10.0),
+        border_bottom_width: Some(20.0),
+        border_left_width: Some(30.0),
+        border_right_width: Some(40.0),
+        border_styles: [Some(BorderLineStyle::Solid); 4],
+        ..style
+    };
+    let plain = |display: Display| Style {
+        display,
+        ..Style::default()
+    };
+    let cell = |style: Style| {
+        node(
+            Style {
+                display: Display::TableCell,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                padding: margins(1.0, 1.0, 1.0, 1.0),
+                ..style
+            },
+            vec![Component::text(
+                "TABLE",
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            )],
+        )
+    };
+    let table = |style: Style, children: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Table,
+                border_collapse: true,
+                ..style
+            },
+            children,
+        )
+    };
+    let row = |style: Style, cells: Vec<Component>| node(style, cells);
+    let root = node(
+        block(),
+        vec![
+            table(
+                mix(Style::default()),
+                vec![row(plain(Display::TableRow), vec![cell(Style::default())])],
+            ),
+            table(
+                Style::default(),
+                vec![node(
+                    mix(plain(Display::TableRowGroup)),
+                    vec![row(plain(Display::TableRow), vec![cell(Style::default())])],
+                )],
+            ),
+            table(
+                Style::default(),
+                vec![row(
+                    mix(plain(Display::TableRow)),
+                    vec![cell(Style::default())],
+                )],
+            ),
+            table(
+                Style::default(),
+                vec![row(
+                    plain(Display::TableRow),
+                    vec![cell(mix(Style::default()))],
+                )],
+            ),
+        ],
+    );
+    let out = ng_rects(&root);
+    let tables = [1usize, 5, 10, 14];
+    let got: Vec<_> = tables.iter().map(|i| rect(&out, *i)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (0.0, 0.0, 172.0, 132.0),
+            (0.0, 132.0, 172.0, 132.0),
+            (0.0, 264.0, 172.0, 132.0),
+            (0.0, 396.0, 172.0, 132.0),
+        ],
+        "table, tbody, tr, td"
+    );
+}
+
 /// Ideographic and zero width spaces in one inline-block's text, against
 /// headless Chrome 156 (Ahem 10px, a 200px container, so no line needs to
 /// break at them). A line that does need a break at one of them still

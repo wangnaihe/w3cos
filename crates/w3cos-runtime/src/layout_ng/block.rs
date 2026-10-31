@@ -405,7 +405,11 @@ fn layout_float(
         Spacing::Auto => 0.0,
         s => resolve_spacing_for_layout(
             s,
-            space.available_inline,
+            if space.percent_unresolved {
+                0.0
+            } else {
+                space.available_inline
+            },
             style,
             space.viewport_w,
             space.viewport_h,
@@ -1048,6 +1052,12 @@ fn canvas_used_size(attr_width: f32, attr_height: f32, style: &Style) -> (f32, f
 }
 
 /// Either axis computes to something other than visible (CSS2 11.1.1).
+/// CSS 2.1 10.8.1: a box whose overflow clips (a scroll container) has
+/// its bottom margin edge as baseline, instead of a line box's.
+pub(super) fn baseline_is_margin_edge(style: &Style) -> bool {
+    non_visible_overflow(style) && style.display.establishes_overflow_clip()
+}
+
 fn non_visible_overflow(style: &Style) -> bool {
     style.resolved_overflow_x() != Overflow::Visible
         || style.resolved_overflow_y() != Overflow::Visible
@@ -1374,8 +1384,18 @@ pub(super) struct BoxMetrics {
 /// CSS2 10.3.3 (+10.4) used width and horizontal margins.
 pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetrics {
     let cb = space.available_inline;
-    let spacing =
-        |s: Spacing| resolve_spacing_for_layout(s, cb, style, space.viewport_w, space.viewport_h);
+    // Cyclic inline percentages (an intrinsic probe): zero margins and
+    // padding, auto width, no min/max-width.
+    let pct_cb = (!space.percent_unresolved).then_some(cb);
+    let spacing = |s: Spacing| {
+        resolve_spacing_for_layout(
+            s,
+            pct_cb.unwrap_or(0.0),
+            style,
+            space.viewport_w,
+            space.viewport_h,
+        )
+    };
     let border = border(style);
     let padding = [
         spacing(style.padding.top),
@@ -1399,15 +1419,15 @@ pub(super) fn resolve_inline(style: &Style, space: &ConstraintSpace) -> BoxMetri
     let specified = if marker(style, WIDTH_KEYWORD).is_some() && size_contained(style) {
         Some(contain_intrinsic_size(style).0)
     } else {
-        resolve_dim(style.width, Some(cb), style, space).map(to_content)
+        resolve_dim(style.width, pct_cb, style, space).map(to_content)
     };
     let mut content_width = specified
         .unwrap_or(cb - margin[1] - margin[3] - edges)
         .max(0.0);
-    if let Some(max) = resolve_dim(style.max_width, Some(cb), style, space).map(to_content) {
+    if let Some(max) = resolve_dim(style.max_width, pct_cb, style, space).map(to_content) {
         content_width = content_width.min(max);
     }
-    if let Some(min) = resolve_dim(style.min_width, Some(cb), style, space).map(to_content) {
+    if let Some(min) = resolve_dim(style.min_width, pct_cb, style, space).map(to_content) {
         content_width = content_width.max(min);
     }
     // Inline-start / inline-end sides in the containing block's direction.
@@ -1492,24 +1512,23 @@ impl MinMax {
 /// Blink's line breaker).
 pub(super) const INDEFINITE_INLINE: f32 = 33_554_431.0;
 
-/// Percentages in the inline axis resolve against the containing block,
-/// which intrinsic sizing has not sized yet (CSS Sizing 3 5.2.1 cyclic
-/// percentages): such subtrees stay on legacy.
-fn percent_inline(style: &Style) -> bool {
-    let dim = |d: Dimension| matches!(d, Dimension::Percent(_));
-    let spacing = |s: Spacing| matches!(s, Spacing::Percent(_));
-    dim(style.width)
-        || dim(style.min_width)
-        || dim(style.max_width)
-        || spacing(style.margin.left)
-        || spacing(style.margin.right)
-        || spacing(style.padding.left)
-        || spacing(style.padding.right)
+/// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
+fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, width: f32) -> f32 {
+    clamp_inline_in(style, space, edges, width, Some(space.available_inline))
 }
 
-/// Clamp a content-box inline size by min-width / max-width (CSS2 10.4).
-fn clamp_inline(style: &Style, space: &ConstraintSpace, edges: f32, mut width: f32) -> f32 {
-    let cb = Some(space.available_inline);
+/// `clamp_inline` against an explicit containing-block inline size. A
+/// `None` basis (an intrinsic-size computation: the containing block is
+/// not sized yet) leaves percentage min-width / max-width unresolved, so
+/// they clamp nothing (CSS Sizing 3 5.2.1, Blink's indefinite-size
+/// ResolveMinInlineLength / ResolveMaxInlineLength).
+fn clamp_inline_in(
+    style: &Style,
+    space: &ConstraintSpace,
+    edges: f32,
+    mut width: f32,
+    cb: Option<f32>,
+) -> f32 {
     let to_content = |w: f32| match style.box_sizing {
         BoxSizing::BorderBox => (w - edges).max(0.0),
         BoxSizing::ContentBox => w,
@@ -1540,7 +1559,7 @@ pub(super) fn intrinsic_sizes(
     // padding are added back onto this content box.
     if matches!(info.style.display, Display::Table | Display::InlineTable) {
         let border_box =
-            super::table::intrinsic_border_box(flat, index, space).why("table:intrinsic")?;
+            super::table::contribution_border_box(flat, index, space).why("table:intrinsic")?;
         let style = info.style;
         let side = |s: Spacing| match s {
             Spacing::Auto => 0.0,
@@ -1553,13 +1572,6 @@ pub(super) fn intrinsic_sizes(
             b[1] + b[3] + side(style.padding.left) + side(style.padding.right)
         };
         return Some(border_box.map(|width| (width - edges).max(0.0)));
-    }
-    if subtree
-        .iter()
-        .filter(rendered)
-        .any(|node| percent_inline(node.style))
-    {
-        return super::bail("intrinsic-percent");
     }
     if is_author_grid(info.style) {
         // A grid's min/max-content size is the sum of its tracks, not the
@@ -1641,7 +1653,7 @@ pub(super) fn intrinsic_sizes(
             }),
             None => intrinsic_sizes(flat, child, space).why("intrinsic")?,
         };
-        let border_box = content.map(|w| clamp_inline(style, space, edges, w) + edges);
+        let border_box = content.map(|w| clamp_inline_in(style, space, edges, w, None) + edges);
         let max_contribution = if floating {
             // A float outside the content area (negative margins) adds
             // nothing.
@@ -1707,7 +1719,8 @@ fn shrink_to_fit(
         None if sizes.max <= available + 1.0 / 128.0 => sizes.max,
         None => return super::bail("shrink-min"),
     };
-    Some(clamp_inline(style, space, edges, width.max(0.0)))
+    let cb = (!space.percent_unresolved).then_some(space.available_inline);
+    Some(clamp_inline_in(style, space, edges, width.max(0.0), cb))
 }
 
 /// Author `display:flex`. Synthetic boxes stay on their own algorithms:
@@ -1875,6 +1888,7 @@ pub(super) fn layout_root(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        percent_unresolved: false,
     };
     let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
@@ -2085,6 +2099,7 @@ fn layout_block_in(
         margin_strut: MarginStrut::default(),
         forced_bfc: false,
         adjoining_from: 0,
+        percent_unresolved: false,
     };
 
     let can_escape_top = !bfc_root && bt == 0.0 && pt == 0.0;
@@ -2683,13 +2698,22 @@ fn layout_block_in(
             pending = result.end_strut;
             at_top = false;
         }
-        if result.last_baseline != LastBaseline::NoLines {
-            last_baseline = result.last_baseline.offset(bt + pt + y);
+        // A scroll container block child exposes its bottom margin edge as
+        // its baseline, whatever lines it holds (css/CSS2/linebox/
+        // baseline-block-with-overflow-001, measured in Chrome).
+        let (child_last, child_first) = if baseline_is_margin_edge(child_info.style) {
+            let edge = LastBaseline::At(result.fragment.height + child_metrics.margin[2]);
+            (edge, edge)
+        } else {
+            (result.last_baseline, result.first_baseline)
+        };
+        if child_last != LastBaseline::NoLines {
+            last_baseline = child_last.offset(bt + pt + y);
         }
         if !matches!(first_baseline, LastBaseline::At(_)) {
-            let candidate = match result.first_baseline {
-                LastBaseline::At(_) => result.first_baseline,
-                _ => result.last_baseline,
+            let candidate = match child_first {
+                LastBaseline::At(_) => child_first,
+                _ => child_last,
             };
             if matches!(candidate, LastBaseline::At(_)) {
                 first_baseline = candidate.offset(bt + pt + y);

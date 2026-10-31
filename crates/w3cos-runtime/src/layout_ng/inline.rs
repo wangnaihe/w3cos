@@ -1874,7 +1874,11 @@ pub(super) fn layout_inline_beside(
             let side = |m| {
                 crate::layout::resolve_spacing_for_layout(
                     m,
-                    available,
+                    if space.percent_unresolved {
+                        0.0
+                    } else {
+                        available
+                    },
                     style,
                     space.viewport_w,
                     space.viewport_h,
@@ -1888,6 +1892,7 @@ pub(super) fn layout_inline_beside(
             ];
             let height = margin[0] + result.fragment.height + margin[2];
             let ascent = match result.last_baseline {
+                _ if super::block::baseline_is_margin_edge(style) => height,
                 LastBaseline::At(b) => margin[0] + b,
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),
@@ -2612,6 +2617,7 @@ pub(super) fn inline_min_max(
             &ConstraintSpace {
                 available_inline: available,
                 percentage_block: None,
+                percent_unresolved: true,
                 ..*space
             },
         )
