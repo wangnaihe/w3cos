@@ -1111,6 +1111,18 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
     if let Some(ref value) = s.grid_column {
         fields.push(format!("grid_column: Some({value:?}.to_string())"));
     }
+    if let Some(ref value) = s.grid_template_rows {
+        fields.push(format!("grid_template_rows: Some({value:?}.to_string())"));
+    }
+    if let Some(ref value) = s.grid_template_areas {
+        fields.push(format!("grid_template_areas: Some({value:?}.to_string())"));
+    }
+    if let Some(ref value) = s.grid_row {
+        fields.push(format!("grid_row: Some({value:?}.to_string())"));
+    }
+    if let Some(ref value) = s.grid_area {
+        fields.push(format!("grid_area: Some({value:?}.to_string())"));
+    }
     if let Some(ref mw) = s.max_width {
         fields.push(format!("max_width: {}", gen_dimension(mw)));
     }
@@ -1717,6 +1729,18 @@ fn gen_dom_style_calls(style: &StyleDecl, var: &str, out: &mut String, indent: &
     }
     if let Some(ref value) = style.grid_column {
         out.push_str(&sp("grid-column", value));
+    }
+    if let Some(ref value) = style.grid_template_rows {
+        out.push_str(&sp("grid-template-rows", value));
+    }
+    if let Some(ref value) = style.grid_template_areas {
+        out.push_str(&sp("grid-template-areas", value));
+    }
+    if let Some(ref value) = style.grid_row {
+        out.push_str(&sp("grid-row", value));
+    }
+    if let Some(ref value) = style.grid_area {
+        out.push_str(&sp("grid-area", value));
     }
     if let Some(ref w) = style.width {
         out.push_str(&sp("width", w));
