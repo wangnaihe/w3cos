@@ -1083,8 +1083,15 @@ pub(super) fn layout(
             // A definite replaced width still honours min/max-width.
             cross = match cross {
                 Some(size) => Some(
-                    clamp_cross(child_style, false, cross_edges, size, Some(inner_width), space)
-                        .why("flex:cross")?,
+                    clamp_cross(
+                        child_style,
+                        false,
+                        cross_edges,
+                        size,
+                        Some(inner_width),
+                        space,
+                    )
+                    .why("flex:cross")?,
                 ),
                 None => None,
             };
@@ -1146,8 +1153,7 @@ pub(super) fn layout(
                         && matches!(child_style.min_width, Dimension::Auto)
                     {
                         specified_height.map(|height| {
-                            (height - margin_cross_start - margin_cross_end - cross_edges)
-                                .max(0.0)
+                            (height - margin_cross_start - margin_cross_end - cross_edges).max(0.0)
                         })
                     } else {
                         None
