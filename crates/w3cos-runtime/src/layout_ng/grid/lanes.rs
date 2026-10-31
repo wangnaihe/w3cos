@@ -9,10 +9,11 @@
 
 use super::{
     Breadth, Dimension, EPS, FlatNodeInfo, INF, Pack, Spec, Style, align_pack, axis_offset,
-    column_pack, columns_spec, expand_auto, finalize, from_units, gap_sum, grow, has_marker,
-    explicit_stretch, inline_minmax, is_baseline, is_subgrid_axis, layout_item, marker, pack_gap, parse_axis_syntax,
-    parse_flow, parse_template, placement, positions, repeat_basis, resolve_axis, resolve_block,
-    row_pack, spacing_px, span_sum, to_content, track_from_spec, units, used_item_align,
+    column_pack, columns_spec, expand_auto, explicit_stretch, finalize, from_units, gap_sum, grow,
+    has_marker, inline_minmax, is_baseline, is_subgrid_axis, layout_item, marker, pack_gap,
+    parse_axis_syntax, parse_flow, parse_template, placement, positions, repeat_basis,
+    resolve_axis, resolve_block, row_pack, spacing_px, span_sum, to_content, track_from_spec,
+    units, used_item_align,
 };
 use crate::layout_ng::block::{self, BoxMetrics};
 use crate::layout_ng::inline::rendered_children;
@@ -946,7 +947,7 @@ fn stack_rows(
         let (mut min_block, mut max_block) = (block_of(&laid.fragment), block_of(&laid.fragment));
         if matches!(flat[entry.index].style.width, Dimension::Auto) {
             let (min_c, max_c) = inline_minmax(flat, entry.index, space).why("lanes:intrinsic")?;
-            let mut at = |width: i64| -> Option<i64> {
+            let at = |width: i64| -> Option<i64> {
                 let sized = prepare(flat, style, space, entry.index, inner, false, Some(width))?;
                 let laid = layout_item(
                     flat,
@@ -1130,8 +1131,8 @@ fn stack_rows(
             let (shift, stretch) = stack_shift(prepared.stack, reverse.fill, room);
             at += shift;
             let child = flat[index].style;
-            let explicit = !matches!(child.width, Dimension::Auto)
-                || has_marker(child, block::WIDTH_KEYWORD);
+            let explicit =
+                !matches!(child.width, Dimension::Auto) || has_marker(child, block::WIDTH_KEYWORD);
             if stretch && !explicit && room > 0 {
                 let edges_h = units(fragment.width) - units(prepared.content_width);
                 let width = units(fragment.width) + room - edges_h;
