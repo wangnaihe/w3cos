@@ -5802,3 +5802,113 @@ fn collapsed_outer_borders_from_any_table_part_match_chrome() {
         "table, tbody, tr, td"
     );
 }
+
+/// Ideographic and zero width spaces in one inline-block's text, against
+/// headless Chrome 156 (Ahem 10px, a 200px container, so no line needs to
+/// break at them). A line that does need a break at one of them still
+/// falls back at layout time: the breaker keeps one fragment per item.
+#[test]
+fn unicode_breakable_spaces_in_text_match_chrome() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let build = |text: &str, width: f32| {
+        let inline_block = Style {
+            display: Display::InlineBlock,
+            ..font.clone()
+        };
+        let container = Style {
+            width: Dimension::Px(width),
+            ..font.clone()
+        };
+        node(
+            block(),
+            vec![node(
+                container,
+                vec![node(
+                    inline_block,
+                    vec![Component::text(
+                        text,
+                        Style {
+                            display: Display::Inline,
+                            ..font.clone()
+                        },
+                    )],
+                )],
+            )],
+        )
+    };
+    let cases: [(&str, &str, (f32, f32, f32, f32)); 5] = [
+        ("n1 ideographic", "XX\u{3000}XX", (0.0, 0.0, 50.0, 10.0)),
+        ("n2 zwsp", "XX\u{200b}XX", (0.0, 0.0, 40.0, 10.0)),
+        (
+            "n3 trailing ideographic",
+            "X\u{3000}",
+            (0.0, 0.0, 20.0, 10.0),
+        ),
+        (
+            "n4 leading ideographic",
+            "\u{3000}XX",
+            (0.0, 0.0, 30.0, 10.0),
+        ),
+        (
+            "n5 mixed",
+            "XX\u{3000}\u{3000}XX\u{200b}X",
+            (0.0, 0.0, 70.0, 10.0),
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (name, text, want) in cases {
+        let root = build(text, 200.0);
+        let flat = pre_flatten(&root);
+        let reasons = block::unsupported_reasons(&flat);
+        if !reasons.is_empty() {
+            bad.push(format!("{name}: bails {reasons:?}"));
+            continue;
+        }
+        let Some((rects, _)) = layout_tree_with_text(&root, &flat, 800.0, 600.0) else {
+            bad.push(format!("{name}: no NG layout"));
+            continue;
+        };
+        let got = rect(&rects, 3);
+        if got != want {
+            bad.push(format!("{name}: got {got:?} want {want:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+
+    // A 50px container needs the break inside the item: NG declines the
+    // layout (legacy lays the page out) instead of guessing.
+    let root = build("XX\u{3000}XX\u{3000}XX", 50.0);
+    let flat = pre_flatten(&root);
+    assert!(block::unsupported_reasons(&flat).is_empty());
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+
+    // Spaces that stay on legacy: joiners (Chrome gives them no advance, the
+    // fallback face does), no-break and fallback-width spaces, word joiner.
+    for text in [
+        "XX\u{200c}XX",
+        "XX\u{200d}XX",
+        "XX\u{202f}XX",
+        "XX\u{2007}XX",
+        "XX\u{2060}XX",
+        "XX\u{2000}XX",
+        "XX\u{205f}XX",
+        "XX\u{2003}XX",
+        "XX\u{2009}XX",
+    ] {
+        let root = build(text, 200.0);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::unsupported_reasons(&flat)
+                .iter()
+                .any(|r| r == "text:script"),
+            "{text:?} must still bail as text:script"
+        );
+    }
+}
