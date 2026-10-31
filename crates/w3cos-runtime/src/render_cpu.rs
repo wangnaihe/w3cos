@@ -657,6 +657,12 @@ thread_local! {
     static RENDER_NODE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Flat paint index of the node `paint_nodes` is currently drawing. Canvas
+    /// surfaces are published per flat index, and `render_node` has no index.
+    static CURRENT_PAINT_INDEX: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
 fn note_painted_node() {
     #[cfg(test)]
     RENDER_NODE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
@@ -731,6 +737,7 @@ fn paint_nodes(
             _ => None,
         };
         let is_focused = focused_index == Some(idx);
+        CURRENT_PAINT_INDEX.with(|slot| slot.set(idx));
         render_node(
             pixmap,
             offset_rect,
@@ -1162,6 +1169,22 @@ fn render_node(
                         pixmap, rect, label, style, text_color, font, clip_mask,
                     );
                 }
+            }
+        }
+        ComponentKind::Canvas { .. } => {
+            let index = CURRENT_PAINT_INDEX.with(std::cell::Cell::get);
+            if let Some(snapshot) = crate::canvas2d::surface_snapshot(index) {
+                draw_image_pixels(
+                    pixmap,
+                    text_content_box(rect, style),
+                    snapshot.width,
+                    snapshot.height,
+                    &snapshot.pixels,
+                    opacity,
+                    clip_mask,
+                    None,
+                    crate::background_image::BackgroundBlendMode::Normal,
+                );
             }
         }
         ComponentKind::Image { src } => {
