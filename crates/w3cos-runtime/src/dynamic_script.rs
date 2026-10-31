@@ -10467,6 +10467,31 @@ mod tests {
 
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     #[test]
+    fn visibility_hidden_boxes_keep_layout_but_do_not_paint() {
+        // Code-OSS hides the walkthrough "x" buttons with `visibility: hidden`
+        // until hover; they must occupy space without painting, while a
+        // descendant that resets `visibility: visible` still paints.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div id="hidden" style="position:absolute;left:0;top:0;width:40px;height:40px;background:#00ff00;visibility:hidden">
+              <div id="reset" style="position:absolute;left:0;top:0;width:10px;height:10px;background:#ff0000;visibility:visible"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:40px;height:40px;background:#00ff00"></div>
+            </body></html>"#;
+        load_html_on_shared_vm(html, "https://visibility.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_ne!(pixel(30, 30), [0, 255, 0], "visibility:hidden box painted");
+        assert_eq!(pixel(5, 5), [255, 0, 0], "visible descendant missing");
+        assert_eq!(pixel(120, 20), [0, 255, 0], "control box missing");
+        let node = crate::dom::query_selector_all("#hidden")[0];
+        assert_eq!(crate::dom::bounding_rect(node).width, 40.0);
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
     fn opacity_zero_ancestor_hides_descendant_paint() {
         // Code-OSS hides idle scrollbars with `.invisible { opacity: 0 }`; the
         // slider child must not paint through its transparent parent.
