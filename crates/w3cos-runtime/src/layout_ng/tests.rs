@@ -9838,3 +9838,241 @@ fn unicode_breakable_spaces_in_text_match_chrome() {
         );
     }
 }
+
+/// `width: min-content | max-content | fit-content` on in-flow block, flex
+/// and grid containers (Ahem 10px/1). Border boxes measured in headless
+/// Chrome 156 (testdata/chrome-width-keywords.json).
+#[test]
+fn intrinsic_width_keywords_match_chrome() {
+    use w3cos_std::style::{BoxSizing, CustomProperties};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/chrome-width-keywords.json")).unwrap();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text = |s: &str| {
+        Component::text(
+            s,
+            Style {
+                display: Display::Inline,
+                ..font.clone()
+            },
+        )
+    };
+    let kw = |mut style: Style, word: &str| {
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-width-keyword".to_string(),
+            word.to_string(),
+        )]));
+        style
+    };
+    let boxed = |style: Style, kids: Vec<Component>| node(style, kids);
+    let item = |words: &str| {
+        if words.is_empty() {
+            boxed(font.clone(), vec![])
+        } else {
+            boxed(font.clone(), vec![text(words)])
+        }
+    };
+    let wrap = |width: f32, inner: Component| {
+        boxed(
+            Style {
+                width: Dimension::Px(width),
+                ..font.clone()
+            },
+            vec![inner],
+        )
+    };
+    let flex = |direction| Style {
+        display: Display::Flex,
+        flex_direction: direction,
+        ..font.clone()
+    };
+    let grid = |columns: &str| Style {
+        display: Display::Grid,
+        grid_template_columns: Some(columns.to_string()),
+        ..font.clone()
+    };
+    let a = |word: &str| boxed(kw(font.clone(), word), vec![text("XX XX")]);
+    // (case, tree, [(flat index, Chrome id)])
+    let cases: Vec<(&str, Component, Vec<(usize, &str)>)> = vec![
+        ("block-max", a("max-content"), vec![(1, "a")]),
+        ("block-min", a("min-content"), vec![(1, "a")]),
+        (
+            "fit-narrow",
+            wrap(30.0, a("fit-content")),
+            vec![(1, "w"), (2, "a")],
+        ),
+        (
+            "fit-wide",
+            wrap(100.0, a("fit-content")),
+            vec![(1, "w"), (2, "a")],
+        ),
+        (
+            "auto-margin",
+            wrap(
+                200.0,
+                boxed(
+                    kw(
+                        Style {
+                            margin: Edges {
+                                top: px(0.0),
+                                right: Spacing::Auto,
+                                bottom: px(0.0),
+                                left: Spacing::Auto,
+                            },
+                            padding: margins(5.0, 5.0, 5.0, 5.0),
+                            border_width: 2.0,
+                            ..font.clone()
+                        },
+                        "max-content",
+                    ),
+                    vec![text("XX XX")],
+                ),
+            ),
+            vec![(1, "w"), (2, "a")],
+        ),
+        (
+            "border-box",
+            boxed(
+                kw(
+                    Style {
+                        box_sizing: BoxSizing::BorderBox,
+                        padding: margins(5.0, 5.0, 5.0, 5.0),
+                        ..font.clone()
+                    },
+                    "min-content",
+                ),
+                vec![text("XX XX")],
+            ),
+            vec![(1, "a")],
+        ),
+        (
+            "clamped",
+            boxed(
+                kw(
+                    Style {
+                        max_width: Dimension::Px(30.0),
+                        ..font.clone()
+                    },
+                    "max-content",
+                ),
+                vec![text("XX XX")],
+            ),
+            vec![(1, "a")],
+        ),
+        (
+            "flex-row-max",
+            boxed(
+                kw(
+                    Style {
+                        gap: 5.0,
+                        ..flex(FlexDirection::Row)
+                    },
+                    "max-content",
+                ),
+                vec![
+                    boxed(
+                        Style {
+                            width: Dimension::Px(30.0),
+                            height: Dimension::Px(10.0),
+                            ..font.clone()
+                        },
+                        vec![],
+                    ),
+                    boxed(
+                        Style {
+                            width: Dimension::Px(20.0),
+                            height: Dimension::Px(10.0),
+                            ..font.clone()
+                        },
+                        vec![],
+                    ),
+                ],
+            ),
+            vec![(1, "f"), (2, "b"), (3, "c")],
+        ),
+        (
+            "flex-col-min",
+            boxed(
+                kw(flex(FlexDirection::Column), "min-content"),
+                vec![item("XX XX"), item("XX XX")],
+            ),
+            vec![(1, "f"), (2, "b"), (4, "c")],
+        ),
+        (
+            "flex-row-fit",
+            wrap(
+                40.0,
+                boxed(
+                    kw(flex(FlexDirection::Row), "fit-content"),
+                    vec![item("XX"), item("XX XX")],
+                ),
+            ),
+            vec![(1, "w"), (2, "f"), (3, "b"), (5, "c")],
+        ),
+        (
+            "grid-max",
+            boxed(
+                kw(grid("auto auto"), "max-content"),
+                vec![item("XX"), item("XXXX")],
+            ),
+            vec![(1, "g"), (2, "b"), (4, "c")],
+        ),
+        (
+            "grid-min",
+            boxed(
+                kw(grid("auto 30px"), "min-content"),
+                vec![item("XX XX"), item("")],
+            ),
+            vec![(1, "g"), (2, "b"), (4, "c")],
+        ),
+        (
+            "grid-fit",
+            wrap(
+                40.0,
+                boxed(
+                    kw(grid("auto auto"), "fit-content"),
+                    vec![item("XX XX"), item("XX XX")],
+                ),
+            ),
+            vec![(1, "w"), (2, "g"), (3, "b"), (5, "c")],
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (name, tree, ids) in cases {
+        let root = node(block(), vec![tree]);
+        let flat = pre_flatten(&root);
+        let reasons = block::unsupported_reasons(&flat);
+        if !reasons.is_empty() {
+            bad.push(format!("{name}: bails {reasons:?}"));
+            continue;
+        }
+        let Some((rects, _)) = layout_tree_with_text(&root, &flat, 800.0, 600.0) else {
+            bad.push(format!("{name}: no NG layout"));
+            continue;
+        };
+        for (index, id) in ids {
+            let want: Vec<f32> = golden["cases"][name]["rects"][id]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}/{id} missing"))
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            let got = rect(&rects, index);
+            if [got.0, got.1, got.2, got.3]
+                .iter()
+                .zip(&want)
+                .any(|(a, b)| (a - b).abs() > 1.0 / 64.0)
+            {
+                bad.push(format!("{name}/{id}: got {got:?} want {want:?}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
