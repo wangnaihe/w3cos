@@ -25128,11 +25128,18 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         } else {
             Vec::new()
         },
-        grid_column: s
-            .grid_column
+        grid_template_rows: s
+            .grid_template_rows
             .as_deref()
-            .map(parse_grid_column)
+            .map(parse_grid_template_columns)
             .unwrap_or_default(),
+        grid_template_areas: s
+            .grid_template_areas
+            .as_deref()
+            .map(parse_grid_template_areas)
+            .unwrap_or_default(),
+        grid_column: resolve_grid_placement(s.grid_area.as_deref(), s.grid_column.as_deref(), true),
+        grid_row: resolve_grid_placement(s.grid_area.as_deref(), s.grid_row.as_deref(), false),
         ..Style::DEFAULT
     };
     if let WDim::Ch(value) = s.width {
@@ -25191,6 +25198,18 @@ fn parse_grid_template_columns(value: &str) -> Vec<GridTemplateComponent<String>
 
 fn parse_grid_track(value: &str) -> Option<GridTemplateComponent<String>> {
     let value = value.trim();
+    if value == "min-content" {
+        return Some(taffy::style_helpers::minmax(
+            MinTrackSizingFunction::MIN_CONTENT,
+            MaxTrackSizingFunction::MIN_CONTENT,
+        ));
+    }
+    if value == "max-content" {
+        return Some(taffy::style_helpers::minmax(
+            MinTrackSizingFunction::MAX_CONTENT,
+            MaxTrackSizingFunction::MAX_CONTENT,
+        ));
+    }
     if let Some(number) = value.strip_suffix("fr")
         && let Ok(number) = number.trim().parse::<f32>()
     {
@@ -25217,6 +25236,12 @@ fn parse_grid_track(value: &str) -> Option<GridTemplateComponent<String>> {
 }
 
 fn parse_grid_min_track(value: &str) -> Option<MinTrackSizingFunction> {
+    if value == "min-content" {
+        return Some(MinTrackSizingFunction::MIN_CONTENT);
+    }
+    if value == "max-content" {
+        return Some(MinTrackSizingFunction::MAX_CONTENT);
+    }
     if value == "auto" {
         return Some(taffy::style_helpers::auto());
     }
@@ -25232,6 +25257,12 @@ fn parse_grid_min_track(value: &str) -> Option<MinTrackSizingFunction> {
 }
 
 fn parse_grid_max_track(value: &str) -> Option<MaxTrackSizingFunction> {
+    if value == "min-content" {
+        return Some(MaxTrackSizingFunction::MIN_CONTENT);
+    }
+    if value == "max-content" {
+        return Some(MaxTrackSizingFunction::MAX_CONTENT);
+    }
     if let Some(number) = value.strip_suffix("fr")
         && let Ok(number) = number.trim().parse::<f32>()
     {
@@ -25297,31 +25328,162 @@ fn split_css_top_level_once(value: &str, separator: char) -> Option<(&str, &str)
     None
 }
 
+/// Parse one `grid-row-start`-style token: `auto`, an integer line, `span N`
+/// or a custom ident naming a line or a `grid-template-areas` area edge.
+fn parse_grid_placement_token(token: &str) -> GridPlacement<String> {
+    let token = token.trim();
+    if token.is_empty() || token == "auto" {
+        return GridPlacement::Auto;
+    }
+    if let Ok(line) = token.parse::<i16>() {
+        return taffy::style_helpers::line(line);
+    }
+    if let Some(span) = token.strip_prefix("span") {
+        let span = span.trim();
+        if let Ok(count) = span.parse::<u16>() {
+            return taffy::style_helpers::span(count);
+        }
+        if !span.is_empty()
+            && span
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return GridPlacement::NamedSpan(span.to_string(), 1);
+        }
+        return GridPlacement::Auto;
+    }
+    if token
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return GridPlacement::NamedLine(token.to_string(), 1);
+    }
+    GridPlacement::Auto
+}
+
+/// A placement is a custom ident when it is a bare name (not `auto`, a number or `span`).
+fn is_grid_ident(token: &str) -> bool {
+    matches!(
+        parse_grid_placement_token(token),
+        GridPlacement::NamedLine(..)
+    )
+}
+
 fn parse_grid_column(value: &str) -> Line<GridPlacement<String>> {
     let value = value.trim();
-    if let Ok(start) = value.parse::<i16>() {
-        return Line {
-            start: taffy::style_helpers::line(start),
-            end: GridPlacement::Auto,
-        };
+    match value.split_once('/') {
+        Some((start, end)) => Line {
+            start: parse_grid_placement_token(start),
+            end: parse_grid_placement_token(end),
+        },
+        None => {
+            let start = parse_grid_placement_token(value);
+            // `grid-row: header` names both edges; other single values leave
+            // the end line auto.
+            let end = if matches!(start, GridPlacement::NamedLine(..)) {
+                start.clone()
+            } else {
+                GridPlacement::Auto
+            };
+            Line { start, end }
+        }
     }
-    if let Some(span) = value.strip_prefix("span ")
-        && let Ok(span) = span.trim().parse::<u16>()
-    {
-        return Line {
-            start: taffy::style_helpers::span(span),
-            end: GridPlacement::Auto,
-        };
+}
+
+/// Resolve `grid-area` plus the longhand-ish `grid-row`/`grid-column` into one
+/// axis placement. `grid-row`/`grid-column` win over the `grid-area` shorthand.
+fn resolve_grid_placement(
+    area: Option<&str>,
+    axis: Option<&str>,
+    column: bool,
+) -> Line<GridPlacement<String>> {
+    if let Some(axis) = axis {
+        return parse_grid_column(axis);
     }
-    if let Some((start, end)) = value.split_once('/')
-        && let (Ok(start), Ok(end)) = (start.trim().parse::<i16>(), end.trim().parse::<i16>())
-    {
-        return Line {
-            start: taffy::style_helpers::line(start),
-            end: taffy::style_helpers::line(end),
-        };
+    let Some(area) = area else {
+        return Line::default();
+    };
+    // grid-area: <row-start> / <column-start> / <row-end> / <column-end>
+    let parts: Vec<&str> = area.split('/').map(str::trim).collect();
+    let row_start = parts.first().copied().unwrap_or("auto");
+    let column_start = parts
+        .get(1)
+        .copied()
+        .unwrap_or(if is_grid_ident(row_start) {
+            row_start
+        } else {
+            "auto"
+        });
+    let row_end = parts
+        .get(2)
+        .copied()
+        .unwrap_or(if is_grid_ident(row_start) {
+            row_start
+        } else {
+            "auto"
+        });
+    let column_end = parts
+        .get(3)
+        .copied()
+        .unwrap_or(if is_grid_ident(column_start) {
+            column_start
+        } else {
+            "auto"
+        });
+    if column {
+        Line {
+            start: parse_grid_placement_token(column_start),
+            end: parse_grid_placement_token(column_end),
+        }
+    } else {
+        Line {
+            start: parse_grid_placement_token(row_start),
+            end: parse_grid_placement_token(row_end),
+        }
     }
-    Line::default()
+}
+
+/// Parse `grid-template-areas` strings (`". header header ." ". left . right"`)
+/// into Taffy areas. Each named area spans the bounding box of its cells.
+fn parse_grid_template_areas(value: &str) -> Vec<taffy::GridTemplateArea<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '"' || ch == '\'' {
+            let quote = ch;
+            let mut row = String::new();
+            for inner in chars.by_ref() {
+                if inner == quote {
+                    break;
+                }
+                row.push(inner);
+            }
+            rows.push(row.split_whitespace().map(str::to_string).collect());
+        }
+    }
+    let mut areas: Vec<taffy::GridTemplateArea<String>> = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        for (column_index, name) in row.iter().enumerate() {
+            if name.chars().all(|c| c == '.') {
+                continue;
+            }
+            let (row_start, column_start) = (row_index as u16 + 1, column_index as u16 + 1);
+            if let Some(area) = areas.iter_mut().find(|area| &area.name == name) {
+                area.row_end = area.row_end.max(row_start + 1);
+                area.column_start = area.column_start.min(column_start);
+                area.column_end = area.column_end.max(column_start + 1);
+            } else {
+                areas.push(taffy::GridTemplateArea {
+                    name: name.clone(),
+                    row_start,
+                    row_end: row_start + 1,
+                    column_start,
+                    column_end: column_start + 1,
+                });
+            }
+        }
+    }
+    areas
 }
 
 fn to_taffy_spacing(
@@ -29611,6 +29773,101 @@ mod tests {
         .unwrap();
         assert_eq!(bottom_border_only[0].0.width, 100.0);
         assert_eq!(bottom_border_only[0].0.height, 43.0);
+    }
+
+    #[test]
+    fn grid_template_areas_and_grid_area_place_items() {
+        fn cell(area: &str) -> Component {
+            Component::boxed(
+                Style {
+                    grid_area: Some(area.to_string()),
+                    ..Style::default()
+                },
+                Vec::new(),
+            )
+        }
+        // Mirrors Code-OSS's Welcome page grid.
+        let grid = Component::column(
+            Style {
+                display: WDisp::Grid,
+                width: WDim::Px(1400.0),
+                height: WDim::Px(400.0),
+                grid_template_rows: Some("25% minmax(min-content, auto) min-content".to_string()),
+                grid_template_columns: Some("1fr 6fr 1fr 6fr 1fr".to_string()),
+                grid_template_areas: Some(
+                    "\". header header header .\"\n\t\". left-column . right-column .\"\n\t\". footer footer footer .\""
+                        .to_string(),
+                ),
+                ..Style::default()
+            },
+            vec![
+                cell("header"),
+                cell("left-column"),
+                cell("right-column"),
+                cell("footer"),
+            ],
+        );
+        let layout = compute(&grid, 1400.0, 400.0).unwrap();
+        // 15 fr units over 1400px.
+        let fr = 1400.0 / 15.0;
+        let header = layout[1].0;
+        let left = layout[2].0;
+        let right = layout[3].0;
+        let footer = layout[4].0;
+        let close = |a: f32, b: f32| (a - b).abs() < 0.05;
+        assert!(
+            close(header.x, fr) && close(header.width, 13.0 * fr),
+            "{header:?}"
+        );
+        assert!(close(left.x, fr) && close(left.width, 6.0 * fr), "{left:?}");
+        assert!(
+            close(right.x, 8.0 * fr) && close(right.width, 6.0 * fr),
+            "{right:?}"
+        );
+        assert!(
+            close(footer.x, fr) && close(footer.width, 13.0 * fr),
+            "{footer:?}"
+        );
+        assert_eq!(header.y, 0.0);
+        assert!(
+            close(left.y, 100.0),
+            "left row starts below the 25% header row: {left:?}"
+        );
+        assert!(footer.y >= left.y);
+        assert!(close(left.y, right.y));
+    }
+
+    #[test]
+    fn grid_area_parsing_covers_names_and_numeric_forms() {
+        let areas = parse_grid_template_areas("\". a a\" \"b b .\"");
+        assert_eq!(areas.len(), 2);
+        assert_eq!(
+            (areas[0].name.as_str(), areas[0].row_start, areas[0].row_end),
+            ("a", 1, 2)
+        );
+        assert_eq!((areas[0].column_start, areas[0].column_end), (2, 4));
+        assert_eq!(
+            (areas[1].name.as_str(), areas[1].row_start, areas[1].row_end),
+            ("b", 2, 3)
+        );
+        assert_eq!((areas[1].column_start, areas[1].column_end), (1, 3));
+        let row = resolve_grid_placement(Some("2 / 3 / 4 / 5"), None, false);
+        assert_eq!(row.start, taffy::style_helpers::line(2));
+        assert_eq!(row.end, taffy::style_helpers::line(4));
+        let column = resolve_grid_placement(Some("2 / 3 / 4 / 5"), None, true);
+        assert_eq!(column.start, taffy::style_helpers::line(3));
+        assert_eq!(column.end, taffy::style_helpers::line(5));
+        let named = resolve_grid_placement(Some("main"), None, true);
+        assert_eq!(named.start, GridPlacement::NamedLine("main".to_string(), 1));
+        assert_eq!(named.end, GridPlacement::NamedLine("main".to_string(), 1));
+        assert_eq!(
+            resolve_grid_placement(Some("main"), Some("2"), true).start,
+            taffy::style_helpers::line(2)
+        );
+        assert_eq!(
+            parse_grid_template_columns("min-content max-content minmax(min-content, auto)").len(),
+            3
+        );
     }
 
     #[test]

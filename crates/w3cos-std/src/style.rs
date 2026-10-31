@@ -341,6 +341,14 @@ pub struct Style {
     pub grid_template_columns: Option<String>,
     #[serde(default)]
     pub grid_column: Option<String>,
+    #[serde(default)]
+    pub grid_template_rows: Option<String>,
+    #[serde(default)]
+    pub grid_template_areas: Option<String>,
+    #[serde(default)]
+    pub grid_row: Option<String>,
+    #[serde(default)]
+    pub grid_area: Option<String>,
 
     // Interaction
     pub cursor: Cursor,
@@ -472,6 +480,10 @@ impl Default for Style {
             justify_items: AlignItems::Stretch,
             grid_template_columns: None,
             grid_column: None,
+            grid_template_rows: None,
+            grid_template_areas: None,
+            grid_row: None,
+            grid_area: None,
             cursor: Cursor::Default,
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
@@ -644,6 +656,10 @@ impl Style {
             justify_items,
             grid_template_columns,
             grid_column,
+            grid_template_rows,
+            grid_template_areas,
+            grid_row,
+            grid_area,
             cursor,
             pointer_events,
             user_select,
@@ -766,6 +782,10 @@ impl Style {
             justify_items: justify_items_b,
             grid_template_columns: grid_template_columns_b,
             grid_column: grid_column_b,
+            grid_template_rows: grid_template_rows_b,
+            grid_template_areas: grid_template_areas_b,
+            grid_row: grid_row_b,
+            grid_area: grid_area_b,
             cursor: cursor_b,
             pointer_events: pointer_events_b,
             user_select: user_select_b,
@@ -886,6 +906,10 @@ impl Style {
             && justify_items == justify_items_b
             && grid_template_columns == grid_template_columns_b
             && grid_column == grid_column_b
+            && grid_template_rows == grid_template_rows_b
+            && grid_template_areas == grid_template_areas_b
+            && grid_row == grid_row_b
+            && grid_area == grid_area_b
             && cursor == cursor_b
             && pointer_events == pointer_events_b
             && user_select == user_select_b

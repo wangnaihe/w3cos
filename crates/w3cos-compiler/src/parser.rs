@@ -193,6 +193,10 @@ pub struct StyleDecl {
     pub justify_items: Option<String>,
     pub grid_template_columns: Option<String>,
     pub grid_column: Option<String>,
+    pub grid_template_rows: Option<String>,
+    pub grid_template_areas: Option<String>,
+    pub grid_row: Option<String>,
+    pub grid_area: Option<String>,
     pub order: Option<i32>,
     pub opacity: Option<f32>,
     pub text_align: Option<String>,
@@ -1290,6 +1294,14 @@ fn parse_style_object(obj: &str) -> Option<StyleDecl> {
                     style.grid_template_columns = Some(unquote(val))
                 }
                 "gridColumn" | "grid_column" => style.grid_column = Some(unquote(val)),
+                "gridTemplateRows" | "grid_template_rows" => {
+                    style.grid_template_rows = Some(unquote(val))
+                }
+                "gridTemplateAreas" | "grid_template_areas" => {
+                    style.grid_template_areas = Some(unquote(val))
+                }
+                "gridRow" | "grid_row" => style.grid_row = Some(unquote(val)),
+                "gridArea" | "grid_area" => style.grid_area = Some(unquote(val)),
                 "flexGrow" | "flex_grow" => style.flex_grow = val.parse().ok(),
                 "position" => style.position = Some(unquote(val)),
                 "top" => style.top = Some(unquote(val)),

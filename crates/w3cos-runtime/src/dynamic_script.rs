@@ -5527,14 +5527,19 @@ impl ScriptLoader {
                     let Some(url) = base
                         .as_ref()
                         .and_then(|base| base.join(&href).ok())
+                        .and_then(vscode_app_font_url_to_file)
                         .filter(|url| matches!(url.scheme(), "http" | "https" | "file"))
                     else {
                         continue;
                     };
                     if url.scheme() == "file" {
-                        // Local documents (file:// base) load sibling font files
-                        // directly from disk; a remote document may not read them.
-                        if base.as_ref().map(Url::scheme) != Some("file") {
+                        // Local documents (file:// or app-scheme base) load font
+                        // files directly from disk; a remote document may not
+                        // read them.
+                        if matches!(
+                            base.as_ref().map(Url::scheme),
+                            Some("http" | "https") | None
+                        ) {
                             continue;
                         }
                         let Some(bytes) = url
@@ -8769,6 +8774,16 @@ fn is_supported_image_mime_type(content_type: &str) -> bool {
     essence.starts_with("image/") || essence == "application/octet-stream"
 }
 
+/// Code-OSS file icon themes (seti) emit `url(vscode-file://vscode-app/<abs path>)`
+/// font sources. The runtime hosts the workbench itself, so that scheme maps to
+/// the plain on-disk path; every other URL is returned unchanged.
+fn vscode_app_font_url_to_file(url: Url) -> Option<Url> {
+    if url.scheme() == "vscode-file" && url.host_str() == Some("vscode-app") {
+        return Url::parse(&format!("file://{}", url.path())).ok();
+    }
+    Some(url)
+}
+
 fn supported_stylesheet_font_format(format: Option<&str>) -> bool {
     format.is_none_or(|format| {
         matches!(
@@ -10448,6 +10463,28 @@ mod tests {
             );
             assert!(r.height < 30.0, "#{id} wrapped: height {}", r.height);
         }
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn opacity_zero_ancestor_hides_descendant_paint() {
+        // Code-OSS hides idle scrollbars with `.invisible { opacity: 0 }`; the
+        // slider child must not paint through its transparent parent.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div style="position:absolute;left:0;top:0;width:50px;height:50px;opacity:0">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:50px;height:50px">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://opacity.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_ne!(pixel(5, 5), [0, 255, 0], "child painted through opacity:0");
+        assert_eq!(pixel(105, 5), [0, 255, 0], "visible control child missing");
     }
 
     #[test]
@@ -16656,6 +16693,53 @@ window.__dynamicInlineHandler = dynamicInlineResult;
             thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("file:// @font-face source was not registered");
+    }
+
+    #[test]
+    fn stylesheet_font_face_loads_escaped_vscode_file_font_urls() {
+        crate::dom::reset_document();
+        crate::jsdom::reset_bridge();
+        w3cos_dom::stylesheet::clear_rules();
+        let directory = tempfile::tempdir().expect("font directory");
+        std::fs::write(
+            directory.path().join("icons.ttf"),
+            include_bytes!("../assets/Inter-Regular.ttf"),
+        )
+        .unwrap();
+        // The Code-OSS icon theme service serialises the seti font as
+        // `url('vscode-file\:\/\/vscode-app\/<abs path>')`.
+        let escaped = format!(
+            "vscode-file://vscode-app{}/icons.ttf",
+            directory.path().display()
+        )
+        .replace(':', "\\:")
+        .replace('/', "\\/")
+        .replace('.', "\\.");
+        let html = format!(
+            "<!doctype html><style>@font-face {{ src: url('{escaped}') format('truetype'); \
+             font-family: 'W3COS Seti Test'; }} span {{ font-family: 'W3COS Seti Test'; }}</style>\
+             <span id=\"s\">hello</span>"
+        );
+        let url = Url::parse("vscode-file://vscode-app/workbench.html").unwrap();
+        load_html_on_shared_vm(&html, url.as_str()).unwrap();
+        let registry = crate::font_face::FontRegistry::global();
+        for _ in 0..2_000 {
+            crate::jsdom::document_value()
+                .get_property("fonts")
+                .get_property("ready");
+            if registry
+                .resolve(
+                    "W3COS Seti Test",
+                    crate::font_face::FontWeight::NORMAL,
+                    crate::font_face::FontFaceStyle::Normal,
+                )
+                .is_some()
+            {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("vscode-file:// @font-face source was not registered");
     }
 
     #[test]

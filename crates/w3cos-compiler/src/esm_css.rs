@@ -752,6 +752,7 @@ fn parse_font_face_block(
                 return Some(StylesheetFontSource::Local(name));
             }
             let (href, rest) = parse_css_function(candidate, "url")?;
+            let href = unescape_css_string(&href);
             if href.is_empty() {
                 return None;
             }
@@ -772,6 +773,45 @@ fn parse_font_face_block(
         unicode_range: value("unicode-range").map(ToString::to_string),
         media: media.map(ToString::to_string),
     })
+}
+
+/// Resolve CSS escapes (`\:` -> `:`, `\2f ` -> `/`) in a quoted url() string, as
+/// the Code-OSS icon theme service emits `vscode-file\:\/\/...` hrefs.
+fn unescape_css_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            None => out.push('\\'),
+            Some('\n') => {
+                chars.next();
+            }
+            Some(h) if h.is_ascii_hexdigit() => {
+                let mut hex = String::new();
+                while hex.len() < 6 && chars.peek().is_some_and(|d| d.is_ascii_hexdigit()) {
+                    hex.push(chars.next().unwrap());
+                }
+                if chars.peek().is_some_and(|d| d.is_ascii_whitespace()) {
+                    chars.next();
+                }
+                let code = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+                out.push(
+                    char::from_u32(code)
+                        .filter(|c| *c != '\0')
+                        .unwrap_or('\u{FFFD}'),
+                );
+            }
+            Some(other) => {
+                chars.next();
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 fn parse_css_function<'a>(source: &'a str, name: &str) -> Option<(String, &'a str)> {
@@ -1542,6 +1582,16 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unescapes_css_escapes_in_url_strings() {
+        assert_eq!(
+            super::unescape_css_string(r"vscode-file\:\/\/vscode-app\/a\/seti\.woff"),
+            "vscode-file://vscode-app/a/seti.woff"
+        );
+        assert_eq!(super::unescape_css_string(r"a\2f b\3A c"), "a/b:c");
+        assert_eq!(super::unescape_css_string("plain.ttf"), "plain.ttf");
+    }
+
     use super::*;
 
     #[test]
