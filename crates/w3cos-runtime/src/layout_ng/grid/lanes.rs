@@ -69,7 +69,9 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if !has_marker(style, LANES) {
         return Some("lanes:none");
     }
-    let columns = lane_columns(style)?;
+    let Some(columns) = lane_columns(style) else {
+        return Some("lanes:direction");
+    };
     if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
         return Some("lanes:size-keyword");
     }
