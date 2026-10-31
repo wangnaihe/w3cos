@@ -2065,6 +2065,23 @@ fn annotate_table_caption_paint_insets(
 }
 
 impl PaintArtifact {
+    /// `true` when an ancestor has `opacity: 0`. Opacity applies to the whole
+    /// subtree, so nothing below such an ancestor paints (Code-OSS hides its
+    /// idle scrollbars this way).
+    pub(crate) fn has_fully_transparent_ancestor(&self, index: usize) -> bool {
+        let mut current = self.nodes.get(index).and_then(|node| node.parent);
+        while let Some(parent) = current {
+            let Some(node) = self.nodes.get(parent) else {
+                return false;
+            };
+            if node.style.opacity <= 0.0 {
+                return true;
+            }
+            current = node.parent;
+        }
+        false
+    }
+
     /// Applied decoration belongs to the originating box, not the child's
     /// computed property. Atomic inline and out-of-flow boxes isolate their
     /// contents, but an isolating box's own decoration still reaches them.
