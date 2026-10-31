@@ -1731,6 +1731,34 @@ fn layout_item(
     main: Option<f32>,
     cross: Option<f32>,
 ) -> Option<LayoutResult> {
+    layout_item_basis(
+        flat,
+        index,
+        space,
+        container_inner_width,
+        container_inner_height,
+        row,
+        main,
+        cross,
+        true,
+    )
+}
+
+/// `layout_item` where `cross_basis` says whether a row item's `cross` size
+/// is a percentage basis for its children. An `auto` height that is not
+/// stretched (align-self other than stretch) stays indefinite even though
+/// layout has to place the item at its content height (CSS Flexbox §9.8).
+fn layout_item_basis(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    container_inner_width: f32,
+    container_inner_height: Option<f32>,
+    row: bool,
+    main: Option<f32>,
+    cross: Option<f32>,
+    cross_basis: bool,
+) -> Option<LayoutResult> {
     let mut nested = *space;
     nested.available_inline = container_inner_width;
     nested.percentage_block = container_inner_height;
@@ -1743,10 +1771,11 @@ fn layout_item(
     let inflexible_length = style.flex_grow <= 0.0
         && style.flex_shrink <= 0.0
         && matches!(style.flex_basis, Dimension::Px(_));
-    nested.fixed_block_indefinite = !row
+    nested.fixed_block_indefinite = (!row
         && container_inner_height.is_none()
         && !inflexible_length
-        && !has_marker(style, "--w3cos-internal-aspect-ratio");
+        && !has_marker(style, "--w3cos-internal-aspect-ratio"))
+        || (row && !cross_basis);
     nested.rtl = false;
     nested.bfc_x = 0.0;
     nested.bfc_y = 0.0;
@@ -2218,7 +2247,7 @@ pub(super) fn layout(
         if !row {
             return super::bail("flex:baseline-column");
         }
-        let laid = layout_item(
+        let laid = layout_item_basis(
             flat,
             item.index,
             space,
@@ -2227,6 +2256,7 @@ pub(super) fn layout(
             true,
             Some(item.content),
             item.cross,
+            !(item.cross_auto && item.align != AlignItems::Stretch),
         )?;
         let ascent = baseline_ascent(item, &laid).why("flex:baseline-unknown")?;
         let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
@@ -2273,7 +2303,7 @@ pub(super) fn layout(
     };
     let mut fragments = Vec::with_capacity(items.len());
     for item in &items {
-        fragments.push(layout_item(
+        fragments.push(layout_item_basis(
             flat,
             item.index,
             space,
@@ -2282,6 +2312,7 @@ pub(super) fn layout(
             row,
             Some(item.content),
             item.cross,
+            !(item.cross_auto && item.align != AlignItems::Stretch),
         )?);
     }
 
@@ -2684,7 +2715,7 @@ fn layout_wrapped(
             if item.align != AlignItems::Baseline {
                 continue;
             }
-            let laid = layout_item(
+            let laid = layout_item_basis(
                 flat,
                 item.index,
                 space,
@@ -2693,6 +2724,7 @@ fn layout_wrapped(
                 true,
                 Some(item.content),
                 item.cross,
+                !(item.cross_auto && item.align != AlignItems::Stretch),
             )?;
             let baseline = match laid.first_baseline {
                 LastBaseline::At(baseline) => baseline,
@@ -2767,7 +2799,7 @@ fn layout_wrapped(
     }
     let mut fragments = Vec::with_capacity(items.len());
     for item in items.iter() {
-        fragments.push(Some(layout_item(
+        fragments.push(Some(layout_item_basis(
             flat,
             item.index,
             space,
@@ -2776,6 +2808,7 @@ fn layout_wrapped(
             row,
             Some(item.content),
             item.cross,
+            !(item.cross_auto && item.align != AlignItems::Stretch),
         )?));
     }
     let used_cross = if row {
