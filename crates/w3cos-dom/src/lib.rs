@@ -3653,6 +3653,41 @@ mod tests {
     }
 
     #[test]
+    fn test_form_control_color_inherit_uses_parent_color() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#wrapper", &[("color", "#123456")]);
+        crate::stylesheet::register_rule("#inherits", &[("color", "inherit")]);
+        crate::stylesheet::register_rule("#unset", &[("color", "unset")]);
+
+        let mut doc = Document::new();
+        let wrapper = doc.create_element("div");
+        wrapper.set_attribute(&mut doc, "id", "wrapper");
+        let mut ids = Vec::new();
+        for (tag, id) in [
+            ("button", "inherits"),
+            ("button", "unset"),
+            ("button", "plain"),
+            ("input", "inherits2"),
+        ] {
+            let el = doc.create_element(tag);
+            el.set_attribute(&mut doc, "id", id);
+            wrapper.append_child(&mut doc, el);
+            ids.push(el.id);
+        }
+        doc.body().append_child(&mut doc, wrapper);
+
+        let expected = w3cos_std::Color::from_hex("#123456");
+        assert_eq!(doc.computed_style_for(ids[0]).color, expected);
+        assert_eq!(doc.computed_style_for(ids[1]).color, expected);
+        // Without an author declaration a button keeps its UA text color.
+        assert_eq!(
+            doc.computed_style_for(ids[2]).color,
+            w3cos_std::Color::BLACK
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn test_background_color_inherit_uses_parent_computed_color() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("#wrapper", &[("background-color", "green")]);
