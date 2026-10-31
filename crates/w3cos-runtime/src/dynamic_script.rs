@@ -10415,6 +10415,7 @@ mod tests {
         (format!("http://{address}/dependency.js"), handle)
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
     #[test]
     fn opacity_zero_ancestor_hides_descendant_paint() {
         // Code-OSS hides idle scrollbars with `.invisible { opacity: 0 }`; the
