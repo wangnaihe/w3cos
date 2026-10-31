@@ -25,7 +25,6 @@ dynamic-js = [
     "dep:w3cos-ir",
     "dep:w3cos-vm",
     "dep:base64",
-    "dep:wuff",
 ]
 # Type-check the OHOS renderer on a non-OHOS host without pretending that the
 # host libc has target_env="ohos". Production builds do not enable this.
@@ -56,7 +55,7 @@ anyhow = { workspace = true }
 image = { workspace = true }
 flate2 = { workspace = true }
 encoding_rs = { workspace = true }
-wuff = { workspace = true, optional = true }
+wuff = { workspace = true }
 resvg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
