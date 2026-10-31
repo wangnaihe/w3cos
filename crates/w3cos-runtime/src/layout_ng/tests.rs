@@ -5477,6 +5477,224 @@ fn inline_svgs_match_chrome() {
     assert!(!block::unsupported_reasons(&flat).is_empty());
 }
 
+/// A 50x25 `<img>` as a flex or grid item is blockified and sized by its
+/// container: min-content from the replaced width (row) or height
+/// (column), `normal` alignment is `start` for a replaced grid item while
+/// an authored `stretch` fills the area (the other axis follows the ratio).
+/// Border boxes measured in headless Chrome 156
+/// (testdata/chrome-replaced-items.json).
+#[test]
+fn replaced_flex_grid_items_match_chrome() {
+    use w3cos_std::style::{AlignItems, AlignSelf, CustomProperties, Position};
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 50, 0, 0, 0, 25, 8,
+        2, 0, 0, 0, 252, 54, 234, 19, 0, 0, 0, 55, 73, 68, 65, 84, 120, 156, 237, 206, 177, 1, 0,
+        16, 0, 192, 48, 92, 238, 116, 15, 88, 58, 49, 36, 23, 100, 142, 61, 62, 180, 94, 7, 238,
+        180, 10, 173, 66, 171, 208, 42, 180, 10, 173, 66, 171, 208, 42, 180, 10, 173, 66, 171, 248,
+        180, 117, 0, 222, 94, 0, 178, 95, 2, 159, 24, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let src = "w3cos-ng-replaced-items-50x25.png".to_string();
+    crate::image_loader::decode_and_install(&src, PNG).expect("decode png");
+    // The UA display of an <img> is inline; the item is blockified.
+    let img = |extra: Style| {
+        Component::image(
+            src.clone(),
+            Style {
+                display: Display::Inline,
+                ..extra
+            },
+        )
+    };
+    let run = |name: &str, container: Style, children: Vec<Component>| {
+        let root = node(block(), vec![node(container, children)]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{name}: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        layout_tree(&root, &flat, 800.0, 600.0).unwrap_or_else(|| panic!("{name} stays on NG"))
+    };
+    let flex = |direction, width, height: Option<f32>| Style {
+        display: Display::Flex,
+        flex_direction: direction,
+        width: Dimension::Px(width),
+        height: height.map_or(Dimension::Auto, Dimension::Px),
+        ..Style::default()
+    };
+    // 0 root, 1 container, 2 image.
+    let r = run(
+        "fr-minw",
+        flex(FlexDirection::Row, 10.0, None),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 50.0, 25.0));
+    let r = run(
+        "fr-grow",
+        flex(FlexDirection::Row, 200.0, None),
+        vec![
+            img(Style {
+                flex_grow: 1.0,
+                flex_shrink: 0.0,
+                ..Style::default()
+            }),
+            node(
+                Style {
+                    flex_grow: 1.0,
+                    flex_shrink: 0.0,
+                    flex_basis: Dimension::Px(1.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 124.5, 62.25));
+    let r = run(
+        "fc-minh",
+        flex(FlexDirection::Column, 100.0, Some(10.0)),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+    let r = run(
+        "fr-stretch",
+        flex(FlexDirection::Row, 200.0, Some(60.0)),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 120.0, 60.0));
+    let r = run(
+        "fc-width",
+        flex(FlexDirection::Column, 100.0, None),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 1), (0.0, 0.0, 100.0, 50.0));
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+
+    let grid = |align: AlignItems, markers: &[&str]| {
+        let mut style = Style {
+            display: Display::Grid,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(100.0),
+            align_items: align,
+            grid_template_columns: Some("100px".to_string()),
+            ..Style::default()
+        };
+        style.grid_ng_mut().grid_template_rows = Some("100px".to_string());
+        if !markers.is_empty() {
+            style.custom_properties = Some(CustomProperties::from_iter(
+                markers
+                    .iter()
+                    .map(|key| (key.to_string(), "stretch".to_string())),
+            ));
+        }
+        style
+    };
+    let align_marker = "--w3cos-internal-align-items-stretch";
+    let justify_marker = "--w3cos-internal-justify-items-stretch";
+    let r = run(
+        "g-normal",
+        grid(AlignItems::Stretch, &[]),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 50.0, 25.0));
+    let r = run(
+        "g-both",
+        grid(AlignItems::Stretch, &[]),
+        vec![img(Style {
+            align_self: AlignSelf::Stretch,
+            justify_self: AlignSelf::Stretch,
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 100.0));
+    let r = run(
+        "g-inline",
+        grid(AlignItems::Stretch, &[]),
+        vec![img(Style {
+            justify_self: AlignSelf::Stretch,
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+    let r = run(
+        "g-block",
+        grid(AlignItems::Stretch, &[]),
+        vec![img(Style {
+            align_self: AlignSelf::Stretch,
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 200.0, 100.0));
+    let r = run(
+        "g-items-stretch",
+        grid(AlignItems::Stretch, &[align_marker]),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 200.0, 100.0));
+    let r = run(
+        "g-both-items",
+        grid(AlignItems::Stretch, &[align_marker, justify_marker]),
+        vec![img(Style::default())],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 100.0));
+    // WPT pages that regressed in the first gate (ratio 2:1 here): the
+    // min/max-width clamp applies to a definite replaced width, and the
+    // transferred height follows the clamped width.
+    let r = run(
+        "col-max-width",
+        flex(FlexDirection::Column, 100.0, None),
+        vec![img(Style {
+            width: Dimension::Px(500.0),
+            max_width: Dimension::Percent(100.0),
+            min_height: Dimension::Px(0.0),
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+    let r = run(
+        "col-min-width",
+        flex(FlexDirection::Column, 100.0, Some(0.0)),
+        vec![img(Style {
+            width: Dimension::Px(0.0),
+            min_width: Dimension::Px(100.0),
+            ..Style::default()
+        })],
+    );
+    assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
+    // A percentage size in an auto grid track, and an abspos flex container
+    // with an inset-derived height, stay on the legacy engine.
+    for (name, container, child) in [
+        (
+            "grid-max-width",
+            Style {
+                display: Display::Grid,
+                width: Dimension::Px(100.0),
+                ..Style::default()
+            },
+            img(Style {
+                width: Dimension::Px(200.0),
+                max_width: Dimension::Percent(100.0),
+                ..Style::default()
+            }),
+        ),
+        (
+            "abspos-flex",
+            Style {
+                display: Display::Flex,
+                position: Position::Absolute,
+                top: Dimension::Px(0.0),
+                bottom: Dimension::Px(0.0),
+                ..Style::default()
+            },
+            img(Style::default()),
+        ),
+    ] {
+        let root = node(block(), vec![node(container, vec![child])]);
+        let flat = pre_flatten(&root);
+        assert!(!block::supports_tree(&flat), "{name} must fall back");
+    }
+}
+
 /// A scroll container's baseline is its bottom margin edge, in an
 /// inline-block and as a block child of one (css/CSS2/linebox/
 /// baseline-block-with-overflow-001). Border boxes and the trailing text's

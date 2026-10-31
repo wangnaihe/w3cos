@@ -97,6 +97,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // stays the enum flex already uses.
             | "height-keyword"
             | "justify-content"
+            // Grid reads these: a replaced item stretches only for the
+            // authored `stretch` keyword, not for `normal`.
+            | "align-items-stretch"
+            | "justify-items-stretch"
             // Flex reads this for `align-content: safe …` overflow.
             // The used align-content enum stays the legacy parse.
             | "safe-align-content"
@@ -507,6 +511,16 @@ fn anonymous_block_text(flat: &[FlatNodeInfo], index: usize) -> bool {
     )
 }
 
+/// An `<img>` that is a flex or grid item. The item is blockified (Flexbox
+/// 4, Grid 6.1), so its UA `inline`/`inline-block` display is not an atomic
+/// inline of an IFC; the container sizes it from its replaced size.
+pub(super) fn is_replaced_item(flat: &[FlatNodeInfo], index: usize) -> bool {
+    matches!(flat[index].kind, ComponentKind::Image { .. })
+        && flat[index].parent.is_some_and(|parent| {
+            is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
+        })
+}
+
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     // Table, row, and cell boxes. The grid is laid out here; other
@@ -526,7 +540,10 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     if matches!(info.kind, ComponentKind::SvgDocument { .. }) {
         return svg_box_reason(flat, index);
     }
-    if inline::is_atomic_inline(flat, index) && !is_blockified_float(flat, index) {
+    if !is_replaced_item(flat, index)
+        && inline::is_atomic_inline(flat, index)
+        && !is_blockified_float(flat, index)
+    {
         // A text run is an anonymous flex item whatever its siblings are:
         // an inline-block text under a flex container is block text even
         // when the container's first child is not inline-level.
@@ -685,6 +702,33 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
 fn image_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let info = &flat[index];
     let style = info.style;
+    if is_replaced_item(flat, index) {
+        // Floats do not apply to flex and grid items, and an abspos child
+        // is not an item; both keep the legacy path.
+        if style.float != Float::None
+            || matches!(
+                style.position,
+                Position::Absolute | Position::Fixed | Position::Sticky
+            )
+        {
+            return Some("image");
+        }
+        let parent = flat[index].parent.map(|parent| flat[parent].style);
+        // A percentage size in an automatic grid track is cyclic (the track
+        // sizes from the item's contribution, CSS Sizing 3 5.2.2), and an
+        // out-of-flow flex/grid container with an inset-derived height does
+        // not give its items a definite cross size here.
+        if parent.is_some_and(|parent| {
+            (is_author_grid(parent)
+                && [style.width, style.min_width, style.max_width]
+                    .iter()
+                    .any(|dim| matches!(dim, Dimension::Percent(_))))
+                || (oof::is_out_of_flow(parent) && matches!(parent.height, Dimension::Auto))
+        }) {
+            return Some("image");
+        }
+        return unsupported_box_style(style, &[inline::VALIGN_MARKER], true);
+    }
     if style.box_sizing == BoxSizing::BorderBox {
         return Some("image");
     }
@@ -1196,6 +1240,39 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
         height = height.max(min);
     }
     Some((width, height))
+}
+
+/// Used content-box size of a replaced item (`None`: not a replaced item;
+/// `Some(None)`: the size is not known here).
+pub(super) fn replaced_item_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<Option<(f32, f32)>> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    Some(replaced_content_size(src, flat[index].style, space))
+}
+
+/// Natural content size of a replaced item with every authored size and
+/// min/max dropped (its intrinsic size and ratio).
+pub(super) fn replaced_intrinsic_size(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<(f32, f32)> {
+    let ComponentKind::Image { src } = flat[index].kind else {
+        return None;
+    };
+    let mut natural = flat[index].style.clone();
+    natural.width = Dimension::Auto;
+    natural.height = Dimension::Auto;
+    natural.min_width = Dimension::Auto;
+    natural.max_width = Dimension::Auto;
+    natural.min_height = Dimension::Auto;
+    natural.max_height = Dimension::Auto;
+    replaced_content_size(src, &natural, space)
 }
 
 /// Visit rendered nodes (display:none subtrees emit nothing in either
@@ -2000,7 +2077,34 @@ fn layout_block_in(
     // new formatting contexts; a replaced box keeps its own width and the
     // overlap check sends a float collision back to legacy.
     let image_size = if let ComponentKind::Image { src } = info.kind {
-        Some(replaced_content_size(src, style, space).why("image")?)
+        let (width, height) = replaced_content_size(src, style, space).why("image")?;
+        match sized {
+            // A flex or grid item takes the container-resolved width; an
+            // automatic height follows the intrinsic ratio (CSS Sizing 4
+            // transferred size), a stretched height arrives in `sized`.
+            Some((sized_width, sized_height)) if is_replaced_item(flat, index) => {
+                let derived = if style.height == Dimension::Auto {
+                    let (natural_w, natural_h) =
+                        replaced_intrinsic_size(flat, index, space).why("image")?;
+                    let mut used = if natural_w > 0.0 {
+                        natural_h * sized_width / natural_w
+                    } else {
+                        height
+                    };
+                    if let Dimension::Px(max) = style.max_height {
+                        used = used.min(max.max(0.0));
+                    }
+                    if let Dimension::Px(min) = style.min_height {
+                        used = used.max(min.max(0.0));
+                    }
+                    used
+                } else {
+                    height
+                };
+                Some((sized_width, sized_height.unwrap_or(derived)))
+            }
+            _ => Some((width, height)),
+        }
     } else if let ComponentKind::Canvas { width, height } = info.kind {
         Some(canvas_content_size(*width, *height, style, space).why("kind:other")?)
     } else if let ComponentKind::SvgDocument { source, .. } = info.kind {

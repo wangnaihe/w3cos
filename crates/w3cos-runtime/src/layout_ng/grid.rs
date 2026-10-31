@@ -42,6 +42,8 @@ const MAX_TRACKS: usize = 1024;
 const INF: i64 = i64::MAX / 4;
 const HEIGHT_KEYWORD: &str = "--w3cos-internal-height-keyword";
 const JUSTIFY_KEYWORD: &str = "--w3cos-internal-justify-content";
+const ALIGN_ITEMS_STRETCH: &str = "--w3cos-internal-align-items-stretch";
+const JUSTIFY_ITEMS_STRETCH: &str = "--w3cos-internal-justify-items-stretch";
 
 fn units(v: f32) -> i64 {
     if v.is_finite() {
@@ -191,6 +193,24 @@ fn used_item_align(container: AlignItems, item: AlignSelf) -> AlignItems {
         AlignSelf::Center => AlignItems::Center,
         AlignSelf::Stretch => AlignItems::Stretch,
         AlignSelf::Baseline => AlignItems::Baseline,
+    }
+}
+
+/// Whether a replaced item's alignment is an authored `stretch`. `normal`
+/// computes to `stretch` in the enum, but a replaced item behaves as
+/// `start` for it (CSS Grid 6.2; Blink ComputeNormalBehavior).
+fn explicit_stretch(container: &Style, item_self: AlignSelf, block: bool) -> bool {
+    match item_self {
+        AlignSelf::Stretch => true,
+        AlignSelf::Auto => has_marker(
+            container,
+            if block {
+                ALIGN_ITEMS_STRETCH
+            } else {
+                JUSTIFY_ITEMS_STRETCH
+            },
+        ),
+        _ => false,
     }
 }
 
@@ -2692,6 +2712,12 @@ struct Item {
     edges_v: f32,
     stretch_block: bool,
     specified_content_h: Option<f32>,
+    /// A replaced item is resized by stretch (shrinking too), and an
+    /// automatic width follows the stretched height through its ratio.
+    replaced: bool,
+    width_auto: bool,
+    stretch_inline: bool,
+    edges_h: f32,
     inline_pack: Pack,
     block_pack: Pack,
 }
@@ -3285,11 +3311,23 @@ pub(super) fn layout(
     for item in &items {
         let child_style = flat[item.index].style;
         let area = inline_of(item);
-        let justify = align_pack(used_item_align(
+        let replaced = block::is_replaced_item(flat, item.index);
+        let mut justify = align_pack(used_item_align(
             style.justify_items,
             child_style.justify_self,
         ));
-        let align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        let mut align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        if replaced {
+            // `normal` is `start` for a replaced item; only an authored
+            // `stretch` fills the area.
+            if justify == Pack::Stretch && !explicit_stretch(style, child_style.justify_self, false)
+            {
+                justify = Pack::Start;
+            }
+            if align == Pack::Stretch && !explicit_stretch(style, child_style.align_self, true) {
+                align = Pack::Start;
+            }
+        }
         let auto_margin = [
             matches!(child_style.margin.top, Spacing::Auto),
             matches!(child_style.margin.right, Spacing::Auto),
@@ -3369,6 +3407,10 @@ pub(super) fn layout(
             edges_v,
             stretch_block,
             specified_content_h,
+            replaced,
+            width_auto: matches!(child_style.width, Dimension::Auto),
+            stretch_inline,
+            edges_h,
             inline_pack: justify,
             block_pack: align,
         });
@@ -3544,7 +3586,22 @@ pub(super) fn layout(
             .max(0);
         let target_content = (target_border - units(item.edges_v)).max(0);
         let measured = units(fragment.fragment.height) - units(item.edges_v);
-        if target_content > measured {
+        let resize = if item.replaced {
+            target_content != measured
+        } else {
+            target_content > measured
+        };
+        if resize {
+            let content_width = if item.replaced && item.width_auto && !item.stretch_inline {
+                let measured_w = fragment.fragment.width - item.edges_h;
+                if measured > 0 {
+                    measured_w * target_content as f32 / measured as f32
+                } else {
+                    return super::bail("grid:replaced-ratio");
+                }
+            } else {
+                item.content_width
+            };
             *fragment = layout_item(
                 flat,
                 item.index,
@@ -3557,7 +3614,7 @@ pub(super) fn layout(
                     row_span: item.row_span,
                     source: item.source,
                 }),
-                item.content_width,
+                content_width,
                 Some(from_units(target_content)),
             )?;
         }

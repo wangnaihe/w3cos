@@ -470,6 +470,11 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if block::is_author_flex(info.style) {
         return intrinsic_sizes(flat, index, space);
     }
+    // A replaced item has no children; its content size is the replaced
+    // width, both as min-content and as max-content.
+    if let Some(size) = block::replaced_item_size(flat, index, space) {
+        return Some(MinMax::exact(size.why("flex:replaced")?.0));
+    }
     let mut sizes = MinMax::exact(0.0);
     let mut any = false;
     for child in rendered_children(flat, index) {
@@ -616,6 +621,10 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
     if let w3cos_std::ComponentKind::Text { .. } = info.kind {
         let line = info.style.font_size * info.style.line_height.max(1.0);
         return Some(line.max(0.0));
+    }
+    // A replaced item's min-content block size is its used replaced height.
+    if let Some(size) = block::replaced_item_size(flat, index, space) {
+        return Some(size?.1);
     }
     let mut sum = 0.0;
     for child in rendered_children(flat, index) {
@@ -1070,6 +1079,23 @@ pub(super) fn layout(
                 .why("flex:cross")?,
             );
         }
+        if !row && block::is_replaced_item(flat, child) {
+            // A definite replaced width still honours min/max-width.
+            cross = match cross {
+                Some(size) => Some(
+                    clamp_cross(
+                        child_style,
+                        false,
+                        cross_edges,
+                        size,
+                        Some(inner_width),
+                        space,
+                    )
+                    .why("flex:cross")?,
+                ),
+                None => None,
+            };
+        }
         let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
             && matches!(child_style.height, Dimension::Auto);
         let measured = if !row && basis_auto {
@@ -1098,7 +1124,54 @@ pub(super) fn layout(
             measured,
         )
         .why("flex:basis")?;
-        let base = base.max(0.0);
+        let mut base = base.max(0.0);
+        let mut min = min;
+        // A replaced item stretched on its cross axis (auto size, nowrap)
+        // has a definite cross size, so its main size is transferred
+        // through the intrinsic ratio (CSS Flexbox 9.8.2, Sizing 4 5.1);
+        // the automatic minimum is that transferred size.
+        if block::is_replaced_item(flat, child)
+            && style.flex_wrap == FlexWrap::NoWrap
+            && matches!(child_style.height, Dimension::Auto)
+            && matches!(child_style.min_height, Dimension::Auto)
+            && matches!(child_style.max_height, Dimension::Auto)
+            && matches!(child_style.flex_basis, Dimension::Auto)
+        {
+            let stretched = used_align(style.align_items, child_style.align_self)
+                == AlignItems::Stretch
+                && matches!(child_style.width, Dimension::Auto)
+                && matches!(child_style.min_width, Dimension::Auto);
+            if let Some((w, h)) = block::replaced_intrinsic_size(flat, child, space)
+                && w > 0.0
+                && h > 0.0
+            {
+                let cross_definite = if row {
+                    // Row: only a stretched auto-size item takes the
+                    // container's definite height through the ratio.
+                    if stretched
+                        && matches!(child_style.width, Dimension::Auto)
+                        && matches!(child_style.min_width, Dimension::Auto)
+                    {
+                        specified_height.map(|height| {
+                            (height - margin_cross_start - margin_cross_end - cross_edges).max(0.0)
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    cross
+                };
+                if let Some(cross_size) = cross_definite {
+                    let used = if row {
+                        w * cross_size / h
+                    } else {
+                        h * cross_size / w
+                    };
+                    base = used;
+                    min = min.max(used.min(max));
+                }
+            }
+        }
         items.push(Item {
             index: child,
             order: child_style.order,
