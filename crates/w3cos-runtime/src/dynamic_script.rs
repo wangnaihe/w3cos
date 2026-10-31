@@ -10452,6 +10452,27 @@ mod tests {
         assert_eq!(pixel(105, 5), [0, 255, 0], "visible control child missing");
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn fractional_opacity_ancestor_fades_descendant_paint() {
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <div style="position:absolute;left:0;top:0;width:50px;height:50px;opacity:0.5">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div>
+            <div style="position:absolute;left:100px;top:0;width:50px;height:50px">
+              <div style="position:absolute;left:0;top:0;width:20px;height:20px;background:#00ff00"></div>
+            </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://group-opacity.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let green = |x: usize, y: usize| frame.rgba[(y * frame.width as usize + x) * 4 + 1];
+        let faded = green(5, 5);
+        assert!(
+            (100..=160).contains(&faded),
+            "child of an opacity:0.5 parent should be ~half green, got {faded}"
+        );
+        assert_eq!(green(105, 5), 255, "opaque control child changed");
+    }
+
     #[test]
     fn load_html_on_shared_vm_runs_inline_script() {
         let html = r#"<!doctype html><html><body>
