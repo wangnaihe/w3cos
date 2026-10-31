@@ -1149,7 +1149,19 @@ fn render_node(
         }
         ComponentKind::Button { label } => {
             if text_color.a > 0 {
-                draw_text_centered_in_rect(pixmap, rect, label, style, text_color, font, clip_mask);
+                let single_line_width = crate::layout::text_intrinsic_size(label, style).0;
+                if crate::layout::button_label_can_wrap(label, style)
+                    && single_line_width > rect.width
+                {
+                    // Wrapped label: centered lines, like a block of text.
+                    let mut wrapped = style.clone();
+                    wrapped.text_align = TextAlign::Center;
+                    draw_text_in_rect(pixmap, rect, label, &wrapped, text_color, font, clip_mask);
+                } else {
+                    draw_text_centered_in_rect(
+                        pixmap, rect, label, style, text_color, font, clip_mask,
+                    );
+                }
             }
         }
         ComponentKind::Image { src } => {

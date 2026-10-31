@@ -23671,6 +23671,59 @@ fn apply_measured_text_height(
     Ok(false)
 }
 
+/// `true` when a text-only `<button>` label may wrap onto several lines.
+pub(crate) fn button_label_can_wrap(label: &str, style: &w3cos_std::style::Style) -> bool {
+    matches!(
+        style.white_space,
+        WWhiteSpace::Normal | WWhiteSpace::PreWrap | WWhiteSpace::PreLine
+    ) && label.trim().contains(char::is_whitespace)
+}
+
+/// A text-only `<button>` wraps its label at its own width like any block of
+/// text; its auto height follows the wrapped line count. Single-line labels
+/// are left untouched.
+fn apply_button_wrapped_height(
+    tree: &mut TaffyTree<usize>,
+    node: NodeId,
+    label: &str,
+    style: &w3cos_std::style::Style,
+    node_width: f32,
+) -> Result<bool, taffy::TaffyError> {
+    let padding = style.padding_lengths();
+    let border_w = style.border_left_width.unwrap_or(style.border_width)
+        + style.border_right_width.unwrap_or(style.border_width);
+    let border_h = style.border_top_width.unwrap_or(style.border_width)
+        + style.border_bottom_width.unwrap_or(style.border_width);
+    let wrapped = wrapped_text_height(label, (node_width - border_w).max(1.0), style);
+    let single = text_intrinsic_size(label, style).1;
+    if wrapped <= single + 0.5 {
+        return Ok(false);
+    }
+    let mut h = wrapped;
+    if style.box_sizing == WBoxSizing::BorderBox {
+        h += border_h;
+    } else {
+        h = (h - padding.top - padding.bottom).max(0.0);
+    }
+    let mut taffy_style = tree.style(node)?.clone();
+    let measured_height = Dimension::length(h);
+    let measured_min_height =
+        if matches!(style.min_height, WDim::Auto) && matches!(style.max_height, WDim::Auto) {
+            measured_height
+        } else {
+            taffy_style.min_size.height
+        };
+    if taffy_style.min_size.height != measured_min_height
+        || taffy_style.size.height != measured_height
+    {
+        taffy_style.min_size.height = measured_min_height;
+        taffy_style.size.height = measured_height;
+        tree.set_style(node, taffy_style)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// After first layout pass, set Text leaf heights from wrapped line count at assigned width.
 /// Returns true when any leaf style changed and a second Taffy pass is required.
 fn update_text_leaf_heights(
@@ -23697,6 +23750,11 @@ fn update_text_leaf_heights(
                         wrap_width,
                         parent_display,
                     )?;
+                }
+            } else if let ComponentKind::Button { label } = flat[idx].kind {
+                let style = flat[idx].style;
+                if matches!(style.height, WDim::Auto) && button_label_can_wrap(label, style) {
+                    dirty |= apply_button_wrapped_height(tree, node, label, style, node_width)?;
                 }
             }
         }
@@ -37580,6 +37638,37 @@ mod tests {
             (btn.width - 338.0).abs() < 4.0,
             "button should stretch to inner column width, got {}",
             btn.width
+        );
+    }
+
+    #[test]
+    fn fixed_width_button_label_wraps_and_grows_taller() {
+        let label = "A long button label that should wrap onto several lines";
+        let button = |width: f32, label: &str, white_space: WWhiteSpace| {
+            Component::button(
+                label,
+                Style {
+                    width: WDim::Px(width),
+                    white_space,
+                    ..Style::default()
+                },
+            )
+        };
+        let height = |component: Component| {
+            let layout = compute(&component, 800.0, 600.0).unwrap();
+            let rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
+            rect.height
+        };
+        let wide = height(button(120.0, label, WWhiteSpace::NoWrap));
+        let narrow = height(button(120.0, label, WWhiteSpace::Normal));
+        let nowrap = height(button(120.0, label, WWhiteSpace::NoWrap));
+        let single_word = height(button(40.0, "Applications", WWhiteSpace::Normal));
+        assert!(narrow > wide * 1.8, "narrow={narrow} wide={wide}");
+        assert!((nowrap - wide).abs() < 0.5, "nowrap={nowrap} wide={wide}");
+        assert!(wide < 30.0, "single line height expected: {wide}");
+        assert!(
+            (single_word - wide).abs() < 0.5,
+            "single word must not wrap"
         );
     }
 
