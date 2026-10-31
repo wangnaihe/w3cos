@@ -57,13 +57,28 @@ CASES = [
     case("rows-stretch", "auto auto", [it("a", w=50), it("b", w=30, h=15), it("c", w=40)], height=80, rows=True),
     case("rows-wrap-width", "30px 30px", [it("a", text="XX XX XX"), it("b", text="XX"), it("c", text="XXXXXXXXXXXXXXXXXXXXXXXX")], axis="row", width=100),
     case("axis-row-cols", "50px 50px", [it("a", w=30, h=10), it("b", w=40, h=10)], axis="row"),
-]
+    case("rev-cols-fill", "50px 50px 50px", stack(), axis="column fill-reverse"),
+    case("rev-cols-fill-gap", "60px 60px 60px", stack(), axis="column fill-reverse", gap=[8, 5]),
+    case("rev-cols-fill-h", "50px 50px 50px", stack(5), axis="column fill-reverse", height=120),
+    case("rev-cols-track", "40px 50px 60px", stack(), axis="column track-reverse"),
+    case("rev-cols-both", "40px 50px 60px", stack(), axis="column fill-reverse track-reverse", gap=[3, 7]),
+    case("rev-cols-span", "40px 40px 40px", [it("a", h=20), it("b", h=30, place="span 2"), it("c", h=10), it("d", h=10), it("e", h=15, place="span 2"), it("f", h=5)], axis="column fill-reverse track-reverse"),
+    case("rev-cols-explicit", "40px 40px 40px", [it("a", h=20, place="3"), it("b", h=30), it("c", h=10), it("d", h=15, place="1"), it("e", h=10)], axis="column track-reverse"),
+    case("rev-cols-justify", "70px 70px", [it("a", h=10, w=30), it("b", h=10, w=20), it("c", h=10, w=40)], axis="column track-reverse"),
+    case("rev-cols-box", "60px 60px", [it("a", h=20, margin=5), it("b", h=10), it("c", h=15, margin=3), it("d", h=10)], gap=[4, 4], axis="column fill-reverse"),
+    case("rev-rows-fill", "30px 30px", [it(x, w=w, h=10) for x, w in zip("abcde", [60, 40, 50, 30, 70])], axis="row fill-reverse"),
+    case("rev-rows-fill-gap", "20px 20px 20px", [it(x, w=w, h=10) for x, w in zip("abcdef", [50, 80, 30, 60, 40, 20])], gap=[6, 4], axis="row fill-reverse"),
+    case("rev-rows-track", "20px 30px", [it(x, w=w, h=10) for x, w in zip("abcde", [60, 40, 50, 30, 70])], axis="row track-reverse"),
+    case("rev-rows-both", "20px 30px", [it(x, w=w, h=10) for x, w in zip("abcde", [60, 40, 50, 30, 70])], axis="row fill-reverse track-reverse", gap=[3, 7]),
+    case("rev-rows-auto", "auto auto", [it("a", text="XX"), it("b", text="XXXX"), it("c", text="XXX"), it("d", text="X"), it("e", text="XX")], axis="row track-reverse"),
+    case("rev-rows-fill-h", "20px 20px", [it("a", w=50, h=10), it("b", w=40, h=10), it("c", w=20, h=10)], axis="row fill-reverse", height=80),
+    case("rev-rows-span", "20px 20px 20px", [it("a", w=50, h=10), it("b", w=40, h=10, place="span 2"), it("c", w=30, h=10), it("d", w=60, h=10)], axis="row fill-reverse"),]
 
 
 def html(c):
     k = c["container"]
     # The axis follows the template that is set, or the direction keyword.
-    rows_axis = k.get("axis") == "row" or (k.get("axis") is None and k.get("rows", False))
+    rows_axis = (k.get("axis") or "").startswith("row") or (k.get("axis") is None and k.get("rows", False))
     style = ["display:grid-lanes", "font:10px/1 Ahem"]
     prop = "grid-template-rows" if rows_axis else "grid-template-columns"
     style.append(f"{prop}:{k['template']}")

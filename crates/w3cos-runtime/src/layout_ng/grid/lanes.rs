@@ -27,19 +27,32 @@ const TOLERANCE: &str = "--w3cos-internal-flow-tolerance";
 const DIRECTION: &str = "--w3cos-internal-grid-lanes-direction";
 const PACK: &str = "--w3cos-internal-grid-lanes-pack";
 
-/// The grid axis of a lanes container: `true` when lanes are columns.
-/// Blink `ComputedStyle::GridLanesTrackSizingDirection`: an explicit
+/// Direction of a lanes container (`grid-lanes-direction`).
+#[derive(Clone, Copy)]
+struct Direction {
+    /// Lanes are columns.
+    columns: bool,
+    /// `fill-reverse`: items stack from the end of the stacking axis.
+    fill_reverse: bool,
+    /// `track-reverse`: auto-placed items fill the lanes last to first.
+    track_reverse: bool,
+}
+
+/// The direction of a lanes container. Blink
+/// `ComputedStyle::GridLanesTrackSizingDirection`: an explicit
 /// `row`/`column` wins, else the specified template picks the axis,
 /// columns first.
-fn lane_columns(style: &Style) -> Option<bool> {
+fn lane_direction(style: &Style) -> Option<Direction> {
     let direction = marker(style, DIRECTION).unwrap_or("normal");
     let mut axis = None;
+    let (mut fill_reverse, mut track_reverse) = (false, false);
     for token in direction.split_whitespace() {
         match token {
             "row" => axis = Some(false),
             "column" => axis = Some(true),
             "normal" => {}
-            // fill-reverse / track-reverse and anything unknown.
+            "fill-reverse" => fill_reverse = true,
+            "track-reverse" => track_reverse = true,
             _ => return None,
         }
     }
@@ -49,13 +62,24 @@ fn lane_columns(style: &Style) -> Option<bool> {
             !spec.is_empty() && !spec.eq_ignore_ascii_case("none")
         })
     };
-    Some(axis.unwrap_or_else(|| {
+    let columns = axis.unwrap_or_else(|| {
         if specified(columns_spec(style)) {
             true
         } else {
             !specified(style.grid_rows())
         }
-    }))
+    });
+    Some(Direction {
+        columns,
+        fill_reverse,
+        track_reverse,
+    })
+}
+
+/// The track a lane span occupies: `track-reverse` counts lanes from the
+/// last track.
+fn track_of(reverse: bool, lanes: usize, start: usize, span: usize) -> usize {
+    if reverse { lanes - start - span } else { start }
 }
 
 /// Whether the real lanes pass lays out this container. Everything else
@@ -69,7 +93,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if !has_marker(style, LANES) {
         return Some("lanes:none");
     }
-    let Some(columns) = lane_columns(style) else {
+    let Some(Direction { columns, .. }) = lane_direction(style) else {
         return Some("lanes:direction");
     };
     if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
@@ -295,7 +319,11 @@ pub(super) fn layout(
     sized: Option<(f32, Option<f32>)>,
 ) -> Option<LayoutResult> {
     let style = flat[index].style;
-    let columns = lane_columns(style).why("lanes:direction")?;
+    let Direction {
+        columns,
+        fill_reverse,
+        track_reverse,
+    } = lane_direction(style).why("lanes:direction")?;
     let metrics: BoxMetrics = block::resolve_inline(style, space);
     let content_width = sized.map_or(metrics.content_width, |(width, _)| width);
     let [bt, br, bb, bl] = metrics.border;
@@ -386,6 +414,20 @@ pub(super) fn layout(
     }
     entries.sort_by_key(|entry| (entry.order, entry.source));
 
+    let used_of = |extent: i64| {
+        let mut used = specified_height.map(units).unwrap_or(extent.max(0));
+        if let Some(min) = min_h {
+            used = used.max(units(min));
+        }
+        if let Some(max) = max_h {
+            used = used.min(units(max));
+        }
+        used
+    };
+    let reverse = Reverse {
+        fill: fill_reverse,
+        track: track_reverse,
+    };
     let (children, mut pending_oof, stacking_extent) = if columns {
         stack_columns(
             flat,
@@ -397,6 +439,8 @@ pub(super) fn layout(
             grid_gap_u,
             stacking_gap_u,
             font,
+            reverse,
+            &used_of,
         )?
     } else {
         stack_rows(
@@ -411,25 +455,13 @@ pub(super) fn layout(
             definite_block.map(units),
             specified_height.map(units),
             font,
+            reverse,
         )?
     };
 
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);
-    let used = if columns {
-        specified_height.map(units).unwrap_or(stacking_extent)
-    } else {
-        specified_height
-            .map(units)
-            .unwrap_or(stacking_extent.max(0))
-    };
-    let mut used = used;
-    if let Some(min) = min_h {
-        used = used.max(units(min));
-    }
-    if let Some(max) = max_h {
-        used = used.min(units(max));
-    }
+    let used = used_of(stacking_extent);
     let content_height = from_units(used.max(0));
     let mut height = content_height;
     if let Some(max) = max_h {
@@ -493,6 +525,12 @@ pub(super) fn layout(
         bfc_dependent: false,
         float_overlap: false,
     })
+}
+
+#[derive(Clone, Copy)]
+struct Reverse {
+    fill: bool,
+    track: bool,
 }
 
 type Placed = Vec<(f32, f32, BoxFragment)>;
@@ -586,6 +624,8 @@ fn stack_columns(
     column_gap_u: i64,
     row_gap_u: i64,
     font: f32,
+    reverse: Reverse,
+    used_of: &dyn Fn(i64) -> i64,
 ) -> Option<Stacked> {
     let lanes = specs.len();
     let mut col_min = vec![0_i64; lanes];
@@ -621,16 +661,28 @@ fn stack_columns(
     let free = inner_u - gap_sum(&collapsed, column_gap_u) - sizes.iter().sum::<i64>();
     let (lead, between) = pack_gap(column_pack(style), free, lanes, column_gap_u);
     let column_x = positions(&sizes, &collapsed, between, lead);
+    if reverse.track
+        && (lead != 0
+            || between != column_gap_u
+            || sizes.iter().sum::<i64>() + gap_sum(&collapsed, column_gap_u) > inner_u)
+    {
+        return crate::layout_ng::bail("lanes:track-reverse-overflow");
+    }
     let tolerance = tolerance_units(style, inner_u);
     let mut running = Running::new(lanes, tolerance);
     let mut placed = Vec::with_capacity(entries.len());
     let mut extent = 0_i64;
+    let mut margins = Vec::with_capacity(entries.len());
     for entry in entries {
-        let (start, at) = match entry.start {
+        let explicit = entry
+            .start
+            .map(|start| track_of(reverse.track, lanes, start, entry.span));
+        let (start, at) = match explicit {
             Some(start) => (start, running.span_max(start, entry.span)),
             None => running.first_eligible(entry.span),
         };
-        let area = span_sum(&sizes, &collapsed, start, entry.span, between);
+        let track = track_of(reverse.track, lanes, start, entry.span);
+        let area = span_sum(&sizes, &collapsed, track, entry.span, between);
         let prepared = prepare(
             flat,
             style,
@@ -661,13 +713,14 @@ fn stack_columns(
             prepared.justify,
         );
         let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
-        let x = from_units(column_x[start] + ml + inline_offset);
+        let x = from_units(column_x[track] + ml + inline_offset);
         let y = from_units(at + mt);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
         running.place(start, entry.span, at + contribution);
         if entry.start.is_none() {
             running.cursor = start + entry.span;
         }
+        margins.push((at, mb, units(fragment.height), dy));
         placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
     }
     for position in &running.positions {
@@ -678,6 +731,18 @@ fn stack_columns(
     } else {
         (extent - row_gap_u).max(0)
     };
+    if reverse.fill {
+        // Items stack from the end of the container: the block axis is
+        // mirrored once its used size is known.
+        let used = used_of(extent);
+        if used < extent {
+            return crate::layout_ng::bail("lanes:fill-reverse-overflow");
+        }
+        for (item, (at, mb, height, dy)) in placed.iter_mut().zip(&margins) {
+            // The margin box mirrors; margins keep their physical sides.
+            item.2 = from_units(used - at - height - mb) + dy;
+        }
+    }
     placed.sort_by_key(|item| item.0);
     Some(unzip_placed(placed, extent))
 }
@@ -695,6 +760,7 @@ fn stack_rows(
     definite_block: Option<i64>,
     specified_block: Option<i64>,
     font: f32,
+    reverse: Reverse,
 ) -> Option<Stacked> {
     let lanes = specs.len();
     let inner = from_units(inner_u);
@@ -801,16 +867,23 @@ fn stack_rows(
     let free = used - gap_sum(&collapsed, row_gap_u) - sizes.iter().sum::<i64>();
     let (lead, between) = pack_gap(row_pack(style), free.max(0), lanes, row_gap_u);
     let row_y = positions(&sizes, &collapsed, between, lead.max(0));
+    if reverse.track && (lead != 0 || between != row_gap_u) {
+        return crate::layout_ng::bail("lanes:track-reverse-overflow");
+    }
     let tolerance = tolerance_units(style, used);
     let mut running = Running::new(lanes, tolerance);
     let mut placed = Vec::with_capacity(entries.len());
     for (entry, (prepared, mut fragment, mut item_oof)) in entries.iter().zip(measured) {
-        let (start, at) = match entry.start {
+        let explicit = entry
+            .start
+            .map(|start| track_of(reverse.track, lanes, start, entry.span));
+        let (start, at) = match explicit {
             Some(start) => (start, running.span_max(start, entry.span)),
             None => running.first_eligible(entry.span),
         };
+        let track = track_of(reverse.track, lanes, start, entry.span);
         let [mt, mr, mb, ml] = prepared.margin.map(units);
-        let lane_size = span_sum(&sizes, &collapsed, start, entry.span, between);
+        let lane_size = span_sum(&sizes, &collapsed, track, entry.span, between);
         let stretch_block = prepared.align == Pack::Stretch
             && prepared.specified_content_h.is_none()
             && !has_marker(flat[entry.index].style, super::HEIGHT_KEYWORD);
@@ -841,8 +914,16 @@ fn stack_rows(
             prepared.align,
         );
         let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
-        let x = from_units(at + ml);
-        let y = from_units(row_y[start] + mt + block_offset);
+        let mut x = from_units(at + ml);
+        if reverse.fill {
+            // Items stack from the inline end: the margin box mirrors.
+            let end = at + ml + units(fragment.width) + mr;
+            if end > inner_u {
+                return crate::layout_ng::bail("lanes:fill-reverse-overflow");
+            }
+            x = from_units(inner_u - at - units(fragment.width) - mr);
+        }
+        let y = from_units(row_y[track] + mt + block_offset);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
         running.place(start, entry.span, at + contribution);
         if entry.start.is_none() {

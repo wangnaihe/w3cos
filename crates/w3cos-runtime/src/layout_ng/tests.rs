@@ -6391,7 +6391,9 @@ fn grid_lanes_matches_chrome() {
         let spec = &case["spec"];
         let container = &spec["container"];
         let number = |value: &serde_json::Value| value.as_f64().map(|v| v as f32);
-        let rows_axis = container["axis"] == "row"
+        let rows_axis = container["axis"]
+            .as_str()
+            .is_some_and(|axis| axis.starts_with("row"))
             || (container["axis"].is_null() && container["rows"].as_bool().unwrap_or(false));
         let mut markers = vec![("--w3cos-internal-grid-lanes".to_string(), String::new())];
         if let Some(axis) = container["axis"].as_str() {
