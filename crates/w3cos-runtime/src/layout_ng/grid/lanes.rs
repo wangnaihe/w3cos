@@ -73,6 +73,9 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
         return Some("lanes:size-keyword");
     }
+    if has_marker(style, "--w3cos-internal-overflow-alignment") {
+        return Some("lanes:overflow-alignment");
+    }
     if marker(style, PACK).is_some_and(|pack| pack != "normal" && pack != "dense") {
         return Some("lanes:pack");
     }
@@ -130,13 +133,40 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if stacking_aligned {
         return Some("lanes:stacking-alignment");
     }
-    if tolerance_spec(style).is_none() {
-        return Some("lanes:tolerance");
+    match tolerance_spec(style) {
+        None => return Some("lanes:tolerance"),
+        // A percentage resolves against the intrinsic grid-axis size,
+        // which the ordinary-grid reference does not model.
+        Some(Tolerance::Percent(_))
+            if matches!(
+                if columns { style.width } else { style.height },
+                Dimension::Auto
+            ) =>
+        {
+            return Some("lanes:percent-tolerance");
+        }
+        Some(_) => {}
     }
+    let intrinsic_axis = template
+        .tracks
+        .iter()
+        .chain(&template.auto_tracks)
+        .any(spec_is_intrinsic);
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
             return Some("lanes:oof");
+        }
+        if has_marker(child_style, "--w3cos-internal-overflow-alignment") {
+            return Some("lanes:overflow-alignment");
+        }
+        if intrinsic_axis
+            && placement(child_style, !columns)
+                .is_some_and(|value| value.contains("span") || value.contains('/'))
+        {
+            // Spanning items over intrinsic tracks feed the track sizing
+            // in ways the ordinary-grid reference does not match.
+            return Some("lanes:intrinsic-span");
         }
         if block::is_replaced_item(flat, child)
             || columns_spec(child_style).is_some_and(is_subgrid_axis)
@@ -874,4 +904,17 @@ fn unzip_placed(
 fn is_dense(style: &Style) -> bool {
     marker(style, PACK) == Some("dense")
         || parse_flow(style.grid_flow()).is_some_and(|flow| flow.dense)
+}
+
+fn spec_is_intrinsic(spec: &Spec) -> bool {
+    let intrinsic = |breadth: &Breadth| {
+        matches!(
+            breadth,
+            Breadth::Auto | Breadth::MinContent | Breadth::MaxContent
+        )
+    };
+    match spec {
+        Spec::One(breadth) | Spec::Fit(breadth) => intrinsic(breadth),
+        Spec::MinMax(min, max) => intrinsic(min) || intrinsic(max),
+    }
 }

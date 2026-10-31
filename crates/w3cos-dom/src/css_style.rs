@@ -62,6 +62,10 @@ pub const MAX_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-height-keywo
 /// `flex-basis: content` (alone or as the third `flex` token). The
 /// dimension stays `Auto`; layouts that care read the marker.
 pub const FLEX_BASIS_CONTENT_PROPERTY: &str = "--w3cos-internal-flex-basis-content";
+/// A `safe` / `unsafe` overflow-position keyword in a self-alignment
+/// declaration. The legacy fields drop it; grid-lanes reads the marker to
+/// stay off the real lanes pass (which would ignore the keyword).
+pub const OVERFLOW_ALIGNMENT_PROPERTY: &str = "--w3cos-internal-overflow-alignment";
 /// `width | height | min-/max-` set to `stretch` (or `-webkit-fill-available`):
 /// a comma list of the axes that carry it (`w`, `h`, `minw`, `minh`, `maxw`,
 /// `maxh`). The dimension stays auto / none; LayoutNG resolves the keyword
@@ -575,6 +579,30 @@ impl CSSStyleDeclaration {
     }
 
     fn set_property_unshadowed(&mut self, name: &str, value: &str) {
+        if matches!(
+            name,
+            "align-items"
+                | "alignItems"
+                | "align-self"
+                | "alignSelf"
+                | "justify-items"
+                | "justifyItems"
+                | "justify-self"
+                | "justifySelf"
+                | "place-items"
+                | "placeItems"
+                | "place-self"
+                | "placeSelf"
+        ) && value
+            .split_whitespace()
+            .any(|token| matches!(token.to_ascii_lowercase().as_str(), "safe" | "unsafe"))
+        {
+            set_marker(
+                &mut self.inner,
+                OVERFLOW_ALIGNMENT_PROPERTY,
+                Some("1".to_string()),
+            );
+        }
         if self.replace_existing_inset(name, value) {
             return;
         }
