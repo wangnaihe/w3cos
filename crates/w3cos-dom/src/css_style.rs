@@ -59,6 +59,9 @@ pub const MIN_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-height-keywo
 /// `max-height: min-content | max-content | fit-content`; `max_height`
 /// stays `Auto` (none).
 pub const MAX_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-height-keyword";
+/// `flex-basis: content` (alone or as the third `flex` token). The
+/// dimension stays `Auto`; layouts that care read the marker.
+pub const FLEX_BASIS_CONTENT_PROPERTY: &str = "--w3cos-internal-flex-basis-content";
 /// `width | height | min-/max-` set to `stretch` (or `-webkit-fill-available`):
 /// a comma list of the axes that carry it (`w`, `h`, `minw`, `minh`, `maxw`,
 /// `maxh`). The dimension stays auto / none; LayoutNG resolves the keyword
@@ -806,7 +809,16 @@ impl CSSStyleDeclaration {
                     self.inner.flex_shrink = v
                 }
             }
-            "flex" => apply_flex_shorthand(&mut self.inner, value),
+            "flex" => {
+                apply_flex_shorthand(&mut self.inner, value);
+                let content = value.split_whitespace().count() > 1
+                    && value.split_whitespace().last() == Some("content");
+                set_marker(
+                    &mut self.inner,
+                    FLEX_BASIS_CONTENT_PROPERTY,
+                    content.then(|| "1".to_string()),
+                );
+            }
 
             // `grid-gap`, `grid-row-gap`, and `grid-column-gap` are the legacy
             // aliases (CSS Box Alignment) that Chrome still parses.
@@ -2038,7 +2050,14 @@ impl CSSStyleDeclaration {
             "visibility" => self.inner.visibility = parse_visibility(value),
 
             // Flex extras
-            "flex-basis" | "flexBasis" => self.inner.flex_basis = parse_dimension(value),
+            "flex-basis" | "flexBasis" => {
+                self.inner.flex_basis = parse_dimension(value);
+                set_marker(
+                    &mut self.inner,
+                    FLEX_BASIS_CONTENT_PROPERTY,
+                    (value.trim() == "content").then(|| "1".to_string()),
+                );
+            }
             "order" => {
                 if let Ok(v) = value.parse() {
                     self.inner.order = v
@@ -3604,7 +3623,14 @@ fn apply_grid_area(style: &mut Style, value: &str) {
     remember_grid_placement(style);
     let parts = split_grid_slash(value);
     let (row, column) = match parts.as_slice() {
-        [only] => ((*only).to_string(), "auto".to_string()),
+        [only] => (
+            (*only).to_string(),
+            if is_grid_custom_ident(only) {
+                (*only).to_string()
+            } else {
+                "auto".to_string()
+            },
+        ),
         [row_start, column_start] => ((*row_start).to_string(), (*column_start).to_string()),
         [row_start, column_start, row_end] => (
             format!("{row_start} / {row_end}"),
@@ -8701,4 +8727,25 @@ fn flex_flow_sets_direction_and_wrap() {
     declaration.set_property("flex-flow", "wrap bogus");
     assert_eq!(declaration.inner.flex_direction, FlexDirection::RowReverse);
     assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
+}
+
+#[test]
+fn flex_basis_content_is_a_marker_over_an_auto_basis() {
+    let marked = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key(FLEX_BASIS_CONTENT_PROPERTY))
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("flex", "1 1 content");
+    assert!(marked(&declaration));
+    assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+    declaration.set_property("flex", "1 1 auto");
+    assert!(!marked(&declaration));
+    declaration.set_property("flex-basis", "content");
+    assert!(marked(&declaration));
+    declaration.set_property("flex-basis", "10px");
+    assert!(!marked(&declaration));
 }

@@ -13,9 +13,10 @@
 //! margin on the items that face a gutter (CSS Grid §9.2). Line names on
 //! the parent are inherited and the subgrid's own `[name]` list is added.
 //! A nested subgrid contributes through the same path. An unsupported
-//! subgrid syntax, a percent gap, and `grid-template-areas` stay on the
-//! legacy engine. A subgrid is still stretched with an automatic size on
-//! the subgridded axis: the legacy engine honors a specified size, so
+//! subgrid syntax and a percent gap stay on the legacy engine. A
+//! `grid-template-areas` matrix is laid out when the explicit tracks cover
+//! it. A subgrid is still stretched with an automatic size on the
+//! subgridded axis: the legacy engine honors a specified size, so
 //! ignoring it here would paint only one side of those reftests.
 //!
 //! Track sizes are LayoutUnits (1/64 px). Flexible tracks share free space
@@ -249,7 +250,10 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-document-element") {
         return Some("grid:root");
     }
-    if style.grid_areas().is_some() {
+    if style
+        .grid_areas()
+        .is_some_and(|text| parse_areas(text).is_none())
+    {
         return Some("grid:areas");
     }
     if is_baseline(style.align_items) || is_baseline(style.justify_items) {
@@ -822,8 +826,7 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     // holds for a static bordered intrinsic box: it is the reference drawn
     // for `display: inline grid-lanes` tests, which stay on legacy flex.
     if style.position != Position::Relative
-        && !(intrinsic
-            && style.position == Position::Static
+        && !(style.position == Position::Static
             && block::border_widths(style)
                 .iter()
                 .all(|value| value.abs() <= EPS))
@@ -862,9 +865,6 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
         || has_marker(style, "--w3cos-internal-width-keyword")
         || has_marker(style, "--w3cos-internal-size-containment")
         || has_marker(style, HEIGHT_KEYWORD)
-        || style.grid_auto_column_spec().is_some()
-        || style.grid_auto_row_spec().is_some()
-        || style.grid_areas().is_some()
     {
         return false;
     }
@@ -2028,6 +2028,145 @@ fn parse_grid_line(token: &str) -> Option<GridLine> {
     }
 }
 
+/// A `grid-template-areas` rectangle, as line indices (end exclusive).
+struct AreaRect {
+    name: String,
+    row_start: usize,
+    column_start: usize,
+    row_end: usize,
+    column_end: usize,
+}
+
+/// Parse a plain `grid-template-areas` string (quoted rows only) into its
+/// row count, column count and named rectangles. `None` for a ragged
+/// matrix, a non-rectangular area, or a `grid-template` shorthand that
+/// carries track sizes.
+fn parse_areas(text: &str) -> Option<(usize, usize, Vec<AreaRect>)> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        let quote = rest.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let body = &rest[1..];
+        let close = body.find(quote)?;
+        let cells: Vec<String> = body[..close]
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if cells.is_empty() {
+            return None;
+        }
+        rows.push(cells);
+        rest = body[close + 1..].trim_start();
+    }
+    let columns = rows.first()?.len();
+    if rows.iter().any(|row| row.len() != columns) {
+        return None;
+    }
+    let mut areas: Vec<AreaRect> = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if cell.chars().all(|ch| ch == '.') {
+                continue;
+            }
+            if !is_ident(cell) {
+                return None;
+            }
+            match areas.iter_mut().find(|area| area.name == *cell) {
+                Some(area) => {
+                    area.row_start = area.row_start.min(r);
+                    area.column_start = area.column_start.min(c);
+                    area.row_end = area.row_end.max(r + 1);
+                    area.column_end = area.column_end.max(c + 1);
+                }
+                None => areas.push(AreaRect {
+                    name: cell.clone(),
+                    row_start: r,
+                    column_start: c,
+                    row_end: r + 1,
+                    column_end: c + 1,
+                }),
+            }
+        }
+    }
+    for area in &areas {
+        for r in area.row_start..area.row_end {
+            for c in area.column_start..area.column_end {
+                if rows[r][c] != area.name {
+                    return None;
+                }
+            }
+        }
+    }
+    Some((rows.len(), columns, areas))
+}
+
+/// Add the implicit `<name>-start` and `<name>-end` lines of the container's
+/// `grid-template-areas` to its templates. Areas beyond the written tracks
+/// add explicit tracks sized by `grid-auto-columns` / `grid-auto-rows`.
+fn add_area_names(
+    style: &Style,
+    columns: &mut Template,
+    rows: &mut Template,
+    implicit_column: &Spec,
+    implicit_row: &Spec,
+) -> Option<()> {
+    let Some(text) = style.grid_areas() else {
+        return Some(());
+    };
+    let (row_count, column_count, areas) = parse_areas(text)?;
+    for (template, count, pad) in [
+        (&mut *columns, column_count, implicit_column),
+        (&mut *rows, row_count, implicit_row),
+    ] {
+        if template.auto_fit.is_some() {
+            return None;
+        }
+        while template.tracks.len() < count {
+            template.tracks.push(*pad);
+            template.names.push(Vec::new());
+        }
+    }
+    for area in &areas {
+        for (template, start, end) in [
+            (&mut *columns, area.column_start, area.column_end),
+            (&mut *rows, area.row_start, area.row_end),
+        ] {
+            template
+                .names
+                .get_mut(start)?
+                .push(format!("{}-start", area.name));
+            template
+                .names
+                .get_mut(end)?
+                .push(format!("{}-end", area.name));
+        }
+    }
+    Some(())
+}
+
+/// A bare identifier that names no line but whose `<name>-start` or
+/// `<name>-end` exists names that area edge.
+fn area_edge(token: &str, names: &[Vec<String>], suffix: &str) -> Option<String> {
+    let token = token.trim();
+    if !is_ident(token)
+        || token.eq_ignore_ascii_case("auto")
+        || token.eq_ignore_ascii_case("span")
+        || names
+            .iter()
+            .any(|line| line.iter().any(|name| name == token))
+    {
+        return None;
+    }
+    let edge = format!("{token}-{suffix}");
+    names
+        .iter()
+        .any(|line| line.contains(&edge))
+        .then_some(edge)
+}
+
 fn is_ident(token: &str) -> bool {
     let mut chars = token.chars();
     match chars.next() {
@@ -2057,8 +2196,18 @@ fn resolve_axis(value: Option<&str>, names: &[Vec<String>], explicit: usize) -> 
     };
     let parts: Vec<&str> = value.split('/').map(str::trim).collect();
     match parts.as_slice() {
-        [only] => resolve_one(only, names, explicit, None),
-        [start, end] => resolve_pair(start, end, names, explicit),
+        [only] => match (
+            area_edge(only, names, "start"),
+            area_edge(only, names, "end"),
+        ) {
+            (Some(start), Some(end)) => resolve_pair(&start, &end, names, explicit),
+            _ => resolve_one(only, names, explicit, None),
+        },
+        [start, end] => {
+            let start = area_edge(start, names, "start").unwrap_or_else(|| (*start).to_string());
+            let end = area_edge(end, names, "end").unwrap_or_else(|| (*end).to_string());
+            resolve_pair(&start, &end, names, explicit)
+        }
         _ => None,
     }
 }
@@ -3917,7 +4066,7 @@ fn layout_impl(
             row_gap_u = inherited.row_gap;
         }
     }
-    let columns_template = if column_sub {
+    let mut columns_template = if column_sub {
         let inherited = inherited.as_ref().unwrap();
         let names = merge_line_names(
             &inherited.col_names,
@@ -3933,7 +4082,7 @@ fn layout_impl(
             Some(spec) => parse_template(spec, false).why("grid:template")?,
         }
     };
-    let rows_template = if row_sub {
+    let mut rows_template = if row_sub {
         let inherited = inherited.as_ref().unwrap();
         let local = local_subgrid_names(style, true);
         if let Some(rows) = &inherited.rows {
@@ -3951,6 +4100,27 @@ fn layout_impl(
             Some(spec) => parse_template(spec, true).why("grid:template")?,
         }
     };
+    if style.grid_areas().is_some() {
+        if column_sub || row_sub || columns_spec(style).is_none() {
+            return super::bail("grid:areas");
+        }
+        let pad_column = match style.grid_auto_column_spec() {
+            Some(spec) => parse_one_track(spec).why("grid:auto-columns")?,
+            None => Spec::One(Breadth::Auto),
+        };
+        let pad_row = match style.grid_auto_row_spec() {
+            Some(spec) => parse_one_track(spec).why("grid:auto-rows")?,
+            None => Spec::One(Breadth::Auto),
+        };
+        add_area_names(
+            style,
+            &mut columns_template,
+            &mut rows_template,
+            &pad_column,
+            &pad_row,
+        )
+        .why("grid:areas")?;
+    }
     let flow = container_flow(flat, index).why("grid:auto-flow")?;
     if (measure || keyword.is_some()) && columns_template.auto_fit.is_some() {
         return super::bail("grid:intrinsic-repeat");
@@ -5825,6 +5995,56 @@ mod tests {
             ),
             &[(2, [40.0, 0.0, 80.0, 10.0])],
         );
+    }
+
+    #[test]
+    fn template_areas_name_implicit_start_and_end_lines() {
+        let item = |column: &str, row: &str| {
+            let mut style = block_box(None, None);
+            style.grid_column = Some(column.to_string());
+            style.grid_ng_mut().grid_row = Some(row.to_string());
+            leaf(style)
+        };
+        let mut style = grid_style(150.0, None, Some("50px 50px 50px"));
+        style.grid_ng_mut().grid_template_rows = Some("10px 10px".to_string());
+        style.grid_ng_mut().grid_template_areas = Some("\"a a b\" \"c c b\"".to_string());
+        // `grid-area: b` is column `b` and row `b`; an area name spans it.
+        expect(
+            &Component::boxed(
+                style,
+                vec![item("b", "b"), item("c", "c"), item("a / b", "a")],
+            ),
+            &[
+                (1, [100.0, 0.0, 50.0, 20.0]),
+                (2, [0.0, 10.0, 100.0, 10.0]),
+                (3, [0.0, 0.0, 150.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn template_areas_beyond_the_tracks_use_the_auto_sizes() {
+        // One written column row, two area rows: the second row is sized by
+        // grid-auto-rows, the first (no template-rows) too.
+        let mut style = grid_style(100.0, None, Some("50px 50px"));
+        style.grid_ng_mut().grid_template_areas = Some("\"a b\" \"a b\"".to_string());
+        style.grid_ng_mut().grid_auto_rows = Some("20px".to_string());
+        let mut second = block_box(None, None);
+        second.grid_column = Some("b".to_string());
+        second.grid_ng_mut().grid_row = Some("b".to_string());
+        expect(
+            &Component::boxed(style, vec![leaf(second)]),
+            &[(1, [50.0, 0.0, 50.0, 40.0])],
+        );
+    }
+
+    #[test]
+    fn template_areas_parse_rectangles_only() {
+        assert!(parse_areas("\"a b\" \"a b\"").is_some());
+        assert!(parse_areas("\"a . b\" \"a ... b\"").is_some());
+        assert!(parse_areas("\"a b\" \"b a\"").is_none());
+        assert!(parse_areas("\"a b\" \"a\"").is_none());
+        assert!(parse_areas("\"a b\" 10px / 1fr").is_none());
     }
 
     #[test]

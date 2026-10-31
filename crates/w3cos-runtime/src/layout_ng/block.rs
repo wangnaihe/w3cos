@@ -141,6 +141,7 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "document-element"
             | "size-containment"
             | "contain-intrinsic-size"
+            | "flex-basis-content"
             // The computed `tab-size` (inherited). Text measure and paint
             // read it for preserved tabs; `text:tab` gates the leaves whose
             // stops need a line position NG does not pass yet.

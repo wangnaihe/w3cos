@@ -3396,13 +3396,14 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
         block::unsupported_reasons(&margin_flat)
     );
 
-    // A static box is the reference side of reftests that still fall back.
+    // A static box is laid out too (grid-template-areas, auto tracks and
+    // the other features switch with it so no reftest splits).
     let mut static_grid = grid("100px", "40px", AlignItems::Stretch);
     static_grid.position = Position::Static;
     let static_root = node(block(), vec![node(static_grid, vec![])]);
     let static_flat = pre_flatten(&static_root);
     assert!(
-        !block::supports_tree(&static_flat),
+        block::supports_tree(&static_flat),
         "{:?}",
         block::unsupported_reasons(&static_flat)
     );
@@ -7365,6 +7366,14 @@ fn indefinite_column_item_children_percent_is_auto() {
     let item = Style {
         height: Dimension::Px(100.0),
         min_height: Dimension::Px(0.0),
+        custom_properties: Some(
+            [(
+                "--w3cos-internal-flex-basis-content".to_string(),
+                "1".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
         ..block()
     };
     let green = Style {

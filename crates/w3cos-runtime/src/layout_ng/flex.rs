@@ -1768,9 +1768,15 @@ fn layout_item_basis(
     // basis (percentage-heights-007), or one whose height transfers from an
     // aspect ratio (flex-aspect-ratio-032).
     let style = flat[index].style;
-    let inflexible_length = style.flex_grow <= 0.0
+    let inflexible_length = (style.flex_grow <= 0.0
         && style.flex_shrink <= 0.0
-        && matches!(style.flex_basis, Dimension::Px(_));
+        && matches!(style.flex_basis, Dimension::Px(_)))
+        // `flex-basis: auto` over a length `height` keeps that height a
+        // percentage basis; `flex-basis: content` does not
+        // (flex-basis-content-percentage-height, percentage-heights-016).
+        || (matches!(style.flex_basis, Dimension::Auto)
+            && matches!(style.height, Dimension::Px(_))
+            && !has_marker(style, "--w3cos-internal-flex-basis-content"));
     nested.fixed_block_indefinite = (!row
         && container_inner_height.is_none()
         && !inflexible_length
