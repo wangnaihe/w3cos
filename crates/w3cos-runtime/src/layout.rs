@@ -21932,7 +21932,19 @@ fn build_taffy_tree(
         {
             min_w
         } else {
-            to_taffy_dim(comp.style.min_width, &comp.style, viewport_w, viewport_h)
+            let authored = to_taffy_dim(comp.style.min_width, &comp.style, viewport_w, viewport_h);
+            // A text-only flex item (e.g. `h3.title { min-width: 3ch }`) keeps
+            // its content width as the lower bound: an authored `min-width`
+            // only raises it. Replacing it lets the leaf collapse to the
+            // authored width and wrap one glyph per line.
+            let text_flex_item = matches!(comp.kind, ComponentKind::Text { .. })
+                && matches!(parent_display, Some(WDisplay::Flex | WDisplay::InlineFlex))
+                && !matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse))
+                && comp.style.white_space != WWhiteSpace::PreWrap;
+            match (text_flex_item, min_w.into_option(), authored.into_option()) {
+                (true, Some(content), Some(authored_px)) if content > authored_px => min_w,
+                _ => authored,
+            }
         };
         let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto)
             && matches!(comp.style.max_height, WDim::Auto)
