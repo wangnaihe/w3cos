@@ -2594,7 +2594,7 @@ impl Document {
         }
         user_normal.extend(author_declarations);
         user_normal.extend(user_important);
-        let author_declarations = user_normal;
+        let author_declarations = expand_logical_border_declarations(user_normal);
         // list-style-image is inherited, unlike most internal layout metadata.
         // Keep it in the ordinary computed cascade so resource consumers and
         // marker lowering observe the same winning value.
@@ -6913,7 +6913,17 @@ impl Document {
                 style.position,
                 w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
             ) && inherited.is_some_and(|parent| {
+                // An absolutely positioned block with both vertical insets has
+                // a definite used height (CSS 2.1 10.6.4), so percentage
+                // heights of its children resolve against it.
+                let definite_by_insets =
+                    matches!(
+                        parent.position,
+                        w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+                    ) && !matches!(parent.top, w3cos_std::style::Dimension::Auto)
+                        && !matches!(parent.bottom, w3cos_std::style::Dimension::Auto);
                 matches!(parent.height, w3cos_std::style::Dimension::Auto)
+                    && !definite_by_insets
                     && matches!(
                         parent.display,
                         w3cos_std::style::Display::Block
@@ -11048,6 +11058,81 @@ impl Document {
             self.dispatch_event_bubbling(&mut input_event);
         }
     }
+}
+
+/// Rewrite logical border declarations (`border-block`, `border-inline`,
+/// `border-block-start`, `border-inline-width`, ...) into the physical
+/// `border-top`/`-right`/`-bottom`/`-left` forms. The used-value passes below
+/// only look at physical names, so without this `border-block: 4px solid`
+/// would be parsed into the style but never reach layout.
+fn expand_logical_border_declarations(
+    declarations: Vec<(String, String, u32)>,
+) -> Vec<(String, String, u32)> {
+    fn logical(name: &str) -> Option<(bool, Option<&'static str>, Option<bool>)> {
+        // (is_block, kind, Some(start)/Some(end)/None-for-both)
+        let lower = name.to_ascii_lowercase();
+        let rest = lower.strip_prefix("border-")?;
+        let (block, rest) = if let Some(rest) = rest.strip_prefix("block") {
+            (true, rest)
+        } else if let Some(rest) = rest.strip_prefix("inline") {
+            (false, rest)
+        } else {
+            return None;
+        };
+        let (kind, rest): (Option<&'static str>, &str) =
+            if let Some(r) = rest.strip_suffix("-width") {
+                (Some("width"), r)
+            } else if let Some(r) = rest.strip_suffix("-style") {
+                (Some("style"), r)
+            } else if let Some(r) = rest.strip_suffix("-color") {
+                (Some("color"), r)
+            } else {
+                (None, rest)
+            };
+        match rest {
+            "" => Some((block, kind, None)),
+            "-start" if kind.is_none() => Some((block, kind, Some(true))),
+            "-end" if kind.is_none() => Some((block, kind, Some(false))),
+            _ => None,
+        }
+    }
+    if !declarations
+        .iter()
+        .any(|(name, _, _)| logical(name).is_some())
+    {
+        return declarations;
+    }
+    let mut out = Vec::with_capacity(declarations.len() + 4);
+    for (name, value, specificity) in declarations {
+        let Some((block, kind, edge)) = logical(&name) else {
+            out.push((name, value, specificity));
+            continue;
+        };
+        let (start, end) = if block {
+            ("top", "bottom")
+        } else {
+            ("left", "right")
+        };
+        let suffix = kind.map(|kind| format!("-{kind}")).unwrap_or_default();
+        let name_for = |side: &str| format!("border-{side}{suffix}");
+        match edge {
+            Some(true) => out.push((name_for(start), value, specificity)),
+            Some(false) => out.push((name_for(end), value, specificity)),
+            None => {
+                let tokens = split_css_tokens(&value);
+                // Longhand-per-edge kinds take `start [end]`; the shorthand
+                // applies the same value to both edges.
+                let (first, second) = if kind.is_some() && tokens.len() == 2 {
+                    (tokens[0].clone(), tokens[1].clone())
+                } else {
+                    (value.clone(), value)
+                };
+                out.push((name_for(start), first, specificity));
+                out.push((name_for(end), second, specificity));
+            }
+        }
+    }
+    out
 }
 
 fn css_property_eq(actual: &str, canonical: &str) -> bool {

@@ -142,6 +142,10 @@ impl CSSStyleDeclaration {
                 | "border-inline-end"
                 | "border-block-start"
                 | "border-block-end"
+                | "border-block"
+                | "border-inline"
+                | "borderBlock"
+                | "borderInline"
                 | "borderInlineStart"
                 | "borderInlineEnd"
                 | "borderBlockStart"
@@ -764,6 +768,18 @@ impl CSSStyleDeclaration {
                     self.inner.border_left_width = Some(if edges[3] { widths[3] } else { 0.0 });
                 }
             }
+            "border-block-width" | "borderBlockWidth" => {
+                let values = split_css_whitespace(value);
+                if let Some(start) = values.first().and_then(|value| parse_border_width(value)) {
+                    self.inner.border_top_width = Some(start);
+                    self.inner.border_bottom_width = Some(
+                        values
+                            .get(1)
+                            .and_then(|value| parse_border_width(value))
+                            .unwrap_or(start),
+                    );
+                }
+            }
             "border-inline-width" | "borderInlineWidth" => {
                 let values = split_css_whitespace(value);
                 if let Some(start) = values.first().and_then(|value| parse_border_width(value)) {
@@ -809,6 +825,16 @@ impl CSSStyleDeclaration {
             }
             "border-left" | "borderLeft" => {
                 apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
+            }
+            // Logical two-sided shorthands: `border-block` is top+bottom,
+            // `border-inline` is left+right (horizontal writing mode).
+            "border-block" | "borderBlock" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Top);
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Bottom);
+            }
+            "border-inline" | "borderInline" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left);
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Right);
             }
             "border-inline-start" | "borderInlineStart" => {
                 apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
@@ -5889,6 +5915,28 @@ mod tests {
         assert_eq!(declaration.inner.border_left_width, Some(0.0));
         assert_eq!(declaration.inner.border_right_width, Some(0.0));
         assert_eq!(declaration.inner.border_top_width, Some(1.0));
+    }
+
+    #[test]
+    fn border_block_and_inline_shorthands_cover_both_edges() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-block", "4px solid transparent");
+        assert_eq!(declaration.inner.border_top_width, Some(4.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(4.0));
+        assert_eq!(declaration.inner.border_left_width, None);
+        assert_eq!(declaration.inner.border_right_width, None);
+
+        declaration.set_property("border-inline", "2px solid #fff");
+        assert_eq!(declaration.inner.border_left_width, Some(2.0));
+        assert_eq!(declaration.inner.border_right_width, Some(2.0));
+
+        declaration.set_property("border-block-width", "1px 3px");
+        assert_eq!(declaration.inner.border_top_width, Some(1.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(3.0));
+
+        declaration.set_property("border-block", "none");
+        assert_eq!(declaration.inner.border_top_width, Some(0.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(0.0));
     }
 
     #[test]
