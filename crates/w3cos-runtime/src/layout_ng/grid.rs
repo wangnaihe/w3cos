@@ -772,9 +772,8 @@ fn zero_margins(style: &Style) -> bool {
         && spacing_is_zero(style.margin.left)
 }
 
-fn zero_box_edges(style: &Style) -> bool {
-    zero_margins(style)
-        && spacing_is_zero(style.padding.top)
+fn zero_padding_and_border(style: &Style) -> bool {
+    spacing_is_zero(style.padding.top)
         && spacing_is_zero(style.padding.right)
         && spacing_is_zero(style.padding.bottom)
         && spacing_is_zero(style.padding.left)
@@ -849,11 +848,20 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     {
         return false;
     }
-    if !(if intrinsic {
-        zero_margins(style)
-    } else {
-        zero_box_edges(style)
-    }) {
+    // Non-negative px margins are placed by the inline-grid line builder.
+    let margins = [
+        style.margin.top,
+        style.margin.right,
+        style.margin.bottom,
+        style.margin.left,
+    ];
+    if !margins
+        .iter()
+        .all(|margin| matches!(margin, Spacing::Px(value) if *value >= 0.0))
+    {
+        return false;
+    }
+    if !intrinsic && !zero_padding_and_border(style) {
         return false;
     }
     if is_baseline(style.align_items) || is_baseline(style.justify_items) {

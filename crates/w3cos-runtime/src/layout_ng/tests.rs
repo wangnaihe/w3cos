@@ -3391,10 +3391,12 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
     let margin_root = node(block(), vec![node(margined, vec![])]);
     let margin_flat = pre_flatten(&margin_root);
     assert!(
-        !block::supports_tree(&margin_flat),
+        block::supports_tree(&margin_flat),
         "{:?}",
         block::unsupported_reasons(&margin_flat)
     );
+    let margin_out = layout_tree(&margin_root, &margin_flat, 800.0, 600.0).expect("margined");
+    assert_eq!(at(&margin_out, 1), (0.0, 10.0, 100.0, 40.0));
 
     // A static box is laid out too (grid-template-areas, auto tracks and
     // the other features switch with it so no reftest splits).

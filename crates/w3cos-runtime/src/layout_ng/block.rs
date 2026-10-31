@@ -3777,6 +3777,21 @@ fn inline_grid_line_ascent(result: &LayoutResult) -> f32 {
     }
 }
 
+/// `[top, right, bottom, left]` px margins of an inline-grid on a line
+/// (`inline_grid_tracks` admits only non-negative px margins).
+fn inline_grid_margins(style: &Style) -> [f32; 4] {
+    let px = |spacing: Spacing| match spacing {
+        Spacing::Px(value) => value.max(0.0),
+        _ => 0.0,
+    };
+    [
+        px(style.margin.top),
+        px(style.margin.right),
+        px(style.margin.bottom),
+        px(style.margin.left),
+    ]
+}
+
 fn is_run_in(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "run-in")
 }
@@ -4691,7 +4706,8 @@ fn layout_block_in(
                     let item = run[index];
                     let result = layout_block_in(flat, item, &child_space, false, None, exclusions)
                         .why("inline-grid")?;
-                    let width = result.fragment.width;
+                    let margins = inline_grid_margins(flat[result.fragment.index].style);
+                    let width = result.fragment.width + margins[1] + margins[3];
                     if line_x > 0.0 && line_x + width > available + 1.0 / 128.0 {
                         break;
                     }
@@ -4703,24 +4719,35 @@ fn layout_block_in(
                 // `vertical-align: baseline` (the initial value). The
                 // ascent is the grid's first baseline, or the bottom
                 // margin edge when the grid has no items (CSS Grid §10,
-                // CSS 2.1 10.8.1).
-                let ascent = line.iter().map(inline_grid_line_ascent).fold(0.0, f32::max);
+                // CSS 2.1 10.8.1); the line box holds the margin boxes.
+                let margin_ascent = |result: &LayoutResult| {
+                    let margins = inline_grid_margins(flat[result.fragment.index].style);
+                    match result.first_baseline {
+                        LastBaseline::At(baseline) => margins[0] + baseline,
+                        LastBaseline::NoLines | LastBaseline::Unknown => {
+                            margins[0] + result.fragment.height + margins[2]
+                        }
+                    }
+                };
+                let ascent = line.iter().map(margin_ascent).fold(0.0, f32::max);
                 let mut placed_x = 0.0f32;
                 let mut line_h = 0.0f32;
                 for result in line {
-                    let shift = (ascent - inline_grid_line_ascent(&result)).max(0.0);
+                    let margins = inline_grid_margins(flat[result.fragment.index].style);
+                    let shift = (ascent - margin_ascent(&result)).max(0.0);
                     let width = result.fragment.width;
                     let height = result.fragment.height;
                     let (dx, dy) =
                         oof::relative_offset(flat[result.fragment.index].style, &child_space);
-                    let (fx, fy) = (bl + pl + placed_x + dx, bt + pt + line_y + shift + dy);
+                    let top = line_y + shift + margins[0];
+                    let (fx, fy) = (bl + pl + placed_x + margins[3] + dx, bt + pt + top + dy);
                     oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
                     if result.last_baseline != LastBaseline::NoLines {
-                        last_baseline = result.last_baseline.offset(bt + pt + line_y + shift);
+                        last_baseline = result.last_baseline.offset(bt + pt + top);
                     }
                     children.push((fx, fy, result.fragment));
-                    placed_x += width;
-                    line_h = line_h.max(shift + height);
+                    placed_x += margins[3] + width + margins[1];
+                    line_h = line_h.max(shift + margins[0] + height + margins[2]);
                 }
                 line_y += line_h;
             }
