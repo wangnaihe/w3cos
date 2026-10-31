@@ -23,6 +23,8 @@
 //! after inflexible tracks have grown to their caps; the truncated
 //! remainder is given one unit at a time to the last flexible tracks.
 
+mod lanes;
+
 use super::Why;
 use super::block::{self, BoxMetrics, MinMax};
 use super::inline::rendered_children;
@@ -265,14 +267,20 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if let Some(reason) = subgrid_or_template(flat, index, true) {
         return Some(reason);
     }
-    if has_marker(style, "--w3cos-internal-grid-lanes") && !lanes_like_grid(flat, index) {
+    let real_lanes =
+        has_marker(style, "--w3cos-internal-grid-lanes") && lanes::eligible(flat, index);
+    if has_marker(style, "--w3cos-internal-grid-lanes")
+        && !real_lanes
+        && !lanes_like_grid(flat, index)
+    {
         // Most `grid-lanes` reftests match only when both sides stay on the
         // legacy flex fallback. Opt in only when the lanes box is the same
         // formatting context as its ordinary-grid reference: explicit
         // columns, or definite rows without auto-repeat or abspos items.
         return Some("grid:lanes");
     }
-    if !block::size_contained(style)
+    if !real_lanes
+        && !block::size_contained(style)
         && row_lane_count(style).is_some_and(|lanes| inflow_count(flat, index) > lanes)
     {
         // Row lanes holding several items each stay on legacy, except under
@@ -281,13 +289,15 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         // lanes reftests (row-overflow-alignment-001) depend on.
         return Some("grid:lanes-rows");
     }
-    if rows_match_legacy_lanes(flat, index)
+    if !real_lanes
+        && rows_match_legacy_lanes(flat, index)
         && style.grid_rows().is_some_and(rows_are_sized)
         && indefinite_block(style)
     {
         return Some("grid:indefinite-rows");
     }
-    if rows_match_legacy_lanes(flat, index)
+    if !real_lanes
+        && rows_match_legacy_lanes(flat, index)
         && has_marker(style, "--w3cos-internal-percent-gap")
         && style.grid_rows().is_some_and(rows_are_sized)
         && !indefinite_block(style)
@@ -3984,6 +3994,12 @@ fn layout_impl(
         cell.borrow_mut().retain(|(id, _)| *id != index);
     });
     let style = flat[index].style;
+    if has_marker(style, "--w3cos-internal-grid-lanes") && lanes::eligible(flat, index) {
+        if measure {
+            return super::bail("grid:lanes-measure");
+        }
+        return lanes::layout(flat, index, space, sized).map(GridOut::Laid);
+    }
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
         metrics.content_width = width;
@@ -6704,7 +6720,9 @@ mod tests {
         )]));
         let root = Component::boxed(lanes, vec![leaf(block_box(None, Some(10.0)))]);
         let flat = pre_flatten(&root);
-        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+        // Real grid-lanes sizes its lanes from the items, so an indefinite
+        // height no longer needs the legacy path.
+        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
 
         let mut gapped = grid_style(100.0, None, None);
         gapped.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());

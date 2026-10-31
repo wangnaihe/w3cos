@@ -171,6 +171,9 @@ fn is_value_carrier_marker(key: &str) -> bool {
             // marker and lays the box out as a grid. Only a grid container
             // consults these; it resolves the `<percent> <px>` gap values.
             | "grid-lanes"
+            | "flow-tolerance"
+            | "grid-lanes-direction"
+            | "grid-lanes-pack"
             | "percent-gap"
             | "row-gap-percent"
             | "column-gap-percent"
