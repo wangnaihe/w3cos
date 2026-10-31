@@ -6368,3 +6368,135 @@ fn intrinsic_width_keywords_match_chrome() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// `display: grid-lanes` (masonry) border boxes measured in headless Chrome
+/// with `--enable-experimental-web-platform-features`
+/// (tools/layout-ng/lanes_cases.py -> testdata/chrome-grid-lanes.json; Ahem
+/// 10px/1, container 200px wide unless noted).
+#[test]
+fn grid_lanes_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/chrome-grid-lanes.json")).unwrap();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let mut bad = Vec::new();
+    for (name, case) in golden["cases"].as_object().unwrap() {
+        let spec = &case["spec"];
+        let container = &spec["container"];
+        let number = |value: &serde_json::Value| value.as_f64().map(|v| v as f32);
+        let rows_axis = container["axis"] == "row"
+            || (container["axis"].is_null() && container["rows"].as_bool().unwrap_or(false));
+        let mut markers = vec![("--w3cos-internal-grid-lanes".to_string(), String::new())];
+        if let Some(axis) = container["axis"].as_str() {
+            markers.push((
+                "--w3cos-internal-grid-lanes-direction".to_string(),
+                axis.to_string(),
+            ));
+        }
+        if let Some(tolerance) = container["tolerance"].as_str() {
+            markers.push((
+                "--w3cos-internal-flow-tolerance".to_string(),
+                tolerance.to_string(),
+            ));
+        }
+        let template = container["template"].as_str().unwrap().to_string();
+        let mut style = Style {
+            display: Display::Flex,
+            width: Dimension::Px(number(&container["width"]).unwrap_or(200.0)),
+            height: number(&container["height"])
+                .map(Dimension::Px)
+                .unwrap_or(Dimension::Auto),
+            custom_properties: Some(CustomProperties::from_iter(markers)),
+            ..font.clone()
+        };
+        if let Some(gap) = container["gap"].as_array() {
+            style.row_gap = number(&gap[0]);
+            style.column_gap = number(&gap[1]);
+        }
+        if rows_axis {
+            style.grid_ng_mut().grid_template_rows = Some(template);
+        } else {
+            style.grid_template_columns = Some(template);
+        }
+        let mut ids = vec![(1, name.clone())];
+        let mut next = 2;
+        let mut kids = Vec::new();
+        for item in spec["items"].as_array().unwrap() {
+            let mut item_style = Style {
+                width: number(&item["w"])
+                    .map(Dimension::Px)
+                    .unwrap_or(Dimension::Auto),
+                height: number(&item["h"])
+                    .map(Dimension::Px)
+                    .unwrap_or(Dimension::Auto),
+                order: item["order"].as_i64().unwrap_or(0) as i32,
+                ..font.clone()
+            };
+            if let Some(margin) = number(&item["margin"]) {
+                item_style.margin = margins(margin, margin, margin, margin);
+                item_style.padding = margins(2.0, 2.0, 2.0, 2.0);
+                item_style.border_width = 1.0;
+            }
+            if let Some(place) = item["place"].as_str() {
+                if rows_axis {
+                    item_style.grid_ng_mut().grid_row = Some(place.to_string());
+                } else {
+                    item_style.grid_column = Some(place.to_string());
+                }
+            }
+            ids.push((next, format!("{name}-{}", item["id"].as_str().unwrap())));
+            let children = match item["text"].as_str() {
+                Some(text) => {
+                    next += 2;
+                    vec![Component::text(
+                        text,
+                        Style {
+                            display: Display::Inline,
+                            ..font.clone()
+                        },
+                    )]
+                }
+                None => {
+                    next += 1;
+                    vec![]
+                }
+            };
+            kids.push(node(item_style, children));
+        }
+        let root = node(block(), vec![node(style, kids)]);
+        let flat = pre_flatten(&root);
+        let reasons = block::unsupported_reasons(&flat);
+        if !reasons.is_empty() {
+            bad.push(format!("{name}: bails {reasons:?}"));
+            continue;
+        }
+        let Some((rects, _)) = layout_tree_with_text(&root, &flat, 800.0, 600.0) else {
+            bad.push(format!("{name}: no NG layout"));
+            continue;
+        };
+        for (index, id) in ids {
+            let want: Vec<f32> = case["rects"][&id]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}/{id} missing"))
+                .iter()
+                .map(|v| v.as_f64().unwrap() as f32)
+                .collect();
+            let got = rect(&rects, index);
+            if [got.0, got.1, got.2, got.3]
+                .iter()
+                .zip(&want)
+                .any(|(a, b)| (a - b).abs() > 1.0 / 64.0)
+            {
+                bad.push(format!("{id}: got {got:?} want {want:?}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
