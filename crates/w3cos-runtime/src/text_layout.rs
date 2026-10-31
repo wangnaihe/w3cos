@@ -551,6 +551,12 @@ where
             max_width
         };
         if !current.is_empty() && current_w + cw > available_width {
+            if ch == ' ' && !current.ends_with(' ') {
+                // The overflowing space is consumed by the soft wrap instead
+                // of opening the next line with an indented blank.
+                flush(&mut lines, &mut current, &mut current_w);
+                continue;
+            }
             if may_not_start_line(ch) {
                 // Keep closing punctuation with the preceding character
                 // without letting the completed line exceed its paint box.
@@ -2071,6 +2077,7 @@ mod tests {
 
     #[test]
     fn char_width_wrap_moves_a_split_word_to_the_next_line() {
+        // A space that overflows is consumed by the soft wrap.
         let lines = wrap_text_with_char_width("aa bb cc", 5.0, WhiteSpace::Normal, |_| 1.0);
         assert_eq!(lines, vec!["aa bb", "cc"]);
         let lines = wrap_text_with_char_width("aa bbbb", 5.0, WhiteSpace::Normal, |_| 1.0);
