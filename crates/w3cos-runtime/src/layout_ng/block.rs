@@ -4773,7 +4773,10 @@ fn layout_block_in(
             definite.max_width = Dimension::Auto;
             definite.box_sizing = BoxSizing::ContentBox;
             resolve_inline(&definite, &child_space)
-        } else if marker(child_info.style, WIDTH_KEYWORD).is_some() {
+        } else if marker(child_info.style, WIDTH_KEYWORD).is_some()
+            && (child_info.style.margin.left == Spacing::Auto
+                || child_info.style.margin.right == Spacing::Auto)
+        {
             // An intrinsic width keyword is a definite width, so auto
             // margins center the box against it (CSS2 10.3.3); the child
             // resolves the same width in its own layout.
