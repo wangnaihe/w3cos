@@ -2430,6 +2430,28 @@ impl PaintArtifact {
         // Reused snapshots include paint-only UA children; reconstruct them
         // from their live hosts rather than accumulating another copy.
         nodes.retain(|node| !node.is_paint_only());
+        // `z-index` applies to flex and grid items even when they are not
+        // positioned: such an item paints like a positioned box at that level
+        // and forms a stacking context. Paint reads only layout rects, so
+        // modelling it as a zero-offset relative box changes ordering alone.
+        let z_items: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.style.z_index != 0
+                    && node.style.position == Position::Static
+                    && node.parent.is_some_and(|parent| {
+                        matches!(
+                            nodes[parent].style.display,
+                            Display::Flex | Display::Grid | Display::InlineFlex
+                        )
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in z_items {
+            nodes[index].style.position = Position::Relative;
+        }
         let mut has_percentage_padding = false;
         for node in &mut nodes {
             crate::background_image::annotate_fixed_background_viewport(&mut node.style, viewport);
