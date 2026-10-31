@@ -1590,7 +1590,7 @@ fn text_paint_box(rect: LayoutRect, style: &Style) -> LayoutRect {
     text_content_box(rect, style)
 }
 
-fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
+fn single_line_h_align(style: &Style, _box_w: f32, _ink_w: f32) -> TextAlign {
     if style.display == w3cos_std::style::Display::Inline {
         return TextAlign::Left;
     }
@@ -1603,14 +1603,6 @@ fn single_line_h_align(style: &Style, box_w: f32, ink_w: f32) -> TextAlign {
     };
     match text_align {
         TextAlign::Center | TextAlign::Right => style.text_align,
-        TextAlign::Left
-            if matches!(
-                style.white_space,
-                w3cos_std::style::WhiteSpace::NoWrap | w3cos_std::style::WhiteSpace::Pre
-            ) && box_w > ink_w + 1.5 =>
-        {
-            TextAlign::Center
-        }
         TextAlign::Left | TextAlign::Justify | TextAlign::Start | TextAlign::End => TextAlign::Left,
     }
 }
