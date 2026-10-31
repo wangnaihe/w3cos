@@ -10415,6 +10415,7 @@ mod tests {
         (format!("http://{address}/dependency.js"), handle)
     }
 
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
     #[test]
     fn visibility_hidden_boxes_keep_layout_but_do_not_paint() {
         // Code-OSS hides the walkthrough "x" buttons with `visibility: hidden`
