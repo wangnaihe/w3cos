@@ -32864,6 +32864,56 @@ mod tests {
     }
 
     #[test]
+    fn percentage_height_resolves_against_absolute_block_with_vertical_insets() {
+        use w3cos_dom::{Document, stylesheet};
+
+        stylesheet::clear_rules();
+        stylesheet::register_rule(
+            "#tab",
+            &[
+                ("position", "relative"),
+                ("width", "100px"),
+                ("height", "24px"),
+                ("border-block", "4px solid transparent"),
+            ],
+        );
+        stylesheet::register_rule(
+            "#actions",
+            &[
+                ("position", "absolute"),
+                ("top", "0"),
+                ("bottom", "0"),
+                ("right", "0"),
+                ("width", "24px"),
+                ("box-sizing", "border-box"),
+                ("border-block", "1px solid transparent"),
+            ],
+        );
+        stylesheet::register_rule("#bar", &[("height", "100%")]);
+
+        let mut document = Document::new();
+        let tab = document.create_element("div");
+        tab.set_attribute(&mut document, "id", "tab");
+        let actions = document.create_element("div");
+        actions.set_attribute(&mut document, "id", "actions");
+        let bar = document.create_element("div");
+        bar.set_attribute(&mut document, "id", "bar");
+        actions.append_child(&mut document, bar);
+        tab.append_child(&mut document, actions);
+        document.body().append_child(&mut document, tab);
+
+        let component = document.to_component_tree();
+        let layout = compute(&component, 800.0, 600.0).unwrap();
+        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
+        // `border-block` must reach layout: 24px content + 2 * 4px borders.
+        assert_eq!(rect(1).height, 32.0, "layout={layout:#?}");
+        // Absolute box fills the 24px padding box; its content box is 22px.
+        assert_eq!(rect(2).height, 24.0, "layout={layout:#?}");
+        assert_eq!(rect(3).height, 22.0, "layout={layout:#?}");
+        stylesheet::clear_rules();
+    }
+
+    #[test]
     fn bottom_inline_with_top_child_keeps_anonymous_text_on_segment_top() {
         let text = |size, alignment| {
             Component::text(
