@@ -10416,6 +10416,40 @@ mod tests {
     }
 
     #[test]
+    fn text_only_flex_item_min_width_does_not_collapse_content_width() {
+        // `h3.title { min-width: 3ch }` in a flex pane header: the authored
+        // min-width must only raise the content-based minimum, not replace
+        // it (the title used to shrink to 3ch and wrap one glyph per line).
+        let html = r#"<!doctype html><html><body style="margin:0"><div style="width:289px">
+            <div style="display:flex"><h3 id="plain" style="margin:0;font-weight:normal">Timeline</h3></div>
+            <div style="display:flex"><h3 id="px" style="margin:0;font-weight:normal;min-width:10px">Timeline</h3></div>
+            <div style="display:flex"><h3 id="ch" style="margin:0;font-weight:normal;min-width:3ch">Timeline</h3></div>
+            <div style="display:flex"><label id="label" style="min-width:10px">Timeline</label></div>
+            <div style="display:flex"><p id="p" style="margin:0;min-width:10px">Timeline</p></div>
+        </div></body></html>"#;
+        load_html_on_shared_vm(html, "https://minwidth.w3cos.local/page.html").unwrap();
+        crate::headless::render_document_rgba_cpu(400, 300).unwrap();
+        let rect = |id: &str| {
+            let node = crate::dom::query_selector_all(&format!("#{id}"))[0];
+            crate::dom::bounding_rect(node)
+        };
+        let plain = rect("plain");
+        assert!(plain.width > 30.0, "plain title width {}", plain.width);
+        for id in ["px", "ch", "label", "p"] {
+            let r = rect(id);
+            assert!(
+                (r.width - plain.width).abs() < 20.0 && r.width > 30.0,
+                "#{id} collapsed to {}x{} (plain {}x{})",
+                r.width,
+                r.height,
+                plain.width,
+                plain.height
+            );
+            assert!(r.height < 30.0, "#{id} wrapped: height {}", r.height);
+        }
+    }
+
+    #[test]
     fn load_html_on_shared_vm_runs_inline_script() {
         let html = r#"<!doctype html><html><body>
             <h1 id="msg">page loading</h1>
