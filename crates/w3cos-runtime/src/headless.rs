@@ -219,6 +219,7 @@ fn finish_headless_frame(
         Some((width as f32, height as f32)),
     );
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
+    let faded = artifact.ancestor_faded_styles();
     let mut nodes = artifact
         .rect_by_index
         .iter()
@@ -229,7 +230,11 @@ fn finish_headless_frame(
             if artifact.has_fully_transparent_ancestor(index) {
                 return None;
             }
-            Some((index, rect, &node.kind, &node.style))
+            let style = faded
+                .get(index)
+                .and_then(Option::as_ref)
+                .unwrap_or(&node.style);
+            Some((index, rect, &node.kind, style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
     nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
@@ -435,6 +440,7 @@ fn paint_retained_artifact(
     layout_results: &layout::LayoutResults,
     artifact: &PaintArtifact,
 ) -> Result<HeadlessFrame> {
+    let faded = artifact.ancestor_faded_styles();
     let mut nodes = artifact
         .rect_by_index
         .iter()
@@ -445,7 +451,11 @@ fn paint_retained_artifact(
             if artifact.has_fully_transparent_ancestor(index) {
                 return None;
             }
-            Some((index, rect, &node.kind, &node.style))
+            let style = faded
+                .get(index)
+                .and_then(Option::as_ref)
+                .unwrap_or(&node.style);
+            Some((index, rect, &node.kind, style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
     nodes.sort_by(|(left, _, _, _), (right, _, _, _)| {
