@@ -1151,6 +1151,14 @@ impl CSSStyleDeclaration {
                 self.inner.grid_template_columns = Some(value.trim().to_string())
             }
             "grid-column" | "gridColumn" => self.inner.grid_column = Some(value.trim().to_string()),
+            "grid-template-rows" | "gridTemplateRows" => {
+                self.inner.grid_template_rows = Some(value.trim().to_string())
+            }
+            "grid-template-areas" | "gridTemplateAreas" => {
+                self.inner.grid_template_areas = Some(value.trim().to_string())
+            }
+            "grid-row" | "gridRow" => self.inner.grid_row = Some(value.trim().to_string()),
+            "grid-area" | "gridArea" => self.inner.grid_area = Some(value.trim().to_string()),
 
             // Outline
             "outline" => {

@@ -226,6 +226,9 @@ fn finish_headless_frame(
         .filter_map(|(index, rect)| {
             let rect = (*rect)?;
             let node = artifact.nodes.get(index)?;
+            if artifact.has_fully_transparent_ancestor(index) {
+                return None;
+            }
             Some((index, rect, &node.kind, &node.style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();
@@ -439,6 +442,9 @@ fn paint_retained_artifact(
         .filter_map(|(index, rect)| {
             let rect = (*rect)?;
             let node = artifact.nodes.get(index)?;
+            if artifact.has_fully_transparent_ancestor(index) {
+                return None;
+            }
             Some((index, rect, &node.kind, &node.style))
         })
         .collect::<Vec<(usize, LayoutRect, _, _)>>();

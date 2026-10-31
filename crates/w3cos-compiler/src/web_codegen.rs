@@ -434,6 +434,18 @@ fn style_decl_to_css(s: &StyleDecl, signal_names: &[&str]) -> String {
     if let Some(value) = s.grid_column.as_ref() {
         parts.push(format!("grid-column:{value}"));
     }
+    if let Some(value) = s.grid_template_rows.as_ref() {
+        parts.push(format!("grid-template-rows:{value}"));
+    }
+    if let Some(value) = s.grid_template_areas.as_ref() {
+        parts.push(format!("grid-template-areas:{value}"));
+    }
+    if let Some(value) = s.grid_row.as_ref() {
+        parts.push(format!("grid-row:{value}"));
+    }
+    if let Some(value) = s.grid_area.as_ref() {
+        parts.push(format!("grid-area:{value}"));
+    }
     if let Some(display) = s.display.as_ref() {
         parts.push(format!("display:{display}"));
     }
