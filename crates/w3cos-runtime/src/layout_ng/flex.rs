@@ -785,7 +785,7 @@ fn column_wrap_max_content(
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
-    let items = column_wrap_items(flat, index, space, Some(main), None)?;
+    let items = column_wrap_items(flat, index, space, Some(main), None, 1)?;
     let mut total = 0.0_f32;
     let mut lines = 0usize;
     let (mut line_main, mut line_cross) = (0.0_f32, 0.0_f32);
@@ -815,6 +815,7 @@ fn column_wrap_items(
     space: &ConstraintSpace,
     main: Option<f32>,
     inner_width: Option<f32>,
+    lines: usize,
 ) -> Option<Vec<(f32, f32)>> {
     let style = flat[index].style;
     let mut children: Vec<usize> = rendered_children(flat, index)
@@ -852,6 +853,20 @@ fn column_wrap_items(
                     block::resolve_length(child_style.width, Some(basis), child_style, space)
             {
                 width = to_content(child_style, cross_edges, size);
+            }
+            // Each of the balanced lines is measured with its share of the
+            // container, not the whole width (balance-available-size-001).
+            if let Some(basis) = inner_width
+                && lines > 1
+                && matches!(child_style.width, Dimension::Auto)
+            {
+                let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+                let share = (basis - column_gap * (lines - 1) as f32) / lines as f32;
+                width = width.min(to_content(
+                    child_style,
+                    cross_edges,
+                    (share - cross_margins).max(0.0),
+                ));
             }
             let laid = layout_item(flat, child, space, width, None, false, None, Some(width))?;
             Some((laid.fragment.height - main_edges).max(0.0))
@@ -958,7 +973,7 @@ fn balanced_column_extent(
 ) -> Option<f32> {
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
-    let items = column_wrap_items(flat, index, space, None, Some(inner_width))?;
+    let items = column_wrap_items(flat, index, space, None, Some(inner_width), lines)?;
     let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
     Some(balanced_min_extent(&outers, row_gap, lines))
 }
@@ -974,7 +989,7 @@ fn balanced_column_max_content(
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
-    let items = column_wrap_items(flat, index, space, None, None)?;
+    let items = column_wrap_items(flat, index, space, None, None, 1)?;
     let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
     let ranges = min_max_partition(&outers, row_gap, lines);
     let total: f32 = ranges
@@ -1887,8 +1902,17 @@ pub(super) fn layout(
         // the item after align-content grows the line.
         if !row && cross.is_none() {
             let align = used_align(style.align_items, child_style.align_self);
-            let available =
+            let mut available =
                 (inner_width - margin_cross_start - margin_cross_end - cross_edges).max(0.0);
+            // A balanced container with several lines measures each item
+            // with its line's share of the width
+            // (balance-available-size-001).
+            if column_wrap && let Some(lines) = balance_min_lines(style) {
+                let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+                let share = (inner_width - column_gap * (lines - 1) as f32) / lines as f32;
+                available = available
+                    .min((share - margin_cross_start - margin_cross_end - cross_edges).max(0.0));
+            }
             // A single-line item that does not stretch is fit-content too
             // (CSS Flexbox §9.4 hypothetical cross size).
             // A replaced item sizes as a replaced box in the line's inline
