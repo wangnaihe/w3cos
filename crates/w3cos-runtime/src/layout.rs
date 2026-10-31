@@ -1183,6 +1183,7 @@ pub struct ScrollExtent {
 // FlatNodeInfo — O(1) indexed access to tree data (replaces O(n) recursive lookups)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct FlatNodeInfo<'a> {
     /// Stable identity for this compiled tree slot across reactive rebuilds.
     /// The compiler keeps conditional branches mounted and only toggles
@@ -1330,7 +1331,9 @@ pub(crate) fn image_intrinsic_size(
     let decoded = crate::image_loader::dimensions(src)
         .map(|(width, height)| (width as f32, height as f32))
         .unwrap_or_else(|| {
-            if crate::image_loader::is_reserved_browser_source(src) {
+            // A missing `src` never starts a request, so there is nothing
+            // to wait for: the box is 0x0, as in browsers.
+            if src.trim().is_empty() || crate::image_loader::is_reserved_browser_source(src) {
                 (0.0, 0.0)
             } else {
                 (200.0, 200.0)
@@ -1930,7 +1933,7 @@ fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
-        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc { .. } => None,
     };
     let constraint_border_box = |dimension| {
         intrinsic_constraint(dimension).map(|width| {
@@ -3840,7 +3843,8 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Em(_)
         | WDim::Ch(_)
         | WDim::Vw(_)
-        | WDim::Vh(_) => None,
+        | WDim::Vh(_)
+        | WDim::Calc { .. } => None,
     }
 }
 
@@ -3966,6 +3970,16 @@ pub(crate) fn resolve_spacing_for_layout(
 ) -> f32 {
     w3cos_std::style::used_box_spacing(match spacing {
         WSpacing::Percent(value) => percentage_spacing_for_layout(percentage_basis, value),
+        // `calc(P% + Xpx)`: against a zero basis (intrinsic sizing) only
+        // the length remains.
+        WSpacing::Calc { percent, px } => {
+            percentage_spacing_for_layout(percentage_basis, percent) + px
+        }
+        // A padding `calc()` is floored at zero (CSS Box 3: negative
+        // padding is invalid, so a used negative sum clamps).
+        WSpacing::PaddingCalc { percent, px } => {
+            (percentage_spacing_for_layout(percentage_basis, percent) + px).max(0.0)
+        }
         WSpacing::Rem(value) => value * ROOT_FONT_SIZE,
         WSpacing::Em(value) => value * font_style.font_size,
         WSpacing::Ch(value) => value * font_style.ch_advance(),
@@ -4389,6 +4403,7 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
+            WDim::Calc { .. } => (0, 0),
         },
         padding_top: padding.top.to_bits(),
         padding_right: padding.right.to_bits(),
@@ -21426,7 +21441,7 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
-        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) => None,
+        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) | WDim::Calc { .. } => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
     // Keep their own height automatic, while descendants use the nearest
@@ -21772,7 +21787,7 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
-        WDim::Auto | WDim::Percent(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Calc { .. } => None,
     };
     let absorbs_ua_inline_padding =
         uses_ua_table_cell_padding && absolute_dimension(comp.style.width).is_some();
@@ -25413,7 +25428,7 @@ fn collect_layouts_fast(
         .get_node_context(node)
         .and_then(|index| flat.get(*index))
         .is_some_and(|info| match info.style.height {
-            WDim::Auto => {
+            WDim::Auto | WDim::Calc { .. } => {
                 matches!(info.style.position, WPos::Absolute | WPos::Fixed)
                     && !matches!(info.style.top, WDim::Auto)
                     && !matches!(info.style.bottom, WDim::Auto)
@@ -26668,6 +26683,8 @@ fn to_taffy_spacing(
 ) -> LengthPercentage {
     match spacing {
         WSpacing::Percent(v) => LengthPercentage::percent(v / 100.0),
+        // Legacy keeps reading a mixed calc() padding as zero.
+        WSpacing::PaddingCalc { .. } => LengthPercentage::length(0.0),
         other => LengthPercentage::length(resolve_spacing_for_layout(
             other, 0.0, font_style, viewport_w, viewport_h,
         )),
@@ -26683,6 +26700,8 @@ fn to_taffy_margin(
     match spacing {
         WSpacing::Auto => LengthPercentageAuto::auto(),
         WSpacing::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
+        // Legacy keeps reading a mixed calc() margin as zero.
+        WSpacing::Calc { .. } => LengthPercentageAuto::length(0.0),
         other => LengthPercentageAuto::length(resolve_spacing_for_layout(
             other, 0.0, font_style, viewport_w, viewport_h,
         )),
@@ -26696,7 +26715,8 @@ fn to_taffy_dim(
     viewport_h: f32,
 ) -> Dimension {
     match d {
-        WDim::Auto => Dimension::auto(),
+        // LayoutNG alone resolves a `calc()` size; legacy keeps `auto`.
+        WDim::Auto | WDim::Calc { .. } => Dimension::auto(),
         WDim::Px(v) => Dimension::length(v),
         WDim::Percent(v) => Dimension::percent(v / 100.0),
         WDim::Rem(v) => Dimension::length(v * 16.0),
@@ -26714,7 +26734,7 @@ fn to_taffy_auto(
     viewport_h: f32,
 ) -> LengthPercentageAuto {
     match d {
-        WDim::Auto => LengthPercentageAuto::auto(),
+        WDim::Auto | WDim::Calc { .. } => LengthPercentageAuto::auto(),
         WDim::Px(v) => LengthPercentageAuto::length(v),
         WDim::Percent(v) => LengthPercentageAuto::percent(v / 100.0),
         WDim::Rem(v) => LengthPercentageAuto::length(v * 16.0),
@@ -38312,6 +38332,12 @@ mod tests {
         let image = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!((image.width, image.height), (200.0, 200.0));
         crate::image_loader::invalidate(source);
+    }
+
+    #[test]
+    fn image_without_a_source_is_empty() {
+        let kind = ComponentKind::Image { src: String::new() };
+        assert_eq!(leaf_intrinsic_size(&kind, &Style::default()), (0.0, 0.0));
     }
 
     #[test]

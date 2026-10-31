@@ -2588,3 +2588,274 @@ fn text_items_break_inside_at_uax14_opportunities() {
         ]
     );
 }
+
+/// NGLineBreaker::HandleOverflow rewinds to the latest opportunity, which
+/// may lie inside an earlier item on the line (after its `-`), later than
+/// the boundary before that item.  Expected leaf rects are Chrome's for
+/// `<div style="width:W;font:20px/1 Ahem"><span>..</span>..</div>`.
+#[test]
+fn overflow_rewinds_inside_an_earlier_item() {
+    let _ahem = AhemGuard::new();
+    let layout = |width: f32, texts: &[&str]| {
+        let mut container = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            ..Style::default()
+        };
+        font(&mut container, 20.0, LineHeight::Number(1.0));
+        container
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let children = texts
+            .iter()
+            .map(|content| {
+                let mut style = Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                };
+                font(&mut style, 20.0, LineHeight::Number(1.0));
+                Component::text(*content, style)
+            })
+            .collect();
+        let root = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, children)],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let (_, _, fragment) = block::layout_root(&flat, 800.0, 600.0).expect("ng");
+        fn leaves(
+            f: &BoxFragment,
+            x: f32,
+            y: f32,
+            out: &mut Vec<(usize, Option<(usize, usize)>, [f32; 4])>,
+        ) {
+            if f.children.is_empty() {
+                out.push((f.index, f.text_range, [x, y, f.width, f.height]));
+            }
+            for (dx, dy, c) in &f.children {
+                leaves(c, x + dx, y + dy, out);
+            }
+        }
+        let mut got = Vec::new();
+        leaves(&fragment, 0.0, 0.0, &mut got);
+        got.retain(|(i, _, _)| *i >= 2);
+        got
+    };
+    // No opportunity before "XX": the line ends after "XX-".
+    assert_eq!(
+        layout(120.0, &["XX-XX", "XX"]),
+        vec![
+            (2, Some((0, 3)), [0.0, 0.0, 60.0, 20.0]),
+            (2, Some((3, 5)), [0.0, 20.0, 40.0, 20.0]),
+            (3, None, [40.0, 20.0, 40.0, 20.0]),
+        ]
+    );
+    // The opportunity after "XX-" comes later than the one after "X ".
+    assert_eq!(
+        layout(160.0, &["X ", "XX-XX", "XXX"]),
+        vec![
+            (2, None, [0.0, 0.0, 40.0, 20.0]),
+            (3, Some((0, 3)), [40.0, 0.0, 60.0, 20.0]),
+            (3, Some((3, 5)), [0.0, 20.0, 40.0, 20.0]),
+            (4, None, [40.0, 20.0, 60.0, 20.0]),
+        ]
+    );
+}
+
+#[test]
+fn folded_breaks_split_into_forced_break_items() {
+    let _ahem = AhemGuard::new();
+    let layout = |width: f32, texts: &[&str]| {
+        let mut container = Style {
+            display: Display::Block,
+            width: Dimension::Px(width),
+            ..Style::default()
+        };
+        font(&mut container, 20.0, LineHeight::Number(1.0));
+        container
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let children = texts
+            .iter()
+            .map(|content| {
+                let mut style = Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                };
+                font(&mut style, 20.0, LineHeight::Number(1.0));
+                Component::text(*content, style)
+            })
+            .collect();
+        let root = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, children)],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let (_, _, fragment) = block::layout_root(&flat, 800.0, 600.0).expect("ng");
+        fn leaves(
+            f: &BoxFragment,
+            x: f32,
+            y: f32,
+            out: &mut Vec<(usize, Option<(usize, usize)>, [f32; 4])>,
+        ) {
+            if f.children.is_empty() {
+                out.push((f.index, f.text_range, [x, y, f.width, f.height]));
+            }
+            for (dx, dy, c) in &f.children {
+                leaves(c, x + dx, y + dy, out);
+            }
+        }
+        let mut got = Vec::new();
+        leaves(&fragment, 0.0, 0.0, &mut got);
+        got.retain(|(i, _, _)| *i >= 2);
+        got
+    };
+    // "XX<br>X XXXX<br>" folded into one leaf, then "XX".
+    assert_eq!(
+        layout(120.0, &["XX\u{2028}X XXXX\u{2028}", "XX"]),
+        vec![
+            (2, Some((0, 2)), [0.0, 0.0, 40.0, 20.0]),
+            (2, Some((5, 11)), [0.0, 20.0, 120.0, 20.0]),
+            (3, None, [0.0, 40.0, 40.0, 20.0]),
+        ]
+    );
+    // The collapsible space after a break is removed at the line start.
+    assert_eq!(
+        layout(120.0, &["X\u{2028} XX"]),
+        vec![
+            (2, Some((0, 1)), [0.0, 0.0, 20.0, 20.0]),
+            (2, Some((5, 7)), [0.0, 20.0, 40.0, 20.0]),
+        ]
+    );
+}
+
+#[test]
+fn split_inline_box_gets_union_of_line_fragments() {
+    let _ahem = AhemGuard::new();
+    // Chrome (Ahem 20px, width 100): `<span>XX XX XX</span>X` has client
+    // rects (0,0,100,20) and (0,20,40,20), bounding box (0,0,100,40).
+    let layout = |before: Option<&str>, span_text: &str, after: Option<&str>, paint: bool| {
+        let mut container = Style {
+            display: Display::Block,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        };
+        font(&mut container, 20.0, LineHeight::Number(1.0));
+        container
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        let text = |content: &str| {
+            let mut style = Style {
+                display: Display::Inline,
+                ..Style::default()
+            };
+            font(&mut style, 20.0, LineHeight::Number(1.0));
+            Component::text(content, style)
+        };
+        let mut span = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut span, 20.0, LineHeight::Number(1.0));
+        if paint {
+            span.background = w3cos_std::color::Color {
+                r: 0,
+                g: 255,
+                b: 255,
+                a: 255,
+            };
+        }
+        let mut children = Vec::new();
+        children.extend(before.map(text));
+        children.push(Component::boxed(span, vec![text(span_text)]));
+        children.extend(after.map(text));
+        let root = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, children)],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let span_index = flat
+            .iter()
+            .position(|n| matches!(n.kind, w3cos_std::ComponentKind::Text { content } if content == span_text))
+            .expect("span text")
+            - 1;
+        block::layout_root(&flat, 800.0, 600.0).map(|(_, _, fragment)| {
+            fn find(f: &BoxFragment, x: f32, y: f32, index: usize) -> Option<[f32; 4]> {
+                if f.index == index && f.text_range.is_none() && x.is_finite() {
+                    return Some([x, y, f.width, f.height]);
+                }
+                f.children
+                    .iter()
+                    .find_map(|(dx, dy, c)| find(c, x + dx, y + dy, index))
+            }
+            fragment
+                .children
+                .iter()
+                .find_map(|(dx, dy, c)| find(c, *dx, *dy, span_index))
+                .expect("span fragment")
+        })
+    };
+    assert_eq!(
+        layout(None, "XX XX XX", Some("X"), false),
+        Some([0.0, 0.0, 100.0, 40.0])
+    );
+    // A painted box needs its per-line fragments.
+    assert_eq!(layout(None, "XX XX XX", Some("X"), true), None);
+    // Starting mid-line: offsetLeft (40) is not the union's left (0).
+    assert_eq!(layout(Some("X "), "XX XX", None, false), None);
+}
+
+/// `<div><span style="font: 24px X">text</span></div>`: the span folds into
+/// its text leaf, so the unmarked div is a one-item IFC that owns the strut.
+/// A default-style box (a shadow `<slot>`) whose text carries another font
+/// stays out.
+#[test]
+fn a_cascaded_box_with_one_folded_text_leaf_is_an_ifc_root() {
+    let leaf = Style {
+        display: Display::Inline,
+        font_family: Some("CSSFW".into()),
+        font_size: 24.0,
+        line_height: 1.0,
+        ..Style::default()
+    };
+    let tree = |family: Option<&str>, children: Vec<Component>| {
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                Style {
+                    display: Display::Block,
+                    font_family: family.map(Into::into),
+                    ..Style::default()
+                },
+                children,
+            )],
+        )
+    };
+    let reason = |root: &Component| inline::container_reason(&pre_flatten(root), 1);
+    let one = || vec![Component::text("hello there", leaf.clone())];
+    assert_eq!(reason(&tree(Some("serif"), one())), None);
+    assert_eq!(reason(&tree(None, one())), Some("ifc:unmarked"));
+    let two = vec![
+        Component::text("hello", leaf.clone()),
+        Component::text(" there", leaf.clone()),
+    ];
+    assert_eq!(reason(&tree(Some("serif"), two)), Some("ifc:unmarked"));
+}

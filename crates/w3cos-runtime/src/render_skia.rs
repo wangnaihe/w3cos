@@ -5690,10 +5690,46 @@ fn positioned_tab_runs<'a>(
     positioned_tab_runs_in_context(text, typeface, style, None, 0.0)
 }
 
+/// The block container's tab metrics (CSS Text 3 4.2): `tab-size` numbers
+/// count the block's space advance, including its letter-spacing and
+/// word-spacing; Blink's `Font::TabWidth` skips to the following stop when
+/// the nearest one is closer than half a space.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TabStops {
-    width: f32,
+    space: f32,
     minimum_gap: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum TabSize {
+    Spaces(f32),
+    Pixels(f32),
+}
+
+/// The computed `tab-size` of a text style (initial 8).
+pub(crate) fn tab_size(style: &Style) -> TabSize {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(w3cos_dom::css_style::TAB_SIZE_PROPERTY))
+        .and_then(|value| match value.strip_suffix("px") {
+            Some(pixels) => pixels.parse().ok().map(TabSize::Pixels),
+            None => value.parse().ok().map(TabSize::Spaces),
+        })
+        .filter(|size| match size {
+            TabSize::Spaces(value) | TabSize::Pixels(value) => value.is_finite() && *value >= 0.0,
+        })
+        .unwrap_or(TabSize::Spaces(8.0))
+}
+
+impl TabStops {
+    /// Distance between stops for text styled `style` (its own tab-size).
+    fn interval(self, style: &Style) -> f32 {
+        match tab_size(style) {
+            TabSize::Spaces(count) => count * self.space,
+            TabSize::Pixels(pixels) => pixels,
+        }
+    }
 }
 
 fn tab_runs_for_context<'a>(
@@ -5724,6 +5760,33 @@ fn with_text_typeface<T>(text: &str, style: &Style, callback: impl FnOnce(&Typef
 /// HTML text field content size, before padding and borders. Mirrors the
 /// browser's character-count sizing rather than a fixed native control size.
 pub(crate) fn html_text_input_content_size(style: &Style, size: u32) -> (f32, f32) {
+    let (character, maximum, line) = html_text_control_metrics(style);
+    (
+        (character * size as f32 + (maximum - character).max(0.0)).ceil(),
+        line,
+    )
+}
+
+/// HTML §15.5.15 textarea effective width and height without the
+/// scrollbar terms: `cols` average character widths (rounded up to a
+/// whole pixel, as Chrome does) by `rows` lines of `line_height`.
+pub(crate) fn html_textarea_content_size(
+    style: &Style,
+    cols: u32,
+    rows: u32,
+    line_height: Option<f32>,
+) -> (f32, f32) {
+    let (character, _, line) = html_text_control_metrics(style);
+    (
+        (character * cols as f32).ceil(),
+        line_height.unwrap_or(line) * rows as f32,
+    )
+}
+
+/// The text control character width (the primary font's average
+/// character width when usable, else the width of "0"), the maximum
+/// character width, and the `line-height: normal` line spacing.
+fn html_text_control_metrics(style: &Style) -> (f32, f32, f32) {
     with_text_typeface("x0", style, |face| {
         let font = crate::skia_text_run::css_font(face, style.font_size);
         let (_, raw) = font.metrics();
@@ -5786,10 +5849,7 @@ pub(crate) fn html_text_input_content_size(style: &Style, size: u32) -> (f32, f3
         } else {
             raw.max_char_width.round()
         };
-        (
-            (character * size as f32 + (maximum - character).max(0.0)).ceil(),
-            geometry.line_spacing(),
-        )
+        (character, maximum, geometry.line_spacing())
     })
 }
 
@@ -5801,8 +5861,8 @@ pub(crate) fn tab_stops_for_style(style: &Style) -> TabStops {
             ..style.clone()
         };
         TabStops {
-            width: 8.0 * measure_skia_text_advance(" ", face, style).max(0.0),
-            minimum_gap: 0.5 * measure_skia_text_advance("0", face, &unspaced).max(0.0),
+            space: measure_skia_text_advance(" ", face, style).max(0.0),
+            minimum_gap: 0.5 * measure_skia_text_advance(" ", face, &unspaced).max(0.0),
         }
     })
 }
@@ -5836,19 +5896,19 @@ fn positioned_tab_runs_in_context<'a>(
     {
         return None;
     }
-    let stop_width = block_stops.map_or_else(
-        || 8.0 * measure_skia_text_advance(" ", typeface, style).max(0.0),
-        |stops| stops.width,
-    );
-    let unspaced = Style {
-        word_spacing: 0.0,
-        letter_spacing: 0.0,
-        ..style.clone()
-    };
-    let minimum_gap = block_stops.map_or_else(
-        || 0.5 * measure_skia_text_advance("0", typeface, &unspaced).max(0.0),
-        |stops| stops.minimum_gap,
-    );
+    let stops = block_stops.unwrap_or_else(|| {
+        let unspaced = Style {
+            word_spacing: 0.0,
+            letter_spacing: 0.0,
+            ..style.clone()
+        };
+        TabStops {
+            space: measure_skia_text_advance(" ", typeface, style).max(0.0),
+            minimum_gap: 0.5 * measure_skia_text_advance(" ", typeface, &unspaced).max(0.0),
+        }
+    });
+    let stop_width = stops.interval(style);
+    let minimum_gap = stops.minimum_gap;
     let mut cursor = line_offset;
     let mut runs = Vec::new();
     let mut parts = text.split('\t').peekable();

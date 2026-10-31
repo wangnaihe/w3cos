@@ -4,8 +4,7 @@
 //! (third_party/blink/renderer/core/layout/grid/grid_layout_algorithm.cc,
 //! Copyright The Chromium Authors, BSD-style license) and CSS Grid Level 1
 //! §8 (placement) and §12 (track sizing). A missing column template is one
-//! `1fr` track, which is what the legacy engine models with
-//! `grid-auto-columns: 1fr`.
+//! track sized by grid-auto-columns, as an implicit column would be.
 //!
 //! A subgrid reuses the parent tracks it spans, including `auto`, `fr`,
 //! `minmax`, and intrinsic tracks. Its items contribute to those tracks.
@@ -41,6 +40,7 @@ const MAX_REPEAT: usize = 1024;
 const MAX_TRACKS: usize = 1024;
 const INF: i64 = i64::MAX / 4;
 const HEIGHT_KEYWORD: &str = "--w3cos-internal-height-keyword";
+const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 const JUSTIFY_KEYWORD: &str = "--w3cos-internal-justify-content";
 const ALIGN_ITEMS_STRETCH: &str = "--w3cos-internal-align-items-stretch";
 const JUSTIFY_ITEMS_STRETCH: &str = "--w3cos-internal-justify-items-stretch";
@@ -86,10 +86,24 @@ fn spacing_px(style: &Style, spacing: Spacing, cb: f32, space: &ConstraintSpace)
     }
 }
 
+/// A percentage `height` resolves against the item's grid area once the
+/// rows are sized; it is auto for track sizing (css-grid-1 6.2 / Blink
+/// grid layout algorithm).
+fn percent_height(style: &Style) -> bool {
+    matches!(style.height, Dimension::Percent(_) | Dimension::Calc { .. })
+        && !has_marker(style, HEIGHT_KEYWORD)
+}
+
+/// A percentage `min-height` / `max-height` still bails: its area-relative
+/// clamp is not modelled.
 fn percent_block(style: &Style) -> bool {
-    matches!(style.height, Dimension::Percent(_))
-        || matches!(style.min_height, Dimension::Percent(_))
-        || matches!(style.max_height, Dimension::Percent(_))
+    matches!(
+        style.min_height,
+        Dimension::Percent(_) | Dimension::Calc { .. }
+    ) || matches!(
+        style.max_height,
+        Dimension::Percent(_) | Dimension::Calc { .. }
+    )
 }
 
 fn inset_set(style: &Style) -> bool {
@@ -235,17 +249,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-document-element") {
         return Some("grid:root");
     }
-    if has_marker(style, "--w3cos-internal-size-containment") {
-        return Some("grid:contain");
-    }
-    // A subgrid item's tracks come from this grid's own sizing, which the
-    // keyword resolves against; that cycle stays on the legacy engine.
-    if has_marker(style, "--w3cos-internal-width-keyword")
-        && (!block::intrinsic_keyword_applies(flat, index)
-            || rendered_children(flat, index).any(|child| subgrid_style(flat[child].style)))
-    {
-        return Some("grid:width-keyword");
-    }
     if style.grid_areas().is_some() {
         return Some("grid:areas");
     }
@@ -258,19 +261,21 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if let Some(reason) = subgrid_or_template(flat, index, true) {
         return Some(reason);
     }
-    // `min-content` / `max-content` still disagree with the legacy engine
-    // on ordinary grids. A parent of a subgrid is the exception: the
-    // subgrid items size those tracks. A top-level inline-grid with a
-    // definite border box is the other: those tracks are the line box.
-    if intrinsic_tracks_without_subgrid(flat, index) && !inline_grid_line_lays_out(flat, index) {
-        return Some("grid:intrinsic-track");
-    }
     if has_marker(style, "--w3cos-internal-grid-lanes") && !lanes_like_grid(flat, index) {
         // Most `grid-lanes` reftests match only when both sides stay on the
         // legacy flex fallback. Opt in only when the lanes box is the same
         // formatting context as its ordinary-grid reference: explicit
         // columns, or definite rows without auto-repeat or abspos items.
         return Some("grid:lanes");
+    }
+    if !block::size_contained(style)
+        && row_lane_count(style).is_some_and(|lanes| inflow_count(flat, index) > lanes)
+    {
+        // Row lanes holding several items each stay on legacy, except under
+        // size containment, where the contained-grid references are on NG.
+        // NG does not parse `safe`/`unsafe` self-alignment yet, which those
+        // lanes reftests (row-overflow-alignment-001) depend on.
+        return Some("grid:lanes-rows");
     }
     if rows_match_legacy_lanes(flat, index)
         && style.grid_rows().is_some_and(rows_are_sized)
@@ -297,6 +302,28 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     if parse_flow(style.grid_flow()).is_none() {
         return Some("grid:auto-flow");
+    }
+    // A replaced item next to an auto-height `aspect-ratio` box: the
+    // box's automatic minimum in the ratio axis is its content, not the
+    // transferred size, so tracks capped to zero must not grow for it
+    // (grid-item-minmax-img-001). Both stay on legacy together.
+    let mut has_replaced = false;
+    let mut has_ratio_box = false;
+    for child in rendered_children(flat, index) {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) {
+            continue;
+        }
+        if block::is_replaced_item(flat, child) {
+            has_replaced = true;
+        } else if block::marker(child_style, "--w3cos-internal-aspect-ratio").is_some()
+            && matches!(child_style.height, Dimension::Auto)
+        {
+            has_ratio_box = true;
+        }
+    }
+    if has_replaced && has_ratio_box {
+        return Some("grid:replaced-ratio-item");
     }
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
@@ -332,7 +359,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.position == Position::Relative && inset_set(child_style) {
             return Some("grid:inset");
         }
-        if has_marker(child_style, "--w3cos-internal-width-keyword") {
+        // Replaced and size-contained items with an intrinsic width keyword
+        // stay on legacy (item_width_keyword resolves the others).
+        if has_marker(child_style, block::WIDTH_KEYWORD)
+            && item_width_keyword(flat, child).is_none()
+        {
             return Some("grid:item-width-keyword");
         }
     }
@@ -551,38 +582,6 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
         let parent_gap = parent_style.column_gap.unwrap_or(parent_style.gap);
         if sum + gaps > width + EPS && specified > parent_gap + EPS {
             return Some("grid:subgrid-overflow-tracks");
-        }
-    }
-    // A row subgrid whose only content is text does not match the
-    // non-subgrid reference (auto-track-sizing-001). Element items stay.
-    if rendered_children(flat, index).any(|child| match flat[child].kind {
-        w3cos_std::ComponentKind::Text { content } => content.chars().any(|ch| !ch.is_whitespace()),
-        _ => false,
-    }) {
-        return Some("grid:subgrid-text");
-    }
-    // Both axes, and this subgrid's gap is larger than the parent's.
-    // The legacy picture matches the fixed-track reference; the extra
-    // margin does not (grid-gap-larger-001). A smaller gap does.
-    let other_is_subgrid = if rows {
-        columns_spec(style).is_some_and(is_subgrid_axis)
-    } else {
-        style.grid_rows().is_some_and(is_subgrid_axis)
-    };
-    if other_is_subgrid {
-        let specified = if rows {
-            style.row_gap
-        } else {
-            style.column_gap
-        };
-        let specified = specified.unwrap_or(style.gap);
-        let parent_gap = if rows {
-            parent_style.row_gap.unwrap_or(parent_style.gap)
-        } else {
-            parent_style.column_gap.unwrap_or(parent_style.gap)
-        };
-        if specified > parent_gap + EPS {
-            return Some("grid:subgrid-gap-larger");
         }
     }
     // `grid: 50px / subgrid` under a named parent lays out on this side
@@ -899,23 +898,6 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     }
 }
 
-/// The same definite box, and not a flex or grid item. Intrinsic tracks
-/// on this box are laid out here; a blockified inline-grid keeps
-/// `grid:intrinsic-track` so an ordinary-grid reference stays on legacy.
-fn inline_grid_line_lays_out(flat: &[FlatNodeInfo], index: usize) -> bool {
-    let style = flat[index].style;
-    if marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid") {
-        return false;
-    }
-    if flat[index].parent.is_some_and(|parent| {
-        let parent_style = flat[parent].style;
-        block::is_author_flex(parent_style) || block::is_author_grid(parent_style)
-    }) {
-        return false;
-    }
-    definite_inline_grid(style) || intrinsic_track_inline_grid(flat, index)
-}
-
 fn breadth_is_line(breadth: Breadth) -> bool {
     matches!(
         breadth,
@@ -969,30 +951,6 @@ fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
         }
         _ => false,
     }
-}
-
-/// Ordinary grids keep intrinsic keywords on the legacy engine. A grid
-/// that has a subgrid item lays them out, because those items are the
-/// track's contents.
-fn intrinsic_tracks_without_subgrid(flat: &[FlatNodeInfo], index: usize) -> bool {
-    let style = flat[index].style;
-    let intrinsic = |spec: Option<&str>, rows: bool| {
-        spec.and_then(|spec| parse_template(spec, rows))
-            .is_some_and(|template| {
-                template
-                    .tracks
-                    .iter()
-                    .chain(template.auto_tracks.iter())
-                    .any(spec_is_intrinsic_keyword)
-            })
-    };
-    if !intrinsic(columns_spec(style), false) && !intrinsic(style.grid_rows(), true) {
-        return false;
-    }
-    !rendered_children(flat, index).any(|child| {
-        let child_style = flat[child].style;
-        !oof::is_out_of_flow(child_style) && subgrid_style(child_style)
-    })
 }
 
 struct InheritedTracks {
@@ -1339,6 +1297,12 @@ struct Flow {
 /// with the same tracks paints the same picture.
 fn lanes_like_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
     let style = flat[index].style;
+    // A size-contained lanes box sizes itself from contain-intrinsic-size,
+    // the same as its contained ordinary-grid reference, so both lay out
+    // on NG.
+    if block::size_contained(style) {
+        return true;
+    }
     if columns_spec(style).is_some_and(|spec| {
         let spec = spec.trim();
         !spec.is_empty() && !spec.eq_ignore_ascii_case("none")
@@ -1352,6 +1316,22 @@ fn lanes_like_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
         return false;
     }
     !rendered_children(flat, index).any(|child| oof::is_out_of_flow(flat[child].style))
+}
+
+/// Whether `rows` (or columns) is the stacking axis of a grid-lanes box.
+/// That axis has no tracks, so nothing in it stretches (CSS Grid Level 3,
+/// grid-lanes layout): the items stack one after another with only the gap
+/// between them. Lanes are columns when `grid-template-columns` is given,
+/// rows otherwise.
+fn lanes_stack_axis(style: &Style, rows: bool) -> bool {
+    if !has_marker(style, "--w3cos-internal-grid-lanes") {
+        return false;
+    }
+    let column_lanes = columns_spec(style).is_some_and(|spec| {
+        let spec = spec.trim();
+        !spec.is_empty() && !spec.eq_ignore_ascii_case("none")
+    });
+    column_lanes == rows
 }
 
 /// The grid-lanes references that only match when both sides ignore
@@ -1376,7 +1356,9 @@ fn rows_match_legacy_lanes(flat: &[FlatNodeInfo], index: usize) -> bool {
 }
 
 fn indefinite_block(style: &Style) -> bool {
-    matches!(style.height, Dimension::Auto)
+    // Size containment gives the block size from contain-intrinsic-size.
+    !block::size_contained(style)
+        && matches!(style.height, Dimension::Auto)
         && matches!(style.min_height, Dimension::Auto)
         && !has_marker(style, "--w3cos-internal-height-keyword")
 }
@@ -1421,6 +1403,42 @@ fn rows_are_sized(spec: &str) -> bool {
         .iter()
         .chain(template.auto_tracks.iter())
         .any(|track| !spec_is_auto(*track))
+}
+
+/// The number of row lanes when a grid-lanes box has rows but no columns
+/// (its lanes are rows and its items stack along the inline axis).
+fn row_lane_count(style: &Style) -> Option<usize> {
+    if !lanes_stack_axis(style, false) {
+        return None;
+    }
+    let template = parse_template(style.grid_rows()?, true)?;
+    (!template.tracks.is_empty() && template.auto_fit.is_none()).then_some(template.tracks.len())
+}
+
+fn inflow_count(flat: &[FlatNodeInfo], index: usize) -> usize {
+    rendered_children(flat, index)
+        .filter(|&child| !oof::is_out_of_flow(flat[child].style))
+        .count()
+}
+
+/// The auto-placement direction. Each item of a grid-lanes box with row
+/// lanes goes into the shortest lane, so equally sized items fill the lanes
+/// in turn, like column auto-flow over those rows. With no more items than
+/// lanes both flows give each item its own lane, and row flow keeps the 1fr
+/// stand-in column that the column-flow references match.
+fn container_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
+    let style = flat[index].style;
+    let flow = parse_flow(style.grid_flow())?;
+    let more_items_than_lanes =
+        row_lane_count(style).is_some_and(|lanes| inflow_count(flat, index) > lanes);
+    Some(if more_items_than_lanes {
+        Flow {
+            column: true,
+            ..flow
+        }
+    } else {
+        flow
+    })
 }
 
 fn parse_flow(value: Option<&str>) -> Option<Flow> {
@@ -1645,49 +1663,201 @@ fn parse_breadth(token: &str) -> Option<Breadth> {
 }
 
 fn parse_calc(inner: &str) -> Option<Breadth> {
-    let inner = inner.trim();
-    if let Some((left, right)) = split_top_level_once(inner, '+') {
-        return add_breadths(parse_breadth(left)?, parse_breadth(right)?, false);
+    // CSS Values 4 calc(): a linear combination of %, px and em, with
+    // + and - (whitespace-delimited), * and / by plain numbers, and nested
+    // parentheses or calc().
+    let mut parser = CalcParser {
+        src: inner.as_bytes(),
+        pos: 0,
+    };
+    let value = parser.sum()?;
+    parser.skip_ws();
+    if parser.pos != parser.src.len() || value.number {
+        return None;
     }
-    // A leading minus is a signed length, not a subtraction.
-    let bytes = inner.as_bytes();
-    for (index, ch) in inner.char_indices() {
-        if ch == '-' && index > 0 && bytes[index - 1].is_ascii_whitespace() {
-            return add_breadths(
-                parse_breadth(inner[..index].trim())?,
-                parse_breadth(inner[index + 1..].trim())?,
-                true,
-            );
+    let finite = value.percent.is_finite() && value.px.is_finite() && value.em.is_finite();
+    if !finite {
+        return None;
+    }
+    match (value.percent != 0.0, value.px != 0.0, value.em != 0.0) {
+        (_, _, true) if value.percent == 0.0 && value.px == 0.0 => {
+            Some(Breadth::Em(value.em as f32))
         }
+        (_, _, true) => None,
+        (true, false, _) => Some(Breadth::Percent(value.percent as f32)),
+        (true, true, _) => Some(Breadth::Calc {
+            percent: value.percent as f32,
+            px: value.px as f32,
+        }),
+        (false, _, _) => Some(Breadth::Px(value.px as f32)),
     }
-    parse_breadth(inner)
 }
 
-fn add_breadths(left: Breadth, right: Breadth, subtract: bool) -> Option<Breadth> {
-    let sign = if subtract { -1.0 } else { 1.0 };
-    match (left, right) {
-        (Breadth::Px(a), Breadth::Px(b)) => Some(Breadth::Px(a + sign * b)),
-        (Breadth::Percent(a), Breadth::Percent(b)) => Some(Breadth::Percent(a + sign * b)),
-        (Breadth::Percent(percent), Breadth::Px(px)) => Some(Breadth::Calc {
-            percent,
-            px: sign * px,
-        }),
-        (Breadth::Px(px), Breadth::Percent(percent)) if !subtract => {
-            Some(Breadth::Calc { percent, px })
+#[derive(Clone, Copy)]
+struct CalcValue {
+    percent: f64,
+    px: f64,
+    em: f64,
+    /// A unitless number (only valid as a * or / operand).
+    number: bool,
+}
+
+impl CalcValue {
+    fn scale(self, factor: f64) -> CalcValue {
+        CalcValue {
+            percent: self.percent * factor,
+            px: self.px * factor,
+            em: self.em * factor,
+            number: self.number,
         }
-        (Breadth::Px(px), Breadth::Percent(percent)) => Some(Breadth::Calc {
-            percent: -percent,
-            px,
-        }),
-        (Breadth::Calc { percent, px }, Breadth::Px(extra)) => Some(Breadth::Calc {
-            percent,
-            px: px + sign * extra,
-        }),
-        (Breadth::Calc { percent, px }, Breadth::Percent(extra)) => Some(Breadth::Calc {
-            percent: percent + sign * extra,
-            px,
-        }),
-        _ => None,
+    }
+}
+
+struct CalcParser<'a> {
+    src: &'a [u8],
+    pos: usize,
+}
+
+impl CalcParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.src.len() && self.src[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn sum(&mut self) -> Option<CalcValue> {
+        let mut left = self.product()?;
+        loop {
+            let before = self.pos;
+            self.skip_ws();
+            let spaced = self.pos > before;
+            let Some(&op) = self.src.get(self.pos) else {
+                return Some(left);
+            };
+            if op != b'+' && op != b'-' {
+                self.pos = before;
+                return Some(left);
+            }
+            // + and - must be surrounded by whitespace.
+            let after = self.src.get(self.pos + 1).copied();
+            if !spaced || !after.is_some_and(|c| c.is_ascii_whitespace()) {
+                return None;
+            }
+            self.pos += 1;
+            let right = self.product()?;
+            if left.number != right.number {
+                return None;
+            }
+            let sign = if op == b'-' { -1.0 } else { 1.0 };
+            if left.number {
+                left.px += sign * right.px;
+            } else {
+                left.percent += sign * right.percent;
+                left.px += sign * right.px;
+                left.em += sign * right.em;
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<CalcValue> {
+        let mut left = self.term()?;
+        loop {
+            let before = self.pos;
+            self.skip_ws();
+            let Some(&op) = self.src.get(self.pos) else {
+                return Some(left);
+            };
+            if op != b'*' && op != b'/' {
+                self.pos = before;
+                return Some(left);
+            }
+            self.pos += 1;
+            let right = self.term()?;
+            if op == b'*' {
+                left = match (left.number, right.number) {
+                    (true, _) => right.scale(left.px),
+                    (false, true) => left.scale(right.px),
+                    (false, false) => return None,
+                };
+            } else {
+                if !right.number || right.px == 0.0 {
+                    return None;
+                }
+                left = left.scale(1.0 / right.px);
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<CalcValue> {
+        self.skip_ws();
+        let rest = &self.src[self.pos..];
+        if rest.first() == Some(&b'(') {
+            self.pos += 1;
+        } else if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"calc(") {
+            self.pos += 5;
+        } else {
+            return self.dimension();
+        }
+        let value = self.sum()?;
+        self.skip_ws();
+        if self.src.get(self.pos) != Some(&b')') {
+            return None;
+        }
+        self.pos += 1;
+        Some(value)
+    }
+
+    fn dimension(&mut self) -> Option<CalcValue> {
+        let start = self.pos;
+        if matches!(self.src.get(self.pos), Some(b'+' | b'-')) {
+            self.pos += 1;
+        }
+        while self
+            .src
+            .get(self.pos)
+            .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+        {
+            self.pos += 1;
+        }
+        let number: f64 = std::str::from_utf8(&self.src[start..self.pos])
+            .ok()?
+            .parse()
+            .ok()?;
+        let unit_start = self.pos;
+        while self
+            .src
+            .get(self.pos)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'%')
+        {
+            self.pos += 1;
+        }
+        let unit = std::str::from_utf8(&self.src[unit_start..self.pos]).ok()?;
+        let zero = CalcValue {
+            percent: 0.0,
+            px: 0.0,
+            em: 0.0,
+            number: false,
+        };
+        if unit.is_empty() {
+            return Some(CalcValue {
+                px: number,
+                number: true,
+                ..zero
+            });
+        }
+        if unit == "%" {
+            return Some(CalcValue {
+                percent: number,
+                ..zero
+            });
+        }
+        if unit.eq_ignore_ascii_case("px") {
+            return Some(CalcValue { px: number, ..zero });
+        }
+        if unit.eq_ignore_ascii_case("em") {
+            return Some(CalcValue { em: number, ..zero });
+        }
+        None
     }
 }
 
@@ -1899,8 +2069,27 @@ fn resolve_pair(
     names: &[Vec<String>],
     explicit: usize,
 ) -> Option<AxisPlace> {
+    let (start_text, end_text) = (start, end);
     let start = parse_grid_line(start)?;
     let end = parse_grid_line(end)?;
+    // An auto side contributes nothing: `x / auto` is `x`, `auto / span n`
+    // is `span n`, and `auto / line` is a span of 1 ending at that line.
+    if matches!(end, GridLine::Auto) {
+        return resolve_one(start_text, names, explicit, None);
+    }
+    if matches!(start, GridLine::Auto) {
+        if matches!(end, GridLine::Span { .. }) {
+            return resolve_one(end_text, names, explicit, None);
+        }
+        let end_line = grid_line_index(&end, names, explicit, None)?;
+        if end_line < 1 {
+            return None;
+        }
+        return Some(AxisPlace {
+            start: Some(end_line - 1),
+            span: 1,
+        });
+    }
     if let GridLine::Span { count, name } = start {
         let end_line = grid_line_index(&end, names, explicit, None)?;
         let start_line = span_to_line(end_line, count, name.as_deref(), names, false)?;
@@ -2159,6 +2348,385 @@ fn repeat_basis(spec: &Spec, available: i64, font: f32) -> Option<i64> {
     }
 }
 
+/// CSS Grid 12.5 step 3 (Blink `IncreaseTrackSizesToAccommodateGridItems`),
+/// for rows: in increasing span order, an item spanning several tracks, none
+/// of them flexible, grows the spanned tracks that have an intrinsic minimum
+/// by equal shares of what its contribution exceeds the spanned sizes and
+/// gaps. Rows are finalized under indefinite free space, so the contribution
+/// feeds the base sizes directly.
+fn grow_for_spanning_items(
+    tracks: &mut [Track],
+    specs: &[Spec],
+    spanning: &[(usize, usize, i64)],
+    available: Option<i64>,
+    font: f32,
+    gap: i64,
+) {
+    let mut order: Vec<&(usize, usize, i64)> = spanning.iter().collect();
+    order.sort_by_key(|(_, span, _)| *span);
+    for &(start, span, size) in order {
+        let end = (start + span).min(tracks.len());
+        if start >= end || tracks[start..end].iter().any(|track| track.flex > 0.0) {
+            continue;
+        }
+        let grows: Vec<usize> = (start..end)
+            .filter(|&index| {
+                specs
+                    .get(index)
+                    .is_some_and(|spec| intrinsic_minimum(spec, available, font))
+            })
+            .collect();
+        if grows.is_empty() {
+            continue;
+        }
+        let spanned: i64 = tracks[start..end].iter().map(|track| track.base).sum();
+        let extra = size - spanned - gap * (end - start - 1) as i64;
+        if extra <= 0 {
+            continue;
+        }
+        let share = extra / grows.len() as i64;
+        let remainder = extra - share * grows.len() as i64;
+        for (offset, &index) in grows.iter().enumerate() {
+            let add = share + if offset < remainder as usize { 1 } else { 0 };
+            let track = &mut tracks[index];
+            track.base += add;
+            track.cap = track.cap.max(track.base);
+        }
+    }
+}
+
+/// An item spanning several tracks, with its minimum, min-content and
+/// max-content contributions (margin boxes, layout units).
+struct SpanItem {
+    start: usize,
+    span: usize,
+    minimum: i64,
+    min_c: i64,
+    max_c: i64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MinKind {
+    Fixed,
+    Auto,
+    MinContent,
+    MaxContent,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MaxKind {
+    Fixed,
+    MinContent,
+    /// `auto` and `max-content`.
+    MaxContent,
+    /// `fit-content(limit)`.
+    Fit(i64),
+    Flex,
+}
+
+/// The min and max track sizing functions of a spec (CSS Grid 7.2.4); a
+/// percentage against indefinite space behaves as `auto`.
+fn sizing_kinds(spec: &Spec, available: Option<i64>, font: f32) -> (MinKind, MaxKind) {
+    let min_kind = |breadth: Breadth| match breadth {
+        Breadth::Auto => MinKind::Auto,
+        Breadth::MinContent => MinKind::MinContent,
+        Breadth::MaxContent => MinKind::MaxContent,
+        Breadth::Fr(_) => MinKind::Auto,
+        other => match definite_breadth(other, available, font) {
+            Some(_) => MinKind::Fixed,
+            None => MinKind::Auto,
+        },
+    };
+    let max_kind = |breadth: Breadth| match breadth {
+        Breadth::Fr(_) => MaxKind::Flex,
+        Breadth::Auto | Breadth::MaxContent => MaxKind::MaxContent,
+        Breadth::MinContent => MaxKind::MinContent,
+        other => match definite_breadth(other, available, font) {
+            Some(_) => MaxKind::Fixed,
+            None => MaxKind::MaxContent,
+        },
+    };
+    match spec {
+        Spec::One(breadth) => (min_kind(*breadth), max_kind(*breadth)),
+        Spec::MinMax(min, max) => (min_kind(*min), max_kind(*max)),
+        Spec::Fit(argument) => (
+            MinKind::Auto,
+            match definite_breadth(*argument, available, font) {
+                Some(limit) => MaxKind::Fit(limit),
+                None => MaxKind::MaxContent,
+            },
+        ),
+    }
+}
+
+/// CSS Grid 12.5 steps 3 and 4 (Blink
+/// `IncreaseTrackSizesToAccommodateGridItems`): after the single-span items
+/// set the tracks, items spanning several tracks grow them, in increasing
+/// span order. Items that cross no flexible track run the six sub-steps of
+/// 12.5.1 (intrinsic, content-based and max-content minimums, then intrinsic
+/// and max-content maximums); the others grow the flexible tracks' bases in
+/// proportion to their flex factors. `has_item` marks the tracks a
+/// single-span item already sized; an intrinsic growth limit of a track
+/// without one starts out infinite.
+fn accommodate_spanning_items(
+    tracks: &mut [Track],
+    specs: &[Spec],
+    has_item: &[bool],
+    spanning: &[SpanItem],
+    available: Option<i64>,
+    font: f32,
+    gap: i64,
+) {
+    if spanning.is_empty() {
+        return;
+    }
+    let count = tracks.len();
+    let kinds: Vec<(MinKind, MaxKind)> = (0..count)
+        .map(|index| {
+            if tracks[index].collapsed {
+                (MinKind::Fixed, MaxKind::Fixed)
+            } else {
+                specs
+                    .get(index)
+                    .map_or((MinKind::Fixed, MaxKind::Fixed), |spec| {
+                        sizing_kinds(spec, available, font)
+                    })
+            }
+        })
+        .collect();
+    let mut infinite: Vec<bool> = (0..count)
+        .map(|index| {
+            !has_item.get(index).copied().unwrap_or(false)
+                && matches!(
+                    kinds[index].1,
+                    MaxKind::MinContent | MaxKind::MaxContent | MaxKind::Fit(_)
+                )
+        })
+        .collect();
+    let mut spans: Vec<usize> = spanning.iter().map(|item| item.span).collect();
+    spans.sort_unstable();
+    spans.dedup();
+    for span in spans {
+        let group: Vec<&SpanItem> = spanning
+            .iter()
+            .filter(|item| item.span == span && item.start + item.span <= count)
+            .collect();
+        let (flexible, plain): (Vec<&SpanItem>, Vec<&SpanItem>) =
+            group.into_iter().partition(|item| {
+                (item.start..item.start + item.span).any(|index| kinds[index].1 == MaxKind::Flex)
+            });
+        let mut growable = vec![false; count];
+        for step in 0..5 {
+            let base_step = step < 3;
+            let mut planned = vec![0_i64; count];
+            for item in &plain {
+                let range = item.start..item.start + item.span;
+                let affected: Vec<usize> = range
+                    .clone()
+                    .filter(|&index| {
+                        let (min, max) = kinds[index];
+                        match step {
+                            0 => min != MinKind::Fixed,
+                            1 => matches!(min, MinKind::MinContent | MinKind::MaxContent),
+                            2 => min == MinKind::MaxContent,
+                            3 => matches!(
+                                max,
+                                MaxKind::MinContent | MaxKind::MaxContent | MaxKind::Fit(_)
+                            ),
+                            _ => matches!(max, MaxKind::MaxContent | MaxKind::Fit(_)),
+                        }
+                    })
+                    .collect();
+                if affected.is_empty() {
+                    continue;
+                }
+                let contribution = match step {
+                    0 => item.minimum,
+                    1 | 3 => item.min_c,
+                    _ => item.max_c,
+                };
+                let size_of = |index: usize| {
+                    if base_step || infinite[index] {
+                        tracks[index].base
+                    } else {
+                        tracks[index].cap
+                    }
+                };
+                let spanned: i64 =
+                    range.clone().map(size_of).sum::<i64>() + gap * (item.span as i64 - 1);
+                let mut space = contribution - spanned;
+                if space <= 0 {
+                    continue;
+                }
+                let limit_of = |index: usize| -> i64 {
+                    if base_step {
+                        if infinite[index] {
+                            INF
+                        } else {
+                            tracks[index].cap
+                        }
+                    } else if infinite[index] || growable[index] {
+                        INF
+                    } else {
+                        tracks[index].cap
+                    }
+                };
+                let mut increase = vec![0_i64; affected.len()];
+                let room: Vec<i64> = affected
+                    .iter()
+                    .map(|&index| {
+                        let mut limit = limit_of(index);
+                        if !base_step {
+                            // A fit-content growth limit stops at its argument.
+                            if let MaxKind::Fit(fit) = kinds[index].1 {
+                                limit = limit.min(fit.max(tracks[index].base));
+                            }
+                        }
+                        (limit - size_of(index)).max(0)
+                    })
+                    .collect();
+                space = distribute_equally(&mut increase, &room, space);
+                if space > 0 {
+                    // 12.5.1 "distribute space beyond limits".
+                    let beyond: Vec<bool> = affected
+                        .iter()
+                        .map(|&index| match step {
+                            0 | 1 => matches!(
+                                kinds[index].1,
+                                MaxKind::MinContent | MaxKind::MaxContent | MaxKind::Fit(_)
+                            ),
+                            2 => matches!(kinds[index].1, MaxKind::MaxContent | MaxKind::Fit(_)),
+                            _ => true,
+                        })
+                        .collect();
+                    let any = beyond.iter().any(|flag| *flag);
+                    let room: Vec<i64> = affected
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, &index)| {
+                            if any && !beyond[slot] {
+                                0
+                            } else if let MaxKind::Fit(limit) = kinds[index].1 {
+                                // A fit-content track stops at its argument.
+                                (limit.max(size_of(index)) - size_of(index) - increase[slot]).max(0)
+                            } else {
+                                INF
+                            }
+                        })
+                        .collect();
+                    distribute_equally(&mut increase, &room, space);
+                }
+                for (slot, &index) in affected.iter().enumerate() {
+                    planned[index] = planned[index].max(increase[slot]);
+                }
+            }
+            for index in 0..count {
+                if base_step {
+                    tracks[index].base += planned[index];
+                } else if planned[index] > 0 {
+                    if infinite[index] {
+                        tracks[index].cap = tracks[index].base + planned[index];
+                        infinite[index] = false;
+                        // 12.5.1 step 5: the next step may grow it past this.
+                        if step == 3 {
+                            growable[index] = true;
+                        }
+                    } else {
+                        tracks[index].cap += planned[index];
+                    }
+                }
+                if step == 2 && !infinite[index] && tracks[index].flex == 0.0 {
+                    tracks[index].cap = tracks[index].cap.max(tracks[index].base);
+                }
+            }
+            if step == 4 {
+                growable.iter_mut().for_each(|flag| *flag = false);
+            }
+        }
+        // 12.5 step 4: items crossing flexible tracks grow those tracks'
+        // bases by their flex factors.
+        let mut planned = vec![0_i64; count];
+        for item in &flexible {
+            let range = item.start..item.start + item.span;
+            let spanned: i64 = range.clone().map(|index| tracks[index].base).sum::<i64>()
+                + gap * (item.span as i64 - 1);
+            let space = item.minimum - spanned;
+            if space <= 0 {
+                continue;
+            }
+            let flex: Vec<usize> = range
+                .filter(|&index| {
+                    kinds[index].1 == MaxKind::Flex && kinds[index].0 != MinKind::Fixed
+                })
+                .collect();
+            let total: f64 = flex.iter().map(|&index| tracks[index].flex).sum();
+            if flex.is_empty() || total <= 0.0 {
+                continue;
+            }
+            let mut given = 0;
+            for (slot, &index) in flex.iter().enumerate() {
+                let share = if slot + 1 == flex.len() {
+                    space - given
+                } else {
+                    ((space as f64) * tracks[index].flex / total).floor() as i64
+                };
+                given += share;
+                planned[index] = planned[index].max(share);
+            }
+        }
+        for index in 0..count {
+            tracks[index].base += planned[index];
+        }
+    }
+    for index in 0..count {
+        if tracks[index].flex == 0.0 {
+            tracks[index].cap = tracks[index].cap.max(tracks[index].base);
+        }
+    }
+}
+
+/// Hands `space` out in equal shares, each slot stopping at its `room`;
+/// returns what is left once every slot is full.
+fn distribute_equally(increase: &mut [i64], room: &[i64], mut space: i64) -> i64 {
+    loop {
+        let open: Vec<usize> = (0..increase.len())
+            .filter(|&slot| room[slot] > increase[slot])
+            .collect();
+        if open.is_empty() || space <= 0 {
+            return space;
+        }
+        let share = space / open.len() as i64;
+        if share == 0 {
+            for slot in open {
+                if space == 0 {
+                    break;
+                }
+                increase[slot] += 1;
+                space -= 1;
+            }
+            return space;
+        }
+        for slot in open {
+            let add = share.min(room[slot] - increase[slot]);
+            increase[slot] += add;
+            space -= add;
+        }
+    }
+}
+
+/// Whether a track's min sizing function is intrinsic (`auto`, `min-content`,
+/// `max-content`, `fit-content()`, or a percentage against indefinite space).
+fn intrinsic_minimum(spec: &Spec, available: Option<i64>, font: f32) -> bool {
+    match spec {
+        Spec::One(Breadth::Fr(_)) => false,
+        Spec::One(breadth) => definite_breadth(*breadth, available, font).is_none(),
+        Spec::Fit(_) => true,
+        Spec::MinMax(min, _) => {
+            !matches!(min, Breadth::Fr(_)) && definite_breadth(*min, available, font).is_none()
+        }
+    }
+}
+
 fn definite_breadth(breadth: Breadth, available: Option<i64>, font: f32) -> Option<i64> {
     match breadth {
         Breadth::Px(value) => Some(units(value).max(0)),
@@ -2186,8 +2754,11 @@ fn fixed_track(size: i64) -> Track {
     }
 }
 
+/// `minimum` is the minimum contribution (auto minimums and flexible
+/// tracks), `min_c` the min-content contribution.
 fn track_from_spec(
     spec: &Spec,
+    minimum: i64,
     min_c: i64,
     max_c: i64,
     available: Option<i64>,
@@ -2196,43 +2767,50 @@ fn track_from_spec(
 ) -> Track {
     let mut track = match spec {
         Spec::One(Breadth::Fr(factor)) => Track {
-            base: min_c.max(0),
+            base: minimum.max(0),
             cap: INF,
             flex: *factor,
             stretchy: false,
             collapsed: false,
         },
-        Spec::One(Breadth::Auto) => Track {
-            base: max_c.max(0),
-            cap: if stretch { INF } else { max_c.max(0) },
-            flex: 0.0,
-            stretchy: stretch,
-            collapsed: false,
-        },
+        // An auto track starts at the minimum contribution with a growth
+        // limit of max-content; "maximize tracks" grows it towards that limit
+        // and only then does stretch hand out the rest (CSS Grid 12.4-12.6,
+        // Blink GridLayoutAlgorithm). It may end below max-content when the
+        // free space runs out.
+        Spec::One(Breadth::Auto) => intrinsic_track(minimum, max_c, stretch),
         Spec::One(Breadth::MinContent) => fixed_track(min_c),
         Spec::One(Breadth::MaxContent) => fixed_track(max_c),
         Spec::One(breadth) => match definite_breadth(*breadth, available, font) {
             Some(size) => fixed_track(size),
-            None => Track {
-                base: max_c.max(0),
-                cap: if stretch { INF } else { max_c.max(0) },
-                flex: 0.0,
-                stretchy: stretch,
-                collapsed: false,
-            },
+            None => intrinsic_track(minimum, max_c, stretch),
         },
+        // fit-content(limit) is minmax(auto, max-content) with the growth
+        // limit clamped at max(base, limit) (CSS Grid 7.2.4).
         Spec::Fit(argument) => {
             let limit = definite_breadth(*argument, available, font).unwrap_or(max_c);
-            fixed_track(max_c.min(limit.max(min_c)))
+            let base = minimum.clamp(0, max_c.max(0));
+            Track {
+                base,
+                cap: max_c.min(limit).max(base),
+                flex: 0.0,
+                stretchy: false,
+                collapsed: false,
+            }
         }
         Spec::MinMax(min, max) => {
-            let base = breadth_floor(*min, min_c, max_c, available, font);
+            let base = breadth_floor(*min, minimum, min_c, max_c, available, font);
             let (cap, flex) = breadth_ceiling(*max, min_c, max_c, available, font);
+            // CSS Grid 12.7: every track with an auto max sizing function
+            // takes part in stretching.
+            let auto_max = matches!(max, Breadth::Auto)
+                || (matches!(max, Breadth::Percent(_) | Breadth::Calc { .. })
+                    && definite_breadth(*max, available, font).is_none());
             Track {
                 base,
                 cap: cap.max(base),
                 flex,
-                stretchy: false,
+                stretchy: stretch && auto_max,
                 collapsed: false,
             }
         }
@@ -2244,15 +2822,28 @@ fn track_from_spec(
     track
 }
 
+fn intrinsic_track(minimum: i64, max_c: i64, stretch: bool) -> Track {
+    let limit = max_c.max(0);
+    Track {
+        base: minimum.clamp(0, limit),
+        cap: limit,
+        flex: 0.0,
+        stretchy: stretch,
+        collapsed: false,
+    }
+}
+
 fn breadth_floor(
     breadth: Breadth,
+    minimum: i64,
     min_c: i64,
     max_c: i64,
     available: Option<i64>,
     font: f32,
 ) -> i64 {
     match breadth {
-        Breadth::Auto | Breadth::MinContent => min_c.max(0),
+        Breadth::Auto => minimum.max(0),
+        Breadth::MinContent => min_c.max(0),
         Breadth::MaxContent => max_c.max(0),
         Breadth::Fr(_) => 0,
         other => definite_breadth(other, available, font).unwrap_or(min_c.max(0)),
@@ -2280,52 +2871,6 @@ fn breadth_ceiling(
 fn gap_sum(collapsed: &[bool], gap: i64) -> i64 {
     let active = collapsed.iter().filter(|flag| !**flag).count();
     gap * active.saturating_sub(1) as i64
-}
-
-/// CSS Grid §12.5 / §12.7, following Blink's ComputeMinMaxSizes two
-/// sizing constraints. Percentages are indefinite during this pass. The
-/// max-content flex fraction must accommodate each track's contribution;
-/// simply summing the flex bases loses the ratios between flexible tracks.
-fn intrinsic_tracks(
-    specs: &[Spec],
-    minimum: &[i64],
-    maximum: &[i64],
-    collapsed: &[bool],
-    gap: i64,
-    font: f32,
-) -> (i64, i64) {
-    let mut min_sum = gap_sum(collapsed, gap);
-    let mut max_sum = min_sum;
-    // Both passes derive the same small Track value; no scratch allocation
-    // is needed just to carry it from flex-fraction discovery to summation.
-    let mut fraction = 0.0_f64;
-    for (i, spec) in specs.iter().enumerate() {
-        if !collapsed[i] {
-            let track = track_from_spec(spec, minimum[i], maximum[i], None, font, false);
-            if track.flex > 0.0 {
-                fraction = fraction.max(maximum[i].max(track.base) as f64 / track.flex.max(1.0));
-            }
-        }
-    }
-    for (i, spec) in specs.iter().enumerate() {
-        if collapsed[i] {
-            continue;
-        }
-        let min = match *spec {
-            Spec::One(Breadth::MaxContent) => maximum[i],
-            Spec::One(breadth) => definite_breadth(breadth, None, font).unwrap_or(minimum[i]),
-            Spec::MinMax(min, _) => breadth_floor(min, minimum[i], maximum[i], None, font),
-            Spec::Fit(_) => minimum[i],
-        };
-        min_sum += min;
-        let track = track_from_spec(spec, minimum[i], maximum[i], None, font, false);
-        max_sum += if track.flex > 0.0 {
-            track.base.max((fraction * track.flex).ceil() as i64)
-        } else {
-            track.base
-        };
-    }
-    (min_sum, max_sum.max(min_sum))
 }
 
 fn grow(used: &mut [i64], caps: &[i64], mut free: i64) {
@@ -2445,8 +2990,10 @@ fn finalize(tracks: &[Track], available: Option<i64>, gap: i64) -> Vec<i64> {
     {
         let mut caps = used.clone();
         for (index, track) in tracks.iter().enumerate() {
-            if track.flex == 0.0 && !track.stretchy && !track.collapsed {
-                caps[index] = track.cap;
+            // Flexible tracks are frozen at their base while the others are
+            // maximized up to their growth limits (CSS Grid 12.5 step 5).
+            if track.flex == 0.0 && !track.collapsed {
+                caps[index] = track.cap.max(used[index]);
             }
         }
         let free = available - gaps - used.iter().sum::<i64>();
@@ -2479,8 +3026,6 @@ fn finalize(tracks: &[Track], available: Option<i64>, gap: i64) -> Vec<i64> {
             .map(|(index, track)| {
                 if track.collapsed {
                     0
-                } else if track.stretchy {
-                    INF
                 } else {
                     track.cap.max(used[index])
                 }
@@ -2716,6 +3261,8 @@ struct Item {
     auto_margin: [bool; 4],
     edges_v: f32,
     stretch_block: bool,
+    /// A percentage `height`: laid out again against the grid area.
+    percent_h: bool,
     specified_content_h: Option<f32>,
     /// A replaced item is resized by stretch (shrinking too), and an
     /// automatic width follows the stretched height through its ratio.
@@ -2734,8 +3281,10 @@ fn layout_item(
     area: f32,
     content_width: f32,
     content_height: Option<f32>,
+    percentage_block: Option<f32>,
 ) -> Option<LayoutResult> {
     let mut nested = *space;
+    nested.percentage_block = percentage_block;
     nested.available_inline = area;
     nested.rtl = false;
     nested.bfc_x = 0.0;
@@ -2772,8 +3321,15 @@ fn inline_minmax(
         return Some((0, 0));
     }
     let content = match style.width {
-        Dimension::Percent(_) | Dimension::Auto => {
+        Dimension::Percent(_) | Dimension::Calc { .. } | Dimension::Auto => {
             let sizes = block::intrinsic_sizes(flat, index, space).why("grid:intrinsic")?;
+            // An intrinsic `width` keyword contributes its own size
+            // (fit-content, and a percentage fit-content(), as auto).
+            let sizes = if item_width_keyword(flat, index).is_some() {
+                block::keyword_width_contribution(flat, index, space, edges, sizes)?
+            } else {
+                sizes
+            };
             (sizes.min.unwrap_or(sizes.max).max(0.0), sizes.max.max(0.0))
         }
         other => {
@@ -2783,9 +3339,156 @@ fn inline_minmax(
             (content, content)
         }
     };
-    let min = block::clamp_inline_size(style, space, edges, content.0).max(0.0);
-    let max = block::clamp_inline_size(style, space, edges, content.1).max(0.0);
+    let floor = min_width_keyword(flat, index, space)?.unwrap_or(0.0);
+    let min = block::clamp_inline_size(style, space, edges, content.0)
+        .max(floor)
+        .max(0.0);
+    let max = block::clamp_inline_size(style, space, edges, content.1)
+        .max(floor)
+        .max(0.0);
     Some((units(min + extra), units(max.max(min) + extra)))
+}
+
+/// A grid item's intrinsic `width` keyword, unless the item is replaced
+/// or size-contained (those keep their own sizing paths).
+fn item_width_keyword<'a>(flat: &[FlatNodeInfo<'a>], index: usize) -> Option<&'a str> {
+    let style = flat[index].style;
+    if block::size_contained(style) || block::is_replaced(flat[index].kind) {
+        return None;
+    }
+    marker(style, block::WIDTH_KEYWORD)
+}
+
+/// The content-box size a `min-width: min-content | max-content` keyword
+/// stands for (Blink `ComputeMinMaxInlineSizes` with an intrinsic min
+/// length): `Some(None)` without the keyword, `None` for `fit-content`,
+/// whose result depends on the available space this pass does not have.
+fn min_width_keyword(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<Option<f32>> {
+    let Some(keyword) = marker(flat[index].style, block::MIN_WIDTH_KEYWORD) else {
+        return Some(None);
+    };
+    let sizes = block::intrinsic_sizes(flat, index, space).why("grid:min-width-keyword")?;
+    let min = sizes.min.unwrap_or(sizes.max).max(0.0);
+    match keyword {
+        "min-content" => Some(Some(min)),
+        "max-content" => Some(Some(sizes.max.max(min))),
+        _ => super::bail("grid:min-width-keyword"),
+    }
+}
+
+/// CSS Grid §6.6 minimum contribution (Blink
+/// `GridLayoutAlgorithm::ContributionSizeForGridItem`, kForIntrinsicMinimums):
+/// a specified `min-width` gives the outer size it implies; with
+/// `min-width: auto` a box that scrolls in the inline axis has no automatic
+/// minimum, so only its margin, border and padding count. Others contribute
+/// their content-based minimum (`None`). A percentage `min-width` against the
+/// indefinite grid area behaves as `auto` here.
+fn inline_minimum(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) -> Option<i64> {
+    let style = flat[index].style;
+    let border = block::border_widths(style);
+    let pad = |spacing| spacing_px(style, spacing, 0.0, space);
+    let margin = |spacing| match spacing {
+        Spacing::Auto => 0.0,
+        other => spacing_px(style, other, 0.0, space),
+    };
+    let edges = border[1] + border[3] + pad(style.padding.left) + pad(style.padding.right);
+    let outer = edges + margin(style.margin.left) + margin(style.margin.right);
+    if let Some(keyword) = min_width_keyword(flat, index, space)? {
+        return Some(units((keyword + outer).max(0.0)));
+    }
+    match style.min_width {
+        Dimension::Auto | Dimension::Percent(_) | Dimension::Calc { .. } => {
+            if !block::scrolls_in_axis(style, true) || !matches!(style.min_width, Dimension::Auto) {
+                return None;
+            }
+            Some(units(outer.max(0.0)))
+        }
+        _ => {
+            let content = block::clamp_inline_size(style, space, edges, 0.0).max(0.0);
+            Some(units((content + outer).max(0.0)))
+        }
+    }
+}
+
+/// Which of an abspos item's grid lines are `auto` (or a span against an
+/// auto line), and so stand for the container's padding edges.
+fn abspos_auto_lines(value: Option<&str>) -> (bool, bool) {
+    let Some(value) = value else {
+        return (true, true);
+    };
+    let parts: Vec<&str> = value.split('/').map(str::trim).collect();
+    let line = |token: &str| parse_grid_line(token);
+    let is_auto = |line: &Option<GridLine>| matches!(line, None | Some(GridLine::Auto));
+    let is_span = |line: &Option<GridLine>| matches!(line, Some(GridLine::Span { .. }));
+    match parts.as_slice() {
+        [only] => {
+            let start = line(only);
+            let start_auto = is_auto(&start) || is_span(&start);
+            // `grid-column: name` copies the ident to the end; any other
+            // single value leaves the end line auto.
+            (start_auto, !is_ident(only))
+        }
+        [start, end] => {
+            let (start, end) = (line(start), line(end));
+            let start_open = is_auto(&start) || is_span(&start);
+            let end_open = is_auto(&end) || is_span(&end);
+            (
+                is_auto(&start) || (is_span(&start) && end_open),
+                is_auto(&end) || (is_span(&end) && start_open),
+            )
+        }
+        _ => (true, true),
+    }
+}
+
+/// The content-box-relative [start, end) of an abspos item's grid area in
+/// one axis, falling back to the padding edges for auto or out-of-grid lines.
+fn abspos_area(
+    sizes: &[i64],
+    offsets: &[i64],
+    start: Option<isize>,
+    span: usize,
+    start_auto: bool,
+    end_auto: bool,
+    padding: (i64, i64),
+) -> (i64, i64) {
+    let len = sizes.len().min(offsets.len());
+    let start_edge = |line: usize| -> Option<i64> {
+        if len == 0 || line > len {
+            None
+        } else if line < len {
+            Some(offsets[line])
+        } else {
+            Some(offsets[len - 1] + sizes[len - 1])
+        }
+    };
+    let end_edge = |line: usize| -> Option<i64> {
+        if len == 0 || line > len {
+            None
+        } else if line == 0 {
+            Some(offsets[0])
+        } else {
+            Some(offsets[line - 1] + sizes[line - 1])
+        }
+    };
+    let start_line = start.filter(|&line| line >= 0).map(|line| line as usize);
+    let a = if start_auto {
+        None
+    } else {
+        start_line.and_then(start_edge)
+    };
+    let b = if end_auto {
+        None
+    } else {
+        start_line.and_then(|line| end_edge(line + span))
+    };
+    let a = a.unwrap_or(padding.0);
+    let b = b.unwrap_or(padding.1).max(a);
+    (a, b)
 }
 
 fn span_sum(sizes: &[i64], collapsed: &[bool], start: usize, span: usize, gap: i64) -> i64 {
@@ -2889,7 +3592,7 @@ fn contribute_subgrid_columns(
         }
     };
     let explicit_rows = row_names.len().saturating_sub(1);
-    let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    let flow = container_flow(flat, index).why("grid:auto-flow")?;
     let mut pending = Vec::new();
     for (ordinal, child) in rendered_children(flat, index).enumerate() {
         let child_style = flat[child].style;
@@ -3003,6 +3706,123 @@ pub(super) fn layout(
     space: &ConstraintSpace,
     sized: Option<(f32, Option<f32>)>,
 ) -> Option<LayoutResult> {
+    match layout_impl(flat, index, space, sized, false)? {
+        GridOut::Laid(result) => Some(result),
+        GridOut::Measured(_) => super::bail("grid:measure"),
+    }
+}
+
+/// Min-content and max-content inline sizes of a grid container's content
+/// box (Blink GridLayoutAlgorithm::ComputeMinMaxSizes): the column tracks
+/// sized under a min-content and a max-content constraint, plus gutters.
+pub(super) fn min_max(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<MinMax> {
+    // Size containment: the intrinsic sizes ignore the items.
+    if block::size_contained(flat[index].style) {
+        return Some(MinMax::exact(
+            block::contain_intrinsic_size(flat[index].style).0,
+        ));
+    }
+    match layout_impl(flat, index, space, None, true)? {
+        GridOut::Measured(sizes) => Some(sizes),
+        GridOut::Laid(_) => super::bail("grid:measure"),
+    }
+}
+
+enum GridOut {
+    Laid(LayoutResult),
+    Measured(MinMax),
+}
+
+/// Column sizes under a min-content (`min`) and a max-content (`max`)
+/// constraint (CSS Grid §12.3–§12.7 with zero / infinite free space). An
+/// auto minimum is the items' min-content contribution; growth limits are
+/// reached only under the max-content constraint, and flexible tracks take
+/// the fr size that fits each item's max-content contribution (§12.7.1,
+/// Blink FindFrSize: a flex sum below 1 counts as 1).
+fn measure_columns(
+    specs: &[Spec],
+    collapsed: &[bool],
+    min_c: &[i64],
+    max_c: &[i64],
+    gap: i64,
+    font: f32,
+) -> MinMax {
+    // (base, growth limit, flex factor) of each track.
+    let mut tracks = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        let (low, high) = (min_c[index].max(0), max_c[index].max(0));
+        let floor = |breadth: Breadth| match breadth {
+            Breadth::Auto | Breadth::MinContent | Breadth::Fr(_) => low,
+            Breadth::MaxContent => high,
+            other => definite_breadth(other, None, font).unwrap_or(low),
+        };
+        let ceiling = |breadth: Breadth| match breadth {
+            Breadth::MinContent => low,
+            Breadth::Auto | Breadth::MaxContent | Breadth::Fr(_) => high,
+            other => definite_breadth(other, None, font).unwrap_or(high),
+        };
+        let track = match spec {
+            Spec::One(Breadth::Fr(factor)) => (low, 0, *factor),
+            Spec::One(breadth) => (floor(*breadth), ceiling(*breadth), 0.0),
+            Spec::Fit(argument) => {
+                let limit = definite_breadth(*argument, None, font).unwrap_or(high);
+                (low, high.min(limit), 0.0)
+            }
+            Spec::MinMax(min, Breadth::Fr(factor)) => (floor(*min), 0, *factor),
+            Spec::MinMax(min, max) => (floor(*min), ceiling(*max), 0.0),
+        };
+        tracks.push(if collapsed[index] { (0, 0, 0.0) } else { track });
+    }
+    let fraction = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.2 > 0.0)
+        .map(|(index, &(base, _, factor))| {
+            let per = |size: i64| size as f64 / factor.max(1.0);
+            per(base).max(per(max_c[index].max(0)))
+        })
+        .fold(0.0_f64, f64::max);
+    let gaps = gap_sum(collapsed, gap);
+    let min: i64 = tracks.iter().map(|track| track.0).sum();
+    let max: i64 = tracks
+        .iter()
+        .map(|&(base, limit, factor)| {
+            if factor > 0.0 {
+                base.max((fraction * factor).round() as i64)
+            } else {
+                base.max(limit)
+            }
+        })
+        .sum();
+    MinMax {
+        min: Some(from_units(min + gaps)),
+        max: from_units(max.max(min) + gaps),
+    }
+}
+
+/// A `<percent> <px>` gap marker resolved against `basis` (zero when
+/// indefinite). `None` when the gap has no percentage.
+fn percent_gap(style: &Style, name: &str, basis: Option<f32>) -> Option<f32> {
+    let mut parts = marker(style, name)?.split_whitespace();
+    let percent = parts.next()?.parse::<f32>().ok()?;
+    let px = parts
+        .next()
+        .and_then(|part| part.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    Some((percent / 100.0 * basis.unwrap_or(0.0).max(0.0) + px).max(0.0))
+}
+
+fn layout_impl(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    sized: Option<(f32, Option<f32>)>,
+    measure: bool,
+) -> Option<GridOut> {
     SUBGRID_CONTENT_ROWS.with(|cell| {
         cell.borrow_mut().retain(|(id, _)| *id != index);
     });
@@ -3010,6 +3830,34 @@ pub(super) fn layout(
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
         metrics.content_width = width;
+    }
+    let keyword = marker(style, WIDTH_KEYWORD).filter(|_| sized.is_none() && !measure);
+    if let Some(keyword) = keyword {
+        // Blink ComputeInlineSizeForFragment: an intrinsic keyword is the
+        // grid's own min/max-content size (fit-content clamps the available
+        // size between them), then min/max-width and auto margins apply
+        // as for a definite width.
+        let sizes = min_max(flat, index, space).why("grid:width-keyword")?;
+        let min = sizes.min.unwrap_or(sizes.max);
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+        let content = block::keyword_content_size(
+            keyword,
+            min,
+            sizes.max,
+            Some(available),
+            Some(space.available_inline),
+            style,
+            space,
+            edges,
+        )
+        .or_else(|| super::bail("grid:width-keyword"))?;
+        let mut definite = style.clone();
+        definite.width = Dimension::Px(match style.box_sizing {
+            BoxSizing::BorderBox => content + edges,
+            BoxSizing::ContentBox => content,
+        });
+        metrics = block::resolve_inline(&definite, space);
     }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
@@ -3021,6 +3869,10 @@ pub(super) fn layout(
         resolve_block(style.height, space.percentage_block, style, space, edges_v)
             .why("grid:percent")?
     };
+    // Size containment: an auto height is the contain-intrinsic one, and
+    // the tracks size into it as a definite height.
+    let specified_height = specified_height
+        .or_else(|| block::size_contained(style).then(|| block::contain_intrinsic_size(style).1));
     let min_h = match style.min_height {
         Dimension::Auto => None,
         other => resolve_block(other, space.percentage_block, style, space, edges_v)
@@ -3036,11 +3888,25 @@ pub(super) fn layout(
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_sub = columns_spec(style).is_some_and(is_subgrid_axis);
     let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
+    if (measure || keyword.is_some()) && (column_sub || row_sub) {
+        return super::bail("grid:intrinsic-subgrid");
+    }
     let inherited = if column_sub || row_sub {
         Some(lookup_inherited(flat, index, space, column_sub, row_sub).why("grid:subgrid")?)
     } else {
         None
     };
+    // A percentage gap resolves against the content box (CSS Box
+    // Alignment). Chrome resolves it against zero while measuring
+    // intrinsic sizes and for an indefinite height.
+    let column_gap = percent_gap(
+        style,
+        "--w3cos-internal-column-gap-percent",
+        (!measure).then_some(inner_width),
+    )
+    .unwrap_or(column_gap);
+    let row_gap =
+        percent_gap(style, "--w3cos-internal-row-gap-percent", specified_height).unwrap_or(row_gap);
     let mut column_gap_u = units(column_gap);
     let mut row_gap_u = units(row_gap);
     if let Some(inherited) = &inherited {
@@ -3060,8 +3926,10 @@ pub(super) fn layout(
         );
         fixed_template(&inherited.columns, names)
     } else {
+        // No column template: no explicit columns. The one column that
+        // row flow needs is added below as an implicit track.
         match columns_spec(style) {
-            None => parse_template("", false).why("grid:template")?,
+            None => parse_template("", true).why("grid:template")?,
             Some(spec) => parse_template(spec, false).why("grid:template")?,
         }
     };
@@ -3083,7 +3951,10 @@ pub(super) fn layout(
             Some(spec) => parse_template(spec, true).why("grid:template")?,
         }
     };
-    let flow = parse_flow(style.grid_flow()).why("grid:auto-flow")?;
+    let flow = container_flow(flat, index).why("grid:auto-flow")?;
+    if (measure || keyword.is_some()) && columns_template.auto_fit.is_some() {
+        return super::bail("grid:intrinsic-repeat");
+    }
     // An automatic inline-grid shrinks to its fixed px tracks (CSS Grid
     // §6). Stretching it to the containing block would grow those tracks
     // under the initial `justify-content: normal` (stretch).
@@ -3100,7 +3971,8 @@ pub(super) fn layout(
         .filter(|&child| !oof::is_out_of_flow(flat[child].style))
         .count();
     // Column flow with no explicit columns builds implicit auto tracks.
-    // A missing template on the row-flow axis stays one `1fr` column.
+    // A missing template on the row-flow axis stays one column, sized as
+    // an implicit (grid-auto-columns) track.
     let mut column_specs = if columns_spec(style).is_none() && flow.column {
         Vec::new()
     } else {
@@ -3124,7 +3996,20 @@ pub(super) fn layout(
         None => Spec::One(Breadth::Auto),
     };
     if column_specs.is_empty() && !flow.column {
-        column_specs.push(Spec::One(Breadth::Fr(1.0)));
+        // That column is implicit: grid-auto-columns sizes it, and the
+        // default `auto` only fills the grid when content distribution
+        // stretches it (place-content: start keeps it at max-content).
+        // With no in-flow items there is no implicit track, so a
+        // grid-auto-columns size must not give the empty grid a width;
+        // the old 1fr stand-in keeps its min-content width at zero. A
+        // grid-lanes box keeps the stand-in too: its percentage-width items
+        // match the column-flow references only against the 1fr track.
+        let lanes = has_marker(style, "--w3cos-internal-grid-lanes");
+        column_specs.push(if inflow > 0 && !lanes {
+            implicit_column.clone()
+        } else {
+            Spec::One(Breadth::Fr(1.0))
+        });
     }
     let explicit_cols = column_specs.len();
     let explicit_rows = row_specs.len();
@@ -3189,13 +4074,24 @@ pub(super) fn layout(
             }
         }
     }
-    let stretch_columns = column_pack(style) == Pack::Stretch;
+    let stretch_columns = column_pack(style) == Pack::Stretch && !lanes_stack_axis(style, false);
+    // `col_min` holds minimum contributions, `col_min_content` min-content
+    // contributions; they differ only for scroll containers.
     let mut col_min = vec![0_i64; column_specs.len()];
+    let mut col_min_content = vec![0_i64; column_specs.len()];
     let mut col_max = vec![0_i64; column_specs.len()];
+    let mut col_has_item = vec![false; column_specs.len()];
     let mut contribs = Vec::new();
     for item in &items {
         let child_style = flat[item.index].style;
         if columns_spec(child_style).is_some_and(is_subgrid_axis) {
+            // A column subgrid's items contribute through the parent's
+            // tracks; the standalone-axis pages that size them under an
+            // intrinsic container width use writing modes this engine does
+            // not store.
+            if measure {
+                return super::bail("grid:intrinsic-subgrid");
+            }
             contribute_subgrid_columns(
                 flat,
                 item.index,
@@ -3217,81 +4113,93 @@ pub(super) fn layout(
         } else {
             inline_minmax(flat, item.index, space).why("grid:intrinsic")?
         };
-        contribs.push(Some((min_c, max_c)));
+        let minimum = inline_minimum(flat, item.index, space)
+            .unwrap_or(min_c)
+            .min(min_c);
+        contribs.push(Some((minimum, min_c, max_c)));
         if item.col_span == 1 {
-            col_min[item.col] = col_min[item.col].max(min_c);
+            col_has_item[item.col] = true;
+            col_min[item.col] = col_min[item.col].max(minimum);
+            col_min_content[item.col] = col_min_content[item.col].max(min_c);
             col_max[item.col] = col_max[item.col].max(max_c);
         }
     }
+    // Subgrid columns wrote only `col_min`; they are min-content too.
+    for (min_content, minimum) in col_min_content.iter_mut().zip(&col_min) {
+        *min_content = (*min_content).max(*minimum);
+    }
+    let spread = |slots: &mut [i64], size: i64| {
+        let current: i64 = slots.iter().sum();
+        if size > current {
+            let extra = size - current;
+            let count = slots.len().max(1) as i64;
+            for slot in slots {
+                *slot += extra / count;
+            }
+        }
+    };
+    // Items spanning several columns. Layout sizes them per CSS Grid 12.5
+    // step 3 on the tracks below; the intrinsic measure still spreads them.
+    let mut spanning_cols = Vec::new();
     for (item, contrib) in items.iter().zip(&contribs) {
-        let Some((min_c, max_c)) = *contrib else {
+        let Some((minimum, min_c, max_c)) = *contrib else {
             continue;
         };
         if item.col_span <= 1 {
             continue;
         }
+        if !measure {
+            spanning_cols.push(SpanItem {
+                start: item.col,
+                span: item.col_span,
+                minimum,
+                min_c,
+                max_c,
+            });
+            continue;
+        }
         let end = (item.col + item.col_span).min(col_max.len());
-        let current: i64 = col_max[item.col..end].iter().sum();
-        if max_c > current {
-            let extra = max_c - current;
-            let slots = (end - item.col).max(1) as i64;
-            for slot in &mut col_max[item.col..end] {
-                *slot += extra / slots;
-            }
-        }
-        let current_min: i64 = col_min[item.col..end].iter().sum();
-        if min_c > current_min {
-            let extra = min_c - current_min;
-            let slots = (end - item.col).max(1) as i64;
-            for slot in &mut col_min[item.col..end] {
-                *slot += extra / slots;
-            }
-        }
+        spread(&mut col_max[item.col..end], max_c);
+        spread(&mut col_min[item.col..end], minimum);
+        spread(&mut col_min_content[item.col..end], min_c);
+    }
+    for (index, has) in col_has_item.iter_mut().enumerate() {
+        // Subgrid columns write their contributions straight into the slots.
+        *has |= col_min[index] > 0 || col_max[index] > 0;
+    }
+    if measure {
+        return Some(GridOut::Measured(measure_columns(
+            &column_specs,
+            &collapsed,
+            &col_min_content,
+            &col_max,
+            column_gap_u,
+            font,
+        )));
     }
     let mut shrink_intrinsic_columns = false;
     if inline_intrinsic && sized.is_none() && matches!(style.width, Dimension::Auto) {
-        let (min, max) = intrinsic_tracks(
+        let measured = measure_columns(
             &column_specs,
-            &col_min,
-            &col_max,
             &collapsed,
+            &col_min_content,
+            &col_max,
             column_gap_u,
             font,
         );
+        let (min, max) = (units(measured.min.unwrap_or(0.0)), units(measured.max));
         inner_u = inner_u.clamp(min, max);
         inner_width = from_units(inner_u);
         shrink_intrinsic_columns = inner_u < max;
     }
-    if sized.is_none() && block::intrinsic_keyword_applies(flat, index) {
-        // CSS Sizing 3 5.1: `width: min-content | max-content | fit-content`
-        // is the track-sized min / max-content size (Blink
-        // NGGridLayoutAlgorithm::ComputeMinMaxSizes), fit-content clamping
-        // the available inline size between the two.
-        let (min, max) = intrinsic_tracks(
-            &column_specs,
-            &col_min,
-            &col_max,
-            &collapsed,
-            column_gap_u,
-            font,
-        );
-        inner_u = match block::marker(style, block::WIDTH_KEYWORD) {
-            Some("max-content") => max,
-            Some("min-content") => min,
-            _ => inner_u.clamp(min, max),
-        };
-        let edges = bl + br + pl + pr;
-        inner_width = block::clamp_inline(style, space, edges, from_units(inner_u));
-        inner_u = units(inner_width);
-        shrink_intrinsic_columns = inner_u < max;
-    }
-    let column_tracks: Vec<Track> = column_specs
+    let mut column_tracks: Vec<Track> = column_specs
         .iter()
         .enumerate()
         .map(|(index, spec)| {
             let mut track = track_from_spec(
                 spec,
                 col_min[index],
+                col_min_content[index],
                 col_max[index],
                 Some(inner_u),
                 font,
@@ -3312,6 +4220,15 @@ pub(super) fn layout(
             track
         })
         .collect();
+    accommodate_spanning_items(
+        &mut column_tracks,
+        &column_specs,
+        &col_has_item,
+        &spanning_cols,
+        Some(inner_u),
+        font,
+        column_gap_u,
+    );
     let mut columns = finalize(&column_tracks, Some(inner_u), column_gap_u);
     if column_sub {
         let exact = &inherited.as_ref().unwrap().columns;
@@ -3392,15 +4309,37 @@ pub(super) fn layout(
             border[1] + border[3] + pad(child_style.padding.left) + pad(child_style.padding.right);
         let edges_v =
             border[0] + border[2] + pad(child_style.padding.top) + pad(child_style.padding.bottom);
+        let width_keyword = item_width_keyword(flat, item.index);
         let stretch_inline = justify == Pack::Stretch
             && matches!(child_style.width, Dimension::Auto)
+            && width_keyword.is_none()
             && !auto_margin[3]
             && !auto_margin[1];
-        let raw = if stretch_inline {
+        let raw = if let Some(keyword) = width_keyword {
+            // css-sizing-3 intrinsic keywords within the grid area: the
+            // available size for fit-content is the area less margins.
+            let sizes = block::intrinsic_sizes(flat, item.index, space).why("grid:intrinsic")?;
+            let min = sizes.min.unwrap_or(sizes.max).max(0.0);
+            block::keyword_content_size(
+                keyword,
+                min,
+                sizes.max,
+                Some((area - ml - mr - edges_h).max(0.0)),
+                Some(area),
+                child_style,
+                space,
+                edges_h,
+            )
+            .or_else(|| super::bail("grid:item-width-keyword"))?
+        } else if stretch_inline {
             (area - ml - mr - edges_h).max(0.0)
         } else if matches!(child_style.width, Dimension::Auto) {
-            let (_, max_c) = inline_minmax(flat, item.index, space).why("grid:intrinsic")?;
-            (from_units(max_c) - ml - mr).max(0.0)
+            // A non-stretched auto width is fit-content within the grid area:
+            // min(max-content, max(min-content, area)). The contributions are
+            // margin boxes; this is the content box.
+            let (min_c, max_c) = inline_minmax(flat, item.index, space).why("grid:intrinsic")?;
+            let fit = from_units(max_c).min(from_units(min_c).max(area));
+            (fit - ml - mr - edges_h).max(0.0)
         } else {
             let specified =
                 block::resolve_length(child_style.width, Some(area), child_style, space)
@@ -3409,9 +4348,12 @@ pub(super) fn layout(
         };
         let mut item_space = *space;
         item_space.available_inline = area;
-        let content_width =
-            block::clamp_inline_size(child_style, &item_space, edges_h, raw).max(0.0);
-        let specified_content_h = if has_marker(child_style, HEIGHT_KEYWORD) {
+        let keyword_floor = min_width_keyword(flat, item.index, space)?.unwrap_or(0.0);
+        let content_width = block::clamp_inline_size(child_style, &item_space, edges_h, raw)
+            .max(keyword_floor)
+            .max(0.0);
+        let percent_h = percent_height(child_style);
+        let specified_content_h = if has_marker(child_style, HEIGHT_KEYWORD) || percent_h {
             None
         } else {
             resolve_block(child_style.height, None, child_style, space, edges_v)
@@ -3419,6 +4361,7 @@ pub(super) fn layout(
         };
         let stretch_block = align == Pack::Stretch
             && specified_content_h.is_none()
+            && !percent_h
             && !has_marker(child_style, HEIGHT_KEYWORD)
             && !auto_margin[0]
             && !auto_margin[2];
@@ -3434,6 +4377,7 @@ pub(super) fn layout(
             auto_margin,
             edges_v,
             stretch_block,
+            percent_h,
             specified_content_h,
             replaced,
             width_auto: matches!(child_style.width, Dimension::Auto),
@@ -3459,8 +4403,12 @@ pub(super) fn layout(
     );
 
     let mut fragments = Vec::with_capacity(built.len());
+    // `row_floor` holds minimum contributions, `row_min` min-content ones.
+    let mut row_floor = vec![0_i64; row_specs.len()];
     let mut row_min = vec![0_i64; row_specs.len()];
     let mut row_max = vec![0_i64; row_specs.len()];
+    // Items spanning several rows: (first row, span, margin-box height).
+    let mut spanning: Vec<(usize, usize, i64)> = Vec::new();
     for item in &built {
         let laid = layout_item(
             flat,
@@ -3476,6 +4424,11 @@ pub(super) fn layout(
             }),
             item.content_width,
             item.specified_content_h,
+            if item.percent_h {
+                None
+            } else {
+                space.percentage_block
+            },
         )?;
         if let Some(content) = take_content_rows(item.index) {
             if content.len() != item.row_span {
@@ -3498,37 +4451,52 @@ pub(super) fn layout(
                 extra = extra.max(0);
                 row_max[track] = row_max[track].max(extra);
                 row_min[track] = row_min[track].max(extra);
+                row_floor[track] = row_floor[track].max(extra);
             }
         } else if item.row_span == 1 && item.row < row_max.len() {
             let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
             row_max[item.row] = row_max[item.row].max(margin_box);
             row_min[item.row] = row_min[item.row].max(margin_box);
+            // §6.6: no automatic minimum for a scroll container.
+            let child_style = flat[item.index].style;
+            let minimum = if block::scrolls_in_axis(child_style, false)
+                && matches!(child_style.min_height, Dimension::Auto)
+            {
+                units(item.edges_v) + item.margin_u[0] + item.margin_u[2]
+            } else {
+                margin_box
+            };
+            row_floor[item.row] = row_floor[item.row].max(minimum.min(margin_box));
+        } else if item.row_span > 1 {
+            let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
+            spanning.push((item.row, item.row_span, margin_box));
         }
         fragments.push(laid);
     }
-    let stretch_rows = row_pack(style) == Pack::Stretch;
+    let stretch_rows = row_pack(style) == Pack::Stretch && !lanes_stack_axis(style, true);
     let intrinsic_row_size = if inline_intrinsic && definite_block.is_none() {
-        Some(
-            intrinsic_tracks(
+        Some(units(
+            measure_columns(
                 &row_specs,
+                &vec![false; row_specs.len()],
                 &row_min,
                 &row_max,
-                &vec![false; row_specs.len()],
                 row_gap_u,
                 font,
             )
-            .1,
-        )
+            .max,
+        ))
     } else {
         None
     };
     let row_available = definite_block.map(units).or(intrinsic_row_size);
-    let row_tracks: Vec<Track> = row_specs
+    let mut row_tracks: Vec<Track> = row_specs
         .iter()
         .enumerate()
         .map(|(index, spec)| {
             track_from_spec(
                 spec,
+                row_floor.get(index).copied().unwrap_or(0),
                 row_min.get(index).copied().unwrap_or(0),
                 row_max.get(index).copied().unwrap_or(0),
                 row_available,
@@ -3537,12 +4505,21 @@ pub(super) fn layout(
             )
         })
         .collect();
+    grow_for_spanning_items(
+        &mut row_tracks,
+        &row_specs,
+        &spanning,
+        row_available,
+        font,
+        row_gap_u,
+    );
+    // Maximize tracks (CSS Grid 12.6) grows rows towards their growth
+    // limits in the free space, so minmax(20px, max-content) reaches
+    // max-content in a tall grid; an indefinite height has no free space.
     let mut rows = if row_tracks.is_empty() {
         Vec::new()
-    } else if intrinsic_row_size.is_some() || row_tracks.iter().any(|track| track.flex > 0.0) {
-        finalize(&row_tracks, row_available, row_gap_u)
     } else {
-        finalize(&row_tracks, None, row_gap_u)
+        finalize(&row_tracks, row_available, row_gap_u)
     };
     let mut recorded_rows = None;
     if row_sub {
@@ -3571,7 +4548,48 @@ pub(super) fn layout(
     {
         return super::bail("grid:max-height");
     }
-    if used < base && !inline_intrinsic {
+    // css-sizing-3 intrinsic min-height / max-height keywords: the limit
+    // is the content height, the sum of the sized rows and gaps (a height
+    // the parent's algorithm fixed stays).
+    let parent_fixed = matches!(sized, Some((_, Some(_))));
+    if !parent_fixed && has_marker(style, block::MAX_HEIGHT_KEYWORD) {
+        used = used.min(base);
+    }
+    if !parent_fixed && has_marker(style, block::MIN_HEIGHT_KEYWORD) {
+        used = used.max(base);
+    }
+    // An indefinite height sized the rows with a zero percentage row gap;
+    // the gap itself resolves against the resulting height (CSS Box
+    // Alignment: zero for intrinsic contributions, the final size for
+    // layout), so the rows may overflow it.
+    if specified_height.is_none()
+        && !row_sub
+        && let Some(gap) = percent_gap(
+            style,
+            "--w3cos-internal-row-gap-percent",
+            Some(from_units(used)),
+        )
+    {
+        row_gap_u = units(gap);
+    }
+    // Rows that overflow a short grid keep their sizes (the content
+    // overflows), except in two cases that stay on legacy. A grid-lanes box
+    // stacks its items rather than placing them in rows, which this
+    // algorithm only approximates, and the difference shows once they
+    // overflow (a single item stacks where its one track puts it). A row
+    // subgrid's own gap is legacy-only on the grid-lanes
+    // side (grid:lanes), and the grid-lanes subgrid references are short
+    // grids that have to match it.
+    if used < base
+        && !inline_intrinsic
+        && ((has_marker(style, "--w3cos-internal-grid-lanes") && built.len() > 1)
+            || built.iter().any(|item| {
+                flat[item.index]
+                    .style
+                    .grid_rows()
+                    .is_some_and(is_subgrid_axis)
+            }))
+    {
         return super::bail("grid:short-height");
     }
     if stretch_rows && used > base && !rows.is_empty() {
@@ -3614,12 +4632,7 @@ pub(super) fn layout(
             .max(0);
         let target_content = (target_border - units(item.edges_v)).max(0);
         let measured = units(fragment.fragment.height) - units(item.edges_v);
-        let resize = if item.replaced {
-            target_content != measured
-        } else {
-            target_content > measured
-        };
-        if resize {
+        if target_content != measured {
             let content_width = if item.replaced && item.width_auto && !item.stretch_inline {
                 let measured_w = fragment.fragment.width - item.edges_h;
                 if measured > 0 {
@@ -3644,16 +4657,46 @@ pub(super) fn layout(
                 }),
                 content_width,
                 Some(from_units(target_content)),
+                space.percentage_block,
             )?;
         }
+    }
+    // A percentage height resolves against the grid area, whose height is
+    // the sum of the spanned rows and gaps.
+    for (item, fragment) in built.iter().zip(fragments.iter_mut()) {
+        if !item.percent_h || rows.is_empty() {
+            continue;
+        }
+        let area_block = from_units(span_sum(
+            &rows,
+            &row_collapsed,
+            item.row,
+            item.row_span,
+            row_gap_u,
+        ));
+        *fragment = layout_item(
+            flat,
+            item.index,
+            space,
+            inline_of(&Placed {
+                index: item.index,
+                col: item.col,
+                row: item.row,
+                col_span: item.col_span,
+                row_span: item.row_span,
+                source: item.source,
+            }),
+            item.content_width,
+            None,
+            Some(area_block),
+        )?;
     }
 
     let row_sum: i64 = rows.iter().sum();
     let row_free = used - gap_sum(&row_collapsed, row_gap_u) - row_sum;
     let active_rows = rows.len().max(1);
-    let (row_lead, row_between) =
-        pack_gap(row_pack(style), row_free.max(0), active_rows, row_gap_u);
-    let row_y = positions(&rows, &row_collapsed, row_between, row_lead.max(0));
+    let (row_lead, row_between) = pack_gap(row_pack(style), row_free, active_rows, row_gap_u);
+    let row_y = positions(&rows, &row_collapsed, row_between, row_lead);
 
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);
@@ -3725,6 +4768,23 @@ pub(super) fn layout(
         children.push((x + dx, y + dy, fragment));
     }
 
+    let content_height = from_units(used.max(0));
+    let mut height = content_height;
+    if let Some(max) = max_h {
+        height = height.min(max);
+    }
+    if let Some(min) = min_h {
+        height = height.max(min);
+    }
+    if (height - content_height).abs() > EPS {
+        height = content_height;
+    }
+    let border_width = inner_width + bl + br + pl + pr;
+    let border_height = height + bt + bb + pt + pb;
+    // The column that stands in for a missing template only exists once an
+    // in-flow item is placed in it; with none, the implicit grid has no
+    // columns and every column line of an abspos child is outside it.
+    let stand_in_column_only = columns_spec(style).is_none() && !flow.column && built.is_empty();
     for child in oof_children {
         let child_style = flat[child].style;
         let column = resolve_axis(placement(child_style, false), &names_cols, explicit_cols)
@@ -3733,17 +4793,28 @@ pub(super) fn layout(
             .why("grid:row")?;
         let col = column.start.unwrap_or(0).max(0) as usize;
         let row_index = row.start.unwrap_or(0).max(0) as usize;
-        // No in-flow rows: the static-position area is the content box,
-        // which is what a stretched auto row would occupy.
-        let area_w = if columns.is_empty() {
+        // When the grid is not the containing block, the static position
+        // is that of the sole item of an area spanning the content box
+        // (CSS Grid 9.2), so grid placement does not move it. No in-flow
+        // rows gives the same area: a stretched auto row fills the box.
+        let static_only = style.position == Position::Static;
+        let area_w = if columns.is_empty() || static_only {
             inner_u
         } else {
             span_sum(&columns, &collapsed, col, column.span, col_between)
         };
-        let area_h = if rows.is_empty() {
+        let area_h = if rows.is_empty() || static_only {
             used
         } else {
             span_sum(&rows, &row_collapsed, row_index, row.span, row_between)
+        };
+        let (col_at, row_at) = if static_only {
+            (0, 0)
+        } else {
+            (
+                column_x.get(col).copied().unwrap_or(0),
+                row_y.get(row_index).copied().unwrap_or(0),
+            )
         };
         let justify = align_pack(used_item_align(
             style.justify_items,
@@ -3770,32 +4841,99 @@ pub(super) fn layout(
         let block_off = border_h
             .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
             .unwrap_or(0);
-        let mut x = from_units(origin_x + column_x.get(col).copied().unwrap_or(0) + inline_off);
-        let y = from_units(origin_y + row_y.get(row_index).copied().unwrap_or(0) + block_off);
+        let mut x = from_units(origin_x + col_at + inline_off);
+        let y = from_units(origin_y + row_at + block_off);
         if rtl {
             x = from_units(origin_x + inner_u - (units(x) - origin_x));
         }
-        pending_oof.push(OofCandidate {
+        let candidate = OofCandidate {
             index: child,
             static_inline: x,
             static_block: y,
             static_rtl: rtl,
-        });
+        };
+        if style.position == Position::Static {
+            pending_oof.push(candidate);
+            continue;
+        }
+        // CSS Grid 9.1: a grid container that is the containing block gives
+        // each abspos child its grid area; auto lines and lines outside the
+        // grid are the padding edges (the augmented grid).
+        let (start_auto, end_auto) = abspos_auto_lines(placement(child_style, false));
+        let (x0, x1) = abspos_area(
+            if stand_in_column_only { &[] } else { &columns },
+            &column_x,
+            column.start,
+            column.span,
+            start_auto,
+            end_auto,
+            (-units(pl), inner_u + units(pr)),
+        );
+        let (start_auto, end_auto) = abspos_auto_lines(placement(child_style, true));
+        let (y0, y1) = abspos_area(
+            &rows,
+            &row_y,
+            row.start,
+            row.span,
+            start_auto,
+            end_auto,
+            (-units(pt), units(height) + units(pb)),
+        );
+        let area_w = x1 - x0;
+        let area_h = y1 - y0;
+        let border_w = definite_border(
+            child_style,
+            false,
+            from_units(area_w),
+            from_units(area_h),
+            space,
+        );
+        let border_h = definite_border(
+            child_style,
+            true,
+            from_units(area_w),
+            from_units(area_h),
+            space,
+        );
+        let inline_off = border_w
+            .map(|size| axis_offset(area_w, size, 0, 0, false, false, justify).2)
+            .unwrap_or(0);
+        let block_off = border_h
+            .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
+            .unwrap_or(0);
+        let (cb_x, static_inline) = if rtl {
+            (
+                origin_x + inner_u - x1,
+                origin_x + inner_u - x0 - inline_off,
+            )
+        } else {
+            (origin_x + x0, origin_x + x0 + inline_off)
+        };
+        let cb = oof::ContainingBlock {
+            x: from_units(cb_x),
+            y: from_units(origin_y + y0),
+            width: from_units(area_w),
+            height: from_units(area_h),
+            rtl,
+        };
+        let candidate = OofCandidate {
+            static_inline: from_units(static_inline),
+            static_block: from_units(origin_y + y0 + block_off),
+            ..candidate
+        };
+        let (placed, rest) = oof::resolve(
+            flat,
+            vec![candidate],
+            &cb,
+            false,
+            space.viewport_w,
+            space.viewport_h,
+        )
+        .why("grid:oof-resolve")?;
+        children.extend(placed);
+        pending_oof.extend(rest);
     }
 
-    let content_height = from_units(used.max(0));
-    let mut height = content_height;
-    if let Some(max) = max_h {
-        height = height.min(max);
-    }
-    if let Some(min) = min_h {
-        height = height.max(min);
-    }
-    if (height - content_height).abs() > EPS {
-        height = content_height;
-    }
-    let border_width = inner_width + bl + br + pl + pr;
-    let border_height = height + bt + bb + pt + pb;
     if style.position != Position::Static && !pending_oof.is_empty() {
         let cb = oof::ContainingBlock {
             x: bl,
@@ -3825,7 +4963,7 @@ pub(super) fn layout(
             cell.borrow_mut().push((index, recorded));
         });
     }
-    Some(LayoutResult {
+    Some(GridOut::Laid(LayoutResult {
         fragment: BoxFragment {
             index,
             width: border_width,
@@ -3850,7 +4988,7 @@ pub(super) fn layout(
         oof: pending_oof,
         bfc_dependent: false,
         float_overlap: false,
-    })
+    }))
 }
 
 fn resolve_block(
@@ -3862,7 +5000,7 @@ fn resolve_block(
 ) -> Option<Option<f32>> {
     match dim {
         Dimension::Auto => Some(None),
-        Dimension::Percent(_) if basis.is_none() => None,
+        Dimension::Percent(_) | Dimension::Calc { .. } if basis.is_none() => None,
         other => {
             let size = block::resolve_length(other, basis, style, space)?;
             Some(Some(to_content(style, edges, size)))
@@ -4401,13 +5539,33 @@ mod tests {
                 vec![leaf(block_box(None, Some(10.0)))],
             )],
         );
-        let short = Component::boxed(
-            grid_style(200.0, Some(5.0), None),
-            vec![leaf(block_box(None, Some(10.0)))],
+    }
+
+    #[test]
+    fn rows_overflow_a_short_grid() {
+        // Chrome: an auto row keeps its min-content size when the grid is
+        // shorter than it; the content overflows the 5px grid.
+        expect(
+            &Component::boxed(
+                grid_style(200.0, Some(5.0), None),
+                vec![leaf(block_box(None, Some(10.0)))],
+            ),
+            &[(0, [0.0, 0.0, 200.0, 5.0]), (1, [0.0, 0.0, 200.0, 10.0])],
         );
-        let flat = pre_flatten(&short);
-        assert!(block::supports_tree(&flat));
-        assert!(super::super::layout_tree(&short, &flat, 800.0, 600.0).is_none());
+        // A stretched item shrinks to a fixed row smaller than its content:
+        // its automatic minimum is zero because it spans no auto-minimum track.
+        let mut grid = grid_style(200.0, Some(5.0), None);
+        grid.grid_ng_mut().grid_template_rows = Some("4px".to_string());
+        expect(
+            &Component::boxed(
+                grid,
+                vec![Component::boxed(
+                    block_box(None, None),
+                    vec![leaf(block_box(None, Some(10.0)))],
+                )],
+            ),
+            &[(1, [0.0, 0.0, 200.0, 4.0]), (2, [0.0, 0.0, 200.0, 10.0])],
+        );
     }
 
     #[test]
@@ -4779,6 +5937,186 @@ mod tests {
                 (2, [0.0, 13.0, 10.0, 20.0]),
                 (3, [0.0, 33.0, 10.0, 10.0]),
             ],
+        );
+    }
+
+    #[test]
+    fn missing_column_template_uses_the_implicit_auto_column() {
+        // No grid-template-columns: row flow gets one implicit column sized by
+        // grid-auto-columns. Under justify-content:start the auto track keeps
+        // its 30px content width (Chrome, fit-content-tracks-dont-stretch-001).
+        let item = || {
+            Component::boxed(
+                block_box(None, None),
+                vec![leaf(block_box(Some(30.0), Some(10.0)))],
+            )
+        };
+        let mut packed = grid_style(200.0, None, None);
+        mark_justify(&mut packed, "start");
+        expect(
+            &Component::boxed(packed, vec![item()]),
+            &[(1, [0.0, 0.0, 30.0, 10.0])],
+        );
+        let mut sized = grid_style(200.0, None, None);
+        sized.grid_ng_mut().grid_auto_columns = Some("50px".to_string());
+        expect(
+            &Component::boxed(sized, vec![item()]),
+            &[(1, [0.0, 0.0, 50.0, 10.0])],
+        );
+        // The initial value still stretches the single auto column.
+        expect(
+            &Component::boxed(grid_style(200.0, None, None), vec![item()]),
+            &[(1, [0.0, 0.0, 200.0, 10.0])],
+        );
+        // An empty grid has no implicit track, so grid-auto-columns does
+        // not give it a max-content width (Chrome, abspos/empty-grid-001).
+        let mut empty = Style {
+            display: Display::Grid,
+            ..Style::default()
+        };
+        empty.grid_ng_mut().grid_auto_columns = Some("200px".to_string());
+        let mut outer = grid_style(400.0, None, None);
+        mark_justify(&mut outer, "start");
+        expect(
+            &Component::boxed(outer, vec![leaf(empty)]),
+            &[(1, [0.0, 0.0, 0.0, 0.0])],
+        );
+    }
+
+    #[test]
+    fn size_contained_grid_sizes_rows_into_the_contain_intrinsic_height() {
+        // contain: size; contain-intrinsic-size: 80px 90px. The auto height
+        // is 90px and the 1fr 2fr rows split it (Chrome: 30px and 60px).
+        let mut style = grid_style(200.0, None, Some("50px"));
+        style.grid_ng_mut().grid_template_rows = Some("1fr 2fr".to_string());
+        style.custom_properties = Some(CustomProperties::from_iter([
+            (
+                "--w3cos-internal-size-containment".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "--w3cos-internal-contain-intrinsic-size".to_string(),
+                "80 90".to_string(),
+            ),
+        ]));
+        let items = (0..2)
+            .map(|_| leaf(block_box(None, None)))
+            .collect::<Vec<_>>();
+        expect(
+            &Component::boxed(style, items),
+            &[(1, [0.0, 0.0, 50.0, 30.0]), (2, [0.0, 30.0, 50.0, 60.0])],
+        );
+    }
+
+    #[test]
+    fn row_lanes_fill_each_lane_in_turn() {
+        // grid-lanes with only grid-template-rows: the rows are the lanes and
+        // each item goes into the shortest one, so equal items alternate
+        // between the two lanes and stack along the inline axis. Only the
+        // size-contained case is on NG.
+        let mut style = grid_style(200.0, None, None);
+        style.grid_ng_mut().grid_template_rows = Some("30px 30px".to_string());
+        style.custom_properties = Some(CustomProperties::from_iter([
+            ("--w3cos-internal-grid-lanes".to_string(), "1".to_string()),
+            (
+                "--w3cos-internal-size-containment".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "--w3cos-internal-contain-intrinsic-size".to_string(),
+                "200 60".to_string(),
+            ),
+        ]));
+        let items = (0..4)
+            .map(|_| leaf(block_box(Some(20.0), None)))
+            .collect::<Vec<_>>();
+        expect(
+            &Component::boxed(style, items),
+            &[
+                (1, [0.0, 0.0, 20.0, 30.0]),
+                (2, [0.0, 30.0, 20.0, 30.0]),
+                (3, [20.0, 0.0, 20.0, 30.0]),
+                (4, [20.0, 30.0, 20.0, 30.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn percentage_height_items_resolve_against_the_grid_area() {
+        // `height: 100%` is auto for track sizing and the 55px / 66px row
+        // (plus the 5px gap for a two-row span) afterwards.
+        let mut style = grid_style(200.0, None, Some("77px 88px"));
+        style.grid_ng_mut().grid_template_rows = Some("55px 66px".to_string());
+        style.row_gap = Some(5.0);
+        let tall = || {
+            leaf(Style {
+                height: Dimension::Percent(100.0),
+                ..block_box(None, None)
+            })
+        };
+        let half = leaf(Style {
+            height: Dimension::Percent(50.0),
+            ..block_box(None, None)
+        });
+        expect(
+            &Component::boxed(style, vec![tall(), tall(), half]),
+            &[
+                (1, [0.0, 0.0, 77.0, 55.0]),
+                (2, [77.0, 0.0, 88.0, 55.0]),
+                (3, [0.0, 60.0, 77.0, 33.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn percentage_gaps_resolve_against_the_content_box() {
+        // Chrome: 10% of the 200px width is a 20px column gap. The row gap
+        // resolves against the definite 100px height (10px). With an auto
+        // height the rows size with no gap (20px tall) and the gap is then
+        // 10% of that, so the rows overflow.
+        let gap = |style: &mut Style| {
+            style.custom_properties = Some(CustomProperties::from_iter([
+                (
+                    "--w3cos-internal-column-gap-percent".to_string(),
+                    "10 0".to_string(),
+                ),
+                (
+                    "--w3cos-internal-row-gap-percent".to_string(),
+                    "10 0".to_string(),
+                ),
+            ]));
+        };
+        let items = || {
+            (0..3)
+                .map(|_| leaf(block_box(None, Some(10.0))))
+                .collect::<Vec<_>>()
+        };
+        let mut definite = grid_style(200.0, Some(100.0), Some("50px 50px"));
+        definite.grid_ng_mut().grid_template_rows = Some("10px 10px".to_string());
+        gap(&mut definite);
+        expect(
+            &Component::boxed(definite, items()),
+            &[(2, [70.0, 0.0, 50.0, 10.0]), (3, [0.0, 20.0, 50.0, 10.0])],
+        );
+        let mut auto = grid_style(200.0, None, Some("50px 50px"));
+        gap(&mut auto);
+        expect(
+            &Component::boxed(auto, items()),
+            &[(3, [0.0, 12.0, 50.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn auto_start_with_an_end_line_spans_one_track() {
+        // `auto / 3` is span 1 ending at line 3: the second column.
+        let mut placed = block_box(None, Some(10.0));
+        placed.grid_column = Some("auto / 3".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(100.0, None, Some("40px 60px")),
+                vec![leaf(placed)],
+            ),
+            &[(1, [40.0, 0.0, 60.0, 10.0])],
         );
     }
 
@@ -5172,6 +6510,250 @@ mod tests {
     }
 
     #[test]
+    fn items_spanning_auto_rows_grow_them_and_stretch_over_the_span() {
+        // CSS Grid 12.5 step 3: D spans both implicit auto rows and grows
+        // them to its 100px; C spans the same rows and stretches over them.
+        let mut c = block_box(None, None);
+        c.grid_ng_mut().grid_row = Some("1 / 3".to_string());
+        let mut d = block_box(None, Some(100.0));
+        d.grid_ng_mut().grid_row = Some("1 / 3".to_string());
+        let mut after = block_box(None, Some(10.0));
+        after.grid_ng_mut().grid_row = Some("2".to_string());
+        after.grid_column = Some("3".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(300.0, None, Some("100px 100px 100px")),
+                vec![
+                    Component::boxed(c, vec![leaf(block_box(None, Some(10.0)))]),
+                    leaf(d),
+                    leaf(after),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 300.0, 100.0]),
+                (1, [0.0, 0.0, 100.0, 100.0]),
+                (3, [100.0, 0.0, 100.0, 100.0]),
+                // Row 2 already holds 10px, so the 90px left is split 45/45.
+                (4, [200.0, 45.0, 100.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn auto_columns_shrink_below_max_content_to_fit_the_free_space() {
+        // Each item is min-content 40 / max-content 80. Auto tracks start at
+        // the minimum contribution and are maximized equally (CSS Grid 12.6).
+        let floats = || {
+            let mut float = block_box(Some(40.0), Some(10.0));
+            float.float = Float::Left;
+            Component::boxed(
+                block_box(None, None),
+                vec![leaf(float.clone()), leaf(float)],
+            )
+        };
+        expect(
+            &Component::boxed(
+                grid_style(100.0, None, Some("auto auto")),
+                vec![floats(), floats()],
+            ),
+            &[(1, [0.0, 0.0, 50.0, 20.0]), (4, [50.0, 0.0, 50.0, 20.0])],
+        );
+        // With room to spare they still reach max-content, then stretch.
+        expect(
+            &Component::boxed(
+                grid_style(200.0, None, Some("auto auto")),
+                vec![floats(), floats()],
+            ),
+            &[(1, [0.0, 0.0, 100.0, 10.0]), (4, [100.0, 0.0, 100.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn an_item_spanning_columns_grows_only_their_intrinsic_maximums() {
+        // CSS Grid 12.5.1: the spanner (min-content 40, max-content 80)
+        // leaves the fixed 5px column alone. Its min-content share goes to
+        // the two intrinsic growth limits (17.5 each), then its max-content
+        // the rest (37.5 each); maximizing reaches those limits and the
+        // auto maximums stretch over the last 20px (47.5 each).
+        let mut float = block_box(Some(40.0), Some(10.0));
+        float.float = Float::Left;
+        let mut spanner = block_box(None, None);
+        spanner.grid_column = Some("1 / -1".to_string());
+        let mut first = block_box(None, Some(5.0));
+        first.grid_column = Some("1".to_string());
+        let mut last = block_box(None, Some(5.0));
+        last.grid_column = Some("3".to_string());
+        expect(
+            &Component::boxed(
+                grid_style(100.0, None, Some("minmax(0px, auto) 5px minmax(0px, auto)")),
+                vec![
+                    Component::boxed(spanner, vec![leaf(float.clone()), leaf(float)]),
+                    leaf(first),
+                    leaf(last),
+                ],
+            ),
+            &[
+                (1, [0.0, 0.0, 100.0, 10.0]),
+                (4, [0.0, 10.0, 47.5, 5.0]),
+                (5, [52.5, 10.0, 47.5, 5.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn fit_content_track_and_auto_maximum_share_a_spanner() {
+        // CSS Grid 12.5.1 (grid-intrinsic-maximums FitContent): the spanner's
+        // 15px minimum grows the fit-content base to 10; min-content 40 adds
+        // 12.5 to each growth limit, max-content 80 another 20; the auto
+        // maximum stretches over the last 15px: 42.5 / 5 / 52.5.
+        let mut outer = grid_style(
+            100.0,
+            None,
+            Some("fit-content(100px) 5px minmax(0px, auto)"),
+        );
+        outer.position = Position::Relative;
+        outer.justify_items = AlignItems::FlexStart;
+        let mut float = block_box(Some(40.0), Some(10.0));
+        float.float = Float::Left;
+        let mut spanner = block_box(None, None);
+        spanner.min_width = Dimension::Px(15.0);
+        spanner.grid_column = Some("1 / -1".to_string());
+        let bar = |column: &str| {
+            let mut bar = block_box(None, Some(5.0));
+            bar.width = Dimension::Percent(100.0);
+            bar.position = Position::Absolute;
+            bar.grid_column = Some(column.to_string());
+            leaf(bar)
+        };
+        let root = Component::boxed(
+            block_box(Some(200.0), None),
+            vec![Component::boxed(
+                outer,
+                vec![
+                    Component::boxed(spanner, vec![leaf(float.clone()), leaf(float)]),
+                    bar("1 / 2"),
+                    bar("3 / 4"),
+                ],
+            )],
+        );
+        expect(
+            &root,
+            &[(5, [0.0, 0.0, 42.5, 5.0]), (6, [47.5, 0.0, 52.5, 5.0])],
+        );
+    }
+
+    #[test]
+    fn min_width_keyword_floors_a_spanners_contributions() {
+        // grid-intrinsic-maximums MinContent#3: `min-width: max-content`
+        // lifts the spanner's min-content contribution to 80, so the
+        // minmax(0px, min-content) column's growth limit takes 80 - 5.
+        use w3cos_std::style::CustomProperties;
+        let mut outer = grid_style(100.0, None, Some("minmax(0px, min-content) 5px"));
+        outer.position = Position::Relative;
+        outer.justify_items = AlignItems::FlexStart;
+        let mut float = block_box(Some(40.0), Some(10.0));
+        float.float = Float::Left;
+        let mut spanner = block_box(None, None);
+        spanner.grid_column = Some("1 / -1".to_string());
+        spanner.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-min-width-keyword".to_string(),
+            "max-content".to_string(),
+        )]));
+        let bar = |column: &str| {
+            let mut bar = block_box(None, Some(5.0));
+            bar.width = Dimension::Percent(100.0);
+            bar.position = Position::Absolute;
+            bar.grid_column = Some(column.to_string());
+            leaf(bar)
+        };
+        let root = Component::boxed(
+            block_box(Some(200.0), None),
+            vec![Component::boxed(
+                outer,
+                vec![
+                    Component::boxed(spanner, vec![leaf(float.clone()), leaf(float)]),
+                    bar("1 / 2"),
+                    bar("2 / 3"),
+                ],
+            )],
+        );
+        expect(
+            &root,
+            &[
+                (2, [0.0, 0.0, 80.0, 10.0]),
+                (5, [0.0, 0.0, 75.0, 5.0]),
+                (6, [75.0, 0.0, 5.0, 5.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn only_the_scrolling_axis_drops_the_automatic_minimum() {
+        // CSS Grid 6.6: overflow-x hidden drops the 100px minimum in the
+        // column axis; overflow-y hidden alone keeps it there.
+        let mut x_scroller = block_box(None, None);
+        x_scroller.overflow_x = Some(w3cos_std::style::Overflow::Hidden);
+        let mut y_scroller = block_box(None, None);
+        y_scroller.overflow_y = Some(w3cos_std::style::Overflow::Hidden);
+        let content = || leaf(block_box(Some(100.0), Some(100.0)));
+        expect(
+            &Component::boxed(
+                grid_style(0.0, None, Some("auto auto")),
+                vec![
+                    Component::boxed(x_scroller, vec![content()]),
+                    Component::boxed(y_scroller, vec![content()]),
+                ],
+            ),
+            &[(1, [0.0, 0.0, 0.0, 100.0]), (3, [0.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn start_aligned_padded_item_takes_its_max_content_box() {
+        // A start-aligned item is as wide as its max-content contribution,
+        // which already holds its padding: content 80, border box 90.
+        let mut outer = grid_style(300.0, None, Some("200px"));
+        outer.justify_items = AlignItems::FlexStart;
+        let mut padded = block_box(None, None);
+        padded.padding = edges(5.0, 5.0, 5.0, 5.0);
+        expect(
+            &Component::boxed(
+                outer,
+                vec![Component::boxed(
+                    padded,
+                    vec![leaf(block_box(Some(80.0), Some(20.0)))],
+                )],
+            ),
+            &[(1, [0.0, 0.0, 90.0, 30.0]), (2, [5.0, 5.0, 80.0, 20.0])],
+        );
+    }
+
+    #[test]
+    fn intrinsic_columns_follow_the_min_and_max_content_constraints() {
+        let u = |px: f32| units(px);
+        // auto, 1fr, 50px and fit-content(30px), one item each:
+        // min-content 10/20/_/40, max-content 40/60/_/80, 10px gaps.
+        let specs = [
+            Spec::One(Breadth::Auto),
+            Spec::One(Breadth::Fr(1.0)),
+            Spec::One(Breadth::Px(50.0)),
+            Spec::Fit(Breadth::Px(30.0)),
+        ];
+        let min_c = [u(10.0), u(20.0), 0, u(40.0)];
+        let max_c = [u(40.0), u(60.0), 0, u(80.0)];
+        let sizes = measure_columns(&specs, &[false; 4], &min_c, &max_c, u(10.0), 16.0);
+        // Bases only: 10 + 20 + 50 + 40, plus three gaps.
+        assert_eq!(sizes.min, Some(150.0));
+        // Growth limits and the fr size of 60px: 40 + 60 + 50 + 40 + 30.
+        assert_eq!(sizes.max, 220.0);
+        // Two fr tracks share one fr size: the larger item per fr.
+        let specs = [Spec::One(Breadth::Fr(1.0)), Spec::One(Breadth::Fr(2.0))];
+        let sizes = measure_columns(&specs, &[false; 2], &[0, 0], &[u(30.0), u(40.0)], 0, 16.0);
+        assert_eq!(sizes.min, Some(0.0));
+        assert_eq!(sizes.max, 90.0);
+    }
+
+    #[test]
     fn grid_lanes_marker_uses_the_grid_algorithm() {
         let mut lanes = grid_style(200.0, None, Some("100px"));
         lanes.display = Display::Flex;
@@ -5205,6 +6787,42 @@ mod tests {
                 (1, [0.0, 0.0, 30.0, 30.0]),
                 (2, [0.0, 0.0, 200.0, 10.0]),
             ],
+        );
+    }
+
+    /// CSS Grid §6.6: a scroll container's minimum contribution drops its
+    /// content (it keeps its padding). Chrome: 1fr tracks 20 / 80, and
+    /// `minmax(auto, 10px)` 6px (the 3px padding on each side).
+    #[test]
+    fn scroll_container_grid_item_has_no_automatic_minimum() {
+        use w3cos_std::style::Overflow;
+        let scroller = |padding: f32, width: f32| {
+            Component::boxed(
+                Style {
+                    overflow: Overflow::Hidden,
+                    padding: edges(0.0, padding, 0.0, padding),
+                    ..block_box(None, None)
+                },
+                vec![leaf(block_box(Some(width), Some(10.0)))],
+            )
+        };
+        let plain = Component::boxed(
+            block_box(None, None),
+            vec![leaf(block_box(Some(80.0), Some(10.0)))],
+        );
+        expect(
+            &Component::boxed(
+                grid_style(100.0, Some(20.0), Some("1fr 1fr")),
+                vec![scroller(0.0, 150.0), plain],
+            ),
+            &[(1, [0.0, 0.0, 20.0, 20.0]), (3, [20.0, 0.0, 80.0, 20.0])],
+        );
+        expect(
+            &Component::boxed(
+                grid_style(30.0, Some(20.0), Some("minmax(auto, 10px) 50px")),
+                vec![scroller(3.0, 40.0), leaf(block_box(None, None))],
+            ),
+            &[(1, [0.0, 0.0, 6.0, 20.0]), (3, [6.0, 0.0, 50.0, 20.0])],
         );
     }
 }

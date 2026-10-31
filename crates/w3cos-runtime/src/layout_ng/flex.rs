@@ -4,18 +4,13 @@
 //! (third_party/blink/renderer/core/layout/flex/flex_layout_algorithm.cc,
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
-//! lengths, alignment, line breaking). Baseline alignment, inline-flex,
-//! and an indefinite percentage basis stay on the legacy engine. A text run
-//! is an anonymous flex item: block text with its min-content as the
-//! automatic minimum (not under an unrecognized display such as
-//! `-webkit-box`).
-//! A single-line row aligns text-free items with a definite cross size by
-//! the border-box under edge (each item's cross margin-start plus its
-//! border box). The line grows by the largest cross margin-end hanging
-//! past that shared edge. Column baseline, wrapping baseline, automatic
-//! cross sizes, and any item that exports a real baseline (text, nested
-//! flex or grid, inline, or a replaced box) stay on legacy
-//! (`flex:baseline`).
+//! lengths, alignment, line breaking). An indefinite percentage basis
+//! stays on the legacy engine.
+//! A row aligns baseline items per line by their first baseline, or the
+//! synthesized border-box under edge (FlexLayoutAlgorithm::BaselineAscent),
+//! measured from the cross end under `wrap-reverse` (the minor group).
+//! Column baseline groups and items whose subtree NG reports no baseline
+//! for stay on legacy (`flex:baseline-column`, `flex:baseline-nested`).
 //! `wrap-reverse` swaps the cross-start (Flexbox §5.2) and packs lines
 //! from that edge. Column wrap breaks lines against a definite block size,
 //! a `max-height`, or an `aspect-ratio` transferred from a definite width.
@@ -24,11 +19,16 @@
 //! item inline size is the fit-content size against the container's inner
 //! width. A column wrap whose block size is still automatic and that has
 //! a gap stays on legacy (`flex:wrap-column`): its reference uses logical
-//! margins and a writing mode this engine does not store. A definite-height
-//! row wrap with a gap and auto-height items stays there too
-//! (`flex-wrap: balance` is unrecognized, and its wrap reference must
-//! use the same engine). An item whose fit-content size cannot be measured
-//! stays on legacy (`flex:wrap-column-auto-cross`).
+//! margins and a writing mode this engine does not store. `flex-wrap:
+//! balance` breaks the greedy line count's lines evenly
+//! (`balanced_line_ranges`). An item whose fit-content
+//! size cannot be measured stays on legacy (`flex:wrap-column-auto-cross`).
+//!
+//! A text run is an anonymous flex item laid out as block text: its flex
+//! base size is its max-content width in a row, its automatic minimum
+//! the min-content width; in a column both are its height at the used
+//! width. Its baseline is the first line's, so a wrapped baseline item
+//! (several lines) bails `flex:baseline-unknown`.
 //!
 //! A flex row the DOM lowered from an inline formatting context carries the
 //! IFC marker and is not a flex container; the block algorithm lays it out
@@ -82,10 +82,27 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("flex:contain");
     }
-    if has_marker(style, "--w3cos-internal-width-keyword")
-        && !block::intrinsic_keyword_applies(flat, index)
-    {
-        return Some("flex:width-keyword");
+    // A container sized by logical properties the cascade does not resolve
+    // (`block-size`) whose items carry `calc()` widths: gap-003/008 and
+    // their references only agree while both sides ignore both, so they
+    // stay on legacy together.
+    if style.custom_properties.as_ref().is_some_and(|props| {
+        props
+            .keys()
+            .any(|key| key.starts_with("--w3cos-internal-logical-size-"))
+    }) {
+        let end = flat[index].subtree_end.max(index + 1);
+        let mut child = index + 1;
+        while child < end {
+            let item = flat[child].style;
+            if [item.width, item.min_width, item.max_width]
+                .iter()
+                .any(|dim| matches!(dim, Dimension::Calc { .. }))
+            {
+                return Some("flex:logical-calc");
+            }
+            child = flat[child].subtree_end.max(child + 1);
+        }
     }
     // An automatic column block size is one flex line, except when a gap
     // is present. gap-003's reference spaces items with logical margins
@@ -93,7 +110,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // that reftest have to stay on legacy. `max-height` and `aspect-ratio`
     // make the main size definite enough to wrap here.
     let column_wrap = style.flex_wrap != FlexWrap::NoWrap && !row_axis(style.flex_direction);
+    // `flex-line-count` also shrinks the cross space offered to the items
+    // (Flexbox 2 §6.1); only the balancing step models its line count.
+    if flex_line_count(style) > 1 && !has_marker(style, BALANCE_MARKER) {
+        return Some("flex:line-count-available");
+    }
     if column_wrap
+        && balance_min_lines(style).is_none()
         && matches!(style.height, Dimension::Auto)
         && matches!(style.max_height, Dimension::Auto)
         && !has_marker(style, "--w3cos-internal-aspect-ratio")
@@ -103,47 +126,18 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some("flex:wrap-column");
     }
-    let definite_column_wrap = column_wrap;
-    // `flex-wrap: balance` stays on legacy (the keyword is unrecognized).
-    // Its reference is an ordinary wrap with a gap and a definite height,
-    // and legacy leaves those auto-height items at 0 while NG would
-    // stretch them to the line. Both sides of that reftest have to stay
-    // on legacy. A wrap whose items have a specified cross size, or whose
-    // container height is auto, still wraps here.
-    if style.flex_wrap == FlexWrap::Wrap
-        && row_axis(style.flex_direction)
-        && !matches!(style.height, Dimension::Auto)
-        && (style.gap > 0.0
-            || style.row_gap.unwrap_or(0.0) > 0.0
-            || style.column_gap.unwrap_or(0.0) > 0.0)
-        && rendered_children(flat, index)
-            .all(|child| matches!(flat[child].style.height, Dimension::Auto))
+    // A nowrap row aligns first baselines below. Anything else with
+    // `align-items: baseline` stays here, ahead of the later reasons.
+    let baseline = baseline_reason(flat, index);
+    if style.align_items == AlignItems::Baseline
+        && let Some(reason) = baseline
     {
-        return Some("flex:wrap-gap");
-    }
-    // A nowrap row of text-free, definite-cross-size items synthesizes
-    // baselines below. Anything else with `align-items: baseline` stays
-    // here, ahead of the later reasons, as it did before that slice.
-    let synthesized = synthesized_row_baseline(flat, index);
-    if style.align_items == AlignItems::Baseline && !synthesized {
-        return Some("flex:baseline");
+        return Some(reason);
     }
     if style.direction == TextDirection::Rtl {
         return Some("flex:rtl");
     }
-    if !matches!(
-        style.align_content,
-        AlignContent::Stretch | AlignContent::FlexStart
-    ) {
-        return Some("flex:align-content");
-    }
     let row = row_axis(style.flex_direction);
-    // Column cross alignment other than stretch (fit-content width) is
-    // still the legacy engine's for a single line. A definite column wrap
-    // already has a used cross size, so center and flex-end apply below.
-    if !row && style.align_items != AlignItems::Stretch && !definite_column_wrap {
-        return Some("flex:column-align");
-    }
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
@@ -152,35 +146,60 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.float != Float::None {
             return Some("flex:float");
         }
-        if child_style.align_self == AlignSelf::Baseline && !synthesized {
-            return Some("flex:baseline");
+        if child_style.align_self == AlignSelf::Baseline
+            && let Some(reason) = baseline
+        {
+            return Some(reason);
         }
-        // A text run is an anonymous flex item, laid out as block text
-        // (CSS Flexbox 4). A `-webkit-box`, `run-in` or other unrecognized
-        // display that computes to flex keeps its text on the legacy engine
-        // (a line-clamp reference next to a fallen-back test must use the
+        // A text run is an anonymous flex item (CSS Flexbox §4), laid out
+        // as block text (`block::node_box_reason` validates its content). A
+        // `-webkit-box`, `run-in` or other unrecognized display that
+        // computes to flex keeps its text on the legacy engine (a
+        // line-clamp reference next to a fallen-back test must use the
         // same engine).
         if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
             && has_marker(style, "--w3cos-internal-unrecognized-display")
         {
             return Some("flex:text-item");
         }
+        // A text run is an anonymous flex item (CSS Flexbox §4), laid out
+        // as block text (`block::node_box_reason` validates its content). A
+        // run of only white space is not rendered; the DOM is expected to
+        // drop it, so one that reaches layout stays on the legacy engine.
+        if let w3cos_std::ComponentKind::Text { content } = flat[child].kind
+            && content.chars().all(char::is_whitespace)
+        {
+            return Some("flex:text-space");
+        }
         if subtree_has_float(flat, child) {
             return Some("flex:float-descendant");
         }
-        // Column cross alignment other than stretch, including align-self,
-        // is still legacy for a single line (fit-content width and inline
-        // content offsets). Definite column wrap aligns in `layout_wrapped`.
-        if !row
-            && !definite_column_wrap
-            && used_align(style.align_items, child_style.align_self) != AlignItems::Stretch
-        {
-            return Some("flex:column-align-self");
-        }
         // Percentage main sizes and percentage block descendants cycle
         // through the automatic minimum. Leave those columns on legacy.
+        // A container with a definite (length) height is a basis for the
+        // item's own percentages; only a percentage further down, which
+        // resolves against the item's flexed size, still cycles.
         if !row && column_percent_size(flat, child) {
-            return Some("flex:column-percent");
+            let definite = matches!(style.height, Dimension::Px(_));
+            let blocked = if definite {
+                column_percent_descendant(flat, child)
+            } else {
+                // An indefinite container: the item's flexed size is not a
+                // percentage basis (`fixed_block_indefinite`), so descendant
+                // percentages are auto. The item's own percentages and its
+                // automatic minimum stay on legacy.
+                percent_block_size(child_style)
+                    || child_style.min_height == Dimension::Auto
+                    || super::block::is_author_flex(child_style)
+                    || super::block::is_author_grid(child_style)
+                    || matches!(
+                        child_style.display,
+                        w3cos_std::style::Display::Table | w3cos_std::style::Display::InlineTable
+                    )
+            };
+            if blocked {
+                return Some("flex:column-percent");
+            }
         }
         let (cross_start, cross_end) = cross_margin_sides(
             child_style,
@@ -202,86 +221,71 @@ fn baseline_participant(container: AlignItems, item: AlignSelf) -> bool {
     }
 }
 
-/// Definite cross size on a row: a length, or a percentage of a
-/// non-automatic container height. `height: auto` is not synthesized.
-fn row_cross_is_definite(item: &Style, container: &Style) -> bool {
-    match item.height {
-        Dimension::Auto => false,
-        Dimension::Percent(_) => !matches!(container.height, Dimension::Auto),
-        Dimension::Px(_)
-        | Dimension::Rem(_)
-        | Dimension::Em(_)
-        | Dimension::Ch(_)
-        | Dimension::Vw(_)
-        | Dimension::Vh(_) => true,
-    }
-}
-
-/// The item and every rendered descendant are block or flow-root boxes.
-/// That is the set whose synthesized baseline is the border-box under edge.
-fn block_border_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
+/// A baseline participant's subtree whose baseline NG does not export:
+/// a block-level grid container (only inline-grid reports one) or a
+/// multi-line column flex container (`layout_wrapped` reports none).
+fn unexported_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
     let end = flat[index].subtree_end.max(index + 1);
     let mut child = index;
     while child < end {
-        if flat[child].style.display == Display::None {
+        let style = flat[child].style;
+        if style.display == Display::None {
             child = flat[child].subtree_end.max(child + 1);
             continue;
         }
-        if !matches!(flat[child].kind, w3cos_std::ComponentKind::Box) {
-            return false;
+        if style.display == Display::Grid {
+            return true;
         }
-        if !matches!(
-            flat[child].style.display,
-            Display::Block | Display::FlowRoot
-        ) {
-            return false;
+        if style.display == Display::Flex
+            && style.flex_wrap != FlexWrap::NoWrap
+            && !row_axis(style.flex_direction)
+        {
+            return true;
         }
         child += 1;
     }
-    true
+    false
 }
 
-fn synthesized_row_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
+/// Why baseline alignment stays on legacy, if it does. A row aligns
+/// first baselines per line (FlexLayoutAlgorithm::BaselineAscent). Column
+/// baseline groups are not done here yet.
+/// A scroll container's flex baseline stays inside its border box, so
+/// overflowing content does not move the line (flex-baseline-overflow-hidden).
+fn clamp_scroll_baseline(style: &Style, baseline: LastBaseline, height: f32) -> LastBaseline {
+    match baseline {
+        LastBaseline::At(b) if super::block::baseline_is_margin_edge(style) => {
+            LastBaseline::At(b.clamp(0.0, height))
+        }
+        other => other,
+    }
+}
+
+fn baseline_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
-    if !row_axis(style.flex_direction) || style.flex_wrap != FlexWrap::NoWrap {
-        return false;
+    if !row_axis(style.flex_direction) {
+        return Some("flex:baseline-column");
     }
     for child in rendered_children(flat, index) {
-        let child_style = flat[child].style;
-        if !baseline_participant(style.align_items, child_style.align_self) {
-            continue;
-        }
-        if !row_cross_is_definite(child_style, style) || !block_border_baseline(flat, child) {
-            return false;
+        if baseline_participant(style.align_items, flat[child].style.align_self)
+            && unexported_baseline(flat, child)
+        {
+            return Some("flex:baseline-nested");
         }
     }
-    true
+    None
 }
 
-/// Shared border-box under edge of the baseline group, and the line's
-/// cross size contribution (that edge plus the largest hanging margin-end).
-/// `Err` when a baseline item has no definite cross size.
-fn baseline_group(items: &[Item]) -> Result<Option<(f32, f32)>, ()> {
-    let mut any = false;
-    let mut max_ascent = 0.0_f32;
-    let mut max_end = 0.0_f32;
-    for item in items {
-        if item.align != AlignItems::Baseline {
-            continue;
-        }
-        if item.cross_auto {
-            return Err(());
-        }
-        let Some(cross) = item.cross else {
-            return Err(());
-        };
-        any = true;
-        let border = cross + item.cross_edges;
-        let ascent = item.margin_cross_start + border;
-        max_ascent = max_ascent.max(ascent);
-        max_end = max_end.max(item.margin_cross_end);
-    }
-    Ok(any.then_some((max_ascent, max_ascent + max_end)))
+/// Item ascent for baseline alignment (Blink BaselineAscent): the cross
+/// start margin plus the first baseline, or the synthesized border-box
+/// under edge when the item has no line. `None` for an unknown baseline.
+fn baseline_ascent(item: &Item, laid: &LayoutResult) -> Option<f32> {
+    let baseline = match laid.first_baseline {
+        LastBaseline::At(baseline) => baseline,
+        LastBaseline::NoLines => laid.fragment.height,
+        LastBaseline::Unknown => return None,
+    };
+    Some(item.margin_cross_start + baseline)
 }
 
 fn subtree_has_float(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -318,6 +322,24 @@ fn column_percent_size(flat: &[FlatNodeInfo], index: usize) -> bool {
     false
 }
 
+/// A percentage block size on a descendant of this column item (not the
+/// item itself).
+fn column_percent_descendant(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let end = flat[index].subtree_end.max(index + 1);
+    let mut child = index + 1;
+    while child < end {
+        if flat[child].style.display == w3cos_std::style::Display::None {
+            child = flat[child].subtree_end.max(child + 1);
+            continue;
+        }
+        if percent_block_size(flat[child].style) {
+            return true;
+        }
+        child += 1;
+    }
+    false
+}
+
 fn percent_block_size(style: &Style) -> bool {
     // `flex-basis: 0%` is a definite zero (`flex: 1`), not a cyclic
     // percentage. A non-zero percentage basis or a percentage block size
@@ -327,9 +349,15 @@ fn percent_block_size(style: &Style) -> bool {
         _ => false,
     };
     basis
-        || matches!(style.height, Dimension::Percent(_))
-        || matches!(style.min_height, Dimension::Percent(_))
-        || matches!(style.max_height, Dimension::Percent(_))
+        || matches!(style.height, Dimension::Percent(_) | Dimension::Calc { .. })
+        || matches!(
+            style.min_height,
+            Dimension::Percent(_) | Dimension::Calc { .. }
+        )
+        || matches!(
+            style.max_height,
+            Dimension::Percent(_) | Dimension::Calc { .. }
+        )
 }
 
 struct Item {
@@ -393,7 +421,7 @@ fn definite(
 ) -> Option<Option<f32>> {
     match dim {
         Dimension::Auto => Some(None),
-        Dimension::Percent(_) if basis.is_none() => None,
+        Dimension::Percent(_) | Dimension::Calc { .. } if basis.is_none() => None,
         other => Some(block::resolve_length(other, basis, style, space)),
     }
 }
@@ -469,13 +497,23 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if let w3cos_std::ComponentKind::Text { content } = info.kind {
         return Some(super::inline::text_min_max(content, info.style));
     }
-    if block::is_author_flex(info.style) {
-        return intrinsic_sizes(flat, index, space);
+    // A replaced item's min- and max-content sizes are its natural size
+    // under its constraints (CSS Sizing 3 §5.1).
+    if block::is_replaced(info.kind) {
+        return block::intrinsic_sizes(flat, index, space);
     }
-    // A replaced item has no children; its content size is the replaced
-    // width, both as min-content and as max-content.
-    if let Some(size) = block::replaced_item_size(flat, index, space) {
-        return Some(MinMax::exact(size.why("flex:replaced")?.0));
+    // So are a button leaf's: its label (or nothing when empty).
+    if matches!(info.kind, w3cos_std::ComponentKind::Button { .. })
+        && rendered_children(flat, index).next().is_none()
+    {
+        return block::intrinsic_sizes(flat, index, space);
+    }
+    // A nested flex container's min/max-content sizes are its own flex
+    // algorithm's (FlexLayoutAlgorithm::ComputeMinMaxSizes): a row sums
+    // its items, it does not take the widest one. `block::intrinsic_sizes`
+    // routes the same way.
+    if block::is_author_flex(info.style) {
+        return container_min_max(flat, index, space);
     }
     let mut sizes = MinMax::exact(0.0);
     let mut any = false;
@@ -492,53 +530,652 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     Some(sizes)
 }
 
-/// Min/max-content inline size of an author flex container's content box
-/// (Blink FlexLayoutAlgorithm::ComputeMinMaxSizes). A column container is
-/// as wide as its widest item. A row adds the item contributions and the
-/// main gaps. Its min-content is that sum for one line (an item that cannot
-/// shrink contributes its max-content) and the widest item for a wrapping
-/// row, which breaks between items.
-pub(super) fn intrinsic_sizes(
+/// NGFlexLayoutAlgorithm::ComputeMinMaxSizes of the content box. A column
+/// encompasses its items' contributions. A row adds up their max-content
+/// contributions and the column gaps; its min-content size is the sum
+/// too on one line, the largest item when it wraps.
+pub(super) fn container_min_max(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
+    container_min_max_at(flat, index, space, None)
+}
+
+/// [`container_min_max`] for a container whose content block size is
+/// already known (`block`: an absolutely positioned box stretched between
+/// its insets, CSS2 10.6.4), as `height` gives it otherwise.
+pub(super) fn container_min_max_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    block: Option<f32>,
+) -> Option<MinMax> {
     let style = flat[index].style;
     let row = row_axis(style.flex_direction);
-    let wrap = style.flex_wrap != FlexWrap::NoWrap;
+    let line = match block {
+        Some(block) => Some(block),
+        None => match definite(style.height, space.percentage_block, style, space)
+            .why("flex:percent")?
+        {
+            Some(size) => {
+                if [style.padding.top, style.padding.bottom]
+                    .iter()
+                    .any(|side| matches!(side, Spacing::Percent(_) | Spacing::PaddingCalc { .. }))
+                {
+                    return super::bail("flex:intrinsic-percent-padding");
+                }
+                Some(to_content(
+                    style,
+                    item_edges(style, space, 0.0, false),
+                    size,
+                ))
+            }
+            None => None,
+        },
+    };
+    let multiline = style.flex_wrap != FlexWrap::NoWrap;
+    let column_line = if !row && multiline {
+        line.or(block::resolve_length(style.max_height, None, style, space)
+            .map(|size| to_content(style, item_edges(style, space, 0.0, false), size)))
+    } else {
+        None
+    };
     let mut sizes = MinMax::exact(0.0);
     let mut count = 0usize;
+    let mut row_maxes: Vec<f32> = Vec::new();
+    // CSS Flexbox §9.9.1: a row whose items carry a definite `flex-basis`
+    // sizes the container from the items' flex base sizes and factors.
+    let mut spec_items: Vec<SpecItem> = Vec::new();
+    let use_spec = row
+        && rendered_children(flat, index).any(|child| {
+            !oof::is_out_of_flow(flat[child].style)
+                && matches!(flat[child].style.flex_basis, Dimension::Px(_))
+        });
     for child in rendered_children(flat, index) {
-        let child_style = flat[child].style;
-        if oof::is_out_of_flow(child_style) || child_style.float != Float::None {
+        if oof::is_out_of_flow(flat[child].style) {
             continue;
         }
+        let stretched =
+            match stretched_image_main(flat, child, style, space, 0.0, line).why("flex:image")? {
+                Some(main) => Some(main),
+                None => stretched_ratio_main(flat, child, style, space, 0.0, line)
+                    .why("flex:aspect-ratio")?,
+            };
+        let item = match stretched {
+            Some(main) => {
+                let child_style = flat[child].style;
+                let margin = spacing_px(child_style, child_style.margin.left, 0.0, space)
+                    + spacing_px(child_style, child_style.margin.right, 0.0, space);
+                MinMax::exact(main + item_edges(child_style, space, 0.0, true) + margin)
+            }
+            None => block::min_max_contribution(flat, child, space).why("flex:intrinsic")?,
+        };
         count += 1;
-        let item = inline_contribution(flat, child, space).why("flex:intrinsic")?;
         if !row {
             sizes.encompass(item);
             continue;
         }
-        let item_min = if child_style.flex_shrink == 0.0 {
-            Some(item.max)
-        } else {
-            item.min
-        };
+        if use_spec {
+            spec_items.push(spec_item(flat, child, space, item, stretched.is_some())?);
+        }
+        row_maxes.push(item.max);
         sizes.max += item.max;
-        sizes.min = if wrap {
-            sizes.min.zip(item_min).map(|(a, b)| a.max(b))
-        } else {
-            sizes.min.zip(item_min).map(|(a, b)| a + b)
-        };
+        sizes.min = sizes
+            .min
+            .zip(item.min)
+            .map(|(a, b)| if multiline { a.max(b) } else { a + b });
     }
-    if row && count > 1 {
-        let gap = style.column_gap.unwrap_or(style.gap).max(0.0) * (count - 1) as f32;
-        sizes.max += gap;
-        if !wrap {
-            sizes.min = sizes.min.map(|min| min + gap);
+    if use_spec {
+        let max_sum = spec_line_sum(&spec_items, false);
+        sizes.max = max_sum;
+        if !multiline {
+            sizes.min = Some(spec_line_sum(&spec_items, true));
         }
     }
+    if row && count > 1 {
+        let gaps = style.column_gap.unwrap_or(style.gap).max(0.0) * (count - 1) as f32;
+        sizes.max += gaps;
+        if !multiline {
+            sizes.min = sizes.min.map(|min| min + gaps);
+        }
+        // A balanced row with a minimum flex line count is broken into
+        // that many lines at its max-content size.
+        if let Some(lines) = balance_min_lines(style) {
+            if use_spec {
+                return super::bail("flex:balance-intrinsic-basis");
+            }
+            let gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+            sizes.max = balanced_min_extent(&row_maxes, gap, lines);
+        }
+    }
+    if !row
+        && multiline
+        && column_line.is_none()
+        && count > 1
+        && let Some(lines) = balance_min_lines(style)
+    {
+        sizes.max = balanced_column_max_content(flat, index, space, lines)?.max(sizes.max);
+        return Some(sizes);
+    }
+    if let Some(main) = column_line
+        && count > 0
+    {
+        // A column-wrap container's max-content size is the sum of its
+        // flex lines' cross sizes, with the lines broken at its main size
+        // (or max main size); its min-content size stays the largest
+        // item contribution.
+        sizes.max = column_wrap_max_content(flat, index, space, main)?.max(sizes.max);
+    }
     Some(sizes)
+}
+
+/// One flex item as the intrinsic main size algorithm reads it (CSS
+/// Flexbox §9.9.1). Sizes are outer (margin box) except `base`, `min`,
+/// and `max`, which are content-box and share `outer_extra` with them.
+struct SpecItem {
+    min_contribution: f32,
+    max_contribution: f32,
+    base: f32,
+    min: f32,
+    max: f32,
+    outer_extra: f32,
+    grow: f32,
+    shrink: f32,
+}
+
+fn spec_item(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    space: &ConstraintSpace,
+    contribution: MinMax,
+    fixed: bool,
+) -> Option<SpecItem> {
+    let style = flat[child].style;
+    let edges = item_edges(style, space, 0.0, true);
+    let margin = spacing_px(style, style.margin.left, 0.0, space)
+        + spacing_px(style, style.margin.right, 0.0, space);
+    let outer_extra = edges + margin;
+    let max_contribution = contribution.max;
+    let min_contribution = contribution.min.unwrap_or(max_contribution);
+    if fixed {
+        // A stretched replaced item's size is already its final one.
+        let content = (max_contribution - outer_extra).max(0.0);
+        return Some(SpecItem {
+            min_contribution,
+            max_contribution,
+            base: content,
+            min: content,
+            max: content,
+            outer_extra,
+            grow: 0.0,
+            shrink: 0.0,
+        });
+    }
+    let base = flex_base(style, true, edges, None, space, flat, child, None)?;
+    let (min, max) = resolve_main_limits(style, true, edges, None, space, flat, child)?;
+    Some(SpecItem {
+        min_contribution,
+        max_contribution,
+        base: base.max(0.0),
+        min,
+        max,
+        outer_extra,
+        grow: style.flex_grow.max(0.0),
+        shrink: style.flex_shrink.max(0.0),
+    })
+}
+
+/// The line's content-based size: each item takes its flex base size plus
+/// its factor times the line's chosen flex fraction, clamped by its min and
+/// max main sizes (Flexbox §9.9.1 steps 1-5). `min_content` reads the
+/// min-content contributions instead of the max-content ones.
+fn spec_line_sum(items: &[SpecItem], min_content: bool) -> f32 {
+    let contribution = |item: &SpecItem| {
+        if min_content {
+            item.min_contribution
+        } else {
+            item.max_contribution
+        }
+    };
+    let fraction = |item: &SpecItem| {
+        let diff = contribution(item) - (item.base + item.outer_extra);
+        if diff > 0.0 {
+            if item.grow >= 1.0 {
+                diff / item.grow
+            } else {
+                diff * item.grow
+            }
+        } else if diff < 0.0 {
+            let scaled = item.shrink * item.base;
+            if scaled == 0.0 {
+                f32::NEG_INFINITY
+            } else {
+                diff / scaled
+            }
+        } else {
+            0.0
+        }
+    };
+    let mut chosen = items.iter().map(fraction).fold(f32::NEG_INFINITY, f32::max);
+    let grow_sum: f32 = items.iter().map(|item| item.grow).sum();
+    let shrink_sum: f32 = items.iter().map(|item| item.shrink).sum();
+    if chosen > 0.0 && grow_sum < 1.0 && grow_sum > 0.0 {
+        chosen /= grow_sum;
+    } else if chosen < 0.0 && chosen.is_finite() && shrink_sum < 1.0 {
+        chosen *= shrink_sum;
+    }
+    items
+        .iter()
+        .map(|item| {
+            let factor = if chosen > 0.0 {
+                item.grow
+            } else {
+                item.shrink * item.base
+            };
+            let delta = if factor == 0.0 { 0.0 } else { factor * chosen };
+            let size = (item.base + delta).min(item.max).max(item.min);
+            size + item.outer_extra
+        })
+        .sum()
+}
+
+/// The max-content inline size of a column-wrap flex container whose
+/// content block size (or max block size) is `main`: items in `order`
+/// are collected into flex lines by their hypothetical outer main sizes,
+/// each line is as wide as its widest max-content contribution, and the
+/// lines are separated by `column-gap` (CSS Flexbox §9.3 and §9.9.1).
+/// Each item's content-based flex base size is measured at its
+/// max-content contribution.
+fn column_wrap_max_content(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    main: f32,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
+    let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+    let items = column_wrap_items(flat, index, space, Some(main), None, 1)?;
+    let mut total = 0.0_f32;
+    let mut lines = 0usize;
+    let (mut line_main, mut line_cross) = (0.0_f32, 0.0_f32);
+    for (outer, cross) in items {
+        if lines > 0 && line_main + row_gap + outer > main + EPS {
+            total += line_cross;
+            (line_main, line_cross) = (outer, cross);
+            lines += 1;
+        } else if lines == 0 {
+            (line_main, line_cross) = (outer, cross);
+            lines = 1;
+        } else {
+            line_main += row_gap + outer;
+            line_cross = line_cross.max(cross);
+        }
+    }
+    total += line_cross;
+    Some(total + column_gap * lines.saturating_sub(1) as f32)
+}
+
+/// The hypothetical outer main size and the max-content cross
+/// contribution of each in-flow item of a column-wrap container, in
+/// `order`. `main` is the container's content block size when definite.
+fn column_wrap_items(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    main: Option<f32>,
+    inner_width: Option<f32>,
+    lines: usize,
+) -> Option<Vec<(f32, f32)>> {
+    let style = flat[index].style;
+    let mut children: Vec<usize> = rendered_children(flat, index)
+        .filter(|&child| !oof::is_out_of_flow(flat[child].style))
+        .collect();
+    children.sort_by_key(|&child| flat[child].style.order);
+    let mut items = Vec::with_capacity(children.len());
+    for child in children {
+        let child_style = flat[child].style;
+        let cross = block::min_max_contribution(flat, child, space)
+            .why("flex:intrinsic")?
+            .max
+            .max(0.0);
+        let main_edges = item_edges(child_style, space, 0.0, false);
+        let cross_edges = item_edges(child_style, space, 0.0, true);
+        let (start, end) = main_margin_sides(child_style, style.flex_direction);
+        let main_margins =
+            spacing_px(child_style, start, 0.0, space) + spacing_px(child_style, end, 0.0, space);
+        let (cross_start, cross_end) = cross_margin_sides(child_style, style.flex_direction, false);
+        let cross_margins = spacing_px(child_style, cross_start, 0.0, space)
+            + spacing_px(child_style, cross_end, 0.0, space);
+        let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
+            && matches!(child_style.height, Dimension::Auto);
+        let measured = if basis_auto {
+            let mut width = (cross - cross_margins - cross_edges).max(0.0);
+            // A percentage width resolves against the container's definite
+            // content width, not its max-content contribution
+            // (balance-percentage-size-001).
+            if let Some(basis) = inner_width
+                && matches!(
+                    child_style.width,
+                    Dimension::Percent(_) | Dimension::Calc { .. }
+                )
+                && let Some(size) =
+                    block::resolve_length(child_style.width, Some(basis), child_style, space)
+            {
+                width = to_content(child_style, cross_edges, size);
+            }
+            // Each of the balanced lines is measured with its share of the
+            // container, not the whole width (balance-available-size-001).
+            if let Some(basis) = inner_width
+                && lines > 1
+                && matches!(child_style.width, Dimension::Auto)
+            {
+                let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+                let share = (basis - column_gap * (lines - 1) as f32) / lines as f32;
+                width = width.min(to_content(
+                    child_style,
+                    cross_edges,
+                    (share - cross_margins).max(0.0),
+                ));
+            }
+            let laid = layout_item(flat, child, space, width, None, false, None, Some(width))?;
+            Some((laid.fragment.height - main_edges).max(0.0))
+        } else {
+            None
+        };
+        let base = flex_base(
+            child_style,
+            false,
+            main_edges,
+            main,
+            space,
+            flat,
+            child,
+            measured,
+        )
+        .why("flex:basis")?
+        .max(0.0);
+        let (min, max) =
+            resolve_main_limits(child_style, false, main_edges, main, space, flat, child)
+                .why("flex:min")?;
+        let outer = base.clamp(min, max.max(min)) + main_edges + main_margins;
+        items.push((outer, cross));
+    }
+    Some(items)
+}
+
+/// The balancing line count of a `flex-wrap: balance` container whose
+/// `flex-line-count` exceeds one: the lines its content-based size is
+/// split into (Flexbox 2 §6.1).
+fn balance_min_lines(style: &Style) -> Option<usize> {
+    if has_marker(style, BALANCE_MARKER) {
+        Some(flex_line_count(style)).filter(|&lines| lines > 1)
+    } else {
+        None
+    }
+}
+
+/// The items' outer main sizes (floored at zero) split into at most
+/// `lines` contiguous lines, minimizing the largest line (items and
+/// gaps). Ties prefer more items on the first line, then the second, ...
+fn min_max_partition(sizes: &[f32], gap: f32, lines: usize) -> Vec<(usize, usize)> {
+    let count = sizes.len();
+    let lines = lines.min(count);
+    if lines == 0 {
+        return Vec::new();
+    }
+    let seg = |start: usize, end: usize| -> f64 {
+        sizes[start..end]
+            .iter()
+            .map(|size| f64::from(size.max(0.0)))
+            .sum::<f64>()
+            + f64::from(gap) * (end - start - 1) as f64
+    };
+    let mut best = vec![vec![f64::INFINITY; count + 1]; lines + 1];
+    best[0][count] = 0.0;
+    for k in 1..=lines {
+        for start in 0..count {
+            for end in start + 1..=count {
+                let value = seg(start, end).max(best[k - 1][end]);
+                if value < best[k][start] {
+                    best[k][start] = value;
+                }
+            }
+        }
+    }
+    let mut ranges = Vec::with_capacity(lines);
+    let mut start = 0;
+    for k in (1..=lines).rev() {
+        let target = best[k][start];
+        let mut chosen = start + 1;
+        for end in (start + 1..=count).rev() {
+            if seg(start, end).max(best[k - 1][end]) <= target + 1e-4 {
+                chosen = end;
+                break;
+            }
+        }
+        ranges.push((start, chosen));
+        start = chosen;
+    }
+    ranges
+}
+
+/// The largest line of [`min_max_partition`].
+fn balanced_min_extent(sizes: &[f32], gap: f32, lines: usize) -> f32 {
+    min_max_partition(sizes, gap, lines)
+        .iter()
+        .map(|&(start, end)| {
+            sizes[start..end].iter().map(|s| s.max(0.0)).sum::<f32>()
+                + gap * (end - start - 1) as f32
+        })
+        .fold(0.0, f32::max)
+}
+
+/// The content block size of an automatic-height `flex-wrap: balance`
+/// column with `flex-line-count` above one: the largest line of the
+/// minimum-largest-line partition of its items.
+fn balanced_column_extent(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    lines: usize,
+    inner_width: f32,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
+    let items = column_wrap_items(flat, index, space, None, Some(inner_width), lines)?;
+    let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
+    Some(balanced_min_extent(&outers, row_gap, lines))
+}
+
+/// The max-content inline size of an automatic-height balanced column:
+/// the cross sizes of the lines of the minimum-largest-line partition.
+fn balanced_column_max_content(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    lines: usize,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
+    let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+    let items = column_wrap_items(flat, index, space, None, None, 1)?;
+    let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
+    let ranges = min_max_partition(&outers, row_gap, lines);
+    let total: f32 = ranges
+        .iter()
+        .map(|&(start, end)| items[start..end].iter().map(|i| i.1).fold(0.0, f32::max))
+        .sum();
+    Some(total + column_gap * ranges.len().saturating_sub(1) as f32)
+}
+
+/// The content-box inline size of an image row item in a single-line
+/// container whose content block size `line` is definite, when the item
+/// is stretched: its definite cross size is the line's (CSS Flexbox §9.8
+/// item 1) and transfers through the aspect ratio. `Some(None)` when the
+/// item is not such an image. Blink builds the intrinsic space with
+/// `kStretchExplicit` for the same items (BuildSpaceForIntrinsicInlineSize).
+fn stretched_image_main(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    if !matches!(flat[child].style.width, Dimension::Auto) {
+        return Some(None);
+    }
+    match stretched_image_cross(flat, child, container, space, inner_width, line)? {
+        Some(stretched) => block::replaced_inline_at_block(flat, child, space, stretched).map(Some),
+        None => Some(None),
+    }
+}
+
+/// The definite stretched content block size of an image row item in a
+/// single-line container whose content block size `line` is definite
+/// (CSS Flexbox §9.8 item 1), whatever its own `width`. `Some(None)` when
+/// the item is not such an image.
+fn stretched_image_cross(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    if !block::is_replaced(flat[child].kind) {
+        return Some(None);
+    }
+    stretched_row_cross(flat, child, container, space, inner_width, line)
+}
+
+/// The content inline size of a non-replaced row item with a preferred
+/// aspect ratio and auto width and height, stretched in a single line
+/// whose content block size `line` is definite: the stretched block size
+/// transfers through the ratio (CSS Flexbox §9.8 item 1; Blink
+/// ComputeMinMaxInlineSizesFromAspectRatio), floored by its min-content
+/// width when its automatic minimum applies. `Some(None)` when the item
+/// is not such a box (aspect-ratio-intrinsic-size-005).
+fn stretched_ratio_main(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    let style = flat[child].style;
+    if block::is_replaced(flat[child].kind)
+        || !matches!(style.width, Dimension::Auto)
+        || block::marker(style, block::WIDTH_KEYWORD).is_some()
+    {
+        return Some(None);
+    }
+    let Some(ratio) = block::BoxAspectRatio::new(
+        style,
+        item_edges(style, space, inner_width, true),
+        item_edges(style, space, inner_width, false),
+    ) else {
+        return Some(None);
+    };
+    let Some(stretched) = stretched_row_cross(flat, child, container, space, inner_width, line)?
+    else {
+        return Some(None);
+    };
+    let mut inline = ratio.inline_from_block(stretched);
+    if matches!(style.min_width, Dimension::Auto) && !block::computed_scrolls_in_axis(style, true) {
+        let content = content_minmax(flat, child, space).why("flex:intrinsic")?;
+        inline = inline.max(content.min.unwrap_or(content.max));
+    }
+    Some(Some(inline))
+}
+
+/// The definite stretched content block size of a row item in a
+/// single-line container whose content block size `line` is definite
+/// (CSS Flexbox §9.8 item 1). `Some(None)` when it is not stretched.
+fn stretched_row_cross(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    let style = flat[child].style;
+    let (start, end) = cross_margin_sides(style, container.flex_direction, false);
+    let Some(line) = line else {
+        return Some(None);
+    };
+    if !row_axis(container.flex_direction)
+        || container.flex_wrap != FlexWrap::NoWrap
+        || !matches!(style.height, Dimension::Auto)
+        || used_align(container.align_items, style.align_self) != AlignItems::Stretch
+        || matches!(start, Spacing::Auto)
+        || matches!(end, Spacing::Auto)
+    {
+        return Some(None);
+    }
+    let edges = item_edges(style, space, inner_width, false);
+    let margins =
+        spacing_px(style, start, inner_width, space) + spacing_px(style, end, inner_width, space);
+    let stretched = clamp_cross(
+        style,
+        true,
+        edges,
+        line - margins - edges,
+        Some(line),
+        space,
+    )
+    .why("flex:cross")?;
+    Some(Some(stretched))
+}
+
+/// The max-content inline size of a column-wrap flex item stretched in a
+/// single-line row container with a definite cross size: its flex lines
+/// break at that stretched block size (CSS Flexbox §9.8 treats it as
+/// definite), as in Chrome (col-wrap-009).
+fn stretched_column_wrap_max(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    container: &Style,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    line: Option<f32>,
+) -> Option<Option<f32>> {
+    let style = flat[child].style;
+    let (start, end) = cross_margin_sides(style, container.flex_direction, false);
+    let Some(line) = line else {
+        return Some(None);
+    };
+    if !row_axis(container.flex_direction)
+        || container.flex_wrap != FlexWrap::NoWrap
+        || !block::is_author_flex(style)
+        || row_axis(style.flex_direction)
+        || style.flex_wrap == FlexWrap::NoWrap
+        || !matches!(style.flex_basis, Dimension::Auto)
+        || !matches!(style.width, Dimension::Auto)
+        || !matches!(style.height, Dimension::Auto)
+        || used_align(container.align_items, style.align_self) != AlignItems::Stretch
+        || matches!(start, Spacing::Auto)
+        || matches!(end, Spacing::Auto)
+    {
+        return Some(None);
+    }
+    let edges = item_edges(style, space, inner_width, false);
+    let margins =
+        spacing_px(style, start, inner_width, space) + spacing_px(style, end, inner_width, space);
+    let stretched = clamp_cross(
+        style,
+        true,
+        edges,
+        line - margins - edges,
+        Some(line),
+        space,
+    )
+    .why("flex:cross")?;
+    container_min_max_at(flat, child, space, Some(stretched)).map(|sizes| Some(sizes.max))
 }
 
 /// Fit-content inline size of a column item (CSS Sizing 3 §5.2.1):
@@ -574,6 +1211,60 @@ fn column_aspect_main(style: &Style, content_width: f32) -> Option<f32> {
     Some((content_width / ratio).max(0.0))
 }
 
+/// Main-size limits of a column item after its intrinsic `min-height` /
+/// `max-height` keywords, which resolve to its auto-height content block
+/// size (all three keywords mean that in the block axis). The max is
+/// applied first and the min wins. When the item has a non-auto height
+/// (its content size would need a separate layout), the limits are kept.
+#[allow(clippy::too_many_arguments)]
+fn column_keyword_limits(
+    flat: &[FlatNodeInfo],
+    child: usize,
+    row: bool,
+    space: &ConstraintSpace,
+    inner_width: f32,
+    specified_height: Option<f32>,
+    cross: Option<f32>,
+    measured: Option<f32>,
+    (min, max): (f32, f32),
+) -> Option<(f32, f32)> {
+    let style = flat[child].style;
+    let min_kw = block::marker(style, block::MIN_HEIGHT_KEYWORD).is_some();
+    let max_kw = block::marker(style, block::MAX_HEIGHT_KEYWORD).is_some();
+    if row || block::is_replaced(flat[child].kind) || !(min_kw || max_kw) {
+        return Some((min, max));
+    }
+    if !matches!(style.height, Dimension::Auto) {
+        return Some((min, max));
+    }
+    let content = match measured {
+        Some(height) => height,
+        None => {
+            let laid = layout_item(
+                flat,
+                child,
+                space,
+                inner_width,
+                specified_height,
+                false,
+                None,
+                cross,
+            )?;
+            let edges = item_edges(style, space, inner_width, false);
+            (laid.fragment.height - edges).max(0.0)
+        }
+    };
+    let mut limits = (min, max);
+    if max_kw {
+        limits.1 = limits.1.min(content);
+    }
+    if min_kw {
+        limits.0 = limits.0.max(content);
+    }
+    limits.1 = limits.1.max(limits.0);
+    Some(limits)
+}
+
 /// Margin-box inline contribution of one in-flow child.
 fn inline_contribution(
     flat: &[FlatNodeInfo],
@@ -581,6 +1272,19 @@ fn inline_contribution(
     space: &ConstraintSpace,
 ) -> Option<MinMax> {
     let style = flat[index].style;
+    // Intrinsic width keywords (and min-/max-width keywords) clamp the
+    // contribution; the block contribution resolves them
+    // (flex-item-content-is-min-width-max-content).
+    if [
+        block::WIDTH_KEYWORD,
+        block::MIN_WIDTH_KEYWORD,
+        block::MAX_WIDTH_KEYWORD,
+    ]
+    .iter()
+    .any(|name| block::marker(style, name).is_some())
+    {
+        return block::min_max_contribution(flat, index, space);
+    }
     let border = block::border_widths(style);
     let pad = |spacing| spacing_px(style, spacing, 0.0, space);
     let edges = border[1] + border[3] + pad(style.padding.left) + pad(style.padding.right);
@@ -624,16 +1328,30 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
         let line = info.style.font_size * info.style.line_height.max(1.0);
         return Some(line.max(0.0));
     }
-    // A replaced item's min-content block size is its used replaced height.
-    if let Some(size) = block::replaced_item_size(flat, index, space) {
-        return Some(size?.1);
+    if block::is_replaced(info.kind) {
+        // Natural block size; a column item's is transferred from its used
+        // width in `layout`.
+        let laid = block::layout_block_sized(flat, index, space, false, None).why("flex:image")?;
+        let border = block::border_widths(info.style);
+        let pad = |spacing| spacing_px(info.style, spacing, 0.0, space);
+        let edges =
+            border[0] + border[2] + pad(info.style.padding.top) + pad(info.style.padding.bottom);
+        return Some((laid.fragment.height - edges).max(0.0));
     }
     let mut sum = 0.0;
+    // Adjacent inline text nodes share a line (`XXX` followed by a
+    // whitespace node is one line, not two).
+    let mut after_inline_text = false;
     for child in rendered_children(flat, index) {
         if oof::is_out_of_flow(flat[child].style) || flat[child].style.float != Float::None {
             continue;
         }
-        sum += block_contribution(flat, child, space).why("flex:block-min")?;
+        let inline_text = matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
+            && flat[child].style.display == Display::Inline;
+        if !(inline_text && after_inline_text) {
+            sum += block_contribution(flat, child, space).why("flex:block-min")?;
+        }
+        after_inline_text = inline_text;
     }
     Some(sum.max(0.0))
 }
@@ -648,6 +1366,18 @@ fn block_contribution(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpa
     let inner = match definite(style.height, None, style, space).why("flex:percent")? {
         Some(size) => to_content(style, edges, size),
         None => block_content_min(flat, index, space).why("flex:block-min")?,
+    };
+    // A length `min-height` / `max-height` bounds the box's block size
+    // (flex-minimum-height-flex-items-019).
+    let inner = if let Dimension::Px(min) = style.min_height {
+        inner.max(to_content(style, edges, min))
+    } else {
+        inner
+    };
+    let inner = if let Dimension::Px(max) = style.max_height {
+        inner.min(to_content(style, edges, max))
+    } else {
+        inner
     };
     Some((inner + edges + margin).max(0.0))
 }
@@ -666,8 +1396,39 @@ fn resolve_main_limits(
     } else {
         (style.min_height, style.max_height, style.height)
     };
-    let min = if matches!(min_dim, Dimension::Auto) {
-        let content_min = if row {
+    let min = if matches!(min_dim, Dimension::Auto) && block::computed_scrolls_in_axis(style, row) {
+        // CSS Flexbox §4.5: the automatic minimum size applies only to items
+        // that are not scroll containers; for those `min-*: auto` is 0
+        // (FlexLayoutAlgorithm::ShouldApplyMinSizeAutoForChild).
+        0.0
+    } else if matches!(min_dim, Dimension::Auto) {
+        let (main_dim, cross_dim) = if row {
+            (style.width, style.height)
+        } else {
+            (style.height, style.width)
+        };
+        let natural_replaced = matches!(
+            flat[index].kind,
+            w3cos_std::ComponentKind::Image { .. }
+                | w3cos_std::ComponentKind::Canvas { .. }
+                | w3cos_std::ComponentKind::SvgDocument { .. }
+        ) && !matches!(main_dim, Dimension::Auto)
+            && !matches!(cross_dim, Dimension::Percent(_) | Dimension::Calc { .. });
+        let content_min = if natural_replaced {
+            // A replaced item's min-content size is its natural size (its
+            // own main size read as auto), with a definite cross size
+            // transferred through its aspect ratio; the specified size
+            // suggestion caps it below (flexbox-min-width-auto-002a,
+            // flexbox-min-height-auto-002a).
+            let mut natural = style.clone();
+            if row {
+                natural.width = Dimension::Auto;
+            } else {
+                natural.height = Dimension::Auto;
+            }
+            let size = block::replaced_size(flat[index].kind, &natural, space)?;
+            if row { size.0 } else { size.1 }
+        } else if row {
             let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
             content.min.unwrap_or(content.max)
         } else if block::size_contained(style) {
@@ -676,9 +1437,15 @@ fn resolve_main_limits(
             block_content_min(flat, index, space).why("flex:block-min")?
         }
         .max(0.0);
-        match definite(specified, inner, style, space).why("flex:percent")? {
+        let suggestion = match definite(specified, inner, style, space).why("flex:percent")? {
             Some(size) => content_min.min(to_content(style, edges, size)),
             None => content_min,
+        };
+        // The content-based minimum size is further clamped by a definite
+        // max main size (CSS Flexbox §4.5; flexbox-min-width-auto-001).
+        match definite(max_dim, inner, style, space).why("flex:percent")? {
+            Some(size) => suggestion.min(to_content(style, edges, size)),
+            None => suggestion,
         }
     } else {
         match definite(min_dim, inner, style, space).why("flex:percent")? {
@@ -708,7 +1475,14 @@ fn flex_base(
         Dimension::Auto => property,
         other => other,
     };
-    match definite(basis, inner, style, space).why("flex:percent")? {
+    // A percentage flex-basis against an indefinite container main size
+    // behaves as `content` (css-flexbox §7.2.1; percentage-heights-017).
+    let resolved = if !row && inner.is_none() && matches!(basis, Dimension::Percent(_)) {
+        Some(None)
+    } else {
+        definite(basis, inner, style, space)
+    };
+    match resolved.why("flex:percent")? {
         Some(size) => Some(to_content(style, edges, size)),
         None => {
             if row {
@@ -857,6 +1631,32 @@ fn snap_to_inner(items: &mut [Item], inner: f32, gap_sum: f32) {
     items[last].content = unit((inner - used - edges).max(items[last].min));
 }
 
+/// Leading offset and extra space between lines for `align-content`.
+/// Stretch has already grown the lines; negative free space makes the
+/// distributed values fall back to flex-start (space-between) or center.
+fn align_lines(kind: AlignContent, free: f32, count: usize) -> (f32, f32) {
+    let n = count.max(1) as f32;
+    match kind {
+        AlignContent::FlexStart | AlignContent::Stretch => (0.0, 0.0),
+        AlignContent::FlexEnd => (free, 0.0),
+        AlignContent::Center => (free / 2.0, 0.0),
+        AlignContent::SpaceBetween if free > 0.0 && count > 1 => (0.0, free / (n - 1.0)),
+        AlignContent::SpaceBetween => (0.0, 0.0),
+        AlignContent::SpaceAround if free > 0.0 => (free / n / 2.0, free / n),
+        AlignContent::SpaceEvenly if free > 0.0 => (free / (n + 1.0), free / (n + 1.0)),
+        AlignContent::SpaceAround | AlignContent::SpaceEvenly => (free / 2.0, 0.0),
+    }
+}
+
+/// `justify-content: safe <position>`.
+fn safe_justify(style: &Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get("--w3cos-internal-justify-content"))
+        .is_some_and(|value| value.split_ascii_whitespace().any(|token| token == "safe"))
+}
+
 fn justify(kind: JustifyContent, free: f32, count: usize) -> (f32, f32) {
     if count == 0 {
         return (0.0, 0.0);
@@ -892,6 +1692,35 @@ fn justify(kind: JustifyContent, free: f32, count: usize) -> (f32, f32) {
     }
 }
 
+/// A text run is an anonymous block flex item (CSS Flexbox §4) whose line
+/// box sits at its top, however far the item stretches or flexes. The run
+/// has no box of its own, so the node takes the rect paint reads for a
+/// paragraph leaf (`inline::paragraph_box`): the font content box of a
+/// single line, else its lines from the upper leading.
+fn text_item_paint_box(
+    flat: &[FlatNodeInfo],
+    item: usize,
+    container: usize,
+    fragment: BoxFragment,
+) -> (f32, BoxFragment) {
+    let style = flat[item].style;
+    let w3cos_std::ComponentKind::Text { content } = flat[item].kind else {
+        return (0.0, fragment);
+    };
+    if style.display != Display::Inline {
+        // An element lowered to a text leaf keeps its own box.
+        return (0.0, fragment);
+    }
+    let (_, _, _, y, height) = super::inline::paragraph_box(
+        content,
+        fragment.width,
+        style,
+        flat[container].style,
+        super::inline::quirks_mode(flat),
+    );
+    (y, BoxFragment { height, ..fragment })
+}
+
 fn layout_item(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -905,6 +1734,19 @@ fn layout_item(
     let mut nested = *space;
     nested.available_inline = container_inner_width;
     nested.percentage_block = container_inner_height;
+    // Blink `IsFixedBlockSizeIndefinite`: a column item's flexed size is not
+    // a percentage basis when the container height is indefinite, unless the
+    // size is definite without layout: a fully inflexible item with a length
+    // basis (percentage-heights-007), or one whose height transfers from an
+    // aspect ratio (flex-aspect-ratio-032).
+    let style = flat[index].style;
+    let inflexible_length = style.flex_grow <= 0.0
+        && style.flex_shrink <= 0.0
+        && matches!(style.flex_basis, Dimension::Px(_));
+    nested.fixed_block_indefinite = !row
+        && container_inner_height.is_none()
+        && !inflexible_length
+        && !has_marker(style, "--w3cos-internal-aspect-ratio");
     nested.rtl = false;
     nested.bfc_x = 0.0;
     nested.bfc_y = 0.0;
@@ -914,33 +1756,7 @@ fn layout_item(
     } else {
         (cross.why("flex:cross")?, main)
     };
-    let mut laid = block::layout_block_sized(flat, index, &nested, false, Some((width, height)))
-        .why("flex:item")?;
-    // An anonymous text run paints its glyphs from the top of its rect (an
-    // inline leaf has no half-leading of its own), while an IFC places them
-    // on the line's baseline. Give a single-line run the font-content-box
-    // fragment its line box would have; a wrapped or bidi run that paint
-    // would misplace stays on the legacy engine.
-    if let w3cos_std::ComponentKind::Text { content } = flat[index].kind {
-        let style = flat[index].style;
-        if style.display == w3cos_std::style::Display::Inline {
-            let border = block::border_widths(style);
-            let pad = |spacing| spacing_px(style, spacing, 0.0, space);
-            let edges = border[1] + border[3] + pad(style.padding.left) + pad(style.padding.right);
-            let content_width = (laid.fragment.width - edges).max(0.0);
-            if !super::table::append_text_leaf_line(
-                &mut laid,
-                style,
-                content,
-                content_width,
-                &nested,
-            ) && !super::inline::leaf_paints_like_ifc(content, style)
-            {
-                return super::bail("flex:text-leading");
-            }
-        }
-    }
-    Some(laid)
+    block::layout_block_sized(flat, index, &nested, false, Some((width, height))).why("flex:item")
 }
 
 /// Lay out one nowrap flex container. `sized` is the content box a float,
@@ -955,6 +1771,11 @@ pub(super) fn layout(
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
         metrics.content_width = width;
+    } else {
+        // Intrinsic `width` / `min-width` / `max-width` keywords resolve
+        // against the container's own min/max-content sizes
+        // (container_min_max_at), as for a block.
+        metrics = block::apply_width_keywords(flat, index, space, metrics)?;
     }
     let direction = style.flex_direction;
     let row = row_axis(direction);
@@ -987,6 +1808,13 @@ pub(super) fn layout(
     {
         specified_height = Some(max_main.map(|max| aspect.min(max)).unwrap_or(aspect));
     }
+    let max_main = match (max_main, balance_min_lines(style)) {
+        (None, Some(lines)) if column_wrap && specified_height.is_none() => Some(
+            balanced_column_extent(flat, index, space, lines, inner_width)
+                .why("flex:balance-extent")?,
+        ),
+        (max_main, _) => max_main,
+    };
     let (inner_main, main_is_max) = if row {
         (Some(inner_width), false)
     } else if let Some(height) = specified_height {
@@ -1002,6 +1830,22 @@ pub(super) fn layout(
         style.row_gap.unwrap_or(style.gap)
     }
     .max(0.0);
+
+    // CSS Sizing 4 stretch-fit sizing: an item's `stretch` sizes resolve
+    // against this container's content box (as for block children).
+    let item_space = ConstraintSpace {
+        available_inline: inner_width,
+        percentage_block: specified_height,
+        ..*space
+    };
+    let stretch_styles = block::stretch_child_styles(flat, index, &item_space, false, false);
+    let stretched_flat;
+    let flat = if stretch_styles.is_empty() {
+        flat
+    } else {
+        stretched_flat = block::flat_with_styles(flat, &stretch_styles);
+        &stretched_flat[..]
+    };
 
     let mut items = Vec::new();
     for child in rendered_children(flat, index) {
@@ -1047,7 +1891,20 @@ pub(super) fn layout(
         let cross_auto = matches!(cross_dim, Dimension::Auto);
         let mut cross =
             match definite(cross_dim, cross_basis, child_style, space).why("flex:percent")? {
-                Some(size) => Some(to_content(child_style, cross_edges, size)),
+                // The used cross size honors the cross min/max sizes
+                // (Blink ComputeInlineSizeForFragment / ComputeBlockSize
+                // clamp a fixed size too).
+                Some(size) => Some(
+                    clamp_cross(
+                        child_style,
+                        row,
+                        cross_edges,
+                        to_content(child_style, cross_edges, size),
+                        cross_basis,
+                        space,
+                    )
+                    .why("flex:cross")?,
+                ),
                 None => None,
             };
         // A column item's cross size is its width. Nowrap stretch uses the
@@ -1056,18 +1913,35 @@ pub(super) fn layout(
         // the item after align-content grows the line.
         if !row && cross.is_none() {
             let align = used_align(style.align_items, child_style.align_self);
-            let available =
+            let mut available =
                 (inner_width - margin_cross_start - margin_cross_end - cross_edges).max(0.0);
-            let raw = if column_wrap {
+            // A balanced container with several lines measures each item
+            // with its line's share of the width
+            // (balance-available-size-001).
+            if column_wrap && let Some(lines) = balance_min_lines(style) {
+                let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+                let share = (inner_width - column_gap * (lines - 1) as f32) / lines as f32;
+                available = available
+                    .min((share - margin_cross_start - margin_cross_end - cross_edges).max(0.0));
+            }
+            // A single-line item that does not stretch is fit-content too
+            // (CSS Flexbox §9.4 hypothetical cross size).
+            // A replaced item sizes as a replaced box in the line's inline
+            // size, so a ratio-only image fills it (CSS 2.1 §10.3.2).
+            let raw = if !column_wrap
+                && align != AlignItems::Stretch
+                && block::is_replaced(flat[child].kind)
+            {
+                let line = ConstraintSpace {
+                    available_inline: available,
+                    ..*space
+                };
+                block::replaced_size(flat[child].kind, child_style, &line)?.0
+            } else if column_wrap || align != AlignItems::Stretch {
                 fit_content_size(flat, child, space, available)
                     .why("flex:wrap-column-auto-cross")?
-            } else if align == AlignItems::Stretch {
-                available
             } else {
-                content_minmax(flat, child, space)
-                    .why("flex:intrinsic")?
-                    .max
-                    .max(0.0)
+                available
             };
             cross = Some(
                 clamp_cross(
@@ -1098,8 +1972,11 @@ pub(super) fn layout(
                 None => None,
             };
         }
-        let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
-            && matches!(child_style.height, Dimension::Auto);
+        let basis_auto = (matches!(child_style.flex_basis, Dimension::Auto)
+            && matches!(child_style.height, Dimension::Auto))
+            // A percentage basis with an indefinite main size is `content`.
+            || (inner_main.is_none()
+                && matches!(child_style.flex_basis, Dimension::Percent(_)));
         let measured = if !row && basis_auto {
             let laid = layout_item(
                 flat,
@@ -1115,6 +1992,28 @@ pub(super) fn layout(
         } else {
             None
         };
+        // A column text item's min-content block size is its laid-out
+        // height at its used width, not one line (the anonymous block's
+        // content size, FlexLayoutAlgorithm::ComputeMinMainSize).
+        // A replaced column item's content size suggestion is its block
+        // size transferred from its used width through the aspect ratio,
+        // capped by its max main size (CSS Flexbox §4.5).
+        let min = match (flat[child].kind, measured) {
+            (w3cos_std::ComponentKind::Text { .. }, Some(height))
+                if !row && matches!(child_style.min_height, Dimension::Auto) =>
+            {
+                min.max(height)
+            }
+            (kind, Some(height))
+                if block::is_replaced(kind)
+                    && !row
+                    && matches!(child_style.min_height, Dimension::Auto)
+                    && !block::computed_scrolls_in_axis(child_style, false) =>
+            {
+                height.min(max)
+            }
+            _ => min,
+        };
         let base = flex_base(
             child_style,
             row,
@@ -1127,53 +2026,79 @@ pub(super) fn layout(
         )
         .why("flex:basis")?;
         let mut base = base.max(0.0);
+        // A replaced row item stretched in a single line with a definite
+        // cross size has that definite cross size (CSS Flexbox §9.8), so its
+        // content-based flex base size and its content size suggestion are
+        // transferred from it through the aspect ratio (§9.2.3 B, §4.5).
         let mut min = min;
-        // A replaced item stretched on its cross axis (auto size, nowrap)
-        // has a definite cross size, so its main size is transferred
-        // through the intrinsic ratio (CSS Flexbox 9.8.2, Sizing 4 5.1);
-        // the automatic minimum is that transferred size.
-        if block::is_replaced_item(flat, child)
-            && style.flex_wrap == FlexWrap::NoWrap
-            && matches!(child_style.height, Dimension::Auto)
-            && matches!(child_style.min_height, Dimension::Auto)
-            && matches!(child_style.max_height, Dimension::Auto)
-            && matches!(child_style.flex_basis, Dimension::Auto)
+        if let Some(transferred) =
+            stretched_ratio_main(flat, child, style, space, inner_width, specified_height)
+                .why("flex:aspect-ratio")?
         {
-            let stretched = used_align(style.align_items, child_style.align_self)
-                == AlignItems::Stretch
-                && matches!(child_style.width, Dimension::Auto)
-                && matches!(child_style.min_width, Dimension::Auto);
-            if let Some((w, h)) = block::replaced_intrinsic_size(flat, child, space)
-                && w > 0.0
-                && h > 0.0
+            if matches!(child_style.flex_basis, Dimension::Auto) {
+                base = transferred;
+            }
+            if matches!(child_style.min_width, Dimension::Auto)
+                && !block::computed_scrolls_in_axis(child_style, true)
             {
-                let cross_definite = if row {
-                    // Row: only a stretched auto-size item takes the
-                    // container's definite height through the ratio.
-                    if stretched
-                        && matches!(child_style.width, Dimension::Auto)
-                        && matches!(child_style.min_width, Dimension::Auto)
-                    {
-                        specified_height.map(|height| {
-                            (height - margin_cross_start - margin_cross_end - cross_edges).max(0.0)
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    cross
+                min = transferred.min(max);
+            }
+        } else if let Some(transferred) =
+            stretched_image_main(flat, child, style, space, inner_width, specified_height)
+                .why("flex:image")?
+        {
+            if matches!(child_style.flex_basis, Dimension::Auto) {
+                base = transferred;
+            }
+            if matches!(child_style.min_width, Dimension::Auto)
+                && !block::computed_scrolls_in_axis(child_style, true)
+            {
+                min = transferred.min(max);
+            }
+        } else if matches!(child_style.min_width, Dimension::Auto)
+            && !block::computed_scrolls_in_axis(child_style, true)
+        {
+            // With a specified width the content size suggestion is still
+            // the image's min-content width at the stretched height, and
+            // the specified size suggestion caps it (§4.5).
+            if let Some(stretched) =
+                stretched_image_cross(flat, child, style, space, inner_width, specified_height)
+                    .why("flex:image")?
+            {
+                let content =
+                    block::replaced_content_inline_at_block(flat, child, space, stretched)
+                        .why("flex:image")?;
+                let specified = match definite(child_style.width, inner_main, child_style, space)
+                    .why("flex:percent")?
+                {
+                    Some(size) => content.min(to_content(child_style, main_edges, size)),
+                    None => content,
                 };
-                if let Some(cross_size) = cross_definite {
-                    let used = if row {
-                        w * cross_size / h
-                    } else {
-                        h * cross_size / w
-                    };
-                    base = used;
-                    min = min.max(used.min(max));
-                }
+                min = specified.min(max);
             }
         }
+        if let Some(stretched) =
+            stretched_column_wrap_max(flat, child, style, space, inner_width, specified_height)
+                .why("flex:column-wrap-item")?
+        {
+            base = stretched;
+        }
+        // Intrinsic min/max-height keywords on a column item are its
+        // content block size at its used width (css-sizing-3): the max
+        // caps, the min floors its main size
+        // (flex-item-max-height-min-content).
+        let (min, max) = column_keyword_limits(
+            flat,
+            child,
+            row,
+            space,
+            inner_width,
+            specified_height,
+            cross,
+            measured,
+            (min, max),
+        )
+        .why("flex:keyword-limit")?;
         items.push(Item {
             index: child,
             order: child_style.order,
@@ -1262,25 +2187,55 @@ pub(super) fn layout(
         .iter()
         .map(|item| item.margin_box_cross())
         .fold(0.0_f32, f32::max);
-    let mut line_inner = if style.align_content == AlignContent::Stretch {
-        content_cross_definite.unwrap_or(max_margin_box)
+    // A nowrap container's single line fills a definite cross size
+    // whatever align-content says (CSS Flexbox §9.4 step 15). An automatic
+    // wrap column takes this path too; there only stretch and flex-start
+    // are handled.
+    let nowrap = style.flex_wrap == FlexWrap::NoWrap;
+    if !nowrap
+        && !matches!(
+            style.align_content,
+            AlignContent::Stretch | AlignContent::FlexStart
+        )
+    {
+        return super::bail("flex:align-content");
+    }
+    let definite_line = if nowrap || style.align_content == AlignContent::Stretch {
+        content_cross_definite
     } else {
-        max_margin_box
+        None
     };
-    // Baseline participants share a border-box under edge. A shorter item's
-    // cross margin-end hangs below that edge and can make the line taller
-    // than any single margin box. A definite stretched line is not shrunk.
-    let max_ascent = match baseline_group(&items) {
-        Err(()) => return super::bail("flex:baseline"),
-        Ok(Some((ascent, extent))) => {
-            if !row {
-                return super::bail("flex:baseline");
-            }
-            line_inner = line_inner.max(extent);
-            ascent
+    // Baseline participants (FlexLayoutAlgorithm::BuildFlexLines): the
+    // line's baseline size is the largest ascent plus the largest descent,
+    // unless the single line has a definite cross size.
+    let mut ascents = vec![None; items.len()];
+    let mut max_ascent = None::<f32>;
+    let mut max_descent = 0.0_f32;
+    for (slot, item) in ascents.iter_mut().zip(&items) {
+        if item.align != AlignItems::Baseline {
+            continue;
         }
-        Ok(None) => 0.0,
-    };
+        if !row {
+            return super::bail("flex:baseline-column");
+        }
+        let laid = layout_item(
+            flat,
+            item.index,
+            space,
+            inner_width,
+            specified_height,
+            true,
+            Some(item.content),
+            item.cross,
+        )?;
+        let ascent = baseline_ascent(item, &laid).why("flex:baseline-unknown")?;
+        let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
+        *slot = Some(ascent);
+        max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
+        max_descent = max_descent.max(margin_box - ascent);
+    }
+    let baseline_extent = max_ascent.map_or(0.0, |ascent| ascent + max_descent);
+    let line_inner = definite_line.unwrap_or(max_margin_box.max(baseline_extent));
 
     for item in &mut items {
         if item.align == AlignItems::Stretch && item.cross_auto {
@@ -1352,13 +2307,19 @@ pub(super) fn layout(
         free = 0.0;
     }
     let (mut lead, between) = justify(style.justify_content, free, items.len());
+    if free < -EPS && safe_justify(style) {
+        // `safe` overflow aligns as `start` (CSS Align §4.4): the physical
+        // start edge, the flex-end side under a reversed main axis.
+        lead = if reverse { free } else { 0.0 };
+    }
     if reverse {
         lead = main_inner - lead;
     }
     let mut cursor = lead;
     let mut children = Vec::with_capacity(items.len());
     let mut oof = Vec::new();
-    for (item, laid) in items.iter().zip(fragments) {
+    let mut fallback_baseline = None;
+    for ((item, laid), ascent) in items.iter().zip(fragments).zip(&ascents) {
         let border_main = item.content + item.main_edges;
         let main = if reverse {
             cursor - item.margin_main_start - border_main
@@ -1367,17 +2328,16 @@ pub(super) fn layout(
         };
         let main = unit(main);
         let margin_box = item.margin_box_cross();
-        // Unsafe overflow alignment, as Chrome does by default: an item
-        // larger than the line overflows both sides of `center` and the
-        // start side of `flex-end`, so the slack may be negative.
+        // Unsafe alignment (FlexItem::AlignmentOffset): an item larger than
+        // its line overflows both sides when centered, the start when
+        // flex-end. A definite cross size does not stretch; it aligns as
+        // flex-start.
         let extra = line_inner - margin_box;
-        // A definite cross size does not stretch; it aligns as flex-start.
         let from_start = match item.align {
             AlignItems::FlexEnd => extra,
             AlignItems::Center => extra / 2.0,
             AlignItems::Baseline => {
-                let border = item.cross.unwrap_or(0.0) + item.cross_edges;
-                max_ascent - (item.margin_cross_start + border)
+                max_ascent.unwrap_or(0.0) - ascent.unwrap_or(item.margin_cross_start)
             }
             AlignItems::Stretch | AlignItems::FlexStart => 0.0,
         };
@@ -1399,7 +2359,21 @@ pub(super) fn layout(
                 .iter()
                 .map(|candidate| candidate.translated(x + dx, y + dy)),
         );
-        children.push((x + dx, y + dy, laid.fragment));
+        // BaselineAccumulator: the fallback is the first item of the line
+        // after ApplyReversals (the last in order for a reversed row),
+        // offset by its position without the relative offset.
+        let item_baseline = match laid.first_baseline {
+            LastBaseline::NoLines => LastBaseline::At(laid.fragment.height),
+            other => other,
+        }
+        .offset(y);
+        if reverse {
+            fallback_baseline = Some(item_baseline);
+        } else {
+            fallback_baseline.get_or_insert(item_baseline);
+        }
+        let (paint_dy, fragment) = text_item_paint_box(flat, item.index, index, laid.fragment);
+        children.push((x + dx, y + dy + paint_dy, fragment));
         let step = item.outer_main() + gap + between;
         if reverse {
             cursor -= step;
@@ -1408,6 +2382,15 @@ pub(super) fn layout(
         }
     }
 
+    // A row's major baseline is the line's largest ascent; otherwise the
+    // fallback item's baseline (FlexLayoutAlgorithm FirstBaseline).
+    let container_baseline = match (row, max_ascent) {
+        (true, Some(ascent)) => LastBaseline::At(bt + pt + ascent),
+        (true, None) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
+        // A column's first baseline is its first item's (CSS Flexbox 8.5);
+        // an `inline-flex` aligns on it.
+        (false, _) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
+    };
     let content_main = if row {
         inner_width
     } else {
@@ -1476,8 +2459,8 @@ pub(super) fn layout(
             ellipsis: false,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        last_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
+        first_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -1489,7 +2472,106 @@ pub(super) fn layout(
 
 /// Flex lines from hypothetical outer main sizes (Flexbox §9.3). A line
 /// keeps at least one item, even when that item is wider than the container.
+/// Marker the NG entry sets on a flex container whose `flex-wrap` is
+/// `balance` (with its wrap direction already stored in `flex_wrap`).
+pub(super) const BALANCE_MARKER: &str = "--w3cos-internal-flex-balance";
+
+/// CSS Flexbox 2 §9.7 balanced lines. The line count is the greedy break's.
+/// `flex-line-count` (initial 1).
+fn flex_line_count(style: &Style) -> usize {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(FLEX_LINE_COUNT))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
+const FLEX_LINE_COUNT: &str = "--w3cos-internal-flex-line-count";
+
+/// The items split into that many contiguous sequences, each at most the
+/// inner main size unless it is a single item, minimizing the sum of the
+/// squared differences between a line's size (items and gaps) and the inner
+/// main size. Ties prefer more items on the first line, then the second, ...
+/// Each line still flexes against the real inner size afterwards.
+fn balanced_line_ranges(
+    items: &[Item],
+    inner: f32,
+    gap: f32,
+    min_lines: usize,
+) -> Vec<(usize, usize)> {
+    // The outer hypothetical main sizes are floored at zero for balancing.
+    let greedy = flex_line_ranges_floored(items, inner, gap, true);
+    let count = items.len();
+    // The balancing line count: the greedy count, or the minimum flex line
+    // count clamped by the number of items if that is larger.
+    let lines = greedy.len().max(min_lines.min(count));
+    if lines <= 1 {
+        return greedy;
+    }
+    let size = |start: usize, end: usize| -> f64 {
+        let sum: f64 = items[start..end]
+            .iter()
+            .map(|i| f64::from(i.outer_main().max(0.0)))
+            .sum();
+        sum + f64::from(gap) * (end - start - 1) as f64
+    };
+    let fits =
+        |start: usize, end: usize| end - start == 1 || size(start, end) <= f64::from(inner) + 1e-4;
+    // best[j][i]: least error placing items i.. on j lines (INFINITY: none).
+    let mut best = vec![vec![f64::INFINITY; count + 1]; lines + 1];
+    best[0][count] = 0.0;
+    for j in 1..=lines {
+        for start in 0..count {
+            for end in start + 1..=count {
+                if !fits(start, end) || !best[j - 1][end].is_finite() {
+                    continue;
+                }
+                let error = (f64::from(inner) - size(start, end)).powi(2) + best[j - 1][end];
+                if error < best[j][start] {
+                    best[j][start] = error;
+                }
+            }
+        }
+    }
+    if !best[lines][0].is_finite() {
+        return greedy;
+    }
+    let mut ranges = Vec::with_capacity(lines);
+    let mut start = 0;
+    for j in (1..=lines).rev() {
+        // The largest end that still reaches the minimum (start bias).
+        let target = best[j][start];
+        let mut chosen = None;
+        for end in (start + 1..=count).rev() {
+            if fits(start, end)
+                && best[j - 1][end].is_finite()
+                && ((f64::from(inner) - size(start, end)).powi(2) + best[j - 1][end] - target).abs()
+                    <= 1e-6 * target.max(1.0)
+            {
+                chosen = Some(end);
+                break;
+            }
+        }
+        let Some(end) = chosen else {
+            return greedy;
+        };
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
 fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)> {
+    flex_line_ranges_floored(items, inner, gap, false)
+}
+
+fn flex_line_ranges_floored(
+    items: &[Item],
+    inner: f32,
+    gap: f32,
+    floor: bool,
+) -> Vec<(usize, usize)> {
     if items.is_empty() {
         return vec![(0, 0)];
     }
@@ -1497,7 +2579,11 @@ fn flex_line_ranges(items: &[Item], inner: f32, gap: f32) -> Vec<(usize, usize)>
     let mut start = 0;
     let mut used = 0.0;
     for (i, item) in items.iter().enumerate() {
-        let outer = item.outer_main();
+        let outer = if floor {
+            item.outer_main().max(0.0)
+        } else {
+            item.outer_main()
+        };
         if i > start && used + gap + outer > inner + EPS {
             lines.push((start, i));
             start = i;
@@ -1532,14 +2618,14 @@ fn layout_wrapped(
     main_is_max: bool,
     main_gap: f32,
 ) -> Option<LayoutResult> {
-    // Per-line baseline groups stay on legacy. `container_reason` already
-    // rejects a wrapping baseline row; this keeps a later caller from
-    // painting those items at the cross start.
-    if items.iter().any(|item| item.align == AlignItems::Baseline) {
-        return super::bail("flex:baseline");
-    }
     let direction = style.flex_direction;
     let row = row_axis(direction);
+    // Column baseline groups stay on legacy. `container_reason` already
+    // rejects them; this keeps a later caller from painting those items
+    // at the cross start.
+    if !row && items.iter().any(|item| item.align == AlignItems::Baseline) {
+        return super::bail("flex:baseline-column");
+    }
     let reverse = reverse_axis(direction);
     let wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
     let [bt, br, bb, bl] = metrics.border;
@@ -1550,7 +2636,11 @@ fn layout_wrapped(
         style.column_gap.unwrap_or(style.gap)
     })
     .max(0.0);
-    let lines = flex_line_ranges(items, inner_main, main_gap);
+    let lines = if has_marker(style, BALANCE_MARKER) {
+        balanced_line_ranges(items, inner_main, main_gap, flex_line_count(style))
+    } else {
+        flex_line_ranges(items, inner_main, main_gap)
+    };
     for &(start, end) in &lines {
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
@@ -1577,15 +2667,55 @@ fn layout_wrapped(
             item.cross = Some((laid.fragment.height - item.cross_edges).max(0.0));
         }
     }
-    let mut line_cross: Vec<f32> = lines
-        .iter()
-        .map(|&(start, end)| {
-            items[start..end]
-                .iter()
-                .map(|item| item.margin_box_cross())
-                .fold(0.0_f32, f32::max)
-        })
-        .collect();
+    // Per-line baseline groups (FlexLayoutAlgorithm::BuildFlexLines). Each
+    // line's baseline size is its largest ascent plus its largest descent.
+    // Under `wrap-reverse` the group is the minor one (DetermineBaselineGroup
+    // with is_flipped): BaselineAscent measures from the cross end, which is
+    // where `margin_cross_start` already sits here.
+    let mut ascents = vec![None::<f32>; items.len()];
+    let mut line_ascent = vec![None::<f32>; lines.len()];
+    let mut line_cross: Vec<f32> = Vec::with_capacity(lines.len());
+    for (line_index, &(start, end)) in lines.iter().enumerate() {
+        let mut size = 0.0_f32;
+        let mut max_ascent = None::<f32>;
+        let mut max_descent = 0.0_f32;
+        for (offset, item) in items[start..end].iter().enumerate() {
+            size = size.max(item.margin_box_cross());
+            if item.align != AlignItems::Baseline {
+                continue;
+            }
+            let laid = layout_item(
+                flat,
+                item.index,
+                space,
+                inner_width,
+                specified_height,
+                true,
+                Some(item.content),
+                item.cross,
+            )?;
+            let baseline = match laid.first_baseline {
+                LastBaseline::At(baseline) => baseline,
+                LastBaseline::NoLines => laid.fragment.height,
+                LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+            };
+            let from_cross_start = if wrap_reverse {
+                laid.fragment.height - baseline
+            } else {
+                baseline
+            };
+            let ascent = item.margin_cross_start + from_cross_start;
+            let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
+            ascents[start + offset] = Some(ascent);
+            max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
+            max_descent = max_descent.max(margin_box - ascent);
+        }
+        if let Some(ascent) = max_ascent {
+            size = size.max(ascent + max_descent);
+        }
+        line_ascent[line_index] = max_ascent;
+        line_cross.push(size);
+    }
     if line_cross.is_empty() {
         line_cross.push(0.0);
     }
@@ -1659,15 +2789,40 @@ fn layout_wrapped(
     let safe_cross = has_marker(style, "--w3cos-internal-safe-align-content");
     let cross_overflows = definite_cross.is_some_and(|size| packed > size + EPS);
     let reverse_cross = wrap_reverse && !(safe_cross && cross_overflows);
+    // A safe overflow keeps `wrap-reverse` lines on the physical start
+    // while the minor baseline group still measures from the cross end.
+    if wrap_reverse && !reverse_cross && ascents.iter().any(Option::is_some) {
+        return super::bail("flex:baseline-wrap-safe");
+    }
+    // BaselineAccumulator over the first line after ApplyReversals, which
+    // is the physically top line: with `wrap-reverse` that is the last
+    // line here. Its major (or, flipped, minor) baseline, else its first
+    // item after reversals (the last in order for a reversed row).
+    let mut container_baseline = None::<LastBaseline>;
     let mut children = Vec::with_capacity(items.len());
     let mut oof_out = Vec::new();
     let mut frag_at = 0;
-    let mut cross_cursor = if reverse_cross { used_cross } else { 0.0 };
+    // align-content packs the lines in the free cross space (CSS Align
+    // §5.3), with the distributed values falling back when it is negative.
+    let cross_free = definite_cross.map_or(0.0, |size| size - packed);
+    let (cross_lead, cross_between) = if safe_cross && cross_free < -EPS {
+        (0.0, 0.0)
+    } else {
+        align_lines(style.align_content, cross_free, line_cross.len())
+    };
+    let mut cross_cursor = if reverse_cross {
+        used_cross - cross_lead
+    } else {
+        cross_lead
+    };
     for (line_index, &(start, end)) in lines.iter().enumerate() {
         let line_size = line_cross[line_index];
         if reverse_cross {
             cross_cursor -= line_size;
         }
+        let top_line = if reverse_cross { true } else { line_index == 0 };
+        let line_top = bt + pt + cross_cursor;
+        let mut fallback_baseline = None::<LastBaseline>;
         let line = &mut items[start..end];
         let gap_sum = main_gap * line.len().saturating_sub(1) as f32;
         let used_outer = line.iter().map(|item| item.outer_main()).sum::<f32>() + gap_sum;
@@ -1689,11 +2844,17 @@ fn layout_wrapped(
             free = 0.0;
         }
         let (mut lead, between) = justify(style.justify_content, free, line.len());
+        if free < -EPS && safe_justify(style) {
+            // `safe` overflow aligns as `start` (CSS Align §4.4): the physical
+            // start edge, the flex-end side under a reversed main axis.
+            lead = if reverse { free } else { 0.0 };
+        }
         if reverse {
             lead = inner_main - lead;
         }
         let mut cursor = lead;
-        for item in line.iter() {
+        for (offset, item) in line.iter().enumerate() {
+            let ascent = ascents[start + offset];
             let laid = fragments[frag_at].take();
             frag_at += 1;
             let Some(laid) = laid else {
@@ -1707,12 +2868,16 @@ fn layout_wrapped(
             };
             let main = unit(main);
             let margin_box = item.margin_box_cross();
-            // Unsafe overflow alignment: the slack may be negative.
+            // Unsafe alignment, as in the single-line path.
             let extra = line_size - margin_box;
             let from_cross_start = match item.align {
                 AlignItems::FlexEnd => extra,
                 AlignItems::Center => extra / 2.0,
-                AlignItems::Stretch | AlignItems::FlexStart | AlignItems::Baseline => 0.0,
+                AlignItems::Baseline => match (line_ascent[line_index], ascent) {
+                    (Some(max), Some(ascent)) => max - ascent,
+                    _ => 0.0,
+                },
+                AlignItems::Stretch | AlignItems::FlexStart => 0.0,
             };
             let border_cross = item.cross_edges + item.cross.unwrap_or(0.0);
             // Cross-start is the top of the line, unless `wrap-reverse` put
@@ -1729,13 +2894,26 @@ fn layout_wrapped(
             } else {
                 (bl + pl + cross_cursor + cross, bt + pt + main)
             };
+            if row && top_line {
+                let item_baseline = match laid.first_baseline {
+                    LastBaseline::NoLines => LastBaseline::At(laid.fragment.height),
+                    other => other,
+                }
+                .offset(y);
+                if reverse {
+                    fallback_baseline = Some(item_baseline);
+                } else {
+                    fallback_baseline.get_or_insert(item_baseline);
+                }
+            }
             let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
             oof_out.extend(
                 laid.oof
                     .iter()
                     .map(|candidate| candidate.translated(x + dx, y + dy)),
             );
-            children.push((x + dx, y + dy, laid.fragment));
+            let (paint_dy, fragment) = text_item_paint_box(flat, item.index, index, laid.fragment);
+            children.push((x + dx, y + dy + paint_dy, fragment));
             let step = item.outer_main() + main_gap + between;
             if reverse {
                 cursor -= step;
@@ -1743,10 +2921,17 @@ fn layout_wrapped(
                 cursor += step;
             }
         }
+        if row && top_line {
+            container_baseline = match line_ascent.get(line_index).copied().flatten() {
+                Some(max) if wrap_reverse => Some(LastBaseline::At(line_top + line_size - max)),
+                Some(max) => Some(LastBaseline::At(line_top + max)),
+                None => fallback_baseline,
+            };
+        }
         if reverse_cross {
-            cross_cursor -= cross_gap;
+            cross_cursor -= cross_gap + cross_between;
         } else {
-            cross_cursor += line_size + cross_gap;
+            cross_cursor += line_size + cross_gap + cross_between;
         }
     }
     // A max-height limit flexes each line but does not force the used
@@ -1829,8 +3014,18 @@ fn layout_wrapped(
             ellipsis: false,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        // As in the single-line path, the first baseline is reported for
+        // both: an inline-flex uses its first baseline.
+        last_baseline: clamp_scroll_baseline(
+            style,
+            container_baseline.unwrap_or(LastBaseline::NoLines),
+            border_height,
+        ),
+        first_baseline: clamp_scroll_baseline(
+            style,
+            container_baseline.unwrap_or(LastBaseline::NoLines),
+            border_height,
+        ),
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -2455,12 +3650,29 @@ mod tests {
     }
 
     #[test]
-    fn column_cross_alignment_stays_on_legacy() {
+    fn column_cross_alignment_uses_fit_content_width() {
+        // A nowrap column item that does not stretch is fit-content wide and
+        // aligned in the container's inner width.
         let mut column = flex_style(FlexDirection::Column, 100.0, Some(80.0));
-        column.align_items = AlignItems::FlexStart;
-        let root = Component::boxed(column, vec![leaf(block_box(None, Some(20.0)))]);
-        let flat = pre_flatten(&root);
-        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+        column.align_items = AlignItems::Center;
+        let mut end = block_box(Some(40.0), Some(20.0));
+        end.align_self = AlignSelf::FlexEnd;
+        let root = Component::boxed(
+            column,
+            vec![
+                leaf(block_box(Some(40.0), Some(20.0))),
+                leaf(end),
+                leaf(block_box(None, Some(10.0))),
+            ],
+        );
+        expect(
+            &root,
+            &[
+                (1, [30.0, 0.0, 40.0, 20.0]),
+                (2, [60.0, 20.0, 40.0, 20.0]),
+                (3, [50.0, 40.0, 0.0, 10.0]),
+            ],
+        );
     }
 
     #[test]
@@ -2627,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn column_wrap_text_and_nested_flex_baseline_stay_on_legacy() {
+    fn column_and_nested_grid_or_column_wrap_baseline_stay_on_legacy() {
         let mut column = flex_style(FlexDirection::Column, 100.0, Some(80.0));
         column.align_items = AlignItems::Baseline;
         stays_legacy(&Component::boxed(
@@ -2635,42 +3847,78 @@ mod tests {
             vec![leaf(block_box(Some(40.0), Some(10.0)))],
         ));
 
-        let mut wrapped = flex_style(FlexDirection::Row, 100.0, None);
-        wrapped.align_items = AlignItems::Baseline;
-        wrapped.flex_wrap = FlexWrap::Wrap;
-        stays_legacy(&Component::boxed(
-            wrapped,
-            vec![leaf(block_box(Some(40.0), Some(10.0)))],
-        ));
-
-        stays_legacy(&baseline_row(
-            200.0,
-            None,
-            vec![leaf(block_box(Some(40.0), None))],
-        ));
-
-        let mut text = block_box(Some(40.0), Some(30.0));
-        text.display = Display::Block;
+        // A multi-line column flex reports no baseline on NG yet.
+        let mut column_wrap = flex_style(FlexDirection::Column, 40.0, Some(50.0));
+        column_wrap.flex_wrap = FlexWrap::Wrap;
         stays_legacy(&baseline_row(
             200.0,
             None,
             vec![Component::boxed(
-                text,
-                vec![Component::text("a", Style::default())],
+                column_wrap,
+                vec![leaf(block_box(Some(40.0), Some(10.0)))],
             )],
         ));
 
-        let mut nested = block_box(Some(40.0), Some(50.0));
-        nested.display = Display::Flex;
-        nested.flex_direction = FlexDirection::Row;
+        // A block-level grid reports no baseline on NG yet.
+        let mut grid = block_box(Some(40.0), Some(50.0));
+        grid.display = Display::Grid;
         stays_legacy(&baseline_row(
             200.0,
             None,
-            vec![
-                Component::boxed(nested, vec![leaf(block_box(Some(40.0), Some(10.0)))]),
-                leaf(block_box(Some(40.0), Some(30.0))),
-            ],
+            vec![Component::boxed(
+                grid,
+                vec![leaf(block_box(None, Some(10.0)))],
+            )],
         ));
+
+        // An automatic cross size, a text line, and a nested nowrap flex
+        // all have a first baseline (or synthesize one) and stay on NG.
+        let mut text = block_box(Some(40.0), Some(30.0));
+        text.display = Display::Block;
+        let mut nested = block_box(Some(40.0), Some(50.0));
+        nested.display = Display::Flex;
+        nested.flex_direction = FlexDirection::Row;
+        // A multi-line row aligns per line and exports its first baseline.
+        let mut row_wrap = flex_style(FlexDirection::Row, 100.0, None);
+        row_wrap.align_items = AlignItems::Baseline;
+        row_wrap.flex_wrap = FlexWrap::Wrap;
+        for root in [
+            baseline_row(200.0, None, vec![leaf(block_box(Some(40.0), None))]),
+            baseline_row(
+                200.0,
+                None,
+                vec![Component::boxed(
+                    text,
+                    vec![Component::text("a", Style::default())],
+                )],
+            ),
+            baseline_row(
+                200.0,
+                None,
+                vec![
+                    Component::boxed(nested, vec![leaf(block_box(Some(40.0), Some(10.0)))]),
+                    leaf(block_box(Some(40.0), Some(30.0))),
+                ],
+            ),
+            Component::boxed(
+                row_wrap.clone(),
+                vec![
+                    leaf(block_box(Some(60.0), Some(10.0))),
+                    leaf(block_box(Some(60.0), Some(30.0))),
+                ],
+            ),
+            baseline_row(
+                200.0,
+                None,
+                vec![Component::boxed(
+                    row_wrap,
+                    vec![leaf(block_box(Some(40.0), Some(10.0)))],
+                )],
+            ),
+        ] {
+            let flat = pre_flatten(&root);
+            assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
+        }
 
         let mut rtl = flex_style(FlexDirection::Row, 100.0, None);
         rtl.direction = TextDirection::Rtl;
@@ -2689,21 +3937,153 @@ mod tests {
     }
 
     #[test]
-    fn definite_height_wrap_with_gap_and_auto_items_stays_on_legacy() {
+    fn definite_height_wrap_with_gap_stretches_auto_height_lines() {
+        // gap-008-ltr shape: height 100, `gap: 40px 20px`, two 40px items
+        // per line. The two empty lines share the free 60px and the
+        // auto-height items stretch to 30px (align-content: stretch,
+        // align-items: stretch).
         let mut container = flex_style(FlexDirection::Row, 100.0, Some(100.0));
+        container.flex_wrap = FlexWrap::Wrap;
+        container.row_gap = Some(40.0);
+        container.column_gap = Some(20.0);
+        let item = || {
+            let mut style = block_box(Some(40.0), None);
+            style.flex_grow = 0.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = Dimension::Px(40.0);
+            leaf(style)
+        };
+        expect(
+            &Component::boxed(container, vec![item(), item(), item(), item()]),
+            &[
+                (1, [0.0, 0.0, 40.0, 30.0]),
+                (2, [60.0, 0.0, 40.0, 30.0]),
+                (3, [0.0, 70.0, 40.0, 30.0]),
+                (4, [60.0, 70.0, 40.0, 30.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn balanced_wrap_minimizes_squared_line_error_with_greedy_line_count() {
+        // Items 30/20/20/30, width 100, gap 10. Greedy: [30,20,20] [30]
+        // (two lines). The even split is [30,20] [20,30] (sizes 60/60);
+        // each line flexes (grow 1) against the real 100px: 50/40, 40/50.
+        let mut container = flex_style(FlexDirection::Row, 100.0, Some(30.0));
         container.flex_wrap = FlexWrap::Wrap;
         container.gap = 10.0;
         container.row_gap = Some(10.0);
         container.column_gap = Some(10.0);
-        let root = Component::boxed(
-            container,
-            vec![
-                leaf(block_box(Some(50.0), None)),
-                leaf(block_box(Some(40.0), None)),
+        let mut props = w3cos_std::style::CustomProperties::default();
+        props.insert(BALANCE_MARKER.to_string(), "1".to_string());
+        container.custom_properties = Some(props);
+        let item = |width: f32| {
+            let mut style = block_box(Some(width), Some(10.0));
+            style.flex_grow = 1.0;
+            style.flex_shrink = 0.0;
+            style.flex_basis = Dimension::Px(width);
+            leaf(style)
+        };
+        expect(
+            &Component::boxed(
+                container,
+                vec![item(30.0), item(20.0), item(20.0), item(30.0)],
+            ),
+            &[
+                (1, [0.0, 0.0, 50.0, 10.0]),
+                (2, [60.0, 0.0, 40.0, 10.0]),
+                (3, [0.0, 20.0, 40.0, 10.0]),
+                (4, [50.0, 20.0, 50.0, 10.0]),
             ],
         );
-        let flat = pre_flatten(&root);
-        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+    }
+
+    fn balanced(mut style: Style, line_count: Option<u32>) -> Style {
+        style.flex_wrap = FlexWrap::Wrap;
+        let mut props = w3cos_std::style::CustomProperties::default();
+        props.insert(BALANCE_MARKER.to_string(), "1".to_string());
+        if let Some(count) = line_count {
+            props.insert(FLEX_LINE_COUNT.to_string(), count.to_string());
+        }
+        style.custom_properties = Some(props);
+        style
+    }
+
+    #[test]
+    fn min_max_partition_minimizes_the_largest_line() {
+        assert_eq!(
+            min_max_partition(&[40.0, 40.0, 40.0], 20.0, 2),
+            [(0, 2), (2, 3)]
+        );
+        assert_eq!(balanced_min_extent(&[40.0, 40.0, 40.0], 20.0, 2), 100.0);
+        assert_eq!(
+            min_max_partition(&[100.0, 30.0, 30.0], 20.0, 2),
+            [(0, 1), (1, 3)]
+        );
+        assert_eq!(balanced_min_extent(&[100.0, 30.0, 30.0], 20.0, 2), 100.0);
+        assert_eq!(balanced_min_extent(&[80.0, 40.0, 40.0], 20.0, 2), 100.0);
+        // At most one line per item, and negative sizes floor at zero.
+        assert_eq!(min_max_partition(&[10.0], 5.0, 4), [(0, 1)]);
+        assert_eq!(balanced_min_extent(&[-30.0, 50.0], 0.0, 1), 50.0);
+        assert!(min_max_partition(&[], 5.0, 2).is_empty());
+    }
+
+    #[test]
+    fn flex_line_count_splits_a_balanced_row_that_fits_on_one_line() {
+        // Three 40px items with a 20px gap fit one line of 200px; a
+        // minimum flex line count of 2 balances them as [40,40] [40].
+        let mut container = balanced(flex_style(FlexDirection::Row, 200.0, None), Some(2));
+        container.column_gap = Some(20.0);
+        container.row_gap = Some(0.0);
+        let item = || leaf(fixed_item(40.0, 10.0));
+        expect(
+            &Component::boxed(container, vec![item(), item(), item()]),
+            &[
+                (1, [0.0, 0.0, 40.0, 10.0]),
+                (2, [60.0, 0.0, 40.0, 10.0]),
+                (3, [0.0, 10.0, 40.0, 10.0]),
+            ],
+        );
+        // Without the count the same row stays on one line.
+        let mut one = balanced(flex_style(FlexDirection::Row, 200.0, None), None);
+        one.column_gap = Some(20.0);
+        one.row_gap = Some(0.0);
+        expect(
+            &Component::boxed(one, vec![item(), item(), item()]),
+            &[(3, [120.0, 0.0, 40.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn balanced_line_breaking_floors_outer_main_sizes_at_zero() {
+        // The second item's outer main size is -100px; unfloored it would
+        // let the 150px item and it share a line.
+        let container = balanced(flex_style(FlexDirection::Row, 100.0, None), None);
+        let mut first = fixed_item(150.0, 20.0);
+        first.flex_grow = 0.0;
+        let mut second = fixed_item(0.0, 20.0);
+        second.margin = edges(0.0, -50.0, 0.0, -50.0);
+        expect(
+            &Component::boxed(container, vec![leaf(first), leaf(second)]),
+            &[(2, [-50.0, 20.0, 0.0, 20.0])],
+        );
+    }
+
+    #[test]
+    fn balanced_column_with_a_line_count_sizes_its_block_axis_from_the_partition() {
+        // 40px items, 20px gap, two lines: [40,40] [40]. The automatic
+        // block size is the largest line, 100px.
+        let mut container = balanced(flex_style(FlexDirection::Column, 300.0, None), Some(2));
+        container.gap = 20.0;
+        container.row_gap = Some(20.0);
+        container.column_gap = Some(20.0);
+        let item = || leaf(fixed_item(40.0, 40.0));
+        let out = lay(&Component::boxed(container, vec![item(), item(), item()]));
+        assert_eq!(rect(&out, 0)[3], 100.0);
+        assert_eq!(rect(&out, 1)[1], 0.0);
+        assert_eq!(rect(&out, 2)[1], 60.0);
+        assert_eq!(rect(&out, 3)[1], 0.0);
+        assert!(rect(&out, 3)[0] > rect(&out, 1)[0]);
     }
 
     #[test]
@@ -2833,6 +4213,58 @@ mod tests {
         expect(
             &Component::boxed(container, vec![leaf(fixed_item(100.0, 100.0))]),
             &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn align_content_distributes_wrapped_lines() {
+        // Two 40px-wide items wrap into two 20px lines in a 100px-tall row.
+        // Free cross space is 60px.
+        let lines = |kind: AlignContent, wrap: FlexWrap| {
+            let mut container = flex_style(FlexDirection::Row, 60.0, Some(100.0));
+            container.flex_wrap = wrap;
+            container.align_content = kind;
+            let root = Component::boxed(
+                container,
+                vec![leaf(fixed_item(40.0, 20.0)), leaf(fixed_item(40.0, 20.0))],
+            );
+            let out = lay(&root);
+            (rect(&out, 1)[1], rect(&out, 2)[1])
+        };
+        assert_eq!(lines(AlignContent::Center, FlexWrap::Wrap), (30.0, 50.0));
+        assert_eq!(lines(AlignContent::FlexEnd, FlexWrap::Wrap), (60.0, 80.0));
+        assert_eq!(
+            lines(AlignContent::SpaceBetween, FlexWrap::Wrap),
+            (0.0, 80.0)
+        );
+        assert_eq!(
+            lines(AlignContent::SpaceAround, FlexWrap::Wrap),
+            (15.0, 65.0)
+        );
+        assert_eq!(
+            lines(AlignContent::SpaceEvenly, FlexWrap::Wrap),
+            (20.0, 60.0)
+        );
+        // wrap-reverse: flex-end packs at the top, first line below.
+        assert_eq!(
+            lines(AlignContent::FlexEnd, FlexWrap::WrapReverse),
+            (20.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn safe_justify_overflow_under_row_reverse_aligns_at_start() {
+        // `flex-flow: row-reverse; justify-content: safe flex-start`. The
+        // 100px item overflows a 90px line, so it aligns as `start`: the
+        // left edge, overflowing on the right.
+        let mut container = flex_style(FlexDirection::RowReverse, 90.0, Some(90.0));
+        container.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+            "--w3cos-internal-justify-content".to_string(),
+            "safe flex-start".to_string(),
+        )]));
+        expect(
+            &Component::boxed(container, vec![leaf(fixed_item(100.0, 100.0))]),
+            &[(1, [0.0, 0.0, 100.0, 100.0])],
         );
     }
 
