@@ -1,0 +1,250 @@
+{
+ "browser": "Google Chrome 156.0.8078.79",
+ "cases": {
+  "block-max": {
+   "html": "<div id=a style='font:10px/1 Ahem;width:max-content'>XX XX</div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     50,
+     10
+    ]
+   }
+  },
+  "block-min": {
+   "html": "<div id=a style='font:10px/1 Ahem;width:min-content'>XX XX</div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     20,
+     20
+    ]
+   }
+  },
+  "fit-narrow": {
+   "html": "<div id=w style='width:30px'><div id=a style='font:10px/1 Ahem;width:fit-content'>XX XX</div></div>",
+   "rects": {
+    "w": [
+     0,
+     0,
+     30,
+     20
+    ],
+    "a": [
+     0,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  "fit-wide": {
+   "html": "<div id=w style='width:100px'><div id=a style='font:10px/1 Ahem;width:fit-content'>XX XX</div></div>",
+   "rects": {
+    "w": [
+     0,
+     0,
+     100,
+     10
+    ],
+    "a": [
+     0,
+     0,
+     50,
+     10
+    ]
+   }
+  },
+  "auto-margin": {
+   "html": "<div id=w style='width:200px'><div id=a style='font:10px/1 Ahem;width:max-content;margin:0 auto;padding:5px;border:2px solid'>XX XX</div></div>",
+   "rects": {
+    "w": [
+     0,
+     0,
+     200,
+     24
+    ],
+    "a": [
+     68,
+     0,
+     64,
+     24
+    ]
+   }
+  },
+  "border-box": {
+   "html": "<div id=a style='font:10px/1 Ahem;width:min-content;box-sizing:border-box;padding:5px'>XX XX</div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     30,
+     30
+    ]
+   }
+  },
+  "clamped": {
+   "html": "<div id=a style='font:10px/1 Ahem;width:max-content;max-width:30px'>XX XX</div>",
+   "rects": {
+    "a": [
+     0,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  "flex-row-max": {
+   "html": "<div id=f style='display:flex;gap:5px;width:max-content'><div id=b style='width:30px;height:10px'></div><div id=c style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "f": [
+     0,
+     0,
+     55,
+     10
+    ],
+    "b": [
+     0,
+     0,
+     30,
+     10
+    ],
+    "c": [
+     35,
+     0,
+     20,
+     10
+    ]
+   }
+  },
+  "flex-col-min": {
+   "html": "<div id=f style='font:10px/1 Ahem;display:flex;flex-direction:column;width:min-content'><div id=b>XX XX</div><div id=c>XX XX</div></div>",
+   "rects": {
+    "f": [
+     0,
+     0,
+     20,
+     40
+    ],
+    "b": [
+     0,
+     0,
+     20,
+     20
+    ],
+    "c": [
+     0,
+     20,
+     20,
+     20
+    ]
+   }
+  },
+  "flex-row-fit": {
+   "html": "<div id=w style='width:40px'><div id=f style='font:10px/1 Ahem;display:flex;width:fit-content'><div id=b>XX</div><div id=c>XX XX</div></div></div>",
+   "rects": {
+    "w": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "f": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "b": [
+     0,
+     0,
+     20,
+     20
+    ],
+    "c": [
+     20,
+     0,
+     20,
+     20
+    ]
+   }
+  },
+  "grid-max": {
+   "html": "<div id=g style='font:10px/1 Ahem;display:grid;grid-template-columns:auto auto;width:max-content'><div id=b>XX</div><div id=c>XXXX</div></div>",
+   "rects": {
+    "g": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "b": [
+     0,
+     0,
+     20,
+     10
+    ],
+    "c": [
+     20,
+     0,
+     40,
+     10
+    ]
+   }
+  },
+  "grid-min": {
+   "html": "<div id=g style='font:10px/1 Ahem;display:grid;grid-template-columns:auto 30px;width:min-content'><div id=b>XX XX</div><div id=c></div></div>",
+   "rects": {
+    "g": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "b": [
+     0,
+     0,
+     20,
+     20
+    ],
+    "c": [
+     20,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  "grid-fit": {
+   "html": "<div id=w style='width:40px'><div id=g style='font:10px/1 Ahem;display:grid;grid-template-columns:auto auto;width:fit-content'><div id=b>XX XX</div><div id=c>XX XX</div></div></div>",
+   "rects": {
+    "w": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "g": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "b": [
+     0,
+     0,
+     20,
+     20
+    ],
+    "c": [
+     20,
+     0,
+     20,
+     20
+    ]
+   }
+  }
+ }
+}

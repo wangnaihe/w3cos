@@ -2552,7 +2552,23 @@ fn layout_block_in(
             definite.max_width = Dimension::Auto;
             definite.box_sizing = BoxSizing::ContentBox;
             resolve_inline(&definite, &child_space)
+        } else if let Some(width) = intrinsic_keyword_width(flat, child, &child_space)? {
+            // An intrinsic width keyword is a definite width, so auto
+            // margins center the box against it (CSS2 10.3.3).
+            let mut definite = child_info.style.clone();
+            definite.width = Dimension::Px(width);
+            definite.min_width = Dimension::Auto;
+            definite.max_width = Dimension::Auto;
+            definite.box_sizing = BoxSizing::ContentBox;
+            resolve_inline(&definite, &child_space)
         } else {
+            if intrinsic_keyword_applies(flat, child)
+                && (child_info.style.margin.left == Spacing::Auto
+                    || child_info.style.margin.right == Spacing::Auto)
+            {
+                // A grid sizes its own tracks, so its width is not known here.
+                return super::bail("width-keyword:grid-auto-margin");
+            }
             resolve_inline(child_info.style, &child_space)
         };
         let x = bl + pl + child_metrics.margin[3];
