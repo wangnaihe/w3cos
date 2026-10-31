@@ -785,7 +785,7 @@ fn column_wrap_max_content(
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
-    let items = column_wrap_items(flat, index, space, Some(main))?;
+    let items = column_wrap_items(flat, index, space, Some(main), None)?;
     let mut total = 0.0_f32;
     let mut lines = 0usize;
     let (mut line_main, mut line_cross) = (0.0_f32, 0.0_f32);
@@ -814,6 +814,7 @@ fn column_wrap_items(
     index: usize,
     space: &ConstraintSpace,
     main: Option<f32>,
+    inner_width: Option<f32>,
 ) -> Option<Vec<(f32, f32)>> {
     let style = flat[index].style;
     let mut children: Vec<usize> = rendered_children(flat, index)
@@ -838,7 +839,20 @@ fn column_wrap_items(
         let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
             && matches!(child_style.height, Dimension::Auto);
         let measured = if basis_auto {
-            let width = (cross - cross_margins - cross_edges).max(0.0);
+            let mut width = (cross - cross_margins - cross_edges).max(0.0);
+            // A percentage width resolves against the container's definite
+            // content width, not its max-content contribution
+            // (balance-percentage-size-001).
+            if let Some(basis) = inner_width
+                && matches!(
+                    child_style.width,
+                    Dimension::Percent(_) | Dimension::Calc { .. }
+                )
+                && let Some(size) =
+                    block::resolve_length(child_style.width, Some(basis), child_style, space)
+            {
+                width = to_content(child_style, cross_edges, size);
+            }
             let laid = layout_item(flat, child, space, width, None, false, None, Some(width))?;
             Some((laid.fragment.height - main_edges).max(0.0))
         } else {
@@ -940,10 +954,11 @@ fn balanced_column_extent(
     index: usize,
     space: &ConstraintSpace,
     lines: usize,
+    inner_width: f32,
 ) -> Option<f32> {
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
-    let items = column_wrap_items(flat, index, space, None)?;
+    let items = column_wrap_items(flat, index, space, None, Some(inner_width))?;
     let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
     Some(balanced_min_extent(&outers, row_gap, lines))
 }
@@ -959,7 +974,7 @@ fn balanced_column_max_content(
     let style = flat[index].style;
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
-    let items = column_wrap_items(flat, index, space, None)?;
+    let items = column_wrap_items(flat, index, space, None, None)?;
     let outers: Vec<f32> = items.iter().map(|item| item.0).collect();
     let ranges = min_max_partition(&outers, row_gap, lines);
     let total: f32 = ranges
@@ -1768,9 +1783,10 @@ pub(super) fn layout(
         specified_height = Some(max_main.map(|max| aspect.min(max)).unwrap_or(aspect));
     }
     let max_main = match (max_main, balance_min_lines(style)) {
-        (None, Some(lines)) if column_wrap && specified_height.is_none() => {
-            Some(balanced_column_extent(flat, index, space, lines).why("flex:balance-extent")?)
-        }
+        (None, Some(lines)) if column_wrap && specified_height.is_none() => Some(
+            balanced_column_extent(flat, index, space, lines, inner_width)
+                .why("flex:balance-extent")?,
+        ),
         (max_main, _) => max_main,
     };
     let (inner_main, main_is_max) = if row {
