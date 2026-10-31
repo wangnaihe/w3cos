@@ -161,6 +161,7 @@ fn finish_headless_frame(
         return Ok(frame);
     }
     let flat = layout::pre_flatten(root);
+    crate::jsdom::publish_canvas_surfaces(&flat);
     let layout_cache = &layout_results.layout_cache;
     if std::env::var_os("W3COS_DUMP_HEADLESS_LAYOUT").is_some() {
         for (rect, index) in layout_cache {
@@ -359,6 +360,7 @@ fn reuse_retained_paint(
             }
         }
         let flat = layout::pre_flatten(root);
+        crate::jsdom::publish_canvas_surfaces(&flat);
         let frame = paint_retained_artifact(
             width,
             height,

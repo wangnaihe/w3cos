@@ -10566,6 +10566,33 @@ mod tests {
 
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     #[test]
+    fn canvas_2d_pixels_paint_in_the_cpu_renderer() {
+        // Monaco's minimap is a 2D canvas positioned inside the editor; the
+        // pixels drawn through getContext('2d') must reach the frame, scaled
+        // to the canvas's CSS box, and a canvas without a context stays empty.
+        let html = r#"<!doctype html><html><body style="margin:0;background:#000">
+            <canvas id="drawn" width="10" height="10" style="position:absolute;left:20px;top:10px;width:40px;height:40px"></canvas>
+            <canvas id="blank" width="10" height="10" style="position:absolute;left:100px;top:10px;width:40px;height:40px"></canvas>
+            <script>
+              var c = document.getElementById('drawn').getContext('2d');
+              c.fillStyle = '#00ff00';
+              c.fillRect(0, 0, 5, 10);
+            </script></body></html>"#;
+        load_html_on_shared_vm(html, "https://canvas-paint.w3cos.local/page.html").unwrap();
+        let frame = crate::headless::render_document_rgba_cpu(200, 100).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * frame.width as usize + x) * 4;
+            [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+        };
+        assert_eq!(pixel(25, 30), [0, 255, 0], "filled half missing");
+        let backdrop = pixel(190, 90);
+        assert_ne!(backdrop, [0, 255, 0]);
+        assert_eq!(pixel(55, 30), backdrop, "unfilled half painted");
+        assert_eq!(pixel(110, 30), backdrop, "context-less canvas painted");
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
     fn fractional_opacity_ancestor_fades_descendant_paint() {
         let html = r#"<!doctype html><html><body style="margin:0;background:#000">
             <div style="position:absolute;left:0;top:0;width:50px;height:50px;opacity:0.5">

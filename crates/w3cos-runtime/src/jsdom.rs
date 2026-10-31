@@ -16217,6 +16217,38 @@ fn canvas_context_value(node: u32) -> Value {
     value
 }
 
+/// Publish every DOM canvas's 2D pixels under its flat paint index so the
+/// retained paint backends can draw them (`canvas2d::surface_snapshot`).
+pub(crate) fn publish_canvas_surfaces(flat: &[crate::layout::FlatNodeInfo<'_>]) {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        if contexts.is_empty() {
+            return;
+        }
+        for (index, info) in flat.iter().enumerate() {
+            if !matches!(info.kind, w3cos_std::ComponentKind::Canvas { .. }) {
+                continue;
+            }
+            let w3cos_std::EventAction::NativeHost { id, .. } = info.on_click else {
+                continue;
+            };
+            let Ok(node) = u32::try_from(*id) else {
+                continue;
+            };
+            match contexts.get(&node) {
+                Some(context) => {
+                    if let Ok(mut context) = context.try_borrow_mut() {
+                        context.publish_to_surface(index);
+                    }
+                }
+                // A canvas without a 2D context must not show the snapshot a
+                // previous canvas left under this index.
+                None => crate::canvas2d::remove_surface(index),
+            }
+        }
+    });
+}
+
 fn canvas_ctx_get(
     node: u32,
     ctx: &Rc<RefCell<crate::canvas2d::CanvasRenderingContext2D>>,
