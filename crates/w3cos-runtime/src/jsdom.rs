@@ -1228,6 +1228,22 @@ pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &
 
 /// Extract the DOM node id carried by an element Value (`__node_id` hidden
 /// prop, read directly so the proxy trap is bypassed).
+/// A prototype-level DOM method (`HTMLElement.prototype.focus`, ...). Element
+/// wrappers resolve these through the bridge per node, so the prototype slot is
+/// otherwise an undefined placeholder. Scripts that capture the original
+/// (`const orig = HTMLElement.prototype.focus; ... orig.apply(this, args)`,
+/// as the workbench's window focus handling does) need a callable that
+/// forwards to the receiver's bridge method.
+pub(crate) fn element_prototype_method(name: &'static str) -> Value {
+    func(move |this, args| {
+        let Some(node) = node_id_of(&this) else {
+            return Value::Undefined;
+        };
+        let method = element_computed_get(node, name);
+        method.call(this, args)
+    })
+}
+
 pub fn node_id_of(value: &Value) -> Option<u32> {
     if let Some(id) = value.live_dom_node() {
         return Some(id);
@@ -32176,6 +32192,80 @@ try {
         assert!(doc.get_property("activeElement") == input);
         input.call_method("blur", vec![]);
         assert!(doc.get_property("activeElement") == doc.get_property("body"));
+    }
+
+    #[test]
+    fn captured_prototype_focus_blur_click_act_on_the_receiver() {
+        setup();
+        let doc = document_value();
+        let proto = window_value()
+            .get_property("HTMLElement")
+            .get_property("prototype");
+        // Captured before any element exists, like workbench/window.ts does.
+        let orig_focus = proto.get_property("focus");
+        let orig_blur = proto.get_property("blur");
+        let orig_click = proto.get_property("click");
+        assert!(orig_focus.is_callable(), "HTMLElement.prototype.focus");
+        assert!(orig_blur.is_callable(), "HTMLElement.prototype.blur");
+        assert!(orig_click.is_callable(), "HTMLElement.prototype.click");
+        let input = create_in_body("input");
+        orig_focus.call(input.clone(), vec![]);
+        assert!(doc.get_property("activeElement") == input);
+        orig_blur.call(input.clone(), vec![]);
+        assert!(doc.get_property("activeElement") == doc.get_property("body"));
+        let clicks = Rc::new(Cell::new(0));
+        let seen = clicks.clone();
+        input.call_method(
+            "addEventListener",
+            vec![
+                Value::string("click"),
+                Value::function(move |_, _| {
+                    seen.set(seen.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        orig_click.call(input.clone(), vec![]);
+        assert_eq!(clicks.get(), 1);
+        // A wrapper installed on the prototype that delegates to the captured
+        // original must still focus the element.
+        let wrapped = orig_focus.clone();
+        proto.set_property(
+            "focus",
+            Value::function(move |this, args| wrapped.call(this, args)),
+        );
+        let other = create_in_body("textarea");
+        other.call_method("focus", vec![]);
+        assert!(doc.get_property("activeElement") == other);
+    }
+
+    #[test]
+    fn focus_readonly_tabindex_textarea_becomes_active_element() {
+        setup();
+        let doc = document_value();
+        let area = create_in_body("textarea");
+        area.call_method(
+            "setAttribute",
+            vec![Value::string("readonly"), Value::string("true")],
+        );
+        area.call_method(
+            "setAttribute",
+            vec![Value::string("tabindex"), Value::string("-1")],
+        );
+        area.call_method(
+            "setAttribute",
+            vec![Value::string("aria-hidden"), Value::string("true")],
+        );
+        area.set_property("className", Value::string("ime-text-area"));
+        let style = area.get_property("style");
+        style.set_property("position", Value::string("absolute"));
+        style.set_property("width", Value::string("1px"));
+        style.set_property("height", Value::string("1px"));
+        area.call_method("focus", vec![]);
+        assert!(
+            doc.get_property("activeElement") == area,
+            "readonly tabindex=-1 textarea must take focus"
+        );
     }
 
     #[test]

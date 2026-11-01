@@ -637,6 +637,17 @@ fn build_constructors() -> HashMap<String, Value> {
             prototype.set_property(property, Value::Undefined);
         }
     }
+    // Methods whose bridge implementation is per node: give the prototype slot
+    // a real function so a captured `HTMLElement.prototype.focus` is callable.
+    for (name, methods) in [
+        ("HTMLElement", ["focus", "blur", "click"].as_slice()),
+        ("SVGElement", ["focus", "blur"].as_slice()),
+    ] {
+        let prototype = constructors[name].get_property("prototype");
+        for method in methods {
+            prototype.set_property(method, crate::jsdom::element_prototype_method(method));
+        }
+    }
     for (name, members) in [
         (
             "SVGAElement",
