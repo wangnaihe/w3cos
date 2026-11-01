@@ -12948,32 +12948,70 @@ mod tests {
             line_height: 1.2,
             ..Style::default()
         };
+        let used_line_height = crate::layout::inline_style_line_height(&style);
         draw_text_in_rect(
             single.canvas(),
             LayoutRect {
                 x: 0.0,
                 y: 0.0,
                 width: 64.0,
-                height: 19.2,
+                height: used_line_height,
             },
             "i",
             &style,
             &typeface,
             &metrics_font,
         );
-        draw_text_in_rect(
+        let mut painted_lines = 0;
+        draw_text_in_rect_with_line_painter(
             multiline.canvas(),
             LayoutRect {
                 x: 0.0,
                 y: 0.0,
                 width: 64.0,
-                height: 38.4,
+                height: 2.0 * used_line_height,
             },
             "i\u{2028}i",
             &style,
             &typeface,
             &metrics_font,
+            None,
+            true,
+            &mut |canvas, x, top, text, advance, style, expansion| {
+                painted_lines += 1;
+                if painted_lines == 1 {
+                    if let Some(expansion) = expansion {
+                        draw_justified_text_line(
+                            canvas,
+                            x,
+                            top,
+                            text,
+                            style.font_size,
+                            style.color,
+                            style.opacity,
+                            &typeface,
+                            style,
+                            expansion,
+                        )
+                    } else {
+                        draw_text_line(
+                            canvas,
+                            x,
+                            top,
+                            text,
+                            style.font_size,
+                            style.color,
+                            style.opacity,
+                            &typeface,
+                            style,
+                        )
+                    }
+                } else {
+                    advance
+                }
+            },
         );
+        assert_eq!(painted_lines, 2, "fixture must exercise the multiline path");
 
         let info = ImageInfo::new((64, 40), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut single_pixels = vec![0_u8; 64 * 40 * 4];
