@@ -1449,6 +1449,7 @@ mod tests {
     fn normal_fallback_line_does_not_reapply_primary_leading() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610080132;
+        const PRIMARY_FAMILY: &str = "W3cosNormalFallbackAhem";
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/layout_ng/testdata/Ahem.ttf"
@@ -1459,7 +1460,11 @@ mod tests {
             .register_for_owner(
                 OWNER,
                 FontFace {
-                    family: "Ahem".into(),
+                    // Keep this registered fixture separate from the special
+                    // synthetic `Ahem` family used by other line-metric tests.
+                    // FontRegistry is process-global and libtest runs these
+                    // tests concurrently.
+                    family: PRIMARY_FAMILY.into(),
                     src: FontSource::Bytes(bytes),
                     ..Default::default()
                 },
@@ -1475,7 +1480,7 @@ mod tests {
         };
         let ahem = Style {
             display: Display::Inline,
-            font_family: Some("Ahem, \"Courier New\"".into()),
+            font_family: Some(format!("{PRIMARY_FAMILY}, \"Courier New\"")),
             font_size: 64.0,
             line_height: 1.1328125,
             ..parent.clone()
