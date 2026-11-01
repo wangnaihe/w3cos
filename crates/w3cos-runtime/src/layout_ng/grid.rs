@@ -206,6 +206,36 @@ fn pack_keyword(keyword: &str, rtl: bool) -> Pack {
     }
 }
 
+/// Block-axis baseline alignment covers plain horizontal grids of items
+/// with a known first or last baseline: no subgrid, lanes, `inline-grid`,
+/// vertical writing mode, grid-container items (whose baseline this engine
+/// does not export for a block grid), or auto margins in the block axis.
+fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
+    use w3cos_std::style::WritingMode;
+    let style = flat[container].style;
+    let child_style = flat[child].style;
+    let subgrid = |spec: Option<&str>| {
+        spec.is_some_and(|text| text.contains("subgrid") || text.contains("masonry"))
+    };
+    // A definite height only: the auto-height forms (intrinsic row sizes
+    // and the container's own baseline) stay on legacy until the paired
+    // subgrid and grid-lanes baseline tests (whose legacy output matches a
+    // legacy reference) run on NG as well.
+    style.writing_mode == WritingMode::HorizontalTb
+        && matches!(style.height, Dimension::Px(_))
+        && child_style.writing_mode == WritingMode::HorizontalTb
+        && !has_marker(style, "--w3cos-internal-grid-lanes")
+        && marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid")
+        && !subgrid(columns_spec(style))
+        && !subgrid(style.grid_rows())
+        && child_style.display != Display::Grid
+        && !subgrid(columns_spec(child_style))
+        && !subgrid(child_style.grid_rows())
+        && !matches!(child_style.margin.top, Spacing::Auto)
+        && !matches!(child_style.margin.bottom, Spacing::Auto)
+        && !percent_height(child_style)
+}
+
 fn used_item_align(container: AlignItems, item: AlignSelf) -> AlignItems {
     match item {
         AlignSelf::Auto => container,
@@ -249,6 +279,30 @@ fn is_baseline(align: AlignItems) -> bool {
     align == AlignItems::Baseline
 }
 
+/// Block-axis baseline alignment of a grid item: `Some(false)` for `first
+/// baseline`, `Some(true)` for `last baseline`. The enums fold the
+/// `first`/`last` forms into `stretch`, so the authored keyword decides.
+fn block_baseline(container: &Style, child: &Style) -> Option<bool> {
+    let keyword = marker(child, "--w3cos-internal-align-self")
+        .filter(|keyword| *keyword != "auto")
+        .or_else(|| marker(container, "--w3cos-internal-align-items"));
+    match keyword {
+        Some(keyword) if keyword.contains("baseline") => Some(keyword.contains("last")),
+        Some(_) => None,
+        None => {
+            is_baseline(used_item_align(container.align_items, child.align_self)).then_some(false)
+        }
+    }
+}
+
+/// Whether any `align-items` / `align-self` of this container's subtree
+/// root or children asks for a block-axis baseline (the transposed vertical
+/// path does not model that yet).
+fn container_wants_block_baseline(container: &Style) -> bool {
+    marker(container, "--w3cos-internal-align-items").is_some_and(|k| k.contains("baseline"))
+        || is_baseline(container.align_items)
+}
+
 /// Why this grid container is outside the supported subset. `None` when
 /// the tracks can be laid out.
 pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -262,7 +316,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some("grid:areas");
     }
-    if is_baseline(style.align_items) || is_baseline(style.justify_items) {
+    if is_baseline(style.justify_items) {
         return Some("grid:baseline");
     }
     if let Some(reason) = subgrid_or_template(flat, index, false) {
@@ -373,11 +427,15 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if placement(child_style, true).is_some_and(|value| parse_axis_syntax(value).is_none()) {
             return Some("grid:row");
         }
-        if is_baseline(used_item_align(style.align_items, child_style.align_self))
-            || is_baseline(used_item_align(
-                style.justify_items,
-                child_style.justify_self,
-            ))
+        if is_baseline(used_item_align(
+            style.justify_items,
+            child_style.justify_self,
+        )) {
+            return Some("grid:baseline");
+        }
+        if block_baseline(style, child_style).is_some()
+            && !block_baseline_supported(flat, index, child)
+            && is_baseline(used_item_align(style.align_items, child_style.align_self))
         {
             return Some("grid:baseline");
         }
@@ -3508,6 +3566,8 @@ struct Item {
     edges_h: f32,
     inline_pack: Pack,
     block_pack: Pack,
+    /// Block-axis baseline alignment: `Some(last)`.
+    baseline: Option<bool>,
 }
 
 fn layout_item(
@@ -4629,6 +4689,17 @@ fn layout_impl(
             child_style.justify_self,
         ));
         let mut align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        // An authored `first baseline` / `last baseline` keyword outside
+        // the supported shapes keeps its earlier treatment (laid out as
+        // stretch); only the plain `baseline` forms fall back there.
+        let baseline = block_baseline(style, child_style)
+            .filter(|_| block_baseline_supported(flat, index, item.index));
+        if baseline.is_some() {
+            if item.row_span != 1 {
+                return super::bail("grid:baseline-span");
+            }
+            align = Pack::Start;
+        }
         if replaced {
             // `normal` is `start` for a replaced item; only an authored
             // `stretch` fills the area.
@@ -4752,6 +4823,7 @@ fn layout_impl(
             edges_h,
             inline_pack: justify,
             block_pack: align,
+            baseline,
         });
     }
 
@@ -4776,7 +4848,9 @@ fn layout_impl(
     let mut row_max = vec![0_i64; row_specs.len()];
     // Items spanning several rows: (first row, span, margin-box height).
     let mut spanning: Vec<(usize, usize, i64)> = Vec::new();
-    for item in &built {
+    // (item, ascent, descent) of the baseline-aligned items.
+    let mut baseline_extents: Vec<(usize, i64, i64)> = Vec::new();
+    for (built_index, item) in built.iter().enumerate() {
         let laid = layout_item(
             flat,
             item.index,
@@ -4820,6 +4894,21 @@ fn layout_impl(
                 row_min[track] = row_min[track].max(extra);
                 row_floor[track] = row_floor[track].max(extra);
             }
+        } else if let Some(last) = item.baseline {
+            // Baseline-sharing group member: the track contribution is the
+            // group's extent, added after every item is measured.
+            let baseline = match if last {
+                laid.last_baseline
+            } else {
+                laid.first_baseline
+            } {
+                LastBaseline::At(value) => value,
+                LastBaseline::NoLines => laid.fragment.height,
+                LastBaseline::Unknown => return super::bail("grid:baseline-unknown"),
+            };
+            let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
+            let ascent = item.margin_u[0] + units(baseline);
+            baseline_extents.push((built_index, ascent, margin_box - ascent));
         } else if item.row_span == 1 && item.row < row_max.len() {
             let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
             row_max[item.row] = row_max[item.row].max(margin_box);
@@ -4839,6 +4928,23 @@ fn layout_impl(
             spanning.push((item.row, item.row_span, margin_box));
         }
         fragments.push(laid);
+    }
+    // Baseline-sharing groups, one per row and baseline kind: the items'
+    // baselines line up, and the group's extent (largest ascent plus
+    // largest descent) is the contribution to the row.
+    let mut groups: Vec<[(i64, i64); 2]> = vec![[(0, 0); 2]; row_specs.len()];
+    for &(item_index, ascent, descent) in &baseline_extents {
+        let item = &built[item_index];
+        let kind = usize::from(item.baseline == Some(true));
+        let group = &mut groups[item.row][kind];
+        group.0 = group.0.max(ascent);
+        group.1 = group.1.max(descent);
+    }
+    for (row, pair) in groups.iter().enumerate() {
+        let extent = pair.iter().map(|(a, d)| a + d).max().unwrap_or(0);
+        row_max[row] = row_max[row].max(extent);
+        row_min[row] = row_min[row].max(extent);
+        row_floor[row] = row_floor[row].max(extent);
     }
     let stretch_rows = row_pack(style) == Pack::Stretch && !lanes_stack_axis(style, true);
     let intrinsic_row_size = if inline_intrinsic && definite_block.is_none() {
@@ -5122,8 +5228,29 @@ fn layout_impl(
             item.block_pack,
         );
         let mut x = from_units(origin_x + column_x[item.col] + ml + inline_offset);
-        let mut y =
-            from_units(origin_y + row_y.get(item.row).copied().unwrap_or(0) + mt + block_offset);
+        let baseline_shift = match item.baseline {
+            None => 0,
+            Some(last) => {
+                let (ascent, descent) = baseline_extents
+                    .iter()
+                    .find(|(i, _, _)| *i == index)
+                    .map(|(_, a, d)| (*a, *d))
+                    .unwrap_or((0, 0));
+                let group = groups[item.row][usize::from(last)];
+                if last {
+                    row_size - group.1 - ascent
+                } else {
+                    group.0 - ascent
+                }
+            }
+        };
+        let mut y = from_units(
+            origin_y
+                + row_y.get(item.row).copied().unwrap_or(0)
+                + mt
+                + block_offset
+                + baseline_shift,
+        );
         if rtl {
             x = from_units(origin_x + inner_u - (units(x) - origin_x) - units(fragment.width));
         }
@@ -5538,6 +5665,7 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             || super::flex::percent_spacing(&style.padding)
             || is_baseline(style.align_items)
             || is_baseline(style.justify_items)
+            || container_wants_block_baseline(style)
             || !vertical_container_markers_ok(style)
             || style.grid_areas().is_some()
             || parse_flow(style.grid_flow()).is_none()
@@ -5564,6 +5692,8 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 || child_style.float != Float::None
                 || child_style.align_self == AlignSelf::Baseline
                 || child_style.justify_self == AlignSelf::Baseline
+                || marker(child_style, "--w3cos-internal-align-self")
+                    .is_some_and(|keyword| keyword.contains("baseline"))
                 || super::flex::percent_spacing(&child_style.margin)
                 || super::flex::percent_spacing(&child_style.padding)
                 || child_style.custom_properties.as_ref().is_some_and(|props| {
@@ -6810,6 +6940,39 @@ mod tests {
         expect(
             &Component::boxed(auto, items()),
             &[(3, [0.0, 12.0, 50.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn baseline_items_share_the_row_baseline() {
+        // Boxes without lines synthesize the baseline at the border-box
+        // bottom, so the shorter item sits on the taller one's bottom edge
+        // and the row is as tall as the group (30px).
+        let mut style = grid_style(100.0, Some(30.0), Some("50px 50px"));
+        style.align_items = AlignItems::Baseline;
+        expect(
+            &Component::boxed(
+                style,
+                vec![
+                    leaf(block_box(None, Some(30.0))),
+                    leaf(block_box(None, Some(10.0))),
+                ],
+            ),
+            &[(1, [0.0, 0.0, 50.0, 30.0]), (2, [50.0, 20.0, 50.0, 10.0])],
+        );
+        // A top margin counts toward the ascent: the margin box of the
+        // second item (4 + 10) aligns its border bottom with the first.
+        let mut margined = block_box(None, Some(10.0));
+        margined.margin = w3cos_std::style::Edges::default();
+        margined.margin.top = Spacing::Px(4.0);
+        let mut style = grid_style(100.0, Some(30.0), Some("50px 50px"));
+        style.align_items = AlignItems::Baseline;
+        expect(
+            &Component::boxed(
+                style,
+                vec![leaf(block_box(None, Some(30.0))), leaf(margined)],
+            ),
+            &[(1, [0.0, 0.0, 50.0, 30.0]), (2, [50.0, 20.0, 50.0, 10.0])],
         );
     }
 
