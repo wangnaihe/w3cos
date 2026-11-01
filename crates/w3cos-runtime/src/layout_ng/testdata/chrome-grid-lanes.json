@@ -9247,6 +9247,516 @@
      100
     ]
    }
+  },
+  "ir-fill-auto": {
+   "spec": {
+    "name": "ir-fill-auto",
+    "container": {
+     "template": "repeat(auto-fill, auto)"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX"
+     },
+     {
+      "id": "b",
+      "text": "XX",
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "XXXXXX",
+      "place": "span 2"
+     },
+     {
+      "id": "e",
+      "text": "X"
+     }
+    ]
+   },
+   "html": "<div id=ir-fill-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fill, auto);width:200px'><div id=ir-fill-auto-a style=''>XXXX</div><div id=ir-fill-auto-b style='grid-column:span 2'>XX</div><div id=ir-fill-auto-c style=''>XXX</div><div id=ir-fill-auto-d style='grid-column:span 2'>XXXXXX</div><div id=ir-fill-auto-e style=''>X</div></div>",
+   "rects": {
+    "ir-fill-auto": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "ir-fill-auto-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "ir-fill-auto-b": [
+     40,
+     0,
+     80,
+     10
+    ],
+    "ir-fill-auto-c": [
+     120,
+     0,
+     40,
+     10
+    ],
+    "ir-fill-auto-d": [
+     0,
+     10,
+     80,
+     10
+    ],
+    "ir-fill-auto-e": [
+     80,
+     10,
+     40,
+     10
+    ]
+   }
+  },
+  "ir-fill-auto-fixed": {
+   "spec": {
+    "name": "ir-fill-auto-fixed",
+    "container": {
+     "template": "repeat(auto-fill, auto 20px)"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX"
+     },
+     {
+      "id": "b",
+      "text": "XX",
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "XXXXXX",
+      "place": "span 2"
+     },
+     {
+      "id": "e",
+      "text": "X"
+     }
+    ]
+   },
+   "html": "<div id=ir-fill-auto-fixed class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fill, auto 20px);width:200px'><div id=ir-fill-auto-fixed-a style=''>XXXX</div><div id=ir-fill-auto-fixed-b style='grid-column:span 2'>XX</div><div id=ir-fill-auto-fixed-c style=''>XXX</div><div id=ir-fill-auto-fixed-d style='grid-column:span 2'>XXXXXX</div><div id=ir-fill-auto-fixed-e style=''>X</div></div>",
+   "rects": {
+    "ir-fill-auto-fixed": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "ir-fill-auto-fixed-a": [
+     0,
+     0,
+     46.65625,
+     10
+    ],
+    "ir-fill-auto-fixed-b": [
+     46.65625,
+     0,
+     66.671875,
+     10
+    ],
+    "ir-fill-auto-fixed-c": [
+     113.328125,
+     0,
+     20,
+     10
+    ],
+    "ir-fill-auto-fixed-d": [
+     133.328125,
+     0,
+     66.671875,
+     10
+    ],
+    "ir-fill-auto-fixed-e": [
+     0,
+     10,
+     46.65625,
+     10
+    ]
+   }
+  },
+  "ir-fill-minmax-auto": {
+   "spec": {
+    "name": "ir-fill-minmax-auto",
+    "container": {
+     "template": "repeat(auto-fill, minmax(auto, 40px))"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX"
+     },
+     {
+      "id": "b",
+      "text": "XX",
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "XXXXXX",
+      "place": "span 2"
+     },
+     {
+      "id": "e",
+      "text": "X"
+     }
+    ]
+   },
+   "html": "<div id=ir-fill-minmax-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fill, minmax(auto, 40px));width:200px'><div id=ir-fill-minmax-auto-a style=''>XXXX</div><div id=ir-fill-minmax-auto-b style='grid-column:span 2'>XX</div><div id=ir-fill-minmax-auto-c style=''>XXX</div><div id=ir-fill-minmax-auto-d style='grid-column:span 2'>XXXXXX</div><div id=ir-fill-minmax-auto-e style=''>X</div></div>",
+   "rects": {
+    "ir-fill-minmax-auto": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "ir-fill-minmax-auto-a": [
+     0,
+     0,
+     40,
+     10
+    ],
+    "ir-fill-minmax-auto-b": [
+     40,
+     0,
+     80,
+     10
+    ],
+    "ir-fill-minmax-auto-c": [
+     120,
+     0,
+     40,
+     10
+    ],
+    "ir-fill-minmax-auto-d": [
+     0,
+     10,
+     80,
+     10
+    ],
+    "ir-fill-minmax-auto-e": [
+     80,
+     10,
+     40,
+     10
+    ]
+   }
+  },
+  "ir-fit-auto": {
+   "spec": {
+    "name": "ir-fit-auto",
+    "container": {
+     "template": "repeat(auto-fit, auto)",
+     "width": 300
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX"
+     },
+     {
+      "id": "b",
+      "text": "XX",
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "text": "XXX"
+     },
+     {
+      "id": "d",
+      "text": "XXXXXX",
+      "place": "span 2"
+     },
+     {
+      "id": "e",
+      "text": "X"
+     }
+    ]
+   },
+   "html": "<div id=ir-fit-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fit, auto);width:300px'><div id=ir-fit-auto-a style=''>XXXX</div><div id=ir-fit-auto-b style='grid-column:span 2'>XX</div><div id=ir-fit-auto-c style=''>XXX</div><div id=ir-fit-auto-d style='grid-column:span 2'>XXXXXX</div><div id=ir-fit-auto-e style=''>X</div></div>",
+   "rects": {
+    "ir-fit-auto": [
+     0,
+     0,
+     300,
+     10
+    ],
+    "ir-fit-auto-a": [
+     0,
+     0,
+     42.84375,
+     10
+    ],
+    "ir-fit-auto-b": [
+     42.84375,
+     0,
+     85.71875,
+     10
+    ],
+    "ir-fit-auto-c": [
+     128.5625,
+     0,
+     42.859375,
+     10
+    ],
+    "ir-fit-auto-d": [
+     171.421875,
+     0,
+     85.71875,
+     10
+    ],
+    "ir-fit-auto-e": [
+     257.140625,
+     0,
+     42.859375,
+     10
+    ]
+   }
+  },
+  "ir-fit-fixed": {
+   "spec": {
+    "name": "ir-fit-fixed",
+    "container": {
+     "template": "repeat(auto-fit, minmax(30px, 1fr))"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10
+     },
+     {
+      "id": "b",
+      "h": 20
+     }
+    ]
+   },
+   "html": "<div id=ir-fit-fixed class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fit, minmax(30px, 1fr));width:200px'><div id=ir-fit-fixed-a style='height:10px'></div><div id=ir-fit-fixed-b style='height:20px'></div></div>",
+   "rects": {
+    "ir-fit-fixed": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "ir-fit-fixed-a": [
+     0,
+     0,
+     100,
+     10
+    ],
+    "ir-fit-fixed-b": [
+     100,
+     0,
+     100,
+     20
+    ]
+   }
+  },
+  "ir-fit-fixed-fill": {
+   "spec": {
+    "name": "ir-fit-fixed-fill",
+    "container": {
+     "template": "repeat(auto-fill, minmax(30px, 1fr))"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10
+     },
+     {
+      "id": "b",
+      "h": 20
+     }
+    ]
+   },
+   "html": "<div id=ir-fit-fixed-fill class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fill, minmax(30px, 1fr));width:200px'><div id=ir-fit-fixed-fill-a style='height:10px'></div><div id=ir-fit-fixed-fill-b style='height:20px'></div></div>",
+   "rects": {
+    "ir-fit-fixed-fill": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "ir-fit-fixed-fill-a": [
+     0,
+     0,
+     33.328125,
+     10
+    ],
+    "ir-fit-fixed-fill-b": [
+     33.328125,
+     0,
+     33.328125,
+     20
+    ]
+   }
+  },
+  "ir-fit-span": {
+   "spec": {
+    "name": "ir-fit-span",
+    "container": {
+     "template": "repeat(auto-fit, minmax(30px, 1fr))"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10
+     },
+     {
+      "id": "b",
+      "h": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=ir-fit-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:repeat(auto-fit, minmax(30px, 1fr));width:200px'><div id=ir-fit-span-a style='height:10px'></div><div id=ir-fit-span-b style='height:20px;grid-column:span 2'></div><div id=ir-fit-span-c style='height:15px'></div></div>",
+   "rects": {
+    "ir-fit-span": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "ir-fit-span-a": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "ir-fit-span-b": [
+     50,
+     0,
+     100,
+     20
+    ],
+    "ir-fit-span-c": [
+     150,
+     0,
+     50,
+     15
+    ]
+   }
+  },
+  "ir-fit-rows": {
+   "spec": {
+    "name": "ir-fit-rows",
+    "container": {
+     "template": "repeat(auto-fit, auto)",
+     "axis": "row",
+     "height": 100
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 20,
+      "text": "XX"
+     },
+     {
+      "id": "b",
+      "w": 30,
+      "text": "XXXX"
+     },
+     {
+      "id": "c",
+      "h": 20,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=ir-fit-rows class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:repeat(auto-fit, auto);grid-lanes-direction:row;width:200px;height:100px'><div id=ir-fit-rows-a style='width:20px'>XX</div><div id=ir-fit-rows-b style='width:30px'>XXXX</div><div id=ir-fit-rows-c style='width:10px;height:20px'></div></div>",
+   "rects": {
+    "ir-fit-rows": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "ir-fit-rows-a": [
+     0,
+     0,
+     20,
+     33.328125
+    ],
+    "ir-fit-rows-b": [
+     0,
+     33.328125,
+     30,
+     33.328125
+    ],
+    "ir-fit-rows-c": [
+     0,
+     66.65625,
+     10,
+     20
+    ]
+   }
+  },
+  "ir-fill-rows-indef": {
+   "spec": {
+    "name": "ir-fill-rows-indef",
+    "container": {
+     "template": "repeat(auto-fill, 20px)",
+     "axis": "row",
+     "height": 90
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 10
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=ir-fill-rows-indef class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:repeat(auto-fill, 20px);grid-lanes-direction:row;width:200px;height:90px'><div id=ir-fill-rows-indef-a style='width:10px;height:10px'></div><div id=ir-fill-rows-indef-b style='width:20px;height:10px'></div></div>",
+   "rects": {
+    "ir-fill-rows-indef": [
+     0,
+     0,
+     200,
+     90
+    ],
+    "ir-fill-rows-indef-a": [
+     0,
+     0,
+     10,
+     10
+    ],
+    "ir-fill-rows-indef-b": [
+     0,
+     20,
+     20,
+     10
+    ]
+   }
   }
  }
 }

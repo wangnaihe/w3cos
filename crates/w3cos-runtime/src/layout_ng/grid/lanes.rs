@@ -160,8 +160,13 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if template.tracks.is_empty() && template.auto_fit.is_none() {
         return Some("lanes:no-template");
     }
-    if template.auto_fit == Some(true) {
-        return Some("lanes:auto-fit");
+    if template.auto_fit.is_some()
+        && !columns
+        && !matches!(style.height, Dimension::Px(_))
+        && !matches!(style.min_height, Dimension::Px(_))
+    {
+        // The repetition count needs a definite grid-axis size.
+        return Some("lanes:repeat-indefinite");
     }
     if has_marker(style, block::WIDTH_KEYWORD)
         && (!columns
@@ -171,14 +176,6 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     {
         // An intrinsic width is only known for fixed grid-axis tracks.
         return Some("lanes:size-keyword");
-    }
-    if template.auto_fit.is_some()
-        && template
-            .auto_tracks
-            .iter()
-            .any(|track| repeat_basis(track, INF / 2, style.font_size).is_none())
-    {
-        return Some("lanes:intrinsic-repeat");
     }
     if style.grid_auto_row_spec().is_some() || style.grid_auto_column_spec().is_some() {
         return Some("lanes:auto-tracks");
@@ -219,6 +216,16 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
             return Some("lanes:oof");
+        }
+        if template.auto_fit.is_some()
+            && placement(child_style, !columns).is_some_and(|value| {
+                let value = value.trim();
+                !value.starts_with("span") && !value.eq_ignore_ascii_case("auto")
+            })
+        {
+            // An explicit line may fall past the resolved repetition,
+            // which needs implicit tracks this pass does not build.
+            return Some("lanes:repeat-explicit");
         }
         if has_marker(child_style, "--w3cos-internal-overflow-alignment") {
             return Some("lanes:overflow-alignment");
@@ -503,6 +510,16 @@ struct Entry {
 }
 
 /// Lay out one lanes container. `None` falls back to the legacy engine.
+thread_local! {
+    static AS_GRID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last `layout` bailed only because the box should lay out as
+/// an ordinary grid. Reading clears it.
+pub(super) fn take_as_grid() -> bool {
+    AS_GRID.with(|flag| flag.replace(false))
+}
+
 pub(super) fn layout(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -586,12 +603,36 @@ pub(super) fn layout(
         return crate::layout_ng::bail("lanes:repeat-indefinite");
     }
     let inflow = rendered_children(flat, index).count();
-    let specs = expand_auto(
+    // An intrinsic repetition (and `auto-fit`) resolves its count from a
+    // hypothetical track sizing (CSS Grid 3 3.1.1).
+    let intrinsic_repeat = template
+        .auto_tracks
+        .iter()
+        .any(|track| repeat_basis(track, INF / 2, font).is_none());
+    let forced = if template.auto_fit == Some(true) || intrinsic_repeat {
+        Some(repeat_count(
+            flat,
+            index,
+            style,
+            space,
+            &template,
+            columns,
+            grid_available.unwrap_or(0),
+            grid_gap_u,
+            font,
+            inflow,
+            inner_width,
+        )?)
+    } else {
+        None
+    };
+    let mut specs = expand_auto(
         &template,
         grid_available.unwrap_or(0),
         grid_gap_u,
         font,
         inflow,
+        forced,
     )
     .why("lanes:repeat")?;
     let lanes = specs.len();
@@ -610,7 +651,15 @@ pub(super) fn layout(
             Some(start) => Some(start as usize),
             None => None,
         };
-        if place.span > lanes || start.is_some_and(|start| start + place.span > lanes) {
+        // A repeat can resolve to fewer tracks than an auto-placed item
+        // spans; the box then lays out as an ordinary grid, which adds
+        // implicit tracks for the span.
+        if start.is_none() && template.auto_fit.is_some() && place.span > lanes {
+            AS_GRID.with(|flag| flag.set(true));
+            return crate::layout_ng::bail("lanes:span-implicit");
+        }
+        let span = place.span;
+        if span > lanes || start.is_some_and(|start| start + span > lanes) {
             return crate::layout_ng::bail("lanes:span");
         }
         entries.push(Entry {
@@ -618,10 +667,17 @@ pub(super) fn layout(
             source: ordinal,
             order: child_style.order,
             start,
-            span: place.span,
+            span,
         });
     }
     entries.sort_by_key(|entry| (entry.order, entry.source));
+    if template.auto_fit == Some(true) {
+        collapse_empty_repeats(&template, &mut specs, &mut entries)?;
+    }
+    let lanes = specs.len();
+    for entry in entries.iter_mut().filter(|entry| entry.start.is_none()) {
+        entry.span = entry.span.min(lanes);
+    }
 
     let used_of = |extent: i64| {
         let mut used = specified_height.map(units).unwrap_or(extent.max(0));
@@ -651,6 +707,7 @@ pub(super) fn layout(
             reverse,
             &used_of,
             min_h.is_some() || max_h.is_some(),
+            template.auto_fit.is_some(),
         )?
     } else {
         stack_rows(
@@ -666,6 +723,7 @@ pub(super) fn layout(
             specified_height.map(units),
             font,
             reverse,
+            template.auto_fit.is_some(),
         )?
     };
 
@@ -961,11 +1019,11 @@ fn stack_columns(
     reverse: Reverse,
     used_of: &dyn Fn(i64) -> i64,
     clamped: bool,
+    exact: bool,
 ) -> Option<Stacked> {
     let rtl = style.direction == TextDirection::Rtl;
     let lanes = specs.len();
-    let mut col_min = vec![0_i64; lanes];
-    let mut col_max = vec![0_i64; lanes];
+    let mut contribs = Contribs::new(lanes, exact);
     // Virtual items: an auto-placed item contributes at every start line.
     for entry in entries {
         let (min_c, max_c) = inline_minmax(flat, entry.index, space).why("lanes:intrinsic")?;
@@ -974,26 +1032,12 @@ fn stack_columns(
             None => 0..=lanes - entry.span,
         };
         for start in starts {
-            super::add_span_contrib(&mut col_min, &mut col_max, start, entry.span, min_c, max_c);
+            contribs.add(start, entry.span, min_c, max_c);
         }
     }
     let stretch = column_pack(style) == Pack::Stretch;
     let collapsed = vec![false; lanes];
-    let tracks: Vec<_> = specs
-        .iter()
-        .enumerate()
-        .map(|(lane, spec)| {
-            track_from_spec(
-                spec,
-                col_min[lane],
-                col_min[lane],
-                col_max[lane],
-                Some(inner_u),
-                font,
-                stretch,
-            )
-        })
-        .collect();
+    let tracks = contribs.tracks(specs, Some(inner_u), font, column_gap_u, stretch);
     let sizes = finalize(&tracks, Some(inner_u), column_gap_u);
     let free = inner_u - gap_sum(&collapsed, column_gap_u) - sizes.iter().sum::<i64>();
     let (lead, between) = pack_gap(column_pack(style), free, lanes, column_gap_u);
@@ -1182,6 +1226,7 @@ fn stack_rows(
     specified_block: Option<i64>,
     font: f32,
     reverse: Reverse,
+    exact: bool,
 ) -> Option<Stacked> {
     let rtl = style.direction == TextDirection::Rtl;
     let lanes = specs.len();
@@ -1189,8 +1234,7 @@ fn stack_rows(
     // Items do not depend on the lane in the inline axis, so each one is
     // measured once and contributes at every candidate start line.
     let mut measured = Vec::with_capacity(entries.len());
-    let mut row_min = vec![0_i64; lanes];
-    let mut row_max = vec![0_i64; lanes];
+    let mut contribs = Contribs::new(lanes, exact);
     for entry in entries {
         let prepared = prepare(flat, style, space, entry.index, inner, false, None)?;
         let laid = layout_item(
@@ -1232,34 +1276,13 @@ fn stack_rows(
             None => 0..=lanes - entry.span,
         };
         for start in starts {
-            super::add_span_contrib(
-                &mut row_min,
-                &mut row_max,
-                start,
-                entry.span,
-                min_block,
-                max_block,
-            );
+            contribs.add(start, entry.span, min_block, max_block);
         }
         measured.push((prepared, laid.fragment, laid.oof));
     }
     let stretch_rows = row_pack(style) == Pack::Stretch;
     let collapsed = vec![false; lanes];
-    let tracks: Vec<_> = specs
-        .iter()
-        .enumerate()
-        .map(|(lane, spec)| {
-            track_from_spec(
-                spec,
-                row_min[lane],
-                row_min[lane],
-                row_max[lane],
-                definite_block,
-                font,
-                stretch_rows,
-            )
-        })
-        .collect();
+    let tracks = contribs.tracks(specs, definite_block, font, row_gap_u, stretch_rows);
     let mut sizes = if tracks.iter().any(|track| track.flex > 0.0) {
         finalize(&tracks, definite_block, row_gap_u)
     } else {
@@ -1485,5 +1508,280 @@ fn spec_is_intrinsic(spec: &Spec) -> bool {
     match spec {
         Spec::One(breadth) | Spec::Fit(breadth) => intrinsic(breadth),
         Spec::MinMax(min, max) => intrinsic(min) || intrinsic(max),
+    }
+}
+
+/// Block-axis (row lanes) or inline-axis (column lanes) min-content and
+/// max-content contributions of an item to the grid axis.
+fn grid_axis_contribution(
+    flat: &[FlatNodeInfo],
+    style: &Style,
+    space: &ConstraintSpace,
+    child: usize,
+    columns: bool,
+    inner: f32,
+) -> Option<(i64, i64)> {
+    if columns {
+        return inline_minmax(flat, child, space).why("lanes:intrinsic");
+    }
+    let block_of = |width: Option<i64>| -> Option<i64> {
+        let prepared = prepare(flat, style, space, child, inner, false, width)?;
+        let laid = layout_item(
+            flat,
+            child,
+            space,
+            inner,
+            prepared.content_width,
+            prepared.specified_content_h,
+            space.percentage_block,
+        )?;
+        let [mt, _, mb, _] = prepared.margin.map(units);
+        Some(units(laid.fragment.height) + mt + mb)
+    };
+    let natural = block_of(None)?;
+    if !matches!(flat[child].style.width, Dimension::Auto) {
+        return Some((natural, natural));
+    }
+    let (min_c, max_c) = inline_minmax(flat, child, space).why("lanes:intrinsic")?;
+    let min_block = block_of(Some(min_c))?;
+    let max_block = block_of(Some(max_c))?.max(min_block);
+    Some((min_block, max_block))
+}
+
+/// Number of repetitions of an `auto-fill` / `auto-fit` repeat. Every
+/// track (including those outside the repeat) takes the size of a
+/// hypothetical sizing where the repeat is expanded once, item placement is
+/// ignored, and a spanning item contributes its size less the spanned gaps
+/// divided by its span to every track (Chromium
+/// `GetIntrinsicRepeaterTrackSizes`, which uses the growth limit).
+#[allow(clippy::too_many_arguments)]
+fn repeat_count(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    style: &Style,
+    space: &ConstraintSpace,
+    template: &super::Template,
+    columns: bool,
+    available: i64,
+    gap: i64,
+    font: f32,
+    inflow: usize,
+    inner: f32,
+) -> Option<usize> {
+    let fit = template.auto_fit?;
+    let repeat_len = template.auto_tracks.len();
+    // One repetition first, only to resolve the largest item span.
+    let mut one: Vec<Spec> = Vec::new();
+    one.extend_from_slice(&template.tracks[..template.auto_at]);
+    one.extend_from_slice(&template.auto_tracks);
+    one.extend_from_slice(&template.tracks[template.auto_at..]);
+    let names = super::expanded_names(template, one.len());
+    let mut items: Vec<(usize, i64, i64)> = Vec::new();
+    let needs_items = one.iter().any(spec_is_intrinsic);
+    let mut largest = 1;
+    if needs_items {
+        for child in rendered_children(flat, index) {
+            let child_style = flat[child].style;
+            let span = resolve_axis(placement(child_style, !columns), &names, one.len())
+                .map_or(1, |place| place.span)
+                .max(1);
+            largest = largest.max(span);
+            let (min_c, max_c) = grid_axis_contribution(flat, style, space, child, columns, inner)?;
+            items.push((span, min_c, max_c));
+        }
+    }
+    // Expand the repeat to cover every automatic placement of each item:
+    // 2 + (largest span - 2) / tracks in the repeat, rounded down.
+    let reps = if largest < 2 || repeat_len == 0 {
+        1
+    } else {
+        (2 + (largest - 2) / repeat_len).min(super::MAX_REPEAT)
+    };
+    let mut specs: Vec<Spec> = Vec::new();
+    specs.extend_from_slice(&template.tracks[..template.auto_at]);
+    let from = specs.len();
+    for _ in 0..reps {
+        specs.extend_from_slice(&template.auto_tracks);
+    }
+    let to = specs.len();
+    specs.extend_from_slice(&template.tracks[template.auto_at..]);
+    let total = specs.len();
+    let mut contribs = Contribs::new(total, true);
+    for &(span, min_c, max_c) in &items {
+        let span = span.min(total.max(1));
+        for start in 0..=(total - span) {
+            contribs.add(start, span, min_c, max_c);
+        }
+    }
+    let sizes: Vec<i64> = contribs
+        .tracks(&specs, Some(available), font, gap, false)
+        .iter()
+        .map(|track| {
+            if track.cap < INF {
+                track.cap
+            } else {
+                track.base
+            }
+        })
+        .collect();
+    // The hypothetical size of a repeat entry is the largest track with
+    // that index.
+    let entry_sizes: Vec<i64> = (0..repeat_len)
+        .map(|entry| {
+            (0..reps)
+                .map(|rep| sizes[from + rep * repeat_len + entry])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let repeat_sum: i64 = entry_sizes.iter().sum();
+    let outside_sum: i64 = sizes[..from].iter().sum::<i64>() + sizes[to..].iter().sum::<i64>();
+    let outside_len = total - (to - from);
+    let denominator = repeat_sum + repeat_len as i64 * gap;
+    if repeat_len == 0 || denominator <= 0 {
+        return Some(if fit { inflow.max(1) } else { 1 });
+    }
+    let room = available + gap - outside_sum - outside_len as i64 * gap;
+    Some(((room / denominator).max(1) as usize).min(super::MAX_REPEAT))
+}
+
+/// CSS Grid 3 3.3.1: `auto-fit` collapses the repeated tracks no item is
+/// expected to occupy. Tracks holding an explicitly placed item are
+/// occupied, and so are the first N unoccupied tracks, N being the sum of
+/// the auto-placed items' spans. A collapsed track takes no placement; it
+/// is dropped (its gap goes with it).
+fn collapse_empty_repeats(
+    template: &super::Template,
+    specs: &mut Vec<Spec>,
+    entries: &mut [Entry],
+) -> Option<()> {
+    let lanes = specs.len();
+    let added = lanes.saturating_sub(template.tracks.len());
+    let (from, to) = (template.auto_at, template.auto_at + added);
+    let mut occupied = vec![false; lanes];
+    let mut auto_spans = 0;
+    for entry in entries.iter() {
+        match entry.start {
+            Some(start) => {
+                for slot in occupied.iter_mut().skip(start).take(entry.span) {
+                    *slot = true;
+                }
+            }
+            None => auto_spans += entry.span,
+        }
+    }
+    for slot in occupied.iter_mut() {
+        if auto_spans == 0 {
+            break;
+        }
+        if !*slot {
+            *slot = true;
+            auto_spans -= 1;
+        }
+    }
+    let kept: Vec<bool> = (0..lanes)
+        .map(|lane| occupied[lane] || lane < from || lane >= to)
+        .collect();
+    if kept.iter().all(|keep| *keep) {
+        return Some(());
+    }
+    let mut new_index = vec![0_usize; lanes + 1];
+    for lane in 0..lanes {
+        new_index[lane + 1] = new_index[lane] + usize::from(kept[lane]);
+    }
+    if new_index[lanes] == 0 {
+        return crate::layout_ng::bail("lanes:auto-fit-empty");
+    }
+    for entry in entries.iter_mut() {
+        if let Some(start) = entry.start {
+            entry.span = new_index[(start + entry.span).min(lanes)] - new_index[start];
+            entry.start = Some(new_index[start]);
+        }
+    }
+    let mut lane = 0;
+    specs.retain(|_| {
+        let keep = kept[lane];
+        lane += 1;
+        keep
+    });
+    Some(())
+}
+
+/// Track-sizing contributions of the (virtual) items of a lanes axis.
+/// With `exact`, spanning items size the tracks by the CSS Grid 12.5
+/// spanning-item steps; otherwise they spread evenly.
+struct Contribs {
+    min: Vec<i64>,
+    max: Vec<i64>,
+    has_item: Vec<bool>,
+    spanning: Vec<super::SpanItem>,
+    exact: bool,
+}
+
+impl Contribs {
+    fn new(lanes: usize, exact: bool) -> Self {
+        Self {
+            min: vec![0; lanes],
+            max: vec![0; lanes],
+            has_item: vec![false; lanes],
+            spanning: Vec::new(),
+            exact,
+        }
+    }
+
+    fn add(&mut self, start: usize, span: usize, min_c: i64, max_c: i64) {
+        if self.exact && span > 1 {
+            if start + span <= self.min.len() {
+                self.spanning.push(super::SpanItem {
+                    start,
+                    span,
+                    minimum: min_c,
+                    min_c,
+                    max_c,
+                });
+            }
+            return;
+        }
+        if span == 1 && start < self.has_item.len() {
+            self.has_item[start] = true;
+        }
+        super::add_span_contrib(&mut self.min, &mut self.max, start, span, min_c, max_c);
+    }
+
+    fn tracks(
+        &self,
+        specs: &[Spec],
+        available: Option<i64>,
+        font: f32,
+        gap: i64,
+        stretch: bool,
+    ) -> Vec<super::Track> {
+        let mut tracks: Vec<super::Track> = specs
+            .iter()
+            .enumerate()
+            .map(|(lane, spec)| {
+                track_from_spec(
+                    spec,
+                    self.min[lane],
+                    self.min[lane],
+                    self.max[lane],
+                    available,
+                    font,
+                    stretch,
+                )
+            })
+            .collect();
+        if self.exact {
+            super::accommodate_spanning_items(
+                &mut tracks,
+                specs,
+                &self.has_item,
+                &self.spanning,
+                available,
+                font,
+                gap,
+            );
+        }
+        tracks
     }
 }

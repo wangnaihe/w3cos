@@ -144,6 +144,24 @@ def dense_cases():
 CASES += dense_cases()
 
 
+def intrinsic_repeat_cases():
+    t = [it("a", text="XXXX"), it("b", text="XX", place="span 2"), it("c", text="XXX"), it("d", text="XXXXXX", place="span 2"), it("e", text="X")]
+    return [
+        case("ir-fill-auto", "repeat(auto-fill, auto)", t),
+        case("ir-fill-auto-fixed", "repeat(auto-fill, auto 20px)", t),
+        case("ir-fill-minmax-auto", "repeat(auto-fill, minmax(auto, 40px))", t),
+        case("ir-fit-auto", "repeat(auto-fit, auto)", t, width=300),
+        case("ir-fit-fixed", "repeat(auto-fit, minmax(30px, 1fr))", [it("a", h=10), it("b", h=20)]),
+        case("ir-fit-fixed-fill", "repeat(auto-fill, minmax(30px, 1fr))", [it("a", h=10), it("b", h=20)]),
+        case("ir-fit-span", "repeat(auto-fit, minmax(30px, 1fr))", [it("a", h=10), it("b", h=20, place="span 2"), it("c", h=15)]),
+        case("ir-fit-rows", "repeat(auto-fit, auto)", [it("a", text="XX", w=20), it("b", text="XXXX", w=30), it("c", w=10, h=20)], axis="row", height=100),
+        case("ir-fill-rows-indef", "repeat(auto-fill, 20px)", [it("a", w=10, h=10), it("b", w=20, h=10)], axis="row", height=90),
+    ]
+
+
+CASES += intrinsic_repeat_cases()
+
+
 def html(c):
     k = c["container"]
     # The axis follows the template that is set, or the direction keyword.
@@ -189,7 +207,10 @@ def main():
     # One page per case: a failing case cannot hide the others.
     result = {}
     version = subprocess.run([CHROME, "--version"], capture_output=True, text=True).stdout.strip()
+    only = os.environ.get("W3COS_ONLY")
     for c in CASES:
+        if only and not c["name"].startswith(only):
+            continue
         body = html(c)
         page = (
             "<!doctype html><html><head><style>@font-face{font-family:Ahem;src:url(data:font/ttf;base64,"

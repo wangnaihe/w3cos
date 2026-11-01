@@ -2553,11 +2553,13 @@ fn expand_auto(
     gap: i64,
     font: f32,
     min_repeat: usize,
+    forced: Option<usize>,
 ) -> Option<Vec<Spec>> {
     let Some(fit) = template.auto_fit else {
         return Some(template.tracks.clone());
     };
-    let mut count = auto_repeat_count(available, gap, &template.auto_tracks, font);
+    let mut count =
+        forced.unwrap_or_else(|| auto_repeat_count(available, gap, &template.auto_tracks, font));
     if count == 0 {
         // A 0-sized repetition does not limit how many tracks fit.
         // auto-fit collapses the copies items do not occupy; auto-fill
@@ -4132,7 +4134,11 @@ fn layout_impl(
         if measure {
             return super::bail("grid:lanes-measure");
         }
-        return lanes::layout(flat, index, space, sized).map(GridOut::Laid);
+        lanes::take_as_grid();
+        let laid = lanes::layout(flat, index, space, sized);
+        if laid.is_some() || !(lanes::take_as_grid() && lanes_like_grid(flat, index)) {
+            return laid.map(GridOut::Laid);
+        }
     }
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
@@ -4371,6 +4377,7 @@ fn layout_impl(
             column_gap_u,
             font,
             inflow,
+            None,
         )
         .why("grid:repeat")?
     };
@@ -4381,6 +4388,7 @@ fn layout_impl(
         row_gap_u,
         font,
         inflow,
+        None,
     )
     .why("grid:repeat")?;
     let implicit_column = match style.grid_auto_column_spec() {
