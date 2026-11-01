@@ -28816,8 +28816,10 @@ mod tests {
                 w3cos_std::inline_text::SOURCE_RUN.into(),
                 "text:fixture".into(),
             );
-        let expected =
+        let mut expected =
             crate::render_skia::measure_skia_inline_fragment_advances(&texts, &plain).unwrap();
+        let total: f32 = expected.iter().sum();
+        *expected.last_mut().unwrap() += text_layout::inline_layout_advance(total) - total;
         let children = texts
             .into_iter()
             .enumerate()
@@ -28852,7 +28854,7 @@ mod tests {
         assert_eq!(
             widths.into_iter().flatten().collect::<Vec<_>>(),
             expected,
-            "content-box advances must exclude padding and retain unsnapped glyph precision"
+            "content-box advances must exclude padding, retain contextual glyph precision, and snap the completed source once"
         );
     }
 
@@ -54512,6 +54514,26 @@ mod tests {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
+        const OWNER: u64 = 202611010001;
+        struct FontFixture;
+        impl Drop for FontFixture {
+            fn drop(&mut self) {
+                crate::font_face::FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: "W3cosHiddenTinos".into(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register deterministic hidden-source font");
+        let _font = FontFixture;
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         let mut parser = StreamingDocumentParser::new_with_script_host(
@@ -54522,7 +54544,7 @@ mod tests {
         parser
             .write(
                 "<!doctype html><body style='margin:8px'>\
-            <div style='line-height:1.25'>Filler Text1\
+            <div style='font-family:W3cosHiddenTinos;font-size:16px;line-height:20px'>Filler Text1\
             <span style='visibility:hidden'>Filler Text2</span>Filler Text3</div></body>",
             )
             .unwrap();
@@ -54538,11 +54560,12 @@ mod tests {
                     .then(|| layouts.iter().find(|(_, item)| *item == index).unwrap().0.x)
             })
             .collect::<Vec<_>>();
-        // Chrome155 original XHTML Text Ranges, V3395: authored source
-        // advances are 79.921875 and 83.109375, not the sum of rounded words.
+        // Isolated Chrome 155 with the exact same Tinos bytes (SHA-256
+        // cf264a22...) starts each 74.578125px source at these positions.
+        // Visibility changes paint, not inline advance or shaping continuity.
         assert_eq!(
             starts,
-            vec![8.0, 87.921875, 171.03125],
+            vec![8.0, 82.578125, 157.15625],
             "synthetic no-break wrappers must not add a LayoutUnit at each source boundary"
         );
     }

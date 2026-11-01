@@ -11355,7 +11355,11 @@ mod tests {
                 letter_spacing: 32.0,
                 ..Style::default()
             };
-            let font = Font::new(&typeface, style.font_size);
+            // The implementation resolves CSS generic families before shaping.
+            // Measure the expectation with that same resolved face; using the
+            // Times fixture for `monospace` compares unrelated glyph metrics.
+            let resolved = generic_serif_typeface(&style).unwrap_or_else(|| typeface.clone());
+            let font = Font::new(&resolved, style.font_size);
             for text in ["a", "ab", "abc"] {
                 let expected = text
                     .chars()
