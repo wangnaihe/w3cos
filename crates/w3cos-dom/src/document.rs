@@ -5071,7 +5071,7 @@ impl Document {
             if let Some((property, value)) = declared_property_value(properties) {
                 let value = value.trim();
                 keywords[side] = if value.eq_ignore_ascii_case("inherit") {
-                    false
+                    inherited.is_none()
                 } else if matches!(
                     value.to_ascii_lowercase().as_str(),
                     "initial" | "unset" | "revert" | "revert-layer" | "currentcolor"
@@ -26640,6 +26640,50 @@ mod image_component_tests {
     }
 
     #[test]
+    fn pseudo_border_inherit_copies_computed_color_without_rebinding_current_color() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#item::before",
+            &[
+                ("content", "'Before'"),
+                ("color", "red"),
+                ("border", "inherit"),
+            ],
+        );
+        let mut document = Document::new();
+        let item = document.create_element("div");
+        item.set_attribute(&mut document, "id", "item");
+        item.style_mut(&mut document)
+            .set_property("border", "2px solid");
+        document.body().append_child(&mut document, item);
+
+        let parent = document.computed_style_for(item.id);
+        let pseudo = document
+            .generated_pseudo_component(item.id, "::before", &parent)
+            .expect("generated before box");
+        assert_eq!(pseudo.style.color, w3cos_std::Color::rgb(255, 0, 0));
+        for color in [
+            pseudo.style.border_top_color,
+            pseudo.style.border_right_color,
+            pseudo.style.border_bottom_color,
+            pseudo.style.border_left_color,
+        ] {
+            assert_eq!(
+                color.unwrap_or(pseudo.style.border_color),
+                parent.border_color
+            );
+        }
+        assert!(
+            !pseudo
+                .style
+                .border_current_color
+                .is_some_and(|flags| flags.into_iter().any(|flag| flag)),
+            "a copied pseudo border must not rebind to the pseudo foreground color"
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn direction_declared_on_table_row_does_not_reorder_columns() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("#table", &[("display", "table")]);
@@ -29389,6 +29433,33 @@ mod computed_style_cache_tests {
             Some(w3cos_std::Color::rgb(0, 0, 255))
         );
         assert_eq!(style.border_current_color, Some([false; 4]));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn root_border_color_inherit_uses_initial_current_color() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let root = document.create_element("html");
+        root.style_mut(&mut document).set_property("color", "red");
+        root.style_mut(&mut document)
+            .set_property("border-style", "solid");
+        root.style_mut(&mut document)
+            .set_property("border-color", "inherit");
+
+        let style = document.computed_style_inherited(root.id, None);
+        for color in [
+            style.border_top_color,
+            style.border_right_color,
+            style.border_bottom_color,
+            style.border_left_color,
+        ] {
+            assert_eq!(
+                color.unwrap_or(style.border_color),
+                w3cos_std::Color::rgb(255, 0, 0)
+            );
+        }
+        assert_eq!(style.border_current_color, Some([true; 4]));
         crate::stylesheet::clear_rules();
     }
 
