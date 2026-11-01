@@ -215,7 +215,24 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
-            return Some("lanes:oof");
+            let Direction { track_reverse, .. } = lane_direction(style)?;
+            // Track reversal and rtl mirror the grid-axis lines; auto-fit
+            // collapse renumbers them.
+            if track_reverse
+                || style.direction == TextDirection::Rtl
+                || template.auto_fit == Some(true)
+                || template
+                    .tracks
+                    .iter()
+                    .chain(&template.auto_tracks)
+                    .any(|spec| matches!(spec, Spec::Fit(_)))
+            {
+                // fit-content tracks next to auto tracks distribute spanning
+                // items differently from Blink; the track edges only show
+                // through out-of-flow areas.
+                return Some("lanes:oof");
+            }
+            continue;
         }
         if template.auto_fit.is_some()
             && placement(child_style, !columns).is_some_and(|value| {
@@ -602,7 +619,9 @@ pub(super) fn layout(
     if template.auto_fit.is_some() && grid_available.is_none() {
         return crate::layout_ng::bail("lanes:repeat-indefinite");
     }
-    let inflow = rendered_children(flat, index).count();
+    let inflow = rendered_children(flat, index)
+        .filter(|&child| !oof::is_out_of_flow(flat[child].style))
+        .count();
     // An intrinsic repetition (and `auto-fit`) resolves its count from a
     // hypothetical track sizing (CSS Grid 3 3.1.1).
     let intrinsic_repeat = template
@@ -642,7 +661,15 @@ pub(super) fn layout(
 
     let mut entries = Vec::new();
     let names = super::expanded_names(&template, lanes);
-    for (ordinal, child) in rendered_children(flat, index).enumerate() {
+    let mut oof_children = Vec::new();
+    let in_flow = rendered_children(flat, index).filter(|&child| {
+        let out = oof::is_out_of_flow(flat[child].style);
+        if out {
+            oof_children.push(child);
+        }
+        !out
+    });
+    for (ordinal, child) in in_flow.enumerate() {
         let child_style = flat[child].style;
         let place =
             resolve_axis(placement(child_style, !columns), &names, lanes).why("lanes:placement")?;
@@ -693,7 +720,7 @@ pub(super) fn layout(
         fill: fill_reverse,
         track: track_reverse,
     };
-    let (children, mut pending_oof, stacking_extent) = if columns {
+    let (children, mut pending_oof, stacking_extent, geometry) = if columns {
         stack_columns(
             flat,
             style,
@@ -707,7 +734,7 @@ pub(super) fn layout(
             reverse,
             &used_of,
             min_h.is_some() || max_h.is_some(),
-            template.auto_fit.is_some(),
+            true,
         )?
     } else {
         stack_rows(
@@ -723,7 +750,7 @@ pub(super) fn layout(
             specified_height.map(units),
             font,
             reverse,
-            template.auto_fit.is_some(),
+            true,
         )?
     };
 
@@ -764,6 +791,30 @@ pub(super) fn layout(
         .collect();
     for candidate in &mut pending_oof {
         *candidate = candidate.translated(ox, oy);
+    }
+    if !oof_children.is_empty() {
+        let frame = OofFrame {
+            columns,
+            fill_reverse,
+            origin_x,
+            origin_y,
+            inner_u,
+            used,
+            height,
+            lanes,
+            padding: [pt, pr, pb, pl],
+            geometry: &geometry,
+            names: &super::expanded_names(&template, lanes),
+        };
+        place_oof_children(
+            flat,
+            style,
+            space,
+            &oof_children,
+            &frame,
+            &mut children,
+            &mut pending_oof,
+        )?;
     }
     if style.position != Position::Static && !pending_oof.is_empty() {
         let cb = oof::ContainingBlock {
@@ -816,7 +867,16 @@ struct Reverse {
 }
 
 type Placed = Vec<(f32, f32, BoxFragment)>;
-type Stacked = (Placed, Vec<OofCandidate>, i64);
+/// Placement of the lane axis (sizes and offsets per track).
+#[derive(Default, Clone)]
+struct Geometry {
+    sizes: Vec<i64>,
+    pos: Vec<i64>,
+    collapsed: Vec<bool>,
+    between: i64,
+}
+
+type Stacked = (Placed, Vec<OofCandidate>, i64, Geometry);
 
 struct Prepared {
     content_width: f32,
@@ -1209,7 +1269,13 @@ fn stack_columns(
         placed.push((source, cross + dx, from_units(y) + dy, fragment, oof));
     }
     placed.sort_by_key(|item| item.0);
-    Some(unzip_placed(placed, extent))
+    let geometry = Geometry {
+        sizes: sizes.clone(),
+        pos: column_x.clone(),
+        collapsed: collapsed.clone(),
+        between,
+    };
+    Some(unzip_placed(placed, extent, geometry))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1477,12 +1543,19 @@ fn stack_rows(
         placed.push((source, from_units(x) + dx, cross + dy, fragment, oof));
     }
     placed.sort_by_key(|item| item.0);
-    Some(unzip_placed(placed, used))
+    let geometry = Geometry {
+        sizes: sizes.clone(),
+        pos: row_y.clone(),
+        collapsed: collapsed.clone(),
+        between,
+    };
+    Some(unzip_placed(placed, used, geometry))
 }
 
 fn unzip_placed(
     placed: Vec<(usize, f32, f32, BoxFragment, Vec<OofCandidate>)>,
     extent: i64,
+    geometry: Geometry,
 ) -> Stacked {
     let mut children = Vec::with_capacity(placed.len());
     let mut oof = Vec::new();
@@ -1490,7 +1563,7 @@ fn unzip_placed(
         oof.extend(item_oof.iter().map(|candidate| candidate.translated(x, y)));
         children.push((x, y, fragment));
     }
-    (children, oof, extent)
+    (children, oof, extent, geometry)
 }
 
 fn is_dense(style: &Style) -> bool {
@@ -1582,6 +1655,9 @@ fn repeat_count(
     if needs_items {
         for child in rendered_children(flat, index) {
             let child_style = flat[child].style;
+            if oof::is_out_of_flow(child_style) {
+                continue;
+            }
             let span = resolve_axis(placement(child_style, !columns), &names, one.len())
                 .map_or(1, |place| place.span)
                 .max(1);
@@ -1784,4 +1860,224 @@ impl Contribs {
         }
         tracks
     }
+}
+
+/// Layout state an out-of-flow child of a lanes container needs.
+struct OofFrame<'a> {
+    columns: bool,
+    fill_reverse: bool,
+    origin_x: i64,
+    origin_y: i64,
+    inner_u: i64,
+    used: i64,
+    height: f32,
+    lanes: usize,
+    /// Top, right, bottom and left padding.
+    padding: [f32; 4],
+    geometry: &'a Geometry,
+    names: &'a [Vec<String>],
+}
+
+/// Out-of-flow children of a lanes container behave as in a grid whose
+/// grid-axis tracks are the lanes and whose other axis is one area spanning
+/// the content box (CSS Grid 3 abspos; Blink GridLanesLayoutAlgorithm).
+/// Under `fill-reverse` the static position sits at the end of the
+/// stacking axis, as the content does.
+fn place_oof_children(
+    flat: &[FlatNodeInfo],
+    style: &Style,
+    space: &ConstraintSpace,
+    oof_children: &[usize],
+    frame: &OofFrame,
+    children: &mut Vec<(f32, f32, BoxFragment)>,
+    pending_oof: &mut Vec<OofCandidate>,
+) -> Option<()> {
+    let OofFrame {
+        columns: lane_columns,
+        fill_reverse,
+        origin_x,
+        origin_y,
+        inner_u,
+        used,
+        height,
+        lanes,
+        padding: [pt, pr, pb, pl],
+        geometry,
+        ..
+    } = *frame;
+    let none = Geometry::default();
+    let (col_geom, row_geom) = if lane_columns {
+        (geometry, &none)
+    } else {
+        (&none, geometry)
+    };
+    let names = frame.names;
+    let empty_names: &[Vec<String>] = &[];
+    let (names_cols, names_rows, explicit_cols, explicit_rows) = if lane_columns {
+        (names, empty_names, lanes, 0)
+    } else {
+        (empty_names, names, 0, lanes)
+    };
+    for &child in oof_children {
+        let child_style = flat[child].style;
+        let padded = |a: Spacing, b: Spacing| {
+            [a, b]
+                .iter()
+                .any(|side| matches!(side, Spacing::Px(px) if *px > 0.0))
+        };
+        let column = super::resolve_abspos_axis(
+            placement(child_style, false),
+            names_cols,
+            explicit_cols,
+            padded(style.padding.left, style.padding.right),
+        )
+        .why("lanes:oof-column")?;
+        let row = super::resolve_abspos_axis(
+            placement(child_style, true),
+            names_rows,
+            explicit_rows,
+            padded(style.padding.top, style.padding.bottom),
+        )
+        .why("lanes:oof-row")?;
+        let col = column.start.unwrap_or(0).max(0) as usize;
+        let row_index = row.start.unwrap_or(0).max(0) as usize;
+        let static_only = style.position == Position::Static;
+        let area_w = if col_geom.sizes.is_empty() || static_only {
+            inner_u
+        } else {
+            span_sum(
+                &col_geom.sizes,
+                &col_geom.collapsed,
+                col,
+                column.span,
+                col_geom.between,
+            )
+        };
+        let area_h = if row_geom.sizes.is_empty() || static_only {
+            used
+        } else {
+            span_sum(
+                &row_geom.sizes,
+                &row_geom.collapsed,
+                row_index,
+                row.span,
+                row_geom.between,
+            )
+        };
+        let (col_at, row_at) = if static_only {
+            (0, 0)
+        } else {
+            (
+                col_geom.pos.get(col).copied().unwrap_or(0),
+                row_geom.pos.get(row_index).copied().unwrap_or(0),
+            )
+        };
+        let mut justify = align_pack(used_item_align(
+            style.justify_items,
+            child_style.justify_self,
+        ));
+        let mut align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        if fill_reverse {
+            if lane_columns {
+                align = Pack::End;
+            } else {
+                justify = Pack::End;
+            }
+        }
+        let border_w = super::definite_border(
+            child_style,
+            false,
+            from_units(area_w),
+            from_units(used),
+            space,
+        );
+        let border_h = super::definite_border(
+            child_style,
+            true,
+            from_units(inner_u),
+            from_units(area_h),
+            space,
+        );
+        let inline_off = border_w
+            .map(|size| axis_offset(area_w, size, 0, 0, false, false, justify).2)
+            .unwrap_or(0);
+        let block_off = border_h
+            .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
+            .unwrap_or(0);
+        let candidate = OofCandidate {
+            index: child,
+            static_inline: from_units(origin_x + col_at + inline_off),
+            static_block: from_units(origin_y + row_at + block_off),
+            static_rtl: false,
+        };
+        if static_only {
+            pending_oof.push(candidate);
+            continue;
+        }
+        let (start_auto, end_auto) = super::abspos_auto_lines(placement(child_style, false));
+        let (x0, x1) = super::abspos_area(
+            &col_geom.sizes,
+            &col_geom.pos,
+            column.start,
+            column.span,
+            start_auto,
+            end_auto,
+            (-units(pl), inner_u + units(pr)),
+        );
+        let (start_auto, end_auto) = super::abspos_auto_lines(placement(child_style, true));
+        let (y0, y1) = super::abspos_area(
+            &row_geom.sizes,
+            &row_geom.pos,
+            row.start,
+            row.span,
+            start_auto,
+            end_auto,
+            (-units(pt), units(height) + units(pb)),
+        );
+        let (area_w, area_h) = (x1 - x0, y1 - y0);
+        let border_w = super::definite_border(
+            child_style,
+            false,
+            from_units(area_w),
+            from_units(area_h),
+            space,
+        );
+        let border_h = super::definite_border(
+            child_style,
+            true,
+            from_units(area_w),
+            from_units(area_h),
+            space,
+        );
+        let inline_off = border_w
+            .map(|size| axis_offset(area_w, size, 0, 0, false, false, justify).2)
+            .unwrap_or(0);
+        let block_off = border_h
+            .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
+            .unwrap_or(0);
+        let cb = oof::ContainingBlock {
+            x: from_units(origin_x + x0),
+            y: from_units(origin_y + y0),
+            width: from_units(area_w),
+            height: from_units(area_h),
+            rtl: false,
+        };
+        let candidate = OofCandidate {
+            static_inline: from_units(origin_x + x0 + inline_off),
+            static_block: from_units(origin_y + y0 + block_off),
+            ..candidate
+        };
+        let (placed, rest) = oof::resolve(
+            flat,
+            vec![candidate],
+            &cb,
+            false,
+            space.viewport_w,
+            space.viewport_h,
+        )
+        .why("lanes:oof-resolve")?;
+        children.extend(placed);
+        pending_oof.extend(rest);
+    }
+    Some(())
 }

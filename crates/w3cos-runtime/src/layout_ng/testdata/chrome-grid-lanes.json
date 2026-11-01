@@ -9757,6 +9757,2111 @@
      10
     ]
    }
+  },
+  "oof-rel-col-auto": {
+   "spec": {
+    "name": "oof-rel-col-auto",
+    "container": {
+     "template": "50px 50px",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-rel-col-auto-a style='height:20px'></div><div id=oof-rel-col-auto-b style='height:30px'></div><div id=oof-rel-col-auto-c style='height:10px'></div><div id=oof-rel-col-auto-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-col-auto": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-rel-col-auto-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-rel-col-auto-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-rel-col-auto-c": [
+     0,
+     20,
+     50,
+     10
+    ],
+    "oof-rel-col-auto-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-place": {
+   "spec": {
+    "name": "oof-rel-col-place",
+    "container": {
+     "template": "50px 50px",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-place class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-rel-col-place-a style='height:20px'></div><div id=oof-rel-col-place-b style='height:30px'></div><div id=oof-rel-col-place-c style='height:10px'></div><div id=oof-rel-col-place-o style='width:10px;height:10px;grid-column:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-col-place": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-rel-col-place-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-rel-col-place-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-rel-col-place-c": [
+     0,
+     20,
+     50,
+     10
+    ],
+    "oof-rel-col-place-o": [
+     50,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-inset": {
+   "spec": {
+    "name": "oof-rel-col-inset",
+    "container": {
+     "template": "50px 50px",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {
+       "left": 5,
+       "top": 5,
+       "right": 5,
+       "bottom": 5
+      },
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-inset class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-rel-col-inset-a style='height:20px'></div><div id=oof-rel-col-inset-b style='height:30px'></div><div id=oof-rel-col-inset-c style='height:10px'></div><div id=oof-rel-col-inset-o style='grid-column:2;position:absolute;left:5px;top:5px;right:5px;bottom:5px'></div></div>",
+   "rects": {
+    "oof-rel-col-inset": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-rel-col-inset-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-rel-col-inset-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-rel-col-inset-c": [
+     0,
+     20,
+     50,
+     10
+    ],
+    "oof-rel-col-inset-o": [
+     55,
+     5,
+     140,
+     20
+    ]
+   }
+  },
+  "oof-rel-col-span": {
+   "spec": {
+    "name": "oof-rel-col-span",
+    "container": {
+     "template": "50px 50px 50px",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {
+       "left": 0,
+       "top": 0
+      },
+      "h": 10,
+      "w": 10,
+      "place": "2 / span 2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-span class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;width:200px'><div id=oof-rel-col-span-a style='height:20px'></div><div id=oof-rel-col-span-b style='height:30px'></div><div id=oof-rel-col-span-c style='height:10px'></div><div id=oof-rel-col-span-o style='width:10px;height:10px;grid-column:2 / span 2;position:absolute;left:0px;top:0px'></div></div>",
+   "rects": {
+    "oof-rel-col-span": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-rel-col-span-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-rel-col-span-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-rel-col-span-c": [
+     100,
+     0,
+     50,
+     10
+    ],
+    "oof-rel-col-span-o": [
+     50,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-fillrev": {
+   "spec": {
+    "name": "oof-rel-col-fillrev",
+    "container": {
+     "template": "50px 50px",
+     "axis": "column fill-reverse",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-fillrev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;grid-lanes-direction:column fill-reverse;width:200px'><div id=oof-rel-col-fillrev-a style='height:20px'></div><div id=oof-rel-col-fillrev-b style='height:30px'></div><div id=oof-rel-col-fillrev-c style='height:10px'></div><div id=oof-rel-col-fillrev-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-col-fillrev": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-rel-col-fillrev-a": [
+     0,
+     10,
+     50,
+     20
+    ],
+    "oof-rel-col-fillrev-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-rel-col-fillrev-c": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "oof-rel-col-fillrev-o": [
+     0,
+     20,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-fillrev-h": {
+   "spec": {
+    "name": "oof-rel-col-fillrev-h",
+    "container": {
+     "template": "50px 50px",
+     "axis": "column fill-reverse",
+     "height": 100,
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-fillrev-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;grid-lanes-direction:column fill-reverse;width:200px;height:100px'><div id=oof-rel-col-fillrev-h-a style='height:20px'></div><div id=oof-rel-col-fillrev-h-b style='height:30px'></div><div id=oof-rel-col-fillrev-h-c style='height:10px'></div><div id=oof-rel-col-fillrev-h-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-col-fillrev-h": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "oof-rel-col-fillrev-h-a": [
+     0,
+     80,
+     50,
+     20
+    ],
+    "oof-rel-col-fillrev-h-b": [
+     50,
+     70,
+     50,
+     30
+    ],
+    "oof-rel-col-fillrev-h-c": [
+     0,
+     70,
+     50,
+     10
+    ],
+    "oof-rel-col-fillrev-h-o": [
+     0,
+     90,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-only": {
+   "spec": {
+    "name": "oof-rel-col-only",
+    "container": {
+     "template": "50px 50px",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-only class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-rel-col-only-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-col-only": [
+     0,
+     0,
+     200,
+     0
+    ],
+    "oof-rel-col-only-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-gap": {
+   "spec": {
+    "name": "oof-rel-col-gap",
+    "container": {
+     "template": "50px 50px",
+     "gap": [
+      4,
+      6
+     ],
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {
+       "left": 2,
+       "top": 2
+      },
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-gap class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;row-gap:4px;column-gap:6px;width:200px'><div id=oof-rel-col-gap-a style='height:20px'></div><div id=oof-rel-col-gap-b style='height:30px'></div><div id=oof-rel-col-gap-c style='height:10px'></div><div id=oof-rel-col-gap-o style='width:10px;height:10px;grid-column:2;position:absolute;left:2px;top:2px'></div></div>",
+   "rects": {
+    "oof-rel-col-gap": [
+     0,
+     0,
+     200,
+     34
+    ],
+    "oof-rel-col-gap-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-rel-col-gap-b": [
+     56,
+     0,
+     50,
+     30
+    ],
+    "oof-rel-col-gap-c": [
+     0,
+     24,
+     50,
+     10
+    ],
+    "oof-rel-col-gap-o": [
+     58,
+     2,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-col-order": {
+   "spec": {
+    "name": "oof-rel-col-order",
+    "container": {
+     "template": "40px 40px",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     },
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-col-order class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px;width:200px'><div id=oof-rel-col-order-o style='width:10px;height:10px;position:absolute'></div><div id=oof-rel-col-order-a style='height:20px'></div><div id=oof-rel-col-order-b style='height:15px'></div></div>",
+   "rects": {
+    "oof-rel-col-order": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "oof-rel-col-order-o": [
+     0,
+     0,
+     10,
+     10
+    ],
+    "oof-rel-col-order-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "oof-rel-col-order-b": [
+     40,
+     0,
+     40,
+     15
+    ]
+   }
+  },
+  "oof-rel-row-auto": {
+   "spec": {
+    "name": "oof-rel-row-auto",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-row-auto class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px'><div id=oof-rel-row-auto-a style='width:60px;height:10px'></div><div id=oof-rel-row-auto-b style='width:40px;height:10px'></div><div id=oof-rel-row-auto-c style='width:50px;height:10px'></div><div id=oof-rel-row-auto-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-row-auto": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-rel-row-auto-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-rel-row-auto-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-rel-row-auto-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-rel-row-auto-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-row-place": {
+   "spec": {
+    "name": "oof-rel-row-place",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-row-place class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px'><div id=oof-rel-row-place-a style='width:60px;height:10px'></div><div id=oof-rel-row-place-b style='width:40px;height:10px'></div><div id=oof-rel-row-place-c style='width:50px;height:10px'></div><div id=oof-rel-row-place-o style='width:10px;height:10px;grid-row:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-row-place": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-rel-row-place-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-rel-row-place-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-rel-row-place-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-rel-row-place-o": [
+     0,
+     30,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-row-inset": {
+   "spec": {
+    "name": "oof-rel-row-inset",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {
+       "left": 3,
+       "top": 3,
+       "right": 3,
+       "bottom": 3
+      },
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-row-inset class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px'><div id=oof-rel-row-inset-a style='width:60px;height:10px'></div><div id=oof-rel-row-inset-b style='width:40px;height:10px'></div><div id=oof-rel-row-inset-c style='width:50px;height:10px'></div><div id=oof-rel-row-inset-o style='grid-row:2;position:absolute;left:3px;top:3px;right:3px;bottom:3px'></div></div>",
+   "rects": {
+    "oof-rel-row-inset": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-rel-row-inset-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-rel-row-inset-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-rel-row-inset-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-rel-row-inset-o": [
+     3,
+     33,
+     194,
+     24
+    ]
+   }
+  },
+  "oof-rel-row-fillrev": {
+   "spec": {
+    "name": "oof-rel-row-fillrev",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row fill-reverse",
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-row-fillrev class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row fill-reverse;width:200px'><div id=oof-rel-row-fillrev-a style='width:60px;height:10px'></div><div id=oof-rel-row-fillrev-b style='width:40px;height:10px'></div><div id=oof-rel-row-fillrev-c style='width:50px;height:10px'></div><div id=oof-rel-row-fillrev-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-row-fillrev": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-rel-row-fillrev-a": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "oof-rel-row-fillrev-b": [
+     160,
+     30,
+     40,
+     10
+    ],
+    "oof-rel-row-fillrev-c": [
+     110,
+     30,
+     50,
+     10
+    ],
+    "oof-rel-row-fillrev-o": [
+     190,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-row-h": {
+   "spec": {
+    "name": "oof-rel-row-h",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "height": 100,
+     "position": "relative"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-row-h class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px;height:100px'><div id=oof-rel-row-h-a style='width:60px;height:10px'></div><div id=oof-rel-row-h-b style='width:40px;height:10px'></div><div id=oof-rel-row-h-c style='width:50px;height:10px'></div><div id=oof-rel-row-h-o style='width:10px;height:10px;grid-row:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-row-h": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "oof-rel-row-h-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-rel-row-h-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-rel-row-h-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-rel-row-h-o": [
+     0,
+     30,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-auto": {
+   "spec": {
+    "name": "oof-sta-col-auto",
+    "container": {
+     "template": "50px 50px",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-auto class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-sta-col-auto-a style='height:20px'></div><div id=oof-sta-col-auto-b style='height:30px'></div><div id=oof-sta-col-auto-c style='height:10px'></div><div id=oof-sta-col-auto-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-col-auto": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-sta-col-auto-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-sta-col-auto-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-sta-col-auto-c": [
+     0,
+     20,
+     50,
+     10
+    ],
+    "oof-sta-col-auto-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-place": {
+   "spec": {
+    "name": "oof-sta-col-place",
+    "container": {
+     "template": "50px 50px",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-place class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-sta-col-place-a style='height:20px'></div><div id=oof-sta-col-place-b style='height:30px'></div><div id=oof-sta-col-place-c style='height:10px'></div><div id=oof-sta-col-place-o style='width:10px;height:10px;grid-column:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-col-place": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-sta-col-place-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-sta-col-place-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-sta-col-place-c": [
+     0,
+     20,
+     50,
+     10
+    ],
+    "oof-sta-col-place-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-span": {
+   "spec": {
+    "name": "oof-sta-col-span",
+    "container": {
+     "template": "50px 50px 50px",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {
+       "left": 0,
+       "top": 0
+      },
+      "h": 10,
+      "w": 10,
+      "place": "2 / span 2"
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-span class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px 50px;width:200px'><div id=oof-sta-col-span-a style='height:20px'></div><div id=oof-sta-col-span-b style='height:30px'></div><div id=oof-sta-col-span-c style='height:10px'></div><div id=oof-sta-col-span-o style='width:10px;height:10px;grid-column:2 / span 2;position:absolute;left:0px;top:0px'></div></div>",
+   "rects": {
+    "oof-sta-col-span": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-sta-col-span-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-sta-col-span-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-sta-col-span-c": [
+     100,
+     0,
+     50,
+     10
+    ],
+    "oof-sta-col-span-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-fillrev": {
+   "spec": {
+    "name": "oof-sta-col-fillrev",
+    "container": {
+     "template": "50px 50px",
+     "axis": "column fill-reverse",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-fillrev class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;grid-lanes-direction:column fill-reverse;width:200px'><div id=oof-sta-col-fillrev-a style='height:20px'></div><div id=oof-sta-col-fillrev-b style='height:30px'></div><div id=oof-sta-col-fillrev-c style='height:10px'></div><div id=oof-sta-col-fillrev-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-col-fillrev": [
+     0,
+     0,
+     200,
+     30
+    ],
+    "oof-sta-col-fillrev-a": [
+     0,
+     10,
+     50,
+     20
+    ],
+    "oof-sta-col-fillrev-b": [
+     50,
+     0,
+     50,
+     30
+    ],
+    "oof-sta-col-fillrev-c": [
+     0,
+     0,
+     50,
+     10
+    ],
+    "oof-sta-col-fillrev-o": [
+     0,
+     20,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-fillrev-h": {
+   "spec": {
+    "name": "oof-sta-col-fillrev-h",
+    "container": {
+     "template": "50px 50px",
+     "axis": "column fill-reverse",
+     "height": 100,
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-fillrev-h class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;grid-lanes-direction:column fill-reverse;width:200px;height:100px'><div id=oof-sta-col-fillrev-h-a style='height:20px'></div><div id=oof-sta-col-fillrev-h-b style='height:30px'></div><div id=oof-sta-col-fillrev-h-c style='height:10px'></div><div id=oof-sta-col-fillrev-h-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-col-fillrev-h": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "oof-sta-col-fillrev-h-a": [
+     0,
+     80,
+     50,
+     20
+    ],
+    "oof-sta-col-fillrev-h-b": [
+     50,
+     70,
+     50,
+     30
+    ],
+    "oof-sta-col-fillrev-h-c": [
+     0,
+     70,
+     50,
+     10
+    ],
+    "oof-sta-col-fillrev-h-o": [
+     0,
+     90,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-only": {
+   "spec": {
+    "name": "oof-sta-col-only",
+    "container": {
+     "template": "50px 50px",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-only class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;width:200px'><div id=oof-sta-col-only-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-col-only": [
+     0,
+     0,
+     200,
+     0
+    ],
+    "oof-sta-col-only-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-gap": {
+   "spec": {
+    "name": "oof-sta-col-gap",
+    "container": {
+     "template": "50px 50px",
+     "gap": [
+      4,
+      6
+     ],
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 30
+     },
+     {
+      "id": "c",
+      "h": 10
+     },
+     {
+      "id": "o",
+      "abs": {
+       "left": 2,
+       "top": 2
+      },
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-gap class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:50px 50px;row-gap:4px;column-gap:6px;width:200px'><div id=oof-sta-col-gap-a style='height:20px'></div><div id=oof-sta-col-gap-b style='height:30px'></div><div id=oof-sta-col-gap-c style='height:10px'></div><div id=oof-sta-col-gap-o style='width:10px;height:10px;grid-column:2;position:absolute;left:2px;top:2px'></div></div>",
+   "rects": {
+    "oof-sta-col-gap": [
+     0,
+     0,
+     200,
+     34
+    ],
+    "oof-sta-col-gap-a": [
+     0,
+     0,
+     50,
+     20
+    ],
+    "oof-sta-col-gap-b": [
+     56,
+     0,
+     50,
+     30
+    ],
+    "oof-sta-col-gap-c": [
+     0,
+     24,
+     50,
+     10
+    ],
+    "oof-sta-col-gap-o": [
+     2,
+     2,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-col-order": {
+   "spec": {
+    "name": "oof-sta-col-order",
+    "container": {
+     "template": "40px 40px",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     },
+     {
+      "id": "a",
+      "h": 20
+     },
+     {
+      "id": "b",
+      "h": 15
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-col-order class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:40px 40px;width:200px'><div id=oof-sta-col-order-o style='width:10px;height:10px;position:absolute'></div><div id=oof-sta-col-order-a style='height:20px'></div><div id=oof-sta-col-order-b style='height:15px'></div></div>",
+   "rects": {
+    "oof-sta-col-order": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "oof-sta-col-order-o": [
+     0,
+     0,
+     10,
+     10
+    ],
+    "oof-sta-col-order-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "oof-sta-col-order-b": [
+     40,
+     0,
+     40,
+     15
+    ]
+   }
+  },
+  "oof-sta-row-auto": {
+   "spec": {
+    "name": "oof-sta-row-auto",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-row-auto class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px'><div id=oof-sta-row-auto-a style='width:60px;height:10px'></div><div id=oof-sta-row-auto-b style='width:40px;height:10px'></div><div id=oof-sta-row-auto-c style='width:50px;height:10px'></div><div id=oof-sta-row-auto-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-row-auto": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-sta-row-auto-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-sta-row-auto-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-sta-row-auto-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-sta-row-auto-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-row-place": {
+   "spec": {
+    "name": "oof-sta-row-place",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-row-place class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px'><div id=oof-sta-row-place-a style='width:60px;height:10px'></div><div id=oof-sta-row-place-b style='width:40px;height:10px'></div><div id=oof-sta-row-place-c style='width:50px;height:10px'></div><div id=oof-sta-row-place-o style='width:10px;height:10px;grid-row:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-row-place": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-sta-row-place-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-sta-row-place-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-sta-row-place-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-sta-row-place-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-row-fillrev": {
+   "spec": {
+    "name": "oof-sta-row-fillrev",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row fill-reverse",
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-row-fillrev class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row fill-reverse;width:200px'><div id=oof-sta-row-fillrev-a style='width:60px;height:10px'></div><div id=oof-sta-row-fillrev-b style='width:40px;height:10px'></div><div id=oof-sta-row-fillrev-c style='width:50px;height:10px'></div><div id=oof-sta-row-fillrev-o style='width:10px;height:10px;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-row-fillrev": [
+     0,
+     0,
+     200,
+     60
+    ],
+    "oof-sta-row-fillrev-a": [
+     140,
+     0,
+     60,
+     10
+    ],
+    "oof-sta-row-fillrev-b": [
+     160,
+     30,
+     40,
+     10
+    ],
+    "oof-sta-row-fillrev-c": [
+     110,
+     30,
+     50,
+     10
+    ],
+    "oof-sta-row-fillrev-o": [
+     190,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-sta-row-h": {
+   "spec": {
+    "name": "oof-sta-row-h",
+    "container": {
+     "template": "30px 30px",
+     "axis": "row",
+     "height": 100,
+     "position": "static"
+    },
+    "items": [
+     {
+      "id": "a",
+      "h": 10,
+      "w": 60
+     },
+     {
+      "id": "b",
+      "h": 10,
+      "w": 40
+     },
+     {
+      "id": "c",
+      "h": 10,
+      "w": 50
+     },
+     {
+      "id": "o",
+      "abs": {},
+      "h": 10,
+      "w": 10,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-sta-row-h class=case style='position:static;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:30px 30px;grid-lanes-direction:row;width:200px;height:100px'><div id=oof-sta-row-h-a style='width:60px;height:10px'></div><div id=oof-sta-row-h-b style='width:40px;height:10px'></div><div id=oof-sta-row-h-c style='width:50px;height:10px'></div><div id=oof-sta-row-h-o style='width:10px;height:10px;grid-row:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-sta-row-h": [
+     0,
+     0,
+     200,
+     100
+    ],
+    "oof-sta-row-h-a": [
+     0,
+     0,
+     60,
+     10
+    ],
+    "oof-sta-row-h-b": [
+     0,
+     30,
+     40,
+     10
+    ],
+    "oof-sta-row-h-c": [
+     40,
+     30,
+     50,
+     10
+    ],
+    "oof-sta-row-h-o": [
+     0,
+     0,
+     10,
+     10
+    ]
+   }
+  },
+  "oof-rel-span-mc": {
+   "spec": {
+    "name": "oof-rel-span-mc",
+    "container": {
+     "template": "minmax(0px, min-content) 5px"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "1"
+     },
+     {
+      "id": "o2",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-mc class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5px;width:200px'><div id=oof-rel-span-mc-a style='grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-mc-o1 style='width:5px;height:5px;grid-column:1;position:absolute'></div><div id=oof-rel-span-mc-o2 style='width:5px;height:5px;grid-column:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-span-mc": [
+     0,
+     0,
+     200,
+     20
+    ],
+    "oof-rel-span-mc-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "oof-rel-span-mc-o1": [
+     0,
+     0,
+     5,
+     5
+    ],
+    "oof-rel-span-mc-o2": [
+     35,
+     0,
+     5,
+     5
+    ]
+   }
+  },
+  "oof-rel-span-xc": {
+   "spec": {
+    "name": "oof-rel-span-xc",
+    "container": {
+     "template": "5px minmax(0px, max-content)"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "1"
+     },
+     {
+      "id": "o2",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-xc class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:5px minmax(0px, max-content);width:200px'><div id=oof-rel-span-xc-a style='grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-xc-o1 style='width:5px;height:5px;grid-column:1;position:absolute'></div><div id=oof-rel-span-xc-o2 style='width:5px;height:5px;grid-column:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-span-xc": [
+     0,
+     0,
+     200,
+     10
+    ],
+    "oof-rel-span-xc-a": [
+     0,
+     0,
+     90,
+     10
+    ],
+    "oof-rel-span-xc-o1": [
+     0,
+     0,
+     5,
+     5
+    ],
+    "oof-rel-span-xc-o2": [
+     5,
+     0,
+     5,
+     5
+    ]
+   }
+  },
+  "oof-rel-span-mm": {
+   "spec": {
+    "name": "oof-rel-span-mm",
+    "container": {
+     "template": "minmax(0px, min-content) 5% minmax(0px, max-content)"
+    },
+    "items": [
+     {
+      "id": "a",
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "1"
+     },
+     {
+      "id": "o2",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "2"
+     },
+     {
+      "id": "o3",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "3"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-mm class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5% minmax(0px, max-content);width:200px'><div id=oof-rel-span-mm-a style='grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-mm-o1 style='width:5px;height:5px;grid-column:1;position:absolute'></div><div id=oof-rel-span-mm-o2 style='width:5px;height:5px;grid-column:2;position:absolute'></div><div id=oof-rel-span-mm-o3 style='width:5px;height:5px;grid-column:3;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-span-mm": [
+     0,
+     0,
+     200,
+     10
+    ],
+    "oof-rel-span-mm-a": [
+     0,
+     0,
+     90,
+     10
+    ],
+    "oof-rel-span-mm-o1": [
+     0,
+     0,
+     5,
+     5
+    ],
+    "oof-rel-span-mm-o2": [
+     15,
+     0,
+     5,
+     5
+    ],
+    "oof-rel-span-mm-o3": [
+     25,
+     0,
+     5,
+     5
+    ]
+   }
+  },
+  "oof-rel-span-minw15": {
+   "spec": {
+    "name": "oof-rel-span-minw15",
+    "container": {
+     "template": "minmax(0px, min-content) 5px",
+     "justify": "start",
+     "width": 100
+    },
+    "items": [
+     {
+      "id": "a",
+      "min_w": 15,
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "1"
+     },
+     {
+      "id": "o2",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-minw15 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5px;justify-items:start;width:100px'><div id=oof-rel-span-minw15-a style='min-width:15px;grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-minw15-o1 style='width:5px;height:5px;grid-column:1;position:absolute'></div><div id=oof-rel-span-minw15-o2 style='width:5px;height:5px;grid-column:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-span-minw15": [
+     0,
+     0,
+     100,
+     20
+    ],
+    "oof-rel-span-minw15-a": [
+     0,
+     0,
+     40,
+     20
+    ],
+    "oof-rel-span-minw15-o1": [
+     0,
+     0,
+     5,
+     5
+    ],
+    "oof-rel-span-minw15-o2": [
+     35,
+     0,
+     5,
+     5
+    ]
+   }
+  },
+  "oof-rel-span-minw55": {
+   "spec": {
+    "name": "oof-rel-span-minw55",
+    "container": {
+     "template": "minmax(0px, min-content) 5px",
+     "justify": "start",
+     "width": 100
+    },
+    "items": [
+     {
+      "id": "a",
+      "min_w": 55,
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "1"
+     },
+     {
+      "id": "o2",
+      "abs": {},
+      "h": 5,
+      "w": 5,
+      "place": "2"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-minw55 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5px;justify-items:start;width:100px'><div id=oof-rel-span-minw55-a style='min-width:55px;grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-minw55-o1 style='width:5px;height:5px;grid-column:1;position:absolute'></div><div id=oof-rel-span-minw55-o2 style='width:5px;height:5px;grid-column:2;position:absolute'></div></div>",
+   "rects": {
+    "oof-rel-span-minw55": [
+     0,
+     0,
+     100,
+     20
+    ],
+    "oof-rel-span-minw55-a": [
+     0,
+     0,
+     55,
+     20
+    ],
+    "oof-rel-span-minw55-o1": [
+     0,
+     0,
+     5,
+     5
+    ],
+    "oof-rel-span-minw55-o2": [
+     50,
+     0,
+     5,
+     5
+    ]
+   }
+  },
+  "oof-rel-span-area": {
+   "spec": {
+    "name": "oof-rel-span-area",
+    "container": {
+     "template": "minmax(0px, min-content) 5px",
+     "justify": "start",
+     "width": 100,
+     "pad": 10
+    },
+    "items": [
+     {
+      "id": "a",
+      "min_w": 15,
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {
+       "left": 0,
+       "right": 0,
+       "top": 0,
+       "bottom": 0
+      },
+      "place": "1 / 2"
+     },
+     {
+      "id": "o2",
+      "abs": {
+       "left": 0,
+       "right": 0,
+       "top": 0,
+       "bottom": 0
+      },
+      "place": "2 / 3"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-area class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5px;justify-items:start;padding-top:10px;border:2px solid;width:100px'><div id=oof-rel-span-area-a style='min-width:15px;grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-area-o1 style='grid-column:1 / 2;position:absolute;left:0px;right:0px;top:0px;bottom:0px'></div><div id=oof-rel-span-area-o2 style='grid-column:2 / 3;position:absolute;left:0px;right:0px;top:0px;bottom:0px'></div></div>",
+   "rects": {
+    "oof-rel-span-area": [
+     0,
+     0,
+     104,
+     34
+    ],
+    "oof-rel-span-area-a": [
+     2,
+     12,
+     40,
+     20
+    ],
+    "oof-rel-span-area-o1": [
+     2,
+     2,
+     35,
+     30
+    ],
+    "oof-rel-span-area-o2": [
+     37,
+     2,
+     5,
+     30
+    ]
+   }
+  },
+  "oof-rel-span-pct": {
+   "spec": {
+    "name": "oof-rel-span-pct",
+    "container": {
+     "template": "minmax(0px, min-content) 5px",
+     "justify": "start",
+     "width": 100,
+     "pad": 10
+    },
+    "items": [
+     {
+      "id": "a",
+      "min_w": 15,
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {
+       "width": "100%",
+       "height": "5px"
+      },
+      "place": "1 / 2"
+     },
+     {
+      "id": "o2",
+      "abs": {
+       "width": "100%",
+       "height": "5px"
+      },
+      "place": "2 / 3"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-pct class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5px;justify-items:start;padding-top:10px;border:2px solid;width:100px'><div id=oof-rel-span-pct-a style='min-width:15px;grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-pct-o1 style='grid-column:1 / 2;position:absolute;width:100%;height:5px'></div><div id=oof-rel-span-pct-o2 style='grid-column:2 / 3;position:absolute;width:100%;height:5px'></div></div>",
+   "rects": {
+    "oof-rel-span-pct": [
+     0,
+     0,
+     104,
+     34
+    ],
+    "oof-rel-span-pct-a": [
+     2,
+     12,
+     40,
+     20
+    ],
+    "oof-rel-span-pct-o1": [
+     2,
+     2,
+     35,
+     5
+    ],
+    "oof-rel-span-pct-o2": [
+     37,
+     2,
+     5,
+     5
+    ]
+   }
+  },
+  "oof-rel-span-pcth": {
+   "spec": {
+    "name": "oof-rel-span-pcth",
+    "container": {
+     "template": "minmax(0px, min-content) 5px",
+     "justify": "start",
+     "width": 100,
+     "pad": 10,
+     "height": 20
+    },
+    "items": [
+     {
+      "id": "a",
+      "min_w": 15,
+      "h": 20,
+      "text": "XXXX XXXX",
+      "place": "1 / -1"
+     },
+     {
+      "id": "o1",
+      "abs": {
+       "width": "100%",
+       "height": "5px"
+      },
+      "place": "1 / 2"
+     },
+     {
+      "id": "o2",
+      "abs": {
+       "width": "100%",
+       "height": "5px"
+      },
+      "place": "2 / 3"
+     }
+    ]
+   },
+   "html": "<div id=oof-rel-span-pcth class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-columns:minmax(0px, min-content) 5px;justify-items:start;padding-top:10px;border:2px solid;width:100px;height:20px'><div id=oof-rel-span-pcth-a style='height:20px;min-width:15px;grid-column:1 / -1'>XXXX XXXX</div><div id=oof-rel-span-pcth-o1 style='grid-column:1 / 2;position:absolute;width:100%;height:5px'></div><div id=oof-rel-span-pcth-o2 style='grid-column:2 / 3;position:absolute;width:100%;height:5px'></div></div>",
+   "rects": {
+    "oof-rel-span-pcth": [
+     0,
+     0,
+     104,
+     34
+    ],
+    "oof-rel-span-pcth-a": [
+     2,
+     12,
+     40,
+     20
+    ],
+    "oof-rel-span-pcth-o1": [
+     2,
+     2,
+     35,
+     5
+    ],
+    "oof-rel-span-pcth-o2": [
+     37,
+     2,
+     5,
+     5
+    ]
+   }
   }
  }
 }

@@ -10167,6 +10167,11 @@ fn grid_lanes_matches_chrome() {
                 .map(Dimension::Px)
                 .unwrap_or(Dimension::Auto),
             custom_properties: Some(CustomProperties::from_iter(markers)),
+            position: if container["position"].as_str() == Some("static") {
+                w3cos_std::style::Position::Static
+            } else {
+                w3cos_std::style::Position::Relative
+            },
             ..font.clone()
         };
         if let Some(value) = container["align"].as_str() {
@@ -10175,6 +10180,17 @@ fn grid_lanes_matches_chrome() {
             } else {
                 style.align_items = align_items(value);
             }
+        }
+        if let Some(value) = container["justify"].as_str() {
+            if rows_axis {
+                style.align_items = align_items(value);
+            } else {
+                style.justify_items = align_items(value);
+            }
+        }
+        if let Some(pad) = number(&container["pad"]) {
+            style.padding = margins(pad, 0.0, 0.0, 0.0);
+            style.border_width = 2.0;
         }
         if let Some(gap) = container["gap"].as_array() {
             style.row_gap = number(&gap[0]);
@@ -10199,11 +10215,34 @@ fn grid_lanes_matches_chrome() {
                 order: item["order"].as_i64().unwrap_or(0) as i32,
                 ..font.clone()
             };
+            if let Some(min) = number(&item["min_w"]) {
+                item_style.min_width = Dimension::Px(min);
+            }
             if let Some(value) = item["self"].as_str() {
                 if rows_axis {
                     item_style.justify_self = align_self(value);
                 } else {
                     item_style.align_self = align_self(value);
+                }
+            }
+            if let Some(offsets) = item["abs"].as_object() {
+                item_style.position = w3cos_std::style::Position::Absolute;
+                for (side, value) in offsets {
+                    let value = match value.as_str() {
+                        Some(text) if text.ends_with('%') => {
+                            Dimension::Percent(text.trim_end_matches('%').parse().unwrap())
+                        }
+                        Some(text) => Dimension::Px(text.trim_end_matches("px").parse().unwrap()),
+                        None => Dimension::Px(number(value).unwrap()),
+                    };
+                    match side.as_str() {
+                        "width" => item_style.width = value,
+                        "height" => item_style.height = value,
+                        "left" => item_style.left = value,
+                        "top" => item_style.top = value,
+                        "right" => item_style.right = value,
+                        _ => item_style.bottom = value,
+                    }
                 }
             }
             if let Some(margin) = number(&item["margin"]) {
