@@ -867,6 +867,14 @@ impl FontRegistry {
         style: FontFaceStyle,
         text: &str,
     ) -> Option<LoadedFont> {
+        let is_cascade_winner_for_all = |font: &LoadedFont| {
+            !stack.contains(',')
+                || text.chars().all(|character| {
+                    let glyph = crate::text_layout::font_glyph_character(character);
+                    self.resolve_render_stack(stack, weight, style, Some(glyph))
+                        .is_some_and(|resolved| resolved.cache_key() == font.cache_key())
+                })
+        };
         let key = face_hit_key(stack, weight, style);
         if let Some(cached) = FACE_HIT.with(|slot| {
             slot.borrow()
@@ -877,6 +885,7 @@ impl FontRegistry {
                 && text.chars().all(|character| {
                     cached.supports_character(crate::text_layout::font_glyph_character(character))
                 })
+                && is_cascade_winner_for_all(&cached)
             {
                 return Some(cached);
             }
@@ -890,6 +899,12 @@ impl FontRegistry {
         if text.chars().any(|character| {
             !font.supports_character(crate::text_layout::font_glyph_character(character))
         }) {
+            return None;
+        }
+        // Coverage alone is insufficient for a multi-family stack. A later
+        // fallback may cover the complete string while an earlier family wins
+        // individual characters (for example `Ahem, Second` and `ŢT`).
+        if !is_cascade_winner_for_all(&font) {
             return None;
         }
         FACE_HIT.with(|slot| *slot.borrow_mut() = Some((key, font.clone())));
@@ -2010,6 +2025,12 @@ mod tests {
             font_family: Some("\"Ahem\", Second".into()),
             ..Default::default()
         };
+        let primed = registry.resolve_style_runs(&style, "\u{0162}");
+        assert_eq!(
+            primed[0].font.as_ref().map(|font| font.family.as_str()),
+            Some("Second"),
+            "the uncovered first character primes the later fallback face"
+        );
         let runs = registry.resolve_style_runs(&style, "\u{0162}T");
         let families = runs
             .iter()
