@@ -5492,7 +5492,10 @@ fn vertical_container_markers_ok(style: &Style) -> bool {
                     )
                 });
             }
-            key == ALIGN_ITEMS_STRETCH || key == JUSTIFY_ITEMS_STRETCH
+            key == ALIGN_ITEMS_STRETCH
+                || key == JUSTIFY_ITEMS_STRETCH
+                || key == "--w3cos-internal-align-items"
+                || key == "--w3cos-internal-align-self"
         })
     })
 }
@@ -5564,7 +5567,11 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 || super::flex::percent_spacing(&child_style.margin)
                 || super::flex::percent_spacing(&child_style.padding)
                 || child_style.custom_properties.as_ref().is_some_and(|props| {
-                    props.keys().any(|key| key.starts_with("--w3cos-internal-"))
+                    props.keys().any(|key| {
+                        key.starts_with("--w3cos-internal-")
+                            && key != "--w3cos-internal-align-self"
+                            && key != "--w3cos-internal-align-items"
+                    })
                 })
             {
                 simple = false;

@@ -10267,3 +10267,71 @@ fn grid_lanes_matches_chrome() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// max-width-violation.html: an inflexible (clamped) item keeps its max
+/// width and the 0.8-grow sibling takes 0.8 of the remaining 650px.
+#[test]
+fn clamped_inflexible_item_leaves_free_space_to_fractional_grow() {
+    use w3cos_std::style::{FlexDirection, Overflow, Position};
+    let col1 = node(
+        Style {
+            width: Dimension::Px(800.0),
+            max_width: Dimension::Px(150.0),
+            overflow: Overflow::Auto,
+            ..block()
+        },
+        vec![Component::text("Column 1", Style::default())],
+    );
+    let col2 = node(
+        Style {
+            flex_grow: 0.8,
+            flex_shrink: 0.0,
+            flex_basis: Dimension::Px(0.0),
+            ..block()
+        },
+        // Its automatic minimum (60px) must not enter the initial free
+        // space, which counts flex base sizes (CSS Flexbox 9.7.3).
+        vec![node(
+            Style {
+                width: Dimension::Px(60.0),
+                ..sized(10.0)
+            },
+            vec![],
+        )],
+    );
+    let red = node(
+        Style {
+            position: Position::Absolute,
+            width: Dimension::Px(510.0),
+            height: Dimension::Px(10.0),
+            ..block()
+        },
+        vec![],
+    );
+    for with_red in [false, true] {
+        let mut kids = vec![col1.clone(), col2.clone()];
+        if with_red {
+            kids.insert(0, red.clone());
+        }
+        let fc = node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                width: Dimension::Px(800.0),
+                ..Style::default()
+            },
+            kids,
+        );
+        let root = node(block(), vec![fc]);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        let n = if with_red { 3 } else { 2 };
+        eprintln!(
+            "red={with_red} col1={:?} col2={:?}",
+            rect(&ng, n),
+            rect(&ng, n + 2)
+        );
+        assert_eq!(rect(&ng, n).2, 150.0);
+        assert!((rect(&ng, n + 2).2 - 520.0).abs() < 0.01);
+    }
+}

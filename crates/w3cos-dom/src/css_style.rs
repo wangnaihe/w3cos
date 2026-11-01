@@ -75,6 +75,12 @@ pub const STRETCH_PROPERTY: &str = "--w3cos-internal-stretch";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
+/// Authored `align-self` / `align-items` keyword (lower-cased). The enums
+/// fold `start`, `self-end`, `normal`, `last baseline`, ... into other
+/// values; LayoutNG reads the keyword for the static position of an
+/// abspos flex child.
+pub const ALIGN_SELF_KEYWORD_PROPERTY: &str = "--w3cos-internal-align-self";
+pub const ALIGN_ITEMS_KEYWORD_PROPERTY: &str = "--w3cos-internal-align-items";
 /// Authored `align-items` / `justify-items: stretch`. The enum folds
 /// `normal` into `stretch`, but a replaced grid item behaves as `start`
 /// for `normal` and stretches only for the explicit keyword. Present only
@@ -778,6 +784,12 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => {
                 self.inner.align_items = parse_align_items(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    ALIGN_ITEMS_KEYWORD_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
                 set_marker(
                     &mut self.inner,
                     ALIGN_ITEMS_STRETCH_PROPERTY,
@@ -2111,7 +2123,15 @@ impl CSSStyleDeclaration {
                     self.inner.order = v
                 }
             }
-            "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "align-self" | "alignSelf" => {
+                self.inner.align_self = parse_align_self(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    ALIGN_SELF_KEYWORD_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
+            }
             "vertical-align" | "verticalAlign" => {
                 let value = value.trim();
                 const KEYWORD_MARKER: &str = "--w3cos-internal-vertical-align-keyword";

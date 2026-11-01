@@ -138,7 +138,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
-            return Some("flex:oof");
+            continue;
         }
         if child_style.float != Float::None {
             return Some("flex:float");
@@ -197,15 +197,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             if blocked {
                 return Some("flex:column-percent");
             }
-        }
-        let (cross_start, cross_end) = cross_margin_sides(
-            child_style,
-            style.flex_direction,
-            style.flex_wrap == FlexWrap::WrapReverse,
-            flip(style),
-        );
-        if matches!(cross_start, Spacing::Auto) || matches!(cross_end, Spacing::Auto) {
-            return Some("flex:auto-cross-margin");
         }
     }
     None
@@ -381,6 +372,10 @@ struct Item {
     cross: Option<f32>,
     /// The cross size property was `auto` (stretch may assign it).
     cross_auto: bool,
+    /// `auto` cross margins: they take the line's positive free space
+    /// (CSS Flexbox §8.1) and the item then ignores `align-self`.
+    auto_cross_start: bool,
+    auto_cross_end: bool,
     align: AlignItems,
     frozen: bool,
 }
@@ -388,6 +383,24 @@ struct Item {
 impl Item {
     fn outer_main(&self) -> f32 {
         outer_at(self, self.content)
+    }
+
+    /// The cross margins after auto margins absorbed `extra` (the line's
+    /// size minus the item's margin box); negative free space leaves them 0.
+    fn cross_margins(&self, extra: f32) -> (f32, f32) {
+        let (mut start, mut end) = (self.margin_cross_start, self.margin_cross_end);
+        if extra > 0.0 {
+            match (self.auto_cross_start, self.auto_cross_end) {
+                (true, true) => {
+                    start += extra / 2.0;
+                    end += extra / 2.0;
+                }
+                (true, false) => start += extra,
+                (false, true) => end += extra,
+                (false, false) => {}
+            }
+        }
+        (start, end)
     }
 
     fn margin_box_cross(&self) -> f32 {
@@ -510,6 +523,23 @@ fn cross_margin_sides(
         (end, start)
     } else {
         (start, end)
+    }
+}
+
+/// The item's alignment in the container's cross axis: an item with an
+/// `auto` cross margin ignores `align-self` (Flexbox §8.1; it neither
+/// stretches nor joins a baseline group) and sits at the cross start.
+fn item_align(container: &Style, child: &Style) -> AlignItems {
+    let (start, end) = cross_margin_sides(
+        child,
+        container.flex_direction,
+        container.flex_wrap == FlexWrap::WrapReverse,
+        flip(container),
+    );
+    if matches!(start, Spacing::Auto) || matches!(end, Spacing::Auto) {
+        AlignItems::FlexStart
+    } else {
+        used_align(container.align_items, child.align_self)
     }
 }
 
@@ -1594,6 +1624,22 @@ fn distribute(items: &mut [Item], inner: f32, gap_sum: f32) {
             item.frozen = true;
         }
     }
+    // §9.7.3: the initial free space counts frozen items at their target
+    // size and the others at their flex base size (not the clamped
+    // hypothetical size); the sub-one scaling below uses this value.
+    let initial_free = {
+        let used: f32 = items
+            .iter()
+            .map(|item| {
+                if item.frozen {
+                    item.outer_main()
+                } else {
+                    outer_at(item, item.base.max(0.0))
+                }
+            })
+            .sum();
+        inner - used - gap_sum
+    };
     for _ in 0..items.len() + 1 {
         let mut frozen_sum = 0.0;
         let mut base_sum = 0.0;
@@ -2058,6 +2104,31 @@ pub(super) fn layout(
     space: &ConstraintSpace,
     sized: Option<(f32, Option<f32>)>,
 ) -> Option<LayoutResult> {
+    let result = layout_with(flat, index, space, sized, None);
+    if result.is_none()
+        && let Some(height) = CLAMP_RETRY.with(|cell| cell.take())
+    {
+        // A multi-line row container with an automatic block size whose
+        // packed lines hit `max-height` / `min-height`: the lines are
+        // aligned within the clamped size, so lay it out again with that
+        // size as definite.
+        return layout_with(flat, index, space, sized, Some(height));
+    }
+    CLAMP_RETRY.with(|cell| cell.set(None));
+    result
+}
+
+thread_local! {
+    static CLAMP_RETRY: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+fn layout_with(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+    sized: Option<(f32, Option<f32>)>,
+    height_override: Option<f32>,
+) -> Option<LayoutResult> {
     let style = flat[index].style;
     let mut metrics: BoxMetrics = block::resolve_inline(style, space);
     if let Some((width, _)) = sized {
@@ -2083,6 +2154,9 @@ pub(super) fn layout(
             None => None,
         }
     };
+    if height_override.is_some() {
+        specified_height = height_override;
+    }
     // `max-height` is the line-breaking limit when the block size is auto,
     // but the used block size is the flexed line (Chrome). `aspect-ratio`
     // transfers a definite width into a definite block size.
@@ -2144,10 +2218,12 @@ pub(super) fn layout(
     };
 
     let mut items = Vec::new();
+    let mut oof_children = Vec::new();
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
-            return super::bail("flex:oof");
+            oof_children.push(child);
+            continue;
         }
         if child_style.float != Float::None {
             return super::bail("flex:float");
@@ -2163,7 +2239,7 @@ pub(super) fn layout(
             && style.flex_wrap == FlexWrap::NoWrap
             && matches!(child_style.height, Dimension::Auto)
             && !block::is_replaced(flat[child].kind)
-            && used_align(style.align_items, child_style.align_self) == AlignItems::Stretch
+            && item_align(style, child_style) == AlignItems::Stretch
             && let Some(line) = specified_height
         {
             basis_space = ConstraintSpace {
@@ -2198,6 +2274,10 @@ pub(super) fn layout(
         if (!row && (auto_main_start || auto_main_end)) && specified_height.is_none() {
             return super::bail("flex:auto-margin");
         }
+        let (auto_cross_start, auto_cross_end) = (
+            matches!(cross_start, Spacing::Auto),
+            matches!(cross_end, Spacing::Auto),
+        );
         let margin_main_start = spacing_px(child_style, main_start, inner_width, space);
         let margin_main_end = spacing_px(child_style, main_end, inner_width, space);
         let margin_cross_start = spacing_px(child_style, cross_start, inner_width, space);
@@ -2236,7 +2316,7 @@ pub(super) fn layout(
         // fit-content; `cross_auto` stays set so the line can still stretch
         // the item after align-content grows the line.
         if !row && cross.is_none() {
-            let align = used_align(style.align_items, child_style.align_self);
+            let align = item_align(style, child_style);
             let mut available =
                 (inner_width - margin_cross_start - margin_cross_end - cross_edges).max(0.0);
             // A balanced container with several lines measures each item
@@ -2442,7 +2522,9 @@ pub(super) fn layout(
             auto_main_end,
             cross,
             cross_auto,
-            align: used_align(style.align_items, child_style.align_self),
+            auto_cross_start,
+            auto_cross_end,
+            align: item_align(style, child_style),
             frozen: false,
         });
     }
@@ -2466,6 +2548,7 @@ pub(super) fn layout(
             inner,
             main_is_max,
             gap,
+            &oof_children,
         );
     }
 
@@ -2659,6 +2742,7 @@ pub(super) fn layout(
         // flex-end. A definite cross size does not stretch; it aligns as
         // flex-start.
         let extra = line_inner - margin_box;
+        let (margin_cross_start, _) = item.cross_margins(extra);
         let from_start = match item.align {
             AlignItems::FlexEnd => extra,
             AlignItems::Center => extra / 2.0,
@@ -2669,9 +2753,9 @@ pub(super) fn layout(
         };
         let cross = if reverse_cross {
             let border_cross = item.cross.unwrap_or(0.0) + item.cross_edges;
-            line_origin + line_inner - from_start - item.margin_cross_start - border_cross
+            line_origin + line_inner - from_start - margin_cross_start - border_cross
         } else {
-            item.margin_cross_start + from_start
+            margin_cross_start + from_start
         };
         let cross = unit(cross);
         let (x, y) = if row {
@@ -2757,6 +2841,15 @@ pub(super) fn layout(
             height = height.max(min);
         }
     }
+    oof.extend(oof_candidates(
+        flat,
+        &oof_children,
+        style,
+        space,
+        (bl + pl, bt + pt),
+        width,
+        height,
+    )?);
     let border_width = width + bl + br + pl + pr;
     let border_height = height + bt + bb + pt + pb;
     if style.position != w3cos_std::style::Position::Static && !oof.is_empty() {
@@ -2950,6 +3043,7 @@ fn layout_wrapped(
     inner_main: f32,
     main_is_max: bool,
     main_gap: f32,
+    oof_children: &[usize],
 ) -> Option<LayoutResult> {
     let direction = style.flex_direction;
     let row = row_axis(direction);
@@ -3205,6 +3299,7 @@ fn layout_wrapped(
             let margin_box = item.margin_box_cross();
             // Unsafe alignment, as in the single-line path.
             let extra = line_size - margin_box;
+            let (margin_cross_start, _) = item.cross_margins(extra);
             let from_cross_start = match item.align {
                 AlignItems::FlexEnd => extra,
                 AlignItems::Center => extra / 2.0,
@@ -3219,9 +3314,9 @@ fn layout_wrapped(
             // it at the bottom. The offset is the border box from the line's
             // physical top.
             let cross = if reverse_cross {
-                line_size - from_cross_start - item.margin_cross_start - border_cross
+                line_size - from_cross_start - margin_cross_start - border_cross
             } else {
-                from_cross_start + item.margin_cross_start
+                from_cross_start + margin_cross_start
             };
             let cross = unit(cross);
             let (x, y) = if row {
@@ -3307,7 +3402,7 @@ fn layout_wrapped(
     {
         let max = to_content_h(max);
         if height > max + EPS {
-            return super::bail("flex:clamp");
+            return clamp_retry(row && specified_height.is_none(), max);
         }
         height = height.min(max);
     }
@@ -3316,11 +3411,20 @@ fn layout_wrapped(
         if !matches!(style.min_height, Dimension::Auto) {
             let min = to_content_h(min);
             if height + EPS < min {
-                return super::bail("flex:clamp");
+                return clamp_retry(row && specified_height.is_none(), min);
             }
             height = height.max(min);
         }
     }
+    oof_out.extend(oof_candidates(
+        flat,
+        oof_children,
+        style,
+        space,
+        (bl + pl, bt + pt),
+        width,
+        height,
+    )?);
     let border_width = width + bl + br + pl + pr;
     let border_height = height + bt + bb + pt + pb;
     if style.position != w3cos_std::style::Position::Static && !oof_out.is_empty() {
@@ -3406,6 +3510,221 @@ fn clamp_cross(
 
 /// Border plus padding on one axis. Percentage padding resolves against
 /// the flex container's content width (CSS 2.1 8.4).
+/// Static positions of the container's abspos children (Flexbox §4.1): each
+/// sits where it would as the sole item of the content box, so
+/// `justify-content` places it on the main axis and `align-self` on the
+/// cross axis (stretch, normal and baseline act as flex-start; the
+/// distribution values fall back to flex-start / center). `width` and
+/// `height` are the content box. Offsets are relative to the border box.
+/// A shape whose alignment needs the child's size (not a fixed px size) or
+/// overflows, or the rtl / vertical flips, stay on legacy.
+#[allow(clippy::too_many_arguments)]
+fn oof_candidates(
+    flat: &[FlatNodeInfo],
+    children: &[usize],
+    style: &Style,
+    space: &ConstraintSpace,
+    origin: (f32, f32),
+    width: f32,
+    height: f32,
+) -> Option<Vec<oof::OofCandidate>> {
+    if children.is_empty() {
+        return Some(Vec::new());
+    }
+    let flipped = flip(style);
+    if flipped.x || flipped.y {
+        return super::bail("flex:oof-flip");
+    }
+    if style.flex_wrap != FlexWrap::NoWrap && style.align_content != AlignContent::Stretch {
+        return super::bail("flex:oof-align-content");
+    }
+    let direction = style.flex_direction;
+    let row = row_axis(direction);
+    let reverse = reverse_axis(direction);
+    let wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
+    let (main_size, cross_size) = if row {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let mut out = Vec::with_capacity(children.len());
+    for &child in children {
+        let child_style = flat[child].style;
+        // The margin box along the physical axis; `None` when not fixed.
+        let margin_box = |horizontal: bool| -> Option<f32> {
+            let dim = if horizontal {
+                child_style.width
+            } else {
+                child_style.height
+            };
+            let Dimension::Px(size) = dim else {
+                return None;
+            };
+            let (a, b) = if horizontal {
+                (child_style.margin.left, child_style.margin.right)
+            } else {
+                (child_style.margin.top, child_style.margin.bottom)
+            };
+            let (Spacing::Px(a), Spacing::Px(b)) = (a, b) else {
+                return None;
+            };
+            let edges = item_edges(child_style, space, 0.0, horizontal);
+            Some(to_content(child_style, edges, size) + edges + a + b)
+        };
+        let (main_factor, main_reversed, main_safe) =
+            main_alignment(style, row, reverse).why("flex:oof-justify")?;
+        let (cross_factor, cross_reversed, cross_safe) =
+            cross_alignment(style, child_style, wrap_reverse).why("flex:oof-align")?;
+        let axis = |area: f32, factor: f32, reversed: bool, horizontal: bool, safe: bool| {
+            let size = margin_box(horizontal);
+            if factor == 0.0 && !reversed {
+                return Some(0.0);
+            }
+            let size = size?;
+            let free = area - size;
+            // Overflow: `safe` falls back to the start edge; otherwise the
+            // alignment is unsafe and the offset goes negative.
+            let offset = if free < 0.0 && (factor == 0.0 || safe) {
+                0.0
+            } else {
+                free * factor
+            };
+            Some(if reversed {
+                area - offset - size
+            } else {
+                offset
+            })
+        };
+        let main =
+            axis(main_size, main_factor, main_reversed, row, main_safe).why("flex:oof-size")?;
+        let cross = axis(cross_size, cross_factor, cross_reversed, !row, cross_safe)
+            .why("flex:oof-size")?;
+        let (x, y) = if row { (main, cross) } else { (cross, main) };
+        out.push(oof::OofCandidate {
+            index: child,
+            static_inline: origin.0 + x,
+            static_block: origin.1 + y,
+            static_rtl: false,
+        });
+    }
+    Some(out)
+}
+
+/// Ask `layout` to lay the container out again at `height`, or bail.
+fn clamp_retry(retry: bool, height: f32) -> Option<LayoutResult> {
+    if retry {
+        CLAMP_RETRY.with(|cell| cell.set(Some(height)));
+        return None;
+    }
+    super::bail("flex:clamp")
+}
+
+fn custom_property<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(key))
+        .map(String::as_str)
+}
+
+/// `(factor, reversed, safe)`: the share of the free space before the
+/// margin box, whether the axis runs end to start physically, and whether
+/// overflow falls back to the start. `None` for a keyword not modelled.
+fn main_alignment(style: &Style, row: bool, reverse: bool) -> Option<(f32, bool, bool)> {
+    let enum_keyword = match style.justify_content {
+        JustifyContent::FlexStart => "normal",
+        JustifyContent::FlexEnd => "flex-end",
+        JustifyContent::Center => "center",
+        JustifyContent::SpaceBetween => "space-between",
+        JustifyContent::SpaceAround => "space-around",
+        JustifyContent::SpaceEvenly => "space-evenly",
+    };
+    let value = custom_property(style, "--w3cos-internal-justify-content").unwrap_or(enum_keyword);
+    let mut safe = false;
+    let mut keyword = "";
+    for token in value.split_ascii_whitespace() {
+        match token {
+            "safe" => safe = true,
+            "unsafe" => {}
+            other if keyword.is_empty() => keyword = other,
+            _ => return None,
+        }
+    }
+    Some(match keyword {
+        "normal" | "stretch" | "flex-start" | "space-between" => (0.0, reverse, safe),
+        "flex-end" => (1.0, reverse, safe),
+        "start" => (0.0, false, safe),
+        "end" => (1.0, false, safe),
+        "left" => (0.0, false, safe),
+        "right" => (if row { 1.0 } else { 0.0 }, false, safe),
+        "center" => (0.5, false, safe),
+        // The distribution values fall back to center; for an abspos
+        // static position Chrome keeps it unsafe (the box overflows both
+        // sides: flex-abspos-staticpos-justify-content-001/005).
+        "space-around" | "space-evenly" => (0.5, false, safe),
+        _ => return None,
+    })
+}
+
+/// As [`main_alignment`] for `align-self` (falling back to the
+/// container's `align-items`) on the cross axis.
+fn cross_alignment(
+    container: &Style,
+    child: &Style,
+    wrap_reverse: bool,
+) -> Option<(f32, bool, bool)> {
+    fn align_name(align: AlignItems) -> &'static str {
+        match align {
+            AlignItems::FlexStart => "flex-start",
+            AlignItems::FlexEnd => "flex-end",
+            AlignItems::Center => "center",
+            AlignItems::Stretch => "stretch",
+            AlignItems::Baseline => "baseline",
+        }
+    }
+    let own = match custom_property(child, "--w3cos-internal-align-self") {
+        Some(value) => value,
+        None => match child.align_self {
+            AlignSelf::Auto => "auto",
+            AlignSelf::FlexStart => "flex-start",
+            AlignSelf::FlexEnd => "flex-end",
+            AlignSelf::Center => "center",
+            AlignSelf::Stretch => "stretch",
+            AlignSelf::Baseline => "baseline",
+        },
+    };
+    let value = if own == "auto" {
+        custom_property(container, "--w3cos-internal-align-items")
+            .unwrap_or(align_name(container.align_items))
+    } else {
+        own
+    };
+    let mut safe = false;
+    let mut words = Vec::new();
+    for token in value.split_ascii_whitespace() {
+        match token {
+            "safe" => safe = true,
+            "unsafe" => {}
+            other => words.push(other),
+        }
+    }
+    if child.writing_mode != container.writing_mode || child.direction != container.direction {
+        return None;
+    }
+    Some(match words.as_slice() {
+        ["normal" | "stretch" | "flex-start"] => (0.0, wrap_reverse, safe),
+        // Baseline falls back to start/end of the line, wrap-reverse
+        // included (flex-abspos-staticpos-align-self-002).
+        ["baseline"] | ["first", "baseline"] => (0.0, false, safe),
+        ["last", "baseline"] => (1.0, false, safe),
+        ["start" | "self-start"] => (0.0, false, safe),
+        ["end" | "self-end"] => (1.0, false, safe),
+        ["flex-end"] => (1.0, wrap_reverse, safe),
+        ["center"] => (0.5, false, safe),
+        _ => return None,
+    })
+}
+
 fn item_edges(style: &Style, space: &ConstraintSpace, cb: f32, horizontal: bool) -> f32 {
     let border = block::border_widths(style);
     let pad = |spacing| spacing_px(style, spacing, cb, space);

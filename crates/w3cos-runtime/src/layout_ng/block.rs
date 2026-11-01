@@ -145,6 +145,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "vertical-flex"
             | "vertical-grid"
             | "overflow-alignment"
+            // The authored `align-self` / `align-items` keyword: read only
+            // for the static position of an abspos flex child.
+            | "align-self"
+            | "align-items"
             // The computed `tab-size` (inherited). Text measure and paint
             // read it for preserved tabs; `text:tab` gates the leaves whose
             // stops need a line position NG does not pass yet.
@@ -523,13 +527,7 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     // The DOM marks a left float that follows in-flow inline content (the
     // legacy engine shifts it to the line start). After a forced line
     // break the float starts a new line, so the marker changes nothing.
-    // Only flex and grid containers: a plain block float after a `<br>`
-    // (`flexbox-align-self-baseline-horiz-002-ref`) stays on legacy, since
-    // its test still falls back (flex:auto-cross-margin) and legacy leaves
-    // no line box for the `<br>` that NG, like Blink, does.
-    if marker(style, LEFT_FLOAT_AFTER_INLINE).is_some()
-        && !((is_author_flex(style) || is_author_grid(style)) && follows_forced_break(flat, index))
-    {
+    if marker(style, LEFT_FLOAT_AFTER_INLINE).is_some() && !follows_forced_break(flat, index) {
         return Some("float:after-inline");
     }
     // An inline-block or list-item float is a block box (§9.7). An
@@ -578,10 +576,41 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     None
 }
 
+const CLEARING_BREAK_MARKER: &str = "--w3cos-internal-clearing-line-break";
+
+/// The `clear` of an anonymous block line holding nothing but a clearing
+/// `<br>` (`br { clear: both }` between floats): the DOM wraps the break in
+/// a block that has no `clear` of its own, so the break's request is the
+/// block's (the br is its only line, Blink's clearance on the line).
+fn clearing_break_clear(flat: &[FlatNodeInfo], index: usize) -> Option<Clear> {
+    if !marker(flat[index].style, inline::ANONYMOUS_BLOCK_MARKER).is_some() {
+        return None;
+    }
+    let mut children = inline::rendered_children(flat, index);
+    let only = children.next()?;
+    if children.next().is_some() {
+        return None;
+    }
+    let leaf = &flat[only];
+    (matches!(leaf.kind, ComponentKind::Text { content } if content == "\u{2028}")
+        && leaf.style.clear != Clear::None
+        && marker(leaf.style, CLEARING_BREAK_MARKER).is_some())
+    .then_some(leaf.style.clear)
+}
+
+/// The `clear` a child block applies: its own, or its clearing break's.
+fn effective_clear(flat: &[FlatNodeInfo], index: usize) -> Clear {
+    let own = flat[index].style.clear;
+    if own != Clear::None {
+        return own;
+    }
+    clearing_break_clear(flat, index).unwrap_or(Clear::None)
+}
+
 /// CSS2 9.5.2: the BFC block offset a `clear` box's border box must not
 /// be above (NGExclusionSpace::ClearanceOffset).
-fn clearance_offset(style: &Style, exclusions: &ExclusionSpace) -> Option<f32> {
-    match style.clear {
+fn clearance_offset(clear: Clear, exclusions: &ExclusionSpace) -> Option<f32> {
+    match clear {
         Clear::None => None,
         Clear::Left => exclusions.clearance_offset(true, false),
         Clear::Right => exclusions.clearance_offset(false, true),
@@ -978,6 +1007,11 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                     Some("ifc:mixed")
                 }
             } else {
+                // A clearing `<br>` that is the sole line of an anonymous
+                // block: the block applies its clearance (effective_clear).
+                let clearing = info
+                    .parent
+                    .is_some_and(|parent| clearing_break_clear(flat, parent).is_some());
                 unsupported_marker(
                     info.style,
                     &[
@@ -987,6 +1021,11 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                         inline::BIDI_FRAGMENT_MARKERS[0],
                         inline::BIDI_FRAGMENT_MARKERS[1],
                         inline::BIDI_FRAGMENT_MARKERS[2],
+                        if clearing {
+                            CLEARING_BREAK_MARKER
+                        } else {
+                            inline::VALIGN_MARKER
+                        },
                     ],
                 )
             }
@@ -4684,7 +4723,7 @@ fn layout_block_in(
             for float in floats {
                 let float_style = flat[float].style;
                 let mut block_start = content_bfc_y + block;
-                if let Some(clear) = clearance_offset(float_style, exclusions) {
+                if let Some(clear) = clearance_offset(float_style.clear, exclusions) {
                     block_start = block_start.max(clear);
                 }
                 let (fx, fy, result) = layout_float(
@@ -4899,7 +4938,8 @@ fn layout_block_in(
         // CSS2 9.5.2: clearance places the border box at the clear offset
         // when the hypothetical position is above it; the cleared box's
         // top margin then no longer collapses with what precedes it.
-        let clear = clearance_offset(child_info.style, exclusions);
+        let child_clear = effective_clear(flat, child);
+        let clear = clearance_offset(child_clear, exclusions);
         // Blink NGBlockLayoutAlgorithm::HandleInflow: with clearance past
         // adjoining floats (HasClearancePastAdjoiningFloats) our BFC block
         // offset resolves first, at the margin strut so far and without
@@ -4909,7 +4949,7 @@ fn layout_block_in(
         // offset, is_pushed_by_floats): its margins have no effect.
         let mut forced_clearance = None;
         if let Some(c) = clear.filter(|_| at_top && can_escape_top && !forced) {
-            let (left, right) = match child_info.style.clear {
+            let (left, right) = match child_clear {
                 Clear::Left => (true, false),
                 Clear::Right => (false, true),
                 _ => (true, true),
