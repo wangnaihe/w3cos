@@ -21844,6 +21844,31 @@ mod image_component_tests {
     }
 
     #[test]
+    fn pseudo_quote_operators_use_the_ancestor_quotes_and_plain_strings_ignore_them() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".host", &[("quotes", "'<' '>'")]);
+        crate::stylesheet::register_rule(".plain::before", &[("content", "'p'")]);
+        crate::stylesheet::register_rule(".quoted::before", &[("content", "'a' open-quote 'b'")]);
+        crate::stylesheet::register_rule(".quoted::after", &[("content", "close-quote 'c'")]);
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        host.set_attribute(&mut document, "class", "host");
+        let plain = document.create_element("span");
+        plain.set_attribute(&mut document, "class", "plain");
+        let quoted = document.create_element("span");
+        quoted.set_attribute(&mut document, "class", "quoted");
+        host.append_child(&mut document, plain);
+        host.append_child(&mut document, quoted);
+        document.body().append_child(&mut document, host);
+        let rendered = descendant_text_runs(&document.to_component_tree())
+            .into_iter()
+            .map(|run| run.0)
+            .collect::<String>();
+        assert_eq!(rendered, "pa<b>c");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn default_quote_pairs_preserve_nested_depth_and_authored_override() {
         crate::stylesheet::clear_rules();
         let mut document = Document::new();
