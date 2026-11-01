@@ -2698,6 +2698,10 @@ impl Document {
             !property.starts_with("--w3cos-internal-")
                 || property == "--w3cos-internal-text-align-last"
                 || property == user_agent::HTML_STANDARD_FONT_PROPERTY
+                // Language is inherited and re-resolved below; keeping the
+                // inherited value lets an unchanged language leave the map
+                // shared instead of cloning it twice per element.
+                || property == user_agent::TEXT_LANGUAGE_PROPERTY
         });
 
         // Custom properties participate in the cascade independently of
@@ -26270,6 +26274,66 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn inherited_language_keeps_the_custom_property_map_shared() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        body.set_attribute(&mut document, "lang", "EN-us");
+        for index in 0..32 {
+            body.style_mut(&mut document)
+                .set_property(&format!("--theme-color-{index}"), "#123456");
+        }
+        let inheriting = document.create_element("div");
+        body.append_child(&mut document, inheriting);
+        let overriding = document.create_element("span");
+        overriding.set_attribute(&mut document, "lang", "fr");
+        body.append_child(&mut document, overriding);
+        let reset = document.create_element("p");
+        reset.set_attribute(&mut document, "lang", "");
+        body.append_child(&mut document, reset);
+
+        let language = |style: &w3cos_std::style::Style| {
+            style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(user_agent::TEXT_LANGUAGE_PROPERTY))
+                .cloned()
+        };
+        let parent = document.computed_style_for(body.id);
+        let inherited = document.computed_style_for(inheriting.id);
+        let overridden = document.computed_style_for(overriding.id);
+        let emptied = document.computed_style_for(reset.id);
+        assert_eq!(language(&parent).as_deref(), Some("en-us"));
+        assert_eq!(language(&inherited).as_deref(), Some("en-us"));
+        assert_eq!(language(&overridden).as_deref(), Some("fr"));
+        assert_eq!(language(&emptied).as_deref(), Some(""));
+        assert!(
+            inherited
+                .custom_properties
+                .as_ref()
+                .unwrap()
+                .ptr_eq(parent.custom_properties.as_ref().unwrap()),
+            "an unchanged inherited language must not clone the variable map"
+        );
+        assert!(
+            !overridden
+                .custom_properties
+                .as_ref()
+                .unwrap()
+                .ptr_eq(parent.custom_properties.as_ref().unwrap())
+        );
+        assert_eq!(
+            parent
+                .custom_properties
+                .as_ref()
+                .unwrap()
+                .get("--theme-color-9")
+                .map(String::as_str),
+            Some("#123456")
+        );
+    }
 
     #[test]
     fn children_share_an_unchanged_inherited_custom_property_map() {
