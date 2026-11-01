@@ -453,8 +453,8 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
 
 const LEFT_FLOAT_AFTER_INLINE: &str = "--w3cos-internal-left-float-after-inline";
 
-/// The in-flow content before the float (past whitespace-only text and
-/// float-group wrappers) ends with a `<br>` (lowered to U+2028).
+/// The in-flow content before the float (past whitespace-only text,
+/// earlier floats and float-group wrappers) ends with a `<br>` (lowered to U+2028).
 fn follows_forced_break(flat: &[FlatNodeInfo], index: usize) -> bool {
     let mut node = index;
     loop {
@@ -489,8 +489,13 @@ fn ends_with_forced_break(flat: &[FlatNodeInfo], index: usize) -> Option<bool> {
                 Some(trimmed.ends_with('\u{2028}'))
             }
         }
-        _ if flat[index].style.float != Float::None => Some(false),
-        _ if is_float_group(flat[index].style) => Some(false),
+        // Floats and out-of-flow boxes are not in-flow content.
+        _ if flat[index].style.float != Float::None
+            || oof::is_out_of_flow(flat[index].style)
+            || is_float_group(flat[index].style) =>
+        {
+            None
+        }
         _ => {
             let children: Vec<usize> = inline::rendered_children(flat, index).collect();
             if children.is_empty() {
@@ -518,7 +523,13 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     // The DOM marks a left float that follows in-flow inline content (the
     // legacy engine shifts it to the line start). After a forced line
     // break the float starts a new line, so the marker changes nothing.
-    if marker(style, LEFT_FLOAT_AFTER_INLINE).is_some() && !follows_forced_break(flat, index) {
+    // Only flex and grid containers: a plain block float after a `<br>`
+    // (`flexbox-align-self-baseline-horiz-002-ref`) stays on legacy, since
+    // its test still falls back (flex:auto-cross-margin) and legacy leaves
+    // no line box for the `<br>` that NG, like Blink, does.
+    if marker(style, LEFT_FLOAT_AFTER_INLINE).is_some()
+        && !((is_author_flex(style) || is_author_grid(style)) && follows_forced_break(flat, index))
+    {
         return Some("float:after-inline");
     }
     // An inline-block or list-item float is a block box (§9.7). An
