@@ -15744,7 +15744,7 @@ pub fn deliver_edit_context_text(text: &str) -> bool {
     let end = context.get_property("selectionEnd").to_number();
     let (start, end) = (start.min(end), start.max(end));
     context.call_method(
-        "updateText",
+        "__w3cos_userTextUpdate",
         vec![
             Value::Number(start),
             Value::Number(end),
