@@ -2332,7 +2332,26 @@ fn layout_with(
             // (CSS Flexbox §9.4 hypothetical cross size).
             // A replaced item sizes as a replaced box in the line's inline
             // size, so a ratio-only image fills it (CSS 2.1 §10.3.2).
-            let raw = if !column_wrap
+            let keyword = block::marker(child_style, block::WIDTH_KEYWORD)
+                .filter(|_| !block::is_replaced(flat[child].kind));
+            let raw = if let Some(keyword) = keyword {
+                // An intrinsic `width` keyword is not `auto`: the item is
+                // not stretched and takes the keyword size.
+                let sizes = block::intrinsic_sizes(flat, child, space)
+                    .why("flex:wrap-column-auto-cross")?;
+                let min = sizes.min.unwrap_or(sizes.max).max(0.0);
+                block::keyword_content_size(
+                    keyword,
+                    min,
+                    sizes.max.max(min),
+                    Some(available),
+                    Some(inner_width),
+                    child_style,
+                    space,
+                    cross_edges,
+                )
+                .why("flex:width-keyword")?
+            } else if !column_wrap
                 && align != AlignItems::Stretch
                 && block::is_replaced(flat[child].kind)
             {

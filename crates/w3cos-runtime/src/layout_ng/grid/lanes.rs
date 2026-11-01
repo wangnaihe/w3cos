@@ -169,26 +169,27 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         return Some("lanes:repeat-indefinite");
     }
     if has_marker(style, block::WIDTH_KEYWORD)
-        && (!columns
-            || block::size_contained(style)
-            || template.auto_fit.is_some()
-            || fixed_tracks_size(&template, 0.0, 0.0).is_none())
+        && (!columns || block::size_contained(style) || template.auto_fit.is_some())
     {
-        // An intrinsic width is only known for fixed grid-axis tracks.
+        // The intrinsic width of column lanes follows the track sizing under
+        // the min/max-content constraints; row lanes and auto-repeat stay off.
         return Some("lanes:size-keyword");
     }
     if style.grid_auto_row_spec().is_some() || style.grid_auto_column_spec().is_some() {
         return Some("lanes:auto-tracks");
     }
     // Content alignment on the stacking axis is not modelled.
+    // Column lanes model it as one group offset (`stack_lead`); row lanes
+    // keep `start` only.
     let stacking_aligned = if columns {
-        row_pack(style) != Pack::Stretch
+        false
     } else {
         !matches!(column_pack(style), Pack::Stretch | Pack::Start)
     };
     if stacking_aligned {
         return Some("lanes:stacking-alignment");
     }
+    let content_shifted = columns && row_pack(style) != Pack::Stretch;
     match tolerance_spec(style) {
         None => return Some("lanes:tolerance"),
         // A percentage resolves against the intrinsic grid-axis size,
@@ -246,6 +247,10 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         if has_marker(child_style, "--w3cos-internal-overflow-alignment") {
             return Some("lanes:overflow-alignment");
+        }
+        if content_shifted && stack_align(style, child_style, columns) != StackAlign::Normal {
+            // Item alignment inside the openings of a shifted group.
+            return Some("lanes:stacking-alignment");
         }
         if intrinsic_axis
             && placement(child_style, !columns)
@@ -552,19 +557,16 @@ pub(super) fn layout(
     let metrics: BoxMetrics = block::resolve_inline(style, space);
     let mut content_width = sized.map_or(metrics.content_width, |(width, _)| width);
     if let Some(keyword) = marker(style, block::WIDTH_KEYWORD).filter(|_| sized.is_none()) {
-        // `min-content` / `max-content` / `fit-content` of fixed lanes is
-        // their track sum.
-        let template = parse_template(columns_spec(style).why("lanes:no-template")?, false)
-            .why("lanes:template")?;
-        let gap = style.column_gap.unwrap_or(style.gap).max(0.0);
-        let tracks = fixed_tracks_size(&template, gap, style.font_size.max(0.0))
-            .why("lanes:size-keyword")?;
+        // `min-content` / `max-content` / `fit-content` of column lanes is
+        // the track sum under the matching constraint.
+        let sizes = intrinsic_columns(flat, index, space)?;
+        let (min, max) = (sizes.min.unwrap_or(sizes.max), sizes.max);
         let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
         let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
         let content = block::keyword_content_size(
             keyword,
-            tracks,
-            tracks,
+            min,
+            max,
             Some(available),
             Some(space.available_inline),
             style,
@@ -978,6 +980,21 @@ impl Openings {
     }
 }
 
+/// Offset of the whole stack along the stacking axis (Chrome-verified:
+/// `space-between` acts as `start`, `space-around` and `space-evenly` as
+/// `center`; a plain `normal` stacks from the end under `fill-reverse`).
+fn stack_lead(pack: Pack, fill_reverse: bool, free: i64) -> i64 {
+    if pack == Pack::Stretch && fill_reverse {
+        return free;
+    }
+    let free = free.max(0);
+    match pack {
+        Pack::End => free,
+        Pack::Center | Pack::SpaceAround | Pack::SpaceEvenly => free / 2,
+        _ => 0,
+    }
+}
+
 /// Offset along the stacking axis and whether the item stretches. In
 /// `fill-reverse` the layout is mirrored afterwards, so the alignment
 /// swaps `start` and `end` (Blink ApplyStackingAxisAlignment).
@@ -1222,6 +1239,7 @@ fn stack_columns(
         return crate::layout_ng::bail("lanes:stacking-overflow");
     }
     let spaces = openings.finish(row_gap_u, used);
+    let lead = stack_lead(row_pack(style), reverse.fill, used - extent);
     for (record, room) in records.into_iter().zip(spaces) {
         let Record {
             source,
@@ -1260,11 +1278,11 @@ fn stack_columns(
             }
         }
         let y = if reverse.fill {
-            // Items stack from the end of the container: the margin box
+            // Items stack from the end of the group: the margin box
             // mirrors; margins keep their physical sides.
-            used - at - units(fragment.height) - after
+            lead + extent - at - units(fragment.height) - after
         } else {
-            at + before
+            lead + at + before
         };
         placed.push((source, cross + dx, from_units(y) + dy, fragment, oof));
     }
@@ -1860,6 +1878,73 @@ impl Contribs {
         }
         tracks
     }
+}
+
+/// The content-box min/max-content widths of a lanes container measured as
+/// an item of another formatting context. Only column lanes are measured.
+pub(super) fn measured(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<super::MinMax> {
+    match lane_direction(flat[index].style) {
+        Some(Direction { columns: true, .. }) => intrinsic_columns(flat, index, space),
+        _ => crate::layout_ng::bail("grid:lanes-measure"),
+    }
+}
+
+/// Min-content and max-content sizes of column lanes: the tracks sized by
+/// the items' contributions (an auto-placed item contributes at every start
+/// line) under a zero and an unbounded constraint.
+fn intrinsic_columns(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<super::MinMax> {
+    let style = flat[index].style;
+    let template = parse_template(columns_spec(style).why("lanes:no-template")?, false)
+        .why("lanes:template")?;
+    if template.auto_fit.is_some() || !template.auto_tracks.is_empty() {
+        return crate::layout_ng::bail("lanes:intrinsic-repeat");
+    }
+    let specs = template.tracks.clone();
+    let lanes = specs.len();
+    if lanes == 0 {
+        return crate::layout_ng::bail("lanes:no-template");
+    }
+    let names = super::expanded_names(&template, lanes);
+    let mut contribs = Contribs::new(lanes, false);
+    for child in rendered_children(flat, index) {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) {
+            continue;
+        }
+        let place =
+            resolve_axis(placement(child_style, false), &names, lanes).why("lanes:placement")?;
+        let span = place.span;
+        let starts = match place.start {
+            Some(start) if start < 0 => return crate::layout_ng::bail("lanes:negative-line"),
+            Some(start) => start as usize..=start as usize,
+            None if span <= lanes => 0..=lanes - span,
+            None => return crate::layout_ng::bail("lanes:span"),
+        };
+        if span > lanes || *starts.end() + span > lanes {
+            return crate::layout_ng::bail("lanes:span");
+        }
+        let (min_c, max_c) = inline_minmax(flat, child, space).why("lanes:intrinsic")?;
+        for start in starts {
+            contribs.add(start, span, min_c, max_c);
+        }
+    }
+    let gap = units(style.column_gap.unwrap_or(style.gap).max(0.0));
+    Some(super::measure_columns(
+        &specs,
+        &vec![false; lanes],
+        &contribs.min,
+        &contribs.max,
+        gap,
+        style.font_size.max(0.0),
+    ))
 }
 
 /// Layout state an out-of-flow child of a lanes container needs.

@@ -10160,9 +10160,19 @@ fn grid_lanes_matches_chrome() {
                 String::new(),
             ));
         }
+        if let Some(word) = container["kw"].as_str() {
+            markers.push((
+                "--w3cos-internal-width-keyword".to_string(),
+                word.to_string(),
+            ));
+        }
         let mut style = Style {
             display: Display::Flex,
-            width: Dimension::Px(number(&container["width"]).unwrap_or(200.0)),
+            width: if container["kw"].is_string() {
+                Dimension::Auto
+            } else {
+                Dimension::Px(number(&container["width"]).unwrap_or(200.0))
+            },
             height: number(&container["height"])
                 .map(Dimension::Px)
                 .unwrap_or(Dimension::Auto),
@@ -10187,6 +10197,17 @@ fn grid_lanes_matches_chrome() {
             } else {
                 style.justify_items = align_items(value);
             }
+        }
+        if let (Some(value), false) = (container["content"].as_str(), rows_axis) {
+            style.align_content = match value {
+                "start" => w3cos_std::style::AlignContent::FlexStart,
+                "center" => w3cos_std::style::AlignContent::Center,
+                "end" => w3cos_std::style::AlignContent::FlexEnd,
+                "space-between" => w3cos_std::style::AlignContent::SpaceBetween,
+                "space-around" => w3cos_std::style::AlignContent::SpaceAround,
+                "space-evenly" => w3cos_std::style::AlignContent::SpaceEvenly,
+                _ => w3cos_std::style::AlignContent::Stretch,
+            };
         }
         if let Some(pad) = number(&container["pad"]) {
             style.padding = margins(pad, 0.0, 0.0, 0.0);

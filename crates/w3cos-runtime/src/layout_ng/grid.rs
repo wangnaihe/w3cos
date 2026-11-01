@@ -4132,7 +4132,7 @@ fn layout_impl(
     let style = flat[index].style;
     if has_marker(style, "--w3cos-internal-grid-lanes") && lanes::eligible(flat, index) {
         if measure {
-            return super::bail("grid:lanes-measure");
+            return lanes::measured(flat, index, space).map(GridOut::Measured);
         }
         lanes::take_as_grid();
         let laid = lanes::layout(flat, index, space, sized);
