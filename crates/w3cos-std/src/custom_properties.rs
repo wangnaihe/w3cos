@@ -26,11 +26,23 @@ impl Clone for Inner {
         if let Some(known) = self.fingerprint.get() {
             let _ = fingerprint.set(*known);
         }
+        MAP_CLONES.with(|count| count.set(count.get() + 1));
         Self {
             map: self.map.clone(),
             fingerprint,
         }
     }
+}
+
+thread_local! {
+    static MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whole-map clones performed on this thread. Lets tests prove a cascade
+/// path kept the map shared instead of unsharing it.
+#[doc(hidden)]
+pub fn map_clone_count() -> usize {
+    MAP_CLONES.with(std::cell::Cell::get)
 }
 
 fn entry_hash(key: &str, value: &str) -> u64 {

@@ -2702,6 +2702,13 @@ impl Document {
                 // inherited value lets an unchanged language leave the map
                 // shared instead of cloning it twice per element.
                 || property == user_agent::TEXT_LANGUAGE_PROPERTY
+                // These are rewritten for every element below (the font
+                // origin/size unconditionally, the list image from the parent's
+                // value), and nothing reads the element's own copy first, so
+                // keeping the inherited value turns the rewrite into a no-op.
+                || property == FONT_SIZE_ORIGIN
+                || property == FONT_SPECIFIED_SIZE
+                || property == crate::css_style::LIST_IMAGE_PROPERTY
         });
 
         // Custom properties participate in the cascade independently of
@@ -26274,6 +26281,63 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn plain_descendants_do_not_clone_the_inherited_variable_map() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        body.set_attribute(&mut document, "lang", "en");
+        {
+            let mut style = body.style_mut(&mut document);
+            style.set_property("font-size", "15px");
+            style.set_property("list-style-image", "url(a.png)");
+            for index in 0..32 {
+                style.set_property(&format!("--theme-color-{index}"), "#123456");
+            }
+        }
+        let outer = document.create_element("div");
+        body.append_child(&mut document, outer);
+        let inner = document.create_element("span");
+        outer.append_child(&mut document, inner);
+        let sized = document.create_element("p");
+        body.append_child(&mut document, sized);
+        sized
+            .style_mut(&mut document)
+            .set_property("font-size", "21px");
+
+        let parent = document.computed_style_for(body.id);
+        let before = w3cos_std::custom_properties::map_clone_count();
+        let child = document.computed_style_for(outer.id);
+        let grandchild = document.computed_style_for(inner.id);
+        assert_eq!(
+            w3cos_std::custom_properties::map_clone_count(),
+            before,
+            "inheriting descendants must not clone the variable map"
+        );
+        let marker = |style: &w3cos_std::style::Style, key: &str| {
+            style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(key))
+                .cloned()
+        };
+        assert_eq!(child.font_size, 15.0);
+        assert_eq!(grandchild.font_size, 15.0);
+        assert_eq!(
+            marker(&grandchild, crate::css_style::LIST_IMAGE_PROPERTY),
+            marker(&parent, crate::css_style::LIST_IMAGE_PROPERTY)
+        );
+        assert_eq!(
+            marker(&grandchild, FONT_SPECIFIED_SIZE).as_deref(),
+            Some("15")
+        );
+
+        let resized = document.computed_style_for(sized.id);
+        assert_eq!(resized.font_size, 21.0);
+        assert_eq!(marker(&resized, FONT_SPECIFIED_SIZE).as_deref(), Some("21"));
+        assert_eq!(marker(&parent, FONT_SPECIFIED_SIZE).as_deref(), Some("15"));
+    }
 
     #[test]
     fn inherited_language_keeps_the_custom_property_map_shared() {
