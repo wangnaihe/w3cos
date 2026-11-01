@@ -4354,6 +4354,18 @@ fn layout_impl(
             }
         }
     }
+    // auto-fit collapses the row copies no item occupies, like the columns.
+    let mut row_collapsed = vec![false; row_specs.len()];
+    if rows_template.auto_fit == Some(true) && !row_sub {
+        for (index, flag) in row_collapsed.iter_mut().enumerate() {
+            let used = items
+                .iter()
+                .any(|item| item.row <= index && index < item.row + item.row_span);
+            if !used {
+                *flag = true;
+            }
+        }
+    }
     let stretch_columns = column_pack(style) == Pack::Stretch && !lanes_stack_axis(style, false);
     // `col_min` holds minimum contributions, `col_min_content` min-content
     // contributions; they differ only for scroll containers.
@@ -4777,7 +4789,7 @@ fn layout_impl(
         Some(units(
             measure_columns(
                 &row_specs,
-                &vec![false; row_specs.len()],
+                &row_collapsed,
                 &row_min,
                 &row_max,
                 row_gap_u,
@@ -4793,7 +4805,7 @@ fn layout_impl(
         .iter()
         .enumerate()
         .map(|(index, spec)| {
-            track_from_spec(
+            let mut track = track_from_spec(
                 spec,
                 row_floor.get(index).copied().unwrap_or(0),
                 row_min.get(index).copied().unwrap_or(0),
@@ -4801,7 +4813,15 @@ fn layout_impl(
                 row_available,
                 font,
                 stretch_rows,
-            )
+            );
+            if row_collapsed.get(index).copied().unwrap_or(false) {
+                track.collapsed = true;
+                track.base = 0;
+                track.cap = 0;
+                track.flex = 0.0;
+                track.stretchy = false;
+            }
+            track
         })
         .collect();
     grow_for_spanning_items(
@@ -4833,7 +4853,7 @@ fn layout_impl(
             recorded_rows = Some(rows.clone());
         }
     }
-    let row_collapsed = vec![false; rows.len()];
+    row_collapsed.resize(rows.len(), false);
     let base = rows.iter().sum::<i64>() + gap_sum(&row_collapsed, row_gap_u);
     let mut used = specified_height
         .map(units)
@@ -4993,7 +5013,7 @@ fn layout_impl(
 
     let row_sum: i64 = rows.iter().sum();
     let row_free = used - gap_sum(&row_collapsed, row_gap_u) - row_sum;
-    let active_rows = rows.len().max(1);
+    let active_rows = row_collapsed.iter().filter(|flag| !**flag).count().max(1);
     let (row_lead, row_between) = pack_gap(row_pack(style), row_free, active_rows, row_gap_u);
     let row_y = positions(&rows, &row_collapsed, row_between, row_lead);
 

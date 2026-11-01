@@ -79,9 +79,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-document-element") {
         return Some("flex:root");
     }
-    if has_marker(style, "--w3cos-internal-size-containment") {
-        return Some("flex:contain");
-    }
     // A container sized by logical properties the cascade does not resolve
     // (`block-size`) whose items carry `calc()` widths: gap-003/008 and
     // their references only agree while both sides ignore both, so they
@@ -552,6 +549,9 @@ pub(super) fn container_min_max_at(
     block: Option<f32>,
 ) -> Option<MinMax> {
     let style = flat[index].style;
+    if block::size_contained(style) {
+        return Some(MinMax::exact(block::contain_intrinsic_size(style).0));
+    }
     let row = row_axis(style.flex_direction);
     let line = match block {
         Some(block) => Some(block),
@@ -1830,6 +1830,11 @@ pub(super) fn layout(
     // `max-height` is the line-breaking limit when the block size is auto,
     // but the used block size is the flexed line (Chrome). `aspect-ratio`
     // transfers a definite width into a definite block size.
+    // Size containment: an automatic block size is the contain-intrinsic
+    // one, as the content-box height of an unconstrained box.
+    if specified_height.is_none() && block::size_contained(style) {
+        specified_height = Some(block::contain_intrinsic_size(style).1);
+    }
     let column_wrap = !row && style.flex_wrap != FlexWrap::NoWrap;
     let max_main = if column_wrap {
         block::resolve_length(style.max_height, space.percentage_block, style, space)
