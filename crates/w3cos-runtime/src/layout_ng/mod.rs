@@ -458,8 +458,15 @@ fn layout_with_run_in(
         run_in_flat = run_in_patched(flat, &run_in);
         &run_in_flat
     };
-    // Vertical-writing-mode flex containers lay out with transposed axes.
-    let vertical = flex::vertical_flex_styles(base);
+    // Vertical-writing-mode flex and grid containers lay out with transposed
+    // axes.
+    let mut vertical = grid::vertical_grid_styles(base);
+    let taken: Vec<usize> = vertical.iter().map(|(index, _)| *index).collect();
+    vertical.extend(
+        flex::vertical_flex_styles(base)
+            .into_iter()
+            .filter(|(index, _)| !taken.contains(index)),
+    );
     if vertical.is_empty() {
         return layout_flat_with_text(base, viewport_w, viewport_h);
     }

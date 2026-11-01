@@ -143,6 +143,7 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "contain-intrinsic-size"
             | "flex-basis-content"
             | "vertical-flex"
+            | "vertical-grid"
             | "overflow-alignment"
             // The computed `tab-size` (inherited). Text measure and paint
             // read it for preserved tabs; `text:tab` gates the leaves whose

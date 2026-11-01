@@ -1769,7 +1769,7 @@ fn justify_kind(style: &Style) -> JustifyContent {
 /// Markers that change what a container or item lays out as in ways the
 /// transposed axes do not model (logical sizes, intrinsic keywords, aspect
 /// ratios, unrecognized flex values, safe alignment, balancing).
-fn vertical_unmodelled_marker(style: &Style) -> bool {
+pub(super) fn vertical_unmodelled_marker(style: &Style) -> bool {
     style.custom_properties.as_ref().is_some_and(|properties| {
         properties.keys().any(|key| {
             key.starts_with("--w3cos-internal-")
@@ -1784,7 +1784,7 @@ fn vertical_unmodelled_marker(style: &Style) -> bool {
     })
 }
 
-fn percent_spacing(edges: &w3cos_std::style::Edges) -> bool {
+pub(super) fn percent_spacing(edges: &w3cos_std::style::Edges) -> bool {
     [edges.top, edges.right, edges.bottom, edges.left]
         .iter()
         .any(|side| matches!(side, Spacing::Percent(_)))

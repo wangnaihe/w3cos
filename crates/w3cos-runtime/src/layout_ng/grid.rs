@@ -45,6 +45,10 @@ const INF: i64 = i64::MAX / 4;
 const HEIGHT_KEYWORD: &str = "--w3cos-internal-height-keyword";
 const WIDTH_KEYWORD: &str = "--w3cos-internal-width-keyword";
 const JUSTIFY_KEYWORD: &str = "--w3cos-internal-justify-content";
+/// Set on a vertical-writing-mode grid laid out with transposed axes
+/// ([`vertical_grid_styles`]); `flip-y` when the inline axis runs bottom to
+/// top (`direction: rtl`).
+pub(super) const VERTICAL_MARKER: &str = "--w3cos-internal-vertical-grid";
 const ALIGN_ITEMS_STRETCH: &str = "--w3cos-internal-align-items-stretch";
 const JUSTIFY_ITEMS_STRETCH: &str = "--w3cos-internal-justify-items-stretch";
 
@@ -5032,6 +5036,7 @@ fn layout_impl(
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);
     let rtl = style.direction == TextDirection::Rtl;
+    let flip_y = marker(style, VERTICAL_MARKER).is_some_and(|value| value.contains("flip-y"));
     let mut children = Vec::with_capacity(built.len());
     let mut pending_oof = Vec::new();
     let inline_grid = marker(style, "--w3cos-internal-unrecognized-display") == Some("inline-grid");
@@ -5053,29 +5058,37 @@ fn layout_impl(
         let fragment = fragments[index].fragment.clone();
         let area = span_sum(&columns, &collapsed, item.col, item.col_span, col_between);
         let row_size = span_sum(&rows, &row_collapsed, item.row, item.row_span, row_between);
+        // Layout runs inline-start first; the margin at the inline start is
+        // the physical right one under rtl, and the mirror below puts it
+        // back on that side.
+        let (start_side, end_side) = if rtl { (1, 3) } else { (3, 1) };
         let (ml, _mr, inline_offset) = axis_offset(
             area,
             units(fragment.width),
-            item.margin_u[3],
-            item.margin_u[1],
-            item.auto_margin[3],
-            item.auto_margin[1],
+            item.margin_u[start_side],
+            item.margin_u[end_side],
+            item.auto_margin[start_side],
+            item.auto_margin[end_side],
             item.inline_pack,
         );
+        let (top_side, bottom_side) = if flip_y { (2, 0) } else { (0, 2) };
         let (mt, _, block_offset) = axis_offset(
             row_size,
             units(fragment.height),
-            item.margin_u[0],
-            item.margin_u[2],
-            item.auto_margin[0],
-            item.auto_margin[2],
+            item.margin_u[top_side],
+            item.margin_u[bottom_side],
+            item.auto_margin[top_side],
+            item.auto_margin[bottom_side],
             item.block_pack,
         );
         let mut x = from_units(origin_x + column_x[item.col] + ml + inline_offset);
-        let y =
+        let mut y =
             from_units(origin_y + row_y.get(item.row).copied().unwrap_or(0) + mt + block_offset);
         if rtl {
             x = from_units(origin_x + inner_u - (units(x) - origin_x) - units(fragment.width));
+        }
+        if flip_y {
+            y = from_units(origin_y + used - (units(y) - origin_y) - units(fragment.height));
         }
         let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
         let laid = &fragments[index];
@@ -5372,6 +5385,206 @@ fn definite_border(
             ))
         }
     }
+}
+
+fn pack_name(pack: Pack) -> &'static str {
+    match pack {
+        Pack::Start => "start",
+        Pack::End => "end",
+        Pack::Center => "center",
+        Pack::SpaceBetween => "space-between",
+        Pack::SpaceAround => "space-around",
+        Pack::SpaceEvenly => "space-evenly",
+        Pack::Stretch => "stretch",
+    }
+}
+
+fn pack_content(pack: Pack) -> AlignContent {
+    match pack {
+        Pack::Start => AlignContent::FlexStart,
+        Pack::End => AlignContent::FlexEnd,
+        Pack::Center => AlignContent::Center,
+        Pack::SpaceBetween => AlignContent::SpaceBetween,
+        Pack::SpaceAround => AlignContent::SpaceAround,
+        Pack::SpaceEvenly => AlignContent::SpaceEvenly,
+        Pack::Stretch => AlignContent::Stretch,
+    }
+}
+
+/// Internal markers a vertical grid container may carry; anything else
+/// (percent gaps, intrinsic keywords, overflow alignment, ...) is not
+/// transposed, so that container keeps its previous behavior.
+fn vertical_container_markers_ok(style: &Style) -> bool {
+    style.custom_properties.as_ref().is_none_or(|props| {
+        props.iter().all(|(key, value)| {
+            if !key.starts_with("--w3cos-internal-") {
+                return true;
+            }
+            if key == JUSTIFY_KEYWORD {
+                return value.split_ascii_whitespace().all(|word| {
+                    matches!(
+                        word,
+                        "start"
+                            | "end"
+                            | "center"
+                            | "stretch"
+                            | "normal"
+                            | "flex-start"
+                            | "flex-end"
+                            | "space-between"
+                            | "space-around"
+                            | "space-evenly"
+                    )
+                });
+            }
+            key == ALIGN_ITEMS_STRETCH || key == JUSTIFY_ITEMS_STRETCH
+        })
+    })
+}
+
+fn swap_flow(flow: Option<&str>) -> Option<String> {
+    let flow = parse_flow(flow)?;
+    Some(format!(
+        "{}{}",
+        if flow.column { "row" } else { "column" },
+        if flow.dense { " dense" } else { "" }
+    ))
+}
+
+/// Grid containers in `vertical-lr` / `vertical-rl` whose items are empty
+/// boxes, with their axes transposed: the column axis is vertical and the
+/// row axis horizontal. The tracks, placements, gaps and alignments of the
+/// two axes are exchanged so the physical layout runs unchanged; the row
+/// axis then runs right to left for `vertical-rl` (the patched direction is
+/// rtl) and the column axis bottom to top under `direction: rtl`
+/// ([`VERTICAL_MARKER`]). Only definite physical sizes and plain leaf items
+/// of the same writing mode and direction qualify.
+pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
+    use w3cos_std::style::WritingMode;
+    let mut patched = Vec::new();
+    for (index, node) in flat.iter().enumerate() {
+        let style = node.style;
+        let block_rl = match style.writing_mode {
+            WritingMode::VerticalRl => true,
+            WritingMode::VerticalLr => false,
+            _ => continue,
+        };
+        if style.display != Display::Grid
+            || !matches!(style.width, Dimension::Px(_))
+            || !matches!(style.height, Dimension::Px(_))
+            || !matches!(style.min_width, Dimension::Auto)
+            || !matches!(style.min_height, Dimension::Auto)
+            || !matches!(style.max_width, Dimension::Auto)
+            || !matches!(style.max_height, Dimension::Auto)
+            || super::flex::percent_spacing(&style.margin)
+            || super::flex::percent_spacing(&style.padding)
+            || is_baseline(style.align_items)
+            || is_baseline(style.justify_items)
+            || !vertical_container_markers_ok(style)
+            || style.grid_areas().is_some()
+            || parse_flow(style.grid_flow()).is_none()
+            || [columns_spec(style), style.grid_rows()]
+                .into_iter()
+                .flatten()
+                .any(|spec| spec.contains("subgrid") || spec.contains("masonry"))
+        {
+            continue;
+        }
+        let mut items = Vec::new();
+        let mut simple = true;
+        for child in rendered_children(flat, index) {
+            let child_style = flat[child].style;
+            if !matches!(
+                flat[child].kind,
+                w3cos_std::ComponentKind::Box
+                    | w3cos_std::ComponentKind::Row
+                    | w3cos_std::ComponentKind::Column
+            ) || flat[child].subtree_end > child + 1
+                || child_style.writing_mode != style.writing_mode
+                || child_style.direction != style.direction
+                || child_style.position != Position::Static
+                || child_style.float != Float::None
+                || child_style.align_self == AlignSelf::Baseline
+                || child_style.justify_self == AlignSelf::Baseline
+                || super::flex::percent_spacing(&child_style.margin)
+                || super::flex::percent_spacing(&child_style.padding)
+                || child_style.custom_properties.as_ref().is_some_and(|props| {
+                    props.keys().any(|key| key.starts_with("--w3cos-internal-"))
+                })
+            {
+                simple = false;
+                break;
+            }
+            items.push(child);
+        }
+        if !simple || items.is_empty() {
+            continue;
+        }
+        let Some(flow) = swap_flow(style.grid_flow()) else {
+            continue;
+        };
+        let rtl = style.direction == TextDirection::Rtl;
+        let direction = if block_rl {
+            TextDirection::Rtl
+        } else {
+            TextDirection::Ltr
+        };
+        let columns = columns_spec(style).map(str::to_string);
+        let rows = style.grid_rows().map(str::to_string);
+        let mut transposed = style.clone();
+        {
+            let ng = transposed.grid_ng_mut();
+            ng.grid_columns_cascaded = true;
+            ng.grid_columns_used = rows.clone();
+            ng.grid_template_rows = columns;
+            ng.grid_auto_flow = Some(flow);
+            std::mem::swap(&mut ng.grid_auto_rows, &mut ng.grid_auto_columns);
+        }
+        transposed.grid_template_columns = rows;
+        transposed.row_gap = Some(style.column_gap.unwrap_or(style.gap));
+        transposed.column_gap = Some(style.row_gap.unwrap_or(style.gap));
+        transposed.align_items = style.justify_items;
+        transposed.justify_items = style.align_items;
+        transposed.align_content = pack_content(column_pack(style));
+        transposed.direction = direction;
+        let props = transposed
+            .custom_properties
+            .get_or_insert_with(Default::default);
+        props.insert(
+            JUSTIFY_KEYWORD.to_string(),
+            pack_name(row_pack(style)).to_string(),
+        );
+        props.remove(ALIGN_ITEMS_STRETCH);
+        props.remove(JUSTIFY_ITEMS_STRETCH);
+        if has_marker(style, JUSTIFY_ITEMS_STRETCH) {
+            props.insert(ALIGN_ITEMS_STRETCH.to_string(), String::new());
+        }
+        if has_marker(style, ALIGN_ITEMS_STRETCH) {
+            props.insert(JUSTIFY_ITEMS_STRETCH.to_string(), String::new());
+        }
+        props.insert(
+            VERTICAL_MARKER.to_string(),
+            if rtl { "flip-y" } else { "-" }.to_string(),
+        );
+        patched.push((index, transposed));
+        for child in items {
+            let child_style = flat[child].style;
+            let column = placement(child_style, false).map(str::to_string);
+            let row = placement(child_style, true).map(str::to_string);
+            let mut item = child_style.clone();
+            {
+                let ng = item.grid_ng_mut();
+                ng.grid_placement_cascaded = true;
+                ng.grid_column_used = row;
+                ng.grid_row_used = column;
+            }
+            item.align_self = child_style.justify_self;
+            item.justify_self = child_style.align_self;
+            item.direction = direction;
+            patched.push((child, item));
+        }
+    }
+    patched
 }
 
 fn axis_offset(
@@ -6560,6 +6773,85 @@ mod tests {
             ),
             &[(2, [100.0, 0.0, 100.0, 10.0]), (3, [0.0, 0.0, 100.0, 10.0])],
         );
+    }
+
+    fn vertical_grid(mode: w3cos_std::style::WritingMode, rtl: bool) -> Component {
+        let mut style = grid_style(300.0, Some(200.0), Some("100px 100px"));
+        style.grid_ng_mut().grid_template_rows = Some("50px 50px".to_string());
+        style.writing_mode = mode;
+        if rtl {
+            style.direction = TextDirection::Rtl;
+        }
+        let mut items = Vec::new();
+        for _ in 0..3 {
+            let mut item = block_box(Some(20.0), Some(40.0));
+            item.writing_mode = mode;
+            if rtl {
+                item.direction = TextDirection::Rtl;
+            }
+            items.push(leaf(item));
+        }
+        // An ltr block hosts the grid so the patched rtl of a `vertical-rl`
+        // container does not move the root's own border box.
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(style, items)],
+        )
+    }
+
+    #[test]
+    fn vertical_columns_run_down_and_rows_across() {
+        use w3cos_std::style::WritingMode::{VerticalLr, VerticalRl};
+        // Columns are the inline axis (vertical); rows the block axis, which
+        // starts at the left in `vertical-lr` and at the right in
+        // `vertical-rl`.
+        expect(
+            &vertical_grid(VerticalLr, false),
+            &[
+                (2, [0.0, 0.0, 20.0, 40.0]),
+                (3, [0.0, 100.0, 20.0, 40.0]),
+                (4, [50.0, 0.0, 20.0, 40.0]),
+            ],
+        );
+        expect(
+            &vertical_grid(VerticalRl, false),
+            &[
+                (2, [280.0, 0.0, 20.0, 40.0]),
+                (3, [280.0, 100.0, 20.0, 40.0]),
+                (4, [230.0, 0.0, 20.0, 40.0]),
+            ],
+        );
+        // `direction: rtl` runs the columns bottom to top.
+        expect(
+            &vertical_grid(VerticalLr, true),
+            &[
+                (2, [0.0, 160.0, 20.0, 40.0]),
+                (3, [0.0, 60.0, 20.0, 40.0]),
+                (4, [50.0, 160.0, 20.0, 40.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn rtl_item_margins_stay_on_their_physical_side() {
+        // `justify-self: start` puts the item at the right under rtl, so the
+        // left margin sits on its far side.
+        let mut container = grid_style(200.0, Some(50.0), Some("100px"));
+        container.direction = TextDirection::Rtl;
+        let mut item = block_box(Some(20.0), Some(10.0));
+        item.margin.left = Spacing::Px(30.0);
+        item.justify_self = AlignSelf::FlexStart;
+        let host = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(container, vec![leaf(item)])],
+        );
+        expect(&host, &[(2, [180.0, 0.0, 20.0, 10.0])]);
     }
 
     #[test]
