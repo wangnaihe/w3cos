@@ -8945,6 +8945,308 @@
      10
     ]
    }
+  },
+  "d-wpt-row-004": {
+   "spec": {
+    "name": "d-wpt-row-004",
+    "container": {
+     "template": "50px 50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 20
+     },
+     {
+      "id": "b",
+      "w": 40
+     },
+     {
+      "id": "c",
+      "w": 60,
+      "place": "4"
+     },
+     {
+      "id": "d",
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "e",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "f",
+      "w": 20,
+      "place": "span 3"
+     },
+     {
+      "id": "g",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "h",
+      "w": 20,
+      "place": "4"
+     },
+     {
+      "id": "i",
+      "w": 20
+     }
+    ]
+   },
+   "html": "<div id=d-wpt-row-004 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px 50px 50px;grid-lanes-direction:row;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-wpt-row-004-a style='width:20px'></div><div id=d-wpt-row-004-b style='width:40px'></div><div id=d-wpt-row-004-c style='width:60px;grid-row:4'></div><div id=d-wpt-row-004-d style='width:20px;grid-row:span 2'></div><div id=d-wpt-row-004-e style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-004-f style='width:20px;grid-row:span 3'></div><div id=d-wpt-row-004-g style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-004-h style='width:20px;grid-row:4'></div><div id=d-wpt-row-004-i style='width:20px'></div></div>",
+   "rects": {
+    "d-wpt-row-004": [
+     0,
+     0,
+     200,
+     200
+    ],
+    "d-wpt-row-004-a": [
+     0,
+     0,
+     20,
+     50
+    ],
+    "d-wpt-row-004-b": [
+     0,
+     50,
+     40,
+     50
+    ],
+    "d-wpt-row-004-c": [
+     0,
+     150,
+     60,
+     50
+    ],
+    "d-wpt-row-004-d": [
+     40,
+     0,
+     20,
+     100
+    ],
+    "d-wpt-row-004-e": [
+     60,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-004-f": [
+     80,
+     0,
+     20,
+     150
+    ],
+    "d-wpt-row-004-g": [
+     100,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-004-h": [
+     80,
+     150,
+     20,
+     50
+    ],
+    "d-wpt-row-004-i": [
+     0,
+     100,
+     20,
+     50
+    ]
+   }
+  },
+  "d-wpt-row-ms-004": {
+   "spec": {
+    "name": "d-wpt-row-ms-004",
+    "container": {
+     "template": "50px 50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "b",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "c",
+      "w": 40,
+      "place": "3 / span 2"
+     },
+     {
+      "id": "d",
+      "w": 20,
+      "place": "span 4"
+     },
+     {
+      "id": "e",
+      "w": 20,
+      "place": "1 / span 2"
+     },
+     {
+      "id": "f",
+      "w": 20,
+      "place": "span 2"
+     }
+    ]
+   },
+   "html": "<div id=d-wpt-row-ms-004 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px 50px 50px;grid-lanes-direction:row;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-wpt-row-ms-004-a style='width:20px;grid-row:span 2'></div><div id=d-wpt-row-ms-004-b style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-ms-004-c style='width:40px;grid-row:3 / span 2'></div><div id=d-wpt-row-ms-004-d style='width:20px;grid-row:span 4'></div><div id=d-wpt-row-ms-004-e style='width:20px;grid-row:1 / span 2'></div><div id=d-wpt-row-ms-004-f style='width:20px;grid-row:span 2'></div></div>",
+   "rects": {
+    "d-wpt-row-ms-004": [
+     0,
+     0,
+     200,
+     200
+    ],
+    "d-wpt-row-ms-004-a": [
+     0,
+     0,
+     20,
+     100
+    ],
+    "d-wpt-row-ms-004-b": [
+     20,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-ms-004-c": [
+     40,
+     100,
+     40,
+     100
+    ],
+    "d-wpt-row-ms-004-d": [
+     80,
+     0,
+     20,
+     200
+    ],
+    "d-wpt-row-ms-004-e": [
+     40,
+     0,
+     20,
+     100
+    ],
+    "d-wpt-row-ms-004-f": [
+     0,
+     100,
+     20,
+     100
+    ]
+   }
+  },
+  "d-wpt-row-rev-ms-005": {
+   "spec": {
+    "name": "d-wpt-row-rev-ms-005",
+    "container": {
+     "template": "50px 50px 50px 50px 50px",
+     "pack": "grid-lanes-pack:dense",
+     "axis": "row track-reverse",
+     "tolerance": "0"
+    },
+    "items": [
+     {
+      "id": "a",
+      "w": 80
+     },
+     {
+      "id": "b",
+      "w": 20,
+      "place": "span 2"
+     },
+     {
+      "id": "c",
+      "w": 40
+     },
+     {
+      "id": "d",
+      "w": 100
+     },
+     {
+      "id": "e",
+      "w": 10,
+      "place": "span 5"
+     },
+     {
+      "id": "f",
+      "w": 10,
+      "place": "span 4"
+     },
+     {
+      "id": "g",
+      "w": 10,
+      "place": "span 2"
+     }
+    ]
+   },
+   "html": "<div id=d-wpt-row-rev-ms-005 class=case style='position:relative;display:grid-lanes;font:10px/1 Ahem;grid-template-rows:50px 50px 50px 50px 50px;grid-lanes-direction:row track-reverse;flow-tolerance:0;grid-lanes-pack:dense;width:200px'><div id=d-wpt-row-rev-ms-005-a style='width:80px'></div><div id=d-wpt-row-rev-ms-005-b style='width:20px;grid-row:span 2'></div><div id=d-wpt-row-rev-ms-005-c style='width:40px'></div><div id=d-wpt-row-rev-ms-005-d style='width:100px'></div><div id=d-wpt-row-rev-ms-005-e style='width:10px;grid-row:span 5'></div><div id=d-wpt-row-rev-ms-005-f style='width:10px;grid-row:span 4'></div><div id=d-wpt-row-rev-ms-005-g style='width:10px;grid-row:span 2'></div></div>",
+   "rects": {
+    "d-wpt-row-rev-ms-005": [
+     0,
+     0,
+     200,
+     250
+    ],
+    "d-wpt-row-rev-ms-005-a": [
+     0,
+     200,
+     80,
+     50
+    ],
+    "d-wpt-row-rev-ms-005-b": [
+     0,
+     100,
+     20,
+     100
+    ],
+    "d-wpt-row-rev-ms-005-c": [
+     0,
+     50,
+     40,
+     50
+    ],
+    "d-wpt-row-rev-ms-005-d": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "d-wpt-row-rev-ms-005-e": [
+     100,
+     0,
+     10,
+     250
+    ],
+    "d-wpt-row-rev-ms-005-f": [
+     80,
+     50,
+     10,
+     200
+    ],
+    "d-wpt-row-rev-ms-005-g": [
+     20,
+     100,
+     10,
+     100
+    ]
+   }
   }
  }
 }

@@ -134,6 +134,10 @@ def dense_cases():
     out.append(case("d-rows-align-center", "20px 20px 20px", rw, pack=S, axis="row", align="center"))
     out.append(case("d-rows-align-stretch", "20px 20px 20px", rw, pack=S, axis="row", align="stretch"))
     out.append(case("d-rows-auto", "auto auto auto", [it("a", text="XXXX"), it("b", text="XXXXXX", place="span 2"), it("c", text="XX"), it("d", text="XXX"), it("e", text="XXXXX", place="span 2"), it("f", text="X")], pack=S, axis="row"))
+    # Cases lifted from the WPT dense-packing tests (explicit and split openings).
+    out.append(case("d-wpt-row-004", "50px 50px 50px 50px", [it("a", w=20), it("b", w=40), it("c", w=60, place="4"), it("d", w=20, place="span 2"), it("e", w=20, place="span 4"), it("f", w=20, place="span 3"), it("g", w=20, place="span 4"), it("h", w=20, place="4"), it("i", w=20)], pack=S, axis="row", tolerance="0"))
+    out.append(case("d-wpt-row-ms-004", "50px 50px 50px 50px", [it("a", w=20, place="span 2"), it("b", w=20, place="span 4"), it("c", w=40, place="3 / span 2"), it("d", w=20, place="span 4"), it("e", w=20, place="1 / span 2"), it("f", w=20, place="span 2")], pack=S, axis="row", tolerance="0"))
+    out.append(case("d-wpt-row-rev-ms-005", "50px 50px 50px 50px 50px", [it("a", w=80), it("b", w=20, place="span 2"), it("c", w=40), it("d", w=100), it("e", w=10, place="span 5"), it("f", w=10, place="span 4"), it("g", w=10, place="span 2")], pack=S, axis="row track-reverse", tolerance="0"))
     return out
 
 
