@@ -6684,3 +6684,37 @@ fn table_display_values_round_trip_without_falling_back_to_flex() {
         assert_eq!(declaration.get_property("display"), value);
     }
 }
+
+#[test]
+fn last_baseline_alignment_sets_a_layout_marker() {
+    let marker = |declaration: &CSSStyleDeclaration, property: &str| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(&format!("{LAST_BASELINE_PREFIX}{property}")))
+            .map(|value| value.to_string())
+    };
+    let mut d = CSSStyleDeclaration::new();
+    for (property, key) in [
+        ("align-items", "align-items"),
+        ("align-self", "align-self"),
+        ("justify-self", "justify-self"),
+        ("justify-items", "justify-items"),
+    ] {
+        assert_eq!(marker(&d, key), None);
+        d.set_property(property, "last baseline");
+        assert_eq!(marker(&d, key).as_deref(), Some("1"), "{property}");
+        // Whitespace and case do not matter; any other value clears it.
+        d.set_property(property, "  LAST   Baseline ");
+        assert_eq!(marker(&d, key).as_deref(), Some("1"), "{property}");
+        d.set_property(property, "baseline");
+        assert_eq!(marker(&d, key), None, "{property}");
+        d.set_property(property, "last baseline");
+        d.set_property(property, "first baseline");
+        assert_eq!(marker(&d, key), None, "{property}");
+    }
+    // The typed fields are unchanged by the marker.
+    d.set_property("align-items", "last baseline");
+    assert_eq!(d.inner.align_items, parse_align_items("last baseline"));
+}

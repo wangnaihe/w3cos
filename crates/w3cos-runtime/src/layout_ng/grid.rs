@@ -5092,6 +5092,54 @@ mod tests {
     }
 
     #[test]
+    fn abspos_static_position_last_baseline_falls_back_to_end() {
+        // Chrome, grid 200x100, 30x20 abspos child with no insets: `last
+        // baseline` (align-self, justify-self, or inherited from the
+        // container items) falls back to end alignment (auto tracks; Chrome
+        // 200x100 grid); an explicit
+        // `align-self: start` or a first `baseline` stays at the start.
+        let marker = |property: &str| {
+            CustomProperties::from_iter([(
+                format!("{LAST_BASELINE_PREFIX}{property}"),
+                "1".to_string(),
+            )])
+        };
+        let child = |own: Option<&str>| {
+            let mut abs = block_box(Some(30.0), Some(20.0));
+            abs.position = Position::Absolute;
+            abs.custom_properties = own.map(marker);
+            abs
+        };
+        let run = |container: Style, child: Style| {
+            let out = lay(&Component::boxed(container, vec![leaf(child)]));
+            let r = rect(&out, 1);
+            (r[0], r[1])
+        };
+        let grid = || grid_style(200.0, Some(100.0), None);
+        assert_eq!(run(grid(), child(Some("align-self"))), (0.0, 80.0));
+        assert_eq!(run(grid(), child(Some("justify-self"))), (170.0, 0.0));
+        let mut items = grid();
+        items.custom_properties = Some(CustomProperties::from_iter([
+            (
+                format!("{LAST_BASELINE_PREFIX}align-items"),
+                "1".to_string(),
+            ),
+            (
+                format!("{LAST_BASELINE_PREFIX}justify-items"),
+                "1".to_string(),
+            ),
+        ]));
+        assert_eq!(run(items.clone(), child(None)), (170.0, 80.0));
+        let mut own_start = child(None);
+        own_start.align_self = AlignSelf::FlexStart;
+        assert_eq!(run(items, own_start), (170.0, 0.0));
+        let mut first = child(None);
+        first.align_self = AlignSelf::Baseline;
+        first.justify_self = AlignSelf::Baseline;
+        assert_eq!(run(grid(), first), (0.0, 0.0));
+    }
+
+    #[test]
     fn auto_repeat_named_lines_calc_and_percent() {
         expect(
             &Component::boxed(
