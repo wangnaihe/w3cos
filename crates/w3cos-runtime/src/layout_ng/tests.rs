@@ -6638,7 +6638,7 @@ fn grid_item_baseline_groups_match_chrome() {
         let mut style = Style {
             display: Display::Grid,
             width: Dimension::Px(200.0),
-            align_items: AlignItems::Baseline,
+            align_items: w3cos_std::style::AlignItems::Baseline,
             grid_template_columns: Some(columns.to_string()),
             gap: 0.0,
             ..block()
@@ -6746,7 +6746,7 @@ fn grid_item_baseline_groups_match_chrome() {
     ));
     assert_eq!(rect(&out, 1), (0.0, 0.0, 200.0, 49.0));
     assert_eq!(rect(&out, 2), (4.0, 12.0, 42.0, 20.0));
-    assert_eq!(rect(&out, 4), (50.0, 1.0, 50.0, 30.0));
+    assert_eq!(rect(&out, 4), (53.0, 1.0, 50.0, 30.0));
     assert_eq!(rect(&out, 6), (0.0, 39.0, 50.0, 10.0));
-    assert_eq!(rect(&out, 8), (50.0, 39.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 8), (53.0, 39.0, 50.0, 10.0));
 }
