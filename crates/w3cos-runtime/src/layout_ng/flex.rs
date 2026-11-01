@@ -202,7 +202,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             child_style,
             style.flex_direction,
             style.flex_wrap == FlexWrap::WrapReverse,
-            is_rtl(style),
+            flip(style),
         );
         if matches!(cross_start, Spacing::Auto) || matches!(cross_end, Spacing::Auto) {
             return Some("flex:auto-cross-margin");
@@ -435,21 +435,56 @@ fn is_rtl(style: &Style) -> bool {
     style.direction == TextDirection::Rtl
 }
 
+/// Set on a vertical-writing-mode flex container whose axes
+/// [`vertical_flex_styles`] transposed: `lr` or `rl` (the block flow
+/// direction), plus `rtl` when the inline axis runs bottom to top.
+pub(super) const VERTICAL_MARKER: &str = "--w3cos-internal-vertical-flex";
+
+/// Physical axes that run against the layout's logical (start-first)
+/// coordinates and are converted at the end (Blink `LogicalToPhysical`).
+#[derive(Clone, Copy)]
+struct Flip {
+    x: bool,
+    y: bool,
+}
+
+fn flip(style: &Style) -> Flip {
+    match style
+        .custom_properties
+        .as_ref()
+        .and_then(|p| p.get(VERTICAL_MARKER))
+    {
+        Some(value) => Flip {
+            x: value.split_ascii_whitespace().next() == Some("rl"),
+            y: value.split_ascii_whitespace().any(|word| word == "rtl"),
+        },
+        None => Flip {
+            x: is_rtl(style),
+            y: false,
+        },
+    }
+}
+
 /// Margins at the main start and end. Layout runs in logical coordinates
 /// (inline-start at x = 0) and `mirror_x` converts to physical ones at the
 /// end, so a row's inline-start margin is the physical right one under rtl
 /// (Blink `LogicalToPhysical`).
-fn main_margin_sides(style: &Style, direction: FlexDirection, rtl: bool) -> (Spacing, Spacing) {
-    let (inline_start, inline_end) = if rtl {
+fn main_margin_sides(style: &Style, direction: FlexDirection, flip: Flip) -> (Spacing, Spacing) {
+    let (inline_start, inline_end) = if flip.x {
         (style.margin.right, style.margin.left)
     } else {
         (style.margin.left, style.margin.right)
     };
+    let (block_start, block_end) = if flip.y {
+        (style.margin.bottom, style.margin.top)
+    } else {
+        (style.margin.top, style.margin.bottom)
+    };
     match direction {
         FlexDirection::Row => (inline_start, inline_end),
         FlexDirection::RowReverse => (inline_end, inline_start),
-        FlexDirection::Column => (style.margin.top, style.margin.bottom),
-        FlexDirection::ColumnReverse => (style.margin.bottom, style.margin.top),
+        FlexDirection::Column => (block_start, block_end),
+        FlexDirection::ColumnReverse => (block_end, block_start),
     }
 }
 
@@ -457,12 +492,16 @@ fn cross_margin_sides(
     style: &Style,
     direction: FlexDirection,
     wrap_reverse: bool,
-    rtl: bool,
+    flip: Flip,
 ) -> (Spacing, Spacing) {
     // `wrap-reverse` swaps cross-start and cross-end (Flexbox §5.2).
     let (start, end) = if row_axis(direction) {
-        (style.margin.top, style.margin.bottom)
-    } else if rtl {
+        if flip.y {
+            (style.margin.bottom, style.margin.top)
+        } else {
+            (style.margin.top, style.margin.bottom)
+        }
+    } else if flip.x {
         (style.margin.right, style.margin.left)
     } else {
         (style.margin.left, style.margin.right)
@@ -868,11 +907,11 @@ fn column_wrap_items(
             .max(0.0);
         let main_edges = item_edges(child_style, space, 0.0, false);
         let cross_edges = item_edges(child_style, space, 0.0, true);
-        let (start, end) = main_margin_sides(child_style, style.flex_direction, is_rtl(style));
+        let (start, end) = main_margin_sides(child_style, style.flex_direction, flip(style));
         let main_margins =
             spacing_px(child_style, start, 0.0, space) + spacing_px(child_style, end, 0.0, space);
         let (cross_start, cross_end) =
-            cross_margin_sides(child_style, style.flex_direction, false, is_rtl(style));
+            cross_margin_sides(child_style, style.flex_direction, false, flip(style));
         let cross_margins = spacing_px(child_style, cross_start, 0.0, space)
             + spacing_px(child_style, cross_end, 0.0, space);
         let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
@@ -1131,8 +1170,7 @@ fn stretched_row_cross(
     line: Option<f32>,
 ) -> Option<Option<f32>> {
     let style = flat[child].style;
-    let (start, end) =
-        cross_margin_sides(style, container.flex_direction, false, is_rtl(container));
+    let (start, end) = cross_margin_sides(style, container.flex_direction, false, flip(container));
     let Some(line) = line else {
         return Some(None);
     };
@@ -1173,8 +1211,7 @@ fn stretched_column_wrap_max(
     line: Option<f32>,
 ) -> Option<Option<f32>> {
     let style = flat[child].style;
-    let (start, end) =
-        cross_margin_sides(style, container.flex_direction, false, is_rtl(container));
+    let (start, end) = cross_margin_sides(style, container.flex_direction, false, flip(container));
     let Some(line) = line else {
         return Some(None);
     };
@@ -1729,10 +1766,133 @@ fn justify_kind(style: &Style) -> JustifyContent {
     style.justify_content
 }
 
+/// Markers that change what a container or item lays out as in ways the
+/// transposed axes do not model (logical sizes, intrinsic keywords, aspect
+/// ratios, unrecognized flex values, safe alignment, balancing).
+fn vertical_unmodelled_marker(style: &Style) -> bool {
+    style.custom_properties.as_ref().is_some_and(|properties| {
+        properties.keys().any(|key| {
+            key.starts_with("--w3cos-internal-")
+                && (key.contains("logical-size")
+                    || key.contains("keyword")
+                    || key.contains("aspect-ratio")
+                    || key.contains("unrecognized")
+                    || key.contains("safe-")
+                    || key.contains("line-count")
+                    || key.contains("balance"))
+        })
+    })
+}
+
+fn percent_spacing(edges: &w3cos_std::style::Edges) -> bool {
+    [edges.top, edges.right, edges.bottom, edges.left]
+        .iter()
+        .any(|side| matches!(side, Spacing::Percent(_)))
+}
+
+/// Flex containers in `vertical-lr` / `vertical-rl` whose items are empty
+/// boxes, with their axes transposed. A vertical flow lays out like a
+/// horizontal one with the physical axes exchanged: the inline axis is
+/// vertical (flipped under `direction: rtl`) and the block axis is
+/// horizontal (flipped for `vertical-rl`). The style gets the direction and
+/// the gaps exchanged so the physical layout below runs unchanged, and
+/// [`VERTICAL_MARKER`] tells it which axes to mirror at the end. Only
+/// definite physical sizes and leaf items of the same writing mode qualify;
+/// everything else keeps its previous behavior.
+pub(super) fn vertical_flex_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
+    use w3cos_std::style::WritingMode;
+    let mut patched = Vec::new();
+    for (index, node) in flat.iter().enumerate() {
+        let style = node.style;
+        let block = match style.writing_mode {
+            WritingMode::VerticalRl => "rl",
+            WritingMode::VerticalLr => "lr",
+            _ => continue,
+        };
+        if style.display != Display::Flex
+            || !matches!(style.width, Dimension::Px(_))
+            || !matches!(style.height, Dimension::Px(_))
+            || !matches!(style.min_width, Dimension::Auto)
+            || !matches!(style.min_height, Dimension::Auto)
+            || !matches!(style.max_width, Dimension::Auto)
+            || !matches!(style.max_height, Dimension::Auto)
+            || percent_spacing(&style.margin)
+            || percent_spacing(&style.padding)
+            || style.align_items == AlignItems::Baseline
+            || vertical_unmodelled_marker(style)
+            || side_keyword(style).is_some()
+        {
+            continue;
+        }
+        let mut simple = true;
+        for child in rendered_children(flat, index) {
+            let child_style = flat[child].style;
+            if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
+                || flat[child].subtree_end > child + 1
+                || child_style.writing_mode != style.writing_mode
+                || child_style.position != w3cos_std::style::Position::Static
+                || child_style.float != Float::None
+                || child_style.align_self == AlignSelf::Baseline
+                || percent_spacing(&child_style.margin)
+                || percent_spacing(&child_style.padding)
+                || vertical_unmodelled_marker(child_style)
+            {
+                simple = false;
+                break;
+            }
+        }
+        if !simple {
+            continue;
+        }
+        let mut transposed = style.clone();
+        transposed.flex_direction = match style.flex_direction {
+            FlexDirection::Row => FlexDirection::Column,
+            FlexDirection::RowReverse => FlexDirection::ColumnReverse,
+            FlexDirection::Column => FlexDirection::Row,
+            FlexDirection::ColumnReverse => FlexDirection::RowReverse,
+        };
+        transposed.row_gap = Some(style.column_gap.unwrap_or(style.gap));
+        transposed.column_gap = Some(style.row_gap.unwrap_or(style.gap));
+        transposed.direction = TextDirection::Ltr;
+        let value = if is_rtl(style) {
+            format!("{block} rtl")
+        } else {
+            block.to_string()
+        };
+        transposed
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(VERTICAL_MARKER.to_string(), value);
+        patched.push((index, transposed));
+    }
+    patched
+}
+
 /// Physical x of a box laid out at logical `x` inside a content box
 /// starting at `origin` (rtl mirrors the inline axis).
 fn mirror_x(origin: f32, inner: f32, x: f32, width: f32) -> f32 {
     unit(origin + inner - (x - origin) - width)
+}
+
+fn mirror_xy(
+    flip: Flip,
+    origin: (f32, f32),
+    inner: (f32, f32),
+    at: (f32, f32),
+    size: (f32, f32),
+) -> (f32, f32) {
+    (
+        if flip.x {
+            mirror_x(origin.0, inner.0, at.0, size.0)
+        } else {
+            at.0
+        },
+        if flip.y {
+            mirror_x(origin.1, inner.1, at.1, size.1)
+        } else {
+            at.1
+        },
+    )
 }
 
 fn justify(kind: JustifyContent, free: f32, count: usize) -> (f32, f32) {
@@ -2006,12 +2166,12 @@ pub(super) fn layout(
             child,
         )
         .why("flex:min")?;
-        let (main_start, main_end) = main_margin_sides(child_style, direction, is_rtl(style));
+        let (main_start, main_end) = main_margin_sides(child_style, direction, flip(style));
         let (cross_start, cross_end) = cross_margin_sides(
             child_style,
             direction,
             style.flex_wrap == FlexWrap::WrapReverse,
-            is_rtl(style),
+            flip(style),
         );
         let (auto_main_start, auto_main_end) = (
             matches!(main_start, Spacing::Auto),
@@ -2501,11 +2661,13 @@ pub(super) fn layout(
         } else {
             (bl + pl + cross, bt + pt + main)
         };
-        let x = if is_rtl(style) {
-            mirror_x(bl + pl, inner_width, x, laid.fragment.width)
-        } else {
-            x
-        };
+        let (x, y) = mirror_xy(
+            flip(style),
+            (bl + pl, bt + pt),
+            (inner_width, specified_height.unwrap_or(0.0)),
+            (x, y),
+            (laid.fragment.width, laid.fragment.height),
+        );
         let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
         oof.extend(
             laid.oof
@@ -3049,11 +3211,13 @@ fn layout_wrapped(
             } else {
                 (bl + pl + cross_cursor + cross, bt + pt + main)
             };
-            let x = if is_rtl(style) {
-                mirror_x(bl + pl, inner_width, x, laid.fragment.width)
-            } else {
-                x
-            };
+            let (x, y) = mirror_xy(
+                flip(style),
+                (bl + pl, bt + pt),
+                (inner_width, specified_height.unwrap_or(0.0)),
+                (x, y),
+                (laid.fragment.width, laid.fragment.height),
+            );
             if row && top_line {
                 let item_baseline = match laid.first_baseline {
                     LastBaseline::NoLines => LastBaseline::At(laid.fragment.height),
@@ -4143,6 +4307,62 @@ mod tests {
         ));
     }
 
+    fn vertical_flex(
+        mode: w3cos_std::style::WritingMode,
+        direction: FlexDirection,
+        rtl: bool,
+    ) -> Component {
+        let mut style = flex_style(direction, 100.0, Some(60.0));
+        style.writing_mode = mode;
+        if rtl {
+            style.direction = TextDirection::Rtl;
+        }
+        let mut items = Vec::new();
+        for (width, height) in [(10.0, 10.0), (20.0, 10.0)] {
+            let mut item = block_box(Some(width), Some(height));
+            item.writing_mode = mode;
+            items.push(leaf(item));
+        }
+        Component::boxed(style, items)
+    }
+
+    #[test]
+    fn vertical_row_runs_down_the_inline_axis() {
+        use w3cos_std::style::WritingMode::{VerticalLr, VerticalRl};
+        // The inline axis is vertical; the block axis (cross) starts at the
+        // left in `vertical-lr` and at the right in `vertical-rl`.
+        expect(
+            &vertical_flex(VerticalLr, FlexDirection::Row, false),
+            &[(1, [0.0, 0.0, 10.0, 10.0]), (2, [0.0, 10.0, 20.0, 10.0])],
+        );
+        expect(
+            &vertical_flex(VerticalRl, FlexDirection::Row, false),
+            &[(1, [90.0, 0.0, 10.0, 10.0]), (2, [80.0, 10.0, 20.0, 10.0])],
+        );
+        // `direction: rtl` runs the inline axis bottom to top.
+        expect(
+            &vertical_flex(VerticalLr, FlexDirection::Row, true),
+            &[(1, [0.0, 50.0, 10.0, 10.0]), (2, [0.0, 40.0, 20.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn vertical_column_runs_along_the_block_axis() {
+        use w3cos_std::style::WritingMode::{VerticalLr, VerticalRl};
+        expect(
+            &vertical_flex(VerticalLr, FlexDirection::Column, false),
+            &[(1, [0.0, 0.0, 10.0, 10.0]), (2, [10.0, 0.0, 20.0, 10.0])],
+        );
+        expect(
+            &vertical_flex(VerticalRl, FlexDirection::Column, false),
+            &[(1, [90.0, 0.0, 10.0, 10.0]), (2, [70.0, 0.0, 20.0, 10.0])],
+        );
+        expect(
+            &vertical_flex(VerticalRl, FlexDirection::ColumnReverse, false),
+            &[(1, [0.0, 0.0, 10.0, 10.0])],
+        );
+    }
+
     fn fixed_item(width: f32, height: f32) -> Style {
         let mut style = block_box(Some(width), Some(height));
         style.flex_grow = 0.0;
@@ -5005,6 +5225,30 @@ mod tests {
                 vec![Component::boxed(margined, vec![leaf(piece); 5])],
             ),
             &[(0, [0.0, 0.0, 125.0, 100.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn row_item_with_several_inline_children_is_as_wide_as_their_sum() {
+        // `flex: none` takes the item's max-content width as its base size.
+        // Three 20px inline-blocks sit on one line, so it is 60px wide, not
+        // the width of the widest child (flexbox-mbp-horiz-001).
+        let mut item = block_box(None, Some(10.0));
+        item.flex_grow = 0.0;
+        item.flex_shrink = 0.0;
+        let piece = Style {
+            display: Display::InlineBlock,
+            width: Dimension::Px(20.0),
+            height: Dimension::Px(10.0),
+            ..Style::default()
+        };
+        expect(
+            &row_of(
+                300.0,
+                Some(40.0),
+                vec![Component::boxed(item, vec![leaf(piece); 3])],
+            ),
+            &[(1, [0.0, 0.0, 60.0, 10.0])],
         );
     }
 }

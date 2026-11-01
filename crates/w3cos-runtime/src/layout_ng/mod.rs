@@ -451,11 +451,20 @@ fn layout_with_run_in(
     viewport_h: f32,
 ) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
     let run_in = block::run_in_block_styles(flat);
-    if !run_in.is_empty() {
-        let patched = run_in_patched(flat, &run_in);
-        return layout_flat_with_text(&patched, viewport_w, viewport_h);
+    let run_in_flat;
+    let base: &[FlatNodeInfo] = if run_in.is_empty() {
+        flat
+    } else {
+        run_in_flat = run_in_patched(flat, &run_in);
+        &run_in_flat
+    };
+    // Vertical-writing-mode flex containers lay out with transposed axes.
+    let vertical = flex::vertical_flex_styles(base);
+    if vertical.is_empty() {
+        return layout_flat_with_text(base, viewport_w, viewport_h);
     }
-    layout_flat_with_text(flat, viewport_w, viewport_h)
+    let patched = run_in_patched(base, &vertical);
+    layout_flat_with_text(&patched, viewport_w, viewport_h)
 }
 
 fn layout_flat_with_text(
