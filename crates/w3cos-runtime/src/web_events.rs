@@ -887,6 +887,12 @@ fn install_modifier_fields(this: &Value, init: &Value) {
 fn install_mouse_fields(this: &Value, init: &Value) {
     install_ui_fields(this, init);
     install_modifier_fields(this, init);
+    // Per CSSOM View, an event built without explicit page/offset/layer/x/y
+    // values derives them from clientX/clientY (document scroll is 0 for a
+    // synthetic, undispatched event). Consumers such as Monaco read `pageX`
+    // directly, so defaulting them to 0 sends every synthetic click to (0, 0).
+    let client_x = init_value(init, "clientX", Value::Number(0.0)).to_number();
+    let client_y = init_value(init, "clientY", Value::Number(0.0)).to_number();
     install_fields(
         this,
         init,
@@ -895,10 +901,10 @@ fn install_mouse_fields(this: &Value, init: &Value) {
             ("screenY", Value::Number(0.0)),
             ("clientX", Value::Number(0.0)),
             ("clientY", Value::Number(0.0)),
-            ("pageX", Value::Number(0.0)),
-            ("pageY", Value::Number(0.0)),
-            ("offsetX", Value::Number(0.0)),
-            ("offsetY", Value::Number(0.0)),
+            ("pageX", Value::Number(client_x)),
+            ("pageY", Value::Number(client_y)),
+            ("offsetX", Value::Number(client_x)),
+            ("offsetY", Value::Number(client_y)),
             ("movementX", Value::Number(0.0)),
             ("movementY", Value::Number(0.0)),
             ("button", Value::Number(0.0)),
@@ -906,10 +912,10 @@ fn install_mouse_fields(this: &Value, init: &Value) {
             ("relatedTarget", Value::Null),
             ("fromElement", Value::Null),
             ("toElement", Value::Null),
-            ("layerX", Value::Number(0.0)),
-            ("layerY", Value::Number(0.0)),
-            ("x", Value::Number(0.0)),
-            ("y", Value::Number(0.0)),
+            ("layerX", Value::Number(client_x)),
+            ("layerY", Value::Number(client_y)),
+            ("x", Value::Number(client_x)),
+            ("y", Value::Number(client_y)),
         ],
     );
 }
@@ -1939,6 +1945,46 @@ pub(crate) fn reset_realm() {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn mouse_event_page_offset_xy_default_to_client_coordinates() {
+        for name in ["MouseEvent", "PointerEvent"] {
+            let init = Value::object(HashMap::from([
+                ("clientX".to_string(), Value::Number(662.0)),
+                ("clientY".to_string(), Value::Number(375.0)),
+            ]));
+            let ev = w3cos_core::class::construct(
+                &event_subclass_class(name),
+                vec![Value::string("mousedown"), init],
+            );
+            for (prop, want) in [
+                ("pageX", 662.0),
+                ("pageY", 375.0),
+                ("offsetX", 662.0),
+                ("offsetY", 375.0),
+                ("x", 662.0),
+                ("y", 375.0),
+            ] {
+                assert_eq!(ev.get_property(prop).to_number(), want, "{name}.{prop}");
+            }
+            // Explicit init values win over the derived defaults.
+            let init = Value::object(HashMap::from([
+                ("clientX".to_string(), Value::Number(10.0)),
+                ("pageX".to_string(), Value::Number(99.0)),
+            ]));
+            let ev = w3cos_core::class::construct(
+                &event_subclass_class(name),
+                vec![Value::string("mousedown"), init],
+            );
+            assert_eq!(ev.get_property("pageX").to_number(), 99.0);
+            assert_eq!(ev.get_property("x").to_number(), 10.0);
+        }
+        let plain = w3cos_core::class::construct(
+            &event_subclass_class("MouseEvent"),
+            vec![Value::string("click")],
+        );
+        assert_eq!(plain.get_property("pageX").to_number(), 0.0);
+    }
 
     #[test]
     fn event_classes_expose_browser_prototype_members() {
