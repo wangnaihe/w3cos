@@ -3584,7 +3584,31 @@ pub(super) fn layout(
         return super::bail("grid:max-height");
     }
     if used < base && !inline_intrinsic {
-        return super::bail("grid:short-height");
+        // Rows that overflow a shorter definite height run on NG, except in
+        // two corners that sibling grid-lanes pages (which still lay out on
+        // the legacy engine) depend on being paired with the same engine:
+        // - subgrid rows overflowing the container;
+        // - a grid-lanes box this pass treats as an ordinary grid, unless
+        //   every item spans more than half of the columns, so lanes and
+        //   grid auto-placement cannot differ (one item per stacking level).
+        let has_row_subgrid = row_sub
+            || items.iter().any(|item| {
+                flat[item.index]
+                    .style
+                    .grid_rows()
+                    .is_some_and(is_subgrid_axis)
+            });
+        if has_row_subgrid {
+            return super::bail("grid:short-height-subgrid");
+        }
+        let lanes_box = has_marker(style, "--w3cos-internal-grid-lanes");
+        if lanes_box
+            && !(lanes::column_lanes(style)
+                && !columns.is_empty()
+                && items.iter().all(|item| item.col_span * 2 > columns.len()))
+        {
+            return super::bail("grid:short-height-lanes");
+        }
     }
     if stretch_rows && used > base && !rows.is_empty() {
         let extra = used - base;
@@ -3663,9 +3687,8 @@ pub(super) fn layout(
     let row_sum: i64 = rows.iter().sum();
     let row_free = used - gap_sum(&row_collapsed, row_gap_u) - row_sum;
     let active_rows = rows.len().max(1);
-    let (row_lead, row_between) =
-        pack_gap(row_pack(style), row_free.max(0), active_rows, row_gap_u);
-    let row_y = positions(&rows, &row_collapsed, row_between, row_lead.max(0));
+    let (row_lead, row_between) = pack_gap(row_pack(style), row_free, active_rows, row_gap_u);
+    let row_y = positions(&rows, &row_collapsed, row_between, row_lead);
 
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);
@@ -4413,13 +4436,69 @@ mod tests {
                 vec![leaf(block_box(None, Some(10.0)))],
             )],
         );
+    }
+
+    #[test]
+    fn grid_shorter_than_its_tracks_runs_on_ng() {
+        // A definite height below the track sum no longer falls back; the
+        // rows overflow like Chrome (numbers in
+        // `grid_short_height_overflow_matches_chrome`).
         let short = Component::boxed(
             grid_style(200.0, Some(5.0), None),
             vec![leaf(block_box(None, Some(10.0)))],
         );
         let flat = pre_flatten(&short);
         assert!(block::supports_tree(&flat));
-        assert!(super::super::layout_tree(&short, &flat, 800.0, 600.0).is_none());
+        assert!(super::super::layout_tree(&short, &flat, 800.0, 600.0).is_some());
+    }
+
+    #[test]
+    fn short_height_keeps_subgrid_and_lanes_boxes_on_legacy() {
+        let layout_is_some = |root: &Component| {
+            let flat = pre_flatten(root);
+            assert!(block::supports_tree(&flat));
+            super::super::layout_tree(root, &flat, 800.0, 600.0).is_some()
+        };
+        // Row subgrid overflowing the parent: sibling grid-lanes pages with
+        // the same shape stay on legacy, so this does too.
+        let mut parent = grid_style(120.0, Some(30.0), Some("40px"));
+        rows(&mut parent, "30px 50px");
+        let mut sub = subgrid_box(None, Some("subgrid"));
+        row_placement(&mut sub, "1 / -1");
+        let subgrid = Component::boxed(
+            parent.clone(),
+            vec![Component::boxed(
+                sub,
+                vec![leaf(block_box(Some(10.0), Some(10.0)))],
+            )],
+        );
+        assert!(!layout_is_some(&subgrid));
+        // The same short grid without the subgrid runs on NG.
+        let plain = Component::boxed(parent, vec![leaf(block_box(Some(10.0), Some(10.0)))]);
+        assert!(layout_is_some(&plain));
+        // A grid-lanes box with an intrinsic auto-repeat is laid out as an
+        // ordinary grid. Single-column items could be packed side by side by
+        // lanes, so a short height stays on legacy; items that each span
+        // more than half of the columns cannot, so those run on NG.
+        let lanes = |span: &str| {
+            let mut style = grid_style(
+                300.0,
+                Some(100.0),
+                Some("repeat(auto-fill, auto auto 100px)"),
+            );
+            style.custom_properties = Some(CustomProperties::from_iter([(
+                "--w3cos-internal-grid-lanes".to_string(),
+                "1".to_string(),
+            )]));
+            let item = || {
+                let mut item = block_box(Some(30.0), Some(100.0));
+                item.grid_column = Some(span.to_string());
+                leaf(item)
+            };
+            Component::boxed(style, vec![item(), item(), item(), item()])
+        };
+        assert!(!layout_is_some(&lanes("span 1")));
+        assert!(layout_is_some(&lanes("span 2")));
     }
 
     #[test]
