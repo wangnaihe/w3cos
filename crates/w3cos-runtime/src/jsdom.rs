@@ -8780,6 +8780,14 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
             ) {
                 return None;
             }
+            // `visibility: hidden` boxes keep their layout but are never a
+            // hit-test target (a visible descendant resolves to its own
+            // `visible` value and still hits). Without this, invisible
+            // overlays such as Code OSS's `.drop-block-overlay` swallow every
+            // click on the editor and side bar.
+            if entry.style.visibility == w3cos_std::style::Visibility::Hidden {
+                return None;
+            }
             let node = match entry.on_click {
                 w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok()?,
                 _ => return None,
@@ -28801,6 +28809,70 @@ try {
         assert!(stack.get_property("0").strict_eq(&target));
         assert!(stack.get_property("1").strict_eq(&outer));
         assert!(stack.get_property("length").to_u32() >= 2);
+    }
+
+    #[cfg(any(feature = "skia", feature = "cpu-render"))]
+    #[test]
+    fn document_hit_testing_skips_visibility_hidden_overlays() {
+        setup();
+        set_viewport(320.0, 240.0);
+        let document = document_value();
+        let base = create_in_body("div");
+        let base_style = base.get_property("style");
+        base_style.set_property("width", Value::string("200px"));
+        base_style.set_property("height", Value::string("100px"));
+        let overlay = document.call_method("createElement", vec![Value::string("div")]);
+        base.call_method("appendChild", vec![overlay.clone()]);
+        let overlay_style = overlay.get_property("style");
+        overlay_style.set_property("position", Value::string("absolute"));
+        overlay_style.set_property("top", Value::string("0px"));
+        overlay_style.set_property("width", Value::string("100%"));
+        overlay_style.set_property("height", Value::string("100%"));
+        overlay_style.set_property("visibility", Value::string("hidden"));
+        overlay_style.set_property("opacity", Value::string("0"));
+        overlay_style.set_property("zIndex", Value::string("12"));
+        base_style.set_property("position", Value::string("relative"));
+
+        let bounds = base.call_method("getBoundingClientRect", Vec::new());
+        let x = bounds.get_property("x").to_number() + 20.0;
+        let y = bounds.get_property("y").to_number() + 20.0;
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(
+            hit.strict_eq(&base),
+            "a visibility:hidden overlay must not be the hit target"
+        );
+        let stack = document.call_method(
+            "elementsFromPoint",
+            vec![Value::Number(x), Value::Number(y)],
+        );
+        for i in 0..stack.get_property("length").to_u32() {
+            assert!(
+                !stack.get_property(&i.to_string()).strict_eq(&overlay),
+                "hidden overlay listed in elementsFromPoint"
+            );
+        }
+
+        // A visible descendant of a hidden box still hits.
+        let child = document.call_method("createElement", vec![Value::string("div")]);
+        overlay.call_method("appendChild", vec![child.clone()]);
+        let child_style = child.get_property("style");
+        child_style.set_property("visibility", Value::string("visible"));
+        child_style.set_property("width", Value::string("50px"));
+        child_style.set_property("height", Value::string("50px"));
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(
+            hit.strict_eq(&child),
+            "visible child of hidden parent must hit"
+        );
+
+        // Becoming visible again makes the overlay hittable.
+        child.call_method("remove", Vec::new());
+        overlay_style.set_property("visibility", Value::string("visible"));
+        let hit =
+            document.call_method("elementFromPoint", vec![Value::Number(x), Value::Number(y)]);
+        assert!(hit.strict_eq(&overlay));
     }
 
     #[test]
