@@ -20,11 +20,33 @@ struct Inner {
 
 impl Clone for Inner {
     fn clone(&self) -> Self {
+        // A clone holds the same entries, so a computed fingerprint stays
+        // valid and later writes adjust it instead of rehashing every entry.
+        let fingerprint = OnceLock::new();
+        if let Some(known) = self.fingerprint.get() {
+            let _ = fingerprint.set(*known);
+        }
         Self {
             map: self.map.clone(),
-            fingerprint: OnceLock::new(),
+            fingerprint,
         }
     }
+}
+
+fn entry_hash(key: &str, value: &str) -> u64 {
+    fn bytes(seed: u64, text: &str) -> u64 {
+        let mut hash = seed ^ 0xcbf2_9ce4_8422_2325;
+        for byte in text.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+    let mut value = bytes(bytes(1, key), value);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 impl Inner {
@@ -39,22 +61,8 @@ impl Inner {
     /// fingerprints are different; equal fingerprints still need a compare.
     fn fingerprint(&self) -> u64 {
         *self.fingerprint.get_or_init(|| {
-            fn bytes(seed: u64, text: &str) -> u64 {
-                let mut hash = seed ^ 0xcbf2_9ce4_8422_2325;
-                for byte in text.as_bytes() {
-                    hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
-                }
-                hash
-            }
-            fn finish(mut value: u64) -> u64 {
-                value ^= value >> 30;
-                value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                value ^= value >> 27;
-                value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-                value ^ (value >> 31)
-            }
             self.map.iter().fold(self.map.len() as u64, |acc, (k, v)| {
-                acc.wrapping_add(finish(bytes(bytes(1, k), v)))
+                acc.wrapping_add(entry_hash(k, v))
             })
         })
     }
@@ -63,12 +71,41 @@ impl Inner {
 #[derive(Clone, Default)]
 pub struct CustomProperties(Arc<Inner>);
 
+#[derive(Default)]
+struct FingerprintDelta {
+    added: u64,
+    removed: u64,
+    len_added: i64,
+}
+
 impl CustomProperties {
     /// Unique access to the map: unshares it and drops the stale fingerprint.
     fn map_mut(&mut self) -> &mut HashMap<String, String> {
         let inner = Arc::make_mut(&mut self.0);
         inner.fingerprint = OnceLock::new();
         &mut inner.map
+    }
+
+    /// Unique access that keeps an already computed fingerprint current: the
+    /// closure reports the fingerprint change (`entries` added and the hash
+    /// sum added and removed) for the writes it performed.
+    fn write_tracked<R>(
+        &mut self,
+        write: impl FnOnce(&mut HashMap<String, String>, &mut FingerprintDelta) -> R,
+    ) -> R {
+        let inner = Arc::make_mut(&mut self.0);
+        let known = inner.fingerprint.take();
+        let mut delta = FingerprintDelta::default();
+        let result = write(&mut inner.map, &mut delta);
+        if let Some(known) = known {
+            let _ = inner.fingerprint.set(
+                known
+                    .wrapping_add(delta.added)
+                    .wrapping_sub(delta.removed)
+                    .wrapping_add(delta.len_added as u64),
+            );
+        }
+        result
     }
 }
 
@@ -88,7 +125,17 @@ impl CustomProperties {
         if self.0.map.get(&property) == Some(&value) {
             return Some(value);
         }
-        self.map_mut().insert(property, value)
+        self.write_tracked(|map, delta| {
+            delta.added = delta.added.wrapping_add(entry_hash(&property, &value));
+            let previous = map.insert(property.clone(), value);
+            match &previous {
+                Some(old) => {
+                    delta.removed = delta.removed.wrapping_add(entry_hash(&property, old));
+                }
+                None => delta.len_added += 1,
+            }
+            previous
+        })
     }
 
     /// Remove a property, unsharing the map only when it is present.
@@ -100,7 +147,12 @@ impl CustomProperties {
         if !self.0.map.contains_key(property) {
             return None;
         }
-        self.map_mut().remove(property)
+        self.write_tracked(|map, delta| {
+            let (key, value) = map.remove_entry(property)?;
+            delta.removed = delta.removed.wrapping_add(entry_hash(&key, &value));
+            delta.len_added -= 1;
+            Some(value)
+        })
     }
 
     /// Retain matching properties, unsharing the map only when one goes.
@@ -111,8 +163,16 @@ impl CustomProperties {
             .iter()
             .any(|(property, value)| !keep(property, value))
         {
-            self.map_mut()
-                .retain(|property, value| keep(property, value));
+            self.write_tracked(|map, delta| {
+                map.retain(|property, value| {
+                    let kept = keep(property, value);
+                    if !kept {
+                        delta.removed = delta.removed.wrapping_add(entry_hash(property, value));
+                        delta.len_added -= 1;
+                    }
+                    kept
+                });
+            });
         }
     }
 
@@ -303,5 +363,40 @@ mod tests {
         drop(a);
         c.insert("--v7".into(), "late".into());
         assert_ne!(c, b);
+    }
+
+    fn fresh_fingerprint(properties: &CustomProperties) -> u64 {
+        Inner::from_map(properties.0.map.clone()).fingerprint()
+    }
+
+    #[test]
+    fn incremental_fingerprint_matches_a_full_rehash_after_every_write() {
+        let mut a: CustomProperties = (0..50)
+            .map(|n| (format!("--v{n}"), n.to_string()))
+            .collect();
+        // Prime the cached fingerprint, then write through a shared clone.
+        assert_eq!(a.0.fingerprint(), fresh_fingerprint(&a));
+        let shared = a.clone();
+        a.insert("--v1".into(), "other".into());
+        assert_eq!(a.0.fingerprint(), fresh_fingerprint(&a));
+        a.insert("--new".into(), "x".into());
+        assert_eq!(a.0.fingerprint(), fresh_fingerprint(&a));
+        a.remove("--v2");
+        assert_eq!(a.0.fingerprint(), fresh_fingerprint(&a));
+        a.retain(|property, _| !property.starts_with("--v3"));
+        assert_eq!(a.0.fingerprint(), fresh_fingerprint(&a));
+        a.extend([("--e1".to_string(), "1".to_string())]);
+        assert_eq!(a.0.fingerprint(), fresh_fingerprint(&a));
+        // The shared source is untouched.
+        assert_eq!(shared.0.fingerprint(), fresh_fingerprint(&shared));
+        assert_ne!(shared, a);
+        // A write that never primed the fingerprint still hashes correctly.
+        let mut b = shared.clone();
+        b.insert("--late".into(), "1".into());
+        assert_eq!(b.0.fingerprint(), fresh_fingerprint(&b));
+        // Equal contents reached through different write orders agree.
+        let mut c = shared.clone();
+        c.insert("--late".into(), "1".into());
+        assert_eq!(b, c);
     }
 }
