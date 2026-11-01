@@ -30,17 +30,18 @@ fn html_text_input_intrinsic_size_uses_control_font_metrics() {
     let (_, metrics) = crate::skia_text_run::css_font(&face, style.font_size).metrics();
     assert_eq!(
         leaf_intrinsic_size(&input.kind, &style),
-        (180.0, 17.0),
-        "HTML size=20 intrinsic content box, metrics={metrics:?}"
+        (145.0, 15.0),
+        "Chrome 155 macOS HTML size=20 content box, metrics={metrics:?}"
     );
     style
         .custom_properties
         .as_mut()
         .unwrap()
         .insert("--w3cos-internal-input-size".into(), "5".into());
-    assert!(
-        leaf_intrinsic_size(&input.kind, &style).0 < 60.0,
-        "HTML size must alter intrinsic width"
+    assert_eq!(
+        leaf_intrinsic_size(&input.kind, &style),
+        (40.0, 15.0),
+        "Chrome 155 macOS HTML size=5 content box"
     );
 }
 
