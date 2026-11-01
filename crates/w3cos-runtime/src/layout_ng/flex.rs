@@ -1802,20 +1802,33 @@ pub(super) fn percent_spacing(edges: &w3cos_std::style::Edges) -> bool {
 pub(super) fn vertical_flex_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
     use w3cos_std::style::WritingMode;
     let mut patched = Vec::new();
-    for (index, node) in flat.iter().enumerate() {
+    // Nested containers are decided first (children follow their parent in
+    // flat order), so an item that is itself a qualifying container with a
+    // definite size can hold boxes of its own.
+    let mut qualifies = vec![false; flat.len()];
+    for (index, node) in flat.iter().enumerate().rev() {
         let style = node.style;
-        let block = match style.writing_mode {
-            WritingMode::VerticalRl => "rl",
-            WritingMode::VerticalLr => "lr",
+        // Sideways modes share the vertical block flow (`sideways-rl` is
+        // `vertical-rl`); `sideways-lr` additionally runs its inline axis
+        // bottom to top, which `direction: ltr` already means for it.
+        let (block, sideways_lr) = match style.writing_mode {
+            WritingMode::VerticalRl | WritingMode::SidewaysRl => ("rl", false),
+            WritingMode::VerticalLr => ("lr", false),
+            WritingMode::SidewaysLr => ("lr", true),
             _ => continue,
+        };
+        let limit_ok = |value: Dimension| match value {
+            Dimension::Auto => true,
+            Dimension::Px(px) => px.is_finite(),
+            _ => false,
         };
         if style.display != Display::Flex
             || !matches!(style.width, Dimension::Px(_))
             || !matches!(style.height, Dimension::Px(_))
-            || !matches!(style.min_width, Dimension::Auto)
-            || !matches!(style.min_height, Dimension::Auto)
-            || !matches!(style.max_width, Dimension::Auto)
-            || !matches!(style.max_height, Dimension::Auto)
+            || !limit_ok(style.min_width)
+            || !limit_ok(style.min_height)
+            || !limit_ok(style.max_width)
+            || !limit_ok(style.max_height)
             || percent_spacing(&style.margin)
             || percent_spacing(&style.padding)
             || style.align_items == AlignItems::Baseline
@@ -1828,7 +1841,10 @@ pub(super) fn vertical_flex_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         for child in rendered_children(flat, index) {
             let child_style = flat[child].style;
             if matches!(flat[child].kind, w3cos_std::ComponentKind::Text { .. })
-                || flat[child].subtree_end > child + 1
+                || (flat[child].subtree_end > child + 1
+                    && !(qualifies[child]
+                        && matches!(child_style.width, Dimension::Px(_))
+                        && matches!(child_style.height, Dimension::Px(_))))
                 || child_style.writing_mode != style.writing_mode
                 || child_style.position != w3cos_std::style::Position::Static
                 || child_style.float != Float::None
@@ -1854,7 +1870,7 @@ pub(super) fn vertical_flex_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         transposed.row_gap = Some(style.column_gap.unwrap_or(style.gap));
         transposed.column_gap = Some(style.row_gap.unwrap_or(style.gap));
         transposed.direction = TextDirection::Ltr;
-        let value = if is_rtl(style) {
+        let value = if is_rtl(style) != sideways_lr {
             format!("{block} rtl")
         } else {
             block.to_string()
@@ -1863,8 +1879,10 @@ pub(super) fn vertical_flex_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             .custom_properties
             .get_or_insert_with(Default::default)
             .insert(VERTICAL_MARKER.to_string(), value);
+        qualifies[index] = true;
         patched.push((index, transposed));
     }
+    patched.reverse();
     patched
 }
 
@@ -4360,6 +4378,37 @@ mod tests {
         expect(
             &vertical_flex(VerticalRl, FlexDirection::ColumnReverse, false),
             &[(1, [0.0, 0.0, 10.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn sideways_modes_share_the_vertical_block_flow() {
+        use w3cos_std::style::WritingMode::{SidewaysLr, SidewaysRl};
+        // `sideways-rl` lays out like `vertical-rl`.
+        expect(
+            &vertical_flex(SidewaysRl, FlexDirection::Row, false),
+            &[(1, [90.0, 0.0, 10.0, 10.0]), (2, [80.0, 10.0, 20.0, 10.0])],
+        );
+        // `sideways-lr` starts its inline axis at the bottom even with
+        // `direction: ltr`.
+        expect(
+            &vertical_flex(SidewaysLr, FlexDirection::Row, false),
+            &[(1, [0.0, 50.0, 10.0, 10.0]), (2, [0.0, 40.0, 20.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn vertical_flex_item_may_be_a_sized_vertical_container() {
+        use w3cos_std::style::WritingMode::VerticalLr;
+        let mut inner = flex_style(FlexDirection::Row, 30.0, Some(30.0));
+        inner.writing_mode = VerticalLr;
+        let mut leaf_style = block_box(Some(10.0), Some(10.0));
+        leaf_style.writing_mode = VerticalLr;
+        let mut style = flex_style(FlexDirection::Row, 100.0, Some(60.0));
+        style.writing_mode = VerticalLr;
+        expect(
+            &Component::boxed(style, vec![Component::boxed(inner, vec![leaf(leaf_style)])]),
+            &[(1, [0.0, 0.0, 30.0, 30.0]), (2, [0.0, 0.0, 10.0, 10.0])],
         );
     }
 

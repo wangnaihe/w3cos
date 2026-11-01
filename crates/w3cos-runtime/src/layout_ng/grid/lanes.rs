@@ -204,10 +204,11 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         Some(_) => {}
     }
-    // Spanning items over intrinsic column tracks feed the track sizing
-    // in ways the ordinary-grid reference does not match (auto-repeat
-    // spans and multi-span baseline sharing); row lanes follow main's
-    // opening-based placement and are covered by the Chrome goldens.
+    // Items with an explicit line plus a span (`4 / span 2`) over intrinsic
+    // column tracks feed the track sizing in ways the ordinary-grid
+    // reference does not match. Span-only placements follow main's
+    // opening-based placement, as do row lanes (Chrome goldens,
+    // column-explicit-placement-003, column-auto-placement-001).
     let intrinsic_axis = columns
         && template
             .tracks
@@ -223,8 +224,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             return Some("lanes:overflow-alignment");
         }
         if intrinsic_axis
-            && placement(child_style, !columns)
-                .is_some_and(|value| value.contains("span") || value.contains('/'))
+            && placement(child_style, !columns).is_some_and(|value| value.contains('/'))
         {
             return Some("lanes:intrinsic-span");
         }

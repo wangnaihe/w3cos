@@ -2264,6 +2264,41 @@ fn resolve_axis(value: Option<&str>, names: &[Vec<String>], explicit: usize) -> 
     }
 }
 
+/// An abspos child may end at the first line (`auto / 1`): its span is the
+/// track before the explicit grid, which an in-flow item cannot occupy.
+///
+/// Only taken when the container has padding on that axis: with none the
+/// area is empty, and the ordinary-grid reference pages that rely on it
+/// (css-grid/subgrid/abs-pos-001) must keep falling back with their tests.
+fn resolve_abspos_axis(
+    value: Option<&str>,
+    names: &[Vec<String>],
+    explicit: usize,
+    padded: bool,
+) -> Option<AxisPlace> {
+    if let Some(place) = resolve_axis(value, names, explicit) {
+        return Some(place);
+    }
+    if !padded {
+        return None;
+    }
+    let parts: Vec<&str> = value?.split('/').map(str::trim).collect();
+    let [start, end] = parts.as_slice() else {
+        return None;
+    };
+    if !matches!(parse_grid_line(start)?, GridLine::Auto) {
+        return None;
+    }
+    let end = parse_grid_line(end)?;
+    if matches!(end, GridLine::Span { .. }) {
+        return None;
+    }
+    (grid_line_index(&end, names, explicit, None)? == 0).then_some(AxisPlace {
+        start: Some(-1),
+        span: 1,
+    })
+}
+
 fn resolve_pair(
     start: &str,
     end: &str,
@@ -3685,7 +3720,12 @@ fn abspos_area(
     let b = if end_auto {
         None
     } else {
-        start_line.and_then(|line| end_edge(line + span))
+        // `auto / 1` ends at the first line: the track before it is outside
+        // the explicit grid (start -1), so the area ends at that edge.
+        start
+            .map(|line| line + span as isize)
+            .filter(|&line| line >= 0)
+            .and_then(|line| end_edge(line as usize))
     };
     let a = a.unwrap_or(padding.0);
     let b = b.unwrap_or(padding.1).max(a);
@@ -5131,10 +5171,25 @@ fn layout_impl(
     let stand_in_column_only = columns_spec(style).is_none() && !flow.column && built.is_empty();
     for child in oof_children {
         let child_style = flat[child].style;
-        let column = resolve_axis(placement(child_style, false), &names_cols, explicit_cols)
-            .why("grid:column")?;
-        let row = resolve_axis(placement(child_style, true), &names_rows, explicit_rows)
-            .why("grid:row")?;
+        let padded = |a: Spacing, b: Spacing| {
+            [a, b]
+                .iter()
+                .any(|side| matches!(side, Spacing::Px(px) if *px > 0.0))
+        };
+        let column = resolve_abspos_axis(
+            placement(child_style, false),
+            &names_cols,
+            explicit_cols,
+            padded(style.padding.left, style.padding.right),
+        )
+        .why("grid:column")?;
+        let row = resolve_abspos_axis(
+            placement(child_style, true),
+            &names_rows,
+            explicit_rows,
+            padded(style.padding.top, style.padding.bottom),
+        )
+        .why("grid:row")?;
         let col = column.start.unwrap_or(0).max(0) as usize;
         let row_index = row.start.unwrap_or(0).max(0) as usize;
         // When the grid is not the containing block, the static position
@@ -6599,6 +6654,27 @@ mod tests {
         expect(
             &Component::boxed(style, items),
             &[(1, [0.0, 0.0, 50.0, 30.0]), (2, [0.0, 30.0, 50.0, 60.0])],
+        );
+    }
+
+    #[test]
+    fn abspos_child_ending_at_first_line_spans_the_padding() {
+        // `auto / 1` is the track before the grid: the area runs from the
+        // padding edge to the first line (Chrome: width 15), while
+        // `auto / 2` ends at the second line (width 15 + 100).
+        let mut style = grid_style(200.0, Some(50.0), Some("100px 100px"));
+        style.position = Position::Relative;
+        style.padding.left = Spacing::Px(15.0);
+        let abs = |column: &str| {
+            let mut child = block_box(None, Some(10.0));
+            child.position = Position::Absolute;
+            child.width = Dimension::Percent(100.0);
+            child.grid_column = Some(column.to_string());
+            leaf(child)
+        };
+        expect(
+            &Component::boxed(style, vec![abs("auto / 1"), abs("auto / 2")]),
+            &[(1, [0.0, 0.0, 15.0, 10.0]), (2, [0.0, 0.0, 115.0, 10.0])],
         );
     }
 
