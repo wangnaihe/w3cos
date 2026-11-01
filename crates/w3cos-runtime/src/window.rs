@@ -8986,24 +8986,40 @@ impl ApplicationHandler for App {
                     self.request_repaint();
                     return;
                 }
-                if let Some(focus_idx) = self.focused_index {
+                // DOM pages: keyboard events go to document.activeElement, with the
+                // native focus chain only as the fallback target.
+                let dom_key_target = if self.dom_mode {
+                    let fallback = self.focused_index.and_then(|focus_idx| {
+                        self.native_host_chain(focus_idx)
+                            .first()
+                            .map(|target| *target as u32)
+                    });
+                    crate::jsdom::keyboard_event_target(fallback)
+                } else {
+                    None
+                };
+                if let Some(target) = dom_key_target {
+                    let default_prevented = crate::jsdom::dispatch_native_key(
+                        target,
+                        &web_key(&event.logical_key),
+                        &web_code(event.physical_key),
+                        event.repeat,
+                        self.modifiers.alt_key(),
+                        self.modifiers.control_key(),
+                        self.modifiers.super_key(),
+                        self.modifiers.shift_key(),
+                        event.state == ElementState::Pressed,
+                    );
+                    self.rebuild_if_dirty();
+                    if default_prevented {
+                        return;
+                    }
+                } else if let Some(focus_idx) = self.focused_index {
                     let chain = self.native_host_chain(focus_idx);
                     let key = web_key(&event.logical_key);
                     let code = web_code(event.physical_key);
                     let default_prevented = if self.dom_mode {
-                        chain.first().is_some_and(|target| {
-                            crate::jsdom::dispatch_native_key(
-                                *target as u32,
-                                &key,
-                                &code,
-                                event.repeat,
-                                self.modifiers.alt_key(),
-                                self.modifiers.control_key(),
-                                self.modifiers.super_key(),
-                                self.modifiers.shift_key(),
-                                event.state == ElementState::Pressed,
-                            )
-                        })
+                        false
                     } else {
                         host_runtime::dispatch_key_chain(
                             &chain,
