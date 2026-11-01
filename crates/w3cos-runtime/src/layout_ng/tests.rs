@@ -10121,6 +10121,15 @@ fn grid_lanes_matches_chrome() {
                 axis.to_string(),
             ));
         }
+        if container["pack"]
+            .as_str()
+            .is_some_and(|pack| pack.contains("grid-lanes-pack:dense"))
+        {
+            markers.push((
+                "--w3cos-internal-grid-lanes-pack".to_string(),
+                "dense".to_string(),
+            ));
+        }
         if let Some(tolerance) = container["tolerance"].as_str() {
             markers.push((
                 "--w3cos-internal-flow-tolerance".to_string(),
