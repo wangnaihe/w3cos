@@ -5688,7 +5688,9 @@ impl Document {
         let mut remaining = value;
         let mut counters = None;
         let mut quote_depth = None;
-        let quote_pairs = self.quote_pairs_for(id);
+        // Resolving `quotes` walks the ancestor chain and re-matches every
+        // selector, so only pay for it when a quote operator is present.
+        let mut quote_pairs: Option<Vec<(String, String)>> = None;
         while !remaining.trim_start().is_empty() {
             remaining = remaining.trim_start();
             let Some(first) = remaining.chars().next() else {
@@ -5832,8 +5834,9 @@ impl Document {
                     quote_depth.get_or_insert_with(|| self.quote_depth_at(id, pseudo_element));
                 match operator {
                     "open-quote" => {
+                        let pairs = quote_pairs.get_or_insert_with(|| self.quote_pairs_for(id));
                         if let Some((opening, _)) =
-                            quote_pairs.get((*depth).min(quote_pairs.len().saturating_sub(1)))
+                            pairs.get((*depth).min(pairs.len().saturating_sub(1)))
                         {
                             output.push(GeneratedContentItem::Quote(opening.clone()));
                         }
@@ -5842,8 +5845,9 @@ impl Document {
                     "no-open-quote" => *depth += 1,
                     "close-quote" if *depth > 0 => {
                         *depth -= 1;
+                        let pairs = quote_pairs.get_or_insert_with(|| self.quote_pairs_for(id));
                         if let Some((_, closing)) =
-                            quote_pairs.get((*depth).min(quote_pairs.len().saturating_sub(1)))
+                            pairs.get((*depth).min(pairs.len().saturating_sub(1)))
                         {
                             output.push(GeneratedContentItem::Quote(closing.clone()));
                         }
@@ -21836,6 +21840,31 @@ mod image_component_tests {
         // Chrome155's default quote pairs are typographic, not ASCII (the
         // pinned dynamic002 actual/reference captures both establish this).
         assert_eq!(rendered, "“Foo”<1>0</1>");
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn pseudo_quote_operators_use_the_ancestor_quotes_and_plain_strings_ignore_them() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".host", &[("quotes", "'<' '>'")]);
+        crate::stylesheet::register_rule(".plain::before", &[("content", "'p'")]);
+        crate::stylesheet::register_rule(".quoted::before", &[("content", "'a' open-quote 'b'")]);
+        crate::stylesheet::register_rule(".quoted::after", &[("content", "close-quote 'c'")]);
+        let mut document = Document::new();
+        let host = document.create_element("div");
+        host.set_attribute(&mut document, "class", "host");
+        let plain = document.create_element("span");
+        plain.set_attribute(&mut document, "class", "plain");
+        let quoted = document.create_element("span");
+        quoted.set_attribute(&mut document, "class", "quoted");
+        host.append_child(&mut document, plain);
+        host.append_child(&mut document, quoted);
+        document.body().append_child(&mut document, host);
+        let rendered = descendant_text_runs(&document.to_component_tree())
+            .into_iter()
+            .map(|run| run.0)
+            .collect::<String>();
+        assert_eq!(rendered, "pa<b>c");
         crate::stylesheet::clear_rules();
     }
 
