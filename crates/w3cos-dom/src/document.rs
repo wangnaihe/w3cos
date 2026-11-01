@@ -50,6 +50,12 @@ struct CachedPseudoDeclarations {
     declarations: Vec<(String, String, u32)>,
 }
 
+struct CachedCascadeDeclarations {
+    node_revision: u64,
+    stylesheet_generation: u64,
+    declarations: Vec<stylesheet::CascadeDeclaration>,
+}
+
 struct CachedComputedStyle {
     node_revision: u64,
     stylesheet_generation: u64,
@@ -452,6 +458,7 @@ pub struct Document {
     /// `computed_style_cache`. Component lowering asks for them on every
     /// rebuild even though almost no element generates content.
     pseudo_declaration_cache: RefCell<HashMap<(NodeId, bool), CachedPseudoDeclarations>>,
+    cascade_declaration_cache: RefCell<HashMap<NodeId, CachedCascadeDeclarations>>,
     computed_style_stamp_clock: Cell<u64>,
     #[cfg(test)]
     computed_style_chain_fast_hits: Cell<usize>,
@@ -591,6 +598,7 @@ impl Document {
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
             pseudo_declaration_cache: RefCell::new(HashMap::new()),
+            cascade_declaration_cache: RefCell::new(HashMap::new()),
             computed_style_stamp_clock: Cell::new(STYLE_LINK_ROOT),
             #[cfg(test)]
             computed_style_chain_fast_hits: Cell::new(0),
@@ -2438,7 +2446,7 @@ impl Document {
         let inline = &self.styles[id.0 as usize];
         let node = self.get_node(id);
         let matched = if stylesheet::has_rules() && node.node_type == NodeType::Element {
-            stylesheet::matching_cascade_declarations_for_node(self, id)
+            self.cascade_declarations(id, node_revision, stylesheet_generation)
         } else {
             Vec::new()
         };
@@ -4670,6 +4678,36 @@ impl Document {
             merged.set_property(&property, &value);
         }
         merged.to_style()
+    }
+
+    /// The element's matched cascade declarations. A style recompute caused
+    /// only by a changed inherited style (same node revision and stylesheet
+    /// generation) reuses them instead of matching every candidate rule again.
+    fn cascade_declarations(
+        &self,
+        id: NodeId,
+        node_revision: u64,
+        stylesheet_generation: u64,
+    ) -> Vec<stylesheet::CascadeDeclaration> {
+        if let Some(cached) = self.cascade_declaration_cache.borrow().get(&id)
+            && cached.node_revision == node_revision
+            && cached.stylesheet_generation == stylesheet_generation
+        {
+            return cached.declarations.clone();
+        }
+        let (declarations, stable) =
+            stylesheet::matching_cascade_declarations_with_stability(self, id);
+        if stable {
+            self.cascade_declaration_cache.borrow_mut().insert(
+                id,
+                CachedCascadeDeclarations {
+                    node_revision,
+                    stylesheet_generation,
+                    declarations: declarations.clone(),
+                },
+            );
+        }
+        declarations
     }
 
     fn pseudo_declarations(&self, id: NodeId, pseudo_element: &str) -> Vec<(String, String, u32)> {
@@ -26436,6 +26474,60 @@ mod computed_style_cache_tests {
             parent_properties.get("--theme-color-3").map(String::as_str),
             Some("#123456")
         );
+    }
+
+    #[test]
+    fn cached_cascade_declarations_follow_dom_and_rule_changes_and_serve_inherited_recomputes() {
+        stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".active span", &[("color", "red")]);
+        crate::stylesheet::register_rule(".lead + span", &[("margin-left", "7px")]);
+        let mut document = Document::new();
+        let body = document.body();
+        let parent = document.create_element("div");
+        let lead = document.create_element("i");
+        let target = document.create_element("span");
+        body.append_child(&mut document, parent);
+        parent.append_child(&mut document, lead);
+        parent.append_child(&mut document, target);
+        let color = |document: &Document| document.computed_style_for(target.id).color;
+        let margin = |document: &Document| document.computed_style_for(target.id).margin.left;
+        let plain = color(&document);
+        assert_eq!(color(&document), plain);
+        // Ancestor and previous-sibling edits still change the match.
+        parent.set_attribute(&mut document, "class", "active");
+        assert_eq!(color(&document), w3cos_std::Color::from_css("red").unwrap());
+        parent.set_attribute(&mut document, "class", "");
+        assert_eq!(color(&document), plain);
+        lead.set_attribute(&mut document, "class", "lead");
+        assert_eq!(margin(&document), w3cos_std::style::Spacing::Px(7.0));
+        lead.set_attribute(&mut document, "class", "other");
+        assert_ne!(margin(&document), w3cos_std::style::Spacing::Px(7.0));
+        // A new rule bumps the stylesheet generation.
+        crate::stylesheet::register_rule("span", &[("color", "blue")]);
+        assert_eq!(
+            color(&document),
+            w3cos_std::Color::from_css("blue").unwrap()
+        );
+
+        // A recompute driven only by a changed inherited style reuses the
+        // cached match: the sentinel replaces it, and survives the parent edit.
+        let revision = document.style_revisions[target.id.0 as usize];
+        {
+            let mut cache = document.cascade_declaration_cache.borrow_mut();
+            let entry = cache.get_mut(&target.id).expect("stable match is cached");
+            assert_eq!(entry.node_revision, revision);
+            for declaration in &mut entry.declarations {
+                if declaration.property == "color" {
+                    declaration.value = "green".to_string();
+                }
+            }
+        }
+        document.computed_style_cache.borrow_mut().clear();
+        assert_eq!(
+            color(&document),
+            w3cos_std::Color::from_css("green").unwrap()
+        );
+        stylesheet::clear_rules();
     }
 
     #[test]
