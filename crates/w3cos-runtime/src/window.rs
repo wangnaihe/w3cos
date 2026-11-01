@@ -1165,6 +1165,12 @@ fn hit_test_order_key(hit: &HitNode, paint_z: &[i32]) -> (bool, i32, bool, bool,
     )
 }
 
+/// Whether a resolved style lets the box be a pointer hit-test target.
+fn style_is_pointer_hittable(style: &w3cos_std::style::Style) -> bool {
+    style.visibility != w3cos_std::style::Visibility::Hidden
+        && !matches!(style.pointer_events, w3cos_std::style::PointerEvents::None)
+}
+
 fn dom_host_disabled(action: &EventAction) -> bool {
     match action {
         EventAction::NativeHost { id, .. } => crate::dom::has_attribute(*id as u32, "disabled"),
@@ -3031,6 +3037,12 @@ impl App {
                     if !layout::is_node_visible(&flat, idx) {
                         continue;
                     }
+                    // `visibility: hidden` / `pointer-events: none` boxes keep
+                    // layout but are never pointer targets (invisible overlays
+                    // such as Code OSS `.drop-block-overlay` would otherwise
+                    // swallow every click). Keyboard focus is unaffected for
+                    // `pointer-events: none`.
+                    let pointer_hittable = style_is_pointer_hittable(node.style);
                     let disabled = dom_host_disabled(&node.on_click);
                     let is_interactive = (matches!(node.kind, ComponentKind::Button { .. })
                         || matches!(node.kind, ComponentKind::TextInput { .. })
@@ -3043,6 +3055,9 @@ impl App {
                         && !disabled;
                     if is_focusable {
                         self.focusable_indices.push(idx);
+                    }
+                    if !pointer_hittable {
+                        continue;
                     }
                     self.hit_nodes.push(HitNode {
                         rect,
@@ -9538,6 +9553,22 @@ mod scroll_physics_tests {
             ),
             Some(3)
         );
+    }
+
+    #[test]
+    fn pointer_hittable_rejects_hidden_and_pointer_events_none() {
+        use w3cos_std::style::{PointerEvents, Style, Visibility};
+        let mut style = Style::default();
+        assert!(style_is_pointer_hittable(&style));
+        style.visibility = Visibility::Hidden;
+        assert!(!style_is_pointer_hittable(&style));
+        style.visibility = Visibility::Collapse;
+        assert!(!style_is_pointer_hittable(&style));
+        style.visibility = Visibility::Visible;
+        style.pointer_events = PointerEvents::None;
+        assert!(!style_is_pointer_hittable(&style));
+        style.pointer_events = PointerEvents::Auto;
+        assert!(style_is_pointer_hittable(&style));
     }
 
     #[test]
