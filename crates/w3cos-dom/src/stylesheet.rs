@@ -1047,7 +1047,7 @@ pub fn matching_pseudo_declarations_for_node(
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
-            .candidate_indices_for_node(document, node)
+            .pseudo_candidate_indices_for_node(document, node)
             .into_iter()
             .map(|index| &rules.rules[index])
             .filter(|rule| rule.pseudo_element.as_deref() == Some(pseudo_element))
@@ -3315,6 +3315,55 @@ mod tests {
         assert_eq!(
             document.computed_pseudo_style_for(item.id, "::before").left,
             w3cos_std::style::Dimension::Px(40.0)
+        );
+    }
+
+    #[test]
+    fn pseudo_element_rules_are_indexed_apart_from_element_rules() {
+        setup();
+        let mut document = Document::new();
+        let item = document.create_element("div");
+        item.set_attribute(&mut document, "class", "icon icon");
+        document.append_child(document.body().id, item.id);
+        register_rule(".icon", &[("color", "red")]);
+        register_rule(".icon::before", &[("content", "\"x\"")]);
+        register_rule("div::after", &[("content", "\"y\"")]);
+        register_rule("::before", &[("content", "\"z\"")]);
+        for index in 0..64 {
+            register_rule(&format!(".other-{index}::before"), &[("content", "\"n\"")]);
+        }
+
+        RULES.with(|rules| {
+            let rules = rules.borrow();
+            let element = rules.candidate_indices_for_node(&document, item.id);
+            assert_eq!(
+                element.len(),
+                1,
+                "only the .icon element rule, no pseudo rules"
+            );
+            assert!(rules.rules[element[0]].pseudo_element.is_none());
+            let mut pseudo = rules.pseudo_candidate_indices_for_node(&document, item.id);
+            pseudo.sort_unstable();
+            let mut unique = pseudo.clone();
+            unique.dedup();
+            assert_eq!(pseudo, unique, "no duplicate candidates");
+            assert_eq!(pseudo.len(), 3, ".icon::before, div::after and ::before");
+            assert!(
+                pseudo
+                    .iter()
+                    .all(|index| rules.rules[*index].pseudo_element.is_some())
+            );
+        });
+        let before = matching_pseudo_declarations_for_node(&document, item.id, "::before");
+        assert_eq!(before.len(), 2);
+        let after = matching_pseudo_declarations_for_node(&document, item.id, "::after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            matching_declarations_for_node(&document, item.id)
+                .iter()
+                .filter(|declaration| declaration.0 == "content")
+                .count(),
+            0
         );
     }
 
