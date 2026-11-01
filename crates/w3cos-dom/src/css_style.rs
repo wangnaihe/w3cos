@@ -25,6 +25,11 @@ pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
 /// `normal` into `stretch`, but a replaced grid item behaves as `start`
 /// for `normal` and stretches only for the explicit keyword. Present only
 /// when the keyword is exactly `stretch`.
+/// `last baseline` alignment of the named property (`align-items`,
+/// `justify-items`, `align-self`, `justify-self`). The typed enums keep
+/// their old fallback value; the layout engines that implement the keyword
+/// read this marker.
+pub const LAST_BASELINE_PREFIX: &str = "--w3cos-internal-last-baseline-";
 pub const ALIGN_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-align-items-stretch";
 pub const JUSTIFY_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-justify-items-stretch";
 /// A display keyword this engine does not model (`inline-grid`,
@@ -117,6 +122,19 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
         value.parse::<f32>().ok()?
     };
     (ratio.is_finite() && ratio > 0.0).then_some(Some(ratio))
+}
+
+fn set_last_baseline(style: &mut Style, property: &str, value: &str) {
+    let last = value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        == ["last", "baseline"];
+    set_marker(
+        style,
+        &format!("{LAST_BASELINE_PREFIX}{property}"),
+        last.then(|| "1".to_string()),
+    );
 }
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
@@ -430,6 +448,7 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => {
                 self.inner.align_items = parse_align_items(value);
+                set_last_baseline(&mut self.inner, "align-items", value);
                 set_marker(
                     &mut self.inner,
                     ALIGN_ITEMS_STRETCH_PROPERTY,
@@ -1485,7 +1504,10 @@ impl CSSStyleDeclaration {
                     self.inner.order = v
                 }
             }
-            "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "align-self" | "alignSelf" => {
+                self.inner.align_self = parse_align_self(value);
+                set_last_baseline(&mut self.inner, "align-self", value);
+            }
             "vertical-align" | "verticalAlign" => {
                 let value = value.trim();
                 const KEYWORD_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
@@ -1543,9 +1565,13 @@ impl CSSStyleDeclaration {
                     safe.then(|| "1".to_string()),
                 );
             }
-            "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
+            "justify-self" | "justifySelf" => {
+                self.inner.justify_self = parse_align_self(value);
+                set_last_baseline(&mut self.inner, "justify-self", value);
+            }
             "justify-items" | "justifyItems" => {
                 self.inner.justify_items = parse_align_items(value);
+                set_last_baseline(&mut self.inner, "justify-items", value);
                 set_marker(
                     &mut self.inner,
                     JUSTIFY_ITEMS_STRETCH_PROPERTY,
