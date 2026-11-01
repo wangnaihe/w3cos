@@ -9278,6 +9278,20 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Ime(ime) => {
+                if self.dom_mode {
+                    let (step, text) = match &ime {
+                        winit::event::Ime::Preedit(text, _) => ("preedit", text.as_str()),
+                        winit::event::Ime::Commit(text) => ("commit", text.as_str()),
+                        winit::event::Ime::Enabled | winit::event::Ime::Disabled => ("end", ""),
+                    };
+                    if crate::jsdom::deliver_edit_context_ime(step, text) {
+                        self.rebuild_if_dirty();
+                        self.repaint_mode = RepaintMode::Full;
+                        self.request_repaint();
+                        self.microtask_checkpoint();
+                        return;
+                    }
+                }
                 if let Some(focus_idx) = self.focused_index {
                     let Some(ComponentKind::TextInput { value, .. }) = self.get_kind_at(focus_idx)
                     else {

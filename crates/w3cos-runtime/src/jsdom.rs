@@ -15843,6 +15843,138 @@ pub(crate) fn deliver_edit_context_command(input_type: &str) -> bool {
     true
 }
 
+fn active_edit_context() -> Option<(u32, Value)> {
+    let active = active_element_id()?;
+    let context = get_expando(active, "editContext").unwrap_or(Value::Null);
+    if context.is_nullish()
+        || !w3cos_core::class::instance_of(&context, &crate::edit_context_web::edit_context_class())
+    {
+        return None;
+    }
+    Some((active, context))
+}
+
+fn fire_edit_context_composition(context: &Value, kind: &str, data: &str) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("CompositionEvent"),
+        vec![
+            Value::string(kind),
+            Value::object(HashMap::from([("data".into(), Value::string(data))])),
+        ],
+    );
+    context.call_method("dispatchEvent", vec![event]);
+}
+
+fn fire_edit_context_text_formats(context: &Value, ranges: &[(u32, u32)]) {
+    let event = w3cos_core::class::construct(
+        &crate::web_events::event_subclass_class("TextFormatUpdateEvent"),
+        vec![Value::string("textformatupdate")],
+    );
+    let formats: Vec<Value> = ranges
+        .iter()
+        .map(|(start, end)| {
+            w3cos_core::class::construct(
+                &crate::edit_context_web::text_format_class(),
+                vec![Value::object(HashMap::from([
+                    ("rangeStart".into(), Value::Number(*start as f64)),
+                    ("rangeEnd".into(), Value::Number(*end as f64)),
+                    ("underlineStyle".into(), Value::string("solid")),
+                    ("underlineThickness".into(), Value::string("thin")),
+                ]))],
+            )
+        })
+        .collect();
+    event.set_property(
+        "getTextFormats",
+        func(move |_, _| Value::array(formats.clone())),
+    );
+    context.call_method("dispatchEvent", vec![event]);
+}
+
+/// Drive IME composition on the focused element's `EditContext`.
+/// `step` is `preedit` (new composition text, empty cancels), `commit`
+/// (final text) or `end` (composition dropped without changing the text).
+/// Fires `compositionstart`, `textupdate` over the composition range,
+/// `textformatupdate` (underline over the preedit) and `compositionend`.
+/// Returns true when an EditContext consumed the event.
+pub fn deliver_edit_context_ime(step: &str, text: &str) -> bool {
+    let Some((active, context)) = active_edit_context() else {
+        return false;
+    };
+    let composing = get_expando(active, "__w3cos_comp_len")
+        .filter(|v| !v.is_nullish())
+        .map(|v| v.to_u32());
+    let comp_start = get_expando(active, "__w3cos_comp_start")
+        .map(|v| v.to_u32())
+        .unwrap_or(0);
+    let clear = || {
+        set_expando(active, "__w3cos_comp_len", Value::Null);
+    };
+    let replace = |start: u32, end: u32, with: &str| {
+        context.call_method(
+            "__w3cos_userTextUpdate",
+            vec![
+                Value::Number(start as f64),
+                Value::Number(end as f64),
+                Value::string(with),
+            ],
+        );
+    };
+    match step {
+        "preedit" => {
+            if text.is_empty() && composing.is_none() {
+                return true;
+            }
+            let (start, end) = match composing {
+                Some(len) => (comp_start, comp_start + len),
+                None => {
+                    let a = context.get_property("selectionStart").to_u32();
+                    let b = context.get_property("selectionEnd").to_u32();
+                    let (a, b) = (a.min(b), a.max(b));
+                    set_expando(active, "__w3cos_comp_start", Value::Number(a as f64));
+                    fire_edit_context_composition(&context, "compositionstart", "");
+                    dispatch_native_before_input(active, text, "insertCompositionText", true);
+                    (a, b)
+                }
+            };
+            let units = text.encode_utf16().count() as u32;
+            replace(start, end, text);
+            if text.is_empty() {
+                clear();
+                fire_edit_context_text_formats(&context, &[]);
+                fire_edit_context_composition(&context, "compositionend", "");
+            } else {
+                set_expando(active, "__w3cos_comp_len", Value::Number(units as f64));
+                fire_edit_context_text_formats(&context, &[(start, start + units)]);
+            }
+            true
+        }
+        "commit" => {
+            let Some(len) = composing else {
+                return deliver_edit_context_text(text);
+            };
+            let units = text.encode_utf16().count() as u32;
+            let end = comp_start + len;
+            clear();
+            if len != 0 || units != 0 {
+                replace(comp_start, end, text);
+            }
+            fire_edit_context_text_formats(&context, &[]);
+            fire_edit_context_composition(&context, "compositionend", text);
+            true
+        }
+        "end" => {
+            if composing.is_some() {
+                clear();
+                fire_edit_context_text_formats(&context, &[]);
+                fire_edit_context_composition(&context, "compositionend", "");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Bridge the cancelable `beforeinput` phase. Returns true when canceled.
 pub(crate) fn dispatch_native_before_input(
     target: u32,
@@ -32530,6 +32662,101 @@ try {
             Some("insertLineBreak")
         );
         assert_eq!(edit_context_input_type_for_key("a", false), None);
+    }
+
+    #[test]
+    fn edit_context_ime_composition_fires_textupdate_formats_and_end() {
+        setup();
+        let context = w3cos_core::class::construct(
+            &crate::edit_context_web::edit_context_class(),
+            vec![Value::object(HashMap::from([
+                ("text".into(), Value::string("ab")),
+                ("selectionStart".into(), Value::Number(1.0)),
+                ("selectionEnd".into(), Value::Number(1.0)),
+            ]))],
+        );
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        editor.set_property("editContext", context.clone());
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        for name in [
+            "compositionstart",
+            "compositionend",
+            "textupdate",
+            "textformatupdate",
+        ] {
+            let log = log.clone();
+            context.call_method(
+                "addEventListener",
+                vec![
+                    Value::string(name),
+                    Value::function(move |_, args| {
+                        let e = &args[0];
+                        let entry = match name {
+                            "textupdate" => format!(
+                                "update:{:?}@{}-{}",
+                                e.get_property("text").to_js_string(),
+                                e.get_property("updateRangeStart").to_u32(),
+                                e.get_property("updateRangeEnd").to_u32()
+                            ),
+                            "textformatupdate" => {
+                                let formats = e.call_method("getTextFormats", vec![]);
+                                let n = formats.get_property("length").to_u32();
+                                if n == 0 {
+                                    "formats:none".to_string()
+                                } else {
+                                    let f = formats.get_property("0");
+                                    format!(
+                                        "formats:{}-{}:{}",
+                                        f.get_property("rangeStart").to_u32(),
+                                        f.get_property("rangeEnd").to_u32(),
+                                        f.get_property("underlineThickness").to_js_string()
+                                    )
+                                }
+                            }
+                            _ => format!("{name}:{}", e.get_property("data").to_js_string()),
+                        };
+                        log.borrow_mut().push(entry);
+                        Value::Undefined
+                    }),
+                ],
+            );
+        }
+        assert!(!deliver_edit_context_ime("preedit", "n"));
+        editor.call_method("focus", vec![]);
+        assert!(deliver_edit_context_ime("preedit", "ni"));
+        assert!(deliver_edit_context_ime("preedit", "ni h"));
+        assert_eq!(context.get_property("text").to_js_string(), "ani hb");
+        assert!(deliver_edit_context_ime("commit", "\u{4f60}"));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{4f60}b");
+        assert_eq!(context.get_property("selectionStart").to_u32(), 2);
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "compositionstart:".to_string(),
+                "update:\"ni\"@1-1".to_string(),
+                "formats:1-3:thin".to_string(),
+                "update:\"ni h\"@1-3".to_string(),
+                "formats:1-5:thin".to_string(),
+                "update:\"\u{4f60}\"@1-5".to_string(),
+                "formats:none".to_string(),
+                "compositionend:\u{4f60}".to_string(),
+            ]
+        );
+        log.borrow_mut().clear();
+        // Cancelling a preedit removes it and ends the composition.
+        assert!(deliver_edit_context_ime("preedit", "x"));
+        assert!(deliver_edit_context_ime("preedit", ""));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{4f60}b");
+        assert_eq!(
+            log.borrow().last().map(String::as_str),
+            Some("compositionend:")
+        );
+        // A commit without a preedit is plain text input.
+        log.borrow_mut().clear();
+        assert!(deliver_edit_context_ime("commit", "z"));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{4f60}zb");
+        assert_eq!(*log.borrow(), vec!["update:\"z\"@2-2".to_string()]);
     }
 
     #[test]
