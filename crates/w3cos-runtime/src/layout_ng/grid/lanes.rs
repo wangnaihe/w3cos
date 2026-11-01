@@ -83,6 +83,21 @@ fn track_of(reverse: bool, lanes: usize, start: usize, span: usize) -> usize {
     if reverse { lanes - start - span } else { start }
 }
 
+/// The sum of fixed (`px` / `em`) tracks plus gaps: the intrinsic grid-axis
+/// size. `None` when any track is not fixed.
+fn fixed_tracks_size(template: &super::Template, gap: f32, font: f32) -> Option<f32> {
+    let mut total = 0.0;
+    for track in &template.tracks {
+        total += match track {
+            Spec::One(Breadth::Px(value)) => *value,
+            Spec::One(Breadth::Em(value)) => value * font,
+            _ => return None,
+        };
+    }
+    let count = template.tracks.len();
+    Some(total + gap * count.saturating_sub(1) as f32)
+}
+
 /// Whether the real lanes pass lays out this container. Everything else
 /// stays on the previous handling (an ordinary grid or the legacy engine).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -105,7 +120,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let Some(Direction { columns, .. }) = lane_direction(style) else {
         return Some("lanes:direction");
     };
-    if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
+    if has_marker(style, super::HEIGHT_KEYWORD) {
         return Some("lanes:size-keyword");
     }
     if has_marker(style, "--w3cos-internal-overflow-alignment") {
@@ -147,6 +162,15 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     }
     if template.auto_fit == Some(true) {
         return Some("lanes:auto-fit");
+    }
+    if has_marker(style, block::WIDTH_KEYWORD)
+        && (!columns
+            || block::size_contained(style)
+            || template.auto_fit.is_some()
+            || fixed_tracks_size(&template, 0.0, 0.0).is_none())
+    {
+        // An intrinsic width is only known for fixed grid-axis tracks.
+        return Some("lanes:size-keyword");
     }
     if template.auto_fit.is_some()
         && template
@@ -364,7 +388,30 @@ pub(super) fn layout(
         track_reverse,
     } = lane_direction(style).why("lanes:direction")?;
     let metrics: BoxMetrics = block::resolve_inline(style, space);
-    let content_width = sized.map_or(metrics.content_width, |(width, _)| width);
+    let mut content_width = sized.map_or(metrics.content_width, |(width, _)| width);
+    if let Some(keyword) = marker(style, block::WIDTH_KEYWORD).filter(|_| sized.is_none()) {
+        // `min-content` / `max-content` / `fit-content` of fixed lanes is
+        // their track sum.
+        let template = parse_template(columns_spec(style).why("lanes:no-template")?, false)
+            .why("lanes:template")?;
+        let gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+        let tracks = fixed_tracks_size(&template, gap, style.font_size.max(0.0))
+            .why("lanes:size-keyword")?;
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+        let content = block::keyword_content_size(
+            keyword,
+            tracks,
+            tracks,
+            Some(available),
+            Some(space.available_inline),
+            style,
+            space,
+            edges,
+        )
+        .why("lanes:size-keyword")?;
+        content_width = block::clamp_inline_size(style, space, edges, content).max(0.0);
+    }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
     let inner_width = content_width.max(0.0);
@@ -894,7 +941,7 @@ fn stack_columns(
     let aligned = records
         .iter()
         .any(|record| record.prepared.stack != StackAlign::Normal);
-    if (reverse.fill && used < extent) || (aligned && (used < extent || clamped)) {
+    if aligned && (used < extent || clamped) {
         return crate::layout_ng::bail("lanes:stacking-overflow");
     }
     openings.finish(&running, row_gap_u, used);
@@ -1152,7 +1199,7 @@ fn stack_rows(
     let aligned = records
         .iter()
         .any(|record| record.prepared.stack != StackAlign::Normal);
-    if (reverse.fill || aligned) && !records.is_empty() && extent > inner_u {
+    if aligned && !records.is_empty() && extent > inner_u {
         return crate::layout_ng::bail("lanes:stacking-overflow");
     }
     openings.finish(&running, column_gap_u, inner_u);
