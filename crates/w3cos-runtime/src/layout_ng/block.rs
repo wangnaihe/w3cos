@@ -714,9 +714,16 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             // Blockified (CSS2 9.7) and laid out like a block box; its
             // static position is still inline-level (`inline_static_offset`).
             // In an IFC it would be an OOF inline item: legacy.
-            if info.parent.is_none_or(|p| {
-                inline::is_inline_container(flat, p) || inline::in_inline_container(flat, index)
-            }) {
+            // A grid or flex container makes its children blocks whatever
+            // their authored display: an inline-level child is not an IFC item.
+            let block_parent = info
+                .parent
+                .is_some_and(|p| is_author_grid(flat[p].style) || is_author_flex(flat[p].style));
+            if !block_parent
+                && info.parent.is_none_or(|p| {
+                    inline::is_inline_container(flat, p) || inline::in_inline_container(flat, index)
+                })
+            {
                 return Some("position:inline");
             }
             if style.position == Position::Fixed {
@@ -767,6 +774,7 @@ pub(super) fn inline_level_oof(flat: &[FlatNodeInfo], index: usize) -> bool {
                 | ComponentKind::Row
                 | ComponentKind::Image { .. }
                 | ComponentKind::Canvas { .. }
+                | ComponentKind::Text { .. }
         )
 }
 
@@ -990,7 +998,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                     inline::BIDI_FRAGMENT_MARKERS[1],
                     inline::BIDI_FRAGMENT_MARKERS[2],
                 ],
-                info.style.display == Display::Inline,
+                info.style.display == Display::Inline && !oof::is_out_of_flow(info.style),
             )
             .or_else(|| inline::block_text_reason(content, info.style))
         }
@@ -3868,8 +3876,16 @@ fn unrecognized_display(style: &Style) -> Option<&str> {
     marker(style, "--w3cos-internal-unrecognized-display")
 }
 
-fn is_inline_grid(style: &Style) -> bool {
+pub(super) fn is_inline_grid(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "inline-grid")
+        || is_inline_lanes(style)
+}
+
+/// `display: inline grid-lanes`: the atomic-inline lane container. The DOM
+/// keeps its unrecognized-display marker and adds the lanes marker.
+pub(super) fn is_inline_lanes(style: &Style) -> bool {
+    is_grid_lanes(style)
+        && unrecognized_display(style).is_some_and(|value| value == "inline grid-lanes")
 }
 
 fn is_blockified_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -3903,6 +3919,7 @@ fn inline_grid_line_ascent(result: &LayoutResult) -> f32 {
 fn inline_grid_margins(style: &Style) -> [f32; 4] {
     let px = |spacing: Spacing| match spacing {
         Spacing::Px(value) => value.max(0.0),
+        Spacing::Em(value) => (value * style.font_size).max(0.0),
         _ => 0.0,
     };
     [
@@ -4294,6 +4311,22 @@ fn layout_block_in(
         return super::flex::layout(flat, index, space, sized);
     }
     if is_author_grid(style) {
+        // An atomic `inline grid-lanes` with an auto width is fit-content
+        // wide (CSS 2.1 10.3.9 / css-grid-3 intrinsic sizing); a keyword
+        // width resolves in the grid's own layout.
+        let sized = if sized.is_none()
+            && is_inline_lanes(style)
+            && style.width == Dimension::Auto
+            && marker(style, WIDTH_KEYWORD).is_none()
+        {
+            let metrics = resolve_inline(style, space);
+            Some((
+                shrink_to_fit(flat, index, space, &metrics).why("inline-lanes:shrink")?,
+                None,
+            ))
+        } else {
+            sized
+        };
         return super::grid::layout(flat, index, space, sized);
     }
     if matches!(style.display, Display::Table | Display::InlineTable) {
@@ -4850,12 +4883,44 @@ fn layout_block_in(
                         }
                     }
                 };
-                let ascent = line.iter().map(margin_ascent).fold(0.0, f32::max);
+                // `vertical-align: top | bottom` aligns the margin box with
+                // the line box edge (CSS 2.1 10.8.1). The strut is the
+                // baseline group on a line of only those boxes.
+                let line_align = |result: &LayoutResult| {
+                    inline::line_relative_align(flat[result.fragment.index].style)
+                };
+                let margin_height = |result: &LayoutResult| {
+                    let margins = inline_grid_margins(flat[result.fragment.index].style);
+                    margins[0] + result.fragment.height + margins[2]
+                };
+                let ascent = line
+                    .iter()
+                    .filter(|result| line_align(result).is_none())
+                    .map(margin_ascent)
+                    .fold(0.0, f32::max);
+                let mut baseline_extent = 0.0f32;
+                for result in line.iter().filter(|result| line_align(result).is_none()) {
+                    let shift = (ascent - margin_ascent(result)).max(0.0);
+                    baseline_extent = baseline_extent.max(shift + margin_height(result));
+                }
+                let mut line_h = baseline_extent;
+                if line.iter().any(|result| line_align(result).is_some()) {
+                    let (strut_ascent, strut_descent) = inline::strut(info.style);
+                    if baseline_extent == 0.0 {
+                        line_h = strut_ascent + strut_descent;
+                    }
+                    for result in line.iter().filter(|result| line_align(result).is_some()) {
+                        line_h = line_h.max(margin_height(result));
+                    }
+                }
                 let mut placed_x = 0.0f32;
-                let mut line_h = 0.0f32;
                 for result in line {
                     let margins = inline_grid_margins(flat[result.fragment.index].style);
-                    let shift = (ascent - margin_ascent(&result)).max(0.0);
+                    let shift = match line_align(&result) {
+                        None => (ascent - margin_ascent(&result)).max(0.0),
+                        Some(true) => 0.0,
+                        Some(false) => (line_h - margin_height(&result)).max(0.0),
+                    };
                     let width = result.fragment.width;
                     let height = result.fragment.height;
                     let (dx, dy) =
@@ -4868,7 +4933,6 @@ fn layout_block_in(
                     }
                     children.push((fx, fy, result.fragment));
                     placed_x += margins[3] + width + margins[1];
-                    line_h = line_h.max(shift + margins[0] + height + margins[2]);
                 }
                 line_y += line_h;
             }

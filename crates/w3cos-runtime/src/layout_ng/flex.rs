@@ -2292,7 +2292,11 @@ fn layout_with(
         } else {
             Some(inner_width)
         };
-        let cross_auto = matches!(cross_dim, Dimension::Auto);
+        // An intrinsic `width` keyword is not `auto`: it never stretches.
+        let cross_auto = matches!(cross_dim, Dimension::Auto)
+            && (row
+                || !block::marker(child_style, block::WIDTH_KEYWORD)
+                    .is_some_and(|_| !block::is_replaced(flat[child].kind)));
         let mut cross =
             match definite(cross_dim, cross_basis, child_style, space).why("flex:percent")? {
                 // The used cross size honors the cross min/max sizes

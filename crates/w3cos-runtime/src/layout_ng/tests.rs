@@ -3515,12 +3515,11 @@ fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
     use w3cos_std::style::{CustomProperties, Position};
     // Headless Chrome 155: auto/100px border-box widths, 3px padding
     // and 2px borders, auto auto columns containing 40px/30px items.
-    // A static bordered box stays on legacy (`inline grid-lanes`
-    // references); the relative one is laid out here.
+    // Static and relative boxes lay out identically.
     for (width, position, outer, second_x) in [
-        (Dimension::Auto, Position::Static, 0.0, 0.0),
+        (Dimension::Auto, Position::Static, 80.0, 45.0),
         (Dimension::Auto, Position::Relative, 80.0, 45.0),
-        (Dimension::Px(100.0), Position::Static, 0.0, 0.0),
+        (Dimension::Px(100.0), Position::Static, 100.0, 55.0),
         (Dimension::Px(100.0), Position::Relative, 100.0, 55.0),
     ] {
         let grid = Style {
@@ -3548,10 +3547,6 @@ fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
         };
         let root = node(block(), vec![node(grid, vec![item(40.0), item(30.0)])]);
         let flat = pre_flatten(&root);
-        if outer == 0.0 {
-            assert!(!block::supports_tree(&flat));
-            continue;
-        }
         assert!(
             block::supports_tree(&flat),
             "{:?}",
@@ -7930,6 +7925,60 @@ fn abspos_replaced_canvas_beside_text_falls_back() {
     );
     let flat = pre_flatten(&root);
     assert!(!block::unsupported_reasons(&flat).is_empty());
+}
+
+/// A column flex item with `width: min-content | max-content | fit-content`
+/// sizes its cross axis from the keyword, whether the container aligns to
+/// the start or stretches. Border boxes measured in headless Chrome
+/// (getBoundingClientRect, Ahem 20px/1) in an 80px column:
+/// min-content 40x40 (two lines), max-content 100x20, fit-content 80x60.
+#[test]
+fn flex_column_item_width_keywords_match_chrome() {
+    use w3cos_std::style::AlignItems;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    for align in [AlignItems::FlexStart, AlignItems::Stretch] {
+        let item = |word: &str, text: &str| {
+            let mut style = Style {
+                width: Dimension::Auto,
+                ..font.clone()
+            };
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert("--w3cos-internal-width-keyword".into(), word.into());
+            node(style, vec![Component::text(text, font.clone())])
+        };
+        let column = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            width: Dimension::Px(80.0),
+            align_items: align,
+            ..font.clone()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                column,
+                vec![
+                    item("min-content", "XX XX"),
+                    item("max-content", "XX XX"),
+                    item("fit-content", "XX XX XX"),
+                ],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("stays on NG");
+        assert_eq!(rect(&rects, 2), (0.0, 0.0, 40.0, 40.0), "min-content");
+        assert_eq!(rect(&rects, 4), (0.0, 40.0, 100.0, 20.0), "max-content");
+        assert_eq!(rect(&rects, 6), (0.0, 60.0, 80.0, 60.0), "fit-content");
+    }
 }
 
 /// A text run directly inside a flex container is an anonymous flex item

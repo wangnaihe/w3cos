@@ -890,7 +890,11 @@ pub(super) fn intrinsic_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -
 
 fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> bool {
     let style = flat[index].style;
-    if marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid") {
+    if !block::is_inline_grid(style) {
+        return false;
+    }
+    let lanes_box = block::is_inline_lanes(style);
+    if lanes_box && !lanes::eligible(flat, index) {
         return false;
     }
     if flat[index].parent.is_some_and(|parent| {
@@ -909,19 +913,23 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     {
         return false;
     }
-    // Static boxes stay on the marker. A static `inline-grid` reference
-    // (fixed px tracks, no insets) is paired with tests that still fall
-    // back, and switching only the reference splits the reftest. The same
-    // holds for a static bordered intrinsic box: it is the reference drawn
-    // for `display: inline grid-lanes` tests, which stay on legacy flex.
-    // A percentage gap (grid-gutters-015/016) pairs the bordered static
-    // box with a plain `display: grid` reference, so it may switch alone.
-    if style.position != Position::Relative
-        && !(style.position == Position::Static
-            && (has_marker(style, "--w3cos-internal-percent-gap")
-                || block::border_widths(style)
-                    .iter()
-                    .all(|value| value.abs() <= EPS)))
+    // Static bordered boxes need all-intrinsic columns (checked below): a
+    // static fixed-track `inline-grid` reference is paired with
+    // `inline grid-lanes` tests that still fall back, and switching only the
+    // reference splits the reftest. The auto-column bordered box is the
+    // reference of the intrinsic-sizing tests, which flip with it (their
+    // `inline grid-lanes` side is laid out here). A percentage gap
+    // (grid-gutters-015/016) pairs the bordered static box with a plain
+    // `display: grid` reference, so it may switch alone.
+    if style.position != Position::Relative && style.position != Position::Static {
+        return false;
+    }
+    if intrinsic
+        && style.position == Position::Static
+        && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb
+        && !block::border_widths(style)
+            .iter()
+            .all(|value| value.abs() <= EPS)
     {
         return false;
     }
@@ -955,10 +963,11 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
         style.margin.bottom,
         style.margin.left,
     ];
-    if !margins
-        .iter()
-        .all(|margin| matches!(margin, Spacing::Px(value) if *value >= 0.0))
-    {
+    if !margins.iter().all(|margin| match margin {
+        Spacing::Px(value) => *value >= 0.0,
+        Spacing::Em(value) => *value >= 0.0,
+        _ => false,
+    }) {
         return false;
     }
     if !intrinsic
@@ -970,18 +979,24 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     if is_baseline(style.align_items) || is_baseline(style.justify_items) {
         return false;
     }
-    if has_marker(style, "--w3cos-internal-grid-lanes")
+    // The fixed-track path sizes to its tracks; a width keyword is only
+    // resolved on the intrinsic one.
+    if !intrinsic && has_marker(style, "--w3cos-internal-width-keyword") {
+        return false;
+    }
+    if (has_marker(style, "--w3cos-internal-grid-lanes") && !lanes_box)
         || has_marker(style, "--w3cos-internal-document-element")
-        || has_marker(style, "--w3cos-internal-width-keyword")
         || has_marker(style, "--w3cos-internal-size-containment")
         || has_marker(style, HEIGHT_KEYWORD)
     {
         return false;
     }
-    if rendered_children(flat, index).any(|child| {
-        let child_style = flat[child].style;
-        oof::is_out_of_flow(child_style)
-    }) {
+    if !intrinsic
+        && rendered_children(flat, index).any(|child| {
+            let child_style = flat[child].style;
+            oof::is_out_of_flow(child_style)
+        })
+    {
         return false;
     }
     let Some(columns) = parse_template(columns_spec(style).unwrap_or(""), false) else {
@@ -1001,6 +1016,22 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
         return false;
     }
     let fixed = fixed_px_sum(&columns).is_some() && fixed_px_sum(&rows).is_some();
+    if style.position == Position::Static
+        && !has_marker(style, "--w3cos-internal-percent-gap")
+        && !block::border_widths(style)
+            .iter()
+            .all(|value| value.abs() <= EPS)
+        && !(intrinsic
+            && !columns.tracks.is_empty()
+            && columns.tracks.iter().all(|track| {
+                matches!(
+                    track,
+                    Spec::One(Breadth::Auto | Breadth::MinContent | Breadth::MaxContent)
+                )
+            }))
+    {
+        return false;
+    }
     if intrinsic {
         !fixed && axis_line(columns_spec(style), false) && axis_line(style.grid_rows(), true)
     } else {
@@ -4613,7 +4644,11 @@ fn layout_impl(
         )));
     }
     let mut shrink_intrinsic_columns = false;
-    if inline_intrinsic && sized.is_none() && matches!(style.width, Dimension::Auto) {
+    if inline_intrinsic
+        && sized.is_none()
+        && keyword.is_none()
+        && matches!(style.width, Dimension::Auto)
+    {
         let measured = measure_columns(
             &column_specs,
             &collapsed,

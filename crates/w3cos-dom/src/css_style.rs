@@ -741,7 +741,18 @@ impl CSSStyleDeclaration {
                     run_in_block.then(|| "1".to_string()),
                 );
                 self.inner.display = parse_display(value);
-                let grid_lanes = keyword == "grid-lanes";
+                // `inline grid-lanes` is the atomic-inline form of the same
+                // container (css-grid-3). It keeps its unrecognized-display
+                // marker (legacy keeps `flex`) and also carries the lanes
+                // marker, so LayoutNG lays it out as a lane container on a
+                // line; the boxes it cannot place there stay on the legacy
+                // path through the unrecognized-display gate.
+                let keyword = if keyword.split_whitespace().eq(["inline", "grid-lanes"]) {
+                    "inline grid-lanes".to_string()
+                } else {
+                    keyword
+                };
+                let grid_lanes = keyword == "grid-lanes" || keyword == "inline grid-lanes";
                 set_marker(
                     &mut self.inner,
                     UNRECOGNIZED_DISPLAY_PROPERTY,
@@ -2188,6 +2199,33 @@ impl CSSStyleDeclaration {
                     "--w3cos-internal-safe-align-content",
                     safe.then(|| "1".to_string()),
                 );
+            }
+            "place-self" | "placeSelf" => {
+                // `<'align-self'> <'justify-self'>?`: one value sets both. A
+                // position or baseline prefix belongs to the keyword after it.
+                let mut groups: Vec<String> = Vec::new();
+                let mut prefix: Option<&str> = None;
+                for token in value.split_whitespace() {
+                    let lower = token.to_ascii_lowercase();
+                    if prefix.is_none()
+                        && matches!(lower.as_str(), "safe" | "unsafe" | "first" | "last")
+                    {
+                        prefix = Some(token);
+                        continue;
+                    }
+                    groups.push(match prefix.take() {
+                        Some(p) => format!("{p} {token}"),
+                        None => token.to_string(),
+                    });
+                }
+                if let Some(p) = prefix {
+                    groups.push(p.to_string());
+                }
+                if let Some(align) = groups.first().cloned() {
+                    let justify = groups.get(1).cloned().unwrap_or_else(|| align.clone());
+                    self.set_property("align-self", &align);
+                    self.set_property("justify-self", &justify);
+                }
             }
             "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
             "justify-items" | "justifyItems" => {
@@ -5055,6 +5093,20 @@ fn computed_tab_size_calc(body: &str, font_size: f32) -> Option<String> {
 #[cfg(test)]
 mod grid_longhand_tests {
     use super::{COLUMN_GAP_PERCENT_PROPERTY, CSSStyleDeclaration, ROW_GAP_PERCENT_PROPERTY};
+
+    #[test]
+    fn place_self_sets_both_axes() {
+        use w3cos_std::style::AlignSelf;
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("place-self", "start");
+        let used = style.to_style();
+        assert_eq!(used.align_self, AlignSelf::FlexStart);
+        assert_eq!(used.justify_self, AlignSelf::FlexStart);
+        style.set_property("place-self", "center stretch");
+        let used = style.to_style();
+        assert_eq!(used.align_self, AlignSelf::Center);
+        assert_eq!(used.justify_self, AlignSelf::Stretch);
+    }
 
     #[test]
     fn grid_line_longhands_rewrite_one_side_of_the_pair() {

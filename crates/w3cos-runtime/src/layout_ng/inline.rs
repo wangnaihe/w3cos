@@ -106,7 +106,7 @@ fn valign_length(style: &Style) -> Option<f32> {
 
 /// `vertical-align: top` (Some(true)) or `bottom` (Some(false)): the box's
 /// aligned subtree is placed against the line box edge (CSS 2.1 10.8.1).
-fn line_relative_align(style: &Style) -> Option<bool> {
+pub(super) fn line_relative_align(style: &Style) -> Option<bool> {
     match style
         .custom_properties
         .as_ref()
@@ -567,6 +567,14 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
         .any(|v| v != 0.0)
     {
         return Some("text:edges");
+    }
+    if super::oof::is_out_of_flow(style) {
+        // An absolutely positioned text leaf (generated `::before` with
+        // `position: absolute`) is blockified (CSS2 9.7) and is the block
+        // text of its own OOF box; its position is the OOF layout's.
+        let mut in_box = style.clone();
+        in_box.position = Position::Static;
+        return block_text_content_reason(content, &in_box);
     }
     block_text_content_reason(content, style)
 }
@@ -1294,7 +1302,7 @@ pub(super) fn leaf_paints_like_ifc(content: &str, style: &Style) -> bool {
 }
 
 /// NGLineHeightMetrics of the root inline box (the block's strut).
-fn strut(style: &Style) -> (f32, f32) {
+pub(super) fn strut(style: &Style) -> (f32, f32) {
     let height = inline_used_line_height(inline_style_line_height(style));
     let ascent = inline_font_baseline_from_line_top(style, height);
     (ascent, height - ascent)
