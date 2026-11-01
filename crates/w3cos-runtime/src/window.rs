@@ -9025,6 +9025,23 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // The focused DOM element may be driven by an EditContext
+                // (Monaco): typed text becomes a `textupdate` there instead of
+                // a native text-control edit.
+                if self.dom_mode
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                    && let Some(text) = event.text.as_ref()
+                    && !text.is_empty()
+                    && !text.chars().all(|c| c.is_control())
+                    && crate::jsdom::deliver_edit_context_text(text)
+                {
+                    self.rebuild_if_dirty();
+                    self.repaint_mode = RepaintMode::Full;
+                    self.request_repaint();
+                    return;
+                }
                 if let Some(focus_idx) = self.focused_index {
                     if let Some(kind) = self.get_kind_at(focus_idx) {
                         match kind {

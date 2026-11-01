@@ -15719,6 +15719,41 @@ pub(crate) fn dispatch_native_key(
     )
 }
 
+/// Deliver user-typed text to the focused element when it is driven by an
+/// `EditContext` (Monaco's native edit context). The UA fires a cancelable
+/// `beforeinput` at the element, then a `textupdate` on the context that
+/// replaces the current selection. Returns true when the text was consumed
+/// by an EditContext, so the caller must not also treat it as a text control edit.
+pub fn deliver_edit_context_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let Some(active) = active_element_id() else {
+        return false;
+    };
+    let context = get_expando(active, "editContext").unwrap_or(Value::Null);
+    if context.is_nullish()
+        || !w3cos_core::class::instance_of(&context, &crate::edit_context_web::edit_context_class())
+    {
+        return false;
+    }
+    if dispatch_native_before_input(active, text, "insertText", false) {
+        return true;
+    }
+    let start = context.get_property("selectionStart").to_number();
+    let end = context.get_property("selectionEnd").to_number();
+    let (start, end) = (start.min(end), start.max(end));
+    context.call_method(
+        "updateText",
+        vec![
+            Value::Number(start),
+            Value::Number(end),
+            Value::string(text),
+        ],
+    );
+    true
+}
+
 /// Bridge the cancelable `beforeinput` phase. Returns true when canceled.
 pub(crate) fn dispatch_native_before_input(
     target: u32,
@@ -32267,6 +32302,61 @@ try {
         let other = create_in_body("textarea");
         other.call_method("focus", vec![]);
         assert!(doc.get_property("activeElement") == other);
+    }
+
+    #[test]
+    fn typed_text_reaches_the_focused_edit_context() {
+        setup();
+        let context =
+            w3cos_core::class::construct(&crate::edit_context_web::edit_context_class(), vec![]);
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        editor.set_property("editContext", context.clone());
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = seen.clone();
+        context.call_method(
+            "addEventListener",
+            vec![
+                Value::string("textupdate"),
+                Value::function(move |_, args| {
+                    let event = &args[0];
+                    log.borrow_mut().push(format!(
+                        "{}@{}-{}",
+                        event.get_property("text").to_js_string(),
+                        event.get_property("updateRangeStart").to_u32(),
+                        event.get_property("updateRangeEnd").to_u32()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+        let before = Rc::new(Cell::new(0));
+        let before_count = before.clone();
+        editor.call_method(
+            "addEventListener",
+            vec![
+                Value::string("beforeinput"),
+                Value::function(move |_, _| {
+                    before_count.set(before_count.get() + 1);
+                    Value::Undefined
+                }),
+            ],
+        );
+        // Nothing focused yet: not an EditContext target.
+        assert!(!deliver_edit_context_text("x"));
+        editor.call_method("focus", vec![]);
+        assert!(deliver_edit_context_text("H"));
+        assert!(deliver_edit_context_text("i"));
+        assert_eq!(
+            *seen.borrow(),
+            vec!["H@0-0".to_string(), "i@1-1".to_string()]
+        );
+        assert_eq!(context.get_property("text").to_js_string(), "Hi");
+        assert_eq!(before.get(), 2);
+        // A plain focused element is not an EditContext target.
+        let plain = create_in_body("input");
+        plain.call_method("focus", vec![]);
+        assert!(!deliver_edit_context_text("z"));
     }
 
     #[test]
