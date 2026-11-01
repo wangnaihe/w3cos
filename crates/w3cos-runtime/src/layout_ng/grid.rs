@@ -6603,6 +6603,36 @@ mod tests {
     }
 
     #[test]
+    fn column_lanes_mirror_under_rtl() {
+        // The lanes pass runs in logical coordinates and mirrors the border
+        // boxes, so the first lane is the rightmost one and an item's
+        // left margin stays on its physical left.
+        let mut style = grid_style(200.0, None, Some("50px 50px"));
+        style.display = Display::Flex;
+        style.direction = TextDirection::Rtl;
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-grid-lanes".to_string(),
+            "1".to_string(),
+        )]));
+        let mut second = block_box(Some(20.0), Some(10.0));
+        second.margin.left = Spacing::Px(5.0);
+        let host = Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(
+                style,
+                vec![leaf(block_box(Some(20.0), Some(10.0))), leaf(second)],
+            )],
+        );
+        expect(
+            &host,
+            &[(2, [180.0, 0.0, 20.0, 10.0]), (3, [130.0, 0.0, 20.0, 10.0])],
+        );
+    }
+
+    #[test]
     fn row_lanes_fill_each_lane_in_turn() {
         // grid-lanes with only grid-template-rows: the rows are the lanes and
         // each item goes into the shortest one, so equal items alternate

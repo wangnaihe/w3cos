@@ -132,7 +132,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if parse_flow(style.grid_flow()).is_none_or(|flow| flow.column) {
         return Some("lanes:flow");
     }
-    if style.direction == TextDirection::Rtl || has_marker(style, "--w3cos-internal-percent-gap") {
+    if has_marker(style, "--w3cos-internal-percent-gap") {
         return Some("lanes:direction");
     }
     let (grid_spec, other_spec) = if columns {
@@ -204,6 +204,16 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         Some(_) => {}
     }
+    // Spanning items over intrinsic column tracks feed the track sizing
+    // in ways the ordinary-grid reference does not match (auto-repeat
+    // spans and multi-span baseline sharing); row lanes follow main's
+    // opening-based placement and are covered by the Chrome goldens.
+    let intrinsic_axis = columns
+        && template
+            .tracks
+            .iter()
+            .chain(&template.auto_tracks)
+            .any(spec_is_intrinsic);
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
@@ -211,6 +221,12 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         if has_marker(child_style, "--w3cos-internal-overflow-alignment") {
             return Some("lanes:overflow-alignment");
+        }
+        if intrinsic_axis
+            && placement(child_style, !columns)
+                .is_some_and(|value| value.contains("span") || value.contains('/'))
+        {
+            return Some("lanes:intrinsic-span");
         }
         if block::is_replaced_item(flat, child)
             || columns_spec(child_style).is_some_and(is_subgrid_axis)
@@ -669,9 +685,23 @@ pub(super) fn layout(
     let border_width = inner_width + bl + br + pl + pr;
     let border_height = height + bt + bb + pt + pb;
     let (ox, oy) = (from_units(origin_x), from_units(origin_y));
+    let rtl = style.direction == TextDirection::Rtl;
+    if rtl && !pending_oof.is_empty() {
+        return crate::layout_ng::bail("lanes:rtl-oof");
+    }
+    // The pass lays out in logical (ltr) coordinates; `direction: rtl`
+    // mirrors every border box inside the content box (Blink converts
+    // logical to physical at the end).
     let mut children: Vec<(f32, f32, BoxFragment)> = children
         .into_iter()
-        .map(|(x, y, fragment)| (x + ox, y + oy, fragment))
+        .map(|(x, y, fragment)| {
+            let x = if rtl {
+                inner_width - x - fragment.width
+            } else {
+                x
+            };
+            (x + ox, y + oy, fragment)
+        })
         .collect();
     for candidate in &mut pending_oof {
         *candidate = candidate.translated(ox, oy);
@@ -931,6 +961,7 @@ fn stack_columns(
     used_of: &dyn Fn(i64) -> i64,
     clamped: bool,
 ) -> Option<Stacked> {
+    let rtl = style.direction == TextDirection::Rtl;
     let lanes = specs.len();
     let mut col_min = vec![0_i64; lanes];
     let mut col_max = vec![0_i64; lanes];
@@ -1010,17 +1041,23 @@ fn stack_columns(
         let fragment = laid.fragment;
         let item_oof = laid.oof;
         let [mt, mr, mb, ml] = prepared.margin.map(units);
+        // Under rtl the layout is logical (mirrored at the end), so the
+        // inline-start margin is the physical right one.
+        let (start_margin, end_margin) = if rtl { (mr, ml) } else { (ml, mr) };
         let (ml, _mr, inline_offset) = axis_offset(
             area,
             units(fragment.width),
-            ml,
-            mr,
+            start_margin,
+            end_margin,
             false,
             false,
             prepared.justify,
         );
         let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
+        if rtl && dx != 0.0 {
+            return crate::layout_ng::bail("lanes:rtl-relative");
+        }
         let size_of = |lane: usize| {
             let track = track_of(reverse.track, lanes, lane, entry.span);
             span_sum(&sizes, &collapsed, track, entry.span, between)
@@ -1145,6 +1182,7 @@ fn stack_rows(
     font: f32,
     reverse: Reverse,
 ) -> Option<Stacked> {
+    let rtl = style.direction == TextDirection::Rtl;
     let lanes = specs.len();
     let inner = from_units(inner_u);
     // Items do not depend on the lane in the inline axis, so each one is
@@ -1304,6 +1342,9 @@ fn stack_rows(
         );
         let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
+        if rtl && dx != 0.0 {
+            return crate::layout_ng::bail("lanes:rtl-relative");
+        }
         let size_of = |lane: usize| {
             let track = track_of(reverse.track, lanes, lane, entry.span);
             span_sum(&sizes, &collapsed, track, entry.span, between)
@@ -1337,8 +1378,8 @@ fn stack_rows(
             index: entry.index,
             cross: y,
             at,
-            before: ml,
-            after: mr,
+            before: if rtl { mr } else { ml },
+            after: if rtl { ml } else { mr },
             dx,
             dy,
             fragment,
@@ -1356,6 +1397,10 @@ fn stack_rows(
     let aligned = records
         .iter()
         .any(|record| record.prepared.stack != StackAlign::Normal);
+    if rtl && aligned {
+        // Stack alignment keywords are not mirrored yet.
+        return crate::layout_ng::bail("lanes:rtl-stack-align");
+    }
     if aligned && !records.is_empty() && extent > inner_u {
         return crate::layout_ng::bail("lanes:stacking-overflow");
     }
@@ -1427,4 +1472,17 @@ fn unzip_placed(
 fn is_dense(style: &Style) -> bool {
     marker(style, PACK) == Some("dense")
         || parse_flow(style.grid_flow()).is_some_and(|flow| flow.dense)
+}
+
+fn spec_is_intrinsic(spec: &Spec) -> bool {
+    let intrinsic = |breadth: &Breadth| {
+        matches!(
+            breadth,
+            Breadth::Auto | Breadth::MinContent | Breadth::MaxContent
+        )
+    };
+    match spec {
+        Spec::One(breadth) | Spec::Fit(breadth) => intrinsic(breadth),
+        Spec::MinMax(min, max) => intrinsic(min) || intrinsic(max),
+    }
 }
