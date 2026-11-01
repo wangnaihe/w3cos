@@ -15754,6 +15754,84 @@ pub fn deliver_edit_context_text(text: &str) -> bool {
     true
 }
 
+/// `beforeinput` type a non-text editing key produces on an EditContext target.
+pub(crate) fn edit_context_input_type_for_key(key: &str, shift: bool) -> Option<&'static str> {
+    match key {
+        "Enter" if shift => Some("insertLineBreak"),
+        "Enter" => Some("insertParagraph"),
+        "Backspace" => Some("deleteContentBackward"),
+        "Delete" => Some("deleteContentForward"),
+        _ => None,
+    }
+}
+
+/// Run a non-text editing command (`insertParagraph`, `insertLineBreak`,
+/// `deleteContentBackward`, `deleteContentForward`) against the focused
+/// element's `EditContext`. A cancelable `beforeinput` goes to the element
+/// first. Line breaks are left to the page's `beforeinput` handler, as in
+/// browsers (no `textupdate`). Deletions then fire a user `textupdate` with
+/// empty text over the removed range. Returns true when an EditContext
+/// consumed the command.
+pub(crate) fn deliver_edit_context_command(input_type: &str) -> bool {
+    let Some(active) = active_element_id() else {
+        return false;
+    };
+    let context = get_expando(active, "editContext").unwrap_or(Value::Null);
+    if context.is_nullish()
+        || !w3cos_core::class::instance_of(&context, &crate::edit_context_web::edit_context_class())
+    {
+        return false;
+    }
+    let backward = match input_type {
+        "insertParagraph" | "insertLineBreak" => {
+            dispatch_native_before_input(active, "", input_type, false);
+            return true;
+        }
+        "deleteContentBackward" => true,
+        "deleteContentForward" => false,
+        _ => return false,
+    };
+    if dispatch_native_before_input(active, "", input_type, false) {
+        return true;
+    }
+    let units: Vec<u16> = context
+        .get_property("text")
+        .to_js_string()
+        .encode_utf16()
+        .collect();
+    let a = context.get_property("selectionStart").to_u32() as usize;
+    let b = context.get_property("selectionEnd").to_u32() as usize;
+    let (mut start, mut end) = (a.min(b).min(units.len()), a.max(b).min(units.len()));
+    if start == end {
+        let is_high = |u: u16| (0xD800..0xDC00).contains(&u);
+        let is_low = |u: u16| (0xDC00..0xE000).contains(&u);
+        if backward && start > 0 {
+            start -= if start >= 2 && is_low(units[start - 1]) && is_high(units[start - 2]) {
+                2
+            } else {
+                1
+            };
+        } else if !backward && end < units.len() {
+            end += if end + 1 < units.len() && is_high(units[end]) && is_low(units[end + 1]) {
+                2
+            } else {
+                1
+            };
+        } else {
+            return true;
+        }
+    }
+    context.call_method(
+        "__w3cos_userTextUpdate",
+        vec![
+            Value::Number(start as f64),
+            Value::Number(end as f64),
+            Value::string(""),
+        ],
+    );
+    true
+}
+
 /// Bridge the cancelable `beforeinput` phase. Returns true when canceled.
 pub(crate) fn dispatch_native_before_input(
     target: u32,
@@ -32357,6 +32435,90 @@ try {
         let plain = create_in_body("input");
         plain.call_method("focus", vec![]);
         assert!(!deliver_edit_context_text("z"));
+    }
+
+    #[test]
+    fn edit_context_commands_fire_beforeinput_and_deletions_fire_textupdate() {
+        setup();
+        let context = w3cos_core::class::construct(
+            &crate::edit_context_web::edit_context_class(),
+            vec![Value::object(HashMap::from([
+                ("text".into(), Value::string("a\u{1F600}bc")),
+                ("selectionStart".into(), Value::Number(4.0)),
+                ("selectionEnd".into(), Value::Number(4.0)),
+            ]))],
+        );
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        editor.set_property("editContext", context.clone());
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let before = log.clone();
+        editor.call_method(
+            "addEventListener",
+            vec![
+                Value::string("beforeinput"),
+                Value::function(move |_, args| {
+                    before.borrow_mut().push(format!(
+                        "before:{}",
+                        args[0].get_property("inputType").to_js_string()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+        let updates = log.clone();
+        context.call_method(
+            "addEventListener",
+            vec![
+                Value::string("textupdate"),
+                Value::function(move |_, args| {
+                    let e = &args[0];
+                    updates.borrow_mut().push(format!(
+                        "update:{:?}@{}-{}",
+                        e.get_property("text").to_js_string(),
+                        e.get_property("updateRangeStart").to_u32(),
+                        e.get_property("updateRangeEnd").to_u32()
+                    ));
+                    Value::Undefined
+                }),
+            ],
+        );
+        assert!(!deliver_edit_context_command("insertParagraph"));
+        editor.call_method("focus", vec![]);
+        assert!(deliver_edit_context_command("insertParagraph"));
+        assert_eq!(*log.borrow(), vec!["before:insertParagraph".to_string()]);
+        log.borrow_mut().clear();
+        // Units: a, D83D, DE00, b, c; caret at 4 so Backspace removes 'b'.
+        assert!(deliver_edit_context_command("deleteContentBackward"));
+        assert_eq!(context.get_property("text").to_js_string(), "a\u{1F600}c");
+        assert!(deliver_edit_context_command("deleteContentBackward"));
+        // Surrogate pair removed as one unit.
+        assert_eq!(context.get_property("text").to_js_string(), "ac");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "before:deleteContentBackward".to_string(),
+                "update:\"\"@3-4".to_string(),
+                "before:deleteContentBackward".to_string(),
+                "update:\"\"@1-3".to_string(),
+            ]
+        );
+        log.borrow_mut().clear();
+        assert!(deliver_edit_context_command("deleteContentForward"));
+        assert_eq!(context.get_property("text").to_js_string(), "a");
+        assert_eq!(context.get_property("selectionStart").to_u32(), 1);
+        // At the end nothing more to delete forward, still consumed.
+        assert!(deliver_edit_context_command("deleteContentForward"));
+        assert_eq!(context.get_property("text").to_js_string(), "a");
+        assert_eq!(
+            edit_context_input_type_for_key("Enter", false),
+            Some("insertParagraph")
+        );
+        assert_eq!(
+            edit_context_input_type_for_key("Enter", true),
+            Some("insertLineBreak")
+        );
+        assert_eq!(edit_context_input_type_for_key("a", false), None);
     }
 
     #[test]
