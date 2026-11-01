@@ -973,6 +973,7 @@ pub fn matching_declarations_for_node(
         .collect()
 }
 
+#[derive(Clone)]
 pub(crate) struct CascadeDeclaration {
     pub origin: StylesheetOrigin,
     pub property: String,
@@ -985,14 +986,35 @@ pub(crate) fn matching_cascade_declarations_for_node(
     document: &Document,
     node: NodeId,
 ) -> Vec<CascadeDeclaration> {
+    matching_cascade_declarations_with_stability(document, node).0
+}
+
+/// The cascade declarations plus whether they depend only on the node's own
+/// style revision and the stylesheet generation. A candidate rule guarded by a
+/// container query depends on layout, so its result must not be reused.
+pub(crate) fn matching_cascade_declarations_with_stability(
+    document: &Document,
+    node: NodeId,
+) -> (Vec<CascadeDeclaration>, bool) {
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
-    RULES.with(|rules| {
+    let mut stable = true;
+    let declarations = RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
             .candidate_indices_for_node(document, node)
             .into_iter()
             .map(|index| &rules.rules[index])
+            .inspect(|rule| {
+                if rule.pseudo_element.is_none()
+                    && rule
+                        .declarations
+                        .iter()
+                        .any(|(property, _)| property == CONTAINER_QUERY_MARKER)
+                {
+                    stable = false;
+                }
+            })
             .filter(|rule| {
                 rule.pseudo_element.is_none()
                     && rule_matches_document_scope(rule, document_scope)
@@ -1031,7 +1053,8 @@ pub(crate) fn matching_cascade_declarations_for_node(
             }
         }
         buckets.into_iter().flatten().collect()
-    })
+    });
+    (declarations, stable)
 }
 
 /// Declarations matching one generated pseudo-element box. The selector is
