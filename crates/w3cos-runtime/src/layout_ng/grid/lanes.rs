@@ -38,8 +38,8 @@ fn lane_columns(style: &Style) -> Option<bool> {
         match token {
             "row" => axis = Some(false),
             "column" => axis = Some(true),
-            "normal" => {}
-            // fill-reverse / track-reverse and anything unknown.
+            "normal" | "fill-reverse" | "track-reverse" => {}
+            // Anything unknown.
             _ => return None,
         }
     }
@@ -56,6 +56,36 @@ fn lane_columns(style: &Style) -> Option<bool> {
             !specified(style.grid_rows())
         }
     }))
+}
+
+/// The sum of fixed (`px` / `em`) tracks plus gaps: the intrinsic grid-axis
+/// size. `None` when any track is not fixed.
+fn fixed_tracks_size(template: &super::Template, gap: f32, font: f32) -> Option<f32> {
+    let mut total = 0.0;
+    for track in &template.tracks {
+        total += match track {
+            Spec::One(Breadth::Px(value)) => *value,
+            Spec::One(Breadth::Em(value)) => value * font,
+            _ => return None,
+        };
+    }
+    let count = template.tracks.len();
+    Some(total + gap * count.saturating_sub(1) as f32)
+}
+
+/// `(fill-reverse, track-reverse)` of the lanes direction.
+fn reversal(style: &Style) -> (bool, bool) {
+    let direction = marker(style, DIRECTION).unwrap_or("normal");
+    let mut fill = false;
+    let mut track = false;
+    for token in direction.split_whitespace() {
+        match token {
+            "fill-reverse" => fill = true,
+            "track-reverse" => track = true,
+            _ => {}
+        }
+    }
+    (fill, track)
 }
 
 /// Whether the real lanes pass lays out this container. Everything else
@@ -78,7 +108,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         return Some("lanes:none");
     }
     let columns = lane_columns(style)?;
-    if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
+    if has_marker(style, super::HEIGHT_KEYWORD) && !columns {
         return Some("lanes:size-keyword");
     }
     if has_marker(style, "--w3cos-internal-overflow-alignment") {
@@ -120,6 +150,15 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     }
     if template.auto_fit == Some(true) {
         return Some("lanes:auto-fit");
+    }
+    if has_marker(style, block::WIDTH_KEYWORD)
+        && (!columns
+            || block::size_contained(style)
+            || template.auto_fit.is_some()
+            || fixed_tracks_size(&template, 0.0, 0.0).is_none())
+    {
+        // An intrinsic width is only known for fixed grid-axis tracks.
+        return Some("lanes:size-keyword");
     }
     if template.auto_fit.is_some()
         && template
@@ -181,6 +220,21 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             || child_style.grid_rows().is_some_and(is_subgrid_axis)
         {
             return Some("lanes:item");
+        }
+        if reversal(style).0 {
+            // Stacking-axis alignment floats an item inside the slack
+            // after its slot; which side `start` names under fill-reverse
+            // is not modelled.
+            let (container_align, item_align, block) = if columns {
+                (style.align_items, child_style.align_self, true)
+            } else {
+                (style.justify_items, child_style.justify_self, false)
+            };
+            if used_item_align(container_align, item_align) != w3cos_std::style::AlignItems::Stretch
+                || super::explicit_stretch(style, item_align, block)
+            {
+                return Some("lanes:reverse-alignment");
+            }
         }
         if is_baseline(used_item_align(style.align_items, child_style.align_self))
             || is_baseline(used_item_align(
@@ -264,6 +318,9 @@ struct Running {
     positions: Vec<i64>,
     cursor: usize,
     tolerance: i64,
+    /// Skipped stacking-axis spaces per lane, `(start, end)`, for dense
+    /// packing.
+    holes: Vec<Vec<(i64, i64)>>,
 }
 
 impl Running {
@@ -272,6 +329,87 @@ impl Running {
             positions: vec![0; lanes],
             cursor: 0,
             tolerance,
+            holes: vec![Vec::new(); lanes],
+        }
+    }
+
+    /// Remember the space an item skips over when it is placed at `at`.
+    fn record(&mut self, start: usize, span: usize, at: i64) {
+        for lane in start..start + span {
+            if self.positions[lane] < at {
+                self.holes[lane].push((self.positions[lane], at));
+            }
+        }
+    }
+
+    /// The spaces open in every lane of a span.
+    fn common(&self, start: usize, span: usize) -> Vec<(i64, i64)> {
+        let mut open = self.holes[start].clone();
+        for lane in start + 1..start + span {
+            let mut next = Vec::new();
+            for &(a, b) in &open {
+                for &(c, d) in &self.holes[lane] {
+                    let (lo, hi) = (a.max(c), b.min(d));
+                    if hi > lo {
+                        next.push((lo, hi));
+                    }
+                }
+            }
+            open = next;
+        }
+        open
+    }
+
+    /// The highest skipped space before `before` that fits `contribution`
+    /// (start-most within the tolerance of the highest), among the start
+    /// lines `same_size` accepts.
+    fn backfill(
+        &self,
+        starts: std::ops::RangeInclusive<usize>,
+        span: usize,
+        contribution: i64,
+        before: i64,
+        same_size: impl Fn(usize) -> bool,
+    ) -> Option<(usize, i64)> {
+        let mut found: Vec<(usize, i64)> = Vec::new();
+        for start in starts {
+            if !same_size(start) {
+                continue;
+            }
+            let position = self
+                .common(start, span)
+                .into_iter()
+                .filter(|(a, b)| b - a >= contribution)
+                .map(|(a, _)| a)
+                .min();
+            if let Some(position) = position.filter(|position| *position < before) {
+                found.push((start, position));
+            }
+        }
+        let highest = found.iter().map(|(_, position)| *position).min()?;
+        let allowed = highest.saturating_add(self.tolerance);
+        found
+            .into_iter()
+            .filter(|(_, position)| *position <= allowed)
+            .min_by_key(|(start, _)| *start)
+    }
+
+    /// Take `[at, at + contribution)` out of the open spaces.
+    fn consume(&mut self, start: usize, span: usize, at: i64, contribution: i64) {
+        for lane in start..start + span {
+            let holes = &mut self.holes[lane];
+            if let Some(slot) = holes
+                .iter()
+                .position(|&(a, b)| a <= at && at + contribution <= b)
+            {
+                let (a, b) = holes.remove(slot);
+                if a < at {
+                    holes.push((a, at));
+                }
+                if at + contribution < b {
+                    holes.push((at + contribution, b));
+                }
+            }
         }
     }
 
@@ -333,7 +471,30 @@ pub(super) fn layout(
     let style = flat[index].style;
     let columns = lane_columns(style).why("lanes:direction")?;
     let metrics: BoxMetrics = block::resolve_inline(style, space);
-    let content_width = sized.map_or(metrics.content_width, |(width, _)| width);
+    let mut content_width = sized.map_or(metrics.content_width, |(width, _)| width);
+    if let Some(keyword) = marker(style, block::WIDTH_KEYWORD).filter(|_| sized.is_none()) {
+        // `min-content` / `max-content` / `fit-content` of fixed lanes is
+        // their track sum.
+        let template = parse_template(columns_spec(style).why("lanes:no-template")?, false)
+            .why("lanes:template")?;
+        let gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+        let tracks = fixed_tracks_size(&template, gap, style.font_size.max(0.0))
+            .why("lanes:size-keyword")?;
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+        let content = block::keyword_content_size(
+            keyword,
+            tracks,
+            tracks,
+            Some(available),
+            Some(space.available_inline),
+            style,
+            space,
+            edges,
+        )
+        .why("lanes:size-keyword")?;
+        content_width = block::clamp_inline_size(style, space, edges, content).max(0.0);
+    }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
     let inner_width = content_width.max(0.0);
@@ -422,6 +583,7 @@ pub(super) fn layout(
     }
     entries.sort_by_key(|entry| (entry.order, entry.source));
 
+    let reverse = reversal(style);
     let (children, mut pending_oof, stacking_extent) = if columns {
         stack_columns(
             flat,
@@ -433,6 +595,12 @@ pub(super) fn layout(
             grid_gap_u,
             stacking_gap_u,
             font,
+            reverse,
+            (
+                specified_height.map(units),
+                min_h.map(units),
+                max_h.map(units),
+            ),
         )?
     } else {
         stack_rows(
@@ -447,6 +615,7 @@ pub(super) fn layout(
             definite_block.map(units),
             specified_height.map(units),
             font,
+            reverse,
         )?
     };
 
@@ -622,7 +791,10 @@ fn stack_columns(
     column_gap_u: i64,
     row_gap_u: i64,
     font: f32,
+    reverse: (bool, bool),
+    block_bounds: (Option<i64>, Option<i64>, Option<i64>),
 ) -> Option<Stacked> {
+    let (fill_reverse, track_reverse) = reverse;
     let lanes = specs.len();
     let mut col_min = vec![0_i64; lanes];
     let mut col_max = vec![0_i64; lanes];
@@ -660,14 +832,22 @@ fn stack_columns(
     let column_x = positions(&sizes, &collapsed, between, lead);
     let tolerance = tolerance_units(style, inner_u);
     let mut running = Running::new(lanes, tolerance);
+    let dense = is_dense(style);
     let mut placed = Vec::with_capacity(entries.len());
+    let mut outer: Vec<(i64, i64, i64)> = Vec::with_capacity(entries.len());
     let mut extent = 0_i64;
     for entry in entries {
+        // With track-reverse the logical lanes run right to left; explicit
+        // lines stay physical.
         let (start, at) = match entry.start {
-            Some(start) => (start, running.span_max(start, entry.span)),
+            Some(start) => {
+                let start = logical(start, entry.span, lanes, track_reverse);
+                (start, running.span_max(start, entry.span))
+            }
             None => running.first_eligible(entry.span),
         };
-        let area = span_sum(&sizes, &collapsed, start, entry.span, between);
+        let physical = logical(start, entry.span, lanes, track_reverse);
+        let area = span_sum(&sizes, &collapsed, physical, entry.span, between);
         let prepared = prepare(
             flat,
             style,
@@ -689,6 +869,25 @@ fn stack_columns(
         let fragment = laid.fragment;
         let item_oof = laid.oof;
         let [mt, mr, mb, ml] = prepared.margin.map(units);
+        let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
+        let (start, at, physical, backfilled) = backfill_slot(
+            &running,
+            dense,
+            entry,
+            (start, at, physical),
+            contribution,
+            lanes,
+            track_reverse,
+            |candidate| {
+                span_sum(
+                    &sizes,
+                    &collapsed,
+                    logical(candidate, entry.span, lanes, track_reverse),
+                    entry.span,
+                    between,
+                ) == area
+            },
+        );
         let (ml, _mr, inline_offset) = axis_offset(
             area,
             units(fragment.width),
@@ -698,13 +897,18 @@ fn stack_columns(
             false,
             prepared.justify,
         );
-        let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
-        let x = from_units(column_x[start] + ml + inline_offset);
+        let x = from_units(column_x[physical] + ml + inline_offset);
         let y = from_units(at + mt);
+        outer.push((at, units(fragment.height) + mt + mb, mt));
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
-        running.place(start, entry.span, at + contribution);
-        if entry.start.is_none() {
-            running.cursor = start + entry.span;
+        if backfilled {
+            running.consume(start, entry.span, at, contribution);
+        } else {
+            running.record(start, entry.span, at);
+            running.place(start, entry.span, at + contribution);
+            if entry.start.is_none() {
+                running.cursor = start + entry.span;
+            }
         }
         placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
     }
@@ -716,6 +920,22 @@ fn stack_columns(
     } else {
         (extent - row_gap_u).max(0)
     };
+    if fill_reverse {
+        // The stacking axis runs bottom-up: mirror each outer box in the
+        // used block size (margins keep their physical sides).
+        let (specified, min, max) = block_bounds;
+        let mut used = specified.unwrap_or(extent);
+        if let Some(min) = min {
+            used = used.max(min);
+        }
+        if let Some(max) = max {
+            used = used.min(max);
+        }
+        for (item, (at, outer_h, mt)) in placed.iter_mut().zip(&outer) {
+            let delta = from_units(used - at - outer_h + mt) - from_units(at + mt);
+            item.2 += delta;
+        }
+    }
     placed.sort_by_key(|item| item.0);
     Some(unzip_placed(placed, extent))
 }
@@ -733,7 +953,9 @@ fn stack_rows(
     definite_block: Option<i64>,
     specified_block: Option<i64>,
     font: f32,
+    reverse: (bool, bool),
 ) -> Option<Stacked> {
+    let (fill_reverse, track_reverse) = reverse;
     let lanes = specs.len();
     let inner = from_units(inner_u);
     // Items do not depend on the lane in the inline axis, so each one is
@@ -844,14 +1066,19 @@ fn stack_rows(
     let row_y = positions(&sizes, &collapsed, between, lead.max(0));
     let tolerance = tolerance_units(style, used);
     let mut running = Running::new(lanes, tolerance);
+    let dense = is_dense(style);
     let mut placed = Vec::with_capacity(entries.len());
     for (entry, (prepared, mut fragment, mut item_oof)) in entries.iter().zip(measured) {
         let (start, at) = match entry.start {
-            Some(start) => (start, running.span_max(start, entry.span)),
+            Some(start) => {
+                let start = logical(start, entry.span, lanes, track_reverse);
+                (start, running.span_max(start, entry.span))
+            }
             None => running.first_eligible(entry.span),
         };
+        let physical = logical(start, entry.span, lanes, track_reverse);
         let [mt, mr, mb, ml] = prepared.margin.map(units);
-        let lane_size = span_sum(&sizes, &collapsed, start, entry.span, between);
+        let lane_size = span_sum(&sizes, &collapsed, physical, entry.span, between);
         let stretch_block = prepared.align == Pack::Stretch
             && prepared.specified_content_h.is_none()
             && !has_marker(flat[entry.index].style, super::HEIGHT_KEYWORD);
@@ -873,6 +1100,30 @@ fn stack_rows(
                 item_oof = relaid.oof;
             }
         }
+        let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
+        let (start, at, physical, backfilled) = backfill_slot(
+            &running,
+            dense,
+            entry,
+            (start, at, physical),
+            contribution,
+            lanes,
+            track_reverse,
+            |candidate| {
+                span_sum(
+                    &sizes,
+                    &collapsed,
+                    logical(candidate, entry.span, lanes, track_reverse),
+                    entry.span,
+                    between,
+                ) == lane_size
+            },
+        );
+        let x = if fill_reverse {
+            from_units(inner_u - at - (units(fragment.width) + ml + mr) + ml)
+        } else {
+            from_units(at + ml)
+        };
         let (mt, _, block_offset) = axis_offset(
             lane_size,
             units(fragment.height),
@@ -882,18 +1133,64 @@ fn stack_rows(
             false,
             prepared.align,
         );
-        let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
-        let x = from_units(at + ml);
-        let y = from_units(row_y[start] + mt + block_offset);
+        let y = from_units(row_y[physical] + mt + block_offset);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
-        running.place(start, entry.span, at + contribution);
-        if entry.start.is_none() {
-            running.cursor = start + entry.span;
+        if backfilled {
+            running.consume(start, entry.span, at, contribution);
+        } else {
+            running.record(start, entry.span, at);
+            running.place(start, entry.span, at + contribution);
+            if entry.start.is_none() {
+                running.cursor = start + entry.span;
+            }
         }
         placed.push((entry.source, x + dx, y + dy, fragment, item_oof));
     }
     placed.sort_by_key(|item| item.0);
     Some(unzip_placed(placed, used))
+}
+
+/// Dense packing: an item that fits a skipped space above where it landed
+/// moves there. Returns the final `(start, at, physical, backfilled)`.
+#[allow(clippy::too_many_arguments)]
+fn backfill_slot(
+    running: &Running,
+    dense: bool,
+    entry: &Entry,
+    placed: (usize, i64, usize),
+    contribution: i64,
+    lanes: usize,
+    track_reverse: bool,
+    same_size: impl Fn(usize) -> bool,
+) -> (usize, i64, usize, bool) {
+    let (start, at, physical) = placed;
+    if !dense {
+        return (start, at, physical, false);
+    }
+    let starts = if entry.start.is_some() {
+        start..=start
+    } else {
+        0..=lanes - entry.span
+    };
+    match running.backfill(starts, entry.span, contribution, at, same_size) {
+        Some((start, at)) => (
+            start,
+            at,
+            logical(start, entry.span, lanes, track_reverse),
+            true,
+        ),
+        None => (start, at, physical, false),
+    }
+}
+
+/// The mirrored start line of a span (logical lane order under
+/// track-reverse); the identity otherwise.
+fn logical(start: usize, span: usize, lanes: usize, track_reverse: bool) -> usize {
+    if track_reverse {
+        lanes - start - span
+    } else {
+        start
+    }
 }
 
 fn unzip_placed(
