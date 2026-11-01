@@ -1451,7 +1451,7 @@ mod tests {
         const OWNER: u64 = 202610080132;
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf"
+            "/src/layout_ng/testdata/Ahem.ttf"
         ))
         .expect("pinned Ahem font");
         let registry = FontRegistry::global();

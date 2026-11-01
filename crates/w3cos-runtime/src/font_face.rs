@@ -1932,7 +1932,10 @@ mod tests {
     /// family order - decides which face paints each character.
     #[test]
     fn ahem_does_not_claim_latin_extended_a() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -1979,7 +1982,10 @@ mod tests {
     /// must move to the next family rather than being painted by the first.
     #[test]
     fn an_uncovered_character_falls_through_to_the_next_family() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(ahem_bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;

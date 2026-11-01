@@ -727,7 +727,7 @@ fn absolute_first_child_static_position_uses_inline_block_content_top() {
                 family: "Ahem".into(),
                 src: FontSource::Path(std::path::PathBuf::from(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../../wpt/fonts/Ahem.ttf"
+                    "/src/layout_ng/testdata/Ahem.ttf"
                 ))),
                 ..Default::default()
             },

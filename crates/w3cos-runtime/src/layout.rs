@@ -27633,7 +27633,7 @@ mod tests {
         let _font = FontOwner;
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf"
+            "/src/layout_ng/testdata/Ahem.ttf"
         ))
         .unwrap();
         FontRegistry::global()
@@ -27871,7 +27871,10 @@ mod tests {
         assert!(style.ch_advance() > first);
         assert_eq!(CH_ADVANCE_MEASUREMENTS.with(std::cell::Cell::get), 2);
 
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -27889,7 +27892,7 @@ mod tests {
                     family: style.font_family.clone().unwrap(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -32691,7 +32694,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -33885,7 +33888,10 @@ mod tests {
 
     #[test]
     fn bottom_aligned_inline_places_anonymous_text_on_the_large_child_line() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -33905,7 +33911,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf",
+                        "/src/layout_ng/testdata/Ahem.ttf",
                     ))),
                     ..Default::default()
                 },
@@ -34058,7 +34064,10 @@ mod tests {
 
     #[test]
     fn anonymous_block_text_wraps_before_and_after_a_larger_font_block() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -34078,7 +34087,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -34142,7 +34151,10 @@ mod tests {
 
     #[test]
     fn mixed_font_top_text_keeps_replaced_baseline_strut_descent() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -34162,7 +34174,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -54590,7 +54602,7 @@ mod tests {
                     family: "Ahem".into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },

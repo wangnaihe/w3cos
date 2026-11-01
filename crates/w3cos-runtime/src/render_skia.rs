@@ -5580,7 +5580,10 @@ mod ahem_segment_tests {
     /// Ahem covers Latin-1 but stops short of Latin Extended-A, which is the
     /// gap `font-family-013` builds `"Ahem", "Times New Roman"` on.
     fn pinned_ahem() -> Option<crate::font_face::LoadedFont> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let bytes = std::fs::read(path).ok()?;
         let registry = FontRegistry::new();
         registry
@@ -9310,7 +9313,10 @@ mod tests {
     fn registered_ahem_normal_line_includes_uncovered_font_metrics() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610080112;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9414,7 +9420,10 @@ mod tests {
     fn registered_ahem_inline_glyph_covers_its_integer_em_background() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 2026100802290;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9512,7 +9521,10 @@ mod tests {
     fn registered_ahem_picture_bounds_preserve_shared_edge_pixels() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 2026101003884;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9592,7 +9604,10 @@ mod tests {
     fn registered_ahem_normal_preserves_font_raster_and_fractional_origin() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610040048;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9666,7 +9681,7 @@ mod tests {
         const OWNER: u64 = 202610100061;
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf"
+            "/src/layout_ng/testdata/Ahem.ttf"
         ))
         .expect("pinned WPT Ahem");
         let registry = FontRegistry::global();
@@ -10096,7 +10111,10 @@ mod tests {
     fn registered_ahem_bold_changes_ink_without_changing_advance() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610040029;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -12692,7 +12710,10 @@ mod tests {
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
         const OWNER: u64 = 202610040049;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
