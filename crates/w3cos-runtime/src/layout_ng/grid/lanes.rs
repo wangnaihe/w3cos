@@ -204,7 +204,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         }
         Some(_) => {}
     }
-    // Items with an explicit line plus a span (`4 / span 2`) over intrinsic
+    // Items with an explicit line plus a span (`4 / span 2`; a lone `1 / auto` is fine) over intrinsic
     // column tracks feed the track sizing in ways the ordinary-grid
     // reference does not match. Span-only placements follow main's
     // opening-based placement, as do row lanes (Chrome goldens,
@@ -224,7 +224,8 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             return Some("lanes:overflow-alignment");
         }
         if intrinsic_axis
-            && placement(child_style, !columns).is_some_and(|value| value.contains('/'))
+            && placement(child_style, !columns)
+                .is_some_and(|value| value.contains('/') && value.contains("span"))
         {
             return Some("lanes:intrinsic-span");
         }

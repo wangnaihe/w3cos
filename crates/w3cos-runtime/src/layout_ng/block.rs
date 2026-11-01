@@ -346,6 +346,9 @@ pub(super) fn unsupported_marker(style: &Style, allowed: &[&str]) -> Option<&'st
                     // children (stretch_child_styles); flex, grid and
                     // table containers fall back when a child has it.
                     && key != STRETCH
+                    // A float after a forced line break: `float_reason`
+                    // decides (it has the tree).
+                    && key != LEFT_FLOAT_AFTER_INLINE
                     // Blocks and grid items resolve min-width keywords and
                     // blocks max-width keywords; elsewhere the limit stays
                     // auto / none, as before the cascade kept them.
@@ -448,6 +451,61 @@ pub(super) fn is_blockified_float(flat: &[FlatNodeInfo], index: usize) -> bool {
         && !matches!(info.kind, ComponentKind::SvgDocument { .. })
 }
 
+const LEFT_FLOAT_AFTER_INLINE: &str = "--w3cos-internal-left-float-after-inline";
+
+/// The in-flow content before the float (past whitespace-only text and
+/// float-group wrappers) ends with a `<br>` (lowered to U+2028).
+fn follows_forced_break(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let mut node = index;
+    loop {
+        let Some(parent) = flat[node].parent else {
+            return false;
+        };
+        let before: Vec<usize> = inline::rendered_children(flat, parent)
+            .take_while(|&child| child != node)
+            .collect();
+        for &child in before.iter().rev() {
+            match ends_with_forced_break(flat, child) {
+                Some(answer) => return answer,
+                None => continue,
+            }
+        }
+        if is_float_group(flat[parent].style) {
+            node = parent;
+            continue;
+        }
+        return false;
+    }
+}
+
+/// `None`: whitespace only (look further back).
+fn ends_with_forced_break(flat: &[FlatNodeInfo], index: usize) -> Option<bool> {
+    match flat[index].kind {
+        ComponentKind::Text { content } => {
+            let trimmed = content.trim_end_matches([' ', '\t', '\n', '\r']);
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.ends_with('\u{2028}'))
+            }
+        }
+        _ if flat[index].style.float != Float::None => Some(false),
+        _ if is_float_group(flat[index].style) => Some(false),
+        _ => {
+            let children: Vec<usize> = inline::rendered_children(flat, index).collect();
+            if children.is_empty() {
+                return Some(false);
+            }
+            for &child in children.iter().rev() {
+                if let Some(answer) = ends_with_forced_break(flat, child) {
+                    return Some(answer);
+                }
+            }
+            None
+        }
+    }
+}
+
 /// Floats of block-level boxes in a block container (S3b).  Floats among
 /// inline content (NGInlineLayoutAlgorithm's float handling) and text
 /// that would have to wrap around a float stay on legacy.
@@ -456,6 +514,12 @@ fn float_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = info.style;
     if style.float == Float::None || oof::is_out_of_flow(style) {
         return None;
+    }
+    // The DOM marks a left float that follows in-flow inline content (the
+    // legacy engine shifts it to the line start). After a forced line
+    // break the float starts a new line, so the marker changes nothing.
+    if marker(style, LEFT_FLOAT_AFTER_INLINE).is_some() && !follows_forced_break(flat, index) {
+        return Some("float:after-inline");
     }
     // An inline-block or list-item float is a block box (§9.7). An
     // inline-block that is still inside an IFC hits `float:inline` below.
@@ -2508,6 +2572,7 @@ pub(super) fn unsupported_reasons(flat: &[FlatNodeInfo]) -> Vec<String> {
                         || key == inline::IFC_MARKER
                         || key == inline::ANONYMOUS_BLOCK_MARKER
                         || key == inline::LINE_WIDTH_MARKER
+                        || key == LEFT_FLOAT_AFTER_INLINE
                     {
                         continue;
                     }
