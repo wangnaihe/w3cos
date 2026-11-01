@@ -5688,7 +5688,9 @@ impl Document {
         let mut remaining = value;
         let mut counters = None;
         let mut quote_depth = None;
-        let quote_pairs = self.quote_pairs_for(id);
+        // Resolving `quotes` walks the ancestor chain and re-matches every
+        // selector, so only pay for it when a quote operator is present.
+        let mut quote_pairs: Option<Vec<(String, String)>> = None;
         while !remaining.trim_start().is_empty() {
             remaining = remaining.trim_start();
             let Some(first) = remaining.chars().next() else {
@@ -5832,8 +5834,9 @@ impl Document {
                     quote_depth.get_or_insert_with(|| self.quote_depth_at(id, pseudo_element));
                 match operator {
                     "open-quote" => {
+                        let pairs = quote_pairs.get_or_insert_with(|| self.quote_pairs_for(id));
                         if let Some((opening, _)) =
-                            quote_pairs.get((*depth).min(quote_pairs.len().saturating_sub(1)))
+                            pairs.get((*depth).min(pairs.len().saturating_sub(1)))
                         {
                             output.push(GeneratedContentItem::Quote(opening.clone()));
                         }
@@ -5842,8 +5845,9 @@ impl Document {
                     "no-open-quote" => *depth += 1,
                     "close-quote" if *depth > 0 => {
                         *depth -= 1;
+                        let pairs = quote_pairs.get_or_insert_with(|| self.quote_pairs_for(id));
                         if let Some((_, closing)) =
-                            quote_pairs.get((*depth).min(quote_pairs.len().saturating_sub(1)))
+                            pairs.get((*depth).min(pairs.len().saturating_sub(1)))
                         {
                             output.push(GeneratedContentItem::Quote(closing.clone()));
                         }
