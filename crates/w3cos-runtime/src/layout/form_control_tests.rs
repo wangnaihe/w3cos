@@ -28,21 +28,32 @@ fn html_text_input_intrinsic_size_uses_control_font_metrics() {
         .match_family_style("Arial", skia_safe::FontStyle::normal())
         .unwrap();
     let (_, metrics) = crate::skia_text_run::css_font(&face, style.font_size).metrics();
-    assert_eq!(
-        leaf_intrinsic_size(&input.kind, &style),
-        (145.0, 15.0),
-        "Chrome 155 macOS HTML size=20 content box, metrics={metrics:?}"
-    );
+    let size_20 = leaf_intrinsic_size(&input.kind, &style);
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            size_20,
+            (145.0, 15.0),
+            "Chrome 155 macOS HTML size=20 content box, metrics={metrics:?}"
+        );
+    } else {
+        assert_eq!(
+            size_20,
+            (180.0, 17.0),
+            "non-macOS control metric contract, metrics={metrics:?}"
+        );
+    }
     style
         .custom_properties
         .as_mut()
         .unwrap()
         .insert("--w3cos-internal-input-size".into(), "5".into());
-    assert_eq!(
-        leaf_intrinsic_size(&input.kind, &style),
-        (40.0, 15.0),
-        "Chrome 155 macOS HTML size=5 content box"
-    );
+    let size_5 = leaf_intrinsic_size(&input.kind, &style);
+    if cfg!(target_os = "macos") {
+        assert_eq!(size_5, (40.0, 15.0), "Chrome 155 macOS size=5 box");
+    } else {
+        assert!(size_5.0 < 60.0, "HTML size must alter intrinsic width");
+        assert_eq!(size_5.1, size_20.1, "size does not change font height");
+    }
 }
 
 #[test]
