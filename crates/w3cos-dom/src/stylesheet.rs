@@ -399,7 +399,7 @@ struct Rule {
 thread_local! {
     static RULES: RefCell<RuleSet> = RefCell::new(RuleSet::default());
     static STYLE_GENERATION: Cell<u64> = const { Cell::new(1) };
-    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural.
+    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural. Bit 4: sibling-scoped :has().
     /// Hot DOM mutations read this cell instead of borrowing `RULES`.
     static RULE_FLAGS: Cell<u8> = const { Cell::new(0) };
 }
@@ -417,6 +417,9 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     }
     if rules.has_structural_dependencies() {
         flags |= 8;
+    }
+    if rules.has_sibling_scoped_relational() {
+        flags |= 16;
     }
     flags
 }
@@ -445,6 +448,17 @@ pub(crate) fn has_relational_dependencies() -> bool {
 /// Sibling, structural, and relational selectors can change when a node moves.
 pub fn tree_order_affects_matching() -> bool {
     has_sibling_dependencies() || has_structural_dependencies() || has_relational_dependencies()
+}
+
+/// A `:has()` argument starts with a sibling combinator, so preceding siblings
+/// of a mutated node (and of its ancestors) can change.
+pub(crate) fn has_sibling_scoped_relational() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 16 != 0)
+}
+
+/// Whether `ctx` can anchor a `:has()` compound; see `RuleSet::relational_anchor`.
+pub(crate) fn relational_anchor(ctx: &SelectorContext) -> Option<u8> {
+    RULES.with(|rules| rules.borrow().relational_anchor(ctx))
 }
 
 pub(crate) fn has_structural_dependencies() -> bool {

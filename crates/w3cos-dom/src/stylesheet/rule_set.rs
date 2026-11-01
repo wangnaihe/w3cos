@@ -14,6 +14,12 @@ pub(super) struct RuleSet {
     has_sibling_dependencies: bool,
     has_relational_dependencies: bool,
     has_structural_dependencies: bool,
+    /// A `:has()` argument uses `+` or `~`, so the subject sits before the mutation.
+    has_sibling_scoped_relational: bool,
+    /// Static part (no relational pseudo) of every compound that carries `:has()`,
+    /// and its reach: 0 subject, 1 earlier compound (descendants may change),
+    /// 2 earlier compound followed by a sibling combinator.
+    relational_anchors: Vec<(CompoundSelector, u8)>,
 }
 
 enum RuleBucket<'a> {
@@ -72,6 +78,8 @@ impl RuleSet {
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
+        self.has_sibling_scoped_relational = false;
+        self.relational_anchors.clear();
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -98,6 +106,48 @@ impl RuleSet {
             .iter()
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
+
+        let last = self.rules[index].chain.len().saturating_sub(1);
+        let mut anchors = Vec::new();
+        let mut sibling_scoped = false;
+        for (position, compound) in self.rules[index].chain.iter().enumerate() {
+            if !compound
+                .pseudo_classes
+                .iter()
+                .any(pseudo_has_relational_dependency)
+            {
+                continue;
+            }
+            if compound
+                .pseudo_classes
+                .iter()
+                .any(pseudo_has_sibling_scoped_relational)
+            {
+                sibling_scoped = true;
+            }
+            let mut anchor = compound.clone();
+            anchor
+                .pseudo_classes
+                .retain(|pseudo| !pseudo_has_relational_dependency(pseudo));
+            let reach = if position == last {
+                0
+            } else if self.rules[index].combinators[position..]
+                .iter()
+                .any(|combinator| {
+                    matches!(
+                        combinator,
+                        super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
+                    )
+                })
+            {
+                2
+            } else {
+                1
+            };
+            anchors.push((anchor, reach));
+        }
+        self.has_sibling_scoped_relational |= sibling_scoped;
+        self.relational_anchors.extend(anchors);
 
         // A rule lives in one best subject bucket. Matching gathers the
         // element's buckets plus universal rules, so no per-node RuleSet scan
@@ -196,6 +246,22 @@ impl RuleSet {
     pub(super) fn has_structural_dependencies(&self) -> bool {
         self.has_structural_dependencies
     }
+
+    pub(super) fn has_sibling_scoped_relational(&self) -> bool {
+        self.has_sibling_scoped_relational
+    }
+
+    /// `None` when `ctx` can never be the subject of, or an earlier compound
+    /// of, a `:has()` rule. Otherwise the largest reach of a matching anchor.
+    pub(super) fn relational_anchor(&self, ctx: &SelectorContext) -> Option<u8> {
+        let mut found = None;
+        for (anchor, reach) in &self.relational_anchors {
+            if found.is_none_or(|current| *reach > current) && anchor.matches(ctx) {
+                found = Some(*reach);
+            }
+        }
+        found
+    }
 }
 
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
@@ -236,6 +302,17 @@ fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
             ]
             .iter()
             .any(|needle| selector.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+fn pseudo_has_sibling_scoped_relational(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::Has(selector) => selector.contains('+') || selector.contains('~'),
+        super::PseudoClass::Not(selector) => {
+            let lower = selector.to_ascii_lowercase();
+            lower.contains(":has(") && (lower.contains('+') || lower.contains('~'))
         }
         _ => false,
     }
