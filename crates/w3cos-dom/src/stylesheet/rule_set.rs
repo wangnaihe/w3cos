@@ -6,11 +6,11 @@ use super::{AttributeSelector, CompoundSelector, Document, NodeId, Rule, Selecto
 pub(super) struct RuleSet {
     pub(super) rules: Vec<Rule>,
     pub(super) document_roots: HashMap<NodeId, u64>,
-    id_rules: HashMap<String, Vec<usize>>,
-    class_rules: HashMap<String, Vec<usize>>,
-    attribute_rules: HashMap<String, Vec<usize>>,
-    tag_rules: HashMap<String, Vec<usize>>,
-    universal_rules: Vec<usize>,
+    /// Rules without a pseudo-element, bucketed by their subject compound.
+    main: Buckets,
+    /// `::before`/`::after`/... rules. Kept apart so the per-element cascade
+    /// never gathers them, and pseudo lookups never scan the element rules.
+    pseudo: Buckets,
     has_sibling_dependencies: bool,
     has_relational_dependencies: bool,
     has_structural_dependencies: bool,
@@ -20,6 +20,107 @@ pub(super) struct RuleSet {
     /// and its reach: 0 subject, 1 earlier compound (descendants may change),
     /// 2 earlier compound followed by a sibling combinator.
     relational_anchors: Vec<(CompoundSelector, u8)>,
+}
+
+#[derive(Debug, Default)]
+struct Buckets {
+    id_rules: HashMap<String, Vec<usize>>,
+    class_rules: HashMap<String, Vec<usize>>,
+    attribute_rules: HashMap<String, Vec<usize>>,
+    tag_rules: HashMap<String, Vec<usize>>,
+    universal_rules: Vec<usize>,
+}
+
+impl Buckets {
+    fn clear(&mut self) {
+        self.id_rules.clear();
+        self.class_rules.clear();
+        self.attribute_rules.clear();
+        self.tag_rules.clear();
+        self.universal_rules.clear();
+    }
+
+    fn insert(&mut self, bucket: RuleBucket<'_>, index: usize) {
+        match bucket {
+            RuleBucket::Id(id) => self.id_rules.entry(id.to_string()).or_default().push(index),
+            RuleBucket::Class(class) => self
+                .class_rules
+                .entry(class.to_string())
+                .or_default()
+                .push(index),
+            RuleBucket::Attribute(name) => self
+                .attribute_rules
+                .entry(attribute_index_key(name))
+                .or_default()
+                .push(index),
+            RuleBucket::Tag(tag) => self
+                .tag_rules
+                .entry(tag.to_ascii_lowercase())
+                .or_default()
+                .push(index),
+            RuleBucket::Universal => self.universal_rules.push(index),
+        }
+    }
+
+    /// Candidate rule indices. Order is unspecified (callers sort by
+    /// specificity and rule order); each rule lives in exactly one bucket, so
+    /// only repeated attribute/class keys can duplicate an index.
+    fn candidates_for_node(&self, document: &Document, node: NodeId) -> Vec<usize> {
+        let node = document.get_node(node);
+        let mut candidates = Vec::with_capacity(self.universal_rules.len() + 16);
+        candidates.extend_from_slice(&self.universal_rules);
+        let start = candidates.len();
+        if let Some((_, id)) = node
+            .attributes
+            .iter()
+            .find(|(name, _)| name.as_str() == "id")
+            && let Some(indices) = self.id_rules.get(id.as_str())
+        {
+            candidates.extend(indices);
+        }
+        for class in &node.class_list {
+            let class = class.as_str();
+            if let Some(indices) = self.class_rules.get(class.as_str()) {
+                candidates.extend(indices);
+            }
+        }
+        for (name, _) in &node.attributes {
+            let name = name.as_str();
+            if let Some(indices) = self
+                .attribute_rules
+                .get(&attribute_index_key(name.as_str()))
+            {
+                candidates.extend(indices);
+            }
+        }
+        append_tag_candidates(&self.tag_rules, &node.tag.as_str(), &mut candidates);
+        normalize_tail(&mut candidates, start);
+        candidates
+    }
+
+    fn candidates_for_context(&self, ctx: &SelectorContext) -> Vec<usize> {
+        let mut candidates = Vec::with_capacity(self.universal_rules.len() + 16);
+        candidates.extend_from_slice(&self.universal_rules);
+        let start = candidates.len();
+        if let Some(id) = &ctx.id
+            && let Some(indices) = self.id_rules.get(id)
+        {
+            candidates.extend(indices);
+        }
+        for class in &ctx.classes {
+            if let Some(indices) = self.class_rules.get(class) {
+                candidates.extend(indices);
+            }
+        }
+        for (name, _) in &ctx.attributes {
+            if let Some(indices) = self.attribute_rules.get(&attribute_index_key(name)) {
+                candidates.extend(indices);
+            }
+        }
+        append_tag_candidates(&self.tag_rules, &ctx.tag, &mut candidates);
+        normalize_tail(&mut candidates, start);
+        candidates
+    }
 }
 
 enum RuleBucket<'a> {
@@ -70,11 +171,8 @@ impl RuleSet {
     }
 
     pub(super) fn rebuild_index(&mut self) {
-        self.id_rules.clear();
-        self.class_rules.clear();
-        self.attribute_rules.clear();
-        self.tag_rules.clear();
-        self.universal_rules.clear();
+        self.main.clear();
+        self.pseudo.clear();
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
@@ -157,82 +255,34 @@ impl RuleSet {
             .last()
             .map(rule_bucket)
             .unwrap_or(RuleBucket::Universal);
-        match bucket {
-            RuleBucket::Id(id) => self.id_rules.entry(id.to_string()).or_default().push(index),
-            RuleBucket::Class(class) => self
-                .class_rules
-                .entry(class.to_string())
-                .or_default()
-                .push(index),
-            RuleBucket::Attribute(name) => self
-                .attribute_rules
-                .entry(attribute_index_key(name))
-                .or_default()
-                .push(index),
-            RuleBucket::Tag(tag) => self
-                .tag_rules
-                .entry(tag.to_ascii_lowercase())
-                .or_default()
-                .push(index),
-            RuleBucket::Universal => self.universal_rules.push(index),
+        if self.rules[index].pseudo_element.is_some() {
+            self.pseudo.insert(bucket, index);
+        } else {
+            self.main.insert(bucket, index);
         }
     }
 
+    /// Candidates among rules without a pseudo-element.
     pub(super) fn candidate_indices_for_context(&self, ctx: &SelectorContext) -> Vec<usize> {
-        let mut candidates = self.universal_rules.clone();
-        if let Some(id) = &ctx.id
-            && let Some(indices) = self.id_rules.get(id)
-        {
-            candidates.extend(indices);
-        }
-        for class in &ctx.classes {
-            if let Some(indices) = self.class_rules.get(class) {
-                candidates.extend(indices);
-            }
-        }
-        for (name, _) in &ctx.attributes {
-            if let Some(indices) = self.attribute_rules.get(&attribute_index_key(name)) {
-                candidates.extend(indices);
-            }
-        }
-        append_tag_candidates(&self.tag_rules, &ctx.tag, &mut candidates);
-        normalize_candidates(&mut candidates);
-        candidates
+        self.main.candidates_for_context(ctx)
     }
 
+    /// Candidates among rules without a pseudo-element.
     pub(super) fn candidate_indices_for_node(
         &self,
         document: &Document,
         node: NodeId,
     ) -> Vec<usize> {
-        let node = document.get_node(node);
-        let mut candidates = self.universal_rules.clone();
-        if let Some((_, id)) = node
-            .attributes
-            .iter()
-            .find(|(name, _)| name.as_str() == "id")
-            && let Some(indices) = self.id_rules.get(id.as_str())
-        {
-            candidates.extend(indices);
-        }
-        for class in &node.class_list {
-            let class = class.as_str();
-            if let Some(indices) = self.class_rules.get(class.as_str()) {
-                candidates.extend(indices);
-            }
-        }
-        for (name, _) in &node.attributes {
-            let name = name.as_str();
-            if let Some(indices) = self
-                .attribute_rules
-                .get(&attribute_index_key(name.as_str()))
-            {
-                candidates.extend(indices);
-            }
-        }
-        append_tag_candidates(&self.tag_rules, &node.tag.as_str(), &mut candidates);
-        normalize_candidates(&mut candidates);
-        candidates
+        self.main.candidates_for_node(document, node)
+    }
+
+    /// Candidates among `::pseudo-element` rules only.
+    pub(super) fn pseudo_candidate_indices_for_node(
+        &self,
+        document: &Document,
+        node: NodeId,
+    ) -> Vec<usize> {
+        self.pseudo.candidates_for_node(document, node)
     }
 
     pub(super) fn has_sibling_dependencies(&self) -> bool {
@@ -367,7 +417,18 @@ fn append_tag_candidates(
     }
 }
 
-fn normalize_candidates(candidates: &mut Vec<usize>) {
-    candidates.sort_unstable();
-    candidates.dedup();
+/// Universal rules (before `start`) are unique; only the bucketed tail can repeat.
+fn normalize_tail(candidates: &mut Vec<usize>, start: usize) {
+    if candidates.len() - start < 2 {
+        return;
+    }
+    candidates[start..].sort_unstable();
+    let mut write = start + 1;
+    for read in start + 1..candidates.len() {
+        if candidates[read] != candidates[write - 1] {
+            candidates[write] = candidates[read];
+            write += 1;
+        }
+    }
+    candidates.truncate(write);
 }
