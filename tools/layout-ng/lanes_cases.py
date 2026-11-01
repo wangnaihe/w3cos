@@ -98,6 +98,52 @@ for rev in ("", " fill-reverse"):
         CASES.append(case(f"al-{tag}-rows-{al}", "20px 20px 20px", al_rows(), gap=[5, 5], align=al, axis="row" + rev))
 
 
+def dense_cases():
+    S = "grid-lanes-pack:dense"
+    out = []
+    sp = [it("a", h=20), it("b", h=30, place="span 2"), it("c", h=10), it("d", h=10), it("e", h=15, place="span 2"), it("f", h=5), it("g", h=20), it("h", h=12)]
+    out.append(case("d-cols-span", "40px 40px 40px", sp, pack=S))
+    out.append(case("d-cols-span-none", "40px 40px 40px", sp))
+    out.append(case("d-cols-span-both", "40px 40px 40px", sp, pack="grid-auto-flow:dense;grid-lanes-pack:dense"))
+    out.append(case("d-cols-span-tol0", "40px 40px 40px", sp, pack=S, tolerance="0"))
+    out.append(case("d-cols-span-gap", "40px 40px 40px", sp, pack=S, gap=[8, 5]))
+    out.append(case("d-cols-single", "50px 50px 50px", stack(), pack=S))
+    out.append(case("d-cols-single-tol0", "50px 50px 50px", stack(), pack=S, tolerance="0"))
+    out.append(case("d-cols-single-tol-inf", "50px 50px 50px", stack(), pack=S, tolerance="infinite"))
+    out.append(case("d-cols-single-gap", "50px 50px 50px", stack(), pack=S, gap=[6, 4]))
+    out.append(case("d-cols-explicit", "40px 40px 40px", [it("a", h=30), it("b", h=10, place="3"), it("c", h=10, place="3"), it("d", h=15, place="1"), it("e", h=10, place="span 2"), it("f", h=10)], pack=S))
+    out.append(case("d-cols-four", "30px 30px 30px 30px", [it("a", h=40), it("b", h=20, place="span 3"), it("c", h=10), it("d", h=10), it("e", h=10, place="span 2"), it("f", h=20), it("g", h=5), it("h", h=10, place="span 4"), it("i", h=7)], pack=S, width=150))
+    out.append(case("d-cols-uneven", "40px 40px 60px 60px", [it("a", h=30), it("b", h=10, place="span 2"), it("c", h=10), it("d", h=10), it("e", h=15, place="span 2"), it("f", h=5), it("g", h=20)], pack=S, width=220))
+    out.append(case("d-cols-order", "40px 40px 40px", [it("a", h=20, order=2), it("b", h=30, place="span 2", order=1), it("c", h=10), it("d", h=10, order=-1), it("e", h=15, place="span 2"), it("f", h=5)], pack=S))
+    out.append(case("d-cols-box", "50px 50px 50px", [it("a", h=20, margin=3), it("b", h=30, place="span 2", margin=2), it("c", h=10), it("d", h=10, margin=4), it("e", h=15, place="span 2"), it("f", h=5)], pack=S, gap=[3, 4]))
+    out.append(case("d-cols-fill-rev", "40px 40px 40px", sp, pack=S, axis="column fill-reverse", height=150))
+    out.append(case("d-cols-track-rev", "40px 40px 40px", sp, pack=S, axis="column track-reverse"))
+    out.append(case("d-cols-both-rev", "40px 40px 40px", sp, pack=S, axis="column fill-reverse track-reverse", height=150))
+    out.append(case("d-cols-align-center", "40px 40px 40px", sp, pack=S, align="center", height=150))
+    out.append(case("d-cols-align-end", "40px 40px 40px", sp, pack=S, align="end", height=150))
+    out.append(case("d-cols-align-stretch", "40px 40px 40px", sp, pack=S, align="stretch", height=150))
+    out.append(case("d-cols-align-self", "40px 40px 40px", [it("a", h=20), it("b", h=30, place="span 2", self_="end"), it("c", h=10), it("d", h=10, self_="center"), it("e", h=15, place="span 2"), it("f", h=5)], pack=S, height=150))
+    rw = [it("a", w=40, h=10), it("b", w=60, h=10, place="span 2"), it("c", w=30, h=10), it("d", w=30, h=10), it("e", w=50, h=10, place="span 2"), it("f", w=20, h=10), it("g", w=40, h=10), it("h", w=25, h=10)]
+    out.append(case("d-rows-span", "20px 20px 20px", rw, pack=S, axis="row"))
+    out.append(case("d-rows-span-tol0", "20px 20px 20px", rw, pack=S, axis="row", tolerance="0"))
+    out.append(case("d-rows-span-gap", "20px 20px 20px", rw, pack=S, axis="row", gap=[6, 4]))
+    out.append(case("d-rows-single", "20px 20px 20px", [it(x, w=w, h=10) for x, w in zip("abcdefg", [60, 20, 40, 80, 20, 20, 50])], pack=S, axis="row"))
+    out.append(case("d-rows-explicit", "20px 20px 20px", [it("a", w=60, h=10), it("b", w=20, h=10, place="3"), it("c", w=30, h=10, place="3"), it("d", w=25, h=10, place="1"), it("e", w=20, h=10, place="span 2"), it("f", w=20, h=10)], pack=S, axis="row"))
+    out.append(case("d-rows-track-rev", "20px 20px 20px", rw, pack=S, axis="row track-reverse"))
+    out.append(case("d-rows-fill-rev", "20px 20px 20px", rw, pack=S, axis="row fill-reverse"))
+    out.append(case("d-rows-align-center", "20px 20px 20px", rw, pack=S, axis="row", align="center"))
+    out.append(case("d-rows-align-stretch", "20px 20px 20px", rw, pack=S, axis="row", align="stretch"))
+    out.append(case("d-rows-auto", "auto auto auto", [it("a", text="XXXX"), it("b", text="XXXXXX", place="span 2"), it("c", text="XX"), it("d", text="XXX"), it("e", text="XXXXX", place="span 2"), it("f", text="X")], pack=S, axis="row"))
+    # Cases lifted from the WPT dense-packing tests (explicit and split openings).
+    out.append(case("d-wpt-row-004", "50px 50px 50px 50px", [it("a", w=20), it("b", w=40), it("c", w=60, place="4"), it("d", w=20, place="span 2"), it("e", w=20, place="span 4"), it("f", w=20, place="span 3"), it("g", w=20, place="span 4"), it("h", w=20, place="4"), it("i", w=20)], pack=S, axis="row", tolerance="0"))
+    out.append(case("d-wpt-row-ms-004", "50px 50px 50px 50px", [it("a", w=20, place="span 2"), it("b", w=20, place="span 4"), it("c", w=40, place="3 / span 2"), it("d", w=20, place="span 4"), it("e", w=20, place="1 / span 2"), it("f", w=20, place="span 2")], pack=S, axis="row", tolerance="0"))
+    out.append(case("d-wpt-row-rev-ms-005", "50px 50px 50px 50px 50px", [it("a", w=80), it("b", w=20, place="span 2"), it("c", w=40), it("d", w=100), it("e", w=10, place="span 5"), it("f", w=10, place="span 4"), it("g", w=10, place="span 2")], pack=S, axis="row track-reverse", tolerance="0"))
+    return out
+
+
+CASES += dense_cases()
+
+
 def html(c):
     k = c["container"]
     # The axis follows the template that is set, or the direction keyword.
@@ -111,6 +157,8 @@ def html(c):
         style.append(f"{'justify-items' if rows_axis else 'align-items'}:{k['align']}")
     if k.get("tolerance"):
         style.append(f"flow-tolerance:{k['tolerance']}")
+    if k.get("pack"):
+        style.append(f"{k['pack']}")
     if k.get("gap"):
         style.append(f"row-gap:{k['gap'][0]}px;column-gap:{k['gap'][1]}px")
     style.append(f"width:{k.get('width', 200)}px")
