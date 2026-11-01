@@ -161,44 +161,54 @@ fn edit_context_value(init: Value) -> Value {
             Value::Undefined
         }),
     );
-    let text_state = Rc::clone(&state);
-    let text_context = context.clone();
-    context.set_property(
-        "updateText",
-        realm_function(generation, move |_, args| {
-            let start = args.first().cloned().unwrap_or_default().to_u32();
-            let end = args.get(1).cloned().unwrap_or_default().to_u32();
-            let replacement = args.get(2).cloned().unwrap_or_default().to_js_string();
-            let replacement_length = replacement.encode_utf16().count() as u32;
-            {
-                let mut state = text_state.borrow_mut();
-                state.text = utf16_replace(&state.text, start, end, &replacement);
-                state.selection_start = start + replacement_length;
-                state.selection_end = state.selection_start;
-            }
-            let event = w3cos_core::class::construct(
-                &crate::web_events::event_subclass_class("TextUpdateEvent"),
-                vec![
-                    Value::string("textupdate"),
-                    Value::object(HashMap::from([
-                        ("text".into(), Value::string(&replacement)),
-                        ("updateRangeStart".into(), Value::Number(start as f64)),
-                        ("updateRangeEnd".into(), Value::Number(end as f64)),
-                        (
-                            "selectionStart".into(),
-                            Value::Number((start + replacement_length) as f64),
-                        ),
-                        (
-                            "selectionEnd".into(),
-                            Value::Number((start + replacement_length) as f64),
-                        ),
-                    ])),
-                ],
-            );
-            text_context.call_method("dispatchEvent", vec![event]);
-            Value::Undefined
-        }),
-    );
+    // Author `updateText` only mirrors the page's own edits into the context:
+    // per spec it never fires `textupdate` (Monaco calls it from its content
+    // change handler, so firing here re-enters the editor in an endless loop).
+    // `textupdate` is for text the user types, delivered through the internal
+    // `__w3cos_userTextUpdate` entry point.
+    for (name, user_input) in [("updateText", false), ("__w3cos_userTextUpdate", true)] {
+        let text_state = Rc::clone(&state);
+        let text_context = context.clone();
+        context.set_property(
+            name,
+            realm_function(generation, move |_, args| {
+                let start = args.first().cloned().unwrap_or_default().to_u32();
+                let end = args.get(1).cloned().unwrap_or_default().to_u32();
+                let replacement = args.get(2).cloned().unwrap_or_default().to_js_string();
+                let replacement_length = replacement.encode_utf16().count() as u32;
+                {
+                    let mut state = text_state.borrow_mut();
+                    state.text = utf16_replace(&state.text, start, end, &replacement);
+                    state.selection_start = start + replacement_length;
+                    state.selection_end = state.selection_start;
+                }
+                if !user_input {
+                    return Value::Undefined;
+                }
+                let event = w3cos_core::class::construct(
+                    &crate::web_events::event_subclass_class("TextUpdateEvent"),
+                    vec![
+                        Value::string("textupdate"),
+                        Value::object(HashMap::from([
+                            ("text".into(), Value::string(&replacement)),
+                            ("updateRangeStart".into(), Value::Number(start as f64)),
+                            ("updateRangeEnd".into(), Value::Number(end as f64)),
+                            (
+                                "selectionStart".into(),
+                                Value::Number((start + replacement_length) as f64),
+                            ),
+                            (
+                                "selectionEnd".into(),
+                                Value::Number((start + replacement_length) as f64),
+                            ),
+                        ])),
+                    ],
+                );
+                text_context.call_method("dispatchEvent", vec![event]);
+                Value::Undefined
+            }),
+        );
+    }
     let bounds_state = Rc::clone(&state);
     context.set_property(
         "updateCharacterBounds",
@@ -358,6 +368,13 @@ mod tests {
         );
         assert_eq!(context.get_property("text").to_js_string(), "aZb");
         assert_eq!(context.get_property("selectionStart").to_u32(), 2);
+        // Author edits stay silent; only user input fires `textupdate`.
+        assert_eq!(updates.get(), 0);
+        context.call_method(
+            "__w3cos_userTextUpdate",
+            vec![Value::Number(1.0), Value::Number(2.0), Value::string("Q")],
+        );
+        assert_eq!(context.get_property("text").to_js_string(), "aQb");
         assert_eq!(updates.get(), 1);
         context.call_method(
             "updateCharacterBounds",
