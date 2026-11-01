@@ -3532,11 +3532,12 @@ fn oof_candidates(
         return Some(Vec::new());
     }
     let flipped = flip(style);
-    if flipped.x || flipped.y {
+    // Offsets are computed in logical coordinates (inline-start at 0); an
+    // rtl (or vertical-rl) container reports the margin box's right edge
+    // (`static_rtl`). A flipped block/main axis (`flip.y`) stays on legacy.
+    let rtl = flipped.x;
+    if flipped.y {
         return super::bail("flex:oof-flip");
-    }
-    if style.flex_wrap != FlexWrap::NoWrap && style.align_content != AlignContent::Stretch {
-        return super::bail("flex:oof-align-content");
     }
     let direction = style.flex_direction;
     let row = row_axis(direction);
@@ -3565,16 +3566,41 @@ fn oof_candidates(
             } else {
                 (child_style.margin.top, child_style.margin.bottom)
             };
-            let (Spacing::Px(a), Spacing::Px(b)) = (a, b) else {
+            // `auto` margins of an abspos box resolve to zero here.
+            let (Some(a), Some(b)) = (
+                match a {
+                    Spacing::Px(v) => Some(v),
+                    Spacing::Auto => Some(0.0),
+                    _ => None,
+                },
+                match b {
+                    Spacing::Px(v) => Some(v),
+                    Spacing::Auto => Some(0.0),
+                    _ => None,
+                },
+            ) else {
                 return None;
             };
             let edges = item_edges(child_style, space, 0.0, horizontal);
             Some(to_content(child_style, edges, size) + edges + a + b)
         };
         let (main_factor, main_reversed, main_safe) =
-            main_alignment(style, row, reverse).why("flex:oof-justify")?;
-        let (cross_factor, cross_reversed, cross_safe) =
-            cross_alignment(style, child_style, wrap_reverse).why("flex:oof-align")?;
+            main_alignment(style, row, reverse, rtl).why("flex:oof-justify")?;
+        let (cross_factor, cross_reversed, cross_safe) = cross_alignment(
+            style,
+            child_style,
+            wrap_reverse,
+            CrossAxis {
+                horizontal: !row,
+                flip_x: rtl,
+                inline: if custom_property(style, VERTICAL_MARKER).is_some() {
+                    row
+                } else {
+                    !row
+                },
+            },
+        )
+        .why("flex:oof-align")?;
         let axis = |area: f32, factor: f32, reversed: bool, horizontal: bool, safe: bool| {
             let size = margin_box(horizontal);
             if factor == 0.0 && !reversed {
@@ -3602,9 +3628,13 @@ fn oof_candidates(
         let (x, y) = if row { (main, cross) } else { (cross, main) };
         out.push(oof::OofCandidate {
             index: child,
-            static_inline: origin.0 + x,
+            static_inline: if rtl {
+                origin.0 + width - x
+            } else {
+                origin.0 + x
+            },
             static_block: origin.1 + y,
-            static_rtl: false,
+            static_rtl: rtl,
         });
     }
     Some(out)
@@ -3630,7 +3660,7 @@ fn custom_property<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
 /// `(factor, reversed, safe)`: the share of the free space before the
 /// margin box, whether the axis runs end to start physically, and whether
 /// overflow falls back to the start. `None` for a keyword not modelled.
-fn main_alignment(style: &Style, row: bool, reverse: bool) -> Option<(f32, bool, bool)> {
+fn main_alignment(style: &Style, row: bool, reverse: bool, rtl: bool) -> Option<(f32, bool, bool)> {
     let enum_keyword = match style.justify_content {
         JustifyContent::FlexStart => "normal",
         JustifyContent::FlexEnd => "flex-end",
@@ -3655,8 +3685,9 @@ fn main_alignment(style: &Style, row: bool, reverse: bool) -> Option<(f32, bool,
         "flex-end" => (1.0, reverse, safe),
         "start" => (0.0, false, safe),
         "end" => (1.0, false, safe),
-        "left" => (0.0, false, safe),
-        "right" => (if row { 1.0 } else { 0.0 }, false, safe),
+        // Physical sides: under rtl the left edge is the inline end.
+        "left" => (if row && rtl { 1.0 } else { 0.0 }, false, safe),
+        "right" => (if row && !rtl { 1.0 } else { 0.0 }, false, safe),
         "center" => (0.5, false, safe),
         // The distribution values fall back to center; for an abspos
         // static position Chrome keeps it unsafe (the box overflows both
@@ -3666,12 +3697,24 @@ fn main_alignment(style: &Style, row: bool, reverse: bool) -> Option<(f32, bool,
     })
 }
 
+/// Which way the cross axis runs, for physical and `self-*` keywords.
+#[derive(Clone, Copy)]
+struct CrossAxis {
+    /// The cross axis is physically horizontal.
+    horizontal: bool,
+    /// Logical x runs right to left.
+    flip_x: bool,
+    /// The cross axis is the container's inline axis.
+    inline: bool,
+}
+
 /// As [`main_alignment`] for `align-self` (falling back to the
 /// container's `align-items`) on the cross axis.
 fn cross_alignment(
     container: &Style,
     child: &Style,
     wrap_reverse: bool,
+    cross: CrossAxis,
 ) -> Option<(f32, bool, bool)> {
     fn align_name(align: AlignItems) -> &'static str {
         match align {
@@ -3708,10 +3751,34 @@ fn cross_alignment(
             other => words.push(other),
         }
     }
-    if child.writing_mode != container.writing_mode || child.direction != container.direction {
+    if child.writing_mode != container.writing_mode {
         return None;
     }
+    // `self-start`/`self-end` follow the child's own direction, which only
+    // matters when the cross axis is the inline axis.
+    let flipped_self = cross.inline && child.direction != container.direction;
     Some(match words.as_slice() {
+        // Physical sides; on a vertical cross axis they behave as start.
+        ["left"] => (
+            if cross.horizontal && cross.flip_x {
+                1.0
+            } else {
+                0.0
+            },
+            false,
+            safe,
+        ),
+        ["right"] => (
+            if cross.horizontal && !cross.flip_x {
+                1.0
+            } else {
+                0.0
+            },
+            false,
+            safe,
+        ),
+        ["self-start"] if flipped_self => (1.0, false, safe),
+        ["self-end"] if flipped_self => (0.0, false, safe),
         ["normal" | "stretch" | "flex-start"] => (0.0, wrap_reverse, safe),
         // Baseline falls back to start/end of the line, wrap-reverse
         // included (flex-abspos-staticpos-align-self-002).
@@ -4713,6 +4780,40 @@ mod tests {
         expect(
             &vertical_flex(SidewaysLr, FlexDirection::Row, false),
             &[(1, [0.0, 50.0, 10.0, 10.0]), (2, [0.0, 40.0, 20.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn abspos_static_position_in_rtl_flex_starts_at_the_right() {
+        use w3cos_std::style::{Position, TextDirection};
+        let abspos = || {
+            let mut style = block_box(Some(10.0), Some(10.0));
+            style.position = Position::Absolute;
+            style
+        };
+        let container = |justify: JustifyContent| {
+            let mut style = flex_style(FlexDirection::Row, 100.0, Some(50.0));
+            style.position = Position::Relative;
+            style.direction = TextDirection::Rtl;
+            style.justify_content = justify;
+            // An ltr block hosts the container (a root would sit at the right).
+            Component::boxed(
+                block_box(None, None),
+                vec![Component::boxed(style, vec![leaf(abspos())])],
+            )
+        };
+        // The inline start of an rtl row is its right edge.
+        expect(
+            &container(JustifyContent::FlexStart),
+            &[(2, [90.0, 0.0, 10.0, 10.0])],
+        );
+        expect(
+            &container(JustifyContent::FlexEnd),
+            &[(2, [0.0, 0.0, 10.0, 10.0])],
+        );
+        expect(
+            &container(JustifyContent::Center),
+            &[(2, [45.0, 0.0, 10.0, 10.0])],
         );
     }
 
