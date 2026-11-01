@@ -131,8 +131,8 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some(reason);
     }
-    if style.direction == TextDirection::Rtl {
-        return Some("flex:rtl");
+    if is_rtl(style) && rtl_justify_unsupported(style) {
+        return Some("flex:rtl-justify");
     }
     let row = row_axis(style.flex_direction);
     for child in rendered_children(flat, index) {
@@ -202,6 +202,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             child_style,
             style.flex_direction,
             style.flex_wrap == FlexWrap::WrapReverse,
+            is_rtl(style),
         );
         if matches!(cross_start, Spacing::Auto) || matches!(cross_end, Spacing::Auto) {
             return Some("flex:auto-cross-margin");
@@ -430,10 +431,23 @@ fn spacing_px(style: &Style, spacing: Spacing, cb: f32, space: &ConstraintSpace)
     }
 }
 
-fn main_margin_sides(style: &Style, direction: FlexDirection) -> (Spacing, Spacing) {
+fn is_rtl(style: &Style) -> bool {
+    style.direction == TextDirection::Rtl
+}
+
+/// Margins at the main start and end. Layout runs in logical coordinates
+/// (inline-start at x = 0) and `mirror_x` converts to physical ones at the
+/// end, so a row's inline-start margin is the physical right one under rtl
+/// (Blink `LogicalToPhysical`).
+fn main_margin_sides(style: &Style, direction: FlexDirection, rtl: bool) -> (Spacing, Spacing) {
+    let (inline_start, inline_end) = if rtl {
+        (style.margin.right, style.margin.left)
+    } else {
+        (style.margin.left, style.margin.right)
+    };
     match direction {
-        FlexDirection::Row => (style.margin.left, style.margin.right),
-        FlexDirection::RowReverse => (style.margin.right, style.margin.left),
+        FlexDirection::Row => (inline_start, inline_end),
+        FlexDirection::RowReverse => (inline_end, inline_start),
         FlexDirection::Column => (style.margin.top, style.margin.bottom),
         FlexDirection::ColumnReverse => (style.margin.bottom, style.margin.top),
     }
@@ -443,10 +457,13 @@ fn cross_margin_sides(
     style: &Style,
     direction: FlexDirection,
     wrap_reverse: bool,
+    rtl: bool,
 ) -> (Spacing, Spacing) {
     // `wrap-reverse` swaps cross-start and cross-end (Flexbox §5.2).
     let (start, end) = if row_axis(direction) {
         (style.margin.top, style.margin.bottom)
+    } else if rtl {
+        (style.margin.right, style.margin.left)
     } else {
         (style.margin.left, style.margin.right)
     };
@@ -511,6 +528,15 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     // routes the same way.
     if block::is_author_flex(info.style) {
         return container_min_max(flat, index, space);
+    }
+    // Several inline-level children share lines: the max-content size is
+    // their sum, not the widest one (InlineNode::ComputeMinMaxSizes). A
+    // shape the inline pass does not size keeps the per-child estimate.
+    if rendered_children(flat, index).nth(1).is_some()
+        && super::inline::is_inline_container(flat, index)
+        && let Some(sizes) = block::intrinsic_sizes(flat, index, space)
+    {
+        return Some(sizes);
     }
     let mut sizes = MinMax::exact(0.0);
     let mut any = false;
@@ -842,10 +868,11 @@ fn column_wrap_items(
             .max(0.0);
         let main_edges = item_edges(child_style, space, 0.0, false);
         let cross_edges = item_edges(child_style, space, 0.0, true);
-        let (start, end) = main_margin_sides(child_style, style.flex_direction);
+        let (start, end) = main_margin_sides(child_style, style.flex_direction, is_rtl(style));
         let main_margins =
             spacing_px(child_style, start, 0.0, space) + spacing_px(child_style, end, 0.0, space);
-        let (cross_start, cross_end) = cross_margin_sides(child_style, style.flex_direction, false);
+        let (cross_start, cross_end) =
+            cross_margin_sides(child_style, style.flex_direction, false, is_rtl(style));
         let cross_margins = spacing_px(child_style, cross_start, 0.0, space)
             + spacing_px(child_style, cross_end, 0.0, space);
         let basis_auto = matches!(child_style.flex_basis, Dimension::Auto)
@@ -1104,7 +1131,8 @@ fn stretched_row_cross(
     line: Option<f32>,
 ) -> Option<Option<f32>> {
     let style = flat[child].style;
-    let (start, end) = cross_margin_sides(style, container.flex_direction, false);
+    let (start, end) =
+        cross_margin_sides(style, container.flex_direction, false, is_rtl(container));
     let Some(line) = line else {
         return Some(None);
     };
@@ -1145,7 +1173,8 @@ fn stretched_column_wrap_max(
     line: Option<f32>,
 ) -> Option<Option<f32>> {
     let style = flat[child].style;
-    let (start, end) = cross_margin_sides(style, container.flex_direction, false);
+    let (start, end) =
+        cross_margin_sides(style, container.flex_direction, false, is_rtl(container));
     let Some(line) = line else {
         return Some(None);
     };
@@ -1657,6 +1686,55 @@ fn safe_justify(style: &Style) -> bool {
         .is_some_and(|value| value.split_ascii_whitespace().any(|token| token == "safe"))
 }
 
+/// The authored `justify-content` keyword under rtl, when it names a
+/// side (`start`, `end`, `left`, `right`, optionally with an overflow
+/// position). The enum folded those into flex-start / flex-end as if the
+/// container were ltr.
+fn side_keyword(style: &Style) -> Option<&str> {
+    let value = style
+        .custom_properties
+        .as_ref()?
+        .get("--w3cos-internal-justify-content")?;
+    let keyword = value.split_ascii_whitespace().last()?;
+    matches!(
+        keyword,
+        "start" | "end" | "left" | "right" | "self-start" | "self-end"
+    )
+    .then_some(keyword)
+}
+
+/// A side keyword outside a plain row needs the item direction too, so
+/// those rtl containers stay on legacy.
+fn rtl_justify_unsupported(style: &Style) -> bool {
+    side_keyword(style).is_some()
+        && (style.flex_direction != FlexDirection::Row
+            || !matches!(
+                side_keyword(style),
+                Some("start" | "end" | "left" | "right")
+            ))
+}
+
+/// `justify-content` in logical (inline-start first) coordinates. A row's
+/// `left` / `right` are physical, `start` / `end` follow the direction.
+fn justify_kind(style: &Style) -> JustifyContent {
+    if is_rtl(style)
+        && style.flex_direction == FlexDirection::Row
+        && let Some(keyword) = side_keyword(style)
+    {
+        return match keyword {
+            "start" | "right" => JustifyContent::FlexStart,
+            _ => JustifyContent::FlexEnd,
+        };
+    }
+    style.justify_content
+}
+
+/// Physical x of a box laid out at logical `x` inside a content box
+/// starting at `origin` (rtl mirrors the inline axis).
+fn mirror_x(origin: f32, inner: f32, x: f32, width: f32) -> f32 {
+    unit(origin + inner - (x - origin) - width)
+}
+
 fn justify(kind: JustifyContent, free: f32, count: usize) -> (f32, f32) {
     if count == 0 {
         return (0.0, 0.0);
@@ -1928,11 +2006,12 @@ pub(super) fn layout(
             child,
         )
         .why("flex:min")?;
-        let (main_start, main_end) = main_margin_sides(child_style, direction);
+        let (main_start, main_end) = main_margin_sides(child_style, direction, is_rtl(style));
         let (cross_start, cross_end) = cross_margin_sides(
             child_style,
             direction,
             style.flex_wrap == FlexWrap::WrapReverse,
+            is_rtl(style),
         );
         let (auto_main_start, auto_main_end) = (
             matches!(main_start, Spacing::Auto),
@@ -2375,7 +2454,7 @@ pub(super) fn layout(
         }
         free = 0.0;
     }
-    let (mut lead, between) = justify(style.justify_content, free, items.len());
+    let (mut lead, between) = justify(justify_kind(style), free, items.len());
     if free < -EPS && safe_justify(style) {
         // `safe` overflow aligns as `start` (CSS Align §4.4): the physical
         // start edge, the flex-end side under a reversed main axis.
@@ -2421,6 +2500,11 @@ pub(super) fn layout(
             (bl + pl + main, bt + pt + cross)
         } else {
             (bl + pl + cross, bt + pt + main)
+        };
+        let x = if is_rtl(style) {
+            mirror_x(bl + pl, inner_width, x, laid.fragment.width)
+        } else {
+            x
         };
         let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
         oof.extend(
@@ -2914,7 +2998,7 @@ fn layout_wrapped(
             }
             free = 0.0;
         }
-        let (mut lead, between) = justify(style.justify_content, free, line.len());
+        let (mut lead, between) = justify(justify_kind(style), free, line.len());
         if free < -EPS && safe_justify(style) {
             // `safe` overflow aligns as `start` (CSS Align §4.4): the physical
             // start edge, the flex-end side under a reversed main axis.
@@ -2964,6 +3048,11 @@ fn layout_wrapped(
                 (bl + pl + main, bt + pt + cross_cursor + cross)
             } else {
                 (bl + pl + cross_cursor + cross, bt + pt + main)
+            };
+            let x = if is_rtl(style) {
+                mirror_x(bl + pl, inner_width, x, laid.fragment.width)
+            } else {
+                x
             };
             if row && top_line {
                 let item_baseline = match laid.first_baseline {
@@ -3990,11 +4079,66 @@ mod tests {
             let flat = pre_flatten(&root);
             assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
         }
+    }
 
-        let mut rtl = flex_style(FlexDirection::Row, 100.0, None);
-        rtl.direction = TextDirection::Rtl;
+    fn rtl_style(direction: FlexDirection, justify: Option<&str>) -> Style {
+        let mut style = flex_style(direction, 100.0, None);
+        style.direction = TextDirection::Rtl;
+        if let Some(justify) = justify {
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+                "--w3cos-internal-justify-content".to_string(),
+                justify.to_string(),
+            )]));
+        }
+        style
+    }
+
+    #[test]
+    fn rtl_row_mirrors_the_main_axis_and_margins() {
+        let mut first = block_box(Some(10.0), Some(10.0));
+        first.margin.left = Spacing::Px(4.0);
+        let second = block_box(Some(20.0), Some(10.0));
+        let root = Component::boxed(
+            rtl_style(FlexDirection::Row, None),
+            vec![leaf(first), leaf(second)],
+        );
+        // The root is right-aligned in the viewport (x = 700). The first item
+        // starts at its right edge; its left margin is the inline-end one.
+        expect(
+            &root,
+            &[(1, [790.0, 0.0, 10.0, 10.0]), (2, [766.0, 0.0, 20.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn rtl_row_side_keywords_follow_the_direction() {
+        for (keyword, first, second) in [
+            ("left", 720.0, 700.0),
+            ("right", 790.0, 770.0),
+            ("start", 790.0, 770.0),
+            ("end", 720.0, 700.0),
+        ] {
+            let root = Component::boxed(
+                rtl_style(FlexDirection::Row, Some(keyword)),
+                vec![
+                    leaf(block_box(Some(10.0), Some(10.0))),
+                    leaf(block_box(Some(20.0), Some(10.0))),
+                ],
+            );
+            expect(
+                &root,
+                &[
+                    (1, [first, 0.0, 10.0, 10.0]),
+                    (2, [second, 0.0, 20.0, 10.0]),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn rtl_column_side_keywords_stay_on_legacy() {
         stays_legacy(&Component::boxed(
-            rtl,
+            rtl_style(FlexDirection::Column, Some("start")),
             vec![leaf(block_box(Some(10.0), Some(10.0)))],
         ));
     }
