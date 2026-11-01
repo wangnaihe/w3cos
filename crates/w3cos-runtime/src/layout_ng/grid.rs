@@ -288,9 +288,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if style.grid_areas().is_some() {
         return Some("grid:areas");
     }
-    if is_baseline(style.justify_items) {
-        return Some("grid:baseline");
-    }
     if let Some(reason) = subgrid_or_template(flat, index, false) {
         return Some(reason);
     }
@@ -361,11 +358,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if last_baseline(style, child_style, true) || last_baseline(style, child_style, false) {
             return Some("grid:last-baseline");
         }
-        if is_baseline(used_item_align(
-            style.justify_items,
-            child_style.justify_self,
-        )) || (is_baseline(used_item_align(style.align_items, child_style.align_self))
-            && !baseline_item(flat, child))
+        // `justify-self: baseline` shares row-axis baselines only with
+        // orthogonal items; a parallel item falls back to start alignment
+        // (css-align-3 9.3), which `Pack::Start` already is.
+        if is_baseline(used_item_align(style.align_items, child_style.align_self))
+            && !baseline_item(flat, child)
         {
             return Some("grid:baseline");
         }
@@ -903,7 +900,7 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     }) {
         return false;
     }
-    if is_baseline(style.align_items) || is_baseline(style.justify_items) {
+    if is_baseline(style.align_items) {
         return false;
     }
     if has_marker(style, "--w3cos-internal-grid-lanes")
