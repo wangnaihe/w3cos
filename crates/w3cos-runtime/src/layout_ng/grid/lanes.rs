@@ -196,12 +196,10 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         None => return Some("lanes:tolerance"),
         // A percentage resolves against the intrinsic grid-axis size,
         // which the ordinary-grid reference does not model.
-        Some(Tolerance::Percent(_))
-            if matches!(
-                if columns { style.width } else { style.height },
-                Dimension::Auto
-            ) =>
-        {
+        // Row lanes take the intrinsic height from the tracks themselves
+        // (`layout_rows` resolves it against the track sum), so only the
+        // column axis stays off.
+        Some(Tolerance::Percent(_)) if columns && matches!(style.width, Dimension::Auto) => {
             return Some("lanes:percent-tolerance");
         }
         Some(_) => {}
@@ -247,12 +245,6 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
             .any(|side| matches!(side, Spacing::Auto | Spacing::Percent(_)))
         {
             return Some("lanes:margin");
-        }
-        if is_dense(style)
-            && placement(child_style, !columns)
-                .is_some_and(|value| value.contains("span") || value.contains('/'))
-        {
-            return Some("lanes:dense-span");
         }
         for row in [false, true] {
             if placement(child_style, row).is_some_and(|value| parse_axis_syntax(value).is_none()) {
@@ -315,6 +307,9 @@ struct Running {
     positions: Vec<i64>,
     cursor: usize,
     tolerance: i64,
+    /// Skipped stacking-axis spaces per lane, `(start, end)`, for dense
+    /// packing.
+    holes: Vec<Vec<(i64, i64)>>,
 }
 
 impl Running {
@@ -323,6 +318,87 @@ impl Running {
             positions: vec![0; lanes],
             cursor: 0,
             tolerance,
+            holes: vec![Vec::new(); lanes],
+        }
+    }
+
+    /// Remember the space an item skips over when it is placed at `at`.
+    fn record(&mut self, start: usize, span: usize, at: i64) {
+        for lane in start..start + span {
+            if self.positions[lane] < at {
+                self.holes[lane].push((self.positions[lane], at));
+            }
+        }
+    }
+
+    /// The spaces open in every lane of a span.
+    fn common(&self, start: usize, span: usize) -> Vec<(i64, i64)> {
+        let mut open = self.holes[start].clone();
+        for lane in start + 1..start + span {
+            let mut next = Vec::new();
+            for &(a, b) in &open {
+                for &(c, d) in &self.holes[lane] {
+                    let (lo, hi) = (a.max(c), b.min(d));
+                    if hi > lo {
+                        next.push((lo, hi));
+                    }
+                }
+            }
+            open = next;
+        }
+        open
+    }
+
+    /// The highest skipped space before `before` that fits `contribution`
+    /// (start-most within the tolerance of the highest), among the start
+    /// lines `same_size` accepts.
+    fn backfill(
+        &self,
+        starts: std::ops::RangeInclusive<usize>,
+        span: usize,
+        contribution: i64,
+        before: i64,
+        same_size: impl Fn(usize) -> bool,
+    ) -> Option<(usize, i64)> {
+        let mut found: Vec<(usize, i64)> = Vec::new();
+        for start in starts {
+            if !same_size(start) {
+                continue;
+            }
+            let position = self
+                .common(start, span)
+                .into_iter()
+                .filter(|(a, b)| b - a >= contribution)
+                .map(|(a, _)| a)
+                .min();
+            if let Some(position) = position.filter(|position| *position < before) {
+                found.push((start, position));
+            }
+        }
+        let highest = found.iter().map(|(_, position)| *position).min()?;
+        let allowed = highest.saturating_add(self.tolerance);
+        found
+            .into_iter()
+            .filter(|(_, position)| *position <= allowed)
+            .min_by_key(|(start, _)| *start)
+    }
+
+    /// Take `[at, at + contribution)` out of the open spaces.
+    fn consume(&mut self, start: usize, span: usize, at: i64, contribution: i64) {
+        for lane in start..start + span {
+            let holes = &mut self.holes[lane];
+            if let Some(slot) = holes
+                .iter()
+                .position(|&(a, b)| a <= at && at + contribution <= b)
+            {
+                let (a, b) = holes.remove(slot);
+                if a < at {
+                    holes.push((a, at));
+                }
+                if at + contribution < b {
+                    holes.push((at + contribution, b));
+                }
+            }
         }
     }
 
@@ -495,9 +571,6 @@ pub(super) fn layout(
     }
     // Dense packing only refills openings left by spanning items, so with
     // single-lane items it places exactly like the default pack.
-    if is_dense(style) && entries.iter().any(|entry| entry.span > 1) {
-        return crate::layout_ng::bail("lanes:dense-span");
-    }
     entries.sort_by_key(|entry| (entry.order, entry.source));
 
     let used_of = |extent: i64| {
@@ -706,6 +779,12 @@ impl Openings {
         }
     }
 
+    /// A dense-packed item sits in a skipped space and never bounds a
+    /// lane's opening.
+    fn skip(&mut self) {
+        self.space.push(i64::MAX);
+    }
+
     fn finish(&mut self, running: &Running, gap: i64, end: i64) {
         for (lane, last) in self.last.iter().enumerate() {
             if let Some(item) = *last {
@@ -862,6 +941,8 @@ fn stack_columns(
     }
     let tolerance = tolerance_units(style, inner_u);
     let mut running = Running::new(lanes, tolerance);
+    let dense = is_dense(style);
+    let mut any_backfilled = false;
     let mut placed = Vec::with_capacity(entries.len());
     let mut extent = 0_i64;
     let mut records = Vec::with_capacity(entries.len());
@@ -897,6 +978,25 @@ fn stack_columns(
         let fragment = laid.fragment;
         let item_oof = laid.oof;
         let [mt, mr, mb, ml] = prepared.margin.map(units);
+        let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
+        let (start, at, track, backfilled) = backfill_slot(
+            &running,
+            dense,
+            entry,
+            (start, at, track),
+            contribution,
+            lanes,
+            reverse.track,
+            |candidate| {
+                span_sum(
+                    &sizes,
+                    &collapsed,
+                    track_of(reverse.track, lanes, candidate, entry.span),
+                    entry.span,
+                    between,
+                ) == area
+            },
+        );
         let (ml, _mr, inline_offset) = axis_offset(
             area,
             units(fragment.width),
@@ -906,13 +1006,19 @@ fn stack_columns(
             false,
             prepared.justify,
         );
-        let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
         let x = from_units(column_x[track] + ml + inline_offset);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
-        openings.place(&running, start, entry.span, at);
-        running.place(start, entry.span, at + contribution);
-        if entry.start.is_none() {
-            running.cursor = start + entry.span;
+        if backfilled {
+            running.consume(start, entry.span, at, contribution);
+            openings.skip();
+            any_backfilled = true;
+        } else {
+            running.record(start, entry.span, at);
+            openings.place(&running, start, entry.span, at);
+            running.place(start, entry.span, at + contribution);
+            if entry.start.is_none() {
+                running.cursor = start + entry.span;
+            }
         }
         records.push(Record {
             source: entry.source,
@@ -943,6 +1049,9 @@ fn stack_columns(
         .any(|record| record.prepared.stack != StackAlign::Normal);
     if aligned && (used < extent || clamped) {
         return crate::layout_ng::bail("lanes:stacking-overflow");
+    }
+    if aligned && any_backfilled {
+        return crate::layout_ng::bail("lanes:dense-aligned");
     }
     openings.finish(&running, row_gap_u, used);
     for (record, room) in records.into_iter().zip(openings.space) {
@@ -1123,6 +1232,8 @@ fn stack_rows(
     }
     let tolerance = tolerance_units(style, used);
     let mut running = Running::new(lanes, tolerance);
+    let dense = is_dense(style);
+    let mut any_backfilled = false;
     let mut placed = Vec::with_capacity(entries.len());
     let mut records = Vec::with_capacity(entries.len());
     let mut openings = Openings::new(lanes);
@@ -1136,7 +1247,26 @@ fn stack_rows(
         };
         let track = track_of(reverse.track, lanes, start, entry.span);
         let [mt, mr, mb, ml] = prepared.margin.map(units);
+        let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
         let lane_size = span_sum(&sizes, &collapsed, track, entry.span, between);
+        let (start, at, track, backfilled) = backfill_slot(
+            &running,
+            dense,
+            entry,
+            (start, at, track),
+            contribution,
+            lanes,
+            reverse.track,
+            |candidate| {
+                span_sum(
+                    &sizes,
+                    &collapsed,
+                    track_of(reverse.track, lanes, candidate, entry.span),
+                    entry.span,
+                    between,
+                ) == lane_size
+            },
+        );
         let stretch_block = prepared.align == Pack::Stretch
             && prepared.specified_content_h.is_none()
             && !has_marker(flat[entry.index].style, super::HEIGHT_KEYWORD);
@@ -1167,13 +1297,19 @@ fn stack_rows(
             false,
             prepared.align,
         );
-        let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
         let y = from_units(row_y[track] + mt + block_offset);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
-        openings.place(&running, start, entry.span, at);
-        running.place(start, entry.span, at + contribution);
-        if entry.start.is_none() {
-            running.cursor = start + entry.span;
+        if backfilled {
+            running.consume(start, entry.span, at, contribution);
+            openings.skip();
+            any_backfilled = true;
+        } else {
+            running.record(start, entry.span, at);
+            openings.place(&running, start, entry.span, at);
+            running.place(start, entry.span, at + contribution);
+            if entry.start.is_none() {
+                running.cursor = start + entry.span;
+            }
         }
         records.push(Record {
             source: entry.source,
@@ -1201,6 +1337,9 @@ fn stack_rows(
         .any(|record| record.prepared.stack != StackAlign::Normal);
     if aligned && !records.is_empty() && extent > inner_u {
         return crate::layout_ng::bail("lanes:stacking-overflow");
+    }
+    if aligned && any_backfilled {
+        return crate::layout_ng::bail("lanes:dense-aligned");
     }
     openings.finish(&running, column_gap_u, inner_u);
     for (record, room) in records.into_iter().zip(openings.space) {
@@ -1252,6 +1391,39 @@ fn stack_rows(
     }
     placed.sort_by_key(|item| item.0);
     Some(unzip_placed(placed, used))
+}
+
+/// Dense packing: an item that fits a skipped space above where it landed
+/// moves there. Returns the final `(start, at, track, backfilled)`.
+#[allow(clippy::too_many_arguments)]
+fn backfill_slot(
+    running: &Running,
+    dense: bool,
+    entry: &Entry,
+    placed: (usize, i64, usize),
+    contribution: i64,
+    lanes: usize,
+    track_reverse: bool,
+    same_size: impl Fn(usize) -> bool,
+) -> (usize, i64, usize, bool) {
+    let (start, at, track) = placed;
+    if !dense {
+        return (start, at, track, false);
+    }
+    let starts = if entry.start.is_some() {
+        start..=start
+    } else {
+        0..=lanes - entry.span
+    };
+    match running.backfill(starts, entry.span, contribution, at, same_size) {
+        Some((start, at)) => (
+            start,
+            at,
+            track_of(track_reverse, lanes, start, entry.span),
+            true,
+        ),
+        None => (start, at, track, false),
+    }
 }
 
 fn unzip_placed(

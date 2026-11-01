@@ -291,21 +291,33 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     if !real_lanes
         && rows_match_legacy_lanes(flat, index)
-        && style.grid_rows().is_some_and(rows_are_sized)
-        && indefinite_block(style)
-    {
-        return Some("grid:indefinite-rows");
-    }
-    if !real_lanes
-        && rows_match_legacy_lanes(flat, index)
         && has_marker(style, "--w3cos-internal-percent-gap")
         && style.grid_rows().is_some_and(rows_are_sized)
         && !indefinite_block(style)
     {
         return Some("grid:percent-gap");
     }
+    if !real_lanes
+        && rows_match_legacy_lanes(flat, index)
+        && style.grid_rows().is_some_and(rows_are_sized)
+        && indefinite_block(style)
+        && (has_marker(style, "--w3cos-internal-percent-gap")
+            || style.custom_properties.as_ref().is_some_and(|props| {
+                props.keys().any(|key| {
+                    key.starts_with("--w3cos-internal-logical-size-") && key.ends_with("block-size")
+                })
+            }))
+    {
+        // The row height is indefinite only because legacy ignores the
+        // unmapped logical block size, or because a percentage gap needs the
+        // resolved height: the lanes side stays on legacy, so the reference
+        // does too.
+        return Some("grid:indefinite-rows");
+    }
     if style.grid_auto_column_spec().is_some_and(|spec| {
-        parse_one_track(spec).is_none_or(|track| spec_is_intrinsic_keyword(&track))
+        parse_one_track(spec).is_none_or(|track| {
+            spec_is_intrinsic_keyword(&track) && !matches!(track, Spec::One(Breadth::MinContent))
+        })
     }) {
         return Some("grid:auto-columns");
     }
@@ -6834,7 +6846,7 @@ mod tests {
         flow.grid_ng_mut().grid_auto_flow = Some("column".to_string());
         let root = Component::boxed(flow, vec![leaf(block_box(None, Some(10.0)))]);
         let flat = pre_flatten(&root);
-        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
+        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
 
         let mut lanes = grid_style(100.0, None, None);
         lanes.display = Display::Flex;
@@ -6865,6 +6877,15 @@ mod tests {
         lane.display = Display::Flex;
         let mut host = grid_style(100.0, None, None);
         host.grid_ng_mut().grid_template_rows = Some("20px 20px".to_string());
+        let root = Component::boxed(host.clone(), vec![leaf(lane.clone())]);
+        let flat = pre_flatten(&root);
+        assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_some());
+        // An unmapped logical block size is why the height is indefinite:
+        // the box stays on legacy next to its lanes test.
+        host.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-logical-size-block-size".to_string(),
+            "100px".to_string(),
+        )]));
         let root = Component::boxed(host, vec![leaf(lane)]);
         let flat = pre_flatten(&root);
         assert!(super::super::layout_tree(&root, &flat, 800.0, 600.0).is_none());
