@@ -1235,12 +1235,41 @@ pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &
 /// as the workbench's window focus handling does) need a callable that
 /// forwards to the receiver's bridge method.
 pub(crate) fn element_prototype_method(name: &'static str) -> Value {
-    func(move |this, args| {
-        let Some(node) = node_id_of(&this) else {
+    let forwarder = func(move |this, args| {
+        let mut method = node_id_of(&this)
+            .map(|node| element_computed_get(node, name))
+            .unwrap_or(Value::Undefined);
+        if !method.is_callable() {
+            // Documents are plain objects whose methods are own data.
+            let own = this
+                .as_object()
+                .and_then(|object| object.borrow().own_data(name));
+            method = own.unwrap_or(Value::Undefined);
+        }
+        if !method.is_callable() || is_prototype_forwarder(&method) {
             return Value::Undefined;
-        };
-        let method = element_computed_get(node, name);
+        }
         method.call(this, args)
+    });
+    if let Some(function) = forwarder.as_function() {
+        PROTOTYPE_FORWARDERS.with(|set| {
+            set.borrow_mut().insert(function.identity());
+        });
+    }
+    forwarder
+}
+
+thread_local! {
+    static PROTOTYPE_FORWARDERS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Forwarders installed by [`element_prototype_method`] stand in for the
+/// per-node bridge methods, so property lookup treats them like the undefined
+/// placeholders they replace and lets the bridge answer.
+fn is_prototype_forwarder(value: &Value) -> bool {
+    value.as_function().is_some_and(|function| {
+        PROTOTYPE_FORWARDERS.with(|set| set.borrow().contains(&function.identity()))
     })
 }
 
@@ -1352,7 +1381,7 @@ fn lookup_dom_prototype(prototype: &Value, key: &str, receiver: &Value) -> Optio
         if let Some(data) = data {
             // Builtin DOM prototypes have undefined data placeholders; the
             // bridge computes those properties after a descriptor miss.
-            return (!data.is_undefined()).then_some(data);
+            return (!data.is_undefined() && !is_prototype_forwarder(&data)).then_some(data);
         }
         if accessor {
             return Some(Value::Undefined); // setter-only descriptor
@@ -22529,6 +22558,7 @@ fn silent_object(value: &Value, key: &str, seen: &mut HashSet<usize>) -> SilentL
             }
             if let Some(data) = object.own_data(key)
                 && !data.is_undefined()
+                && !is_prototype_forwarder(&data)
             {
                 return SilentLookup::Data(data);
             }
@@ -32327,6 +32357,87 @@ try {
         let plain = create_in_body("input");
         plain.call_method("focus", vec![]);
         assert!(!deliver_edit_context_text("z"));
+    }
+
+    #[test]
+    fn captured_prototype_methods_are_callable_and_act_on_the_receiver() {
+        setup();
+        let win = window_value();
+        let proto = |name: &str| win.get_property(name).get_property("prototype");
+        for (ctor, names) in [
+            (
+                "Node",
+                "appendChild removeChild getRootNode normalize isEqualNode isSameNode",
+            ),
+            (
+                "Element",
+                "after append before closest getAttribute getAttributeNames getBoundingClientRect \
+                 hasAttribute hasAttributes insertAdjacentElement insertAdjacentHTML matches \
+                 prepend querySelector querySelectorAll remove removeAttribute replaceChildren \
+                 replaceWith scrollIntoView setAttribute toggleAttribute webkitMatchesSelector",
+            ),
+            (
+                "Document",
+                "getElementById getElementsByClassName getElementsByTagName querySelector \
+                 querySelectorAll elementFromPoint elementsFromPoint hasFocus createEvent",
+            ),
+        ] {
+            let prototype = proto(ctor);
+            for name in names.split_whitespace() {
+                assert!(
+                    prototype.get_property(name).is_callable(),
+                    "{ctor}.prototype.{name} should be callable"
+                );
+            }
+        }
+        // Captured before any element exists.
+        let el = proto("Element");
+        let set_attribute = el.get_property("setAttribute");
+        let get_attribute = el.get_property("getAttribute");
+        let has_attribute = el.get_property("hasAttribute");
+        let remove_attribute = el.get_property("removeAttribute");
+        let matches = el.get_property("matches");
+        let closest = el.get_property("closest");
+        let query_selector = el.get_property("querySelector");
+        let remove = el.get_property("remove");
+        let append_child = proto("Node").get_property("appendChild");
+        let get_root_node = proto("Node").get_property("getRootNode");
+
+        let host = create_in_body("div");
+        set_attribute.call(
+            host.clone(),
+            vec![Value::string("id"), Value::string("host")],
+        );
+        assert_eq!(
+            get_attribute
+                .call(host.clone(), vec![Value::string("id")])
+                .to_js_string(),
+            "host"
+        );
+        assert!(has_attribute.call(host.clone(), vec![Value::string("id")]) == Value::Bool(true));
+        assert!(matches.call(host.clone(), vec![Value::string("#host")]) == Value::Bool(true));
+        let child = create_in_body("span");
+        append_child.call(host.clone(), vec![child.clone()]);
+        assert!(query_selector.call(host.clone(), vec![Value::string("span")]) == child);
+        assert!(closest.call(child.clone(), vec![Value::string("#host")]) == host);
+        assert!(get_root_node.call(child.clone(), vec![]) == document_value());
+        remove_attribute.call(host.clone(), vec![Value::string("id")]);
+        assert!(has_attribute.call(host.clone(), vec![Value::string("id")]) == Value::Bool(false));
+        remove.call(child.clone(), vec![]);
+        assert!(query_selector.call(host.clone(), vec![Value::string("span")]) == Value::Null);
+
+        let doc = document_value();
+        let by_id = proto("Document").get_property("getElementById");
+        set_attribute.call(
+            host.clone(),
+            vec![Value::string("id"), Value::string("again")],
+        );
+        assert!(by_id.call(doc.clone(), vec![Value::string("again")]) == host);
+        let doc_query = proto("Document").get_property("querySelector");
+        assert!(doc_query.call(doc, vec![Value::string("#again")]) == host);
+
+        // Instance lookups still reach the per-node bridge method.
+        assert!(host.call_method("matches", vec![Value::string("#again")]) == Value::Bool(true));
     }
 
     #[test]

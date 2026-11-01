@@ -638,13 +638,39 @@ fn build_constructors() -> HashMap<String, Value> {
         }
     }
     // Methods whose bridge implementation is per node: give the prototype slot
-    // a real function so a captured `HTMLElement.prototype.focus` is callable.
+    // a real function so a captured original (`const f = Element.prototype.matches`,
+    // then `f.call(el, ...)`) is callable and acts on its receiver.
     for (name, methods) in [
-        ("HTMLElement", ["focus", "blur", "click"].as_slice()),
-        ("SVGElement", ["focus", "blur"].as_slice()),
+        (
+            "HTMLElement",
+            "focus blur click attachInternals hidePopover showPopover togglePopover",
+        ),
+        ("SVGElement", "focus blur"),
+        (
+            "Node",
+            "appendChild removeChild getRootNode normalize isEqualNode isSameNode \
+             lookupNamespaceURI lookupPrefix isDefaultNamespace",
+        ),
+        (
+            "Element",
+            "after animate append before checkVisibility closest getAnimations getAttribute \
+             getAttributeNS getAttributeNames getAttributeNode getAttributeNodeNS \
+             getBoundingClientRect getClientRects getElementsByClassName getElementsByTagName \
+             getElementsByTagNameNS getHTML hasAttribute hasAttributeNS hasAttributes \
+             hasPointerCapture insertAdjacentElement insertAdjacentHTML insertAdjacentText \
+             matches prepend querySelector querySelectorAll releasePointerCapture remove \
+             removeAttribute removeAttributeNS removeAttributeNode replaceChildren replaceWith \
+             requestFullscreen requestPointerLock scroll scrollBy scrollIntoView scrollTo \
+             setAttribute setAttributeNS setAttributeNode setAttributeNodeNS setHTMLUnsafe \
+             setPointerCapture toggleAttribute webkitMatchesSelector",
+        ),
     ] {
         let prototype = constructors[name].get_property("prototype");
-        for method in methods {
+        for method in methods.split_whitespace() {
+            // Only fill placeholders; never replace a real implementation.
+            if prototype.get_property(method).is_callable() {
+                continue;
+            }
             prototype.set_property(method, crate::jsdom::element_prototype_method(method));
         }
     }
@@ -922,6 +948,15 @@ fn build_constructors() -> HashMap<String, Value> {
         "importNode",
     ] {
         document.set_property(method, forward_receiver_method(method));
+    }
+    // Document methods are own data on the document object; give the prototype
+    // slots (placeholders above) real forwarders so captured originals work.
+    for method in "getElementById getElementsByClassName getElementsByTagName querySelector \
+        querySelectorAll elementFromPoint elementsFromPoint hasFocus getSelection execCommand \
+        createRange createEvent adoptNode append prepend"
+        .split_whitespace()
+    {
+        document.set_property(method, crate::jsdom::element_prototype_method(method));
     }
     for (name, members) in [
         ("HTMLAllCollection", "item length namedItem"),
