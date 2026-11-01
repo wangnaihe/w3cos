@@ -60298,11 +60298,40 @@ mod tests {
     #[cfg(feature = "skia")]
     #[test]
     fn wrapped_text_height_accounts_for_first_line_percent_indent() {
-        let text = "X The first X in this sentence should be indented to the center of this block.";
+        use crate::font_face::{FontFace, FontRegistry, FontSource};
+
+        const OWNER: u64 = 0x494e_4445_4e54;
+        const FAMILY: &str = "W3cos Percent Indent Tinos";
+        struct FontOwner;
+        impl Drop for FontOwner {
+            fn drop(&mut self) {
+                FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        let _font = FontOwner;
+        FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: FAMILY.into(),
+                    src: FontSource::Bytes(
+                        include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register deterministic percent-indent font");
+
+        // Isolated Chrome155 with the same Tinos bytes and a 220px block:
+        // the unindented text occupies one 19.2px line, while a 50% first-line
+        // indent wraps `four` onto a second line.  The longer historical text
+        // occupied three lines in both cases and therefore did not test the
+        // indent despite its host-font-dependent height assertion.
+        let text = "one two three four";
         let base = Style {
             font_size: 16.0,
             line_height: 1.2,
-            font_family: Some("serif".into()),
+            font_family: Some(FAMILY.into()),
             ..Style::default()
         };
         let indented = Style {
