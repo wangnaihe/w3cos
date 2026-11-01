@@ -2387,15 +2387,37 @@ impl Document {
     ) -> w3cos_std::style::Style {
         let node_revision = self.style_revisions[id.0 as usize];
         let stylesheet_generation = stylesheet::generation();
-        if let Some(cached) = self.computed_style_cache.borrow().get(&id)
-            && cached.node_revision == node_revision
-            && cached.stylesheet_generation == stylesheet_generation
-            && cached.inherited_style.as_ref() == inherited
-        {
+        let hit = {
+            let cache = self.computed_style_cache.borrow();
+            cache.get(&id).and_then(|cached| {
+                (cached.node_revision == node_revision
+                    && cached.stylesheet_generation == stylesheet_generation
+                    && cached.inherited_style.as_ref() == inherited)
+                    .then(|| {
+                        // Equal by content but not by allocation: the next
+                        // lookup would repeat the full variable compare.
+                        let relink = match (
+                            cached
+                                .inherited_style
+                                .as_ref()
+                                .and_then(|style| style.custom_properties.as_ref()),
+                            inherited.and_then(|style| style.custom_properties.as_ref()),
+                        ) {
+                            (Some(old), Some(new)) => !old.ptr_eq(new),
+                            _ => false,
+                        };
+                        (cached.style.clone(), relink)
+                    })
+            })
+        };
+        if let Some((style, relink)) = hit {
+            if relink && let Some(cached) = self.computed_style_cache.borrow_mut().get_mut(&id) {
+                cached.inherited_style = inherited.cloned();
+            }
             #[cfg(test)]
             self.computed_style_cache_hits
                 .set(self.computed_style_cache_hits.get() + 1);
-            return cached.style.clone();
+            return style;
         }
         #[cfg(test)]
         self.computed_style_cache_misses
@@ -26214,6 +26236,61 @@ mod computed_style_cache_tests {
             parent_properties.get("--theme-color-3").map(String::as_str),
             Some("#123456")
         );
+    }
+
+    #[test]
+    fn style_cache_hit_adopts_an_equal_inherited_variable_map() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        let div = document.create_element("div");
+        body.append_child(&mut document, div);
+        let mut parent = document.computed_style_inherited(body.id, None);
+        let properties = parent
+            .custom_properties
+            .get_or_insert_with(Default::default);
+        for index in 0..50 {
+            properties.insert(format!("--v{index}"), index.to_string());
+        }
+        let first = document.computed_style_inherited(div.id, Some(&parent));
+        // Same entries in a fresh allocation, as after the parent was
+        // recomputed with identical variables.
+        let mut rebuilt = parent.clone();
+        rebuilt.custom_properties = parent
+            .custom_properties
+            .as_ref()
+            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        assert!(
+            !rebuilt
+                .custom_properties
+                .as_ref()
+                .unwrap()
+                .ptr_eq(parent.custom_properties.as_ref().unwrap())
+        );
+        let hits = document.computed_style_cache_hits.get();
+        let second = document.computed_style_inherited(div.id, Some(&rebuilt));
+        assert_eq!(document.computed_style_cache_hits.get(), hits + 1);
+        assert_eq!(first, second);
+        let cache = document.computed_style_cache.borrow();
+        let stored = cache[&div.id].inherited_style.as_ref().unwrap();
+        assert!(
+            stored
+                .custom_properties
+                .as_ref()
+                .unwrap()
+                .ptr_eq(rebuilt.custom_properties.as_ref().unwrap()),
+            "the entry now shares the caller's map so the next check is O(1)"
+        );
+        drop(cache);
+        let mut changed = rebuilt.clone();
+        changed
+            .custom_properties
+            .as_mut()
+            .unwrap()
+            .insert("--v3".into(), "other".into());
+        let misses = document.computed_style_cache_stats().1;
+        document.computed_style_inherited(div.id, Some(&changed));
+        assert_eq!(document.computed_style_cache_stats().1, misses + 1);
     }
 
     #[test]
