@@ -1893,9 +1893,36 @@ pub(super) fn layout(
         }
         let main_edges = item_edges(child_style, space, inner_width, row);
         let cross_edges = item_edges(child_style, space, inner_width, !row);
-        let (min, max) =
-            resolve_main_limits(child_style, row, main_edges, inner_main, space, flat, child)
-                .why("flex:min")?;
+        // A stretched row item's children resolve a percentage height
+        // against the item's stretched content height (CSS Flexbox §9.8),
+        // not against the container's own containing block
+        // (flex-item-percentage-height-img-001).
+        let basis_space;
+        let measure_space = if row
+            && style.flex_wrap == FlexWrap::NoWrap
+            && matches!(child_style.height, Dimension::Auto)
+            && !block::is_replaced(flat[child].kind)
+            && used_align(style.align_items, child_style.align_self) == AlignItems::Stretch
+            && let Some(line) = specified_height
+        {
+            basis_space = ConstraintSpace {
+                percentage_block: Some((line - cross_edges).max(0.0)),
+                ..*space
+            };
+            &basis_space
+        } else {
+            space
+        };
+        let (min, max) = resolve_main_limits(
+            child_style,
+            row,
+            main_edges,
+            inner_main,
+            measure_space,
+            flat,
+            child,
+        )
+        .why("flex:min")?;
         let (main_start, main_end) = main_margin_sides(child_style, direction);
         let (cross_start, cross_end) = cross_margin_sides(
             child_style,
@@ -2054,7 +2081,7 @@ pub(super) fn layout(
             row,
             main_edges,
             inner_main,
-            space,
+            measure_space,
             flat,
             child,
             measured,

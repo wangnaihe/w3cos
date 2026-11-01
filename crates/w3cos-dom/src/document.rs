@@ -3450,6 +3450,19 @@ impl Document {
         }
         user_normal.extend(author_declarations);
         user_normal.extend(user_important);
+        // CSS Grid 3.1: `vertical-align` has no effect on grid items (the
+        // item is blockified). An `inline-grid` parent is a flex box with
+        // the unrecognized-display marker here.
+        if inherited.is_some_and(|parent| {
+            parent.display == w3cos_std::style::Display::Grid
+                || parent.custom_properties.as_ref().is_some_and(|props| {
+                    props
+                        .get(crate::css_style::UNRECOGNIZED_DISPLAY_PROPERTY)
+                        .is_some_and(|value| value == "inline-grid")
+                })
+        }) {
+            user_normal.retain(|(name, _, _)| !css_property_eq(name, "vertical-align"));
+        }
         let author_declarations = user_normal;
         // list-style-image is inherited, unlike most internal layout metadata.
         // Keep it in the ordinary computed cascade so resource consumers and

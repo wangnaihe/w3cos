@@ -743,7 +743,16 @@ pub(super) fn definite_inline_grid(style: &Style) -> bool {
     if !matches!(style.height, Dimension::Px(h) if h.is_finite() && h >= 0.0) {
         return false;
     }
-    if !zero_margins(style) {
+    // Non-negative px margins are placed by the inline-grid line builder.
+    if ![
+        style.margin.top,
+        style.margin.right,
+        style.margin.bottom,
+        style.margin.left,
+    ]
+    .iter()
+    .all(|margin| matches!(margin, Spacing::Px(value) if value.is_finite() && *value >= 0.0))
+    {
         return false;
     }
     if style.align_items != AlignItems::Stretch
@@ -777,13 +786,6 @@ fn axis_is_auto_or_px(dim: Dimension) -> bool {
         Dimension::Px(value) if value.is_finite() && value >= 0.0 => true,
         _ => false,
     }
-}
-
-fn zero_margins(style: &Style) -> bool {
-    spacing_is_zero(style.margin.top)
-        && spacing_is_zero(style.margin.right)
-        && spacing_is_zero(style.margin.bottom)
-        && spacing_is_zero(style.margin.left)
 }
 
 fn zero_padding_and_border(style: &Style) -> bool {
