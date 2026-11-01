@@ -1,3 +1,6 @@
+#[cfg(all(target_os = "macos", feature = "web-geolocation"))]
+extern crate objc2_06 as objc2;
+
 pub mod animations_web;
 pub mod audio_device;
 pub mod audio_input;

@@ -4,6 +4,93 @@ use crate::Style;
 pub const FRAGMENT_ENDS: &str = "--w3cos-internal-text-fragment-ends";
 pub const SOURCE_RUN: &str = "--w3cos-internal-text-source-run";
 pub const DECORATION_COLOR: &str = "--w3cos-internal-text-decoration-color";
+pub const CSSOM_OWNER_RANGES: &str = "--w3cos-internal-cssom-owner-ranges";
+pub const CSSOM_BOX_OWNERS: &str = "--w3cos-internal-cssom-box-owners";
+
+/// UTF-8 byte ranges within a coalesced text run that still belong to a
+/// dissolved source inline. The text fingerprint rejects inherited metadata
+/// after any lowering pass that replaces the content.
+pub fn cssom_owner_ranges(text: &str, style: &Style) -> Vec<(u32, usize, usize)> {
+    let Some(value) = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(CSSOM_OWNER_RANGES))
+    else {
+        return Vec::new();
+    };
+    let Some((hash, records)) = value.split_once(':') else {
+        return Vec::new();
+    };
+    if u64::from_str_radix(hash, 16).ok() != Some(fingerprint(text)) {
+        return Vec::new();
+    }
+    records
+        .split(';')
+        .filter_map(|record| {
+            let mut fields = record.split(',');
+            let owner = fields.next()?.parse().ok()?;
+            let start = fields.next()?.parse().ok()?;
+            let end = fields.next()?.parse().ok()?;
+            if fields.next().is_some()
+                || start >= end
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                return None;
+            }
+            Some((owner, start, end))
+        })
+        .collect()
+}
+
+pub fn set_cssom_owner_ranges(style: &mut Style, text: &str, ranges: &[(u32, usize, usize)]) {
+    let properties = style.custom_properties.get_or_insert_with(Default::default);
+    properties.remove(CSSOM_OWNER_RANGES);
+    let records = ranges
+        .iter()
+        .filter(|(_, start, end)| {
+            *start < *end
+                && *end <= text.len()
+                && text.is_char_boundary(*start)
+                && text.is_char_boundary(*end)
+        })
+        .map(|(owner, start, end)| format!("{owner},{start},{end}"))
+        .collect::<Vec<_>>();
+    if !records.is_empty() {
+        properties.insert(
+            CSSOM_OWNER_RANGES.into(),
+            format!("{:x}:{}", fingerprint(text), records.join(";")),
+        );
+    }
+}
+
+pub fn cssom_box_owners(style: &Style) -> Vec<u32> {
+    style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get(CSSOM_BOX_OWNERS))
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|owner| owner.parse().ok())
+        .collect()
+}
+
+pub fn append_cssom_box_owner(style: &mut Style, owner: u32) {
+    let properties = style.custom_properties.get_or_insert_with(Default::default);
+    let owners = properties.entry(CSSOM_BOX_OWNERS.into()).or_default();
+    if owners
+        .split(',')
+        .filter_map(|value| value.parse::<u32>().ok())
+        .any(|candidate| candidate == owner)
+    {
+        return;
+    }
+    if !owners.is_empty() {
+        owners.push(',');
+    }
+    owners.push_str(&owner.to_string());
+}
 
 /// Anonymous text paints its decorating element's used properties; CSS
 /// element boxes still do not inherit these properties by default.
@@ -182,11 +269,12 @@ pub fn decoration_owners(style: &Style) -> Vec<Style> {
 }
 
 pub fn metadata_cache_key(style: &Style) -> u64 {
-    style
-        .custom_properties
-        .as_ref()
-        .and_then(|properties| properties.get(FRAGMENT_ENDS))
-        .map_or(0, |value| fingerprint(value))
+    style.custom_properties.as_ref().map_or(0, |properties| {
+        [FRAGMENT_ENDS, CSSOM_OWNER_RANGES]
+            .into_iter()
+            .filter_map(|key| properties.get(key))
+            .fold(0, |hash, value| hash ^ fingerprint(value).rotate_left(1))
+    })
 }
 
 fn fingerprint(text: &str) -> u64 {
@@ -397,5 +485,20 @@ mod tests {
         let mut ends = Vec::new();
         append_fragment_ends(&mut ends, 8, "é界X", &style);
         assert_eq!(ends, [10, 13, 14]);
+    }
+
+    #[test]
+    fn cssom_owner_ranges_are_utf8_checked_and_bound_to_the_actual_text() {
+        let mut style = Style::default();
+        set_cssom_owner_ranges(
+            &mut style,
+            "aé界z",
+            &[(7, 1, 3), (8, 3, 6), (9, 2, 6), (10, 6, 7)],
+        );
+        assert_eq!(
+            cssom_owner_ranges("aé界z", &style),
+            vec![(7, 1, 3), (8, 3, 6), (10, 6, 7)]
+        );
+        assert!(cssom_owner_ranges("aé界x", &style).is_empty());
     }
 }

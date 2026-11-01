@@ -1184,6 +1184,7 @@ pub struct ScrollExtent {
 // ---------------------------------------------------------------------------
 
 pub struct FlatNodeInfo<'a> {
+    pub component: Option<&'a Component>,
     /// Stable identity for this compiled tree slot across reactive rebuilds.
     /// The compiler keeps conditional branches mounted and only toggles
     /// display, so a structural path is stable even when visibility changes.
@@ -1630,7 +1631,7 @@ fn atomic_inline_intrinsic_width(component: &Component, minimum: bool) -> Option
     Some(widest.max(advance).max(0.0))
 }
 
-fn component_max_content_width(component: &Component) -> f32 {
+pub(crate) fn component_max_content_width(component: &Component) -> f32 {
     #[cfg(feature = "skia")]
     let contextual_widths =
         if component.children.len() >= 3 || component.style.white_space == WWhiteSpace::Pre {
@@ -4102,6 +4103,40 @@ fn cascade_measure_width(text: &str, style: &w3cos_std::style::Style) -> f32 {
         .sum()
 }
 
+/// Physical advances for adjacent fragments that share one layout text run.
+/// The GPU/Skia path shapes the concatenated run and partitions its clusters;
+/// the Vello-only path mirrors its current fontdue layout contract, whose
+/// advances are per character and whose authored fragments are consumed at
+/// separate LayoutUnit endpoints.
+pub(crate) fn physical_text_fragment_advances(
+    fragments: &[&str],
+    style: &w3cos_std::style::Style,
+) -> Option<Vec<f32>> {
+    if fragments.is_empty() {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    let mut advances = crate::render_skia::measure_skia_cssom_fragment_advances(fragments, style)?;
+    #[cfg(not(feature = "skia"))]
+    let advances = fragments
+        .iter()
+        .map(|fragment| text_layout::inline_layout_advance(cascade_measure_width(fragment, style)))
+        .collect::<Vec<_>>();
+
+    #[cfg(feature = "skia")]
+    {
+        let total = advances.iter().sum::<f32>();
+        let snapped = text_layout::inline_layout_advance(total);
+        if let Some(last) = advances.last_mut() {
+            *last += snapped - total;
+        }
+    }
+    advances
+        .iter()
+        .all(|advance| advance.is_finite() && *advance >= 0.0)
+        .then_some(advances)
+}
+
 fn cascade_line_height(text: &str, style: &w3cos_std::style::Style) -> f32 {
     if style.line_height_computed_px.is_some() {
         return crate::layout::inline_style_line_height(style);
@@ -4658,6 +4693,7 @@ fn pre_flatten_recursive<'a>(
 ) {
     let my_idx = out.len();
     out.push(FlatNodeInfo {
+        component: Some(comp),
         stable_id,
         kind: &comp.kind,
         style: &comp.style,
@@ -27597,7 +27633,7 @@ mod tests {
         let _font = FontOwner;
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf"
+            "/src/layout_ng/testdata/Ahem.ttf"
         ))
         .unwrap();
         FontRegistry::global()
@@ -27835,7 +27871,10 @@ mod tests {
         assert!(style.ch_advance() > first);
         assert_eq!(CH_ADVANCE_MEASUREMENTS.with(std::cell::Cell::get), 2);
 
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -27853,7 +27892,7 @@ mod tests {
                     family: style.font_family.clone().unwrap(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -28780,8 +28819,10 @@ mod tests {
                 w3cos_std::inline_text::SOURCE_RUN.into(),
                 "text:fixture".into(),
             );
-        let expected =
+        let mut expected =
             crate::render_skia::measure_skia_inline_fragment_advances(&texts, &plain).unwrap();
+        let total: f32 = expected.iter().sum();
+        *expected.last_mut().unwrap() += text_layout::inline_layout_advance(total) - total;
         let children = texts
             .into_iter()
             .enumerate()
@@ -28816,7 +28857,7 @@ mod tests {
         assert_eq!(
             widths.into_iter().flatten().collect::<Vec<_>>(),
             expected,
-            "content-box advances must exclude padding and retain unsnapped glyph precision"
+            "content-box advances must exclude padding, retain contextual glyph precision, and snap the completed source once"
         );
     }
 
@@ -32653,7 +32694,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -33847,7 +33888,10 @@ mod tests {
 
     #[test]
     fn bottom_aligned_inline_places_anonymous_text_on_the_large_child_line() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -33867,7 +33911,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf",
+                        "/src/layout_ng/testdata/Ahem.ttf",
                     ))),
                     ..Default::default()
                 },
@@ -34020,7 +34064,10 @@ mod tests {
 
     #[test]
     fn anonymous_block_text_wraps_before_and_after_a_larger_font_block() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -34040,7 +34087,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -34104,7 +34151,10 @@ mod tests {
 
     #[test]
     fn mixed_font_top_text_keeps_replaced_baseline_strut_descent() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -34124,7 +34174,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -54078,6 +54128,29 @@ mod tests {
     }
 
     #[test]
+    fn physical_text_fragments_match_the_layout_backend_endpoints() {
+        let style = Style {
+            display: WDisp::Inline,
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let fragments = ["outer ", "inner", " tail"];
+        let advances = physical_text_fragment_advances(&fragments, &style).unwrap();
+        assert_eq!(advances.len(), fragments.len());
+        assert!(advances.iter().all(|advance| *advance >= 0.0));
+        #[cfg(not(feature = "skia"))]
+        for (fragment, advance) in fragments.into_iter().zip(advances) {
+            assert_eq!(advance, text_intrinsic_size(fragment, &style).0);
+        }
+        #[cfg(feature = "skia")]
+        assert_eq!(
+            advances.iter().sum::<f32>(),
+            text_intrinsic_size(&fragments.concat(), &style).0,
+            "Skia partitions a single contextually shaped run, so its fragment endpoints must sum to the combined run rather than independent substring widths"
+        );
+    }
+
+    #[test]
     #[cfg(all(feature = "skia", target_os = "macos"))]
     fn split_inline_words_preserve_space_word_shaping_advance() {
         use crate::html_parser_host::InertParserScriptHost;
@@ -54453,6 +54526,26 @@ mod tests {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
+        const OWNER: u64 = 202611010001;
+        struct FontFixture;
+        impl Drop for FontFixture {
+            fn drop(&mut self) {
+                crate::font_face::FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: "W3cosHiddenTinos".into(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register deterministic hidden-source font");
+        let _font = FontFixture;
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         let mut parser = StreamingDocumentParser::new_with_script_host(
@@ -54463,7 +54556,7 @@ mod tests {
         parser
             .write(
                 "<!doctype html><body style='margin:8px'>\
-            <div style='line-height:1.25'>Filler Text1\
+            <div style='font-family:W3cosHiddenTinos;font-size:16px;line-height:20px'>Filler Text1\
             <span style='visibility:hidden'>Filler Text2</span>Filler Text3</div></body>",
             )
             .unwrap();
@@ -54479,11 +54572,12 @@ mod tests {
                     .then(|| layouts.iter().find(|(_, item)| *item == index).unwrap().0.x)
             })
             .collect::<Vec<_>>();
-        // Chrome155 original XHTML Text Ranges, V3395: authored source
-        // advances are 79.921875 and 83.109375, not the sum of rounded words.
+        // Isolated Chrome 155 with the exact same Tinos bytes (SHA-256
+        // cf264a22...) starts each 74.578125px source at these positions.
+        // Visibility changes paint, not inline advance or shaping continuity.
         assert_eq!(
             starts,
-            vec![8.0, 87.921875, 171.03125],
+            vec![8.0, 82.578125, 157.15625],
             "synthetic no-break wrappers must not add a LayoutUnit at each source boundary"
         );
     }
@@ -54508,7 +54602,7 @@ mod tests {
                     family: "Ahem".into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -60204,11 +60298,40 @@ mod tests {
     #[cfg(feature = "skia")]
     #[test]
     fn wrapped_text_height_accounts_for_first_line_percent_indent() {
-        let text = "X The first X in this sentence should be indented to the center of this block.";
+        use crate::font_face::{FontFace, FontRegistry, FontSource};
+
+        const OWNER: u64 = 0x494e_4445_4e54;
+        const FAMILY: &str = "W3cos Percent Indent Tinos";
+        struct FontOwner;
+        impl Drop for FontOwner {
+            fn drop(&mut self) {
+                FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        let _font = FontOwner;
+        FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: FAMILY.into(),
+                    src: FontSource::Bytes(
+                        include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register deterministic percent-indent font");
+
+        // Isolated Chrome155 with the same Tinos bytes and a 220px block:
+        // the unindented text occupies one 19.2px line, while a 50% first-line
+        // indent wraps `four` onto a second line.  The longer historical text
+        // occupied three lines in both cases and therefore did not test the
+        // indent despite its host-font-dependent height assertion.
+        let text = "one two three four";
         let base = Style {
             font_size: 16.0,
             line_height: 1.2,
-            font_family: Some("serif".into()),
+            font_family: Some(FAMILY.into()),
             ..Style::default()
         };
         let indented = Style {

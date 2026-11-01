@@ -4,7 +4,7 @@
 //! headers, and data without a symbol stay outside the table. This is the same
 //! class of measurement as `cargo bloat`.
 
-use object::{Object, ObjectSymbol, SymbolKind};
+use object::{BinaryFormat, Object, ObjectSection, ObjectSymbol, SectionIndex, SymbolKind};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -108,10 +108,45 @@ pub fn attribute_object(bytes: &[u8]) -> Attribution {
     let Ok(object) = object::File::parse(bytes) else {
         return empty();
     };
+    // Mach-O's nlist symbol table does not carry an ELF-style symbol size.
+    // `object` therefore reports zero for ordinary Rust text/data symbols on
+    // macOS, even in an unstripped executable or its dSYM. Infer the occupied
+    // interval from the next distinct symbol in the same section (or the
+    // section end), matching the convention used by Mach-O size tools. Keep
+    // the existing explicit-size behavior for every other object format.
+    let infer_macho_sizes = object.format() == BinaryFormat::MachO;
+    let mut macho_sections: Vec<(SectionIndex, u64, Vec<u64>)> = Vec::new();
+    if infer_macho_sizes {
+        for section in object.sections() {
+            macho_sections.push((
+                section.index(),
+                section.address().saturating_add(section.size()),
+                Vec::new(),
+            ));
+        }
+        for symbol in object.symbols() {
+            if symbol.is_undefined() {
+                continue;
+            }
+            let Some(index) = symbol.section_index() else {
+                continue;
+            };
+            if let Some((_, _, addresses)) = macho_sections
+                .iter_mut()
+                .find(|(section, _, _)| *section == index)
+            {
+                addresses.push(symbol.address());
+            }
+        }
+        for (_, _, addresses) in &mut macho_sections {
+            addresses.sort_unstable();
+            addresses.dedup();
+        }
+    }
     let mut crates: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut symbols = Vec::new();
     for symbol in object.symbols() {
-        if symbol.is_undefined() || symbol.size() == 0 {
+        if symbol.is_undefined() {
             continue;
         }
         match symbol.kind() {
@@ -122,15 +157,41 @@ pub fn attribute_object(bytes: &[u8]) -> Attribution {
         if raw.is_empty() {
             continue;
         }
+        let size = if symbol.size() > 0 {
+            symbol.size()
+        } else if infer_macho_sizes {
+            symbol
+                .section_index()
+                .and_then(|index| {
+                    macho_sections
+                        .iter()
+                        .find(|(section, _, _)| *section == index)
+                })
+                .and_then(|(_, section_end, addresses)| {
+                    let address = symbol.address();
+                    let next = addresses
+                        .iter()
+                        .copied()
+                        .find(|candidate| *candidate > address)
+                        .unwrap_or(*section_end);
+                    next.checked_sub(address)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if size == 0 {
+            continue;
+        }
         let demangled = demangle(raw);
         let crate_name = crate_name_of(&demangled);
         let entry = crates.entry(crate_name.clone()).or_insert((0, 0));
-        entry.0 += symbol.size();
+        entry.0 += size;
         entry.1 += 1;
         symbols.push(SymbolBytes {
             name: truncate_symbol(&demangled),
             crate_name,
-            bytes: symbol.size(),
+            bytes: size,
         });
     }
     if symbols.is_empty() {

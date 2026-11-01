@@ -68,13 +68,25 @@ fn is_outside_list_marker(component: &Component) -> bool {
         .is_some_and(|props| props.contains_key(LIST_MARKER))
 }
 
+fn is_split_inline_fragment(component: &Component) -> bool {
+    component
+        .style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER))
+}
+
 /// No box anywhere in `root` can make a block subtree depend on more than
 /// its containing block width.
 pub(super) fn tree_is_spliceable(root: &Component) -> bool {
     let mut stack = vec![root];
     while let Some(component) = stack.pop() {
         let style = &component.style;
-        if style.float != Float::None
+        // The sparse CSSOM fragment map is rebuilt from a complete flattened
+        // tree. Keep split-inline trees on that path until splice publishes
+        // equivalent ordered fragment ownership itself.
+        if is_split_inline_fragment(component)
+            || style.float != Float::None
             || matches!(style.position, Position::Fixed | Position::Sticky)
             || (style.position == Position::Absolute && !is_outside_list_marker(component))
             || style.column_count.is_some()
