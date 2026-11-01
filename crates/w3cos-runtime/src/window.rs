@@ -9042,6 +9042,21 @@ impl ApplicationHandler for App {
                     self.request_repaint();
                     return;
                 }
+                if self.dom_mode
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                    && let Some(input_type) = crate::jsdom::edit_context_input_type_for_key(
+                        &web_key(&event.logical_key),
+                        self.modifiers.shift_key(),
+                    )
+                    && crate::jsdom::deliver_edit_context_command(input_type)
+                {
+                    self.rebuild_if_dirty();
+                    self.repaint_mode = RepaintMode::Full;
+                    self.request_repaint();
+                    return;
+                }
                 if let Some(focus_idx) = self.focused_index {
                     if let Some(kind) = self.get_kind_at(focus_idx) {
                         match kind {
