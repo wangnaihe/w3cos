@@ -436,6 +436,30 @@ impl CSSStyleDeclaration {
                     (value.trim() == "stretch").then(|| "stretch".to_string()),
                 );
             }
+            "flex-flow" | "flexFlow" => {
+                // CSS Flexbox 3: `<flex-direction> || <flex-wrap>`; an omitted
+                // part resets to its initial value, a CSS-wide keyword sets both.
+                let mut direction = "row";
+                let mut wrap = "nowrap";
+                let lowered = value.trim().to_ascii_lowercase();
+                if css_wide_keyword(&lowered) {
+                    direction = lowered.as_str();
+                    wrap = lowered.as_str();
+                    self.set_property("flex-direction", direction);
+                    self.set_property("flex-wrap", wrap);
+                } else {
+                    for token in lowered.split_whitespace() {
+                        match token {
+                            "row" | "row-reverse" | "column" | "column-reverse" => {
+                                direction = token
+                            }
+                            _ => wrap = token,
+                        }
+                    }
+                    self.set_property("flex-direction", direction);
+                    self.set_property("flex-wrap", wrap);
+                }
+            }
             "flex-wrap" | "flexWrap" => {
                 self.inner.flex_wrap = parse_flex_wrap(value);
                 let keyword = value.trim().to_ascii_lowercase();
