@@ -10110,7 +10110,9 @@ fn grid_lanes_matches_chrome() {
         let spec = &case["spec"];
         let container = &spec["container"];
         let number = |value: &serde_json::Value| value.as_f64().map(|v| v as f32);
-        let rows_axis = container["axis"] == "row"
+        let rows_axis = container["axis"]
+            .as_str()
+            .is_some_and(|axis| axis.starts_with("row"))
             || (container["axis"].is_null() && container["rows"].as_bool().unwrap_or(false));
         let mut markers = vec![("--w3cos-internal-grid-lanes".to_string(), String::new())];
         if let Some(axis) = container["axis"].as_str() {
@@ -10126,6 +10128,29 @@ fn grid_lanes_matches_chrome() {
             ));
         }
         let template = container["template"].as_str().unwrap().to_string();
+        let align_items = |value: &str| match value {
+            "start" => w3cos_std::style::AlignItems::FlexStart,
+            "end" => w3cos_std::style::AlignItems::FlexEnd,
+            "center" => w3cos_std::style::AlignItems::Center,
+            _ => w3cos_std::style::AlignItems::Stretch,
+        };
+        let align_self = |value: &str| match value {
+            "start" => w3cos_std::style::AlignSelf::FlexStart,
+            "end" => w3cos_std::style::AlignSelf::FlexEnd,
+            "center" => w3cos_std::style::AlignSelf::Center,
+            _ => w3cos_std::style::AlignSelf::Stretch,
+        };
+        if container["align"].as_str() == Some("stretch") {
+            markers.push((
+                if rows_axis {
+                    "--w3cos-internal-justify-items-stretch"
+                } else {
+                    "--w3cos-internal-align-items-stretch"
+                }
+                .to_string(),
+                String::new(),
+            ));
+        }
         let mut style = Style {
             display: Display::Flex,
             width: Dimension::Px(number(&container["width"]).unwrap_or(200.0)),
@@ -10135,6 +10160,13 @@ fn grid_lanes_matches_chrome() {
             custom_properties: Some(CustomProperties::from_iter(markers)),
             ..font.clone()
         };
+        if let Some(value) = container["align"].as_str() {
+            if rows_axis {
+                style.justify_items = align_items(value);
+            } else {
+                style.align_items = align_items(value);
+            }
+        }
         if let Some(gap) = container["gap"].as_array() {
             style.row_gap = number(&gap[0]);
             style.column_gap = number(&gap[1]);
@@ -10158,6 +10190,13 @@ fn grid_lanes_matches_chrome() {
                 order: item["order"].as_i64().unwrap_or(0) as i32,
                 ..font.clone()
             };
+            if let Some(value) = item["self"].as_str() {
+                if rows_axis {
+                    item_style.justify_self = align_self(value);
+                } else {
+                    item_style.align_self = align_self(value);
+                }
+            }
             if let Some(margin) = number(&item["margin"]) {
                 item_style.margin = margins(margin, margin, margin, margin);
                 item_style.padding = margins(2.0, 2.0, 2.0, 2.0);
