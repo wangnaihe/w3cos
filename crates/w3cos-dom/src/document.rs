@@ -44,6 +44,12 @@ enum GeneratedContentItem {
     Image(String),
 }
 
+struct CachedPseudoDeclarations {
+    node_revision: u64,
+    stylesheet_generation: u64,
+    declarations: Vec<(String, String, u32)>,
+}
+
 struct CachedComputedStyle {
     node_revision: u64,
     stylesheet_generation: u64,
@@ -441,6 +447,11 @@ pub struct Document {
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
+    /// Generated-content declarations per (node, ::before/::after), valid for
+    /// the node's style revision and the stylesheet generation, like
+    /// `computed_style_cache`. Component lowering asks for them on every
+    /// rebuild even though almost no element generates content.
+    pseudo_declaration_cache: RefCell<HashMap<(NodeId, bool), CachedPseudoDeclarations>>,
     computed_style_stamp_clock: Cell<u64>,
     #[cfg(test)]
     computed_style_chain_fast_hits: Cell<usize>,
@@ -579,6 +590,7 @@ impl Document {
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
+            pseudo_declaration_cache: RefCell::new(HashMap::new()),
             computed_style_stamp_clock: Cell::new(STYLE_LINK_ROOT),
             #[cfg(test)]
             computed_style_chain_fast_hits: Cell::new(0),
@@ -4649,14 +4661,45 @@ impl Document {
         merged.to_style()
     }
 
+    fn pseudo_declarations(&self, id: NodeId, pseudo_element: &str) -> Vec<(String, String, u32)> {
+        let slot = match pseudo_element {
+            "::before" => Some((id, false)),
+            "::after" => Some((id, true)),
+            _ => None,
+        };
+        let Some(key) = slot else {
+            return stylesheet::matching_pseudo_declarations_for_node(self, id, pseudo_element);
+        };
+        let node_revision = self.style_revisions[id.0 as usize];
+        let stylesheet_generation = stylesheet::generation();
+        if let Some(cached) = self.pseudo_declaration_cache.borrow().get(&key)
+            && cached.node_revision == node_revision
+            && cached.stylesheet_generation == stylesheet_generation
+        {
+            return cached.declarations.clone();
+        }
+        let (declarations, stable) =
+            stylesheet::matching_pseudo_declarations_with_stability(self, id, pseudo_element);
+        if stable {
+            self.pseudo_declaration_cache.borrow_mut().insert(
+                key,
+                CachedPseudoDeclarations {
+                    node_revision,
+                    stylesheet_generation,
+                    declarations: declarations.clone(),
+                },
+            );
+        }
+        declarations
+    }
+
     fn generated_pseudo_component(
         &self,
         id: NodeId,
         pseudo_element: &str,
         origin_style: &w3cos_std::style::Style,
     ) -> Option<w3cos_std::Component> {
-        let mut declarations =
-            stylesheet::matching_pseudo_declarations_for_node(self, id, pseudo_element);
+        let mut declarations = self.pseudo_declarations(id, pseudo_element);
         if !declarations
             .iter()
             .any(|(property, _, _)| css_property_eq(property, "content"))
@@ -26265,6 +26308,53 @@ mod computed_style_cache_tests {
             parent_properties.get("--theme-color-3").map(String::as_str),
             Some("#123456")
         );
+    }
+
+    #[test]
+    fn cached_pseudo_declarations_follow_ancestor_sibling_and_rule_changes() {
+        stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".active span::before", &[("content", "'a'")]);
+        crate::stylesheet::register_rule(".lead + span::after", &[("content", "'s'")]);
+        let mut document = Document::new();
+        let body = document.body().id;
+        let parent = document.create_element("div");
+        let lead = document.create_element("i");
+        let target = document.create_element("span");
+        document.append_child(body, parent.id);
+        document.append_child(parent.id, lead.id);
+        document.append_child(parent.id, target.id);
+        let content = |document: &Document, pseudo: &str| {
+            document
+                .pseudo_declarations(target.id, pseudo)
+                .into_iter()
+                .find(|(property, _, _)| property == "content")
+                .map(|(_, value, _)| value)
+        };
+        // Prime the cache, then read it again unchanged.
+        assert_eq!(content(&document, "::before"), None);
+        assert_eq!(content(&document, "::after"), None);
+        assert_eq!(content(&document, "::before"), None);
+        // An ancestor class edit changes a descendant's pseudo rule.
+        parent.set_attribute(&mut document, "class", "active");
+        assert_eq!(content(&document, "::before").as_deref(), Some("'a'"));
+        parent.set_attribute(&mut document, "class", "");
+        assert_eq!(content(&document, "::before"), None);
+        // A previous-sibling class edit changes `+` matching.
+        lead.set_attribute(&mut document, "class", "lead");
+        assert_eq!(content(&document, "::after").as_deref(), Some("'s'"));
+        lead.set_attribute(&mut document, "class", "other");
+        assert_eq!(content(&document, "::after"), None);
+        // A new rule (stylesheet generation) shows up for a cached miss.
+        crate::stylesheet::register_rule("span::after", &[("content", "'late'")]);
+        assert_eq!(content(&document, "::after").as_deref(), Some("'late'"));
+        // A cached hit equals a fresh match.
+        for pseudo in ["::before", "::after"] {
+            assert_eq!(
+                document.pseudo_declarations(target.id, pseudo),
+                stylesheet::matching_pseudo_declarations_for_node(&document, target.id, pseudo)
+            );
+        }
+        stylesheet::clear_rules();
     }
 
     #[test]
