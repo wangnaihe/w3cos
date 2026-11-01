@@ -9332,8 +9332,34 @@ mod tests {
                 },
             )
             .unwrap();
+        let fallback_faces = [
+            (
+                "W3COS Test Tinos",
+                include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").as_slice(),
+            ),
+            (
+                "W3COS Test Arimo",
+                include_bytes!("../assets/test-fonts/Arimo-Regular.ttf").as_slice(),
+            ),
+            (
+                "W3COS Test Cousine",
+                include_bytes!("../assets/test-fonts/Cousine-Regular.ttf").as_slice(),
+            ),
+        ];
+        for (family, bytes) in fallback_faces {
+            registry
+                .register_for_owner(
+                    OWNER,
+                    FontFace {
+                        family: family.into(),
+                        src: FontSource::Bytes(bytes.to_vec()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
         let mut results = Vec::new();
-        for family in ["Times New Roman", "Arial", "Courier New"] {
+        for family in ["W3COS Test Tinos", "W3COS Test Arimo", "W3COS Test Cousine"] {
             let style = Style {
                 font_family: Some(format!("Ahem, \"{family}\"")),
                 font_size: 64.0,
