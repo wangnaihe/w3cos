@@ -1167,8 +1167,10 @@ fn hit_test_order_key(hit: &HitNode, paint_z: &[i32]) -> (bool, i32, bool, bool,
 
 /// Whether a resolved style lets the box be a pointer hit-test target.
 fn style_is_pointer_hittable(style: &w3cos_std::style::Style) -> bool {
-    style.visibility != w3cos_std::style::Visibility::Hidden
-        && !matches!(style.pointer_events, w3cos_std::style::PointerEvents::None)
+    !matches!(
+        style.visibility,
+        w3cos_std::style::Visibility::Hidden | w3cos_std::style::Visibility::Collapse
+    ) && !matches!(style.pointer_events, w3cos_std::style::PointerEvents::None)
 }
 
 fn dom_host_disabled(action: &EventAction) -> bool {
