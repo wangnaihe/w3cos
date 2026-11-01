@@ -1042,8 +1042,20 @@ pub fn matching_pseudo_declarations_for_node(
     node: NodeId,
     pseudo_element: &str,
 ) -> Vec<(String, String, u32)> {
+    matching_pseudo_declarations_with_stability(document, node, pseudo_element).0
+}
+
+/// Like `matching_pseudo_declarations_for_node`, plus whether the answer is a
+/// pure function of the node's style revision and the stylesheet generation.
+/// A candidate guarded by a container query depends on layout, so it is not.
+pub fn matching_pseudo_declarations_with_stability(
+    document: &Document,
+    node: NodeId,
+    pseudo_element: &str,
+) -> (Vec<(String, String, u32)>, bool) {
     let ancestor_bloom = LazyAncestorBloom::new(|| AncestorBloom::for_node(document, node), false);
-    RULES.with(|rules| {
+    let mut stable = true;
+    let declarations = RULES.with(|rules| {
         let rules = rules.borrow();
         let document_scope = rules.document_scope_for_node(document, node);
         let mut matched: Vec<&Rule> = rules
@@ -1051,6 +1063,15 @@ pub fn matching_pseudo_declarations_for_node(
             .into_iter()
             .map(|index| &rules.rules[index])
             .filter(|rule| rule.pseudo_element.as_deref() == Some(pseudo_element))
+            .inspect(|rule| {
+                if rule
+                    .declarations
+                    .iter()
+                    .any(|(property, _)| property == CONTAINER_QUERY_MARKER)
+                {
+                    stable = false;
+                }
+            })
             .filter(|rule| rule_matches_document_scope(rule, document_scope))
             .filter(|rule| ancestor_bloom.might_contain(rule.ancestor_filter))
             .filter(|rule| {
@@ -1081,7 +1102,8 @@ pub fn matching_pseudo_declarations_for_node(
             }
         }
         buckets.into_iter().flatten().collect()
-    })
+    });
+    (declarations, stable)
 }
 
 pub(crate) fn declaration_value_and_importance(value: &str) -> (&str, bool) {
