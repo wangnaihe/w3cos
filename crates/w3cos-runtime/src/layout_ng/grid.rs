@@ -3583,9 +3583,6 @@ pub(super) fn layout(
     {
         return super::bail("grid:max-height");
     }
-    if used < base && !inline_intrinsic {
-        return super::bail("grid:short-height");
-    }
     if stretch_rows && used > base && !rows.is_empty() {
         let extra = used - base;
         let caps: Vec<i64> = row_tracks
@@ -3663,9 +3660,8 @@ pub(super) fn layout(
     let row_sum: i64 = rows.iter().sum();
     let row_free = used - gap_sum(&row_collapsed, row_gap_u) - row_sum;
     let active_rows = rows.len().max(1);
-    let (row_lead, row_between) =
-        pack_gap(row_pack(style), row_free.max(0), active_rows, row_gap_u);
-    let row_y = positions(&rows, &row_collapsed, row_between, row_lead.max(0));
+    let (row_lead, row_between) = pack_gap(row_pack(style), row_free, active_rows, row_gap_u);
+    let row_y = positions(&rows, &row_collapsed, row_between, row_lead);
 
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);

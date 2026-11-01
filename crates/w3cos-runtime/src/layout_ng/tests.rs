@@ -6548,3 +6548,59 @@ fn grid_lanes_matches_chrome() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// A definite-height grid shorter than its tracks keeps the track sizes and
+/// the rows overflow it. `center` and `end` are unsafe, distributed
+/// alignments fall back to start (headless Chrome 156: two 40px rows, 4px
+/// gap, 50px box: rows at y=0/44 for start, -17/27 for center, -34/10 for
+/// end).
+#[test]
+fn grid_short_height_overflow_matches_chrome() {
+    use w3cos_std::style::AlignContent;
+    let run = |align: AlignContent, rows: &str| {
+        let mut grid = Style {
+            display: Display::Grid,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(50.0),
+            gap: 4.0,
+            align_content: align,
+            ..Style::default()
+        };
+        grid.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        let item = || {
+            node(
+                Style {
+                    height: Dimension::Px(40.0),
+                    ..block()
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(grid, vec![item(), item()])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+        (rect(&out, 1).3, rect(&out, 2).1, rect(&out, 3).1)
+    };
+    for rows in ["40px 40px", "1fr 40px", "auto auto"] {
+        assert_eq!(
+            run(AlignContent::Stretch, rows),
+            (50.0, 0.0, 44.0),
+            "{rows}"
+        );
+        assert_eq!(run(AlignContent::FlexStart, rows), (50.0, 0.0, 44.0));
+        assert_eq!(
+            run(AlignContent::Center, rows),
+            (50.0, -17.0, 27.0),
+            "{rows}"
+        );
+        assert_eq!(
+            run(AlignContent::FlexEnd, rows),
+            (50.0, -34.0, 10.0),
+            "{rows}"
+        );
+        assert_eq!(run(AlignContent::SpaceBetween, rows), (50.0, 0.0, 44.0));
+        assert_eq!(run(AlignContent::SpaceAround, rows), (50.0, 0.0, 44.0));
+        assert_eq!(run(AlignContent::SpaceEvenly, rows), (50.0, 0.0, 44.0));
+    }
+}
