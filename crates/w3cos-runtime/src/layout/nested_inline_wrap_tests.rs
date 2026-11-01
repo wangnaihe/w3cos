@@ -1715,19 +1715,42 @@ fn nonfitting_bfc_margin_separates_at_the_adjoining_float_band() {
 
 #[test]
 fn character_unit_uses_font_zero_not_shaped_fixed_point_advance() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
+    const OWNER: u64 = 202611010001;
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: "W3cosChTinos".into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     install_font_unit_provider();
-    let style = w3cos_std::Style {
+    let controlled = w3cos_std::Style {
+        font_family: Some("W3cosChTinos".into()),
         font_size: 16.0,
-        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-            w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
-            "1".into(),
-        )])),
         ..w3cos_std::Style::default()
     };
     assert_eq!(
-        style.ch_advance() * 20.0,
-        180.0,
-        "Chrome155 original align001 has exact20ch192 and10ch96 boxes"
+        controlled.ch_advance(),
+        crate::render_skia::measure_skia_font_zero_advance(&controlled),
+        "the CSS unit must use the selected face's zero metric directly"
+    );
+    assert_eq!(
+        controlled.ch_advance() * 20.0,
+        160.0,
+        "bundled Tinos matches isolated Chrome155: 20ch=160 and 10ch=80"
     );
 }
 
