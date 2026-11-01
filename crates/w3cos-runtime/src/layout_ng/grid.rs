@@ -4409,13 +4409,20 @@ mod tests {
                 vec![leaf(block_box(None, Some(10.0)))],
             )],
         );
+    }
+
+    #[test]
+    fn grid_shorter_than_its_tracks_runs_on_ng() {
+        // A definite height below the track sum no longer falls back; the
+        // rows overflow like Chrome (numbers in
+        // `grid_short_height_overflow_matches_chrome`).
         let short = Component::boxed(
             grid_style(200.0, Some(5.0), None),
             vec![leaf(block_box(None, Some(10.0)))],
         );
         let flat = pre_flatten(&short);
         assert!(block::supports_tree(&flat));
-        assert!(super::super::layout_tree(&short, &flat, 800.0, 600.0).is_none());
+        assert!(super::super::layout_tree(&short, &flat, 800.0, 600.0).is_some());
     }
 
     #[test]
