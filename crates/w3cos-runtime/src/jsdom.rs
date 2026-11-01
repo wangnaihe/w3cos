@@ -15229,6 +15229,17 @@ pub(crate) fn active_element_id() -> Option<u32> {
     ACTIVE_ELEMENT.with(|active| *active.borrow())
 }
 
+/// Target for a native key event. Per spec keyboard events go to
+/// `document.activeElement`; the native focus chain (a hit-tested widget)
+/// is only the fallback when nothing in the DOM is focused. A script-driven
+/// `focus()` (Monaco's EditContext div) therefore receives keydown/keyup
+/// even when the native focused index points somewhere else or nowhere.
+pub(crate) fn keyboard_event_target(fallback: Option<u32>) -> Option<u32> {
+    active_element_id()
+        .filter(|id| dom::node_type(*id) == 1)
+        .or(fallback)
+}
+
 fn native_touch_value(touch: &NativeTouch) -> Value {
     let x = Value::Number(touch.client_x as f64);
     let y = Value::Number(touch.client_y as f64);
@@ -32827,6 +32838,46 @@ try {
 
         // Instance lookups still reach the per-node bridge method.
         assert!(host.call_method("matches", vec![Value::string("#again")]) == Value::Bool(true));
+    }
+
+    #[test]
+    fn native_key_events_target_the_active_element() {
+        setup();
+        let editor = create_in_body("div");
+        editor.set_property("tabIndex", Value::Number(0.0));
+        let other = create_in_body("button");
+        let other_id = node_id_of(&other).unwrap();
+        // Nothing focused: the native chain target is used.
+        assert_eq!(keyboard_event_target(Some(other_id)), Some(other_id));
+        assert_eq!(keyboard_event_target(None), None);
+        editor.call_method("focus", vec![]);
+        let editor_id = node_id_of(&editor).unwrap();
+        assert_eq!(keyboard_event_target(Some(other_id)), Some(editor_id));
+        assert_eq!(keyboard_event_target(None), Some(editor_id));
+        let keys = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = keys.clone();
+        editor.call_method(
+            "addEventListener",
+            vec![
+                Value::string("keydown"),
+                Value::function(move |_, args| {
+                    let event = &args[0];
+                    log.borrow_mut().push(format!(
+                        "{}:{}",
+                        event.get_property("key").to_js_string(),
+                        event.get_property("keyCode").to_u32()
+                    ));
+                    event.call_method("preventDefault", vec![]);
+                    Value::Undefined
+                }),
+            ],
+        );
+        let target = keyboard_event_target(Some(other_id)).unwrap();
+        let prevented = dispatch_native_key(
+            target, "Enter", "Enter", false, false, false, false, false, true,
+        );
+        assert!(prevented);
+        assert_eq!(*keys.borrow(), vec!["Enter:13".to_string()]);
     }
 
     #[test]
