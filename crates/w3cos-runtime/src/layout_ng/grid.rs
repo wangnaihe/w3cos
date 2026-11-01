@@ -344,7 +344,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if oof::is_out_of_flow(child_style) {
             continue;
         }
-        if child_style.float != Float::None {
+        // Float does not apply to a grid item (CSS Grid §6); only the
+        // inline-grid line path ignores it so far (grid-inline-float-001).
+        if child_style.float != Float::None
+            && !(fixed_track_inline_grid(flat, index) || intrinsic_track_inline_grid(flat, index))
+        {
             return Some("grid:float");
         }
         if placement(child_style, false).is_some_and(|value| parse_axis_syntax(value).is_none()) {
@@ -834,11 +838,14 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     // back, and switching only the reference splits the reftest. The same
     // holds for a static bordered intrinsic box: it is the reference drawn
     // for `display: inline grid-lanes` tests, which stay on legacy flex.
+    // A percentage gap (grid-gutters-015/016) pairs the bordered static
+    // box with a plain `display: grid` reference, so it may switch alone.
     if style.position != Position::Relative
         && !(style.position == Position::Static
-            && block::border_widths(style)
-                .iter()
-                .all(|value| value.abs() <= EPS))
+            && (has_marker(style, "--w3cos-internal-percent-gap")
+                || block::border_widths(style)
+                    .iter()
+                    .all(|value| value.abs() <= EPS)))
     {
         return false;
     }
@@ -851,10 +858,17 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     if !axis_is_auto_or_px(style.width) || !axis_is_auto_or_px(style.height) {
         return false;
     }
-    if !matches!(style.min_width, Dimension::Auto)
-        || !matches!(style.max_width, Dimension::Auto)
-        || !matches!(style.min_height, Dimension::Auto)
-        || !matches!(style.max_height, Dimension::Auto)
+    // Fixed-track boxes clamp their sum with px min/max sizes. The
+    // intrinsic path keeps them on the marker.
+    let size_limit_ok = |dim: Dimension| match dim {
+        Dimension::Auto => true,
+        Dimension::Px(value) => !intrinsic && value.is_finite() && value >= 0.0,
+        _ => false,
+    };
+    if !size_limit_ok(style.min_width)
+        || !size_limit_ok(style.max_width)
+        || !size_limit_ok(style.min_height)
+        || !size_limit_ok(style.max_height)
     {
         return false;
     }
@@ -871,14 +885,16 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     {
         return false;
     }
-    if !intrinsic && !zero_padding_and_border(style) {
+    if !intrinsic
+        && !has_marker(style, "--w3cos-internal-percent-gap")
+        && !zero_padding_and_border(style)
+    {
         return false;
     }
     if is_baseline(style.align_items) || is_baseline(style.justify_items) {
         return false;
     }
     if has_marker(style, "--w3cos-internal-grid-lanes")
-        || has_marker(style, "--w3cos-internal-percent-gap")
         || has_marker(style, "--w3cos-internal-document-element")
         || has_marker(style, "--w3cos-internal-width-keyword")
         || has_marker(style, "--w3cos-internal-size-containment")
@@ -888,7 +904,7 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     }
     if rendered_children(flat, index).any(|child| {
         let child_style = flat[child].style;
-        oof::is_out_of_flow(child_style) || child_style.float != Float::None
+        oof::is_out_of_flow(child_style)
     }) {
         return false;
     }
@@ -4044,7 +4060,7 @@ fn layout_impl(
     };
     // Size containment: an auto height is the contain-intrinsic one, and
     // the tracks size into it as a definite height.
-    let specified_height = specified_height
+    let mut specified_height = specified_height
         .or_else(|| block::size_contained(style).then(|| block::contain_intrinsic_size(style).1));
     let min_h = match style.min_height {
         Dimension::Auto => None,
@@ -4072,13 +4088,13 @@ fn layout_impl(
     // A percentage gap resolves against the content box (CSS Box
     // Alignment). Chrome resolves it against zero while measuring
     // intrinsic sizes and for an indefinite height.
-    let column_gap = percent_gap(
+    let mut column_gap = percent_gap(
         style,
         "--w3cos-internal-column-gap-percent",
         (!measure).then_some(inner_width),
     )
     .unwrap_or(column_gap);
-    let row_gap =
+    let mut row_gap =
         percent_gap(style, "--w3cos-internal-row-gap-percent", specified_height).unwrap_or(row_gap);
     let mut column_gap_u = units(column_gap);
     let mut row_gap_u = units(row_gap);
@@ -4146,18 +4162,79 @@ fn layout_impl(
         .why("grid:areas")?;
     }
     let flow = container_flow(flat, index).why("grid:auto-flow")?;
+    // An intrinsic size of an auto-repeat grid counts the repetitions that
+    // fit its definite max-width (CSS Grid 7.2.3.2); without one the count
+    // has no basis and the grid stays on the legacy engine.
+    let mut repeat_cap = None;
     if (measure || keyword.is_some()) && columns_template.auto_fit.is_some() {
-        return super::bail("grid:intrinsic-repeat");
+        let max = match style.max_width {
+            Dimension::Px(value) => value,
+            Dimension::Percent(percent) => space.available_inline * percent / 100.0,
+            _ => return super::bail("grid:intrinsic-repeat"),
+        };
+        let edges = bl + br + pl + pr;
+        let content = match style.box_sizing {
+            BoxSizing::BorderBox => (max - edges).max(0.0),
+            BoxSizing::ContentBox => max,
+        };
+        repeat_cap = Some(units(content));
     }
     // An automatic inline-grid shrinks to its fixed px tracks (CSS Grid
     // §6). Stretching it to the containing block would grow those tracks
     // under the initial `justify-content: normal` (stretch).
     let inline_fixed = fixed_track_inline_grid(flat, index);
     let inline_intrinsic = intrinsic_track_inline_grid(flat, index);
+    // An automatic-height inline-grid with fixed px rows is as tall as
+    // those rows (clamped by min/max-height); a percentage row gap is zero
+    // while it shrinks to them and resolves against that height after.
+    if inline_fixed
+        && sized.is_none()
+        && matches!(style.height, Dimension::Auto)
+        && specified_height.is_none()
+        && has_marker(style, "--w3cos-internal-row-gap-percent")
+        && let Some(sum) = fixed_px_sum(&rows_template)
+    {
+        let sizing_gap =
+            percent_gap(style, "--w3cos-internal-row-gap-percent", Some(0.0)).unwrap_or(row_gap);
+        let mut height = sum + sizing_gap * rows_template.tracks.len().saturating_sub(1) as f32;
+        if let Some(max) = max_h {
+            height = height.min(max);
+        }
+        if let Some(min) = min_h {
+            height = height.max(min);
+        }
+        specified_height = Some(height);
+        row_gap =
+            percent_gap(style, "--w3cos-internal-row-gap-percent", Some(height)).unwrap_or(row_gap);
+        row_gap_u = units(row_gap);
+    }
     if inline_fixed && sized.is_none() && matches!(style.width, Dimension::Auto) {
         if let Some(sum) = fixed_px_sum(&columns_template) {
-            let gaps = column_gap * columns_template.tracks.len().saturating_sub(1) as f32;
+            // A percentage gap is zero while the box shrinks to its tracks
+            // and resolves against the final content box afterwards.
+            let sizing_gap = percent_gap(style, "--w3cos-internal-column-gap-percent", Some(0.0))
+                .unwrap_or(column_gap);
+            let gaps = sizing_gap * columns_template.tracks.len().saturating_sub(1) as f32;
             inner_width = sum + gaps;
+            let edges = bl + br + pl + pr;
+            let to_content = |value: f32| match style.box_sizing {
+                BoxSizing::BorderBox => (value - edges).max(0.0),
+                BoxSizing::ContentBox => value,
+            };
+            if let Dimension::Px(max) = style.max_width {
+                inner_width = inner_width.min(to_content(max));
+            }
+            if let Dimension::Px(min) = style.min_width {
+                inner_width = inner_width.max(to_content(min));
+            }
+            if let Some(gap) = percent_gap(
+                style,
+                "--w3cos-internal-column-gap-percent",
+                Some(inner_width),
+            ) {
+                column_gap = gap;
+                column_gap_u = units(gap);
+            }
         }
     }
     let mut inner_u = units(inner_width);
@@ -4170,7 +4247,14 @@ fn layout_impl(
     let mut column_specs = if columns_spec(style).is_none() && flow.column {
         Vec::new()
     } else {
-        expand_auto(&columns_template, inner_u, column_gap_u, font, inflow).why("grid:repeat")?
+        expand_auto(
+            &columns_template,
+            repeat_cap.map_or(inner_u, |cap| inner_u.min(cap)),
+            column_gap_u,
+            font,
+            inflow,
+        )
+        .why("grid:repeat")?
     };
     let definite_block = specified_height.or(min_h.filter(|_| specified_height.is_none()));
     let mut row_specs = expand_auto(
@@ -4307,9 +4391,28 @@ fn layout_impl(
         } else {
             inline_minmax(flat, item.index, space).why("grid:intrinsic")?
         };
-        let minimum = inline_minimum(flat, item.index, space)
+        let mut min_c = min_c;
+        let mut minimum = inline_minimum(flat, item.index, space)
             .unwrap_or(min_c)
             .min(min_c);
+        // CSS Grid 6.6: an item over one track with a fixed max whose
+        // size depends on the containing block (or is auto) has an
+        // automatic minimum clamped to that max.
+        if item.col_span == 1
+            && matches!(child_style.min_width, Dimension::Auto)
+            && !has_marker(child_style, "--w3cos-internal-width-keyword")
+            && matches!(
+                child_style.width,
+                Dimension::Auto | Dimension::Percent(_) | Dimension::Calc { .. }
+            )
+            && let Some(Spec::MinMax(Breadth::Auto, Breadth::Px(limit))) =
+                column_specs.get(item.col)
+            && limit.is_finite()
+        {
+            let limit = units(*limit).max(0);
+            minimum = minimum.min(limit);
+            min_c = min_c.min(limit);
+        }
         contribs.push(Some((minimum, min_c, max_c)));
         if item.col_span == 1 {
             col_has_item[item.col] = true;

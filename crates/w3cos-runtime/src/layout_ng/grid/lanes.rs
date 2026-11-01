@@ -61,7 +61,15 @@ fn lane_columns(style: &Style) -> Option<bool> {
 /// Whether the real lanes pass lays out this container. Everything else
 /// stays on the previous handling (an ordinary grid or the legacy engine).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
-    reason(flat, index).is_none()
+    let why = reason(flat, index);
+    #[cfg(any(test, feature = "layout-ng-trace"))]
+    if let Some(why) = why
+        && why != "lanes:none"
+        && super::super::trace()
+    {
+        eprintln!("[layout-ng] lanes-ineligible {why}");
+    }
+    why.is_none()
 }
 
 fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -851,7 +859,7 @@ fn stack_rows(
             let target_border = (lane_size - mt - mb).max(0);
             let target_content = (target_border - units(prepared.edges_v)).max(0);
             let measured_content = units(fragment.height) - units(prepared.edges_v);
-            if target_content > measured_content {
+            if target_content != measured_content {
                 let relaid = layout_item(
                     flat,
                     entry.index,
