@@ -98,6 +98,11 @@ fn fixed_tracks_size(template: &super::Template, gap: f32, font: f32) -> Option<
     Some(total + gap * count.saturating_sub(1) as f32)
 }
 
+/// Whether a lanes container stacks items along columns (lanes are columns).
+pub(super) fn column_lanes(style: &Style) -> bool {
+    lane_direction(style).is_some_and(|direction| direction.columns)
+}
+
 /// Whether the real lanes pass lays out this container. Everything else
 /// stays on the previous handling (an ordinary grid or the legacy engine).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
