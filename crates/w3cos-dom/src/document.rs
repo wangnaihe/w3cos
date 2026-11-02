@@ -1689,7 +1689,9 @@ impl Document {
         {
             // :nth-child, :empty, and sibling combinators can change the
             // matched style of existing siblings when the child list changes.
-            self.invalidate_style_subtree(id);
+            if !self.invalidate_child_list_observers(id) {
+                self.invalidate_style_subtree(id);
+            }
         } else {
             // No registered selector observes the sibling list. Restyling the
             // whole parent on every append is quadratic and does not change
@@ -1700,6 +1702,46 @@ impl Document {
             self.invalidate_relational_observers(id);
         }
         self.record_layout_dirty(id);
+    }
+
+    /// A child-list change under `parent` can only change the match result of
+    /// the parent itself (`:empty`) and of children that some rule observes by
+    /// position or through a `+`/`~` combinator. Restyle just those subtrees
+    /// instead of every sibling. Returns false when the rules are not bounded
+    /// that way and the caller must restyle the whole parent subtree.
+    fn invalidate_child_list_observers(&mut self, parent: NodeId) -> bool {
+        if stylesheet::has_relational_dependencies()
+            || !stylesheet::positional_dependencies_bounded()
+            || self
+                .nodes
+                .get(parent.0 as usize)
+                .and_then(Option::as_ref)
+                .is_none_or(|node| node.node_type != NodeType::Element)
+        {
+            return false;
+        }
+        let parent_context = self.selector_context_base(parent);
+        if stylesheet::empty_anchor_matches(&parent_context) {
+            // The parent's own match can flip, and its descendants may be
+            // selected through it.
+            self.invalidate_style_subtree(parent);
+            return true;
+        }
+        self.touch_style_revision(parent);
+        let mut current = self.get_node(parent).first_child;
+        while let Some(child) = current {
+            current = crate::node::sib(self.get_node(child).next_sibling);
+            let observed = self.get_node(child).node_type == NodeType::Element
+                && stylesheet::positional_anchor_matches(
+                    &self.selector_context_base(child),
+                    &parent_context,
+                    false,
+                );
+            if observed {
+                self.invalidate_style_subtree(child);
+            }
+        }
+        true
     }
 
     /// A mutation at `start` can change `:has()` results on its ancestors and,
@@ -1757,6 +1799,14 @@ impl Document {
     /// Invalidate selectors whose subject, ancestor chain, or preceding
     /// siblings can observe a class/id/attribute mutation.
     pub(crate) fn mark_selector_dirty(&mut self, id: NodeId) {
+        if stylesheet::has_sibling_dependencies()
+            && !stylesheet::has_relational_dependencies()
+            && self.invalidate_following_sibling_observers(id)
+        {
+            self.record_layout_dirty(id);
+            self.note_cascade_change();
+            return;
+        }
         let invalidation_root = if stylesheet::has_sibling_dependencies()
             || stylesheet::has_relational_dependencies()
         {
@@ -1772,6 +1822,42 @@ impl Document {
         }
         self.record_layout_dirty(id);
         self.note_cascade_change();
+    }
+
+    /// A class/attribute change on `id` reaches later siblings only through
+    /// `+`/`~`: restyle `id` and the following siblings some such combinator
+    /// can select. False when the rules are not bounded that way.
+    fn invalidate_following_sibling_observers(&mut self, id: NodeId) -> bool {
+        if !stylesheet::positional_dependencies_bounded() {
+            return false;
+        }
+        let Some(parent) = self.get_node(id).parent else {
+            return false;
+        };
+        if self
+            .nodes
+            .get(parent.0 as usize)
+            .and_then(Option::as_ref)
+            .is_none_or(|node| node.node_type != NodeType::Element)
+        {
+            return false;
+        }
+        let parent_context = self.selector_context_base(parent);
+        self.invalidate_style_subtree(id);
+        let mut current = crate::node::sib(self.get_node(id).next_sibling);
+        while let Some(sibling) = current {
+            current = crate::node::sib(self.get_node(sibling).next_sibling);
+            let observed = self.get_node(sibling).node_type == NodeType::Element
+                && stylesheet::positional_anchor_matches(
+                    &self.selector_context_base(sibling),
+                    &parent_context,
+                    true,
+                );
+            if observed {
+                self.invalidate_style_subtree(sibling);
+            }
+        }
+        true
     }
 
     /// Inline declarations cannot change selector matching (unless a selector
@@ -29133,6 +29219,193 @@ mod computed_style_cache_tests {
             document.computed_style_for(first.id).color,
             w3cos_std::Color::rgb(255, 0, 0)
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    fn red() -> w3cos_std::Color {
+        w3cos_std::Color::rgb(255, 0, 0)
+    }
+
+    fn row_list(document: &mut Document, count: usize) -> (Element, Vec<(NodeId, NodeId)>) {
+        let list = document.create_element("div");
+        list.class_list_add(document, "list");
+        document.body().append_child(document, list);
+        let mut rows = Vec::new();
+        for _ in 0..count {
+            let row = document.create_element("div");
+            row.class_list_add(document, "row");
+            let cell = document.create_element("span");
+            cell.class_list_add(document, "cell");
+            row.append_child(document, cell);
+            list.append_child(document, row);
+            rows.push((row.id, cell.id));
+        }
+        (list, rows)
+    }
+
+    #[test]
+    fn appending_a_child_restyles_only_siblings_a_rule_observes_by_position() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".list > .row:last-child .cell", &[("color", "red")]);
+        let mut document = Document::new();
+        let (list, rows) = row_list(&mut document, 4);
+        for (row, cell) in &rows {
+            let _ = (row, document.computed_style_for(*cell));
+        }
+        assert_eq!(document.computed_style_for(rows[3].1).color, red());
+        assert_ne!(document.computed_style_for(rows[2].1).color, red());
+
+        let appended = document.create_element("div");
+        appended.class_list_add(&mut document, "row");
+        let appended_cell = document.create_element("span");
+        appended_cell.class_list_add(&mut document, "cell");
+        appended.append_child(&mut document, appended_cell);
+        list.append_child(&mut document, appended);
+
+        // The previous last row loses :last-child; the rule matches `.row`,
+        // so every row is an anchor and all of them are restyled correctly.
+        assert_ne!(document.computed_style_for(rows[3].1).color, red());
+        assert_eq!(document.computed_style_for(appended_cell.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn child_list_changes_leave_siblings_no_rule_observes_cached() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".list > .row:last-child", &[("color", "red")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        document.body().append_child(&mut document, list);
+        let observed = document.create_element("div");
+        observed.class_list_add(&mut document, "row");
+        let plain = document.create_element("div");
+        plain.class_list_add(&mut document, "plain");
+        let plain_child = document.create_element("span");
+        plain.append_child(&mut document, plain_child);
+        list.append_child(&mut document, plain);
+        list.append_child(&mut document, observed);
+        let _ = document.computed_style_for(plain_child.id);
+        assert_eq!(document.computed_style_for(observed.id).color, red());
+
+        let appended = document.create_element("div");
+        appended.class_list_add(&mut document, "row");
+        list.append_child(&mut document, appended);
+
+        assert!(document.computed_style_cache_is_current(plain_child.id));
+        assert!(!document.computed_style_cache_is_current(observed.id));
+        assert_ne!(document.computed_style_for(observed.id).color, red());
+        assert_eq!(document.computed_style_for(appended.id).color, red());
+
+        // Removing the last row hands :last-child back to the observed row.
+        document.remove_node(appended.id);
+        assert!(document.computed_style_cache_is_current(plain_child.id));
+        assert_eq!(document.computed_style_for(observed.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn a_child_combinator_parent_scopes_positional_anchors() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".list > :first-child", &[("color", "red")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        let other = document.create_element("div");
+        other.class_list_add(&mut document, "other");
+        document.body().append_child(&mut document, list);
+        document.body().append_child(&mut document, other);
+        let in_other = document.create_element("span");
+        other.append_child(&mut document, in_other);
+        let first = document.create_element("span");
+        list.append_child(&mut document, first);
+        assert_eq!(document.computed_style_for(first.id).color, red());
+        let _ = document.computed_style_for(in_other.id);
+
+        let late = document.create_element("span");
+        other.append_child(&mut document, late);
+        // `other` is not a `.list`, so its children are not anchors.
+        assert!(document.computed_style_cache_is_current(in_other.id));
+
+        let before = document.create_element("span");
+        list.insert_before(&mut document, before, first);
+        assert!(!document.computed_style_cache_is_current(first.id));
+        assert_ne!(document.computed_style_for(first.id).color, red());
+        assert_eq!(document.computed_style_for(before.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn nth_child_of_selector_lists_fall_back_to_restyling_every_sibling() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".list > :nth-last-child(1 of :not(.hidden))",
+            &[("color", "red")],
+        );
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        document.body().append_child(&mut document, list);
+        let plain = document.create_element("span");
+        list.append_child(&mut document, plain);
+        let _ = document.computed_style_for(plain.id);
+        let appended = document.create_element("span");
+        list.append_child(&mut document, appended);
+        assert!(!crate::stylesheet::positional_dependencies_bounded());
+        assert!(!document.computed_style_cache_is_current(plain.id));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn empty_pseudo_class_restyles_the_parent_when_a_child_arrives() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".box:empty .x", &[("color", "red")]);
+        crate::stylesheet::register_rule(".box:empty", &[("color", "blue")]);
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.class_list_add(&mut document, "box");
+        document.body().append_child(&mut document, parent);
+        assert_eq!(
+            document.computed_style_for(parent.id).color,
+            w3cos_std::Color::rgb(0, 0, 255)
+        );
+        let child = document.create_element("span");
+        parent.append_child(&mut document, child);
+        assert_ne!(
+            document.computed_style_for(parent.id).color,
+            w3cos_std::Color::rgb(0, 0, 255)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn a_class_change_reaches_only_the_following_siblings_a_combinator_selects() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".on + .next", &[("color", "red")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        document.body().append_child(&mut document, list);
+        let before = document.create_element("span");
+        let target = document.create_element("span");
+        let next = document.create_element("span");
+        next.class_list_add(&mut document, "next");
+        let unrelated = document.create_element("span");
+        for node in [before, target, next, unrelated] {
+            list.append_child(&mut document, node);
+        }
+        for node in [before, target, next, unrelated] {
+            let _ = document.computed_style_for(node.id);
+        }
+        assert_ne!(document.computed_style_for(next.id).color, red());
+
+        target.class_list_add(&mut document, "on");
+
+        assert!(document.computed_style_cache_is_current(before.id));
+        assert!(document.computed_style_cache_is_current(unrelated.id));
+        assert!(!document.computed_style_cache_is_current(next.id));
+        assert_eq!(document.computed_style_for(next.id).color, red());
+        target.class_list_remove(&mut document, "on");
+        assert_ne!(document.computed_style_for(next.id).color, red());
         crate::stylesheet::clear_rules();
     }
 
