@@ -1486,7 +1486,14 @@ fn component_max_content_width(component: &Component) -> f32 {
     let intrinsic_width = if let Some(width) = atomic_inline_intrinsic_width(component, false) {
         width
     } else if component.children.is_empty() {
-        let width = leaf_intrinsic_size(&component.kind, &component.style).0;
+        let width = match &component.kind {
+            // The shared intrinsic measure wraps at a fixed probe width, which
+            // would cap the preferred width of any longer run at ~360px.
+            ComponentKind::Text { content } => {
+                text_intrinsic_size_at(content, &component.style, UNBOUNDED_TEXT_WRAP_WIDTH).0
+            }
+            _ => leaf_intrinsic_size(&component.kind, &component.style).0,
+        };
         if matches!(component.kind, ComponentKind::Text { .. }) {
             // Text measurement already includes padding; the border box adds it below.
             let padding = component.style.padding_lengths();
@@ -3654,6 +3661,18 @@ pub(crate) fn resolve_spacing_for_layout(
 }
 
 pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
+    text_intrinsic_size_at(content, style, DEFAULT_TEXT_WRAP_WIDTH)
+}
+
+/// Wrap probe wide enough that no realistic line breaks: the text's
+/// max-content (single line per hard break) size.
+const UNBOUNDED_TEXT_WRAP_WIDTH: f32 = 1.0e6;
+
+fn text_intrinsic_size_at(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    wrap_width: f32,
+) -> (f32, f32) {
     if let Some(advance) = crate::list_marker::inside_advance(style) {
         let padding = style.padding_lengths();
         return (
@@ -3667,7 +3686,7 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
     #[cfg(not(feature = "skia"))]
     let has_registered_runs = font_runs.iter().any(|run| run.font.is_some());
     let key = text_measure_key(
-        DEFAULT_TEXT_WRAP_WIDTH,
+        wrap_width,
         style,
         registry.cascade_cache_key(style, content),
     );
@@ -3694,14 +3713,9 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         #[cfg(not(feature = "skia"))]
         {
             if has_registered_runs {
-                cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
+                cascade_text_intrinsic_size(content, style, wrap_width)
             } else {
-                text_layout::text_intrinsic_size_font(
-                    content,
-                    style,
-                    DEFAULT_TEXT_WRAP_WIDTH,
-                    layout_font(),
-                )
+                text_layout::text_intrinsic_size_font(content, style, wrap_width, layout_font())
             }
         }
     };
@@ -3726,6 +3740,34 @@ pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style
         cache.entries += 1;
     });
     measured
+}
+
+/// Height of `content` wrapped at the given taffy (content-box when
+/// `box-sizing: content-box`) width.
+fn text_height_at_content_width_for_taffy(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    content_width: f32,
+) -> f32 {
+    let padding = style.padding_lengths();
+    let (wrap_width, vertical) = if style.box_sizing == WBoxSizing::BorderBox {
+        (content_width, 0.0)
+    } else {
+        (
+            content_width + padding.left + padding.right,
+            padding.top + padding.bottom,
+        )
+    };
+    (text_intrinsic_size_at(content, style, wrap_width).1 - vertical).max(0.0)
+}
+
+fn text_max_content_width_for_taffy(content: &str, style: &w3cos_std::style::Style) -> f32 {
+    let width = text_intrinsic_size_at(content, style, UNBOUNDED_TEXT_WRAP_WIDTH).0;
+    if style.box_sizing == WBoxSizing::BorderBox {
+        return width;
+    }
+    let padding = style.padding_lengths();
+    (width - padding.left - padding.right).max(0.0)
 }
 
 fn text_intrinsic_size_for_taffy(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
@@ -4386,6 +4428,7 @@ fn rebuild_for_grid_item_calc(
         None,
         false,
         None,
+        false,
     );
     GRID_ITEM_HINTS.with(|slot| *slot.borrow_mut() = None);
     GRID_CALC_SEEN.with(|seen| seen.set(false));
@@ -4556,6 +4599,7 @@ impl LayoutEngine {
                 None,
                 false,
                 None,
+                false,
             )?);
             self.tree_valid = true;
             if let Some(root_node) = self.root_node {
@@ -4919,6 +4963,7 @@ pub fn compute_with_scroll_details(
         None,
         false,
         None,
+        false,
     )?;
     let root_margins = root_used_margins(
         flat.first().map(|entry| entry.style),
@@ -20172,6 +20217,7 @@ fn build_taffy_tree(
     table_column: Option<usize>,
     parent_table_height_definite: bool,
     inherited_border_spacing: Option<(f32, f32)>,
+    parent_lowered_block_inline: bool,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
@@ -21684,6 +21730,7 @@ fn build_taffy_tree(
                 comp.style.display,
                 WDisplay::InlineBlock | WDisplay::InlineFlex
             ) && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
+        let mut wide_text_width: Option<f32> = None;
         let (min_w, size_w) = if passive_inline_edges
             && !matches!(comp.kind, ComponentKind::Text { .. })
         {
@@ -21779,6 +21826,38 @@ fn build_taffy_tree(
                             ))
                     {
                         let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
+                        if inline_text_in_block
+                            && !nowrap
+                            && !absolute_auto_shrink_to_fit
+                            && comp.style.float == WFloat::None
+                            && containing_width.is_finite()
+                            && containing_width > 0.0
+                        {
+                            // The intrinsic measure above wraps at a fixed 360px
+                            // probe width, so text wider than that would be
+                            // locked to a narrow, many-line box inside a wide
+                            // block. CSS shrink-to-fit: the preferred (max-content)
+                            // width bounded by the containing block, never below
+                            // the longest unbreakable run.
+                            let padding = comp.style.padding_lengths();
+                            let edges = padding.left
+                                + padding.right
+                                + comp
+                                    .style
+                                    .border_left_width
+                                    .unwrap_or(comp.style.border_width)
+                                + comp
+                                    .style
+                                    .border_right_width
+                                    .unwrap_or(comp.style.border_width);
+                            let used =
+                                shrink_to_fit_used_width_with_available(comp, containing_width);
+                            w = if comp.style.box_sizing == WBoxSizing::ContentBox {
+                                (used - edges).max(0.0)
+                            } else {
+                                used
+                            };
+                        }
                         if comp.style.display == WDisplay::InlineBlock {
                             w += comp
                                 .style
@@ -21880,6 +21959,21 @@ fn build_taffy_tree(
                             );
                         let mut w = if pre_wrap_flex_text {
                             component_min_content_width(comp)
+                        } else if (inline_text_in_block
+                            || (parent_lowered_block_inline
+                                && comp.style.display == WDisplay::Inline))
+                            && comp.style.white_space != WWhiteSpace::NoWrap
+                            && containing_width.is_finite()
+                            && containing_width > 0.0
+                        {
+                            // Preferred (single-line) width bounded by the
+                            // containing block. The fixed 360px wrap probe
+                            // would otherwise lock wide text into a narrow
+                            // many-line box.
+                            let wide = text_max_content_width_for_taffy(content, &comp.style)
+                                .min(containing_width);
+                            wide_text_width = Some(wide);
+                            wide
                         } else {
                             text_intrinsic_size_for_taffy(content, &comp.style).0
                         };
@@ -22030,10 +22124,19 @@ fn build_taffy_tree(
         let table_cell_track_width = (comp.style.display == WDisplay::TableCell
             && inherited_cell_tracks.is_some())
         .then_some(style.size.width);
+        // The shared leaf height wraps at the fixed 360px probe; a text leaf
+        // given its true single-line/wide width needs the matching height.
+        let (leaf_height, min_h) = match (&comp.kind, wide_text_width) {
+            (ComponentKind::Text { content }, Some(width)) if min_h.into_option().is_some() => {
+                let height = text_height_at_content_width_for_taffy(content, &comp.style, width);
+                (Dimension::length(height), Dimension::length(height))
+            }
+            _ => (size.height, min_h),
+        };
         let mut leaf_style = Style {
             size: Size {
                 width: size_w,
-                height: size.height,
+                height: leaf_height,
             },
             min_size: Size {
                 width: min_w,
@@ -22344,6 +22447,7 @@ fn build_taffy_tree(
                                     | WDisplay::TableFooterGroup
                             )),
                     active_border_spacing,
+                    lowered_block_inline,
                 );
                 if is_grid_item {
                     GRID_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
@@ -43778,6 +43882,62 @@ mod tests {
             wrapper.width > 150.0,
             "wrapper lost its text width: {wrapper:?}"
         );
+    }
+
+    #[test]
+    fn inline_text_wider_than_the_wrap_probe_keeps_its_single_line_width_in_a_block() {
+        // Text longer than the fixed 360px intrinsic wrap probe must size to
+        // its real max-content width (bounded by the containing block), not to
+        // the probe-wrapped width.
+        let text = "n ".repeat(48);
+        let style = Style {
+            display: WDisplay::Inline,
+            font_size: 12.0,
+            ..Style::default()
+        };
+        let single_line = text_intrinsic_size_at(&text, &style, UNBOUNDED_TEXT_WRAP_WIDTH);
+        assert!(single_line.0 > 400.0, "fixture must exceed the probe width");
+        let layout = compute(
+            &Component::column(
+                Style {
+                    display: WDisplay::Block,
+                    font_size: 12.0,
+                    ..Style::default()
+                },
+                vec![Component::text(text.clone(), style.clone())],
+            ),
+            1264.0,
+            800.0,
+        )
+        .unwrap();
+        let (rect, _) = layout
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .expect("text leaf");
+        assert!(
+            (rect.width - single_line.0).abs() < 0.5,
+            "width {} should be the single-line width {}",
+            rect.width,
+            single_line.0
+        );
+        assert!(
+            rect.height < single_line.1 * 1.5,
+            "height {} should be a single line, not wrapped at the probe width",
+            rect.height
+        );
+    }
+
+    #[test]
+    fn max_content_width_of_a_text_leaf_is_not_capped_by_the_wrap_probe() {
+        let text = "n".repeat(256);
+        let style = Style {
+            font_size: 12.0,
+            ..Style::default()
+        };
+        let component = Component::text(text.clone(), style.clone());
+        let expected = text_intrinsic_size_at(&text, &style, UNBOUNDED_TEXT_WRAP_WIDTH).0;
+        assert!(expected > 1000.0);
+        assert!((component_max_content_width(&component) - expected).abs() < 0.5);
     }
 
     #[test]
