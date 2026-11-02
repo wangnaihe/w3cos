@@ -1789,6 +1789,25 @@ impl Document {
             }
             previous = crate::node::sib(self.get_node(id).prev_sibling);
         }
+        // `:last-of-type` flips only on the last earlier sibling of the
+        // appended element's own type.
+        let previous_of_type = if stylesheet::following_of_type_needed(parent_context) {
+            let mut candidate = previous;
+            while let Some(id) = candidate {
+                if self
+                    .get_node(id)
+                    .tag
+                    .as_str()
+                    .eq_ignore_ascii_case(&self.get_node(new_last).tag.as_str())
+                {
+                    break;
+                }
+                candidate = self.previous_element_sibling_id(id);
+            }
+            candidate
+        } else {
+            None
+        };
         if stylesheet::following_scan_needed(parent_context) {
             let mut current = self.get_node(parent).first_child;
             while let Some(child) = current {
@@ -1801,14 +1820,24 @@ impl Document {
                     &context,
                     parent_context,
                     Some(child) == previous,
+                    Some(child) == previous_of_type,
                 ) {
                     self.invalidate_style_subtree(child);
                 }
             }
-        } else if let Some(previous) = previous {
-            let context = self.selector_context_base(previous);
-            if stylesheet::following_anchor_matches(&context, parent_context, true) {
-                self.invalidate_style_subtree(previous);
+            return;
+        }
+        for (id, last, of_type) in [
+            (previous, true, previous == previous_of_type),
+            (previous_of_type, false, true),
+        ] {
+            let Some(id) = id else { continue };
+            if !last && Some(id) == previous {
+                continue;
+            }
+            let context = self.selector_context_base(id);
+            if stylesheet::following_anchor_matches(&context, parent_context, last, of_type) {
+                self.invalidate_style_subtree(id);
             }
         }
     }
@@ -29416,9 +29445,13 @@ mod computed_style_cache_tests {
             (".list > .row:only-child", LAST_ONLY),
             (".list > .row:not(:last-child)", LAST_ONLY),
             (".list > .row:nth-last-child(2)", ALL),
-            (".list > .row:last-of-type", ALL),
+            (".list > .row:last-of-type", LAST_ONLY),
+            (".list > .row:only-of-type", LAST_ONLY),
+            (".list > .row:not(:last-of-type)", LAST_ONLY),
+            (".list > .row:last-child:last-of-type", LAST_ONLY),
+            (".list > .row:nth-last-of-type(2)", ALL),
+            (".list > .row:not(:nth-last-of-type(2))", ALL),
             (".list > .row:has(+ .row)", ALL),
-            (".list > .row:not(:last-of-type)", ALL),
             (".list > .row:not(:has(+ .row))", ALL),
             (".list:has(> .row:last-child) > .row", ALL),
         ] {
@@ -29448,6 +29481,67 @@ mod computed_style_cache_tests {
             }
             // The appended node is always styled from scratch and correctly.
             let _ = document.computed_style_for(appended.id);
+            crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn tail_append_of_type_only_restyles_the_last_sibling_of_the_same_type() {
+        for extra_rule in [None, Some(".list > .other:nth-last-child(9)")] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(".list > .row:last-of-type", &[("color", "red")]);
+            if let Some(extra) = extra_rule {
+                crate::stylesheet::register_rule(extra, &[("width", "3px")]);
+            }
+            let mut document = Document::new();
+            let list = document.create_element("div");
+            list.class_list_add(&mut document, "list");
+            document.body().append_child(&mut document, list);
+            let tags = ["div", "span", "div", "span", "i"];
+            let mut rows = Vec::new();
+            for tag in tags {
+                let row = document.create_element(tag);
+                row.class_list_add(&mut document, "row");
+                list.append_child(&mut document, row);
+                rows.push(row);
+                for row in &rows {
+                    let _ = document.computed_style_for(row.id);
+                }
+            }
+            let is_red = |document: &mut Document, row: Element| {
+                document.computed_style_for(row.id).color == red()
+            };
+            // last of type: the second div (index 2), second span (3), the i (4).
+            assert!(!is_red(&mut document, rows[0]));
+            assert!(is_red(&mut document, rows[2]));
+            assert!(is_red(&mut document, rows[3]));
+            assert!(is_red(&mut document, rows[4]));
+
+            // A new span takes `:last-of-type` from the earlier span only.
+            let span = document.create_element("span");
+            span.class_list_add(&mut document, "row");
+            list.append_child(&mut document, span);
+            let observed = |document: &Document, row: Element| {
+                !document.computed_style_cache_is_current(row.id)
+            };
+            assert!(!observed(&document, rows[0]), "{extra_rule:?}: first div");
+            assert!(!observed(&document, rows[1]), "{extra_rule:?}: first span");
+            assert!(!observed(&document, rows[2]), "{extra_rule:?}: last div");
+            assert!(observed(&document, rows[3]), "{extra_rule:?}: earlier span");
+            assert!(!observed(&document, rows[4]), "{extra_rule:?}: i");
+            assert!(!is_red(&mut document, rows[3]));
+            assert!(is_red(&mut document, span));
+            assert!(is_red(&mut document, rows[2]));
+            assert!(is_red(&mut document, rows[4]));
+
+            // A tag nobody else uses restyles nothing and is styled correctly.
+            let section = document.create_element("section");
+            section.class_list_add(&mut document, "row");
+            list.append_child(&mut document, section);
+            for row in &rows {
+                assert!(!observed(&document, *row), "{extra_rule:?}: unrelated type");
+            }
+            assert!(is_red(&mut document, section));
             crate::stylesheet::clear_rules();
         }
     }
