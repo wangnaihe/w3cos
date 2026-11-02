@@ -10927,3 +10927,65 @@ fn grid_short_height_overflow_matches_chrome() {
         assert_eq!(run(AlignContent::SpaceEvenly, rows), (50.0, 0.0, 44.0));
     }
 }
+
+/// A generated `::before { content: "" }` is lowered to an empty text leaf
+/// that keeps the pseudo-element's display: a block-level one is an empty
+/// box with its own size and borders, and an empty inline one generates
+/// nothing.
+#[test]
+fn empty_text_leaves_are_boxes_or_nothing() {
+    let sized = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        border_width: 1.0,
+        ..block()
+    };
+    let inline = Style {
+        display: Display::Inline,
+        ..block()
+    };
+    let tall = Style {
+        height: Dimension::Px(10.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            Component::text("", sized),
+            Component::text("", inline),
+            node(tall, vec![]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&rects, 1), (0.0, 0.0, 102.0, 52.0));
+    assert_eq!(rect(&rects, 3), (0.0, 52.0, 800.0, 10.0));
+    assert_eq!(rect(&rects, 0).3, 62.0);
+}
+
+/// The empty text nodes around a `<br>` that follows an atomic inline stay
+/// on the legacy path: this engine stacks that break differently.
+#[test]
+fn empty_text_beside_a_break_after_a_box_stays_legacy() {
+    let atomic = Style {
+        display: Display::InlineBlock,
+        height: Dimension::Px(20.0),
+        width: Dimension::Px(40.0),
+        ..block()
+    };
+    let inline = Style {
+        display: Display::Inline,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(atomic, vec![]),
+            Component::text("", inline.clone()),
+            Component::text("\u{2028}", inline.clone()),
+            Component::text("", inline),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+}

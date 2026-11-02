@@ -301,10 +301,103 @@ pub(crate) fn layout_tree_with_text(
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
+    let _ = root;
+    // A generated `::before`/`::after` with `content: ""` is lowered to an
+    // empty text leaf that keeps the pseudo-element's own display. A
+    // block-level or atomic one is an empty box here, as in the box tree.
+    // An empty inline text node generates no box at all (CSS Text 3 §4.1:
+    // collapsed away; it adds nothing to a line, and a flex or grid parent
+    // makes no item of it).
+    let hidden: Vec<(usize, w3cos_std::style::Style)> = flat
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            is_empty_inline_text(node)
+                && !node
+                    .parent
+                    .is_some_and(|parent| parent_has_break_beside_boxes(flat, parent))
+        })
+        .map(|(index, node)| {
+            let mut style = node.style.clone();
+            style.display = w3cos_std::style::Display::None;
+            (index, style)
+        })
+        .collect();
+    if !hidden.is_empty() {
+        let flat_hidden = run_in_patched(flat, &hidden);
+        let patched: Vec<FlatNodeInfo> = flat_hidden
+            .iter()
+            .map(|node| FlatNodeInfo {
+                kind: if is_empty_box_leaf(node) {
+                    &EMPTY_BOX
+                } else {
+                    node.kind
+                },
+                ..*node
+            })
+            .collect();
+        return layout_tree_balanced(&patched, viewport_w, viewport_h);
+    }
+    if flat.iter().any(is_empty_box_leaf) {
+        let patched: Vec<FlatNodeInfo> = flat
+            .iter()
+            .map(|node| FlatNodeInfo {
+                kind: if is_empty_box_leaf(node) {
+                    &EMPTY_BOX
+                } else {
+                    node.kind
+                },
+                ..*node
+            })
+            .collect();
+        return layout_tree_balanced(&patched, viewport_w, viewport_h);
+    }
+    layout_tree_balanced(flat, viewport_w, viewport_h)
+}
+
+static EMPTY_BOX: ComponentKind = ComponentKind::Box;
+
+fn is_empty_box_leaf(node: &FlatNodeInfo) -> bool {
+    matches!(node.kind, ComponentKind::Text { content } if content.is_empty())
+        && matches!(
+            node.style.display,
+            w3cos_std::style::Display::Block | w3cos_std::style::Display::InlineBlock
+        )
+}
+
+/// A parent holding both a forced break (`<br>`, U+2028) and a non-text
+/// child. Its line boxes put the break after an atomic inline, which this
+/// engine stacks differently from the legacy layout, so the empty text
+/// nodes around such a break keep the container on the legacy path.
+fn parent_has_break_beside_boxes(flat: &[FlatNodeInfo], parent: usize) -> bool {
+    let end = flat[parent].subtree_end;
+    let mut breaks = false;
+    let mut boxes = false;
+    let mut child = parent + 1;
+    while child < end {
+        match flat[child].kind {
+            ComponentKind::Text { content } if content.contains('\u{2028}') => breaks = true,
+            ComponentKind::Text { .. } => {}
+            _ => boxes = true,
+        }
+        child = flat[child].subtree_end.max(child + 1);
+    }
+    breaks && boxes
+}
+
+fn is_empty_inline_text(node: &FlatNodeInfo) -> bool {
+    matches!(node.kind, ComponentKind::Text { content } if content.is_empty())
+        && node.style.display == w3cos_std::style::Display::Inline
+}
+
+fn layout_tree_balanced(
+    flat: &[FlatNodeInfo],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
     // `flex-wrap: balance` is stored by the cascade as `nowrap` plus a
     // marker (legacy keeps it unrecognized); this engine reads it as a
     // balanced wrap.
-    let _ = root;
     let balanced = balanced_wrap_styles(flat);
     if balanced.is_empty() {
         return layout_logical(flat, viewport_w, viewport_h);
