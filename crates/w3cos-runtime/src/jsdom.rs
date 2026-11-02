@@ -9832,10 +9832,61 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     let rect = if stored.width != 0.0 || stored.height != 0.0 || stored.x != 0.0 || stored.y != 0.0
     {
         stored
+    } else if let Some(rect) = merged_inline_text_rect(node) {
+        rect
     } else {
         live
     };
     apply_css_motion_to_rect(node, rect)
+}
+
+/// An inline element whose only content is text is merged into the enclosing
+/// block's text run, so layout gives it no rect of its own and it would read
+/// back as 0x0 even though it renders text. Measure that text on its own,
+/// wrapped at the enclosing block's width, as a browser's inline box would.
+fn merged_inline_text_rect(node: u32) -> Option<w3cos_dom::DOMRect> {
+    if dom::node_type(node) != 1 || !dom::is_connected(node) {
+        return None;
+    }
+    let children = dom::children(node);
+    if children.is_empty() || children.iter().any(|child| dom::node_type(*child) != 3) {
+        return None;
+    }
+    let parent = dom::parent_node(node)?;
+    let parent_rect = dom::bounding_rect(parent);
+    // A hidden ancestor lays out as 0x0; only a laid-out block yields a box.
+    if parent_rect.width <= 0.0 || parent_rect.height <= 0.0 {
+        return None;
+    }
+    let style = dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)));
+    if style.display != w3cos_std::style::Display::Inline {
+        return None;
+    }
+    let mut ancestor = Some(parent);
+    while let Some(id) = ancestor {
+        let hidden = dom::with_document(|document| {
+            document.computed_style_for(NodeId::from_u32(id)).display
+                == w3cos_std::style::Display::None
+        });
+        if hidden {
+            return None;
+        }
+        ancestor = dom::parent_node(id);
+    }
+    let text = children
+        .iter()
+        .filter_map(|child| dom::get_text_content(*child))
+        .collect::<String>();
+    if text.is_empty() || text.chars().all(char::is_whitespace) {
+        return None;
+    }
+    let (width, height) = crate::layout::inline_text_box_size(&text, &style, parent_rect.width);
+    Some(w3cos_dom::DOMRect::new(
+        parent_rect.x,
+        parent_rect.y,
+        width,
+        height,
+    ))
 }
 
 /// Border box of a definite px width and height whose position is unchanged
@@ -24066,6 +24117,12 @@ mod tests {
         setup();
         set_viewport(1280.0, 800.0);
         let document = document_value();
+        // A stylesheet is present in the editor, so authored-rule layout runs.
+        let sheet = document.call_method("createElement", vec![Value::string("style")]);
+        sheet.set_property("textContent", Value::string(".zz { color: red; }"));
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![sheet]);
         let container = document.call_method("createElement", vec![Value::string("div")]);
         let container_style = container.get_property("style");
         container_style.set_property("position", Value::string("absolute"));
@@ -24089,13 +24146,6 @@ mod tests {
         document
             .get_property("body")
             .call_method("appendChild", vec![container.clone()]);
-        // The first read flushes layout; read again once geometry exists.
-        let _ = reg.get_property("offsetWidth");
-        reg.call_method(
-            "appendChild",
-            vec![document.call_method("createElement", vec![Value::string("div")])],
-        );
-        let _ = reg.get_property("offsetWidth");
         let mut advances = vec![];
         for (chr, span) in &spans {
             let width = span.get_property("offsetWidth").to_number() / 256.0;
@@ -24111,6 +24161,39 @@ mod tests {
             advances.push(width);
         }
         assert!(advances[0] > 5.0, "n advance {}", advances[0]);
+    }
+
+    #[test]
+    fn inline_span_holding_only_text_has_a_measured_box() {
+        setup();
+        set_viewport(1280.0, 800.0);
+        let document = document_value();
+        let host = document.call_method("createElement", vec![Value::string("div")]);
+        host.get_property("style")
+            .set_property("fontSize", Value::string("12px"));
+        let span = document.call_method("createElement", vec![Value::string("span")]);
+        span.set_property("textContent", Value::string("hello world"));
+        host.call_method("appendChild", vec![span.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![host.clone()]);
+        let width = span.get_property("offsetWidth").to_number();
+        let height = span.get_property("offsetHeight").to_number();
+        assert!(width > 20.0 && width < 200.0, "span width {width}");
+        assert!(height > 8.0 && height < 30.0, "span height {height}");
+        // Content that is hidden from the start reads as an empty box.
+        let hidden = document.call_method("createElement", vec![Value::string("div")]);
+        hidden
+            .get_property("style")
+            .set_property("display", Value::string("none"));
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        inner.set_property("textContent", Value::string("hello world"));
+        hidden.call_method("appendChild", vec![inner.clone()]);
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![hidden]);
+        assert_eq!(inner.get_property("offsetWidth").to_number(), 0.0);
+        assert_eq!(inner.get_property("offsetHeight").to_number(), 0.0);
     }
 
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
