@@ -11069,3 +11069,214 @@ fn flex_row_item_transfers_width_from_definite_height() {
         assert_eq!(rect(&ng, 2), (0.0, 0.0, width, 100.0));
     }
 }
+
+/// `flex-basis: content` ignores the item's own main size: the flex base size
+/// is the content size, here transferred through the aspect ratio
+/// (css/css-sizing/aspect-ratio/flex-aspect-ratio-021, -022).
+#[test]
+fn flex_basis_content_uses_the_ratio_transferred_size() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    for column in [false, true] {
+        let item = with_markers(
+            Style {
+                width: Dimension::Px(if column { 100.0 } else { 20.0 }),
+                height: Dimension::Px(if column { 20.0 } else { 100.0 }),
+                min_width: Dimension::Px(0.0),
+                min_height: Dimension::Px(0.0),
+                ..block()
+            },
+            &[
+                ("--w3cos-internal-aspect-ratio", "1"),
+                ("--w3cos-internal-flex-basis-content", "1"),
+            ],
+        );
+        let flex = Style {
+            display: Display::Flex,
+            flex_direction: if column {
+                FlexDirection::Column
+            } else {
+                FlexDirection::Row
+            },
+            flex_wrap: FlexWrap::NoWrap,
+            ..Style::default()
+        };
+        let root = node(block(), vec![node(flex, vec![node(item, vec![])])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0), "column={column}");
+    }
+}
+
+/// css-sizing-4 aspect-ratio, a column flex item stretched to a definite
+/// width keeps its transferred block size as its automatic minimum, so it
+/// does not shrink into a 0-height container
+/// (css/css-sizing/aspect-ratio/flex-aspect-ratio-046).
+#[test]
+fn flex_column_item_min_auto_holds_the_transferred_block_size() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let item = with_markers(Style::default(), &[("--w3cos-internal-aspect-ratio", "1")]);
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        flex_wrap: FlexWrap::NoWrap,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(0.0),
+        ..Style::default()
+    };
+    let root = node(block(), vec![node(flex, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// A row flex item with a percentage height against the container's definite
+/// height transfers its width through the ratio even when the container is
+/// 0 wide (css/css-sizing/aspect-ratio/flex-aspect-ratio-047).
+#[test]
+fn flex_row_item_percent_height_transfers_width() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let item = with_markers(
+        Style {
+            height: Dimension::Percent(100.0),
+            ..block()
+        },
+        &[("--w3cos-internal-aspect-ratio", "1")],
+    );
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::NoWrap,
+        width: Dimension::Px(0.0),
+        height: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let root = node(block(), vec![node(flex, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// css-sizing-4 aspect-ratio on an image with one specified axis: the CSS
+/// ratio replaces the natural one (aspect-ratio/replaced-element-001,
+/// flex-aspect-ratio-015).
+#[test]
+fn image_css_aspect_ratio_derives_the_auto_axis() {
+    use w3cos_std::style::{Display, FlexDirection, FlexWrap};
+    let source = "w3cos-ng-css-ratio-8x16.png";
+    let image = image::RgbaImage::from_pixel(8, 16, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let marked = |style: Style| {
+        Component::image(
+            source,
+            with_markers(
+                Style {
+                    display: Display::Block,
+                    ..style
+                },
+                &[("--w3cos-internal-aspect-ratio", "1")],
+            ),
+        )
+    };
+    let in_block = node(
+        block(),
+        vec![marked(Style {
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        })],
+    );
+    let flat = pre_flatten(&in_block);
+    let ng = layout_tree(&in_block, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0));
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::NoWrap,
+        ..Style::default()
+    };
+    let in_flex = node(
+        block(),
+        vec![node(
+            flex,
+            vec![marked(Style {
+                height: Dimension::Px(100.0),
+                ..Style::default()
+            })],
+        )],
+    );
+    let flat = pre_flatten(&in_flex);
+    let ng = layout_tree(&in_flex, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// A broken image has no natural ratio to replace: the CSS ratio must not
+/// resize it (aspect-ratio/replaced-element-028).
+#[test]
+fn broken_image_ignores_css_aspect_ratio() {
+    use w3cos_std::style::Display;
+    let image = Component::image(
+        "missing-ratio.png",
+        with_markers(
+            Style {
+                display: Display::Block,
+                width: Dimension::Px(100.0),
+                ..Style::default()
+            },
+            &[("--w3cos-internal-aspect-ratio", "0.2")],
+        ),
+    );
+    let root = node(block(), vec![image]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_ne!(rect(&ng, 1).3, 500.0);
+}
+
+/// An image with a CSS ratio but no authored size keeps its natural box,
+/// and an `object-fit` image keeps it too (the fit is not painted).
+#[test]
+fn image_ratio_without_authored_size_or_with_object_fit_keeps_natural_box() {
+    use w3cos_std::style::Display;
+    let source = "w3cos-ng-css-ratio-8x16.png";
+    let image = image::RgbaImage::from_pixel(8, 16, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let case = |style: Style, markers: &[(&str, &str)]| {
+        let img = Component::image(
+            source,
+            with_markers(
+                Style {
+                    display: Display::Block,
+                    ..style
+                },
+                markers,
+            ),
+        );
+        let root = node(block(), vec![img]);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("ng bailed: {:?}", block::unsupported_reasons(&flat)));
+        rect(&ng, 1)
+    };
+    let none = case(Style::default(), &[("--w3cos-internal-aspect-ratio", "2")]);
+    assert_eq!((none.2, none.3), (8.0, 16.0));
+    let fitted = case(
+        Style {
+            height: Dimension::Px(100.0),
+            ..Style::default()
+        },
+        &[
+            ("--w3cos-internal-aspect-ratio", "3"),
+            ("--w3cos-internal-object-fit", "contain"),
+        ],
+    );
+    assert_eq!((fitted.2, fitted.3), (8.0 * 100.0 / 16.0, 100.0));
+}

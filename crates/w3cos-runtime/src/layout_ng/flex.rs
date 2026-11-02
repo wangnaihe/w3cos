@@ -594,7 +594,7 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
             w3cos_std::ComponentKind::Text { .. } | w3cos_std::ComponentKind::Button { .. }
         )
         && block::marker(info.style, "--w3cos-internal-aspect-ratio").is_some()
-        && matches!(info.style.height, Dimension::Px(_))
+        && matches!(info.style.height, Dimension::Px(_) | Dimension::Percent(_))
     {
         let style = info.style;
         let side = |spacing| spacing_px(style, spacing, 0.0, space);
@@ -1321,6 +1321,12 @@ fn column_aspect_main(style: &Style, content_width: f32) -> Option<f32> {
     if !matches!(style.height, Dimension::Auto) || matches!(style.width, Dimension::Auto) {
         return None;
     }
+    aspect_block_size(style, content_width)
+}
+
+/// The block size a content width transfers through the `aspect-ratio`
+/// marker (a width/height ratio), whatever the item's own sizes are.
+fn aspect_block_size(style: &Style, content_width: f32) -> Option<f32> {
     let ratio = style
         .custom_properties
         .as_ref()?
@@ -1599,7 +1605,10 @@ fn flex_base(
     };
     // A percentage flex-basis against an indefinite container main size
     // behaves as `content` (css-flexbox §7.2.1; percentage-heights-017).
-    let resolved = if !row && inner.is_none() && matches!(basis, Dimension::Percent(_)) {
+    let resolved = if (!row && inner.is_none() && matches!(basis, Dimension::Percent(_)))
+        || (matches!(style.flex_basis, Dimension::Auto)
+            && has_marker(style, "--w3cos-internal-flex-basis-content"))
+    {
         Some(None)
     } else {
         definite(basis, inner, style, space)
@@ -2326,6 +2335,18 @@ fn layout_with(
                 ..*space
             };
             &basis_space
+        } else if row
+            && matches!(child_style.height, Dimension::Percent(_))
+            && has_marker(child_style, "--w3cos-internal-aspect-ratio")
+            && let Some(height) = specified_height
+        {
+            // A percentage height resolves against the container's content
+            // height, so the ratio can transfer it to the width.
+            basis_space = ConstraintSpace {
+                percentage_block: Some(height),
+                ..*space
+            };
+            &basis_space
         } else {
             space
         };
@@ -2478,12 +2499,35 @@ fn layout_with(
                 None => None,
             };
         }
+        let content_basis = matches!(child_style.flex_basis, Dimension::Auto)
+            && has_marker(child_style, "--w3cos-internal-flex-basis-content");
         let basis_auto = (matches!(child_style.flex_basis, Dimension::Auto)
             && matches!(child_style.height, Dimension::Auto))
+            || content_basis
             // A percentage basis with an indefinite main size is `content`.
             || (inner_main.is_none()
                 && matches!(child_style.flex_basis, Dimension::Percent(_)));
-        let measured = if !row && basis_auto {
+        // `flex-basis: content` on a column item with an aspect ratio and a
+        // definite width: the block size transferred from that width, not
+        // the item's own `height` (css-flexbox §9.2.3 B; flex-aspect-ratio-022).
+        let content_ratio = if !row && content_basis && !block::is_replaced(flat[child].kind) {
+            let mut as_auto = child_style.clone();
+            as_auto.height = Dimension::Auto;
+            column_aspect_main(
+                &as_auto,
+                to_content(
+                    child_style,
+                    item_edges(child_style, space, inner_width, true),
+                    block::resolve_length(child_style.width, Some(inner_width), child_style, space)
+                        .unwrap_or(0.0),
+                ),
+            )
+        } else {
+            None
+        };
+        let measured = if let Some(height) = content_ratio {
+            Some(height)
+        } else if !row && basis_auto {
             let laid = layout_item(
                 flat,
                 child,
@@ -2517,6 +2561,21 @@ fn layout_with(
                     && !block::computed_scrolls_in_axis(child_style, false) =>
             {
                 height.min(max)
+            }
+            // A non-replaced column item's content size suggestion transfers
+            // its used (stretched or definite) width through the aspect
+            // ratio (Blink ComputeMinMaxSizes; flex-aspect-ratio-046).
+            (kind, _)
+                if !row
+                    && !block::is_replaced(kind)
+                    && matches!(child_style.min_height, Dimension::Auto)
+                    && matches!(child_style.height, Dimension::Auto)
+                    && !block::computed_scrolls_in_axis(child_style, false) =>
+            {
+                match cross.and_then(|width| aspect_block_size(child_style, width)) {
+                    Some(height) => min.max(height).min(max),
+                    None => min,
+                }
             }
             _ => min,
         };

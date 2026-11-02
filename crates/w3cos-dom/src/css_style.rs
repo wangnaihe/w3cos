@@ -1330,6 +1330,17 @@ impl CSSStyleDeclaration {
                     set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
+            "object-fit" | "objectFit" => {
+                // Not painted yet; the marker lets layout keep the natural
+                // box of a fitted image instead of stretching it.
+                let keyword = value.trim().to_ascii_lowercase();
+                let fitted = !matches!(keyword.as_str(), "" | "fill" | "initial");
+                set_marker(
+                    &mut self.inner,
+                    "--w3cos-internal-object-fit",
+                    fitted.then_some(keyword),
+                );
+            }
             "aspect-ratio" | "aspectRatio" => {
                 if let Some(ratio) = parse_aspect_ratio(value) {
                     set_marker(

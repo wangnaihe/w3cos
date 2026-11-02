@@ -142,6 +142,9 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             | "size-containment"
             | "contain-intrinsic-size"
             | "flex-basis-content"
+            // Authored `object-fit`: read only to keep a fitted image's
+            // natural box (the fit itself is not painted).
+            | "object-fit"
             | "vertical-flex"
             | "vertical-grid"
             | "vertical-grid-item"
@@ -1923,13 +1926,44 @@ fn replaced_content_size(src: &str, style: &Style, space: &ConstraintSpace) -> O
         Some(space.available_inline)
     };
     if limits.iter().all(Option::is_none) {
-        return Some(crate::layout::image_intrinsic_size(
-            src, &definite, containing,
-        ));
+        let size = crate::layout::image_intrinsic_size(src, &definite, containing);
+        return Some(css_ratio_replaced_size(src, &definite, size));
     }
     Some(constrained_replaced_size(
         src, &definite, containing, limits,
     ))
+}
+
+/// A CSS `aspect-ratio` replaces an image's natural ratio when exactly one
+/// axis is specified: the other axis follows it (css-sizing-4 §4.1;
+/// aspect-ratio/replaced-element-001). `auto <ratio>` keeps the natural
+/// ratio when the image has one. Both axes auto keep the natural size.
+fn css_ratio_replaced_size(src: &str, definite: &Style, size: (f32, f32)) -> (f32, f32) {
+    let Some(ratio) = marker(definite, "--w3cos-internal-aspect-ratio")
+        .and_then(|raw| raw.parse::<f32>().ok())
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+    else {
+        return size;
+    };
+    // `object-fit` is not painted: an image that fits its content into a
+    // ratio box would be stretched, so the natural box is kept
+    // (aspect-ratio/replaced-element-024).
+    if marker(definite, "--w3cos-internal-object-fit").is_some() {
+        return size;
+    }
+    // A broken image has no natural ratio to replace.
+    let Some(natural) = crate::layout::image_intrinsic_ratio(src) else {
+        return size;
+    };
+    if marker(definite, "--w3cos-internal-aspect-ratio-auto").is_some() && natural > 0.0 {
+        return size;
+    }
+    match (definite.width, definite.height) {
+        (Dimension::Auto, Dimension::Auto) => size,
+        (Dimension::Auto, _) => (size.1 * ratio, size.1),
+        (_, Dimension::Auto) => (size.0, size.0 / ratio),
+        _ => size,
+    }
 }
 
 /// Used content-box size of a replaced item (`None`: not a replaced item;
@@ -4362,6 +4396,16 @@ pub(super) fn layout_block_in(
                 override_replaced_axis(&mut definite, true);
                 definite.min_width = Dimension::Auto;
                 definite.max_width = Dimension::Auto;
+                if style.width == Dimension::Auto
+                    && style.height == Dimension::Auto
+                    && matches!(info.kind, ComponentKind::Image { .. })
+                    && let Some(properties) = definite.custom_properties.as_mut()
+                {
+                    // Neither axis is authored: the width override is the
+                    // natural (or shrink-to-fit) one, which the CSS ratio
+                    // does not re-derive (grid/nested-grid-item-block-size-001).
+                    properties.remove("--w3cos-internal-aspect-ratio");
+                }
                 let mut height = replaced_size(info.kind, &definite, space)?.1;
                 // An image with no known ratio (not decoded: the 200x200
                 // placeholder) that a flex item's max-width or shrinking
