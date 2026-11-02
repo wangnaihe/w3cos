@@ -207,7 +207,7 @@ fn pack_keyword(keyword: &str, rtl: bool) -> Pack {
 }
 
 /// Block-axis baseline alignment covers plain horizontal grids of items
-/// with a known first or last baseline: no subgrid, lanes, `inline-grid`,
+/// with a known first or last baseline: no subgrid, lanes,
 /// vertical writing mode, grid-container items (whose baseline this engine
 /// does not export for a block grid), or auto margins in the block axis.
 fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
@@ -221,7 +221,12 @@ fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
     // row-grid-lanes-item-baseline-003).
     let style = flat[container].style;
     (matches!(style.height, Dimension::Px(_))
-        || (columns_spec(style).is_none() && style.grid_rows().is_none()))
+        || (columns_spec(style).is_none() && style.grid_rows().is_none())
+        // An inline-grid whose rows are all fixed px has a definite
+        // content height, so its row baselines do not feed a size cycle.
+        || (block::is_inline_grid(style)
+            && parse_template(style.grid_rows().unwrap_or(""), true)
+                .is_some_and(|rows| fixed_px_sum(&rows).is_some())))
         && baseline_shape_supported(flat, container, child)
 }
 
@@ -235,7 +240,6 @@ fn baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
     style.writing_mode == WritingMode::HorizontalTb
         && child_style.writing_mode == WritingMode::HorizontalTb
         && !has_marker(style, "--w3cos-internal-grid-lanes")
-        && marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid")
         && !subgrid(columns_spec(style))
         && !subgrid(style.grid_rows())
         && child_style.display != Display::Grid
@@ -254,7 +258,6 @@ fn inline_baseline_container_ok(style: &Style) -> bool {
     use w3cos_std::style::WritingMode;
     style.writing_mode == WritingMode::HorizontalTb
         && !has_marker(style, "--w3cos-internal-grid-lanes")
-        && marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid")
 }
 
 /// The static-position alignment of an abspos grid child whose authored
@@ -1066,9 +1069,9 @@ fn inline_grid_tracks_for(
     {
         return false;
     }
-    if is_baseline(style.align_items) || is_baseline(style.justify_items) {
-        return false;
-    }
+    // Baseline alignment on an inline-grid container is laid out here: the
+    // container's own first baseline is exported for the line, and a shape
+    // the baseline engine cannot place still bails in `container_reason`.
     // The fixed-track path sizes to its tracks; a width keyword is only
     // resolved on the intrinsic one.
     if !intrinsic && has_marker(style, "--w3cos-internal-width-keyword") {

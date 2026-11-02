@@ -3715,6 +3715,57 @@ fn auto_sized_inline_grid_shrinks_and_wraps_auto_track_text() {
     assert_eq!(rect(&out, 4), (35.0, 0.0, 25.0, 20.0));
 }
 
+/// `align-items: baseline` on an auto-sized fixed-track `inline-grid`
+/// (grid-alignment-style-changes-001). Headless Chrome, body margin 0: in
+/// `100px / 50px 50px 50px` the items 20, 50 and 30px tall share a baseline
+/// at their bottom margin edges, so they sit at y=30, 0 and 20 inside the
+/// 150×100 grid.
+#[test]
+fn baseline_aligned_fixed_track_inline_grid_lays_out_items() {
+    use w3cos_std::style::{AlignItems, CustomProperties, Position};
+    let mut style = Style {
+        display: Display::Flex,
+        position: Position::Relative,
+        align_items: AlignItems::Baseline,
+        grid_template_columns: Some("50px 50px 50px".to_string()),
+        ..Style::default()
+    };
+    style.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-unrecognized-display".to_string(),
+        "inline-grid".to_string(),
+    )]));
+    style.grid_ng_mut().grid_template_rows = Some("100px".to_string());
+    let item = |height: f32| {
+        node(
+            Style {
+                height: Dimension::Px(height),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        block(),
+        vec![node(style, vec![item(20.0), item(50.0), item(30.0)])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("baseline inline-grid");
+    let at = |index: usize| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    // 0 root, 1 grid, 2..4 items.
+    assert_eq!(at(1), (0.0, 0.0, 150.0, 100.0));
+    assert_eq!(at(2), (0.0, 30.0, 50.0, 20.0));
+    assert_eq!(at(3), (50.0, 0.0, 50.0, 50.0));
+    assert_eq!(at(4), (100.0, 20.0, 50.0, 30.0));
+}
+
 /// Non-fixed tracks on a definite top-level `inline-grid`, and baseline
 /// alignment of the line. Headless Chrome, body margin 0: a 40×20 grid and
 /// a 40×60 grid after a 15px block sit at (0,55) and (40,15) (the baseline
