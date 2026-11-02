@@ -14,6 +14,9 @@ pub(super) struct RuleSet {
     has_sibling_dependencies: bool,
     has_relational_dependencies: bool,
     has_structural_dependencies: bool,
+    /// Some selector reads the `style` attribute, so an inline-style write
+    /// can change which rules match on that element or its descendants.
+    has_style_attribute_dependencies: bool,
     /// A `:has()` argument uses `+` or `~`, so the subject sits before the mutation.
     has_sibling_scoped_relational: bool,
     /// Static part (no relational pseudo) of every compound that carries `:has()`,
@@ -176,6 +179,7 @@ impl RuleSet {
         self.has_sibling_dependencies = false;
         self.has_relational_dependencies = false;
         self.has_structural_dependencies = false;
+        self.has_style_attribute_dependencies = false;
         self.has_sibling_scoped_relational = false;
         self.relational_anchors.clear();
         for index in 0..self.rules.len() {
@@ -204,6 +208,11 @@ impl RuleSet {
             .iter()
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
+
+        self.has_style_attribute_dependencies |= self.rules[index]
+            .chain
+            .iter()
+            .any(compound_reads_style_attribute);
 
         let last = self.rules[index].chain.len().saturating_sub(1);
         let mut anchors = Vec::new();
@@ -297,6 +306,10 @@ impl RuleSet {
         self.has_structural_dependencies
     }
 
+    pub(super) fn has_style_attribute_dependencies(&self) -> bool {
+        self.has_style_attribute_dependencies
+    }
+
     pub(super) fn has_sibling_scoped_relational(&self) -> bool {
         self.has_sibling_scoped_relational
     }
@@ -312,6 +325,28 @@ impl RuleSet {
         }
         found
     }
+}
+
+/// Conservative: an attribute selector on `style`, or a functional pseudo-class
+/// whose argument mentions it (`:not([style])`, `:is(...)`, `:has(...)`).
+fn compound_reads_style_attribute(compound: &super::CompoundSelector) -> bool {
+    use super::AttributeSelector as A;
+    compound.attributes.iter().any(|attribute| {
+        let (A::Present(name)
+        | A::Equals(name, ..)
+        | A::Includes(name, ..)
+        | A::DashMatch(name, ..)
+        | A::Prefix(name, ..)
+        | A::Suffix(name, ..)
+        | A::Substring(name, ..)) = attribute;
+        name.eq_ignore_ascii_case("style")
+    }) || compound.pseudo_classes.iter().any(|pseudo| match pseudo {
+        super::PseudoClass::Has(selector)
+        | super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector) => selector.to_ascii_lowercase().contains("style"),
+        _ => false,
+    })
 }
 
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
