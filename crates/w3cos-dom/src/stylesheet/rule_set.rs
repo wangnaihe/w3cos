@@ -33,16 +33,28 @@ pub(super) struct RuleSet {
 
 /// Which siblings a rule reads *after* its subject. A tail append (a new last
 /// element) can change the subject only through this reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum FollowingReach {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FollowingReach(u8);
+
+impl FollowingReach {
     /// Only preceding siblings (`:first-child`, `:nth-child(n)`, `a + b`).
-    None,
+    const NONE: Self = Self(0);
     /// `:last-child` / `:only-child`: only the element that was last before
     /// the append can change.
-    PreviousLast,
-    /// `:nth-last-*`, `:last-of-type`, `:only-of-type`, `:has(+ x)`: any
-    /// sibling can change.
-    Any,
+    const PREVIOUS_LAST: Self = Self(1);
+    /// `:last-of-type` / `:only-of-type`: only the last earlier sibling of the
+    /// appended element's type can change.
+    const PREVIOUS_OF_TYPE: Self = Self(2);
+    /// `:nth-last-*`, `:has(+ x)`: any sibling can change.
+    const ANY: Self = Self(4);
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
 }
 
 /// Static part (pseudo-classes dropped, which only widens the match) of a
@@ -325,8 +337,7 @@ impl RuleSet {
             .iter()
             .flat_map(|compound| compound.pseudo_classes.iter())
             .map(pseudo_following_reach)
-            .max()
-            .unwrap_or(FollowingReach::None);
+            .fold(FollowingReach::NONE, FollowingReach::union);
         for (position, compound) in rule.chain.iter().enumerate() {
             let sibling_combinator = position > 0
                 && matches!(
@@ -373,19 +384,21 @@ impl RuleSet {
     /// Whether `ctx` (a child of `parent`) could change its match result when
     /// an element is appended after the last child. `previous_last` is true
     /// for the element that was last before the append, the only one
-    /// `:last-child`/`:only-child` rules can flip.
+    /// `:last-child`/`:only-child` rules can flip; `previous_of_type` is true
+    /// for the last earlier sibling of the appended element's type, the only
+    /// one `:last-of-type`/`:only-of-type` rules can flip.
     pub(super) fn following_anchor_matches(
         &self,
         ctx: &SelectorContext,
         parent: &SelectorContext,
         previous_last: bool,
+        previous_of_type: bool,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
-            let reaches = match anchor.following {
-                FollowingReach::None => false,
-                FollowingReach::PreviousLast => previous_last,
-                FollowingReach::Any => true,
-            };
+            let reach = anchor.following;
+            let reaches = reach.contains(FollowingReach::ANY)
+                || (previous_last && reach.contains(FollowingReach::PREVIOUS_LAST))
+                || (previous_of_type && reach.contains(FollowingReach::PREVIOUS_OF_TYPE));
             reaches
                 && anchor.subject.matches(ctx)
                 && anchor
@@ -396,11 +409,21 @@ impl RuleSet {
     }
 
     /// Whether some rule reads following siblings of any child of `parent`
-    /// (`:nth-last-child`, `:last-of-type`, ...), so a tail append has to look
-    /// at every child instead of only the previous last one.
+    /// (`:nth-last-child`, ...), so a tail append has to look at every child
+    /// instead of only the previous last one.
     pub(super) fn following_scan_needed(&self, parent: &SelectorContext) -> bool {
+        self.following_reach_needed(parent, FollowingReach::ANY)
+    }
+
+    /// Whether some rule under `parent` reads the last earlier sibling of the
+    /// appended element's type (`:last-of-type`, `:only-of-type`).
+    pub(super) fn following_of_type_needed(&self, parent: &SelectorContext) -> bool {
+        self.following_reach_needed(parent, FollowingReach::PREVIOUS_OF_TYPE)
+    }
+
+    fn following_reach_needed(&self, parent: &SelectorContext, reach: FollowingReach) -> bool {
         self.positional_anchors.iter().any(|anchor| {
-            anchor.following == FollowingReach::Any
+            anchor.following.contains(reach)
                 && anchor
                     .parent
                     .as_ref()
@@ -598,34 +621,43 @@ fn pseudo_nests_position(pseudo: &super::PseudoClass) -> bool {
 fn pseudo_following_reach(pseudo: &super::PseudoClass) -> FollowingReach {
     match pseudo {
         super::PseudoClass::LastChild | super::PseudoClass::OnlyChild => {
-            FollowingReach::PreviousLast
+            FollowingReach::PREVIOUS_LAST
         }
-        super::PseudoClass::LastOfType
-        | super::PseudoClass::OnlyOfType
-        | super::PseudoClass::NthLastChild(_)
-        | super::PseudoClass::NthLastOfType(_) => FollowingReach::Any,
-        _ if pseudo_has_sibling_scoped_relational(pseudo) => FollowingReach::Any,
+        super::PseudoClass::LastOfType | super::PseudoClass::OnlyOfType => {
+            FollowingReach::PREVIOUS_OF_TYPE
+        }
+        super::PseudoClass::NthLastChild(_) | super::PseudoClass::NthLastOfType(_) => {
+            FollowingReach::ANY
+        }
+        _ if pseudo_has_sibling_scoped_relational(pseudo) => FollowingReach::ANY,
         _ => match selector_list_argument(pseudo) {
             Some(selector) => selector_list_following_reach(&selector),
-            None => FollowingReach::None,
+            None => FollowingReach::NONE,
         },
     }
 }
 
 fn selector_list_following_reach(selector: &str) -> FollowingReach {
     if selector.contains(":has(") && (selector.contains('+') || selector.contains('~')) {
-        return FollowingReach::Any;
+        return FollowingReach::ANY;
     }
-    let rest = selector
-        .replace(":last-child", "")
-        .replace(":only-child", "");
-    let found_child = rest.len() != selector.len();
+    let mut reach = FollowingReach::NONE;
+    let mut rest = selector.to_string();
+    for (needle, found) in [
+        (":last-child", FollowingReach::PREVIOUS_LAST),
+        (":only-child", FollowingReach::PREVIOUS_LAST),
+        (":last-of-type", FollowingReach::PREVIOUS_OF_TYPE),
+        (":only-of-type", FollowingReach::PREVIOUS_OF_TYPE),
+    ] {
+        if rest.contains(needle) {
+            reach = reach.union(found);
+            rest = rest.replace(needle, "");
+        }
+    }
     if rest.contains(":last-") || rest.contains(":only-") || rest.contains(":nth-last-") {
-        FollowingReach::Any
-    } else if found_child {
-        FollowingReach::PreviousLast
+        FollowingReach::ANY
     } else {
-        FollowingReach::None
+        reach
     }
 }
 
