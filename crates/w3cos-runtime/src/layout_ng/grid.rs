@@ -5196,7 +5196,11 @@ fn layout_impl(
             return super::bail("grid:short-height-subgrid");
         }
         let lanes_box = has_marker(style, "--w3cos-internal-grid-lanes");
+        // A single item stacks the same way in lanes and in a grid, so a
+        // box with one item always runs here (grid-lanes
+        // column-auto-repeat-011 passes on NG).
         if lanes_box
+            && built.len() > 1
             && !(lanes::column_lanes(style)
                 && !columns.is_empty()
                 && items.iter().all(|item| item.col_span * 2 > columns.len()))
