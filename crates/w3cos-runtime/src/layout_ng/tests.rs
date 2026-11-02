@@ -10607,6 +10607,56 @@ fn orthogonal_vertical_blocks_match_chrome() {
     );
 }
 
+/// Real documents give every element (and text node) the cascade-only
+/// `list-style-image` / `text-source-run` markers; they must not keep a
+/// vertical root off the orthogonal path.
+#[test]
+fn orthogonal_roots_accept_cascade_only_markers() {
+    use w3cos_std::style::{CustomProperties, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let marked = |style: Style, keys: &[&str]| Style {
+        custom_properties: Some(CustomProperties::from_iter(
+            keys.iter()
+                .map(|k| (format!("--w3cos-internal-{k}"), "none".to_string())),
+        )),
+        ..style
+    };
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let root = node(
+        marked(font.clone(), &["list-style-image"]),
+        vec![node(
+            marked(
+                Style {
+                    writing_mode: WritingMode::VerticalLr,
+                    ..font.clone()
+                },
+                &["list-style-image", "font-size-origin"],
+            ),
+            vec![Component::text(
+                "XXXX XXX",
+                marked(
+                    Style {
+                        display: Display::Inline,
+                        writing_mode: WritingMode::VerticalLr,
+                        ..font.clone()
+                    },
+                    &["list-style-image", "text-source-run"],
+                ),
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 100.0).expect("ng");
+    assert_eq!(rect(&rects, 1), (0.0, 0.0, 10.0, 80.0));
+    assert!(texts.iter().all(|t| t.vertical) && !texts.is_empty());
+}
+
 /// Nested blocks inside orthogonal roots: block-direction margins collapse
 /// along the physical x axis, children stretch to the root's inline size
 /// (its physical height), and `vertical-rl` flows from the right edge.

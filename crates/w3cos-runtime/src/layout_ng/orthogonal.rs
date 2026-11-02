@@ -67,6 +67,11 @@ pub(super) const INERT_MARKERS: &[&str] = &[
     "--w3cos-internal-z-index-specified",
     "--w3cos-internal-background-inherit",
     "--w3cos-internal-quirks-mode",
+    // Every styled element and text node carries these: the list image only
+    // matters to `display: list-item` (never accepted here) and the source
+    // run only tells the inline builder where a text node came from.
+    "--w3cos-internal-list-style-image",
+    "--w3cos-internal-text-source-run",
 ];
 
 fn has_internal_marker(style: &Style, allowed: &[&str]) -> bool {
