@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::selector_filter::AncestorBloom;
 use super::{AttributeSelector, CompoundSelector, Document, NodeId, Rule, SelectorContext};
 
 #[derive(Debug, Default)]
@@ -35,6 +36,18 @@ pub(super) struct RuleSet {
 /// element) can change the subject only through this reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct FollowingReach(u8);
+
+impl PositionalAnchor {
+    /// Whether the anchor can apply to children of `parent`, whose own and
+    /// outer ancestors are summarised by `ancestors`.
+    fn scoped(&self, parent: &SelectorContext, ancestors: AncestorBloom) -> bool {
+        ancestors.might_contain(self.ancestor_filter)
+            && self
+                .parent
+                .as_ref()
+                .is_none_or(|compound| compound.matches(parent))
+    }
+}
 
 impl FollowingReach {
     /// Only preceding siblings (`:first-child`, `:nth-child(n)`, `a + b`).
@@ -176,6 +189,8 @@ struct PositionalAnchor {
     /// change it. Pure from-the-end rules (`:last-child`, `:nth-last-child(k)`)
     /// do not.
     reads_preceding: bool,
+    /// Features the shared ancestor chain of the siblings must contain.
+    ancestor_filter: AncestorBloom,
     /// The compound counts siblings by their own attributes
     /// (`:nth-child(An+B of S)`), so a class change on any sibling, before or
     /// after it, can change its result.
@@ -493,6 +508,11 @@ impl RuleSet {
                     reads_preceding: sibling_rhs
                         || sibling_any
                         || pseudos.iter().any(pseudo_reads_preceding_position),
+                    ancestor_filter: AncestorBloom::for_compound_at(
+                        &rule.chain,
+                        &rule.combinators,
+                        position,
+                    ),
                     sibling_any,
                 });
             }
@@ -511,6 +531,7 @@ impl RuleSet {
         &self,
         ctx: &SelectorContext,
         parent: &SelectorContext,
+        ancestors: AncestorBloom,
         previous: FollowingPosition,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
@@ -521,12 +542,7 @@ impl RuleSet {
                 || (reach.contains(FollowingReach::WINDOW)
                     && (previous.distance <= anchor.window_child
                         || previous.type_distance <= anchor.window_type));
-            reaches
-                && anchor.subject.matches(ctx)
-                && anchor
-                    .parent
-                    .as_ref()
-                    .is_none_or(|compound| compound.matches(parent))
+            reaches && anchor.subject.matches(ctx) && anchor.scoped(parent, ancestors)
         })
     }
 
@@ -538,6 +554,7 @@ impl RuleSet {
         &self,
         ctx: &SelectorContext,
         parent: &SelectorContext,
+        ancestors: AncestorBloom,
         later: bool,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
@@ -546,24 +563,19 @@ impl RuleSet {
             } else {
                 anchor.following.0 != 0
             };
-            reaches
-                && anchor.subject.matches(ctx)
-                && anchor
-                    .parent
-                    .as_ref()
-                    .is_none_or(|compound| compound.matches(parent))
+            reaches && anchor.subject.matches(ctx) && anchor.scoped(parent, ancestors)
         })
     }
 
     /// How a tail append has to look at the siblings under `parent`.
-    pub(super) fn following_scan(&self, parent: &SelectorContext) -> FollowingScan {
+    pub(super) fn following_scan(
+        &self,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+    ) -> FollowingScan {
         let mut scan = FollowingScan::default();
         for anchor in &self.positional_anchors {
-            if anchor
-                .parent
-                .as_ref()
-                .is_some_and(|compound| !compound.matches(parent))
-            {
+            if !anchor.scoped(parent, ancestors) {
                 continue;
             }
             if anchor.following.contains(FollowingReach::ANY) {
@@ -579,18 +591,23 @@ impl RuleSet {
 
     /// Whether some rule under `parent` reads the last earlier sibling of the
     /// appended element's type (`:last-of-type`, `:only-of-type`).
-    pub(super) fn following_of_type_needed(&self, parent: &SelectorContext) -> bool {
-        self.following_reach_needed(parent, FollowingReach::PREVIOUS_OF_TYPE)
+    pub(super) fn following_of_type_needed(
+        &self,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+    ) -> bool {
+        self.following_reach_needed(parent, ancestors, FollowingReach::PREVIOUS_OF_TYPE)
     }
 
-    fn following_reach_needed(&self, parent: &SelectorContext, reach: FollowingReach) -> bool {
-        self.positional_anchors.iter().any(|anchor| {
-            anchor.following.contains(reach)
-                && anchor
-                    .parent
-                    .as_ref()
-                    .is_none_or(|compound| compound.matches(parent))
-        })
+    fn following_reach_needed(
+        &self,
+        parent: &SelectorContext,
+        ancestors: AncestorBloom,
+        reach: FollowingReach,
+    ) -> bool {
+        self.positional_anchors
+            .iter()
+            .any(|anchor| anchor.following.contains(reach) && anchor.scoped(parent, ancestors))
     }
 
     /// Whether `ctx` (a child of `parent`) could change match result when its
@@ -600,15 +617,13 @@ impl RuleSet {
         &self,
         ctx: &SelectorContext,
         parent: &SelectorContext,
+        ancestors: AncestorBloom,
         siblings_only: bool,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
             (!siblings_only || anchor.sibling_rhs || anchor.sibling_any)
                 && anchor.subject.matches(ctx)
-                && anchor
-                    .parent
-                    .as_ref()
-                    .is_none_or(|compound| compound.matches(parent))
+                && anchor.scoped(parent, ancestors)
         })
     }
 
@@ -618,14 +633,10 @@ impl RuleSet {
         &self,
         ctx: &SelectorContext,
         parent: &SelectorContext,
+        ancestors: AncestorBloom,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
-            anchor.sibling_any
-                && anchor.subject.matches(ctx)
-                && anchor
-                    .parent
-                    .as_ref()
-                    .is_none_or(|compound| compound.matches(parent))
+            anchor.sibling_any && anchor.subject.matches(ctx) && anchor.scoped(parent, ancestors)
         })
     }
 
