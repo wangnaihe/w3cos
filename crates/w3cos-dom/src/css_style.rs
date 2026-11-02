@@ -455,6 +455,15 @@ impl CSSStyleDeclaration {
                     (value.trim() == "stretch").then(|| "stretch".to_string()),
                 );
             }
+            "flex-flow" | "flexFlow" => {
+                // CSS Flexbox 3: `<flex-direction> || <flex-wrap>`. An omitted
+                // part resets to its initial value; an invalid declaration is
+                // dropped whole. CSS-wide keywords reset both parts.
+                if let Some((direction, wrap)) = parse_flex_flow(value) {
+                    self.set_property("flex-direction", direction);
+                    self.set_property("flex-wrap", wrap);
+                }
+            }
             "flex-wrap" | "flexWrap" => {
                 self.inner.flex_wrap = parse_flex_wrap(value);
                 let keyword = value.trim().to_ascii_lowercase();
@@ -2557,6 +2566,41 @@ fn parse_clear(value: &str) -> Clear {
         "both" => Clear::Both,
         _ => Clear::None,
     }
+}
+
+/// `flex-flow` longhands as `(flex-direction, flex-wrap)`, `None` when the
+/// value is not `<flex-direction> || <flex-wrap>`.
+fn parse_flex_flow(value: &str) -> Option<(&'static str, &'static str)> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if css_wide_keyword(&lowered) {
+        return Some(("row", "nowrap"));
+    }
+    let mut direction = None;
+    let mut wrap = None;
+    for token in lowered.split_whitespace() {
+        match token {
+            "row" | "row-reverse" | "column" | "column-reverse" if direction.is_none() => {
+                direction = Some(match token {
+                    "row" => "row",
+                    "row-reverse" => "row-reverse",
+                    "column" => "column",
+                    _ => "column-reverse",
+                });
+            }
+            "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => {
+                wrap = Some(match token {
+                    "nowrap" => "nowrap",
+                    "wrap" => "wrap",
+                    _ => "wrap-reverse",
+                });
+            }
+            _ => return None,
+        }
+    }
+    if direction.is_none() && wrap.is_none() {
+        return None;
+    }
+    Some((direction.unwrap_or("row"), wrap.unwrap_or("nowrap")))
 }
 
 fn parse_flex_direction(value: &str) -> FlexDirection {
@@ -6717,4 +6761,57 @@ fn last_baseline_alignment_sets_a_layout_marker() {
     // The typed fields are unchanged by the marker.
     d.set_property("align-items", "last baseline");
     assert_eq!(d.inner.align_items, parse_align_items("last baseline"));
+}
+
+#[test]
+fn flex_flow_shorthand_expands_to_direction_and_wrap() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let apply = |declaration: &mut CSSStyleDeclaration, value: &str| {
+        declaration.set_property("flex-flow", value);
+        (
+            declaration.inner.flex_direction,
+            declaration.inner.flex_wrap,
+        )
+    };
+    let mut d = CSSStyleDeclaration::new();
+    assert_eq!(
+        apply(&mut d, "column wrap"),
+        (FlexDirection::Column, FlexWrap::Wrap)
+    );
+    // Either order; an omitted part resets to its initial value.
+    assert_eq!(
+        apply(&mut d, "wrap-reverse row-reverse"),
+        (FlexDirection::RowReverse, FlexWrap::WrapReverse)
+    );
+    assert_eq!(
+        apply(&mut d, "column"),
+        (FlexDirection::Column, FlexWrap::NoWrap)
+    );
+    assert_eq!(apply(&mut d, "wrap"), (FlexDirection::Row, FlexWrap::Wrap));
+    assert_eq!(
+        apply(&mut d, "COLUMN-REVERSE NOWRAP"),
+        (FlexDirection::ColumnReverse, FlexWrap::NoWrap)
+    );
+    // CSS-wide keywords reset both parts.
+    apply(&mut d, "column wrap");
+    assert_eq!(
+        apply(&mut d, "initial"),
+        (FlexDirection::Row, FlexWrap::NoWrap)
+    );
+    // Invalid declarations (duplicate or unknown parts) are ignored whole.
+    apply(&mut d, "column wrap");
+    for bad in ["column row", "wrap nowrap", "foo", "column wrap extra", ""] {
+        assert_eq!(
+            apply(&mut d, bad),
+            (FlexDirection::Column, FlexWrap::Wrap),
+            "{bad:?}"
+        );
+    }
+    // The camelCase CSSOM name and the longhands keep working.
+    d.set_property("flexFlow", "row-reverse wrap");
+    assert_eq!(d.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
+    d.set_property("flex-direction", "column");
+    assert_eq!(d.inner.flex_direction, FlexDirection::Column);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
 }
