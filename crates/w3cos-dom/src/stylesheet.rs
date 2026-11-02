@@ -476,6 +476,10 @@ pub(crate) fn positional_anchor_matches(
     })
 }
 
+pub(crate) fn following_anchor_matches(ctx: &SelectorContext, parent: &SelectorContext) -> bool {
+    RULES.with(|rules| rules.borrow().following_anchor_matches(ctx, parent))
+}
+
 pub(crate) fn empty_anchor_matches(ctx: &SelectorContext) -> bool {
     RULES.with(|rules| rules.borrow().empty_anchor_matches(ctx))
 }
