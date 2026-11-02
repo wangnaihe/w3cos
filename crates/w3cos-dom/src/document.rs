@@ -1774,10 +1774,16 @@ impl Document {
         self.note_cascade_change();
     }
 
-    /// Inline declarations cannot change selector matching, but inherited
-    /// values and custom properties require the complete descendant subtree.
+    /// Inline declarations cannot change selector matching (unless a selector
+    /// reads the `style` attribute). Inherited values and custom properties
+    /// reach descendants through the `inherited` style, which every descendant
+    /// cache lookup compares, so only this node's revision needs to change.
     pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
-        self.invalidate_style_subtree(id);
+        if stylesheet::has_style_attribute_dependencies() {
+            self.invalidate_style_subtree(id);
+        } else {
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
         self.note_cascade_change();
     }
@@ -4474,22 +4480,33 @@ impl Document {
         ))
     }
 
+    /// The cached style of `id` when it is current and was computed from the
+    /// current style of every ancestor. A node's own revision does not move
+    /// when an ancestor's inline style changes, and `position: inherit` or
+    /// `border: inherit` read the parent's value, so the whole chain must be
+    /// linked; callers fall back to `computed_style_for` otherwise.
     fn cached_style(&self, id: NodeId) -> Option<std::cell::Ref<'_, w3cos_std::style::Style>> {
-        let revision = self.style_revisions.get(id.0 as usize).copied()?;
+        let chain = self.element_style_chain(id);
+        let stylesheet_generation = stylesheet::generation();
         let cache = self.computed_style_cache.borrow();
-        let current = cache.get(&id).is_some_and(|cached| {
-            cached.node_revision == revision
-                && cached.stylesheet_generation == stylesheet::generation()
-        });
-        if !current {
-            return None;
+        let mut parent = STYLE_LINK_ROOT;
+        for link in &chain {
+            let entry = cache.get(link)?;
+            if entry.node_revision != *self.style_revisions.get(link.0 as usize)?
+                || entry.stylesheet_generation != stylesheet_generation
+                || entry.inherited_link != parent
+            {
+                return None;
+            }
+            parent = entry.stamp;
         }
         Some(std::cell::Ref::map(cache, |cache| {
             &cache.get(&id).expect("style cache entry").style
         }))
     }
 
-    pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+    /// Element ancestors from the document element down to `id`, inclusive.
+    fn element_style_chain(&self, id: NodeId) -> Vec<NodeId> {
         let mut ancestor_ids = Vec::new();
         let document_element = self.document_element_id();
         let mut current = (Some(id) != document_element)
@@ -4505,6 +4522,11 @@ impl Document {
         ancestor_ids.reverse();
         ancestor_ids.retain(|ancestor| self.get_node(*ancestor).node_type == NodeType::Element);
         ancestor_ids.push(id);
+        ancestor_ids
+    }
+
+    pub fn computed_style_for(&self, id: NodeId) -> w3cos_std::style::Style {
+        let ancestor_ids = self.element_style_chain(id);
         if let Some(style) = self.linked_cached_style(&ancestor_ids) {
             return style;
         }
@@ -23542,6 +23564,62 @@ mod image_component_tests {
     }
 
     #[test]
+    fn cached_position_and_border_peeks_never_lag_an_ancestor_inline_write() {
+        use w3cos_std::style::Position;
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        let child = document.create_element("div");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+        document
+            .get_style_mut(parent.id)
+            .set_property("border-left-width", "2px");
+        document
+            .get_style_mut(parent.id)
+            .set_property("border-left-style", "solid");
+        document.mark_inline_style_dirty(parent.id);
+        document
+            .get_style_mut(child.id)
+            .set_property("border-left-style", "solid");
+        document
+            .get_style_mut(child.id)
+            .set_property("position", "relative");
+        document
+            .get_style_mut(child.id)
+            .set_property("border-left-width", "inherit");
+        document.mark_inline_style_dirty(child.id);
+        assert_eq!(
+            document.computed_style_for(child.id).border_left_width,
+            Some(2.0)
+        );
+        assert_eq!(document.cached_position(child.id), Some(Position::Relative));
+        assert_eq!(
+            document.cached_border_left_top(child.id).map(|b| b.0),
+            Some(2.0)
+        );
+
+        document
+            .get_style_mut(parent.id)
+            .set_property("border-left-width", "5px");
+        document.mark_inline_style_dirty(parent.id);
+        // The child's own revision did not move: the peeks must refuse the
+        // stale entry instead of reporting the old inherited value.
+        assert_eq!(document.cached_position(child.id), None);
+        assert_eq!(document.cached_border_left_top(child.id), None);
+        assert_eq!(
+            document.computed_style_for(child.id).border_left_width,
+            Some(5.0)
+        );
+        assert_eq!(document.cached_position(child.id), Some(Position::Relative));
+        assert_eq!(
+            document.cached_border_left_top(child.id).map(|b| b.0),
+            Some(5.0)
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn multicol_properties_inherit_only_explicitly_in_cascade_order() {
         crate::stylesheet::clear_rules();
         let mut document = Document::new();
@@ -28774,7 +28852,9 @@ mod computed_style_cache_tests {
         assert!(document.computed_style_cache_is_current(child.id));
         parent.style_mut(&mut document).set_property("color", "red");
 
-        assert!(!document.computed_style_cache_is_current(child.id));
+        // The child's entry keeps its revision; the changed inherited style
+        // makes the next lookup recompute it.
+        assert!(!document.computed_style_cache_is_current(parent.id));
         assert_eq!(
             document.computed_style_for(child.id).color,
             w3cos_std::Color::rgb(255, 0, 0)
