@@ -4,6 +4,7 @@
 //! Tree shape, text metrics, and inherited cascades rebuild once.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
@@ -37,9 +38,17 @@ struct Cache {
     /// Full rect snapshots keyed by one node's px width. Repeat flushes of
     /// the same width restore the rects instead of solving Taffy again.
     width_memos: Vec<WidthMemo>,
+    /// `display: none` nodes that are absent from `component`. Restyling one
+    /// of them while it stays hidden cannot change any used box, so the patch
+    /// path skips it instead of rebuilding. Valid only until the next rebuild.
+    hidden: HashSet<u32>,
 }
 
 thread_local! {
+    /// Set when a patch failed only because a hidden node was not in the
+    /// component tree; the rebuild that follows records which dirty nodes are
+    /// hidden.
+    static LEARN_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
 }
 
@@ -71,6 +80,7 @@ pub fn flush() -> bool {
     });
     let dirty = crate::dom::with_document_mut(|document| document.take_precise_dirty());
     let mut ok = false;
+    LEARN_HIDDEN.with(|flag| flag.set(false));
     CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
         let structure_matches = slot
@@ -90,9 +100,14 @@ pub fn flush() -> bool {
                 return;
             }
         }
+        #[cfg(test)]
+        FLUSH_REBUILDS.with(|count| count.set(count.get() + 1));
         ok = rebuild(
             &mut slot, layout_gen, structure, cascade, viewport_w, viewport_h,
         );
+        if ok && LEARN_HIDDEN.with(|flag| flag.replace(false)) {
+            learn_hidden(&mut slot, &dirty);
+        }
     });
     if ok {
         crate::dom::clear_document_dirty();
@@ -134,8 +149,50 @@ fn rebuild(
         width_memos,
         viewport_w_bits: viewport_w.to_bits(),
         viewport_h_bits: viewport_h.to_bits(),
+        hidden: HashSet::new(),
     });
     true
+}
+
+fn collect_host_ids(component: &Component, ids: &mut HashSet<u32>) {
+    if let Some(id) = host_id(component) {
+        ids.insert(id);
+    }
+    for child in &component.children {
+        collect_host_ids(child, ids);
+    }
+}
+
+/// After a rebuild forced by a hidden dirty node, remember which dirty nodes
+/// are `display: none` and not part of the fresh component tree.
+fn learn_hidden(slot: &mut Option<Cache>, dirty: &[NodeId]) {
+    let Some(cache) = slot.as_mut() else {
+        return;
+    };
+    let mut present = HashSet::new();
+    collect_host_ids(&cache.component, &mut present);
+    for id in dirty {
+        if !present.contains(&id.as_u32())
+            && crate::dom::with_document(|document| document.computed_style_for(*id)).display
+                == Display::None
+        {
+            cache.hidden.insert(id.as_u32());
+        }
+    }
+}
+
+fn hidden_only_flush(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
+    if cache.viewport_w_bits == viewport_w.to_bits()
+        && cache.viewport_h_bits == viewport_h.to_bits()
+    {
+        return true;
+    }
+    let ok = recompute(cache, viewport_w, viewport_h);
+    if ok {
+        cache.viewport_w_bits = viewport_w.to_bits();
+        cache.viewport_h_bits = viewport_h.to_bits();
+    }
+    ok
 }
 
 fn patch_and_compute(
@@ -150,27 +207,25 @@ fn patch_and_compute(
         if geometry_only {
             return false;
         }
-        if cache.viewport_w_bits == viewport_w.to_bits()
-            && cache.viewport_h_bits == viewport_h.to_bits()
-        {
-            // Scroll and repaint-only text leave the used boxes in place.
-            return true;
-        }
-        let ok = recompute(cache, viewport_w, viewport_h);
-        if ok {
-            cache.viewport_w_bits = viewport_w.to_bits();
-            cache.viewport_h_bits = viewport_h.to_bits();
-        }
-        return ok;
+        // Scroll and repaint-only text leave the used boxes in place.
+        return hidden_only_flush(cache, viewport_w, viewport_h);
     }
     let mut styles = Vec::with_capacity(dirty.len());
     for id in dirty {
         let style = crate::dom::with_document(|document| document.computed_style_for(*id));
+        if style.display == Display::None && cache.hidden.contains(&id.as_u32()) {
+            // Hidden since the last rebuild and still hidden: no used box
+            // depends on it.
+            continue;
+        }
         if !style_patch_is_safe(&style) {
             return false;
         }
         if geometry_only {
             let Some(old) = component_style(&cache.component, id.as_u32()).cloned() else {
+                if style.display == Display::None {
+                    LEARN_HIDDEN.with(|flag| flag.set(true));
+                }
                 return false;
             };
             if !geometry_only_change(&old, &style) {
@@ -178,6 +233,10 @@ fn patch_and_compute(
             }
         }
         styles.push((id.as_u32(), style));
+    }
+    if styles.is_empty() {
+        // Every dirty node was hidden: only a viewport change needs a solve.
+        return hidden_only_flush(cache, viewport_w, viewport_h);
     }
     let memo_hit = single_px_width(&styles).and_then(|(node, bits)| {
         let viewport_w_bits = viewport_w.to_bits();
@@ -196,6 +255,9 @@ fn patch_and_compute(
     });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
+            if style.display == Display::None {
+                LEARN_HIDDEN.with(|flag| flag.set(true));
+            }
             return false;
         }
     }
@@ -519,6 +581,11 @@ pub(crate) fn take_paint_reuse() -> PaintReuse {
 
 fn note_paint_reuse(kind: PaintReuse) {
     PAINT_REUSE.with(|slot| slot.set(kind));
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLUSH_REBUILDS: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1293,6 +1360,70 @@ mod paint_layout_tests {
             stored.width,
             stored.height
         );
+    }
+
+    fn flush_rebuilds() -> u32 {
+        FLUSH_REBUILDS.with(Cell::get)
+    }
+
+    fn hidden_in_cache(id: u32) -> bool {
+        CACHE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|cache| cache.hidden.contains(&id))
+        })
+    }
+
+    #[test]
+    fn restyling_a_hidden_node_patches_instead_of_rebuilding() {
+        crate::dom::reset_document();
+        let first = crate::dom::create_element("div");
+        crate::dom::set_style_property(first, "height", "20px");
+        let hidden = crate::dom::create_element("div");
+        crate::dom::set_style_property(hidden, "display", "none");
+        crate::dom::set_style_property(hidden, "height", "30px");
+        let inner = crate::dom::create_element("div");
+        crate::dom::set_style_property(inner, "height", "10px");
+        crate::dom::append_child(hidden, inner);
+        let last = crate::dom::create_element("div");
+        crate::dom::set_style_property(last, "height", "20px");
+        for node in [first, hidden, last] {
+            crate::dom::append_child(crate::dom::body_id(), node);
+        }
+        assert_stored_matches_fresh(last);
+
+        // The first hidden restyle is not in the cached tree: one rebuild
+        // that records the node.
+        let rebuilds = flush_rebuilds();
+        crate::dom::set_style_property(hidden, "color", "red");
+        assert_stored_matches_fresh(last);
+        assert_eq!(flush_rebuilds() - rebuilds, 1, "learning rebuild");
+        assert!(hidden_in_cache(hidden), "hidden node is remembered");
+
+        // Later restyles of the same hidden node skip layout work.
+        let rebuilds = flush_rebuilds();
+        for color in ["blue", "green", "red"] {
+            crate::dom::set_style_property(hidden, "color", color);
+            assert_stored_matches_fresh(last);
+        }
+        assert_eq!(
+            flush_rebuilds(),
+            rebuilds,
+            "a hidden restyle must not rebuild the layout"
+        );
+
+        // Showing it again must lay it out and move what follows.
+        let before = crate::dom::bounding_rect(last);
+        crate::dom::set_style_property(hidden, "display", "block");
+        assert_stored_matches_fresh(last);
+        let after = crate::dom::bounding_rect(last);
+        assert!(
+            after.y > before.y + 25.0,
+            "showing the node must push the next sibling down, {} -> {}",
+            before.y,
+            after.y
+        );
+        assert!(!hidden_in_cache(hidden), "a shown node is not hidden");
     }
 
     #[test]
