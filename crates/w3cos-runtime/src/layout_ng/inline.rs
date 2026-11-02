@@ -594,6 +594,20 @@ pub(super) fn block_text_reason_at(
         if !(horizontal(style)
             && parent_horizontal
             && !super::oof::is_out_of_flow(style)
+            // Grid items stay legacy (animated tracks reach only legacy), and
+            // so do intrinsic width keywords: NG and legacy min-content
+            // differ for text NG cannot shape (joiners), which a reftest's
+            // NG-rendered reference would expose.
+            && !flat[index]
+                .parent
+                .is_some_and(|parent| super::block::is_author_grid(flat[parent].style))
+            && [
+                super::block::WIDTH_KEYWORD,
+                super::block::MIN_WIDTH_KEYWORD,
+                super::block::MAX_WIDTH_KEYWORD,
+            ]
+            .into_iter()
+            .all(|key| super::block::marker(style, key).is_none())
             && [
                 style.padding.top,
                 style.padding.right,
