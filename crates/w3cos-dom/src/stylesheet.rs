@@ -1483,12 +1483,22 @@ fn pseudo_matches_node(
             selector_matches_node_with_target(selector, document, node, target_id)
                 .is_ok_and(|matched| matched)
         }
-        PseudoClass::NthChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, false)
-        }
-        PseudoClass::NthLastChild(expression) => {
-            matches_nth_position(&element_siblings(), node, expression, true)
-        }
+        PseudoClass::NthChild(expression) => matches_nth_child(
+            document,
+            node,
+            element_siblings(),
+            expression,
+            false,
+            target_id,
+        ),
+        PseudoClass::NthLastChild(expression) => matches_nth_child(
+            document,
+            node,
+            element_siblings(),
+            expression,
+            true,
+            target_id,
+        ),
         PseudoClass::NthOfType(expression) => {
             matches_nth_position(&type_siblings(), node, expression, false)
         }
@@ -1627,6 +1637,53 @@ fn node_direction(document: &Document, mut node: NodeId) -> String {
         };
         node = parent;
     }
+}
+
+/// Splits `An+B of S` (Selectors 4) into the `An+B` part and the selector
+/// list `S`. Plain `An+B` yields no selector list.
+pub(crate) fn split_nth_of_selector(expression: &str) -> (&str, Option<&str>) {
+    let bytes = expression.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index..index + 2].eq_ignore_ascii_case(b"of")
+            && index > 0
+            && is_css_whitespace(bytes[index - 1] as char)
+            && bytes
+                .get(index + 2)
+                .is_none_or(|next| is_css_whitespace(*next as char))
+        {
+            return (
+                trim_css_whitespace(&expression[..index]),
+                Some(trim_css_whitespace(&expression[index + 2..])),
+            );
+        }
+        index += 1;
+    }
+    (trim_css_whitespace(expression), None)
+}
+
+/// `:nth-child(An+B [of S])` and `:nth-last-child(An+B [of S])`: with `S`, only
+/// siblings matching `S` are counted, and the subject must match it as well.
+fn matches_nth_child(
+    document: &Document,
+    node: NodeId,
+    siblings: Vec<NodeId>,
+    expression: &str,
+    from_end: bool,
+    target_id: Option<&str>,
+) -> bool {
+    let (an_plus_b, selector) = split_nth_of_selector(expression);
+    let Some(selector) = selector else {
+        return matches_nth_position(&siblings, node, an_plus_b, from_end);
+    };
+    let counted = siblings
+        .into_iter()
+        .filter(|sibling| {
+            selector_matches_node_with_target(selector, document, *sibling, target_id)
+                .is_ok_and(|matched| matched)
+        })
+        .collect::<Vec<_>>();
+    matches_nth_position(&counted, node, an_plus_b, from_end)
 }
 
 fn matches_nth_position(
@@ -2312,12 +2369,26 @@ fn parse_compound(chars: &[char], mut pos: usize) -> Option<(CompoundSelector, u
                                 .push(PseudoClass::Is(valid.join(", ")))
                         }
                     }
-                    (false, true, "nth-child") => compound
-                        .pseudo_classes
-                        .push(PseudoClass::NthChild(argument)),
-                    (false, true, "nth-last-child") => compound
-                        .pseudo_classes
-                        .push(PseudoClass::NthLastChild(argument)),
+                    (false, true, "nth-child" | "nth-last-child") => {
+                        let (an_plus_b, selector) = split_nth_of_selector(&argument);
+                        let valid_selector = selector.is_none_or(|selector| {
+                            !selector.is_empty()
+                                && split_selector_group(selector)
+                                    .into_iter()
+                                    .all(|single| parse_selector_chain(&single).is_some())
+                        });
+                        if parse_an_plus_b(an_plus_b).is_none() || !valid_selector {
+                            compound.unsupported = true;
+                        } else if name == "nth-child" {
+                            compound
+                                .pseudo_classes
+                                .push(PseudoClass::NthChild(argument))
+                        } else {
+                            compound
+                                .pseudo_classes
+                                .push(PseudoClass::NthLastChild(argument))
+                        }
+                    }
                     (false, true, "nth-of-type") => compound
                         .pseudo_classes
                         .push(PseudoClass::NthOfType(argument)),
@@ -2598,6 +2669,136 @@ mod tests {
         register_rule("li:first-child", &[("color", "blue")]);
         assert!(has_structural_dependencies());
         assert!(!has_sibling_dependencies());
+    }
+
+    fn nth_of_fixture() -> (Document, Vec<NodeId>) {
+        let mut document = Document::new();
+        let list = document.create_element("ul");
+        document.body().append_child(&mut document, list);
+        // li.a, li.b, li.a, li.b, li.a
+        let items = ["a", "b", "a", "b", "a"]
+            .into_iter()
+            .map(|class| {
+                let item = document.create_element("li");
+                item.class_list_add(&mut document, class);
+                list.append_child(&mut document, item);
+                item.id
+            })
+            .collect();
+        (document, items)
+    }
+
+    fn nth_of_matches(document: &Document, items: &[NodeId], selector: &str) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| selector_matches_node(selector, document, **item) == Ok(true))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn nth_child_of_selector_counts_only_matching_siblings() {
+        let (document, items) = nth_of_fixture();
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2 of .a)"),
+            [2]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(1 of .b)"),
+            [1]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(odd of .a)"),
+            [0, 4]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2n+1 OF .a)"),
+            [0, 4]
+        );
+        // The subject itself must match the selector list.
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(1 of .b)"),
+            [1]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(n of .b)"),
+            [1, 3]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2 of .a, .b)"),
+            [1]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2 of :not(.b))"),
+            [2]
+        );
+    }
+
+    #[test]
+    fn nth_last_child_of_selector_counts_from_the_end_among_matching_siblings() {
+        let (document, items) = nth_of_fixture();
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1 of .a)"),
+            [4]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1 of .b)"),
+            [3]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(2 of .a)"),
+            [2]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1 of :not(.a))"),
+            [3]
+        );
+    }
+
+    #[test]
+    fn nth_child_without_of_still_counts_every_element_sibling() {
+        let (document, items) = nth_of_fixture();
+        assert_eq!(nth_of_matches(&document, &items, "li:nth-child(2)"), [1]);
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-child(2n)"),
+            [1, 3]
+        );
+        assert_eq!(
+            nth_of_matches(&document, &items, "li:nth-last-child(1)"),
+            [4]
+        );
+    }
+
+    #[test]
+    fn nth_child_of_selector_rejects_invalid_arguments() {
+        let (document, items) = nth_of_fixture();
+        for selector in [
+            "li:nth-child(2 of)",
+            "li:nth-child(2 of ,)",
+            "li:nth-child(banana of .a)",
+            "li:nth-last-child(1 of [)",
+        ] {
+            assert!(
+                nth_of_matches(&document, &items, selector).is_empty(),
+                "{selector}"
+            );
+        }
+        // `of S` is not part of the `-of-type` forms.
+        assert!(nth_of_matches(&document, &items, "li:nth-of-type(1 of .a)").is_empty());
+    }
+
+    #[test]
+    fn split_nth_of_selector_requires_whitespace_around_of() {
+        assert_eq!(split_nth_of_selector("2n+1 of .a"), ("2n+1", Some(".a")));
+        assert_eq!(
+            split_nth_of_selector(" odd\tOf\n.a, .b "),
+            ("odd", Some(".a, .b"))
+        );
+        assert_eq!(split_nth_of_selector("2n+1"), ("2n+1", None));
+        assert_eq!(split_nth_of_selector("2 of"), ("2", Some("")));
+        assert_eq!(split_nth_of_selector("of"), ("of", None));
+        assert_eq!(split_nth_of_selector("2 offset"), ("2 offset", None));
     }
 
     #[test]

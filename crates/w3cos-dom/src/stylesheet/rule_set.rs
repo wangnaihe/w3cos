@@ -457,6 +457,10 @@ fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
     match pseudo {
         super::PseudoClass::Has(_) => true,
         super::PseudoClass::Not(selector) => selector.contains('+') || selector.contains('~'),
+        // `:nth-child(An+B of S)` counts siblings by their own attributes.
+        super::PseudoClass::NthChild(expression) | super::PseudoClass::NthLastChild(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
         _ => false,
     }
 }

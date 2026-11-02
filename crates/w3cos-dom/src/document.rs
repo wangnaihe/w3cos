@@ -29336,6 +29336,58 @@ mod computed_style_cache_tests {
     }
 
     #[test]
+    fn nth_child_of_selector_follows_sibling_class_changes_in_both_directions() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            ".list > .row:nth-last-child(1 of :not(.hidden))",
+            &[("color", "red")],
+        );
+        crate::stylesheet::register_rule(
+            ".list > .row:nth-child(1 of :not(.hidden))",
+            &[("background-color", "blue")],
+        );
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        document.body().append_child(&mut document, list);
+        let rows: Vec<_> = (0..3)
+            .map(|_| {
+                let row = document.create_element("div");
+                row.class_list_add(&mut document, "row");
+                list.append_child(&mut document, row);
+                row
+            })
+            .collect();
+        let is_red = |document: &mut Document, row: Element| {
+            document.computed_style_for(row.id).color == red()
+        };
+        assert_eq!(
+            [0, 1, 2].map(|i| is_red(&mut document, rows[i])),
+            [false, false, true]
+        );
+
+        // Hiding the last row moves the "last visible" match to a *preceding*
+        // sibling.
+        rows[2].class_list_add(&mut document, "hidden");
+        assert_eq!(
+            [0, 1, 2].map(|i| is_red(&mut document, rows[i])),
+            [false, true, false]
+        );
+        // Hiding the first row must not disturb the last-row match.
+        rows[0].class_list_add(&mut document, "hidden");
+        assert_eq!(
+            [0, 1, 2].map(|i| is_red(&mut document, rows[i])),
+            [false, true, false]
+        );
+        rows[2].class_list_remove(&mut document, "hidden");
+        assert_eq!(
+            [0, 1, 2].map(|i| is_red(&mut document, rows[i])),
+            [false, false, true]
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn nth_child_of_selector_lists_fall_back_to_restyling_every_sibling() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(
