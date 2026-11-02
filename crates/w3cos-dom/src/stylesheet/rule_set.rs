@@ -31,6 +31,20 @@ pub(super) struct RuleSet {
     empty_anchors: Vec<CompoundSelector>,
 }
 
+/// Which siblings a rule reads *after* its subject. A tail append (a new last
+/// element) can change the subject only through this reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FollowingReach {
+    /// Only preceding siblings (`:first-child`, `:nth-child(n)`, `a + b`).
+    None,
+    /// `:last-child` / `:only-child`: only the element that was last before
+    /// the append can change.
+    PreviousLast,
+    /// `:nth-last-*`, `:last-of-type`, `:only-of-type`, `:has(+ x)`: any
+    /// sibling can change.
+    Any,
+}
+
 /// Static part (pseudo-classes dropped, which only widens the match) of a
 /// compound whose result depends on its position among its siblings.
 #[derive(Debug)]
@@ -42,6 +56,10 @@ struct PositionalAnchor {
     /// The compound sits right of `+` or `~` (also inside `:not(.a + .b)`),
     /// so it reads siblings *before* it.
     sibling_rhs: bool,
+    /// How far the rule reads siblings *after* the subject; see
+    /// `FollowingReach`. Every anchor that counts only preceding siblings is
+    /// unaffected by a tail append.
+    following: FollowingReach,
     /// The compound counts siblings by their own attributes
     /// (`:nth-child(An+B of S)`), so a class change on any sibling, before or
     /// after it, can change its result.
@@ -302,6 +320,13 @@ impl RuleSet {
         let rule = &self.rules[index];
         let mut anchors = Vec::new();
         let mut empty = Vec::new();
+        let following = rule
+            .chain
+            .iter()
+            .flat_map(|compound| compound.pseudo_classes.iter())
+            .map(pseudo_following_reach)
+            .max()
+            .unwrap_or(FollowingReach::None);
         for (position, compound) in rule.chain.iter().enumerate() {
             let sibling_combinator = position > 0
                 && matches!(
@@ -336,12 +361,51 @@ impl RuleSet {
                     subject,
                     parent,
                     sibling_rhs,
+                    following,
                     sibling_any,
                 });
             }
         }
         self.positional_anchors.extend(anchors);
         self.empty_anchors.extend(empty);
+    }
+
+    /// Whether `ctx` (a child of `parent`) could change its match result when
+    /// an element is appended after the last child. `previous_last` is true
+    /// for the element that was last before the append, the only one
+    /// `:last-child`/`:only-child` rules can flip.
+    pub(super) fn following_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        previous_last: bool,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            let reaches = match anchor.following {
+                FollowingReach::None => false,
+                FollowingReach::PreviousLast => previous_last,
+                FollowingReach::Any => true,
+            };
+            reaches
+                && anchor.subject.matches(ctx)
+                && anchor
+                    .parent
+                    .as_ref()
+                    .is_none_or(|compound| compound.matches(parent))
+        })
+    }
+
+    /// Whether some rule reads following siblings of any child of `parent`
+    /// (`:nth-last-child`, `:last-of-type`, ...), so a tail append has to look
+    /// at every child instead of only the previous last one.
+    pub(super) fn following_scan_needed(&self, parent: &SelectorContext) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            anchor.following == FollowingReach::Any
+                && anchor
+                    .parent
+                    .as_ref()
+                    .is_none_or(|compound| compound.matches(parent))
+        })
     }
 
     /// Whether `ctx` (a child of `parent`) could change match result when its
@@ -527,6 +591,42 @@ fn pseudo_nests_position(pseudo: &super::PseudoClass) -> bool {
                 .iter()
                 .any(|needle| *needle != ":empty" && selector.contains(needle))
     })
+}
+
+/// How far the compound's result depends on siblings after it. Selector lists
+/// are scanned as text and stay conservative.
+fn pseudo_following_reach(pseudo: &super::PseudoClass) -> FollowingReach {
+    match pseudo {
+        super::PseudoClass::LastChild | super::PseudoClass::OnlyChild => {
+            FollowingReach::PreviousLast
+        }
+        super::PseudoClass::LastOfType
+        | super::PseudoClass::OnlyOfType
+        | super::PseudoClass::NthLastChild(_)
+        | super::PseudoClass::NthLastOfType(_) => FollowingReach::Any,
+        _ if pseudo_has_sibling_scoped_relational(pseudo) => FollowingReach::Any,
+        _ => match selector_list_argument(pseudo) {
+            Some(selector) => selector_list_following_reach(&selector),
+            None => FollowingReach::None,
+        },
+    }
+}
+
+fn selector_list_following_reach(selector: &str) -> FollowingReach {
+    if selector.contains(":has(") && (selector.contains('+') || selector.contains('~')) {
+        return FollowingReach::Any;
+    }
+    let rest = selector
+        .replace(":last-child", "")
+        .replace(":only-child", "");
+    let found_child = rest.len() != selector.len();
+    if rest.contains(":last-") || rest.contains(":only-") || rest.contains(":nth-last-") {
+        FollowingReach::Any
+    } else if found_child {
+        FollowingReach::PreviousLast
+    } else {
+        FollowingReach::None
+    }
 }
 
 /// `:not(.a + .b)`: the subject reads siblings before it.

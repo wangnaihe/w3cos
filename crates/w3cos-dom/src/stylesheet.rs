@@ -476,6 +476,22 @@ pub(crate) fn positional_anchor_matches(
     })
 }
 
+pub(crate) fn following_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    previous_last: bool,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .following_anchor_matches(ctx, parent, previous_last)
+    })
+}
+
+pub(crate) fn following_scan_needed(parent: &SelectorContext) -> bool {
+    RULES.with(|rules| rules.borrow().following_scan_needed(parent))
+}
+
 pub(crate) fn sibling_any_anchor_matches(ctx: &SelectorContext, parent: &SelectorContext) -> bool {
     RULES.with(|rules| rules.borrow().sibling_any_anchor_matches(ctx, parent))
 }

@@ -833,7 +833,11 @@ impl Document {
         {
             self.mark_dirty(old_parent);
         }
-        self.mark_dirty(parent);
+        if old_parent == Some(parent) {
+            self.mark_dirty(parent);
+        } else {
+            self.mark_dirty_after_tail_append(parent);
+        }
         // A new ancestor chain can change used values such as flex item
         // blockification. Positional selectors are covered by `mark_dirty`:
         // it restyles the parent when a sibling or structural rule exists.
@@ -1683,13 +1687,24 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
+        self.mark_child_list_dirty(id, false);
+    }
+
+    /// `mark_dirty` for a node appended after the last child of `id`. Earlier
+    /// siblings keep their position from the start, so only rules that read
+    /// following siblings (`:last-child`, `:only-child`, ...) can change.
+    fn mark_dirty_after_tail_append(&mut self, id: NodeId) {
+        self.mark_child_list_dirty(id, true);
+    }
+
+    fn mark_child_list_dirty(&mut self, id: NodeId, tail_append: bool) {
         if stylesheet::has_sibling_dependencies()
             || stylesheet::has_structural_dependencies()
             || stylesheet::has_relational_dependencies()
         {
             // :nth-child, :empty, and sibling combinators can change the
             // matched style of existing siblings when the child list changes.
-            if !self.invalidate_child_list_observers(id) {
+            if !self.invalidate_child_list_observers(id, tail_append) {
                 self.invalidate_style_subtree(id);
             }
         } else {
@@ -1711,7 +1726,7 @@ impl Document {
     /// ancestors are restyled separately by `invalidate_relational_observers`.
     /// Returns false when the parent is not an element and the caller must
     /// restyle the whole parent subtree.
-    fn invalidate_child_list_observers(&mut self, parent: NodeId) -> bool {
+    fn invalidate_child_list_observers(&mut self, parent: NodeId, tail_append: bool) -> bool {
         if self
             .nodes
             .get(parent.0 as usize)
@@ -1733,20 +1748,69 @@ impl Document {
             return true;
         }
         self.touch_style_revision(parent);
+        if tail_append {
+            self.invalidate_tail_append_observers(parent, &parent_context);
+            return true;
+        }
         let mut current = self.get_node(parent).first_child;
         while let Some(child) = current {
             current = crate::node::sib(self.get_node(child).next_sibling);
-            let observed = self.get_node(child).node_type == NodeType::Element
-                && stylesheet::positional_anchor_matches(
-                    &self.selector_context_base(child),
-                    &parent_context,
-                    false,
-                );
+            let observed = self.get_node(child).node_type == NodeType::Element && {
+                let context = self.selector_context_base(child);
+                stylesheet::positional_anchor_matches(&context, &parent_context, false)
+            };
             if observed {
                 self.invalidate_style_subtree(child);
             }
         }
         true
+    }
+
+    /// `parent` just got a new last child. Position counted from the start is
+    /// unchanged, text nodes are not counted at all, and `:last-child` /
+    /// `:only-child` can only flip on the element that was last before, so
+    /// that one element is all that has to be restyled unless some rule counts
+    /// from the end (`:nth-last-child`, `:last-of-type`, ...).
+    fn invalidate_tail_append_observers(
+        &mut self,
+        parent: NodeId,
+        parent_context: &stylesheet::SelectorContext,
+    ) {
+        let Some(new_last) = self.get_node(parent).last_child else {
+            return;
+        };
+        if self.get_node(new_last).node_type != NodeType::Element {
+            return;
+        }
+        let mut previous = crate::node::sib(self.get_node(new_last).prev_sibling);
+        while let Some(id) = previous {
+            if self.get_node(id).node_type == NodeType::Element {
+                break;
+            }
+            previous = crate::node::sib(self.get_node(id).prev_sibling);
+        }
+        if stylesheet::following_scan_needed(parent_context) {
+            let mut current = self.get_node(parent).first_child;
+            while let Some(child) = current {
+                current = crate::node::sib(self.get_node(child).next_sibling);
+                if child == new_last || self.get_node(child).node_type != NodeType::Element {
+                    continue;
+                }
+                let context = self.selector_context_base(child);
+                if stylesheet::following_anchor_matches(
+                    &context,
+                    parent_context,
+                    Some(child) == previous,
+                ) {
+                    self.invalidate_style_subtree(child);
+                }
+            }
+        } else if let Some(previous) = previous {
+            let context = self.selector_context_base(previous);
+            if stylesheet::following_anchor_matches(&context, parent_context, true) {
+                self.invalidate_style_subtree(previous);
+            }
+        }
     }
 
     /// A mutation at `start` can change `:has()` results on its ancestors and,
@@ -29322,6 +29386,167 @@ mod computed_style_cache_tests {
         document.remove_node(appended.id);
         assert!(document.computed_style_cache_is_current(plain_child.id));
         assert_eq!(document.computed_style_for(observed.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    fn row_with_class(document: &mut Document, list: Element, class: &str) -> Element {
+        let row = document.create_element("div");
+        row.class_list_add(document, class);
+        list.append_child(document, row);
+        row
+    }
+
+    #[test]
+    fn tail_append_only_restyles_rules_that_read_following_siblings() {
+        // Which of the three existing rows `[first, second, third]` a rule
+        // restyles when a fourth is appended.
+        const NONE: [bool; 3] = [false, false, false];
+        const LAST_ONLY: [bool; 3] = [false, false, true];
+        const ALL: [bool; 3] = [true, true, true];
+        for (selector, restyled) in [
+            (".list > .row:first-child", NONE),
+            (".list > .row:nth-child(2n+1)", NONE),
+            (".list > .row:nth-child(-n+2)", NONE),
+            (".list > .row:not(:first-child)", NONE),
+            (".list > .row:first-of-type", NONE),
+            (".list > .row + .row", NONE),
+            (".list > .row ~ .row", NONE),
+            (".list > .row:not(:has(.x))", NONE),
+            (".list > .row:last-child", LAST_ONLY),
+            (".list > .row:only-child", LAST_ONLY),
+            (".list > .row:not(:last-child)", LAST_ONLY),
+            (".list > .row:nth-last-child(2)", ALL),
+            (".list > .row:last-of-type", ALL),
+            (".list > .row:has(+ .row)", ALL),
+            (".list > .row:not(:last-of-type)", ALL),
+            (".list > .row:not(:has(+ .row))", ALL),
+            (".list:has(> .row:last-child) > .row", ALL),
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(selector, &[("color", "red")]);
+            let mut document = Document::new();
+            let list = document.create_element("div");
+            list.class_list_add(&mut document, "list");
+            document.body().append_child(&mut document, list);
+            let rows = [
+                row_with_class(&mut document, list, "row"),
+                row_with_class(&mut document, list, "row"),
+                row_with_class(&mut document, list, "row"),
+            ];
+            for row in rows {
+                let _ = document.computed_style_for(row.id);
+            }
+
+            let appended = row_with_class(&mut document, list, "row");
+
+            for (row, expected) in rows.iter().zip(restyled) {
+                assert_eq!(
+                    !document.computed_style_cache_is_current(row.id),
+                    expected,
+                    "{selector}: restyle of an existing row after a tail append"
+                );
+            }
+            // The appended node is always styled from scratch and correctly.
+            let _ = document.computed_style_for(appended.id);
+            crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn tail_append_skips_text_nodes_when_finding_the_previous_last_element() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".list > .row:last-child", &[("color", "red")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        document.body().append_child(&mut document, list);
+        let first = row_with_class(&mut document, list, "row");
+        let second = row_with_class(&mut document, list, "row");
+        let gap = document.create_text_node(" ");
+        list.append_child(&mut document, gap);
+        for row in [first, second] {
+            let _ = document.computed_style_for(row.id);
+        }
+        assert_eq!(document.computed_style_for(second.id).color, red());
+
+        // A text node is not a `:last-child` candidate: nothing is restyled.
+        let tail_text = document.create_text_node("tail");
+        list.append_child(&mut document, tail_text);
+        assert!(document.computed_style_cache_is_current(first.id));
+        assert!(document.computed_style_cache_is_current(second.id));
+
+        // The previous last *element* is found behind both text nodes.
+        let third = row_with_class(&mut document, list, "row");
+        assert!(document.computed_style_cache_is_current(first.id));
+        assert!(!document.computed_style_cache_is_current(second.id));
+        assert_ne!(document.computed_style_for(second.id).color, red());
+        assert_eq!(document.computed_style_for(third.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn tail_append_keeps_results_equal_to_a_fresh_cascade() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".list > .row:last-child", &[("color", "red")]);
+        crate::stylesheet::register_rule(".list > .row:first-child", &[("width", "10px")]);
+        crate::stylesheet::register_rule(".list > .row:nth-last-child(2)", &[("height", "7px")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        document.body().append_child(&mut document, list);
+        let mut rows = Vec::new();
+        for _ in 0..4 {
+            rows.push(row_with_class(&mut document, list, "row"));
+            for row in &rows {
+                let _ = document.computed_style_for(row.id);
+            }
+        }
+        let count = rows.len();
+        for (index, row) in rows.iter().enumerate() {
+            let style = document.computed_style_for(row.id);
+            assert_eq!(
+                style.color == red(),
+                index + 1 == count,
+                "last-child {index}"
+            );
+            assert_eq!(
+                style.height,
+                if index + 2 == count {
+                    w3cos_std::style::Dimension::Px(7.0)
+                } else {
+                    w3cos_std::style::Dimension::Auto
+                }
+            );
+            assert_eq!(
+                style.width,
+                if index == 0 {
+                    w3cos_std::style::Dimension::Px(10.0)
+                } else {
+                    w3cos_std::style::Dimension::Auto
+                }
+            );
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn moving_a_child_inside_its_parent_still_restyles_position_observers() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".list > .row:first-child", &[("color", "red")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        list.class_list_add(&mut document, "list");
+        document.body().append_child(&mut document, list);
+        let first = row_with_class(&mut document, list, "row");
+        let second = row_with_class(&mut document, list, "row");
+        assert_eq!(document.computed_style_for(first.id).color, red());
+        let _ = document.computed_style_for(second.id);
+
+        // Re-appending the first row moves it to the tail: `second` becomes
+        // the first child.
+        list.append_child(&mut document, first);
+        assert_eq!(document.computed_style_for(second.id).color, red());
+        assert_ne!(document.computed_style_for(first.id).color, red());
         crate::stylesheet::clear_rules();
     }
 
