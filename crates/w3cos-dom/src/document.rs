@@ -29310,6 +29310,63 @@ mod computed_style_cache_tests {
     }
 
     #[test]
+    fn is_and_where_lists_with_positional_pseudos_follow_child_list_changes() {
+        for selector in [
+            ".list > .row:is(:last-child, .x)",
+            ".list > .row:where(:last-child, .x)",
+            ".list > .row:is(:nth-last-child(1))",
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(selector, &[("color", "red")]);
+            let mut document = Document::new();
+            let list = document.create_element("div");
+            list.class_list_add(&mut document, "list");
+            document.body().append_child(&mut document, list);
+            let row = document.create_element("div");
+            row.class_list_add(&mut document, "row");
+            list.append_child(&mut document, row);
+            assert_eq!(
+                document.computed_style_for(row.id).color,
+                red(),
+                "{selector}"
+            );
+
+            let appended = document.create_element("div");
+            appended.class_list_add(&mut document, "row");
+            list.append_child(&mut document, appended);
+            assert_ne!(
+                document.computed_style_for(row.id).color,
+                red(),
+                "{selector}"
+            );
+            assert_eq!(document.computed_style_for(appended.id).color, red());
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn is_list_with_a_sibling_combinator_follows_class_changes() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".item:is(.a + .item)", &[("color", "red")]);
+        let mut document = Document::new();
+        let list = document.create_element("div");
+        document.body().append_child(&mut document, list);
+        let first = document.create_element("div");
+        first.class_list_add(&mut document, "item");
+        let second = document.create_element("div");
+        second.class_list_add(&mut document, "item");
+        list.append_child(&mut document, first);
+        list.append_child(&mut document, second);
+        assert_ne!(document.computed_style_for(second.id).color, red());
+
+        first.class_list_add(&mut document, "a");
+        assert_eq!(document.computed_style_for(second.id).color, red());
+        first.class_list_remove(&mut document, "a");
+        assert_ne!(document.computed_style_for(second.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn a_child_combinator_parent_scopes_positional_anchors() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule(".list > :first-child", &[("color", "red")]);

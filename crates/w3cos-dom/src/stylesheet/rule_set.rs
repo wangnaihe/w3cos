@@ -444,7 +444,9 @@ fn compound_reads_style_attribute(compound: &super::CompoundSelector) -> bool {
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
     match pseudo {
         super::PseudoClass::Has(_) => true,
-        super::PseudoClass::Not(selector) => selector.contains('+') || selector.contains('~'),
+        super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector) => selector.contains('+') || selector.contains('~'),
         _ => false,
     }
 }
@@ -525,7 +527,10 @@ fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
         | super::PseudoClass::NthLastChild(_)
         | super::PseudoClass::NthOfType(_)
         | super::PseudoClass::NthLastOfType(_) => true,
-        super::PseudoClass::Not(selector) | super::PseudoClass::Has(selector) => {
+        super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector)
+        | super::PseudoClass::Has(selector) => {
             let selector = selector.to_ascii_lowercase();
             [
                 ":empty",
