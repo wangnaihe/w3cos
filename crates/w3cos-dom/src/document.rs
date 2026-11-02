@@ -1722,9 +1722,14 @@ impl Document {
         }
         let parent_context = self.selector_context_base(parent);
         if stylesheet::empty_anchor_matches(&parent_context) {
-            // The parent's own match can flip, and its descendants may be
-            // selected through it.
-            self.invalidate_style_subtree(parent);
+            // The parent's own match can flip, its descendants may be
+            // selected through it, and so may its following siblings
+            // (`.box:empty + .after`).
+            if !(stylesheet::has_sibling_dependencies()
+                && self.invalidate_sibling_observers(parent))
+            {
+                self.invalidate_style_subtree(parent);
+            }
             return true;
         }
         self.touch_style_revision(parent);
@@ -29388,6 +29393,38 @@ mod computed_style_cache_tests {
         assert_ne!(document.computed_style_for(item.id).color, red());
         lead.class_list_remove(&mut document, "x");
         assert_eq!(document.computed_style_for(item.id).color, red());
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn not_empty_restyles_the_following_sibling_when_a_child_arrives() {
+        for rule in [
+            ".box:not(:empty) + .after",
+            ".box:empty ~ .after:not(.never)",
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(rule, &[("color", "red")]);
+            let mut document = Document::new();
+            let parent = document.create_element("div");
+            parent.class_list_add(&mut document, "box");
+            let after = document.create_element("div");
+            after.class_list_add(&mut document, "after");
+            let after_child = document.create_element("span");
+            after.append_child(&mut document, after_child);
+            document.body().append_child(&mut document, parent);
+            document.body().append_child(&mut document, after);
+            let initial = document.computed_style_for(after.id).color == red();
+            let child = document.create_element("span");
+            parent.append_child(&mut document, child);
+            let filled = document.computed_style_for(after.id).color == red();
+            assert_ne!(initial, filled, "{rule}");
+            document.remove_node(child.id);
+            assert_eq!(
+                document.computed_style_for(after.id).color == red(),
+                initial,
+                "{rule}"
+            );
+        }
         crate::stylesheet::clear_rules();
     }
 
