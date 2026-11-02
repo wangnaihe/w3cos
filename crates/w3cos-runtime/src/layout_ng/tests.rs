@@ -8277,20 +8277,19 @@ fn flex_text_items_match_chrome() {
         ],
     );
 
-    // A text item with padding or a border stays on the legacy engine.
+    // A text item with padding keeps it around the text.
     let padded = Style {
         padding: margins(0.0, 5.0, 0.0, 5.0),
         ..item(font.clone())
     };
-    let root = node(
+    let rects = run(node(
         block(),
         vec![node(
             flex(FlexDirection::Row, Some(300.0)),
             vec![Component::text("XX", padded)],
         )],
-    );
-    let flat = pre_flatten(&root);
-    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    ));
+    check(&rects, &[(2, (0.0, 0.0, 50.0, 20.0))]);
 
     // A text run paints from the top of its rect with no line context, so a
     // single line's node takes the font-content-box rect an IFC line would

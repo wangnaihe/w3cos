@@ -131,7 +131,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some(reason);
     }
-    if is_rtl(style) && rtl_justify_unsupported(style) {
+    if rtl_justify_unsupported(style) {
         return Some("flex:rtl-justify");
     }
     let row = row_axis(style.flex_direction);
@@ -578,7 +578,7 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
         return Some(MinMax::exact(block::contain_intrinsic_size(info.style).0));
     }
     if let w3cos_std::ComponentKind::Text { content } = info.kind {
-        return Some(super::inline::text_min_max(content, info.style));
+        return Some(super::inline::text_content_min_max(content, info.style));
     }
     // A replaced item's min- and max-content sizes are its natural size
     // under its constraints (CSS Sizing 3 §5.1).
@@ -1786,27 +1786,51 @@ fn side_keyword(style: &Style) -> Option<&str> {
     .then_some(keyword)
 }
 
-/// A side keyword outside a plain row needs the item direction too, so
-/// those rtl containers stay on legacy.
-fn rtl_justify_unsupported(style: &Style) -> bool {
-    side_keyword(style).is_some()
-        && (style.flex_direction != FlexDirection::Row
-            || !matches!(
-                side_keyword(style),
-                Some("start" | "end" | "left" | "right")
-            ))
+/// Whether a side keyword needs the direction or the reversed main axis
+/// to resolve: an rtl container, or a `row-reverse` one (whose main-start
+/// edge is the physical right under ltr).
+fn side_keyword_needs_direction(style: &Style) -> bool {
+    is_rtl(style) || style.flex_direction == FlexDirection::RowReverse
 }
 
-/// `justify-content` in logical (inline-start first) coordinates. A row's
-/// `left` / `right` are physical, `start` / `end` follow the direction.
+/// A side keyword outside a plain or reversed row needs the item direction
+/// too, so those containers stay on legacy.
+fn rtl_justify_unsupported(style: &Style) -> bool {
+    side_keyword(style).is_some()
+        && side_keyword_needs_direction(style)
+        && (!matches!(
+            style.flex_direction,
+            FlexDirection::Row | FlexDirection::RowReverse
+        ) || !matches!(
+            side_keyword(style),
+            Some("start" | "end" | "left" | "right")
+        ))
+}
+
+/// `justify-content` in logical (main-start first) coordinates. A row's
+/// `left` / `right` are physical, `start` / `end` follow the direction;
+/// the main axis starts at the inline start unless the row is reversed.
 fn justify_kind(style: &Style) -> JustifyContent {
-    if is_rtl(style)
-        && style.flex_direction == FlexDirection::Row
-        && let Some(keyword) = side_keyword(style)
+    // The enum folds `left` / `right` into `flex-start`, so even a plain
+    // ltr row reads the authored keyword.
+    if matches!(
+        style.flex_direction,
+        FlexDirection::Row | FlexDirection::RowReverse
+    ) && let Some(keyword) = side_keyword(style)
+        && matches!(keyword, "start" | "end" | "left" | "right")
     {
-        return match keyword {
-            "start" | "right" => JustifyContent::FlexStart,
-            _ => JustifyContent::FlexEnd,
+        let reverse = style.flex_direction == FlexDirection::RowReverse;
+        let left_is_main_start = is_rtl(style) == reverse;
+        let main_start = match keyword {
+            "left" => left_is_main_start,
+            "right" => !left_is_main_start,
+            "start" => !reverse,
+            _ => reverse,
+        };
+        return if main_start {
+            JustifyContent::FlexStart
+        } else {
+            JustifyContent::FlexEnd
         };
     }
     style.justify_content
@@ -4713,6 +4737,93 @@ mod tests {
         ] {
             let root = Component::boxed(
                 rtl_style(FlexDirection::Row, Some(keyword)),
+                vec![
+                    leaf(block_box(Some(10.0), Some(10.0))),
+                    leaf(block_box(Some(20.0), Some(10.0))),
+                ],
+            );
+            expect(
+                &root,
+                &[
+                    (1, [first, 0.0, 10.0, 10.0]),
+                    (2, [second, 0.0, 20.0, 10.0]),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn padded_text_items_lay_out_in_ng_but_vertical_ones_stay_legacy() {
+        let item = |vertical: bool| {
+            let mut style = Style::default();
+            style.padding = edges(5.0, 7.0, 5.0, 7.0);
+            style.border_width = 1.0;
+            if vertical {
+                style.writing_mode = w3cos_std::style::WritingMode::VerticalRl;
+            }
+            Component::text("ab", style)
+        };
+        let row = |child| row_of(300.0, None, vec![child]);
+        // A horizontal text leaf keeps its padding and border around the
+        // line box.
+        let out = lay(&row(item(false)));
+        let got = rect(&out, 1);
+        // 16 of horizontal edges around the text, 12 of vertical around the line.
+        assert!(got[2] > 18.0 && got[3] == 12.0, "{got:?}");
+        let v = row(item(true));
+        stays_legacy(&v);
+    }
+
+    #[test]
+    fn row_reverse_side_keywords_follow_the_physical_edges() {
+        // (rtl, keyword, first x, second x): the reversed row of the two
+        // items packs against the named edge; `left` / `right` are
+        // physical, `start` / `end` follow the direction.
+        for (rtl, keyword, first, second) in [
+            (false, "left", 20.0, 0.0),
+            (false, "start", 20.0, 0.0),
+            (false, "right", 90.0, 70.0),
+            (false, "end", 90.0, 70.0),
+            (true, "left", 700.0, 710.0),
+            (true, "end", 700.0, 710.0),
+            (true, "right", 770.0, 780.0),
+            (true, "start", 770.0, 780.0),
+        ] {
+            let mut style = rtl_style(FlexDirection::RowReverse, Some(keyword));
+            if !rtl {
+                style.direction = TextDirection::Ltr;
+            }
+            let root = Component::boxed(
+                style,
+                vec![
+                    leaf(block_box(Some(10.0), Some(10.0))),
+                    leaf(block_box(Some(20.0), Some(10.0))),
+                ],
+            );
+            expect(
+                &root,
+                &[
+                    (1, [first, 0.0, 10.0, 10.0]),
+                    (2, [second, 0.0, 20.0, 10.0]),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn plain_row_left_and_right_are_physical() {
+        // The enum folds `left` / `right` into flex-start; a plain ltr row
+        // still packs `right` against the right edge.
+        for (keyword, first, second) in [
+            ("left", 0.0, 10.0),
+            ("start", 0.0, 10.0),
+            ("right", 70.0, 80.0),
+            ("end", 70.0, 80.0),
+        ] {
+            let mut style = rtl_style(FlexDirection::Row, Some(keyword));
+            style.direction = TextDirection::Ltr;
+            let root = Component::boxed(
+                style,
                 vec![
                     leaf(block_box(Some(10.0), Some(10.0))),
                     leaf(block_box(Some(20.0), Some(10.0))),

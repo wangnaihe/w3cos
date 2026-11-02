@@ -551,8 +551,16 @@ fn preserved_tabs_ok(content: &str, style: &Style, block: &Style) -> bool {
 /// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
 /// block-axis margins are handled by block layout.
 pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
+    if text_leaf_has_edges(style) {
+        return Some("text:edges");
+    }
+    block_text_leaf_reason(content, style)
+}
+
+/// Padding or border on a text leaf (an element lowered to one Text box).
+fn text_leaf_has_edges(style: &Style) -> bool {
     let padding = style.padding_lengths();
-    if [padding.top, padding.right, padding.bottom, padding.left]
+    [padding.top, padding.right, padding.bottom, padding.left]
         .into_iter()
         .any(|v| v != 0.0)
         || style.border_width != 0.0
@@ -565,9 +573,43 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
         .into_iter()
         .flatten()
         .any(|v| v != 0.0)
-    {
-        return Some("text:edges");
+}
+
+/// [`block_text_reason`] for the text leaf `index`: an in-flow horizontal
+/// leaf in a horizontal parent may carry padding and border, which block
+/// layout puts around the line boxes like any other box edge (the text
+/// paints at the content edge).  Orthogonal, vertical, out-of-flow and
+/// percentage-edged leaves keep the bail.
+pub(super) fn block_text_reason_at(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    content: &str,
+) -> Option<&'static str> {
+    let style = flat[index].style;
+    if text_leaf_has_edges(style) {
+        let horizontal = |s: &Style| s.writing_mode == w3cos_std::style::WritingMode::HorizontalTb;
+        let parent_horizontal = flat[index]
+            .parent
+            .is_some_and(|parent| horizontal(flat[parent].style));
+        if !(horizontal(style)
+            && parent_horizontal
+            && !super::oof::is_out_of_flow(style)
+            && [
+                style.padding.top,
+                style.padding.right,
+                style.padding.bottom,
+                style.padding.left,
+            ]
+            .into_iter()
+            .all(basis_free_spacing))
+        {
+            return Some("text:edges");
+        }
     }
+    block_text_leaf_reason(content, style)
+}
+
+fn block_text_leaf_reason(content: &str, style: &Style) -> Option<&'static str> {
     if super::oof::is_out_of_flow(style) {
         // An absolutely positioned text leaf (generated `::before` with
         // `position: absolute`) is blockified (CSS2 9.7) and is the block
@@ -3189,4 +3231,12 @@ mod tab_tests {
         };
         assert!(!preserved_tabs_ok("\t", &pre, &indented));
     }
+}
+
+/// [`text_min_max`] of a text leaf's content box: the legacy measure behind
+/// it includes the leaf's own horizontal padding, which the caller adds back.
+pub(super) fn text_content_min_max(content: &str, style: &Style) -> MinMax {
+    let padding = style.padding_lengths();
+    let edges = padding.left + padding.right;
+    text_min_max(content, style).map(|width| (width - edges).max(0.0))
 }

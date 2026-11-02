@@ -887,7 +887,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
                 true,
             )
-            .or_else(|| inline::block_text_reason(content, info.style)),
+            .or_else(|| inline::block_text_reason_at(flat, index, content)),
             _ if inline::is_inline_container(flat, index) => unsupported_box_style(
                 info.style,
                 &[
@@ -1004,7 +1004,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 ],
                 info.style.display == Display::Inline && !oof::is_out_of_flow(info.style),
             )
-            .or_else(|| inline::block_text_reason(content, info.style))
+            .or_else(|| inline::block_text_reason_at(flat, index, content))
         }
         ComponentKind::Text { content } => {
             // Validated with its container (container_reason). A block
@@ -1014,7 +1014,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             // here would send only this page back to the legacy engine.
             if !inline::in_inline_container(flat, index) {
                 if anonymous_block_text(flat, index) {
-                    inline::block_text_reason(content, info.style)
+                    inline::block_text_reason_at(flat, index, content)
                 } else {
                     Some("ifc:mixed")
                 }
