@@ -5745,4 +5745,62 @@ mod tests {
             &[(1, [0.0, 0.0, 60.0, 10.0])],
         );
     }
+
+    fn safe_justify(direction: FlexDirection, safe: bool) -> Style {
+        let mut container = flex_style(direction, 90.0, Some(90.0));
+        if safe {
+            container.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+                "--w3cos-internal-justify-content".to_string(),
+                "safe flex-start".to_string(),
+            )]));
+        }
+        container
+    }
+
+    #[test]
+    fn safe_justify_content_aligns_an_overflowing_reverse_line_at_the_start() {
+        // flexbox-safe-overflow-position-003/-004 (headless Chrome passes
+        // both): `justify-content: safe flex-start` on a reversed main axis
+        // with a 100px item in a 90px container aligns as `start`, the
+        // physical left or top edge, so the item overflows right or bottom.
+        // Without `safe`, flex-start is the right or bottom edge and the
+        // item overflows left or up.
+        let item = || vec![leaf(fixed_item(100.0, 100.0))];
+        expect(
+            &Component::boxed(safe_justify(FlexDirection::RowReverse, true), item()),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+        expect(
+            &Component::boxed(safe_justify(FlexDirection::ColumnReverse, true), item()),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+        expect(
+            &Component::boxed(safe_justify(FlexDirection::RowReverse, false), item()),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [-10.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn column_wrap_max_content_width_sums_the_lines() {
+        // col-wrap-001/-013/-020 (headless Chrome): a column wrap with a
+        // definite 100px height and two 100px items is two lines, so its
+        // max-content width is the sum of the line widths plus the column
+        // gap, not the widest item.
+        let nested = |gap: f32, widths: [f32; 2]| {
+            let mut inner = column_flow(FlexDirection::Column, FlexWrap::Wrap, 0.0, 100.0);
+            inner.width = Dimension::Auto;
+            inner.column_gap = Some(gap);
+            let items = widths.iter().map(|w| leaf(column_box(*w, 100.0))).collect();
+            Component::boxed(
+                flex_style(FlexDirection::Row, 400.0, Some(100.0)),
+                vec![Component::boxed(inner, items)],
+            )
+        };
+        let out = lay(&nested(0.0, [50.0, 50.0]));
+        assert_eq!(rect(&out, 1)[2], 100.0);
+        let out = lay(&nested(0.0, [30.0, 70.0]));
+        assert_eq!(rect(&out, 1)[2], 100.0);
+        let out = lay(&nested(80.0, [10.0, 10.0]));
+        assert_eq!(rect(&out, 1)[2], 100.0);
+    }
 }

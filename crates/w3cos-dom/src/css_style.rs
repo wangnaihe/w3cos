@@ -8881,3 +8881,56 @@ fn flex_basis_content_is_a_marker_over_an_auto_basis() {
     declaration.set_property("flex-basis", "10px");
     assert!(!marked(&declaration));
 }
+
+#[test]
+fn flex_flow_shorthand_expands_to_direction_and_wrap() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let apply = |declaration: &mut CSSStyleDeclaration, value: &str| {
+        declaration.set_property("flex-flow", value);
+        (
+            declaration.inner.flex_direction,
+            declaration.inner.flex_wrap,
+        )
+    };
+    let mut d = CSSStyleDeclaration::new();
+    assert_eq!(
+        apply(&mut d, "column wrap"),
+        (FlexDirection::Column, FlexWrap::Wrap)
+    );
+    // Either order; an omitted part resets to its initial value.
+    assert_eq!(
+        apply(&mut d, "wrap-reverse row-reverse"),
+        (FlexDirection::RowReverse, FlexWrap::WrapReverse)
+    );
+    assert_eq!(
+        apply(&mut d, "column"),
+        (FlexDirection::Column, FlexWrap::NoWrap)
+    );
+    assert_eq!(apply(&mut d, "wrap"), (FlexDirection::Row, FlexWrap::Wrap));
+    assert_eq!(
+        apply(&mut d, "COLUMN-REVERSE NOWRAP"),
+        (FlexDirection::ColumnReverse, FlexWrap::NoWrap)
+    );
+    // CSS-wide keywords reset both parts.
+    apply(&mut d, "column wrap");
+    assert_eq!(
+        apply(&mut d, "initial"),
+        (FlexDirection::Row, FlexWrap::NoWrap)
+    );
+    // Invalid declarations (duplicate or unknown parts) are ignored whole.
+    apply(&mut d, "column wrap");
+    for bad in ["column row", "wrap nowrap", "foo", "column wrap extra", ""] {
+        assert_eq!(
+            apply(&mut d, bad),
+            (FlexDirection::Column, FlexWrap::Wrap),
+            "{bad:?}"
+        );
+    }
+    // The camelCase CSSOM name and the longhands keep working.
+    d.set_property("flexFlow", "row-reverse wrap");
+    assert_eq!(d.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
+    d.set_property("flex-direction", "column");
+    assert_eq!(d.inner.flex_direction, FlexDirection::Column);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
+}
