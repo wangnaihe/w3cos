@@ -355,7 +355,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if placement(child_style, true).is_some_and(|value| parse_axis_syntax(value).is_none()) {
             return Some("grid:row");
         }
-        if last_baseline(style, child_style, true) || last_baseline(style, child_style, false) {
+        // A block-axis `last baseline` needs baseline-sharing groups. An
+        // in-flow inline-axis `last baseline` is not implemented and keeps
+        // the pre-marker behavior (the default alignment), as it did before
+        // the marker existed: grid-lanes-baseline-alignment-affects-intrinsic-
+        // size-010 and its ordinary-grid reference stay on the same engine
+        // and agree. Only an out-of-flow static position reads it (End).
+        if last_baseline(style, child_style, true) {
             return Some("grid:last-baseline");
         }
         // `justify-self: baseline` shares row-axis baselines only with
