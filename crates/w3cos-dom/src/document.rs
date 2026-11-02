@@ -15466,10 +15466,14 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
             fragment = text;
         }
         loop {
-            let painted_wrapper_matches_text = fragment.children.first().is_some_and(|child| {
-                equivalent_text_style(&fragment.style, &child.style)
-                    && painted_inline_text_box_can_merge(&fragment.style)
-            });
+            // The style comparison clones both styles, so it runs only once
+            // every cheaper wrapper condition below has already passed.
+            let painted_wrapper_matches_text = || {
+                fragment.children.first().is_some_and(|child| {
+                    equivalent_text_style(&fragment.style, &child.style)
+                        && painted_inline_text_box_can_merge(&fragment.style)
+                })
+            };
             if !matches!(&fragment.kind, ComponentKind::Row | ComponentKind::Box)
                 || !matches!(
                     fragment.style.display,
@@ -15490,7 +15494,7 @@ fn coalesce_passive_inline_text_children(component: &mut w3cos_std::Component) {
                 // would silently turn `vertical-align: top` into baseline.
                 || fragment.style.align_self != w3cos_std::style::AlignSelf::Auto
                 || !(principal_box_can_merge_generated_inline_text(&fragment.style)
-                    || painted_wrapper_matches_text)
+                    || painted_wrapper_matches_text())
                 || !matches!(&fragment.children[0].kind, ComponentKind::Text { .. })
             {
                 break;
@@ -23561,6 +23565,29 @@ mod image_component_tests {
             Some("right")
         );
         crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn equivalent_text_style_ignores_run_identity_and_none_background_only() {
+        let base = w3cos_std::style::Style::default();
+        let mut run = base.clone();
+        let mut properties = w3cos_std::custom_properties::CustomProperties::default();
+        properties.insert(
+            w3cos_std::inline_text::SOURCE_RUN.to_string(),
+            "7".to_string(),
+        );
+        run.custom_properties = Some(properties);
+        run.background_image = Some("none".to_string().into());
+        assert!(equivalent_text_style(&base, &run));
+        assert!(equivalent_text_style(&run, &base));
+        let mut painted = base.clone();
+        painted.color = w3cos_std::Color::rgb(1, 2, 3);
+        assert!(!equivalent_text_style(&base, &painted));
+        let mut custom = base.clone();
+        let mut properties = w3cos_std::custom_properties::CustomProperties::default();
+        properties.insert("--tone".to_string(), "dark".to_string());
+        custom.custom_properties = Some(properties);
+        assert!(!equivalent_text_style(&base, &custom));
     }
 
     #[test]
