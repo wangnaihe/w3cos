@@ -811,6 +811,7 @@ impl Document {
             return;
         }
         let old_parent = self.get_node(child).parent;
+        let was_rendered = old_parent.is_some_and(|old| self.is_rendered_node(old));
         self.unlink_from_parent(child);
 
         let parent_last = self.get_node(parent).last_child;
@@ -842,7 +843,7 @@ impl Document {
         if parent_changed {
             self.invalidate_style_subtree(child);
         }
-        self.note_structure_change();
+        self.note_tree_edit(parent, was_rendered);
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
@@ -850,7 +851,7 @@ impl Document {
         self.get_node_mut(child).parent = None;
         self.mark_dirty(parent);
         self.invalidate_style_subtree(child);
-        self.note_structure_change();
+        self.note_tree_edit(parent, false);
     }
 
     pub fn replace_child(&mut self, parent: NodeId, new_child: NodeId, old_child: NodeId) {
@@ -939,6 +940,7 @@ impl Document {
             return;
         }
         let old_parent = self.get_node(new_child).parent;
+        let was_rendered = old_parent.is_some_and(|old| self.is_rendered_node(old));
         self.unlink_from_parent(new_child);
 
         let ref_prev = self.get_node(ref_child).prev_sibling;
@@ -961,7 +963,7 @@ impl Document {
         }
         self.mark_dirty(parent);
         self.invalidate_style_subtree(new_child);
-        self.note_structure_change();
+        self.note_tree_edit(parent, was_rendered);
     }
 
     fn insertion_would_create_cycle(&self, parent: NodeId, child: NodeId) -> bool {
@@ -1070,7 +1072,7 @@ impl Document {
         }
         self.link_fresh_child(parent, element.id);
         self.mark_dirty(parent);
-        self.note_structure_change();
+        self.note_tree_edit(parent, false);
         element.id
     }
 
@@ -1135,7 +1137,7 @@ impl Document {
         }
         self.link_fresh_child(parent, element.id);
         self.mark_dirty(parent);
-        self.note_structure_change();
+        self.note_tree_edit(parent, false);
         element.id
     }
 
@@ -1229,7 +1231,7 @@ impl Document {
     /// One layout invalidation for a batch of unnoted text writes and moves.
     pub fn note_batched_child_edits(&mut self, parent: NodeId) {
         self.mark_dirty(parent);
-        self.note_structure_change();
+        self.note_tree_edit(parent, false);
     }
 
     /// Create a repeated block row: one element, one text child, one inline
@@ -1277,7 +1279,7 @@ impl Document {
         self.link_fresh_child(parent, element);
         self.touch_style_revision(parent);
         self.record_layout_dirty(parent);
-        self.note_structure_change();
+        self.note_tree_edit(parent, false);
         Some(element)
     }
 
@@ -1342,7 +1344,7 @@ impl Document {
         self.link_fresh_child(parent, element);
         self.touch_style_revision(parent);
         self.record_layout_dirty(parent);
-        self.note_structure_change();
+        self.note_tree_edit(parent, false);
         Some(element)
     }
 
@@ -1923,7 +1925,7 @@ impl Document {
             self.touch_style_revision(id);
         }
         self.record_layout_dirty(id);
-        self.note_structure_change();
+        self.note_tree_edit(id, false);
     }
 
     fn text_box_is_stable(&self, id: NodeId) -> bool {
@@ -2006,6 +2008,40 @@ impl Document {
         self.cascade_generation = self.cascade_generation.wrapping_add(1);
         self.invalidate_text_box_stability();
         bump_structure_tick();
+    }
+
+    /// Whether `id` hangs under the body or the document node, i.e. whether
+    /// layout can see it. Nodes of a detached subtree (a fragment under
+    /// construction, a removed row, a shadow tree: composed rendering is not
+    /// implemented) never reach the layout tree.
+    fn is_rendered_node(&self, id: NodeId) -> bool {
+        let mut current = id;
+        loop {
+            if current == self.body_id {
+                return true;
+            }
+            let node = self.get_node(current);
+            if node.node_type == NodeType::Document {
+                return true;
+            }
+            match node.parent {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// A child-list or text edit at `node`. Layout generations only move when
+    /// the edit touches the rendered tree (`node` now, or `was_rendered` for
+    /// the place a moved child came from); building or editing a detached
+    /// subtree must not force a layout rebuild. The JS-visible structure
+    /// tick always moves.
+    fn note_tree_edit(&mut self, node: NodeId, was_rendered: bool) {
+        if was_rendered || self.is_rendered_node(node) {
+            self.note_structure_change();
+        } else {
+            bump_structure_tick();
+        }
     }
 
     /// The next paint must read new text, and the used boxes stay valid.
@@ -29853,5 +29889,112 @@ mod tree_mutation_tests {
         }
         assert_eq!(document.nodes.capacity(), capacity);
         assert!(document.nodes.len() <= capacity);
+    }
+}
+
+#[cfg(test)]
+mod detached_edit_tests {
+    use super::*;
+
+    fn generations(document: &Document) -> (u64, u64, u64) {
+        (
+            document.structure_generation(),
+            document.layout_generation(),
+            document.cascade_generation(),
+        )
+    }
+
+    #[test]
+    fn edits_inside_a_detached_subtree_leave_the_layout_generations_alone() {
+        let mut document = Document::new();
+        let tick = structure_tick();
+        let before = generations(&document);
+
+        let fragment = document.create_element("div");
+        for _ in 0..3 {
+            let row = document.create_element("div");
+            fragment.append_child(&mut document, row);
+            let label = document.create_text_node("x");
+            row.append_child(&mut document, label);
+        }
+        let first = document.get_node(fragment.id).first_child.unwrap();
+        let extra = document.create_element("span");
+        fragment.insert_before(&mut document, extra, Element::new(first));
+        fragment.remove_child(&mut document, &extra);
+
+        assert_eq!(
+            generations(&document),
+            before,
+            "building a detached tree must not force a layout rebuild"
+        );
+        assert!(
+            structure_tick() > tick,
+            "the JS-visible structure tick still moves"
+        );
+    }
+
+    #[test]
+    fn attaching_a_detached_subtree_bumps_once_per_rendered_edit() {
+        let mut document = Document::new();
+        let fragment = document.create_element("div");
+        let row = document.create_element("div");
+        fragment.append_child(&mut document, row);
+        let before = generations(&document);
+
+        document.body().append_child(&mut document, fragment);
+        let attached = generations(&document);
+        assert!(attached.1 > before.1 && attached.0 > before.0 && attached.2 > before.2);
+
+        // Now rendered: an edit deep in the subtree counts.
+        let leaf = document.create_element("div");
+        row.append_child(&mut document, leaf);
+        assert!(document.layout_generation() > attached.1);
+    }
+
+    #[test]
+    fn moving_or_removing_a_rendered_child_bumps_even_when_the_target_is_detached() {
+        let mut document = Document::new();
+        let row = document.create_element("div");
+        document.body().append_child(&mut document, row);
+        let scratch = document.create_element("div");
+
+        let before = document.layout_generation();
+        scratch.append_child(&mut document, row);
+        assert!(
+            document.layout_generation() > before,
+            "the row left the rendered tree"
+        );
+
+        let host = document.create_element("div");
+        document.body().append_child(&mut document, host);
+        let child = document.create_element("div");
+        host.append_child(&mut document, child);
+        let before = document.layout_generation();
+        host.remove_child(&mut document, &child);
+        assert!(document.layout_generation() > before);
+
+        // Moving between two detached parents stays quiet.
+        let a = document.create_element("div");
+        let b = document.create_element("div");
+        let item = document.create_element("div");
+        a.append_child(&mut document, item);
+        let before = generations(&document);
+        b.append_child(&mut document, item);
+        assert_eq!(generations(&document), before);
+    }
+
+    #[test]
+    fn text_edits_in_a_detached_node_are_quiet_and_rendered_ones_count() {
+        let mut document = Document::new();
+        let label = document.create_element("div");
+        label.set_text_content(&mut document, "a");
+        let before = generations(&document);
+        label.set_text_content(&mut document, "b");
+        assert_eq!(generations(&document), before);
+
+        document.body().append_child(&mut document, label);
+        let before = document.layout_generation();
+        label.set_text_content(&mut document, "c");
+        assert!(document.layout_generation() >= before);
     }
 }
