@@ -3416,7 +3416,7 @@ fn ratio_inline_contribution(
 /// ComputeMinMaxSizes of a box with an aspect ratio and a definite block
 /// size is the transferred inline size, which intrinsic `width` keywords
 /// then resolve against (aspect-ratio/intrinsic-size-004, -014).
-fn ratio_inline_size(
+pub(super) fn ratio_inline_size(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,

@@ -11040,3 +11040,32 @@ fn empty_text_beside_a_break_after_a_box_stays_legacy() {
     let flat = pre_flatten(&root);
     assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
 }
+
+/// css-sizing-4 aspect-ratio, a row flex item with a definite height and
+/// auto width: its flex base size is the width transferred from the height
+/// (css/css-sizing/aspect-ratio/flex-aspect-ratio-001, -005).
+#[test]
+fn flex_row_item_transfers_width_from_definite_height() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    for (ratio, width) in [("1", 100.0), ("0.5", 50.0)] {
+        let item = with_markers(
+            Style {
+                height: Dimension::Px(100.0),
+                min_width: Dimension::Px(0.0),
+                ..block()
+            },
+            &[("--w3cos-internal-aspect-ratio", ratio)],
+        );
+        let flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::NoWrap,
+            ..Style::default()
+        };
+        let root = node(block(), vec![node(flex, vec![node(item, vec![])])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 2), (0.0, 0.0, width, 100.0));
+    }
+}

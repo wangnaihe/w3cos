@@ -585,6 +585,32 @@ fn content_minmax(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpace) 
     if block::is_replaced(info.kind) {
         return block::intrinsic_sizes(flat, index, space);
     }
+    // A box with an aspect ratio and a definite block size has the inline
+    // size transferred from it as both intrinsic sizes (Blink
+    // ComputeMinMaxSizes; aspect-ratio/flex-aspect-ratio-001, -005).
+    if info.style.display == Display::Block
+        && !matches!(
+            info.kind,
+            w3cos_std::ComponentKind::Text { .. } | w3cos_std::ComponentKind::Button { .. }
+        )
+        && block::marker(info.style, "--w3cos-internal-aspect-ratio").is_some()
+        && matches!(info.style.height, Dimension::Px(_))
+    {
+        let style = info.style;
+        let side = |spacing| spacing_px(style, spacing, 0.0, space);
+        let border = block::border_widths(style);
+        let inline_edges =
+            border[1] + border[3] + side(style.padding.left) + side(style.padding.right);
+        let block_edges =
+            border[0] + border[2] + side(style.padding.top) + side(style.padding.bottom);
+        let sizes = block::intrinsic_sizes(flat, index, space).why("flex:intrinsic")?;
+        if let Some(inline) =
+            block::ratio_inline_size(flat, index, space, inline_edges, block_edges, sizes)
+                .why("flex:aspect-ratio")?
+        {
+            return Some(MinMax::exact(inline));
+        }
+    }
     // So are a button leaf's: its label (or nothing when empty).
     if matches!(info.kind, w3cos_std::ComponentKind::Button { .. })
         && rendered_children(flat, index).next().is_none()
