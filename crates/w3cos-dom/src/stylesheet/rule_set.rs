@@ -29,10 +29,6 @@ pub(super) struct RuleSet {
     positional_anchors: Vec<PositionalAnchor>,
     /// Compounds carrying `:empty`, which watch their own child list.
     empty_anchors: Vec<CompoundSelector>,
-    /// Some positional/sibling dependency is not captured by the anchors
-    /// (nested selector lists, `:nth-child(.. of S)`), so callers must fall
-    /// back to restyling every sibling.
-    positional_unbounded: bool,
 }
 
 /// Static part (pseudo-classes dropped, which only widens the match) of a
@@ -43,7 +39,8 @@ struct PositionalAnchor {
     /// Static part of the parent compound when joined by `>`; every sibling
     /// shares one parent, so the anchor can only apply when it matches.
     parent: Option<CompoundSelector>,
-    /// The compound sits right of `+` or `~`.
+    /// The compound sits right of `+` or `~` (also inside `:not(.a + .b)`),
+    /// so it reads siblings *before* it.
     sibling_rhs: bool,
 }
 
@@ -206,7 +203,6 @@ impl RuleSet {
         self.relational_anchors.clear();
         self.positional_anchors.clear();
         self.empty_anchors.clear();
-        self.positional_unbounded = false;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -302,22 +298,19 @@ impl RuleSet {
         let rule = &self.rules[index];
         let mut anchors = Vec::new();
         let mut empty = Vec::new();
-        let mut unbounded = false;
         for (position, compound) in rule.chain.iter().enumerate() {
-            unbounded |= compound
-                .pseudo_classes
-                .iter()
-                .any(pseudo_is_positionally_opaque);
-            let sibling_rhs = position > 0
+            let sibling_combinator = position > 0
                 && matches!(
                     rule.combinators[position - 1],
                     super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
                 );
-            let positional = compound.pseudo_classes.iter().any(pseudo_is_positional);
-            let watches_children = compound
-                .pseudo_classes
-                .iter()
-                .any(|pseudo| matches!(pseudo, super::PseudoClass::Empty));
+            let pseudos = &compound.pseudo_classes;
+            let sibling_rhs = sibling_combinator || pseudos.iter().any(pseudo_reads_preceding);
+            // `:has(+ x)` makes the subject depend on the sibling after it.
+            let positional = pseudos.iter().any(|pseudo| {
+                pseudo_is_positional(pseudo) || pseudo_has_sibling_scoped_relational(pseudo)
+            });
+            let watches_children = pseudos.iter().any(pseudo_watches_children);
             if !(positional || sibling_rhs || watches_children) {
                 continue;
             }
@@ -341,13 +334,8 @@ impl RuleSet {
                 });
             }
         }
-        self.positional_unbounded |= unbounded;
         self.positional_anchors.extend(anchors);
         self.empty_anchors.extend(empty);
-    }
-
-    pub(super) fn positional_unbounded(&self) -> bool {
-        self.positional_unbounded
     }
 
     /// Whether `ctx` (a child of `parent`) could change match result when its
@@ -463,54 +451,65 @@ fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
 
 /// Position-dependent pseudo-classes whose subject is the sibling itself.
 fn pseudo_is_positional(pseudo: &super::PseudoClass) -> bool {
-    matches!(
-        pseudo,
-        super::PseudoClass::FirstChild
-            | super::PseudoClass::LastChild
-            | super::PseudoClass::FirstOfType
-            | super::PseudoClass::LastOfType
-            | super::PseudoClass::OnlyChild
-            | super::PseudoClass::OnlyOfType
-            | super::PseudoClass::NthChild(_)
-            | super::PseudoClass::NthLastChild(_)
-            | super::PseudoClass::NthOfType(_)
-            | super::PseudoClass::NthLastOfType(_)
-    )
+    pseudo_nests_position(pseudo)
+        || matches!(
+            pseudo,
+            super::PseudoClass::FirstChild
+                | super::PseudoClass::LastChild
+                | super::PseudoClass::FirstOfType
+                | super::PseudoClass::LastOfType
+                | super::PseudoClass::OnlyChild
+                | super::PseudoClass::OnlyOfType
+                | super::PseudoClass::NthChild(_)
+                | super::PseudoClass::NthLastChild(_)
+                | super::PseudoClass::NthOfType(_)
+                | super::PseudoClass::NthLastOfType(_)
+        )
 }
 
-/// Pseudo-classes whose sibling/structural reach the anchors cannot bound:
-/// selector lists that may nest a positional or sibling selector, and
-/// `:nth-*(An+B of S)`, which also reads sibling attributes.
-fn pseudo_is_positionally_opaque(pseudo: &super::PseudoClass) -> bool {
+const POSITIONAL_KEYWORDS: [&str; 7] = [
+    ":empty",
+    ":first-child",
+    ":last-child",
+    ":first-of-type",
+    ":last-of-type",
+    ":only-child",
+    ":only-of-type",
+];
+
+/// Selector-list pseudo-classes whose argument is evaluated against the
+/// subject itself (`:not(:first-child)`), as opposed to `:has()`, which reads
+/// the subject's descendants and is tracked by the relational anchors.
+fn selector_list_argument(pseudo: &super::PseudoClass) -> Option<String> {
     match pseudo {
-        super::PseudoClass::Has(_) => true,
         super::PseudoClass::Not(selector)
         | super::PseudoClass::Is(selector)
-        | super::PseudoClass::Where(selector) => {
-            let selector = selector.to_ascii_lowercase();
-            selector.contains('+')
-                || selector.contains('~')
-                || selector.contains(":nth-")
-                || [
-                    ":empty",
-                    ":first-child",
-                    ":last-child",
-                    ":first-of-type",
-                    ":last-of-type",
-                    ":only-child",
-                    ":only-of-type",
-                ]
-                .iter()
-                .any(|needle| selector.contains(needle))
-        }
-        super::PseudoClass::NthChild(expression)
-        | super::PseudoClass::NthLastChild(expression)
-        | super::PseudoClass::NthOfType(expression)
-        | super::PseudoClass::NthLastOfType(expression) => {
-            expression.to_ascii_lowercase().contains(" of ")
-        }
-        _ => false,
+        | super::PseudoClass::Where(selector) => Some(selector.to_ascii_lowercase()),
+        _ => None,
     }
+}
+
+/// The compound's result depends on its position in the child list through a
+/// nested selector list (`:not(:first-child)`, `:is(:nth-child(2n), .x)`).
+fn pseudo_nests_position(pseudo: &super::PseudoClass) -> bool {
+    selector_list_argument(pseudo).is_some_and(|selector| {
+        selector.contains(":nth-")
+            || POSITIONAL_KEYWORDS
+                .iter()
+                .any(|needle| *needle != ":empty" && selector.contains(needle))
+    })
+}
+
+/// `:not(.a + .b)`: the subject reads siblings before it.
+fn pseudo_reads_preceding(pseudo: &super::PseudoClass) -> bool {
+    selector_list_argument(pseudo)
+        .is_some_and(|selector| selector.contains('+') || selector.contains('~'))
+}
+
+/// `:empty`, also nested in `:not(:empty)`.
+fn pseudo_watches_children(pseudo: &super::PseudoClass) -> bool {
+    matches!(pseudo, super::PseudoClass::Empty)
+        || selector_list_argument(pseudo).is_some_and(|selector| selector.contains(":empty"))
 }
 
 fn pseudo_has_structural_dependency(pseudo: &super::PseudoClass) -> bool {
