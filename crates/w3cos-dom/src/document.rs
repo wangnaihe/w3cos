@@ -1766,10 +1766,16 @@ impl Document {
         self.note_cascade_change();
     }
 
-    /// Inline declarations cannot change selector matching, but inherited
-    /// values and custom properties require the complete descendant subtree.
+    /// Inline declarations cannot change selector matching (unless a selector
+    /// reads the `style` attribute). Inherited values and custom properties
+    /// reach descendants through the `inherited` style, which every descendant
+    /// cache lookup compares, so only this node's revision needs to change.
     pub fn mark_inline_style_dirty(&mut self, id: NodeId) {
-        self.invalidate_style_subtree(id);
+        if stylesheet::has_style_attribute_dependencies() {
+            self.invalidate_style_subtree(id);
+        } else {
+            self.touch_style_revision(id);
+        }
         self.record_layout_dirty(id);
         self.note_cascade_change();
     }
@@ -28682,7 +28688,9 @@ mod computed_style_cache_tests {
         assert!(document.computed_style_cache_is_current(child.id));
         parent.style_mut(&mut document).set_property("color", "red");
 
-        assert!(!document.computed_style_cache_is_current(child.id));
+        // The child's entry keeps its revision; the changed inherited style
+        // makes the next lookup recompute it.
+        assert!(!document.computed_style_cache_is_current(parent.id));
         assert_eq!(
             document.computed_style_for(child.id).color,
             w3cos_std::Color::rgb(255, 0, 0)

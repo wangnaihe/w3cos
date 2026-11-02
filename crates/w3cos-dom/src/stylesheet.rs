@@ -399,7 +399,7 @@ struct Rule {
 thread_local! {
     static RULES: RefCell<RuleSet> = RefCell::new(RuleSet::default());
     static STYLE_GENERATION: Cell<u64> = const { Cell::new(1) };
-    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural. Bit 4: sibling-scoped :has().
+    /// Bit 0: any rule. Bit 1: sibling. Bit 2: relational. Bit 3: structural. Bit 4: sibling-scoped :has(). Bit 5: `style` attribute selector.
     /// Hot DOM mutations read this cell instead of borrowing `RULES`.
     static RULE_FLAGS: Cell<u8> = const { Cell::new(0) };
 }
@@ -420,6 +420,9 @@ fn pack_rule_flags(rules: &RuleSet) -> u8 {
     }
     if rules.has_sibling_scoped_relational() {
         flags |= 16;
+    }
+    if rules.has_style_attribute_dependencies() {
+        flags |= 32;
     }
     flags
 }
@@ -459,6 +462,11 @@ pub(crate) fn has_sibling_scoped_relational() -> bool {
 /// Whether `ctx` can anchor a `:has()` compound; see `RuleSet::relational_anchor`.
 pub(crate) fn relational_anchor(ctx: &SelectorContext) -> Option<u8> {
     RULES.with(|rules| rules.borrow().relational_anchor(ctx))
+}
+
+/// Whether any selector observes the `style` attribute.
+pub(crate) fn has_style_attribute_dependencies() -> bool {
+    RULE_FLAGS.with(|cell| cell.get() & 32 != 0)
 }
 
 pub(crate) fn has_structural_dependencies() -> bool {
