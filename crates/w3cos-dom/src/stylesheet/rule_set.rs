@@ -30,6 +30,10 @@ pub(super) struct RuleSet {
     positional_anchors: Vec<PositionalAnchor>,
     /// Compounds carrying `:empty`, which watch their own child list.
     empty_anchors: Vec<CompoundSelector>,
+    /// Rules that declare a transition the runtime can sample (see
+    /// `declares_sampled_transition`). An element none of them match cannot
+    /// carry a sampled transition, so style change tracking skips it.
+    motion_rules: Vec<usize>,
 }
 
 /// Which siblings a rule reads *after* its subject. A tail append (a new last
@@ -356,12 +360,28 @@ impl RuleSet {
         self.relational_anchors.clear();
         self.positional_anchors.clear();
         self.empty_anchors.clear();
+        self.motion_rules.clear();
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
     }
 
+    pub(super) fn motion_rules(&self) -> impl Iterator<Item = &Rule> {
+        self.motion_rules.iter().map(|index| &self.rules[*index])
+    }
+
+    pub(super) fn has_motion_rules(&self) -> bool {
+        !self.motion_rules.is_empty()
+    }
+
     fn index_rule(&mut self, index: usize) {
+        if self.rules[index]
+            .declarations
+            .iter()
+            .any(|(property, value)| super::declares_sampled_transition(property, value))
+        {
+            self.motion_rules.push(index);
+        }
         self.has_sibling_dependencies |= self.rules[index].combinators.iter().any(|combinator| {
             matches!(
                 combinator,

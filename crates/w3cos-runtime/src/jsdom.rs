@@ -13352,6 +13352,12 @@ fn motion_style(node: u32, pseudo: Option<&str>) -> w3cos_std::style::Style {
 }
 
 fn capture_transition_snapshots(node: u32) -> Vec<TransitionSnapshot> {
+    // Only `left`/`transform` transitions are sampled. When no rule or inline
+    // declaration can give this node one, skip the three computed styles.
+    if !dom::with_document(|document| document.may_have_sampled_transition(NodeId::from_u32(node)))
+    {
+        return Vec::new();
+    }
     let mut snapshots = Vec::new();
     for pseudo in [None, Some("::before"), Some("::after")] {
         let style = motion_style(node, pseudo);
