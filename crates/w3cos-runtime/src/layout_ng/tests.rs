@@ -3263,8 +3263,8 @@ fn top_level_definite_inline_grid_shares_a_line() {
 /// item fills it; `align-items: start` keeps a 20×10 item at the start;
 /// `100px 150px` with a 10px column gap is 260×40; `left: 8px; top: 4px`
 /// offsets that border box. Two empty grids after a 15px block share the
-/// bottom-margin baseline. An out-of-flow child and a margin stay on the
-/// legacy marker.
+/// bottom-margin baseline. An out-of-flow child is placed by the grid; a
+/// non-negative px margin offsets the box.
 #[test]
 fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
     use w3cos_std::style::{AlignItems, CustomProperties, Position};
@@ -3381,10 +3381,12 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
     );
     let oof_flat = pre_flatten(&oof);
     assert!(
-        !block::supports_tree(&oof_flat),
+        block::supports_tree(&oof_flat),
         "{:?}",
         block::unsupported_reasons(&oof_flat)
     );
+    let oof_out = layout_tree(&oof, &oof_flat, 800.0, 600.0).expect("oof child");
+    assert_eq!(at(&oof_out, 1), (0.0, 0.0, 100.0, 100.0));
 
     let mut margined = grid("100px", "40px", AlignItems::Stretch);
     margined.margin = margins(10.0, 0.0, 0.0, 0.0);
@@ -3409,6 +3411,87 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
         "{:?}",
         block::unsupported_reasons(&static_flat)
     );
+}
+
+/// A fixed-track `inline-grid` with `direction: rtl` mirrors its columns
+/// (the first column is at the right edge of its 400px border box), and
+/// out-of-flow children are placed in it. A vertical-writing-mode one is
+/// laid out through the transposed path: its width is the sum of the rows
+/// and its height the sum of the columns. One whose items are not plain
+/// leaves stays on the marker.
+#[test]
+fn fixed_track_inline_grid_supports_rtl_and_vertical_writing_modes() {
+    use w3cos_std::style::{CustomProperties, Position, TextDirection, WritingMode};
+    let grid = |mode: WritingMode, direction: TextDirection| {
+        let mut style = Style {
+            display: Display::Flex,
+            position: Position::Relative,
+            writing_mode: mode,
+            direction,
+            grid_template_columns: Some("100px 150px".to_string()),
+            ..Style::default()
+        };
+        style.grid_ng_mut().grid_template_rows = Some("40px 60px".to_string());
+        style.custom_properties = Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )]));
+        style
+    };
+    let at = |out: &[(LayoutRect, usize)], index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    let item = |mode: WritingMode, direction: TextDirection| {
+        node(
+            Style {
+                writing_mode: mode,
+                direction,
+                width: Dimension::Px(10.0),
+                height: Dimension::Px(20.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    // 0 root, 1 grid, 2 first item.
+    let mut rtl_style = grid(WritingMode::HorizontalTb, TextDirection::Rtl);
+    rtl_style.width = Dimension::Px(400.0);
+    let rtl = node(
+        block(),
+        vec![node(
+            rtl_style,
+            vec![item(WritingMode::HorizontalTb, TextDirection::Rtl)],
+        )],
+    );
+    let rtl_flat = pre_flatten(&rtl);
+    assert!(
+        block::supports_tree(&rtl_flat),
+        "{:?}",
+        block::unsupported_reasons(&rtl_flat)
+    );
+    let rtl_out = layout_tree(&rtl, &rtl_flat, 800.0, 600.0).expect("rtl");
+    assert_eq!(at(&rtl_out, 1), (0.0, 0.0, 400.0, 100.0));
+    // Column 1 spans 300..400; the 10px item sits at its start (right) edge.
+    assert_eq!(at(&rtl_out, 2).0, 390.0);
+
+    for mode in [WritingMode::VerticalLr, WritingMode::VerticalRl] {
+        let vertical = node(
+            block(),
+            vec![node(
+                grid(mode, TextDirection::Ltr),
+                vec![item(mode, TextDirection::Ltr)],
+            )],
+        );
+        let flat = pre_flatten(&vertical);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&vertical, &flat, 800.0, 600.0).expect("vertical");
+        assert_eq!(at(&out, 1), (0.0, 0.0, 100.0, 250.0), "{mode:?}");
+    }
 }
 
 #[test]

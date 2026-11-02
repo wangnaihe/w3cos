@@ -957,6 +957,17 @@ pub(super) fn intrinsic_track_inline_grid(flat: &[FlatNodeInfo], index: usize) -
 }
 
 fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> bool {
+    inline_grid_tracks_for(flat, index, intrinsic, false)
+}
+
+/// `patching`: `vertical_grid_styles` asks whether the box could be laid
+/// out once transposed, so the vertical-writing-mode guard does not apply.
+fn inline_grid_tracks_for(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    intrinsic: bool,
+    patching: bool,
+) -> bool {
     let style = flat[index].style;
     if !block::is_inline_grid(style) {
         return false;
@@ -1001,9 +1012,20 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     {
         return false;
     }
-    if style.direction == TextDirection::Rtl
+    if (style.direction == TextDirection::Rtl && intrinsic)
         || style.float != Float::None
         || style.clear != Clear::None
+    {
+        return false;
+    }
+    // A vertical-writing-mode inline-grid lays out only through the
+    // transposed path (`vertical_grid_styles`), which marks it; anything
+    // else would be laid out as a horizontal grid.
+    if !intrinsic
+        && !patching
+        && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb
+        && !has_marker(style, VERTICAL_MARKER)
+        && rendered_children(flat, index).any(|child| oof::is_out_of_flow(flat[child].style))
     {
         return false;
     }
@@ -1056,14 +1078,6 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
         || has_marker(style, "--w3cos-internal-document-element")
         || has_marker(style, "--w3cos-internal-size-containment")
         || has_marker(style, HEIGHT_KEYWORD)
-    {
-        return false;
-    }
-    if !intrinsic
-        && rendered_children(flat, index).any(|child| {
-            let child_style = flat[child].style;
-            oof::is_out_of_flow(child_style)
-        })
     {
         return false;
     }
@@ -5744,10 +5758,16 @@ fn pack_content(pack: Pack) -> AlignContent {
 /// Internal markers a vertical grid container may carry; anything else
 /// (percent gaps, intrinsic keywords, overflow alignment, ...) is not
 /// transposed, so that container keeps its previous behavior.
-fn vertical_container_markers_ok(style: &Style) -> bool {
+fn vertical_container_markers_ok(style: &Style, inline_root: bool) -> bool {
     style.custom_properties.as_ref().is_none_or(|props| {
         props.iter().all(|(key, value)| {
             if !key.starts_with("--w3cos-internal-") || vertical_inert_marker(key) {
+                return true;
+            }
+            if inline_root
+                && key == "--w3cos-internal-unrecognized-display"
+                && value == "inline-grid"
+            {
                 return true;
             }
             if key == JUSTIFY_KEYWORD {
@@ -5831,9 +5851,20 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             WritingMode::VerticalLr => false,
             _ => continue,
         };
-        if style.display != Display::Grid
-            || !matches!(style.width, Dimension::Px(_))
-            || !matches!(style.height, Dimension::Px(_))
+        // A fixed-track inline-grid sizes to the sum of its tracks, which
+        // the transposed grid computes in the other axis.
+        let inline_root = style.display != Display::Grid
+            && block::is_inline_grid(style)
+            && !block::is_inline_lanes(style)
+            && inline_grid_tracks_for(flat, index, false, true);
+        let sized = |dim: Dimension| match dim {
+            Dimension::Px(_) => true,
+            Dimension::Auto => inline_root,
+            _ => false,
+        };
+        if !(style.display == Display::Grid || inline_root)
+            || !sized(style.width)
+            || !sized(style.height)
             || !matches!(style.min_width, Dimension::Auto)
             || !matches!(style.min_height, Dimension::Auto)
             || !matches!(style.max_width, Dimension::Auto)
@@ -5843,7 +5874,7 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             || is_baseline(style.align_items)
             || is_baseline(style.justify_items)
             || container_wants_block_baseline(style)
-            || !vertical_container_markers_ok(style)
+            || !vertical_container_markers_ok(style, inline_root)
             || style.grid_areas().is_some()
             || parse_flow(style.grid_flow()).is_none()
             || [columns_spec(style), style.grid_rows()]

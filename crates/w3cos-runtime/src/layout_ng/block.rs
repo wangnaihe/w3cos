@@ -4886,8 +4886,18 @@ pub(super) fn layout_block_in(
                 // margin edge when the grid has no items (CSS Grid §10,
                 // CSS 2.1 10.8.1); the line box holds the margin boxes.
                 let margin_ascent = |result: &LayoutResult| {
-                    let margins = inline_grid_margins(flat[result.fragment.index].style);
-                    match result.first_baseline {
+                    let style = flat[result.fragment.index].style;
+                    let margins = inline_grid_margins(style);
+                    // A vertical-writing-mode grid in a horizontal line is
+                    // orthogonal: its baseline is synthesized from the
+                    // bottom border edge.
+                    let first_baseline =
+                        if style.writing_mode == w3cos_std::style::WritingMode::HorizontalTb {
+                            result.first_baseline
+                        } else {
+                            LastBaseline::NoLines
+                        };
+                    match first_baseline {
                         LastBaseline::At(baseline) => margins[0] + baseline,
                         LastBaseline::NoLines | LastBaseline::Unknown => {
                             margins[0] + result.fragment.height + margins[2]
@@ -4939,7 +4949,10 @@ pub(super) fn layout_block_in(
                     let top = line_y + shift + margins[0];
                     let (fx, fy) = (bl + pl + placed_x + margins[3] + dx, bt + pt + top + dy);
                     oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
-                    if result.last_baseline != LastBaseline::NoLines {
+                    if result.last_baseline != LastBaseline::NoLines
+                        && flat[result.fragment.index].style.writing_mode
+                            == w3cos_std::style::WritingMode::HorizontalTb
+                    {
                         last_baseline = result.last_baseline.offset(bt + pt + top);
                     }
                     children.push((fx, fy, result.fragment));
