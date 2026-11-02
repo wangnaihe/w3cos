@@ -15679,7 +15679,12 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         for _ in 0..5000 {
             loader.poll();
             poll_script_fetches();
-            if crate::image_loader::dimensions(&source) == Some((3, 2)) {
+            // The image can arrive one poll before the loader observes the
+            // load event; wait for both so a slow runner cannot race the
+            // `Complete` assertion below.
+            if crate::image_loader::dimensions(&source) == Some((3, 2))
+                && loader.progress() == &DocumentLoadProgress::Complete
+            {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(1));
