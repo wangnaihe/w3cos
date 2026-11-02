@@ -51,7 +51,7 @@ fn flow_of(style: &Style) -> Option<Flow> {
 /// scripts, bidi controls and scripts with their own vertical rules are not
 /// modeled.
 fn sideways_char(c: char) -> bool {
-    c <= '\u{24F}' || ('\u{2010}'..='\u{2027}').contains(&c)
+    c <= '\u{24F}' || ('\u{2010}'..='\u{2027}').contains(&c) || c == '\u{2028}'
 }
 
 /// Internal markers that only carry cascade values this module's styles are
@@ -84,12 +84,12 @@ fn has_internal_marker(style: &Style, allowed: &[&str]) -> bool {
     })
 }
 
-fn plain_style(style: &Style, flow: Flow) -> bool {
+/// The part of a plain orthogonal box's style shared by in-flow roots, their
+/// descendants and out-of-flow grid items.
+fn plain_flow_style(style: &Style, flow: Flow) -> bool {
     flow_of(style) == Some(flow)
-        && style.direction == TextDirection::Ltr
         && style.float == Float::None
         && style.clear == Clear::None
-        && style.position == Position::Static
         && style.unicode_bidi == UnicodeBidi::Normal
         && !block::non_visible_overflow(style)
         && matches!(style.text_align, TextAlign::Start)
@@ -98,12 +98,136 @@ fn plain_style(style: &Style, flow: Flow) -> bool {
         && style.column_width == Dimension::Auto
 }
 
+fn plain_style(style: &Style, flow: Flow) -> bool {
+    plain_flow_style(style, flow)
+        && style.direction == TextDirection::Ltr
+        && style.position == Position::Static
+}
+
+/// Set on the style copy of an absolutely positioned item of a transposed
+/// vertical grid that holds text (`grid::vertical_grid_styles`): the item is
+/// an orthogonal root of the grid's physical (horizontal) frame, sized by the
+/// out-of-flow resolver.
+pub(super) const GRID_ITEM_MARKER: &str = "--w3cos-internal-vertical-grid-item";
+
+/// Markers an out-of-flow vertical grid item carries for its alignment.
+const GRID_ITEM_MARKERS: &[&str] = &[
+    GRID_ITEM_MARKER,
+    inline::IFC_MARKER,
+    "--w3cos-internal-align-self",
+    "--w3cos-internal-justify-self",
+    "--w3cos-internal-align-items",
+    "--w3cos-internal-overflow-alignment",
+];
+
+/// Whether `index` is an absolutely positioned item with text of a vertical
+/// grid, laid out as an orthogonal root of the grid's frame. `patched`: the
+/// transposed style copy (marked, direction patched) instead of the author
+/// style the grid patch inspects.
+fn grid_item_flow(flat: &[FlatNodeInfo], index: usize, patched: bool) -> Option<Flow> {
+    let info = &flat[index];
+    let style = info.style;
+    let flow = flow_of(style)?;
+    if patched {
+        let parent = info.parent?;
+        flat[parent]
+            .style
+            .custom_properties
+            .as_ref()
+            .filter(|props| props.contains_key(super::grid::VERTICAL_MARKER))?;
+    }
+    if !matches!(style.display, Display::Block | Display::FlowRoot)
+        || !matches!(
+            info.kind,
+            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
+        )
+        || !plain_flow_style(style, flow)
+        || (!patched && style.direction != TextDirection::Ltr)
+        || style.position != Position::Absolute
+        || block::is_author_flex(style)
+        || block::is_author_grid(style)
+        || has_internal_marker(style, GRID_ITEM_MARKERS)
+        || [
+            style.margin.top,
+            style.margin.right,
+            style.margin.bottom,
+            style.margin.left,
+        ]
+        .contains(&Spacing::Auto)
+        || ![style.min_width, style.max_width, style.max_height]
+            .iter()
+            .all(|d| matches!(d, Dimension::Auto))
+        || !(matches!(style.min_height, Dimension::Auto) || is_ifc_strut(style))
+    {
+        return None;
+    }
+    descendants_plain(flat, index, flow).then_some(flow)
+}
+
+/// The line-box strut `min-height` the DOM lowering gives an inline
+/// formatting context whose authored min/height are auto. It is a horizontal
+/// line-height artifact: the transposed frame lays the lines out itself.
+fn is_ifc_strut(style: &Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|p| p.contains_key(inline::IFC_MARKER))
+        && style.min_height == Dimension::Px(style.font_size * style.line_height)
+}
+
+/// The grid patch's check on an author-style item (unmarked, ltr).
+pub(super) fn grid_item_text_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
+    grid_item_flow(flat, index, false)
+}
+
+/// Every descendant of `index` is a plain box or sideways text this
+/// module transposes exactly.
+fn descendants_plain(flat: &[FlatNodeInfo], index: usize, flow: Flow) -> bool {
+    for node in index + 1..flat[index].subtree_end {
+        let node_info = &flat[node];
+        let s = node_info.style;
+        if s.display == Display::None {
+            continue;
+        }
+        let kind_ok = match node_info.kind {
+            ComponentKind::Text { content } => content.chars().all(sideways_char),
+            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => true,
+            _ => false,
+        };
+        let display_ok = match s.display {
+            Display::Block | Display::FlowRoot | Display::Inline => true,
+            Display::Flex => s
+                .custom_properties
+                .as_ref()
+                .is_some_and(|p| p.contains_key(inline::IFC_MARKER)),
+            _ => false,
+        };
+        if !kind_ok
+            || !display_ok
+            || !plain_style(s, flow)
+            || block::is_author_flex(s)
+            || block::is_author_grid(s)
+            || has_internal_marker(s, &[inline::IFC_MARKER])
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// The flow of `index` when it is an orthogonal root this module lays out
 /// exactly; `None` leaves the box on the pre-existing path.
 pub(super) fn root_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
     let info = &flat[index];
     let style = info.style;
     let flow = flow_of(style)?;
+    if style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(GRID_ITEM_MARKER))
+    {
+        return grid_item_flow(flat, index, true);
+    }
     let parent = info.parent?;
     let parent_style = flat[parent].style;
     if parent_style.writing_mode != WritingMode::HorizontalTb
@@ -133,7 +257,7 @@ pub(super) fn root_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
         || !plain_style(style, flow)
         || block::is_author_flex(style)
         || block::is_author_grid(style)
-        || has_internal_marker(style, &[])
+        || has_internal_marker(style, &[inline::IFC_MARKER])
         || [
             style.margin.top,
             style.margin.right,
@@ -144,34 +268,8 @@ pub(super) fn root_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
     {
         return None;
     }
-    for node in index + 1..info.subtree_end {
-        let node_info = &flat[node];
-        let s = node_info.style;
-        if s.display == Display::None {
-            continue;
-        }
-        let kind_ok = match node_info.kind {
-            ComponentKind::Text { content } => content.chars().all(sideways_char),
-            ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => true,
-            _ => false,
-        };
-        let display_ok = match s.display {
-            Display::Block | Display::FlowRoot | Display::Inline => true,
-            Display::Flex => s
-                .custom_properties
-                .as_ref()
-                .is_some_and(|p| p.contains_key(inline::IFC_MARKER)),
-            _ => false,
-        };
-        if !kind_ok
-            || !display_ok
-            || !plain_style(s, flow)
-            || block::is_author_flex(s)
-            || block::is_author_grid(s)
-            || has_internal_marker(s, &[inline::IFC_MARKER])
-        {
-            return None;
-        }
+    if !descendants_plain(flat, index, flow) {
+        return None;
     }
     Some(flow)
 }
@@ -269,16 +367,23 @@ pub(super) fn layout(
     // Contexts this slice does not model: a measured size (flex/grid/float
     // items), a probe, a float the root would have to avoid, a right-to-left
     // containing block.
-    if sized.is_some() {
+    let style = flat[index].style;
+    // An out-of-flow item of a transposed vertical grid: sized by the
+    // resolver, whose containing block direction is the grid's patched one
+    // (the item itself and its content are ltr).
+    let item = style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(GRID_ITEM_MARKER));
+    if sized.is_some() && !item {
         return super::bail("orthogonal:sized");
     }
-    if space.percent_unresolved || space.rtl {
+    if space.percent_unresolved || (space.rtl && !item) {
         return super::bail("orthogonal:probe");
     }
     if !exclusions.is_empty() {
         return super::bail("orthogonal:float");
     }
-    let style = flat[index].style;
     let cb_width = space.available_inline;
     let side = |s: Spacing| {
         resolve_spacing_for_layout(s, cb_width, style, space.viewport_w, space.viewport_h)
@@ -329,11 +434,34 @@ pub(super) fn layout(
     inner.min_height = resolve_percent(style.min_width, Some(cb_width));
     inner.max_height = resolve_percent(style.max_width, Some(cb_width));
 
+    if item {
+        inner.position = Position::Static;
+        inner.direction = TextDirection::Ltr;
+        if is_ifc_strut(style) {
+            inner.min_width = Dimension::Auto;
+        }
+        if let Some((width, height)) = sized {
+            // Content sizes: the physical width is the block size, the
+            // physical height (when definite) the inline size.
+            inner.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
+            inner.height = Dimension::Px(width);
+            if let Some(height) = height {
+                inner.width = Dimension::Px(height);
+            }
+        }
+    }
+
     // Transposed copy of the tree: the root's subtree in horizontal space.
     let mut styles: Vec<Style> = Vec::new();
     styles.push(inner);
     for node in index + 1..flat[index].subtree_end {
-        styles.push(transpose_style(flat[node].style, flow));
+        let mut transposed_style = transpose_style(flat[node].style, flow);
+        if matches!(&flat[node].kind, ComponentKind::Text { content } if content.as_str() == "\u{2028}")
+        {
+            // A `<br>`'s line-height box height is a horizontal artifact.
+            transposed_style.width = Dimension::Auto;
+        }
+        styles.push(transposed_style);
     }
     let transposed: Vec<FlatNodeInfo> = flat
         .iter()

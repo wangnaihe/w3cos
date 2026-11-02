@@ -5894,7 +5894,9 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 w3cos_std::ComponentKind::Box
                     | w3cos_std::ComponentKind::Row
                     | w3cos_std::ComponentKind::Column
-            ) || flat[child].subtree_end > child + 1
+            ) || (flat[child].subtree_end > child + 1
+                && !(child_style.position == Position::Absolute
+                    && super::orthogonal::grid_item_text_flow(flat, child).is_some()))
                 || child_style.writing_mode != style.writing_mode
                 || child_style.direction != style.direction
                 || !(child_style.position == Position::Static
@@ -5915,6 +5917,8 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                     props.keys().any(|key| {
                         key.starts_with("--w3cos-internal-")
                             && !vertical_inert_marker(key)
+                            && !(key == super::inline::IFC_MARKER
+                                && flat[child].subtree_end > child + 1)
                             && !(child_style.position == Position::Absolute
                                 && key == "--w3cos-internal-overflow-alignment")
                             && key != "--w3cos-internal-align-self"
@@ -6014,7 +6018,19 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                     _ => {}
                 }
             }
-            item.direction = direction;
+            if flat[child].subtree_end > child + 1 {
+                // An item with text keeps its own (ltr) direction: its
+                // text is laid out by the orthogonal root path, which
+                // transposes it as ltr.
+                item.custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        super::orthogonal::GRID_ITEM_MARKER.to_string(),
+                        String::new(),
+                    );
+            } else {
+                item.direction = direction;
+            }
             patched.push((child, item));
         }
     }

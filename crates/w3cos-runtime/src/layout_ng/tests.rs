@@ -10657,6 +10657,118 @@ fn orthogonal_roots_accept_cascade_only_markers() {
     assert!(texts.iter().all(|t| t.vertical) && !texts.is_empty());
 }
 
+/// An absolutely positioned item with text, in a vertical fixed-track
+/// inline-grid, is an orthogonal root of the grid's frame: shrink-to-fit
+/// along the vertical inline axis, one text line per `<br>`. Measured with
+/// Chrome (wpt grid-column-axis-alignment-positioned-items-001): 10x60 for
+/// "X XX X" and 20x60 for two lines.
+#[test]
+fn vertical_grid_abspos_items_with_text_are_orthogonal_roots() {
+    use w3cos_std::style::{CustomProperties, Position, TextDirection, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let marked = |style: Style, keys: &[&str]| Style {
+        custom_properties: Some(CustomProperties::from_iter(
+            keys.iter()
+                .map(|k| (format!("--w3cos-internal-{k}"), "none".to_string())),
+        )),
+        ..style
+    };
+    for mode in [WritingMode::VerticalLr, WritingMode::VerticalRl] {
+        let mut grid = marked(
+            Style {
+                display: Display::Flex,
+                position: Position::Relative,
+                writing_mode: mode,
+                direction: TextDirection::Ltr,
+                grid_template_columns: Some("100px 150px".to_string()),
+                ..font.clone()
+            },
+            &["align-items"],
+        );
+        grid.grid_ng_mut().grid_template_rows = Some("40px 60px".to_string());
+        grid.custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            );
+        let text = |s: &str| {
+            Component::text(
+                s,
+                marked(
+                    Style {
+                        display: Display::Inline,
+                        writing_mode: mode,
+                        ..font.clone()
+                    },
+                    &["text-source-run"],
+                ),
+            )
+        };
+        let br = Component::text(
+            "\u{2028}",
+            Style {
+                display: Display::Inline,
+                writing_mode: mode,
+                height: Dimension::Px(10.0),
+                ..font.clone()
+            },
+        );
+        let item = |children: Vec<Component>, ifc: bool| {
+            let mut keys = vec!["justify-self"];
+            if ifc {
+                keys.push("inline-formatting-context");
+            }
+            node(
+                marked(
+                    Style {
+                        position: Position::Absolute,
+                        writing_mode: mode,
+                        min_height: if ifc {
+                            Dimension::Px(10.0)
+                        } else {
+                            Dimension::Auto
+                        },
+                        ..font.clone()
+                    },
+                    &keys,
+                ),
+                children,
+            )
+        };
+        // 0 root, 1 grid, 2 item, 3 text, 4 item, 5.. its children.
+        let root = node(
+            block(),
+            vec![node(
+                grid,
+                vec![
+                    item(vec![text("X XX X")], false),
+                    item(vec![text("XX"), br, text("XXX")], true),
+                ],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("{mode:?}: grid fell back"));
+        assert_eq!(rect(&rects, 1), (0.0, 0.0, 100.0, 250.0), "{mode:?}");
+        let (x, w) = if mode == WritingMode::VerticalLr {
+            (0.0, 10.0)
+        } else {
+            (90.0, 10.0)
+        };
+        assert_eq!(rect(&rects, 2), (x, 0.0, w, 60.0), "{mode:?} one line");
+        assert_eq!(rect(&rects, 4).2, 20.0, "{mode:?} two lines");
+        assert!(texts.iter().all(|t| t.vertical) && !texts.is_empty());
+    }
+}
+
 /// Nested blocks inside orthogonal roots: block-direction margins collapse
 /// along the physical x axis, children stretch to the root's inline size
 /// (its physical height), and `vertical-rl` flows from the right edge.
