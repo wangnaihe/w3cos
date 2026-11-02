@@ -489,6 +489,14 @@ pub(crate) fn following_anchor_matches(
     })
 }
 
+pub(crate) fn removal_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    later: bool,
+) -> bool {
+    RULES.with(|rules| rules.borrow().removal_anchor_matches(ctx, parent, later))
+}
+
 pub(crate) fn following_of_type_needed(parent: &SelectorContext) -> bool {
     RULES.with(|rules| rules.borrow().following_of_type_needed(parent))
 }

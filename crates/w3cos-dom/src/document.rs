@@ -528,6 +528,20 @@ mod replaced_table_tests;
 #[path = "document/form_control_tests.rs"]
 mod form_control_tests;
 
+/// What happened to the child list of a node, for style invalidation.
+enum ChildListChange {
+    /// Insertion or move at an arbitrary position.
+    Any,
+    /// An element was appended after the last child.
+    TailAppend,
+    /// A child was removed. `boundary` is the sibling that followed it, `tag`
+    /// its lower-cased tag when it was an element.
+    Removed {
+        boundary: Option<NodeId>,
+        tag: Option<String>,
+    },
+}
+
 impl Document {
     /// Host readability preferences, separate from author-specified sizes.
     /// Zero leaves the corresponding minimum disabled.
@@ -850,9 +864,20 @@ impl Document {
     }
 
     pub fn remove_child(&mut self, parent: NodeId, child: NodeId) {
+        let removed = (self.get_node(child).parent == Some(parent)).then(|| {
+            let node = self.get_node(child);
+            let tag = (node.node_type == NodeType::Element)
+                .then(|| node.tag.as_str().to_ascii_lowercase());
+            (crate::node::sib(node.next_sibling), tag)
+        });
         self.unlink_from_parent(child);
         self.get_node_mut(child).parent = None;
-        self.mark_dirty(parent);
+        match removed {
+            Some((boundary, tag)) => {
+                self.mark_child_list_dirty(parent, ChildListChange::Removed { boundary, tag })
+            }
+            None => self.mark_dirty(parent),
+        }
         self.invalidate_style_subtree(child);
         self.note_structure_change();
     }
@@ -1687,24 +1712,24 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
-        self.mark_child_list_dirty(id, false);
+        self.mark_child_list_dirty(id, ChildListChange::Any);
     }
 
     /// `mark_dirty` for a node appended after the last child of `id`. Earlier
     /// siblings keep their position from the start, so only rules that read
     /// following siblings (`:last-child`, `:only-child`, ...) can change.
     fn mark_dirty_after_tail_append(&mut self, id: NodeId) {
-        self.mark_child_list_dirty(id, true);
+        self.mark_child_list_dirty(id, ChildListChange::TailAppend);
     }
 
-    fn mark_child_list_dirty(&mut self, id: NodeId, tail_append: bool) {
+    fn mark_child_list_dirty(&mut self, id: NodeId, change: ChildListChange) {
         if stylesheet::has_sibling_dependencies()
             || stylesheet::has_structural_dependencies()
             || stylesheet::has_relational_dependencies()
         {
             // :nth-child, :empty, and sibling combinators can change the
             // matched style of existing siblings when the child list changes.
-            if !self.invalidate_child_list_observers(id, tail_append) {
+            if !self.invalidate_child_list_observers(id, change) {
                 self.invalidate_style_subtree(id);
             }
         } else {
@@ -1726,7 +1751,7 @@ impl Document {
     /// ancestors are restyled separately by `invalidate_relational_observers`.
     /// Returns false when the parent is not an element and the caller must
     /// restyle the whole parent subtree.
-    fn invalidate_child_list_observers(&mut self, parent: NodeId, tail_append: bool) -> bool {
+    fn invalidate_child_list_observers(&mut self, parent: NodeId, change: ChildListChange) -> bool {
         if self
             .nodes
             .get(parent.0 as usize)
@@ -1748,16 +1773,43 @@ impl Document {
             return true;
         }
         self.touch_style_revision(parent);
-        if tail_append {
-            self.invalidate_tail_append_observers(parent, &parent_context);
-            return true;
-        }
+        let (removal, boundary) = match change {
+            ChildListChange::TailAppend => {
+                self.invalidate_tail_append_observers(parent, &parent_context);
+                return true;
+            }
+            ChildListChange::Removed { boundary, tag } => {
+                // Text nodes are not counted by any positional rule, and
+                // `:empty` on the parent was handled above.
+                let Some(tag) = tag else { return true };
+                if boundary.is_none() {
+                    // The last child went away: the same siblings as for a
+                    // tail append of that element are affected.
+                    let previous = self.last_element_child_id(parent);
+                    self.invalidate_tail_edge_observers(parent, &parent_context, &tag, previous);
+                    return true;
+                }
+                (true, boundary)
+            }
+            ChildListChange::Any => (false, None),
+        };
+        // Children before the removed one lose position from the end, the
+        // ones after it position from the start. Any other change (insert
+        // before, reorder) can shift either and keeps the full check.
+        let mut after_boundary = false;
         let mut current = self.get_node(parent).first_child;
         while let Some(child) = current {
             current = crate::node::sib(self.get_node(child).next_sibling);
+            if Some(child) == boundary {
+                after_boundary = true;
+            }
             let observed = self.get_node(child).node_type == NodeType::Element && {
                 let context = self.selector_context_base(child);
-                stylesheet::positional_anchor_matches(&context, &parent_context, false)
+                if removal {
+                    stylesheet::removal_anchor_matches(&context, &parent_context, after_boundary)
+                } else {
+                    stylesheet::positional_anchor_matches(&context, &parent_context, false)
+                }
             };
             if observed {
                 self.invalidate_style_subtree(child);
@@ -1782,24 +1834,36 @@ impl Document {
         if self.get_node(new_last).node_type != NodeType::Element {
             return;
         }
-        let mut previous = crate::node::sib(self.get_node(new_last).prev_sibling);
-        while let Some(id) = previous {
-            if self.get_node(id).node_type == NodeType::Element {
-                break;
-            }
-            previous = crate::node::sib(self.get_node(id).prev_sibling);
+        let tag = self.get_node(new_last).tag.as_str().to_ascii_lowercase();
+        let previous = self.previous_element_sibling_id(new_last);
+        self.invalidate_tail_edge_observers(parent, parent_context, &tag, previous);
+    }
+
+    fn last_element_child_id(&self, parent: NodeId) -> Option<NodeId> {
+        let last = self.get_node(parent).last_child?;
+        if self.get_node(last).node_type == NodeType::Element {
+            Some(last)
+        } else {
+            self.previous_element_sibling_id(last)
         }
+    }
+
+    /// The element list under `parent` gained or lost its last element, an
+    /// element with lower-cased `new_tag`. `previous` is the last element that
+    /// remains before the edge.
+    fn invalidate_tail_edge_observers(
+        &mut self,
+        parent: NodeId,
+        parent_context: &stylesheet::SelectorContext,
+        new_tag: &str,
+        previous: Option<NodeId>,
+    ) {
         // `:last-of-type` flips only on the last earlier sibling of the
         // appended element's own type.
         let previous_of_type = if stylesheet::following_of_type_needed(parent_context) {
             let mut candidate = previous;
             while let Some(id) = candidate {
-                if self
-                    .get_node(id)
-                    .tag
-                    .as_str()
-                    .eq_ignore_ascii_case(&self.get_node(new_last).tag.as_str())
-                {
+                if self.get_node(id).tag.as_str().eq_ignore_ascii_case(new_tag) {
                     break;
                 }
                 candidate = self.previous_element_sibling_id(id);
@@ -1808,7 +1872,6 @@ impl Document {
         } else {
             None
         };
-        let new_tag = self.get_node(new_last).tag.as_str().to_ascii_lowercase();
         let scan = stylesheet::following_scan(parent_context);
         if scan.needed() {
             // Walk back from the previous last element. Rules that read the
@@ -1831,7 +1894,7 @@ impl Document {
                     .get_node(child)
                     .tag
                     .as_str()
-                    .eq_ignore_ascii_case(&new_tag);
+                    .eq_ignore_ascii_case(new_tag);
                 if same_type {
                     of_type_count += 1;
                 }
@@ -29680,6 +29743,122 @@ mod computed_style_cache_tests {
                 );
             }
             crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn removing_a_child_only_restyles_the_siblings_whose_position_changed() {
+        // (selector, removed row, rows that must be restyled), four rows.
+        for (selector, removed, restyled) in [
+            // The last child went away: same siblings as a tail append.
+            (".list > .row:last-child", 3, &[2usize][..]),
+            (".list > .row:not(:last-child)", 3, &[2][..]),
+            (".list > .row:nth-last-child(2)", 3, &[1, 2][..]),
+            (".list > .row:has(+ .row)", 3, &[2][..]),
+            (".list > .row:only-child", 3, &[2][..]),
+            (".list > .row:first-child", 3, &[][..]),
+            (".list > .row + .row", 3, &[][..]),
+            // The first child went away: later siblings lose position from
+            // the start only.
+            (".list > .row:last-child", 0, &[][..]),
+            (".list > .row:not(:last-child)", 0, &[][..]),
+            (".list > .row:nth-last-child(2)", 0, &[][..]),
+            (".list > .row:last-of-type", 0, &[][..]),
+            (".list > .row:first-child", 0, &[1, 2, 3][..]),
+            (".list > .row:nth-child(2n)", 0, &[1, 2, 3][..]),
+            (".list > .row + .row", 0, &[1, 2, 3][..]),
+            (".list > .row:only-child", 0, &[1, 2, 3][..]),
+            // A middle row: both sides can change, from-the-start rules only
+            // on the later ones, following-reading rules on the earlier ones.
+            (".list > .row:first-child", 1, &[2, 3][..]),
+            (".list > .row:nth-last-child(2)", 1, &[0][..]),
+            (".list > .row:has(+ .row)", 1, &[0][..]),
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(selector, &[("color", "red")]);
+            let mut document = Document::new();
+            let list = document.create_element("div");
+            list.class_list_add(&mut document, "list");
+            document.body().append_child(&mut document, list);
+            let rows: Vec<Element> = (0..4)
+                .map(|_| row_with_class(&mut document, list, "row"))
+                .collect();
+            for row in &rows {
+                let _ = document.computed_style_for(row.id);
+            }
+
+            list.remove_child(&mut document, &rows[removed]);
+
+            for (index, row) in rows.iter().enumerate() {
+                if index == removed {
+                    continue;
+                }
+                assert_eq!(
+                    !document.computed_style_cache_is_current(row.id),
+                    restyled.contains(&index),
+                    "{selector}, remove row {removed}: restyle of row {index}"
+                );
+            }
+            crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn removing_a_child_keeps_results_equal_to_a_fresh_cascade() {
+        let tags = ["div", "span", "div", "i", "span", "div"];
+        for selector in [
+            ".list > .row:last-child",
+            ".list > .row:not(:last-child)",
+            ".list > .row:nth-last-child(2)",
+            ".list > .row:nth-last-of-type(2)",
+            ".list > .row:nth-last-child(1 of span)",
+            ".list > .row:last-of-type",
+            ".list > .row:only-child",
+            ".list > .row:first-child",
+            ".list > .row:nth-child(2n)",
+            ".list > .row:nth-of-type(2)",
+            ".list > .row + .row",
+            ".list > .row ~ .row",
+            ".list > .row:has(+ i)",
+            ".list > .row:not(:first-child)",
+            ".list > .row:not(:has(+ span))",
+            ".list > i + .row:last-of-type",
+            ".list > .row:nth-last-child(2) + .row",
+        ] {
+            for removed in 0..tags.len() {
+                crate::stylesheet::clear_rules();
+                crate::stylesheet::register_rule(selector, &[("color", "red")]);
+                let build = |skip: Option<usize>| {
+                    let mut document = Document::new();
+                    let list = document.create_element("div");
+                    list.class_list_add(&mut document, "list");
+                    document.body().append_child(&mut document, list);
+                    let mut rows = Vec::new();
+                    for (index, tag) in tags.iter().enumerate() {
+                        let row = document.create_element(tag);
+                        row.class_list_add(&mut document, "row");
+                        if skip != Some(index) {
+                            list.append_child(&mut document, row);
+                        }
+                        rows.push(row);
+                    }
+                    (document, list, rows)
+                };
+                let (mut document, list, rows) = build(None);
+                for row in &rows {
+                    let _ = document.computed_style_for(row.id);
+                }
+                list.remove_child(&mut document, &rows[removed]);
+                let (mut fresh, _, fresh_rows) = build(Some(removed));
+                for index in (0..tags.len()).filter(|index| *index != removed) {
+                    assert_eq!(
+                        document.computed_style_for(rows[index].id).color == red(),
+                        fresh.computed_style_for(fresh_rows[index].id).color == red(),
+                        "{selector}, remove row {removed}: row {index} equals a fresh cascade"
+                    );
+                }
+                crate::stylesheet::clear_rules();
+            }
         }
     }
 
