@@ -1808,22 +1808,57 @@ impl Document {
         } else {
             None
         };
-        if stylesheet::following_scan_needed(parent_context) {
-            let mut current = self.get_node(parent).first_child;
+        let new_tag = self.get_node(new_last).tag.as_str().to_ascii_lowercase();
+        let scan = stylesheet::following_scan(parent_context);
+        if scan.needed() {
+            // Walk back from the previous last element. Rules that read the
+            // whole list visit everything; `:nth-last-child(k)` and
+            // `:nth-last-of-type(k)` stop once both windows are exhausted.
+            let mut distance = 0usize;
+            let mut of_type_count = 0usize;
+            let mut of_type_seen = false;
+            let mut current = previous;
             while let Some(child) = current {
-                current = crate::node::sib(self.get_node(child).next_sibling);
-                if child == new_last || self.get_node(child).node_type != NodeType::Element {
-                    continue;
+                if !scan.all
+                    && distance + 1 > scan.window_child
+                    && of_type_count + 1 > scan.window_type
+                {
+                    break;
                 }
-                let context = self.selector_context_base(child);
-                if stylesheet::following_anchor_matches(
-                    &context,
+                current = self.previous_element_sibling_id(child);
+                distance += 1;
+                let same_type = self
+                    .get_node(child)
+                    .tag
+                    .as_str()
+                    .eq_ignore_ascii_case(&new_tag);
+                if same_type {
+                    of_type_count += 1;
+                }
+                let is_of_type = Some(child) == previous_of_type;
+                of_type_seen |= is_of_type;
+                self.restyle_following_anchor(
+                    child,
                     parent_context,
-                    Some(child) == previous,
-                    Some(child) == previous_of_type,
-                ) {
-                    self.invalidate_style_subtree(child);
-                }
+                    stylesheet::FollowingPosition {
+                        last: Some(child) == previous,
+                        of_type: is_of_type,
+                        distance,
+                        type_distance: if same_type { of_type_count } else { usize::MAX },
+                    },
+                );
+            }
+            if let Some(id) = previous_of_type.filter(|_| !of_type_seen) {
+                self.restyle_following_anchor(
+                    id,
+                    parent_context,
+                    stylesheet::FollowingPosition {
+                        last: false,
+                        of_type: true,
+                        distance: usize::MAX,
+                        type_distance: usize::MAX,
+                    },
+                );
             }
             return;
         }
@@ -1835,10 +1870,28 @@ impl Document {
             if !last && Some(id) == previous {
                 continue;
             }
-            let context = self.selector_context_base(id);
-            if stylesheet::following_anchor_matches(&context, parent_context, last, of_type) {
-                self.invalidate_style_subtree(id);
-            }
+            self.restyle_following_anchor(
+                id,
+                parent_context,
+                stylesheet::FollowingPosition {
+                    last,
+                    of_type,
+                    distance: usize::MAX,
+                    type_distance: usize::MAX,
+                },
+            );
+        }
+    }
+
+    fn restyle_following_anchor(
+        &mut self,
+        id: NodeId,
+        parent_context: &stylesheet::SelectorContext,
+        position: stylesheet::FollowingPosition,
+    ) {
+        let context = self.selector_context_base(id);
+        if stylesheet::following_anchor_matches(&context, parent_context, position) {
+            self.invalidate_style_subtree(id);
         }
     }
 
@@ -29432,6 +29485,8 @@ mod computed_style_cache_tests {
         const NONE: [bool; 3] = [false, false, false];
         const LAST_ONLY: [bool; 3] = [false, false, true];
         const ALL: [bool; 3] = [true, true, true];
+        // `:nth-last-child(2)` moves from the second row to the third.
+        const LAST_TWO: [bool; 3] = [false, true, true];
         for (selector, restyled) in [
             (".list > .row:first-child", NONE),
             (".list > .row:nth-child(2n+1)", NONE),
@@ -29444,15 +29499,25 @@ mod computed_style_cache_tests {
             (".list > .row:last-child", LAST_ONLY),
             (".list > .row:only-child", LAST_ONLY),
             (".list > .row:not(:last-child)", LAST_ONLY),
-            (".list > .row:nth-last-child(2)", ALL),
+            (".list > .row:nth-last-child(1)", LAST_ONLY),
+            (".list > .row:nth-last-child(2)", LAST_TWO),
+            (".list > .row:nth-last-child(3)", ALL),
+            (".list > .row:nth-last-child(2n)", ALL),
+            (".list > .row:nth-last-child(1 of .row)", ALL),
+            (".list > .row ~ .row:nth-last-child(2)", LAST_TWO),
+            (".list > .row:nth-last-child(2) ~ .row", ALL),
+            (".list > .row:last-child ~ .row", LAST_ONLY),
             (".list > .row:last-of-type", LAST_ONLY),
             (".list > .row:only-of-type", LAST_ONLY),
             (".list > .row:not(:last-of-type)", LAST_ONLY),
             (".list > .row:last-child:last-of-type", LAST_ONLY),
-            (".list > .row:nth-last-of-type(2)", ALL),
+            (".list > .row:nth-last-of-type(2)", LAST_TWO),
+            (".list > .row:nth-last-of-type(odd)", ALL),
             (".list > .row:not(:nth-last-of-type(2))", ALL),
-            (".list > .row:has(+ .row)", ALL),
-            (".list > .row:not(:has(+ .row))", ALL),
+            (".list > .row:has(+ .row)", LAST_ONLY),
+            (".list > .row:not(:has(+ .row))", LAST_ONLY),
+            (".list > .row:has(~ .row)", ALL),
+            (".list > .row:has(+ .row + .row)", ALL),
             (".list:has(> .row:last-child) > .row", ALL),
         ] {
             crate::stylesheet::clear_rules();
@@ -29542,6 +29607,78 @@ mod computed_style_cache_tests {
                 assert!(!observed(&document, *row), "{extra_rule:?}: unrelated type");
             }
             assert!(is_red(&mut document, section));
+            crate::stylesheet::clear_rules();
+        }
+    }
+
+    #[test]
+    fn tail_append_windows_follow_the_constant_in_nth_last_rules() {
+        // Rows `d s d s d s d` (div/span) followed by one more of each type.
+        let tags = ["div", "span", "div", "span", "div", "span", "div"];
+        for (selector, appended, restyled) in [
+            // The window covers the last `k` elements, whatever their type.
+            (".list > .row:nth-last-child(3)", "div", &[4usize, 5, 6][..]),
+            (".list > .row:nth-last-child(3)", "i", &[4, 5, 6][..]),
+            // Of-type windows count only the appended element's own type.
+            (".list > .row:nth-last-of-type(2)", "div", &[4, 6][..]),
+            (".list > .row:nth-last-of-type(2)", "span", &[3, 5][..]),
+            (".list > .row:nth-last-of-type(2)", "i", &[][..]),
+            (".list > .row:nth-last-of-type(3)", "div", &[2, 4, 6][..]),
+            // `:has(+ x)` reaches only the element before the appended one.
+            (".list > .row:has(+ .row)", "div", &[6][..]),
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(selector, &[("color", "red")]);
+            let mut document = Document::new();
+            let list = document.create_element("div");
+            list.class_list_add(&mut document, "list");
+            document.body().append_child(&mut document, list);
+            let mut rows = Vec::new();
+            for tag in tags {
+                let row = document.create_element(tag);
+                row.class_list_add(&mut document, "row");
+                list.append_child(&mut document, row);
+                rows.push(row);
+            }
+            for row in &rows {
+                let _ = document.computed_style_for(row.id);
+            }
+
+            let new_row = document.create_element(appended);
+            new_row.class_list_add(&mut document, "row");
+            list.append_child(&mut document, new_row);
+
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    !document.computed_style_cache_is_current(row.id),
+                    restyled.contains(&index),
+                    "{selector} + {appended}: restyle of row {index}"
+                );
+            }
+
+            // Whatever was restyled or kept must equal a fresh cascade.
+            let mut kept = Vec::new();
+            for row in rows.iter().chain([&new_row]) {
+                kept.push(document.computed_style_for(row.id).color == red());
+            }
+            let mut fresh = Document::new();
+            let fresh_list = fresh.create_element("div");
+            fresh_list.class_list_add(&mut fresh, "list");
+            fresh.body().append_child(&mut fresh, fresh_list);
+            let mut fresh_rows = Vec::new();
+            for tag in tags.iter().copied().chain([appended]) {
+                let row = fresh.create_element(tag);
+                row.class_list_add(&mut fresh, "row");
+                fresh_list.append_child(&mut fresh, row);
+                fresh_rows.push(row);
+            }
+            for (index, row) in fresh_rows.iter().enumerate() {
+                assert_eq!(
+                    fresh.computed_style_for(row.id).color == red(),
+                    kept[index],
+                    "{selector} + {appended}: row {index} equals a fresh cascade"
+                );
+            }
             crate::stylesheet::clear_rules();
         }
     }

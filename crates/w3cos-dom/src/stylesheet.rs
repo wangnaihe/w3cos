@@ -28,6 +28,7 @@ mod selector_filter;
 mod selector_parse_cache;
 
 use rule_set::RuleSet;
+pub(crate) use rule_set::{FollowingPosition, FollowingScan};
 use selector_filter::{AncestorBloom, LazyAncestorBloom};
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
@@ -479,13 +480,12 @@ pub(crate) fn positional_anchor_matches(
 pub(crate) fn following_anchor_matches(
     ctx: &SelectorContext,
     parent: &SelectorContext,
-    previous_last: bool,
-    previous_of_type: bool,
+    position: FollowingPosition,
 ) -> bool {
     RULES.with(|rules| {
         rules
             .borrow()
-            .following_anchor_matches(ctx, parent, previous_last, previous_of_type)
+            .following_anchor_matches(ctx, parent, position)
     })
 }
 
@@ -493,8 +493,8 @@ pub(crate) fn following_of_type_needed(parent: &SelectorContext) -> bool {
     RULES.with(|rules| rules.borrow().following_of_type_needed(parent))
 }
 
-pub(crate) fn following_scan_needed(parent: &SelectorContext) -> bool {
-    RULES.with(|rules| rules.borrow().following_scan_needed(parent))
+pub(crate) fn following_scan(parent: &SelectorContext) -> FollowingScan {
+    RULES.with(|rules| rules.borrow().following_scan(parent))
 }
 
 pub(crate) fn sibling_any_anchor_matches(ctx: &SelectorContext, parent: &SelectorContext) -> bool {
