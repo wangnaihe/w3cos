@@ -2724,6 +2724,33 @@ fn render_node_with_applied_decorations(
                 // the border must still paint around the original edge box.
                 draw_box_border(canvas, rect, style);
                 fragment.paint(canvas, text_content_box(rect, style), style);
+            } else if style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|p| p.contains_key(block_text_paint::VERTICAL_TEXT))
+            {
+                // A line of a vertical flow, laid out horizontally in its
+                // transposed rect: sideways glyphs, a quarter turn clockwise
+                // (their tops face right, the line's start is the top).
+                canvas.save();
+                canvas.translate((rect.x + rect.width, rect.y));
+                canvas.rotate(90.0, None);
+                let turned = LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: rect.height,
+                    height: rect.width,
+                };
+                draw_text_in_rect_with_line_context(
+                    canvas,
+                    turned,
+                    content,
+                    style,
+                    typeface,
+                    metrics_font,
+                    None,
+                );
+                canvas.restore();
             } else {
                 draw_text_in_rect_with_line_context(
                     canvas,

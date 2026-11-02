@@ -2906,6 +2906,7 @@ fn layout_with(
             height: border_height,
             text_range: None,
             ellipsis: false,
+            vertical: false,
             children,
         },
         last_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
@@ -3481,6 +3482,7 @@ fn layout_wrapped(
             height: border_height,
             text_range: None,
             ellipsis: false,
+            vertical: false,
             children,
         },
         // As in the single-line path, the first baseline is reported for

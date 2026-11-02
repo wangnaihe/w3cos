@@ -121,7 +121,7 @@ pub(super) fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
     (axes.next().unwrap_or(0.0), axes.next().unwrap_or(0.0))
 }
 
-fn is_value_carrier_marker(key: &str) -> bool {
+pub(super) fn is_value_carrier_marker(key: &str) -> bool {
     let name = key.trim_start_matches("--w3cos-internal-");
     matches!(
         name,
@@ -1724,7 +1724,7 @@ pub(super) fn baseline_is_margin_edge(style: &Style) -> bool {
     non_visible_overflow(style) && style.display.establishes_overflow_clip()
 }
 
-fn non_visible_overflow(style: &Style) -> bool {
+pub(super) fn non_visible_overflow(style: &Style) -> bool {
     style.resolved_overflow_x() != Overflow::Visible
         || style.resolved_overflow_y() != Overflow::Visible
 }
@@ -3140,6 +3140,9 @@ pub(super) fn intrinsic_sizes_at(
     block: Option<f32>,
 ) -> Option<MinMax> {
     let info = &flat[index];
+    if let Some(flow) = super::orthogonal::root_flow(flat, index) {
+        return super::orthogonal::intrinsic(flat, index, flow, space);
+    }
     let subtree = &flat[index + 1..info.subtree_end.max(index + 1)];
     let rendered = |node: &&FlatNodeInfo| node.style.display != Display::None;
     // A table resolves percentage columns itself. The caller's border and
@@ -3835,7 +3838,7 @@ fn keyword_inline_size(
 
 /// CSS2 10.3.9 shrink-to-fit width of an inline-block's content box:
 /// min(max(min-content, available), max-content), then min/max-width.
-fn shrink_to_fit(
+pub(super) fn shrink_to_fit(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
@@ -4283,7 +4286,7 @@ pub(super) fn flat_with_styles<'a>(
 
 /// NGBlockLayoutAlgorithm in a block formatting context whose exclusion
 /// space is `exclusions` (a BFC root starts its own).
-fn layout_block_in(
+pub(super) fn layout_block_in(
     flat: &[FlatNodeInfo],
     index: usize,
     space: &ConstraintSpace,
@@ -4293,6 +4296,10 @@ fn layout_block_in(
 ) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
+    // An orthogonal (vertical) root inside a horizontal block container.
+    if let Some(flow) = super::orthogonal::root_flow(flat, index) {
+        return super::orthogonal::layout(flat, index, flow, space, sized, exclusions);
+    }
     // NGFlexLayoutAlgorithm. Lowered IFC rows and synthetic float groups
     // stay on the paths below.
     if is_author_flex(style) {
@@ -4805,6 +4812,7 @@ fn layout_block_in(
                         index: child,
                         text_range: None,
                         ellipsis: false,
+                        vertical: false,
                         width,
                         height: (bottom - y0).max(0.0),
                         children: placed
@@ -5597,6 +5605,7 @@ fn layout_block_in(
             index,
             text_range: None,
             ellipsis: false,
+            vertical: false,
             width,
             height,
             children,

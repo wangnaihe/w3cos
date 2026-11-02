@@ -295,6 +295,9 @@ pub struct PaintArtifact {
     /// pieces in place of the node's single rect, at the node's own position
     /// in paint order.
     pub text_fragments: Vec<Vec<(LayoutRect, String)>>,
+    /// Per node: its text pieces are sideways glyphs of a vertical flow
+    /// (`TextFragment::vertical`); paint rotates them a quarter turn.
+    pub vertical_text: Vec<bool>,
     pub generation: u64,
 }
 
@@ -320,6 +323,7 @@ impl Default for PaintArtifact {
             rect_by_index: Vec::new(),
             column_fragments: Vec::new(),
             text_fragments: Vec::new(),
+            vertical_text: Vec::new(),
             generation: 0,
         }
     }
@@ -2164,6 +2168,7 @@ impl PaintArtifact {
     /// Install LayoutNG's text pieces (see `text_fragments`).
     pub(crate) fn set_text_fragments(&mut self, fragments: &[crate::layout_ng::TextFragment]) {
         self.text_fragments.clear();
+        self.vertical_text.clear();
         if fragments.is_empty() {
             return;
         }
@@ -2172,7 +2177,19 @@ impl PaintArtifact {
             if let Some(slot) = self.text_fragments.get_mut(fragment.index) {
                 slot.push((fragment.rect, fragment.text.clone()));
             }
+            if fragment.vertical {
+                if self.vertical_text.is_empty() {
+                    self.vertical_text = vec![false; self.nodes.len()];
+                }
+                if let Some(flag) = self.vertical_text.get_mut(fragment.index) {
+                    *flag = true;
+                }
+            }
         }
+    }
+
+    pub(crate) fn is_vertical_text(&self, index: usize) -> bool {
+        self.vertical_text.get(index).copied().unwrap_or(false)
     }
 
     pub(crate) fn text_fragments_of(&self, index: usize) -> &[(LayoutRect, String)] {

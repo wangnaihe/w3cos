@@ -1490,6 +1490,7 @@ pub(super) fn append_text_leaf_line(
             height: font_height,
             text_range: Some((0, content.len())),
             ellipsis: false,
+            vertical: false,
             children: Vec::new(),
         },
     ));
@@ -2580,6 +2581,7 @@ pub(super) fn layout_with_block_size(
             index,
             text_range: None,
             ellipsis: false,
+            vertical: false,
             width: rect.2,
             height: rect.3,
             children,

@@ -10444,3 +10444,187 @@ fn clamped_inflexible_item_leaves_free_space_to_fractional_grow() {
         assert!((rect(&ng, n + 2).2 - 520.0).abs() < 0.01);
     }
 }
+
+/// A `vertical-lr` / `vertical-rl` block of Latin text in a horizontal
+/// block container (orthogonal flow): inline size from the height (or the
+/// initial containing block's height), lines stacking sideways, text turned
+/// a quarter turn. Expected values are from Chrome 156 with Ahem.
+#[test]
+fn orthogonal_vertical_blocks_match_chrome() {
+    use w3cos_std::style::WritingMode;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let vertical = |mode: WritingMode, height: Option<f32>, width: Option<f32>| {
+        let style = Style {
+            writing_mode: mode,
+            border_width: 2.0,
+            padding: margins(3.0, 1.0, 4.0, 5.0),
+            margin: margins(7.0, 3.0, 2.0, 6.0),
+            height: height.map_or(Dimension::Auto, Dimension::Px),
+            width: width.map_or(Dimension::Auto, Dimension::Px),
+            ..font.clone()
+        };
+        node(
+            style,
+            vec![Component::text(
+                "XXX XX",
+                Style {
+                    display: Display::Inline,
+                    writing_mode: mode,
+                    ..font.clone()
+                },
+            )],
+        )
+    };
+    let root = node(
+        Style { ..font.clone() },
+        vec![
+            vertical(WritingMode::VerticalRl, None, None),
+            vertical(WritingMode::VerticalRl, Some(30.0), None),
+            vertical(WritingMode::VerticalLr, Some(30.0), None),
+            vertical(WritingMode::VerticalLr, Some(30.0), Some(100.0)),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root, then (box, text) pairs at 1,2 / 3,4 / 5,6 / 7,8.
+    let boxed: Vec<_> = [1, 3, 5, 7].iter().map(|i| rect(&rects, *i)).collect();
+    assert_eq!(boxed[0], (6.0, 7.0, 20.0, 71.0));
+    assert_eq!(boxed[1], (6.0, 85.0, 30.0, 41.0));
+    assert_eq!(boxed[2], (6.0, 133.0, 30.0, 41.0));
+    assert_eq!(boxed[3], (6.0, 181.0, 110.0, 41.0));
+    let pieces = |index: usize| -> Vec<[f32; 4]> {
+        texts
+            .iter()
+            .filter(|t| t.index == index)
+            .map(|t| {
+                assert!(t.vertical);
+                [t.rect.x, t.rect.y, t.rect.width, t.rect.height]
+            })
+            .collect()
+    };
+    assert_eq!(pieces(2), vec![[13.0, 12.0, 10.0, 60.0]]);
+    assert_eq!(
+        pieces(4),
+        vec![[23.0, 90.0, 10.0, 30.0], [13.0, 90.0, 10.0, 20.0]]
+    );
+    assert_eq!(
+        pieces(6),
+        vec![[13.0, 138.0, 10.0, 30.0], [23.0, 138.0, 10.0, 20.0]]
+    );
+    assert_eq!(
+        pieces(8),
+        vec![[13.0, 186.0, 10.0, 30.0], [23.0, 186.0, 10.0, 20.0]]
+    );
+}
+
+/// Nested blocks inside orthogonal roots: block-direction margins collapse
+/// along the physical x axis, children stretch to the root's inline size
+/// (its physical height), and `vertical-rl` flows from the right edge.
+#[test]
+fn orthogonal_nested_blocks_match_chrome() {
+    use w3cos_std::style::WritingMode;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text = |mode: WritingMode, s: &str| {
+        Component::text(
+            s,
+            Style {
+                display: Display::Inline,
+                writing_mode: mode,
+                ..font.clone()
+            },
+        )
+    };
+    let build = |mode: WritingMode, first: Style, second: Style, margin: Edges| {
+        node(
+            Style {
+                writing_mode: mode,
+                height: Dimension::Px(100.0),
+                margin,
+                ..font.clone()
+            },
+            vec![
+                node(
+                    Style {
+                        writing_mode: mode,
+                        ..first
+                    },
+                    vec![text(mode, "XXX")],
+                ),
+                node(
+                    Style {
+                        writing_mode: mode,
+                        ..second
+                    },
+                    vec![text(mode, "XX XX")],
+                ),
+            ],
+        )
+    };
+    let rl = build(
+        WritingMode::VerticalRl,
+        Style {
+            margin: margins(0.0, 4.0, 0.0, 6.0),
+            padding: margins(2.0, 3.0, 2.0, 3.0),
+            ..font.clone()
+        },
+        Style {
+            height: Dimension::Px(40.0),
+            margin: margins(0.0, 0.0, 0.0, 5.0),
+            border_width: 1.0,
+            ..font.clone()
+        },
+        margins(5.0, 0.0, 5.0, 0.0),
+    );
+    let lr = build(
+        WritingMode::VerticalLr,
+        Style {
+            margin: margins(0.0, 4.0, 0.0, 6.0),
+            padding: margins(2.0, 3.0, 2.0, 3.0),
+            ..font.clone()
+        },
+        Style {
+            width: Dimension::Px(40.0),
+            margin: margins(5.0, 0.0, 0.0, 0.0),
+            border_width: 1.0,
+            ..font.clone()
+        },
+        margins(9.0, 0.0, 3.0, 0.0),
+    );
+    let root = node(font.clone(), vec![rl, lr]);
+    let flat = pre_flatten(&root);
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    // 0 root; rl 1 (a1 2 + text 3, a2 4 + text 5); lr 6 (b1 7 + 8, b2 9 + 10).
+    assert_eq!(rect(&rects, 1), (0.0, 5.0, 53.0, 100.0));
+    assert_eq!(rect(&rects, 2), (33.0, 5.0, 16.0, 100.0));
+    assert_eq!(rect(&rects, 4), (5.0, 5.0, 22.0, 42.0));
+    assert_eq!(rect(&rects, 6), (0.0, 114.0, 68.0, 100.0));
+    assert_eq!(rect(&rects, 7), (6.0, 114.0, 16.0, 100.0));
+    assert_eq!(rect(&rects, 9), (26.0, 119.0, 42.0, 95.0));
+    let piece = |index: usize| -> Vec<[f32; 4]> {
+        texts
+            .iter()
+            .filter(|t| t.index == index)
+            .map(|t| [t.rect.x, t.rect.y, t.rect.width, t.rect.height])
+            .collect()
+    };
+    assert_eq!(piece(3), vec![[36.0, 7.0, 10.0, 30.0]]);
+    assert_eq!(
+        piece(5),
+        vec![[16.0, 6.0, 10.0, 20.0], [6.0, 6.0, 10.0, 20.0]]
+    );
+    assert_eq!(piece(8), vec![[9.0, 116.0, 10.0, 30.0]]);
+}

@@ -29,6 +29,7 @@ mod flex;
 mod grid;
 mod inline;
 mod oof;
+mod orthogonal;
 mod table;
 
 use crate::layout::{FlatNodeInfo, LayoutRect};
@@ -158,6 +159,10 @@ pub(crate) struct BoxFragment {
     /// The piece ends a `-webkit-line-clamp` box: paint draws its text with
     /// a block ellipsis (U+2026) after it, trailing breaks removed.
     pub ellipsis: bool,
+    /// A text leaf of an orthogonal (vertical) flow: its rect is physical
+    /// and paint rotates the glyphs a quarter turn clockwise (sideways
+    /// glyphs of `text-orientation: mixed`).
+    pub vertical: bool,
     /// Children with their border-box offset from this border box.
     pub children: Vec<(f32, f32, BoxFragment)>,
 }
@@ -270,6 +275,8 @@ pub struct TextFragment {
     pub end: usize,
     pub rect: LayoutRect,
     pub text: String,
+    /// Sideways glyphs of a vertical flow (see `BoxFragment::vertical`).
+    pub vertical: bool,
 }
 
 /// Entry point used by tests: the per-node rects only.
@@ -623,7 +630,14 @@ fn flatten(
         width: fragment.width,
         height: fragment.height,
     };
-    if let Some((start, end)) = fragment.text_range {
+    let whole = fragment
+        .vertical
+        .then(|| match flat[fragment.index].kind {
+            w3cos_std::ComponentKind::Text { content } => (0, content.len()),
+            _ => (0, 0),
+        })
+        .filter(|_| fragment.text_range.is_none());
+    if let Some((start, end)) = fragment.text_range.or(whole) {
         let mut text = match flat[fragment.index].kind {
             w3cos_std::ComponentKind::Text { content } => content[start..end].to_string(),
             _ => String::new(),
@@ -646,6 +660,7 @@ fn flatten(
             end,
             rect,
             text,
+            vertical: fragment.vertical,
         });
     }
     out.push((rect, fragment.index));
