@@ -305,6 +305,24 @@ fn abspos_keyword_pack(container: &Style, child: &Style, block: bool, rtl: bool)
     }
 }
 
+/// The physical side of an abspos item's margin box that sits at the static
+/// point when its size is not definite (so `axis_offset` cannot place it):
+/// the static position is then an edge of the grid area and the box is
+/// aligned to it once sized (NGLogicalStaticPosition's edge).
+fn static_anchor(pack: Pack, rtl: bool) -> oof::Anchor {
+    match pack {
+        Pack::End => {
+            if rtl {
+                oof::Anchor::Start
+            } else {
+                oof::Anchor::End
+            }
+        }
+        Pack::Center => oof::Anchor::Center,
+        _ => oof::Anchor::Auto,
+    }
+}
+
 fn used_item_align(container: AlignItems, item: AlignSelf) -> AlignItems {
     match item {
         AlignSelf::Auto => container,
@@ -5536,12 +5554,44 @@ fn layout_impl(
         if rtl {
             x = from_units(origin_x + inner_u - (units(x) - origin_x));
         }
-        let candidate = OofCandidate {
+        let mut candidate = OofCandidate {
             index: child,
             static_inline: x,
             static_block: y,
             static_rtl: rtl,
+            ..OofCandidate::default()
         };
+        // An item whose size is not definite is aligned to the area's edge
+        // once the resolver has sized it.
+        if border_w.is_none() {
+            let anchor = static_anchor(justify, rtl);
+            let left = if rtl {
+                origin_x + inner_u - col_at - area_w
+            } else {
+                origin_x + col_at
+            };
+            match anchor {
+                oof::Anchor::Start => candidate.static_inline = from_units(left),
+                oof::Anchor::End => candidate.static_inline = from_units(left + area_w),
+                oof::Anchor::Center => candidate.static_inline = from_units(left + area_w / 2),
+                oof::Anchor::Auto => {}
+            }
+            candidate.inline_anchor = anchor;
+        }
+        if border_h.is_none() {
+            let top = origin_y + row_at;
+            match align {
+                Pack::End => {
+                    candidate.static_block = from_units(top + area_h);
+                    candidate.block_anchor = oof::Anchor::End;
+                }
+                Pack::Center => {
+                    candidate.static_block = from_units(top + area_h / 2);
+                    candidate.block_anchor = oof::Anchor::Center;
+                }
+                _ => {}
+            }
+        }
         if style.position == Position::Static {
             pending_oof.push(candidate);
             continue;
@@ -5606,11 +5656,39 @@ fn layout_impl(
             height: from_units(area_h),
             rtl,
         };
-        let candidate = OofCandidate {
+        let mut candidate = OofCandidate {
             static_inline: from_units(static_inline),
             static_block: from_units(origin_y + y0 + block_off),
             ..candidate
         };
+        // The same edge alignment against the abspos containing-block area.
+        candidate.inline_anchor = oof::Anchor::Auto;
+        candidate.block_anchor = oof::Anchor::Auto;
+        if border_w.is_none() {
+            let anchor = static_anchor(justify, rtl);
+            let left = cb_x;
+            match anchor {
+                oof::Anchor::Start => candidate.static_inline = from_units(left),
+                oof::Anchor::End => candidate.static_inline = from_units(left + area_w),
+                oof::Anchor::Center => candidate.static_inline = from_units(left + area_w / 2),
+                oof::Anchor::Auto => {}
+            }
+            candidate.inline_anchor = anchor;
+        }
+        if border_h.is_none() {
+            let top = origin_y + y0;
+            match align {
+                Pack::End => {
+                    candidate.static_block = from_units(top + area_h);
+                    candidate.block_anchor = oof::Anchor::End;
+                }
+                Pack::Center => {
+                    candidate.static_block = from_units(top + area_h / 2);
+                    candidate.block_anchor = oof::Anchor::Center;
+                }
+                _ => {}
+            }
+        }
         let (placed, rest) = oof::resolve(
             flat,
             vec![candidate],
@@ -5819,12 +5897,38 @@ fn abspos_alignment_unmodelled(container: &Style, _child: &Style) -> bool {
         .is_some_and(|keyword| keyword.contains("last"))
 }
 
-/// An abspos box whose insets are all `auto` sits at its static position
-/// (the grid-area alignment), which the axis swap of a vertical grid keeps.
-fn all_insets_auto(style: &Style) -> bool {
+/// An abspos box whose insets are `auto` or lengths: the axis swap of a
+/// vertical grid keeps the physical sides, so the insets resolve against the
+/// same grid area and the static position keeps the grid-area alignment.
+fn insets_auto_or_length(style: &Style) -> bool {
     [style.top, style.right, style.bottom, style.left]
         .iter()
-        .all(|inset| matches!(inset, Dimension::Auto))
+        .all(|inset| matches!(inset, Dimension::Auto | Dimension::Px(_)))
+}
+
+/// The physical sides `self-start` resolves to for an abspos child in the
+/// horizontal (left, first) and vertical (top, second) axes, from the
+/// child's own writing mode and direction.
+fn self_start_sides(child: &Style) -> (bool, bool) {
+    use w3cos_std::style::WritingMode;
+    let ltr = child.direction != TextDirection::Rtl;
+    match child.writing_mode {
+        WritingMode::VerticalLr => (true, ltr),
+        WritingMode::VerticalRl => (false, ltr),
+        _ => (ltr, true),
+    }
+}
+
+/// A horizontal abspos item whose subtree is plain text: it is laid out by
+/// the ordinary path inside the transposed grid.
+fn horizontal_text_item(flat: &[FlatNodeInfo], child: usize) -> bool {
+    use w3cos_std::style::WritingMode;
+    flat[child].style.writing_mode == WritingMode::HorizontalTb
+        && flat[child].style.display == Display::Block
+        && (child + 1..flat[child].subtree_end).all(|node| {
+            matches!(flat[node].kind, w3cos_std::ComponentKind::Text { content }
+                if content.chars().all(|c| c.is_ascii() || c == '\u{2028}'))
+        })
 }
 
 fn swap_flow(flow: Option<&str>) -> Option<String> {
@@ -5852,7 +5956,9 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         let block_rl = match style.writing_mode {
             WritingMode::VerticalRl => true,
             WritingMode::VerticalLr => false,
-            _ => continue,
+            _ => {
+                continue;
+            }
         };
         // A fixed-track inline-grid sizes to the sum of its tracks, which
         // the transposed grid computes in the other axis.
@@ -5899,13 +6005,16 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                     | w3cos_std::ComponentKind::Column
             ) || (flat[child].subtree_end > child + 1
                 && !(child_style.position == Position::Absolute
-                    && super::orthogonal::grid_item_text_flow(flat, child).is_some()))
-                || child_style.writing_mode != style.writing_mode
-                || child_style.direction != style.direction
+                    && (super::orthogonal::grid_item_text_flow(flat, child).is_some()
+                        || horizontal_text_item(flat, child))))
+                || !(child_style.writing_mode == style.writing_mode
+                    || child_style.position == Position::Absolute)
+                || !(child_style.direction == style.direction
+                    || child_style.position == Position::Absolute)
                 || !(child_style.position == Position::Static
                     || (child_style.position == Position::Absolute
                         && !rtl
-                        && all_insets_auto(child_style)))
+                        && insets_auto_or_length(child_style)))
                 || (child_style.position == Position::Static && child_style.float != Float::None)
                 || (child_style.position == Position::Absolute
                     && abspos_alignment_unmodelled(style, child_style))
@@ -6001,9 +6110,19 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 // The enum folds `self-start` / `self-end` into `auto`; the
                 // child shares the container's writing mode, so they are
                 // `start` / `end` of the (transposed) inline axis.
+                // A child whose block flow opposes the container's has its
+                // own start on the other physical side.
+                let (left_start, top_start) = self_start_sides(child_style);
+                // `FlexStart` of the transposed row axis is the container's
+                // block-start side: left for `vertical-lr`, right for `-rl`.
+                let (to_start, to_end) = if left_start == !block_rl {
+                    (AlignSelf::FlexStart, AlignSelf::FlexEnd)
+                } else {
+                    (AlignSelf::FlexEnd, AlignSelf::FlexStart)
+                };
                 match marker(child_style, "--w3cos-internal-align-self") {
-                    Some("self-start") => item.justify_self = AlignSelf::FlexStart,
-                    Some("self-end") => item.justify_self = AlignSelf::FlexEnd,
+                    Some("self-start") => item.justify_self = to_start,
+                    Some("self-end") => item.justify_self = to_end,
                     Some(keyword) if keyword.contains("last") => {
                         item.justify_self = AlignSelf::FlexEnd;
                     }
@@ -6013,15 +6132,32 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 // top to bottom for an ltr container: `left` is its start
                 // (line-left is the top edge), `right` its end.
                 match marker(child_style, "--w3cos-internal-justify-self") {
-                    Some("self-start" | "left") => item.align_self = AlignSelf::FlexStart,
-                    Some("self-end" | "right") => item.align_self = AlignSelf::FlexEnd,
+                    Some("left") => item.align_self = AlignSelf::FlexStart,
+                    Some("right") => item.align_self = AlignSelf::FlexEnd,
+                    Some("self-start") => {
+                        item.align_self = if top_start {
+                            AlignSelf::FlexStart
+                        } else {
+                            AlignSelf::FlexEnd
+                        }
+                    }
+                    Some("self-end") => {
+                        item.align_self = if top_start {
+                            AlignSelf::FlexEnd
+                        } else {
+                            AlignSelf::FlexStart
+                        }
+                    }
                     Some(keyword) if keyword.contains("last") => {
                         item.align_self = AlignSelf::FlexEnd;
                     }
                     _ => {}
                 }
             }
-            if flat[child].subtree_end > child + 1 {
+            if flat[child].subtree_end > child + 1 && horizontal_text_item(flat, child) {
+                // A horizontal item keeps its own direction and lays its text
+                // out on the ordinary path.
+            } else if flat[child].subtree_end > child + 1 {
                 // An item with text keeps its own (ltr) direction: its
                 // text is laid out by the orthogonal root path, which
                 // transposes it as ltr.
@@ -7588,6 +7724,28 @@ mod tests {
                     keyword.to_string(),
                 );
             expect(&justified, &[(2, [23.0, y, 6.0, 8.0])]);
+        }
+    }
+
+    #[test]
+    fn vertical_abspos_accepts_length_insets_and_self_start_from_the_child() {
+        use w3cos_std::style::WritingMode::VerticalLr;
+        // Chrome (grid-self-alignment-non-static-positioned-items-001): a
+        // length inset places the box from the containing block's edge.
+        let mut inset = vertical_abspos_grid(VerticalLr, Position::Relative, AlignSelf::Auto);
+        inset.children[0].children[0].style.left = Dimension::Px(4.0);
+        expect(&inset, &[(2, [7.0, 5.0, 6.0, 8.0])]);
+        // `self-start` of the vertical inline axis is the bottom edge for an
+        // rtl child (its own direction), the top edge for an ltr one.
+        for (direction, y) in [(TextDirection::Rtl, 11.0), (TextDirection::Ltr, 5.0)] {
+            let mut grid = vertical_abspos_grid(VerticalLr, Position::Relative, AlignSelf::Auto);
+            let abs = &mut grid.children[0].children[0].style;
+            abs.direction = direction;
+            abs.custom_properties.as_mut().unwrap().insert(
+                "--w3cos-internal-justify-self".to_string(),
+                "self-start".to_string(),
+            );
+            expect(&grid, &[(2, [3.0, y, 6.0, 8.0])]);
         }
     }
 

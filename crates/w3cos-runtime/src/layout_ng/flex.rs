@@ -3713,6 +3713,7 @@ fn oof_candidates(
             },
             static_block: origin.1 + y,
             static_rtl: rtl,
+            ..oof::OofCandidate::default()
         });
     }
     Some(out)

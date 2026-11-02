@@ -4743,6 +4743,7 @@ pub(super) fn layout_block_in(
                 },
                 static_block: bt + pt + block,
                 static_rtl: child_space.rtl,
+                ..OofCandidate::default()
             });
             child = next;
             continue;

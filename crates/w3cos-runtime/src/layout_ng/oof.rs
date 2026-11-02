@@ -23,14 +23,32 @@ use w3cos_std::style::{BoxSizing, Dimension, Position, Spacing, Style, TextDirec
 /// position (NGLogicalStaticPosition: the margin-box inline-start edge
 /// and block-start edge it would have in flow) relative to the border box
 /// of the fragment currently carrying it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct OofCandidate {
     pub index: usize,
     /// Left edge (ltr parent) or right edge (rtl parent) of the static
-    /// position.
+    /// position (the physical `inline_anchor` point when that is set).
     pub static_inline: f32,
     pub static_block: f32,
     pub static_rtl: bool,
+    /// Which edge of the box the static point is, when the alignment
+    /// container's `justify-self` / `align-self` is not `start`
+    /// (NGLogicalStaticPosition inline / block edge): the box is aligned
+    /// to the point once its size is known.
+    pub inline_anchor: Anchor,
+    pub block_anchor: Anchor,
+}
+
+/// The side of the margin box that sits at the static point. `Auto` keeps
+/// the box's start edge as `static_inline` / `static_block` describe it.
+/// Physical: `Start` is the left / top edge, `End` the right / bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) enum Anchor {
+    #[default]
+    Auto,
+    Start,
+    Center,
+    End,
 }
 
 impl OofCandidate {
@@ -161,11 +179,26 @@ pub(super) fn layout_out_of_flow(
     let mut left = length(style.left, w, style, &space);
     let mut right = length(style.right, w, style, &space);
     let static_inline = candidate.static_inline - cb.x;
+    // A centred static position gives the box the room the nearer side of
+    // the point leaves; its margin box is centred on the point below.
+    let mut centered_inline = None;
     if left.is_none() && right.is_none() {
-        if candidate.static_rtl {
-            right = Some(w - static_inline);
-        } else {
-            left = Some(static_inline);
+        match candidate.inline_anchor {
+            Anchor::Start => left = Some(static_inline),
+            Anchor::End => right = Some(w - static_inline),
+            Anchor::Center => {
+                let near = static_inline.min(w - static_inline).max(0.0);
+                left = Some(static_inline - near);
+                right = Some(w - static_inline - near);
+                centered_inline = Some(static_inline);
+            }
+            Anchor::Auto => {
+                if candidate.static_rtl {
+                    right = Some(w - static_inline);
+                } else {
+                    left = Some(static_inline);
+                }
+            }
         }
     }
     let content_w = |v: f32| match style.box_sizing {
@@ -287,7 +320,7 @@ pub(super) fn layout_out_of_flow(
         match length(style.width, w, style, &space).map(content_w) {
             Some(v) => clamp_inline_size(style, &space, edges_h, v),
             None => match (left, right) {
-                (Some(l), Some(r)) => clamp_inline_size(
+                (Some(l), Some(r)) if centered_inline.is_none() => clamp_inline_size(
                     style,
                     &space,
                     edges_h,
@@ -336,6 +369,11 @@ pub(super) fn layout_out_of_flow(
     };
     let border_w = width + edges_h;
     let (margin_left, x) = match (left, right) {
+        _ if centered_inline.is_some() => {
+            let (mlu, mru) = (ml.unwrap_or(0.0), mr.unwrap_or(0.0));
+            let at = centered_inline.unwrap_or(0.0);
+            (mlu, at - (border_w + mlu + mru) / 2.0)
+        }
         (Some(l), Some(r)) => {
             let remaining = w - l - r - border_w;
             let (ml_used, mr_used) = match (ml, mr) {
@@ -374,8 +412,15 @@ pub(super) fn layout_out_of_flow(
     // CSS2 10.6.4.
     let mut top = length(style.top, h, style, &space);
     let bottom = length(style.bottom, h, style, &space);
+    let mut bottom = bottom;
+    let mut centered_block = None;
     if top.is_none() && bottom.is_none() {
-        top = Some(candidate.static_block - cb.y);
+        let at = candidate.static_block - cb.y;
+        match candidate.block_anchor {
+            Anchor::End => bottom = Some(h - at),
+            Anchor::Center => centered_block = Some(at),
+            Anchor::Auto | Anchor::Start => top = Some(at),
+        }
     }
     let content_h = |v: f32| match style.box_sizing {
         BoxSizing::BorderBox => (v - edges_v).max(0.0),
@@ -431,6 +476,10 @@ pub(super) fn layout_out_of_flow(
         layout_block_sized(flat, index, &space, true, Some((width, fixed_h))).why("oof-layout")?;
     let border_h = result.fragment.height;
     let y = match (top, bottom) {
+        _ if centered_block.is_some() => {
+            let (mtu, mbu) = (mt.unwrap_or(0.0), mb.unwrap_or(0.0));
+            centered_block.unwrap_or(0.0) - (border_h + mtu + mbu) / 2.0 + mtu
+        }
         (Some(t), Some(bo)) => {
             let remaining = h - t - bo - border_h;
             let mt_used = match (mt, mb) {

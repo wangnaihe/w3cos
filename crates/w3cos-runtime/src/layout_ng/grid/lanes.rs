@@ -2100,6 +2100,7 @@ fn place_oof_children(
             static_inline: from_units(origin_x + col_at + inline_off),
             static_block: from_units(origin_y + row_at + block_off),
             static_rtl: false,
+            ..OofCandidate::default()
         };
         if static_only {
             pending_oof.push(candidate);
@@ -2153,11 +2154,37 @@ fn place_oof_children(
             height: from_units(area_h),
             rtl: false,
         };
-        let candidate = OofCandidate {
+        let mut candidate = OofCandidate {
             static_inline: from_units(origin_x + x0 + inline_off),
             static_block: from_units(origin_y + y0 + block_off),
             ..candidate
         };
+        // An item whose size is not definite is aligned to the area's edge
+        // once the resolver has sized it (as in the ordinary grid).
+        if border_w.is_none() {
+            let anchor = super::static_anchor(justify, false);
+            let left = origin_x + x0;
+            match anchor {
+                oof::Anchor::End => candidate.static_inline = from_units(left + area_w),
+                oof::Anchor::Center => candidate.static_inline = from_units(left + area_w / 2),
+                _ => {}
+            }
+            candidate.inline_anchor = anchor;
+        }
+        if border_h.is_none() {
+            let top = origin_y + y0;
+            match align {
+                Pack::End => {
+                    candidate.static_block = from_units(top + area_h);
+                    candidate.block_anchor = oof::Anchor::End;
+                }
+                Pack::Center => {
+                    candidate.static_block = from_units(top + area_h / 2);
+                    candidate.block_anchor = oof::Anchor::Center;
+                }
+                _ => {}
+            }
+        }
         let (placed, rest) = oof::resolve(
             flat,
             vec![candidate],
