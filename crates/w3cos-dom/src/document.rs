@@ -4759,6 +4759,24 @@ impl Document {
         {
             *own = parent.clone();
         }
+        // A recompute that lands on the same variables as the previous entry
+        // keeps that entry's allocation. Otherwise every child's cached
+        // `inherited_style` would differ by allocation and each child's next
+        // lookup would repeat the full O(#variables) map compare.
+        if let Some(own) = style.custom_properties.as_mut()
+            && !inherited
+                .and_then(|parent| parent.custom_properties.as_ref())
+                .is_some_and(|parent| own.ptr_eq(parent))
+            && let Some(previous) = self
+                .computed_style_cache
+                .borrow()
+                .get(&id)
+                .and_then(|entry| entry.style.custom_properties.clone())
+            && !own.ptr_eq(&previous)
+            && *own == previous
+        {
+            *own = previous;
+        }
         self.computed_style_cache.borrow_mut().insert(
             id,
             CachedComputedStyle {
@@ -26777,6 +26795,45 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    #[test]
+    fn recompute_with_unchanged_variables_keeps_the_variable_map_allocation() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        {
+            let mut style = body.style_mut(&mut document);
+            for index in 0..64 {
+                style.set_property(&format!("--theme-{index}"), "#123456");
+            }
+        }
+        let child = document.create_element("div");
+        body.append_child(&mut document, child);
+        let before_body = document.computed_style_for(body.id);
+        let before_child = document.computed_style_for(child.id);
+        let vars = |style: &w3cos_std::style::Style| style.custom_properties.clone().unwrap();
+        assert!(vars(&before_child).ptr_eq(&vars(&before_body)));
+
+        // Not a variable: only the node's own revision moves.
+        body.style_mut(&mut document).set_property("color", "red");
+        let after_body = document.computed_style_for(body.id);
+        let after_child = document.computed_style_for(child.id);
+        assert!(
+            vars(&after_body).ptr_eq(&vars(&before_body)),
+            "unchanged variables must keep the previous allocation"
+        );
+        assert!(vars(&after_child).ptr_eq(&vars(&after_body)));
+
+        // A changed variable still produces a new map for the node and child.
+        body.style_mut(&mut document)
+            .set_property("--theme-3", "#abcdef");
+        let changed = document.computed_style_for(body.id);
+        let changed_child = document.computed_style_for(child.id);
+        assert!(!vars(&changed).ptr_eq(&vars(&after_body)));
+        assert_eq!(vars(&changed).get("--theme-3").unwrap(), "#abcdef");
+        assert_eq!(vars(&changed_child).get("--theme-3").unwrap(), "#abcdef");
+        assert_eq!(vars(&after_body).get("--theme-3").unwrap(), "#123456");
+    }
 
     /// Whether the element's own style or either generated box carries a
     /// transition the runtime samples for `left` / `transform`.
