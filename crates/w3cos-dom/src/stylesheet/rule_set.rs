@@ -60,6 +60,35 @@ impl FollowingReach {
     }
 }
 
+/// Whether removing or inserting an earlier sibling can change the pseudo-class.
+fn pseudo_reads_preceding_position(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::LastChild | super::PseudoClass::LastOfType => false,
+        super::PseudoClass::NthLastChild(expression)
+        | super::PseudoClass::NthLastOfType(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
+        super::PseudoClass::FirstChild
+        | super::PseudoClass::FirstOfType
+        | super::PseudoClass::OnlyChild
+        | super::PseudoClass::OnlyOfType
+        | super::PseudoClass::NthChild(_)
+        | super::PseudoClass::NthOfType(_) => true,
+        _ => match selector_list_argument(pseudo) {
+            Some(selector) => {
+                let mut rest = selector.replace(":last-child", "");
+                rest = rest.replace(":last-of-type", "");
+                rest.contains(":nth-")
+                    || rest.contains(":first-")
+                    || rest.contains(":only-")
+                    || rest.contains('+')
+                    || rest.contains('~')
+            }
+            None => pseudo_reads_preceding(pseudo) || pseudo_counts_siblings_by_selector(pseudo),
+        },
+    }
+}
+
 /// `FollowingReach` plus the window sizes of `FollowingReach::WINDOW`.
 #[derive(Debug, Clone, Copy, Default)]
 struct Following {
@@ -142,6 +171,11 @@ struct PositionalAnchor {
     /// The same counted over siblings of the appended element's type
     /// (`:nth-last-of-type(k)`).
     window_type: usize,
+    /// The compound reads siblings *before* it (`:first-child`,
+    /// `:nth-child(n)`, `+`/`~`, ...), so removing an earlier sibling can
+    /// change it. Pure from-the-end rules (`:last-child`, `:nth-last-child(k)`)
+    /// do not.
+    reads_preceding: bool,
     /// The compound counts siblings by their own attributes
     /// (`:nth-child(An+B of S)`), so a class change on any sibling, before or
     /// after it, can change its result.
@@ -456,6 +490,9 @@ impl RuleSet {
                     following: following.reach,
                     window_child: following.window_child,
                     window_type: following.window_type,
+                    reads_preceding: sibling_rhs
+                        || sibling_any
+                        || pseudos.iter().any(pseudo_reads_preceding_position),
                     sibling_any,
                 });
             }
@@ -484,6 +521,31 @@ impl RuleSet {
                 || (reach.contains(FollowingReach::WINDOW)
                     && (previous.distance <= anchor.window_child
                         || previous.type_distance <= anchor.window_type));
+            reaches
+                && anchor.subject.matches(ctx)
+                && anchor
+                    .parent
+                    .as_ref()
+                    .is_none_or(|compound| compound.matches(parent))
+        })
+    }
+
+    /// Whether `ctx` (a child of `parent`) could change its match result when
+    /// a sibling was removed. `later` is true for children after the removed
+    /// one, which only lose from-the-start position; earlier children only
+    /// lose from-the-end position.
+    pub(super) fn removal_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        later: bool,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            let reaches = if later {
+                anchor.reads_preceding
+            } else {
+                anchor.following.0 != 0
+            };
             reaches
                 && anchor.subject.matches(ctx)
                 && anchor
