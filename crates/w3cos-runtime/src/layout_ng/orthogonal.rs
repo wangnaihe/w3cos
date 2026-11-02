@@ -58,7 +58,7 @@ fn sideways_char(c: char) -> bool {
 /// unaffected by. Every other marker (aspect-ratio, size containment,
 /// intrinsic keywords, flex/grid helpers, ...) changes sizing and is
 /// not transposed, so a box carrying one stays on the existing path.
-const INERT_MARKERS: &[&str] = &[
+pub(super) const INERT_MARKERS: &[&str] = &[
     "--w3cos-internal-font-size-origin",
     "--w3cos-internal-font-specified-size",
     "--w3cos-internal-html-standard-font",

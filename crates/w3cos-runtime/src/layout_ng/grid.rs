@@ -5643,7 +5643,7 @@ fn pack_content(pack: Pack) -> AlignContent {
 fn vertical_container_markers_ok(style: &Style) -> bool {
     style.custom_properties.as_ref().is_none_or(|props| {
         props.iter().all(|(key, value)| {
-            if !key.starts_with("--w3cos-internal-") {
+            if !key.starts_with("--w3cos-internal-") || vertical_inert_marker(key) {
                 return true;
             }
             if key == JUSTIFY_KEYWORD {
@@ -5669,6 +5669,34 @@ fn vertical_container_markers_ok(style: &Style) -> bool {
                 || key == "--w3cos-internal-align-self"
         })
     })
+}
+
+/// Cascade-only markers every styled element carries (font origin, list
+/// image, ...): they never change how a grid or its items are sized.
+fn vertical_inert_marker(key: &str) -> bool {
+    // `left-float-after-inline` only tells the block float placement where a
+    // float after line content sits; the container's own layout ignores it.
+    matches!(
+        key,
+        "--w3cos-internal-list-style-image" | "--w3cos-internal-left-float-after-inline"
+    ) || super::orthogonal::INERT_MARKERS.contains(&key)
+}
+
+/// Authored alignment the transposed static position does not model for an
+/// abspos child: a container-wide `last baseline` default. (A child's own
+/// `last baseline` is its end side; `safe` / `unsafe` follow the same clamped
+/// offsets the horizontal static position uses.)
+fn abspos_alignment_unmodelled(container: &Style, _child: &Style) -> bool {
+    marker(container, "--w3cos-internal-align-items")
+        .is_some_and(|keyword| keyword.contains("last"))
+}
+
+/// An abspos box whose insets are all `auto` sits at its static position
+/// (the grid-area alignment), which the axis swap of a vertical grid keeps.
+fn all_insets_auto(style: &Style) -> bool {
+    [style.top, style.right, style.bottom, style.left]
+        .iter()
+        .all(|inset| matches!(inset, Dimension::Auto))
 }
 
 fn swap_flow(flow: Option<&str>) -> Option<String> {
@@ -5722,6 +5750,7 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         }
         let mut items = Vec::new();
         let mut simple = true;
+        let rtl = style.direction == TextDirection::Rtl;
         for child in rendered_children(flat, index) {
             let child_style = flat[child].style;
             if !matches!(
@@ -5732,17 +5761,26 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             ) || flat[child].subtree_end > child + 1
                 || child_style.writing_mode != style.writing_mode
                 || child_style.direction != style.direction
-                || child_style.position != Position::Static
-                || child_style.float != Float::None
-                || child_style.align_self == AlignSelf::Baseline
-                || child_style.justify_self == AlignSelf::Baseline
-                || marker(child_style, "--w3cos-internal-align-self")
-                    .is_some_and(|keyword| keyword.contains("baseline"))
+                || !(child_style.position == Position::Static
+                    || (child_style.position == Position::Absolute
+                        && !rtl
+                        && all_insets_auto(child_style)))
+                || (child_style.position == Position::Static && child_style.float != Float::None)
+                || (child_style.position == Position::Absolute
+                    && abspos_alignment_unmodelled(style, child_style))
+                || (child_style.position == Position::Static
+                    && (child_style.align_self == AlignSelf::Baseline
+                        || child_style.justify_self == AlignSelf::Baseline
+                        || marker(child_style, "--w3cos-internal-align-self")
+                            .is_some_and(|keyword| keyword.contains("baseline"))))
                 || super::flex::percent_spacing(&child_style.margin)
                 || super::flex::percent_spacing(&child_style.padding)
                 || child_style.custom_properties.as_ref().is_some_and(|props| {
                     props.keys().any(|key| {
                         key.starts_with("--w3cos-internal-")
+                            && !vertical_inert_marker(key)
+                            && !(child_style.position == Position::Absolute
+                                && key == "--w3cos-internal-overflow-alignment")
                             && key != "--w3cos-internal-align-self"
                             && key != "--w3cos-internal-align-items"
                     })
@@ -5759,7 +5797,6 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         let Some(flow) = swap_flow(style.grid_flow()) else {
             continue;
         };
-        let rtl = style.direction == TextDirection::Rtl;
         let direction = if block_rl {
             TextDirection::Rtl
         } else {
@@ -5816,6 +5853,19 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             }
             item.align_self = child_style.justify_self;
             item.justify_self = child_style.align_self;
+            if child_style.position == Position::Absolute {
+                // The enum folds `self-start` / `self-end` into `auto`; the
+                // child shares the container's writing mode, so they are
+                // `start` / `end` of the (transposed) inline axis.
+                match marker(child_style, "--w3cos-internal-align-self") {
+                    Some("self-start") => item.justify_self = AlignSelf::FlexStart,
+                    Some("self-end") => item.justify_self = AlignSelf::FlexEnd,
+                    Some(keyword) if keyword.contains("last") => {
+                        item.justify_self = AlignSelf::FlexEnd;
+                    }
+                    _ => {}
+                }
+            }
             item.direction = direction;
             patched.push((child, item));
         }
@@ -7152,6 +7202,87 @@ mod tests {
                 (3, [0.0, 60.0, 20.0, 40.0]),
                 (4, [50.0, 160.0, 20.0, 40.0]),
             ],
+        );
+    }
+
+    fn vertical_abspos_grid(
+        mode: w3cos_std::style::WritingMode,
+        position: Position,
+        align: AlignSelf,
+    ) -> Component {
+        let mut style = grid_style(30.0, Some(22.0), Some("3px 14px 3px"));
+        style.grid_ng_mut().grid_template_rows = Some("2px 20px 2px".to_string());
+        style.writing_mode = mode;
+        style.position = position;
+        style.padding = edges(2.0, 1.0, 2.0, 1.0);
+        let mut abs = block_box(Some(6.0), Some(8.0));
+        abs.writing_mode = mode;
+        abs.position = Position::Absolute;
+        abs.grid_column = Some("2 / 3".to_string());
+        abs.grid_ng_mut().grid_row = Some("2 / 3".to_string());
+        abs.align_self = align;
+        // Every styled element carries these cascade-only markers.
+        for style in [&mut style, &mut abs] {
+            style.custom_properties = Some(CustomProperties::from_iter([
+                (
+                    "--w3cos-internal-font-size-origin".to_string(),
+                    "default".to_string(),
+                ),
+                (
+                    "--w3cos-internal-list-style-image".to_string(),
+                    "none".to_string(),
+                ),
+            ]));
+        }
+        Component::boxed(
+            Style {
+                display: Display::Block,
+                ..Style::default()
+            },
+            vec![Component::boxed(style, vec![leaf(abs)])],
+        )
+    }
+
+    #[test]
+    fn vertical_abspos_static_position_follows_the_swapped_axes() {
+        use w3cos_std::style::WritingMode::{VerticalLr, VerticalRl};
+        // Chrome (grid-abspos-staticpos-align-self-vertWM-001): `align-self`
+        // acts on the horizontal block axis, which starts at the right in
+        // `vertical-rl`; the area is row 2 (2px in from the start edge).
+        expect(
+            &vertical_abspos_grid(VerticalRl, Position::Relative, AlignSelf::Auto),
+            &[
+                (0, [0.0, 0.0, 800.0, 26.0]),
+                (1, [0.0, 0.0, 32.0, 26.0]),
+                (2, [23.0, 5.0, 6.0, 8.0]),
+            ],
+        );
+        // A static container is not the containing block: the box sits at
+        // the content-box start corner, whatever its grid area says.
+        expect(
+            &vertical_abspos_grid(VerticalRl, Position::Static, AlignSelf::Auto),
+            &[(2, [25.0, 2.0, 6.0, 8.0])],
+        );
+        expect(
+            &vertical_abspos_grid(VerticalRl, Position::Relative, AlignSelf::Center),
+            &[(2, [16.0, 5.0, 6.0, 8.0])],
+        );
+        // `align-self: self-end` folds into `auto` in the enum; the authored
+        // keyword marker decides, and it is the block-end (left) edge here.
+        let mut self_end = vertical_abspos_grid(VerticalRl, Position::Relative, AlignSelf::Auto);
+        self_end.children[0].children[0]
+            .style
+            .custom_properties
+            .as_mut()
+            .unwrap()
+            .insert(
+                "--w3cos-internal-align-self".to_string(),
+                "self-end".to_string(),
+            );
+        expect(&self_end, &[(2, [9.0, 5.0, 6.0, 8.0])]);
+        expect(
+            &vertical_abspos_grid(VerticalLr, Position::Relative, AlignSelf::Auto),
+            &[(2, [3.0, 5.0, 6.0, 8.0])],
         );
     }
 
