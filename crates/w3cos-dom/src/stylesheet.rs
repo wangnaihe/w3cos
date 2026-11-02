@@ -788,6 +788,52 @@ pub fn rule_count() -> usize {
     RULES.with(|rules| rules.borrow().rules.len())
 }
 
+/// Whether a declaration can give an element a `transition` the runtime
+/// samples (`left` or `transform`). `parse_transition` reads only the first
+/// token of the shorthand, so this mirrors that and stays conservative for
+/// anything it cannot resolve statically (`var()`, CSS-wide keywords).
+pub(crate) fn declares_sampled_transition(property: &str, value: &str) -> bool {
+    if !property.eq_ignore_ascii_case("transition") {
+        return false;
+    }
+    let (value, _) = declaration_value_and_importance(value);
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return false;
+    }
+    if value.contains("var(") || value.contains("VAR(") {
+        return true;
+    }
+    let first = value.split_whitespace().next().unwrap_or("");
+    ["all", "transform", "left"]
+        .iter()
+        .any(|name| first.eq_ignore_ascii_case(name))
+        || ["inherit", "initial", "unset", "revert", "revert-layer"]
+            .iter()
+            .any(|keyword| value.eq_ignore_ascii_case(keyword))
+}
+
+/// Whether some registered rule that declares a sampled transition matches
+/// `node` (as the element itself or as the origin of a generated pseudo
+/// element). Cheaper than a computed style, and never a false negative.
+pub(crate) fn node_matches_motion_rule(document: &Document, node: NodeId) -> bool {
+    RULES.with(|rules| {
+        let rules = rules.borrow();
+        rules.has_motion_rules()
+            && rules.motion_rules().any(|rule| {
+                matches_chain_node(
+                    document,
+                    node,
+                    &rule.chain,
+                    &rule.combinators,
+                    rule.chain.len() - 1,
+                    None,
+                    None,
+                )
+            })
+    })
+}
+
 /// Whether any rules are registered — fast path for the DOM walk.
 pub fn has_rules() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 1 != 0)

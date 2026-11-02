@@ -5001,6 +5001,24 @@ impl Document {
         }
     }
 
+    /// Whether the element (or its `::before`/`::after`) can have a
+    /// transition on `left` or `transform`. A `false` answer is exact: its
+    /// computed style then has no sampled transition, so callers that only
+    /// need that can skip computing the style. `true` is conservative.
+    pub fn may_have_sampled_transition(&self, id: NodeId) -> bool {
+        if self.get_node(id).node_type != NodeType::Element {
+            return false;
+        }
+        if self.styles[id.0 as usize]
+            .inline_declarations
+            .iter()
+            .any(|(property, value)| stylesheet::declares_sampled_transition(property, value))
+        {
+            return true;
+        }
+        stylesheet::node_matches_motion_rule(self, id)
+    }
+
     /// Resolve the author cascade for a generated pseudo-element. Pseudo
     /// declarations are matched against the originating element but remain
     /// separate from its principal computed style.
@@ -26740,6 +26758,137 @@ mod details_component_tests {
 #[cfg(test)]
 mod computed_style_cache_tests {
     use super::*;
+
+    /// Whether the element's own style or either generated box carries a
+    /// transition the runtime samples for `left` / `transform`.
+    fn samples_transition(document: &Document, id: NodeId) -> bool {
+        let applies = |style: w3cos_std::style::Style| {
+            use w3cos_std::style::TransitionProperty;
+            style.transition.is_some_and(|transition| {
+                transition.duration_ms > 0
+                    && match &transition.property {
+                        TransitionProperty::All | TransitionProperty::Transform => true,
+                        TransitionProperty::Custom(name) => {
+                            name.eq_ignore_ascii_case("left")
+                                || name.eq_ignore_ascii_case("transform")
+                        }
+                        _ => false,
+                    }
+            })
+        };
+        applies(document.computed_style_for(id))
+            || applies(document.computed_pseudo_style_for(id, "::before"))
+            || applies(document.computed_pseudo_style_for(id, "::after"))
+    }
+
+    #[test]
+    fn sampled_transition_gate_never_misses_a_transition_the_style_carries() {
+        let cases: &[(&str, &str, &str)] = &[
+            (".t", "transition", "left 1s"),
+            (".t", "transition", "transform 0.2s ease-out"),
+            (".t", "transition", "all 1s"),
+            (".t", "transition", "ALL 1s"),
+            (".t", "transition", "left 1s !important"),
+            (".t::before", "transition", "transform 1s"),
+            (".t::after", "transition", "all 1s"),
+            (".t", "transition", "opacity 1s"),
+            (".t", "transition", "top 70ms, left 70ms"),
+            (".t", "transition", "none"),
+            (".t", "transition", "left 0s"),
+            (".t", "transition", "background-color 1s"),
+            (".p .t", "transition", "left 1s"),
+            (".p > .t", "transition", "transform 1s"),
+            (".t:first-child", "transition", "left 1s"),
+            (".other", "transition", "left 1s"),
+        ];
+        for (selector, property, value) in cases {
+            for (classes, inline) in [("t", false), ("p", false), ("t other", false), ("t", true)] {
+                stylesheet::clear_rules();
+                stylesheet::register_rule(selector, &[(property, value)]);
+                let mut document = Document::new();
+                let body = document.body();
+                let parent = document.create_element("div");
+                body.append_child(&mut document, parent);
+                parent.set_attribute(&mut document, "class", "p");
+                let node = document.create_element("div");
+                parent.append_child(&mut document, node);
+                node.set_attribute(&mut document, "class", classes);
+                if inline {
+                    node.style_mut(&mut document)
+                        .set_property("transition", "transform 1s");
+                }
+                let gate = document.may_have_sampled_transition(node.id);
+                assert!(
+                    gate || !samples_transition(&document, node.id),
+                    "gate said no but the style carries a transition: {selector} {{ {property}: {value} }} classes={classes:?} inline={inline}"
+                );
+                if inline {
+                    assert!(gate, "inline transform transition must pass the gate");
+                }
+            }
+        }
+        stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn sampled_transition_gate_is_false_without_a_matching_motion_rule_and_computes_nothing() {
+        stylesheet::clear_rules();
+        stylesheet::register_rule(".moves", &[("transition", "left 1s")]);
+        stylesheet::register_rule(".fades", &[("transition", "opacity 1s")]);
+        stylesheet::register_rule(".plain", &[("color", "red"), ("left", "3px")]);
+        let mut document = Document::new();
+        let body = document.body();
+        let make = |document: &mut Document, class: &str| {
+            let node = document.create_element("div");
+            body.append_child(document, node);
+            node.set_attribute(document, "class", class);
+            node
+        };
+        let plain = make(&mut document, "plain");
+        let fades = make(&mut document, "fades");
+        let moves = make(&mut document, "moves");
+        let misses = document.computed_style_cache_misses.get();
+        assert!(!document.may_have_sampled_transition(plain.id));
+        assert!(!document.may_have_sampled_transition(fades.id));
+        assert!(document.may_have_sampled_transition(moves.id));
+        assert_eq!(
+            document.computed_style_cache_misses.get(),
+            misses,
+            "the gate must not compute a style"
+        );
+        // The answer follows later class and stylesheet changes.
+        plain.set_attribute(&mut document, "class", "plain moves");
+        assert!(document.may_have_sampled_transition(plain.id));
+        plain.set_attribute(&mut document, "class", "plain");
+        assert!(!document.may_have_sampled_transition(plain.id));
+        stylesheet::register_rule(".plain", &[("transition", "transform 1s")]);
+        assert!(document.may_have_sampled_transition(plain.id));
+        stylesheet::clear_rules();
+        assert!(!document.may_have_sampled_transition(plain.id));
+    }
+
+    #[test]
+    fn sampled_transition_gate_is_conservative_for_values_it_cannot_resolve() {
+        for value in [
+            "var(--t)",
+            "var(--prop) 1s",
+            "inherit",
+            "unset",
+            "left 1s var(--x)",
+        ] {
+            assert!(
+                stylesheet::declares_sampled_transition("transition", value),
+                "{value}"
+            );
+        }
+        for value in ["none", "opacity 1s", "top 1s, left 1s", "", "color 1s"] {
+            assert!(
+                !stylesheet::declares_sampled_transition("transition", value),
+                "{value}"
+            );
+        }
+        assert!(!stylesheet::declares_sampled_transition("left", "left"));
+    }
 
     #[test]
     fn plain_descendants_do_not_clone_the_inherited_variable_map() {
