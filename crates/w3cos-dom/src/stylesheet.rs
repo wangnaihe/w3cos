@@ -29,7 +29,8 @@ mod selector_parse_cache;
 
 use rule_set::RuleSet;
 pub(crate) use rule_set::{FollowingPosition, FollowingScan};
-use selector_filter::{AncestorBloom, LazyAncestorBloom};
+pub(crate) use selector_filter::AncestorBloom;
+use selector_filter::LazyAncestorBloom;
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
 #[derive(Debug, Clone, Default)]
@@ -468,45 +469,65 @@ pub(crate) fn relational_anchor(ctx: &SelectorContext) -> Option<u8> {
 pub(crate) fn positional_anchor_matches(
     ctx: &SelectorContext,
     parent: &SelectorContext,
+    ancestors: AncestorBloom,
     siblings_only: bool,
 ) -> bool {
     RULES.with(|rules| {
         rules
             .borrow()
-            .positional_anchor_matches(ctx, parent, siblings_only)
+            .positional_anchor_matches(ctx, parent, ancestors, siblings_only)
     })
 }
 
 pub(crate) fn following_anchor_matches(
     ctx: &SelectorContext,
     parent: &SelectorContext,
+    ancestors: AncestorBloom,
     position: FollowingPosition,
 ) -> bool {
     RULES.with(|rules| {
         rules
             .borrow()
-            .following_anchor_matches(ctx, parent, position)
+            .following_anchor_matches(ctx, parent, ancestors, position)
     })
 }
 
 pub(crate) fn removal_anchor_matches(
     ctx: &SelectorContext,
     parent: &SelectorContext,
+    ancestors: AncestorBloom,
     later: bool,
 ) -> bool {
-    RULES.with(|rules| rules.borrow().removal_anchor_matches(ctx, parent, later))
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .removal_anchor_matches(ctx, parent, ancestors, later)
+    })
 }
 
-pub(crate) fn following_of_type_needed(parent: &SelectorContext) -> bool {
-    RULES.with(|rules| rules.borrow().following_of_type_needed(parent))
+pub(crate) fn following_of_type_needed(parent: &SelectorContext, ancestors: AncestorBloom) -> bool {
+    RULES.with(|rules| rules.borrow().following_of_type_needed(parent, ancestors))
 }
 
-pub(crate) fn following_scan(parent: &SelectorContext) -> FollowingScan {
-    RULES.with(|rules| rules.borrow().following_scan(parent))
+pub(crate) fn following_scan(parent: &SelectorContext, ancestors: AncestorBloom) -> FollowingScan {
+    RULES.with(|rules| rules.borrow().following_scan(parent, ancestors))
 }
 
-pub(crate) fn sibling_any_anchor_matches(ctx: &SelectorContext, parent: &SelectorContext) -> bool {
-    RULES.with(|rules| rules.borrow().sibling_any_anchor_matches(ctx, parent))
+pub(crate) fn sibling_any_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    ancestors: AncestorBloom,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .sibling_any_anchor_matches(ctx, parent, ancestors)
+    })
+}
+
+/// Features on the ancestor chain shared by the children of `parent`.
+pub(crate) fn children_ancestor_bloom(document: &Document, parent: NodeId) -> AncestorBloom {
+    AncestorBloom::for_children_of(document, parent)
 }
 
 pub(crate) fn empty_anchor_matches(ctx: &SelectorContext) -> bool {

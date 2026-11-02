@@ -46,7 +46,7 @@ impl<F: Fn() -> AncestorBloom> LazyAncestorBloom<F> {
 /// Hash collisions only retain extra rules; the full selector matcher remains
 /// authoritative for every rule that passes.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct AncestorBloom(u128);
+pub(crate) struct AncestorBloom(u128);
 
 impl AncestorBloom {
     pub(super) fn for_rule(chain: &[CompoundSelector], combinators: &[Combinator]) -> Self {
@@ -67,6 +67,29 @@ impl AncestorBloom {
         bloom
     }
 
+    /// Requirements on the ancestor chain of the element matching
+    /// `chain[position]`.
+    pub(super) fn for_compound_at(
+        chain: &[CompoundSelector],
+        combinators: &[Combinator],
+        position: usize,
+    ) -> Self {
+        let mut bloom = Self::default();
+        let mut index = position;
+        while index > 0 {
+            match combinators[index - 1] {
+                Combinator::Child | Combinator::Descendant => {
+                    bloom.insert_compound_requirement(&chain[index - 1]);
+                }
+                // The sibling itself is not an ancestor, but whatever it needs
+                // above it is shared with this element.
+                Combinator::AdjacentSibling | Combinator::GeneralSibling => {}
+            }
+            index -= 1;
+        }
+        bloom
+    }
+
     pub(super) fn for_contexts(ancestors: &[SelectorContext]) -> Self {
         let mut bloom = Self::default();
         for ancestor in ancestors {
@@ -75,9 +98,19 @@ impl AncestorBloom {
         bloom
     }
 
-    pub(super) fn for_node(document: &Document, node: NodeId) -> Self {
+    pub(crate) fn for_node(document: &Document, node: NodeId) -> Self {
+        Self::from_chain(document, document.get_node(node).parent)
+    }
+
+    /// The ancestor chain shared by the children of `parent`: `parent` itself
+    /// and everything above it.
+    pub(crate) fn for_children_of(document: &Document, parent: NodeId) -> Self {
+        Self::from_chain(document, Some(parent))
+    }
+
+    fn from_chain(document: &Document, start: Option<NodeId>) -> Self {
         let mut bloom = Self::default();
-        let mut ancestor = document.get_node(node).parent;
+        let mut ancestor = start;
         while let Some(candidate) = ancestor {
             let node = document.get_node(candidate);
             if node.node_type == NodeType::Element {

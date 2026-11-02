@@ -1761,6 +1761,7 @@ impl Document {
             return false;
         }
         let parent_context = self.selector_context_base(parent);
+        let ancestors = stylesheet::children_ancestor_bloom(self, parent);
         if stylesheet::empty_anchor_matches(&parent_context) {
             // The parent's own match can flip, its descendants may be
             // selected through it, and so may its following siblings
@@ -1806,9 +1807,19 @@ impl Document {
             let observed = self.get_node(child).node_type == NodeType::Element && {
                 let context = self.selector_context_base(child);
                 if removal {
-                    stylesheet::removal_anchor_matches(&context, &parent_context, after_boundary)
+                    stylesheet::removal_anchor_matches(
+                        &context,
+                        &parent_context,
+                        ancestors,
+                        after_boundary,
+                    )
                 } else {
-                    stylesheet::positional_anchor_matches(&context, &parent_context, false)
+                    stylesheet::positional_anchor_matches(
+                        &context,
+                        &parent_context,
+                        ancestors,
+                        false,
+                    )
                 }
             };
             if observed {
@@ -1860,7 +1871,8 @@ impl Document {
     ) {
         // `:last-of-type` flips only on the last earlier sibling of the
         // appended element's own type.
-        let previous_of_type = if stylesheet::following_of_type_needed(parent_context) {
+        let ancestors = stylesheet::children_ancestor_bloom(self, parent);
+        let previous_of_type = if stylesheet::following_of_type_needed(parent_context, ancestors) {
             let mut candidate = previous;
             while let Some(id) = candidate {
                 if self.get_node(id).tag.as_str().eq_ignore_ascii_case(new_tag) {
@@ -1872,7 +1884,7 @@ impl Document {
         } else {
             None
         };
-        let scan = stylesheet::following_scan(parent_context);
+        let scan = stylesheet::following_scan(parent_context, ancestors);
         if scan.needed() {
             // Walk back from the previous last element. Rules that read the
             // whole list visit everything; `:nth-last-child(k)` and
@@ -1903,6 +1915,7 @@ impl Document {
                 self.restyle_following_anchor(
                     child,
                     parent_context,
+                    ancestors,
                     stylesheet::FollowingPosition {
                         last: Some(child) == previous,
                         of_type: is_of_type,
@@ -1915,6 +1928,7 @@ impl Document {
                 self.restyle_following_anchor(
                     id,
                     parent_context,
+                    ancestors,
                     stylesheet::FollowingPosition {
                         last: false,
                         of_type: true,
@@ -1936,6 +1950,7 @@ impl Document {
             self.restyle_following_anchor(
                 id,
                 parent_context,
+                ancestors,
                 stylesheet::FollowingPosition {
                     last,
                     of_type,
@@ -1950,10 +1965,11 @@ impl Document {
         &mut self,
         id: NodeId,
         parent_context: &stylesheet::SelectorContext,
+        ancestors: stylesheet::AncestorBloom,
         position: stylesheet::FollowingPosition,
     ) {
         let context = self.selector_context_base(id);
-        if stylesheet::following_anchor_matches(&context, parent_context, position) {
+        if stylesheet::following_anchor_matches(&context, parent_context, ancestors, position) {
             self.invalidate_style_subtree(id);
         }
     }
@@ -2057,6 +2073,7 @@ impl Document {
             return false;
         }
         let parent_context = self.selector_context_base(parent);
+        let ancestors = stylesheet::children_ancestor_bloom(self, parent);
         self.invalidate_style_subtree(id);
         // `:nth-child(An+B of S)` also reads the siblings *before* `id`.
         let mut earlier = self.get_node(parent).first_child;
@@ -2069,6 +2086,7 @@ impl Document {
                 && stylesheet::sibling_any_anchor_matches(
                     &self.selector_context_base(sibling),
                     &parent_context,
+                    ancestors,
                 );
             if observed {
                 self.invalidate_style_subtree(sibling);
@@ -2081,6 +2099,7 @@ impl Document {
                 && stylesheet::positional_anchor_matches(
                     &self.selector_context_base(sibling),
                     &parent_context,
+                    ancestors,
                     true,
                 );
             if observed {
@@ -29860,6 +29879,72 @@ mod computed_style_cache_tests {
                 crate::stylesheet::clear_rules();
             }
         }
+    }
+
+    #[test]
+    fn positional_anchors_only_apply_under_the_ancestors_their_rule_requires() {
+        // (selector, scoped container classes): the same child list edits
+        // inside and outside `.scope` for a rule written as `.scope p:...`.
+        for selector in [
+            ".scope p:last-child",
+            ".scope p:not(:last-child)",
+            ".scope p:nth-last-child(2)",
+            ".scope p:last-of-type",
+            ".scope p:has(+ b)",
+            ".scope p:first-child",
+            ".scope p + p",
+        ] {
+            for scoped in [false, true] {
+                for edit in 0..3 {
+                    crate::stylesheet::clear_rules();
+                    crate::stylesheet::register_rule(selector, &[("color", "red")]);
+                    let mut document = Document::new();
+                    let outer = document.create_element("section");
+                    if scoped {
+                        outer.class_list_add(&mut document, "scope");
+                    }
+                    document.body().append_child(&mut document, outer);
+                    let list = document.create_element("div");
+                    outer.append_child(&mut document, list);
+                    let mut rows = Vec::new();
+                    for _ in 0..3 {
+                        let row = document.create_element("p");
+                        list.append_child(&mut document, row);
+                        rows.push(row);
+                    }
+                    for row in &rows {
+                        let _ = document.computed_style_for(row.id);
+                    }
+                    match edit {
+                        0 => {
+                            let added = document.create_element("p");
+                            list.append_child(&mut document, added);
+                        }
+                        1 => list.remove_child(&mut document, &rows[2]),
+                        _ => list.remove_child(&mut document, &rows[0]),
+                    }
+                    let removed = match edit {
+                        1 => Some(2),
+                        2 => Some(0),
+                        _ => None,
+                    };
+                    let any_restyled = rows.iter().enumerate().any(|(index, row)| {
+                        Some(index) != removed && !document.computed_style_cache_is_current(row.id)
+                    });
+                    if !scoped {
+                        assert!(
+                            !any_restyled,
+                            "{selector}, edit {edit}: nothing outside .scope can be selected"
+                        );
+                    } else if edit == 0
+                        && !matches!(selector, ".scope p:first-child" | ".scope p + p")
+                    {
+                        assert!(any_restyled, "{selector}, edit {edit}: inside .scope");
+                    }
+                }
+            }
+        }
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
