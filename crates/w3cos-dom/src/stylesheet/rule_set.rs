@@ -42,6 +42,10 @@ struct PositionalAnchor {
     /// The compound sits right of `+` or `~` (also inside `:not(.a + .b)`),
     /// so it reads siblings *before* it.
     sibling_rhs: bool,
+    /// The compound counts siblings by their own attributes
+    /// (`:nth-child(An+B of S)`), so a class change on any sibling, before or
+    /// after it, can change its result.
+    sibling_any: bool,
 }
 
 #[derive(Debug, Default)]
@@ -311,6 +315,7 @@ impl RuleSet {
                 pseudo_is_positional(pseudo) || pseudo_has_sibling_scoped_relational(pseudo)
             });
             let watches_children = pseudos.iter().any(pseudo_watches_children);
+            let sibling_any = pseudos.iter().any(pseudo_counts_siblings_by_selector);
             if !(positional || sibling_rhs || watches_children) {
                 continue;
             }
@@ -331,6 +336,7 @@ impl RuleSet {
                     subject,
                     parent,
                     sibling_rhs,
+                    sibling_any,
                 });
             }
         }
@@ -348,7 +354,24 @@ impl RuleSet {
         siblings_only: bool,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
-            (!siblings_only || anchor.sibling_rhs)
+            (!siblings_only || anchor.sibling_rhs || anchor.sibling_any)
+                && anchor.subject.matches(ctx)
+                && anchor
+                    .parent
+                    .as_ref()
+                    .is_none_or(|compound| compound.matches(parent))
+        })
+    }
+
+    /// Whether `ctx` (a child of `parent`) counts siblings by their own
+    /// attributes, so a change on a *following* sibling can restyle it.
+    pub(super) fn sibling_any_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            anchor.sibling_any
                 && anchor.subject.matches(ctx)
                 && anchor
                     .parent
@@ -447,6 +470,10 @@ fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
         super::PseudoClass::Not(selector)
         | super::PseudoClass::Is(selector)
         | super::PseudoClass::Where(selector) => selector.contains('+') || selector.contains('~'),
+        // `:nth-child(An+B of S)` counts siblings by their own attributes.
+        super::PseudoClass::NthChild(expression) | super::PseudoClass::NthLastChild(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
         _ => false,
     }
 }
@@ -506,6 +533,16 @@ fn pseudo_nests_position(pseudo: &super::PseudoClass) -> bool {
 fn pseudo_reads_preceding(pseudo: &super::PseudoClass) -> bool {
     selector_list_argument(pseudo)
         .is_some_and(|selector| selector.contains('+') || selector.contains('~'))
+}
+
+/// `:nth-child(An+B of S)` and `:nth-last-child(An+B of S)`.
+fn pseudo_counts_siblings_by_selector(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::NthChild(expression) | super::PseudoClass::NthLastChild(expression) => {
+            super::split_nth_of_selector(expression).1.is_some()
+        }
+        _ => false,
+    }
 }
 
 /// `:empty`, also nested in `:not(:empty)`.
