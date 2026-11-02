@@ -6238,9 +6238,15 @@ mod tests {
         floating.transform.translate_x = 40.0;
         // z-index does not apply to this static, non-flex/grid float.
         floating.z_index = -10;
+        // `Style::default()` is `display: flex`, which would make the float a
+        // flex item (where z-index does apply); the parent must be a block.
+        let block_parent = Style {
+            display: Display::Block,
+            ..Style::default()
+        };
         let artifact = PaintArtifact::build(
             [
-                node(ComponentKind::Column, Style::default(), None),
+                node(ComponentKind::Column, block_parent, None),
                 node(ComponentKind::Row, floating, Some(0)),
                 node(
                     ComponentKind::Text {
@@ -6262,6 +6268,41 @@ mod tests {
             artifact.paint_order_key(2),
             artifact.paint_order_key(1)
         );
+    }
+
+    #[test]
+    fn static_flex_item_z_index_orders_like_a_positioned_box() {
+        // z-index applies to flex items even when `position` is static, so a
+        // negative-z item paints below its parent's normal-flow ink.
+        let node = |kind, style, parent| PaintNode {
+            kind,
+            style,
+            parent,
+            sticky_counter_signal: None,
+        };
+        let build = |parent_display| {
+            let item = Style {
+                z_index: -10,
+                ..Style::default()
+            };
+            let parent = Style {
+                display: parent_display,
+                ..Style::default()
+            };
+            let artifact = PaintArtifact::build(
+                [
+                    node(ComponentKind::Column, parent, None),
+                    node(ComponentKind::Row, Style::default(), Some(0)),
+                    node(ComponentKind::Row, item, Some(0)),
+                ],
+                &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+                1,
+            );
+            // The later sibling carries the negative z-index.
+            artifact.paint_order_key(2) < artifact.paint_order_key(1)
+        };
+        assert!(build(Display::Flex), "flex item honours z-index");
+        assert!(!build(Display::Block), "block child ignores z-index");
     }
 
     #[test]
