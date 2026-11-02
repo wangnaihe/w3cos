@@ -149,6 +149,9 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // for the static position of an abspos flex child.
             | "align-self"
             | "align-items"
+            // The authored `justify-self` keyword: read only for the static
+            // position of an abspos grid child in a vertical writing mode.
+            | "justify-self"
             // The computed `tab-size` (inherited). Text measure and paint
             // read it for preserved tabs; `text:tab` gates the leaves whose
             // stops need a line position NG does not pass yet.

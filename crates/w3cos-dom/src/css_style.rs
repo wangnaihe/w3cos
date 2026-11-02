@@ -81,6 +81,10 @@ pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
 /// abspos flex child.
 pub const ALIGN_SELF_KEYWORD_PROPERTY: &str = "--w3cos-internal-align-self";
 pub const ALIGN_ITEMS_KEYWORD_PROPERTY: &str = "--w3cos-internal-align-items";
+/// Authored `justify-self` keyword (lower-cased); same folding as
+/// [`ALIGN_SELF_KEYWORD_PROPERTY`]. LayoutNG reads it for the static
+/// position of an abspos grid child in a vertical writing mode.
+pub const JUSTIFY_SELF_KEYWORD_PROPERTY: &str = "--w3cos-internal-justify-self";
 /// Authored `align-items` / `justify-items: stretch`. The enum folds
 /// `normal` into `stretch`, but a replaced grid item behaves as `start`
 /// for `normal` and stretches only for the explicit keyword. Present only
@@ -2227,7 +2231,15 @@ impl CSSStyleDeclaration {
                     self.set_property("justify-self", &justify);
                 }
             }
-            "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
+            "justify-self" | "justifySelf" => {
+                self.inner.justify_self = parse_align_self(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    JUSTIFY_SELF_KEYWORD_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
+            }
             "justify-items" | "justifyItems" => {
                 self.inner.justify_items = parse_align_items(value);
                 set_marker(

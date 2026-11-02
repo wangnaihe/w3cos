@@ -5667,6 +5667,7 @@ fn vertical_container_markers_ok(style: &Style) -> bool {
                 || key == JUSTIFY_ITEMS_STRETCH
                 || key == "--w3cos-internal-align-items"
                 || key == "--w3cos-internal-align-self"
+                || key == "--w3cos-internal-justify-self"
         })
     })
 }
@@ -5782,6 +5783,7 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                             && !(child_style.position == Position::Absolute
                                 && key == "--w3cos-internal-overflow-alignment")
                             && key != "--w3cos-internal-align-self"
+                            && key != "--w3cos-internal-justify-self"
                             && key != "--w3cos-internal-align-items"
                     })
                 })
@@ -5862,6 +5864,17 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                     Some("self-end") => item.justify_self = AlignSelf::FlexEnd,
                     Some(keyword) if keyword.contains("last") => {
                         item.justify_self = AlignSelf::FlexEnd;
+                    }
+                    _ => {}
+                }
+                // `justify-self` acts on the vertical inline axis, which runs
+                // top to bottom for an ltr container: `left` is its start
+                // (line-left is the top edge), `right` its end.
+                match marker(child_style, "--w3cos-internal-justify-self") {
+                    Some("self-start" | "left") => item.align_self = AlignSelf::FlexStart,
+                    Some("self-end" | "right") => item.align_self = AlignSelf::FlexEnd,
+                    Some(keyword) if keyword.contains("last") => {
+                        item.align_self = AlignSelf::FlexEnd;
                     }
                     _ => {}
                 }
@@ -7284,6 +7297,22 @@ mod tests {
             &vertical_abspos_grid(VerticalLr, Position::Relative, AlignSelf::Auto),
             &[(2, [3.0, 5.0, 6.0, 8.0])],
         );
+        // `justify-self` is the vertical inline axis (top to bottom): the
+        // authored `right` / `self-end` keyword is its end, `left` its start.
+        for (keyword, y) in [("right", 11.0), ("self-end", 11.0), ("left", 5.0)] {
+            let mut justified =
+                vertical_abspos_grid(VerticalRl, Position::Relative, AlignSelf::Auto);
+            justified.children[0].children[0]
+                .style
+                .custom_properties
+                .as_mut()
+                .unwrap()
+                .insert(
+                    "--w3cos-internal-justify-self".to_string(),
+                    keyword.to_string(),
+                );
+            expect(&justified, &[(2, [23.0, y, 6.0, 8.0])]);
+        }
     }
 
     #[test]
