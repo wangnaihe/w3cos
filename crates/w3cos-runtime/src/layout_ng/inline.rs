@@ -308,7 +308,12 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.break_spaces {
         return Some("text:break-spaces");
     }
-    if style.word_break != WordBreak::Normal {
+    // break-all / keep-all only change the opportunities
+    // (crate::line_break::BreakMode); break-word adds emergency breaks.
+    if !matches!(
+        style.word_break,
+        WordBreak::Normal | WordBreak::BreakAll | WordBreak::KeepAll
+    ) {
         return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
@@ -825,7 +830,9 @@ fn inline_text_reason(
         // break-all / overflow-wrap add emergency breaks inside an item.
         if !matches!(
             style.word_break,
-            w3cos_std::style::WordBreak::Normal | w3cos_std::style::WordBreak::KeepAll
+            w3cos_std::style::WordBreak::Normal
+                | w3cos_std::style::WordBreak::KeepAll
+                | w3cos_std::style::WordBreak::BreakAll
         ) {
             return Some("text:word-break");
         }
@@ -1423,7 +1430,7 @@ fn internal_opportunity(content: &str, style: &Style) -> bool {
     } else {
         core
     };
-    if core.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    if style.word_break != WordBreak::BreakAll && core.bytes().all(|b| b.is_ascii_alphanumeric()) {
         // FillAscii: no opportunity between ASCII letters and digits.
         return false;
     }

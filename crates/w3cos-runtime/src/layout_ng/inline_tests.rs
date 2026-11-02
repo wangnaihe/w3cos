@@ -2859,3 +2859,58 @@ fn a_cascaded_box_with_one_folded_text_leaf_is_an_ifc_root() {
     ];
     assert_eq!(reason(&tree(Some("serif"), two)), Some("ifc:unmarked"));
 }
+
+/// `word-break: break-all` makes every cluster an opportunity
+/// (NGLineBreaker over a kBreakAll iterator): a sole paragraph leaf wraps at
+/// the width, and items sharing a line fill it before the next one starts.
+#[test]
+fn break_all_breaks_between_any_clusters() {
+    let _ahem = AhemGuard::new();
+    let container = |children: Vec<Component>| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(100.0),
+            word_break: w3cos_std::style::WordBreak::BreakAll,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        Component::boxed(style, children)
+    };
+    let leaf = |text: &str, weight: bool| {
+        let mut style = Style {
+            display: Display::Inline,
+            word_break: w3cos_std::style::WordBreak::BreakAll,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        if weight {
+            style.font_weight = 700;
+        }
+        Component::text(text, style)
+    };
+    // Sole leaf: 12 characters, 5 per line: three lines.
+    let root = container(vec![leaf("XXXXXXXXXXXX", false)]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    let block_rect = rects.iter().find(|(_, i)| *i == 0).expect("block").0;
+    assert_eq!(block_rect.height, 60.0);
+    // Two items: the second starts inside the first's last line.
+    let root = container(vec![leaf("XXXXXXXX", false), leaf("XXXX", true)]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    let block_rect = rects.iter().find(|(_, i)| *i == 0).expect("block").0;
+    assert_eq!(block_rect.height, 60.0);
+    let spans: Vec<(usize, usize, usize)> =
+        texts.iter().map(|t| (t.index, t.start, t.end)).collect();
+    assert_eq!(
+        spans,
+        vec![(1, 0, 5), (1, 5, 8), (2, 0, 2), (2, 2, 4)],
+        "{texts:?}"
+    );
+}
