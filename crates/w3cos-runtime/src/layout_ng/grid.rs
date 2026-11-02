@@ -3328,11 +3328,15 @@ fn distribute_flex(bases: &[i64], factors: &[f64], mut budget: i64) -> Vec<i64> 
         if factor_sum <= 0.0 || budget <= 0 {
             break;
         }
+        // CSS Grid 12.7.1: when the flex factors add up to less than one,
+        // each fr is worth `leftover / 1`, so the tracks leave the rest of
+        // the space to the stretched auto tracks.
+        let divisor = factor_sum.max(1.0);
         let mut violated = Vec::new();
         let mut raw = Vec::new();
         let mut used_raw = 0_i64;
         for &index in &unfrozen {
-            let share = ((budget as f64) * factors[index] / factor_sum).floor() as i64;
+            let share = ((budget as f64) * factors[index] / divisor).floor() as i64;
             raw.push((index, share));
             used_raw += share;
             if bases[index] > share {
@@ -3353,7 +3357,11 @@ fn distribute_flex(bases: &[i64], factors: &[f64], mut budget: i64) -> Vec<i64> 
             }
             continue;
         }
-        let mut leftover = budget - used_raw;
+        let mut leftover = if factor_sum < 1.0 {
+            0
+        } else {
+            budget - used_raw
+        };
         for &(index, share) in &raw {
             size[index] = share.max(bases[index]);
         }
@@ -6235,6 +6243,30 @@ mod tests {
                 (1, [0.0, 0.0, 100.0, 10.0]),
                 (2, [100.0, 0.0, 100.0, 10.0]),
                 (3, [0.0, 40.0, 100.0, 10.0]),
+            ],
+        );
+    }
+
+    #[test]
+    fn fr_sum_below_one_leaves_the_rest_to_stretched_auto_tracks() {
+        let mut container = grid_style(200.0, Some(300.0), Some("auto 0.25fr"));
+        container.grid_ng_mut().grid_template_rows = Some("0.2fr auto".to_string());
+        expect(
+            &Component::boxed(
+                container,
+                vec![
+                    leaf(block_box(None, None)),
+                    leaf(block_box(None, None)),
+                    leaf(block_box(None, None)),
+                    leaf(block_box(None, None)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 200.0, 300.0]),
+                (1, [0.0, 0.0, 150.0, 60.0]),
+                (2, [150.0, 0.0, 50.0, 60.0]),
+                (3, [0.0, 60.0, 150.0, 240.0]),
+                (4, [150.0, 60.0, 50.0, 240.0]),
             ],
         );
     }

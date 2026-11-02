@@ -5345,14 +5345,25 @@ fn decode_unhandled_numeric_character_references(input: &str) -> String {
     output
 }
 
+/// Finds the `>` that ends the markup starting at the beginning of `input`.
+/// In a start/end tag a quote only opens a value when it directly follows `=`
+/// (the HTML tokenizer's "before attribute value" state); a stray quote
+/// elsewhere in the tag is ordinary name text. Declarations (`<!...`, e.g. a
+/// DOCTYPE with an XML internal subset) and `<?...` keep quote-aware scanning.
 pub(crate) fn html_tag_end(input: &str) -> Option<usize> {
+    let any_quote = input.starts_with("<!") || input.starts_with("<?");
     let mut quote = None;
+    let mut previous = None;
     for (index, ch) in input.char_indices() {
         match (quote, ch) {
             (Some(active), current) if current == active => quote = None,
-            (None, '\'' | '"') => quote = Some(ch),
+            (Some(_), _) => {}
+            (None, '\'' | '"') if any_quote || previous == Some('=') => quote = Some(ch),
             (None, '>') => return Some(index),
             _ => {}
+        }
+        if quote.is_none() && !ch.is_whitespace() {
+            previous = Some(ch);
         }
     }
     None
@@ -23186,6 +23197,20 @@ pub fn reset_bridge() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn html_tag_end_treats_quote_outside_a_value_as_name_text() {
+        let tag = "div class=\"grid\"\" style=\"a: b\">text \"x\"";
+        assert_eq!(super::html_tag_end(tag), tag.find('>'));
+        let spaced = "a title = 'x>y' id=z>";
+        assert_eq!(super::html_tag_end(spaced), Some(spaced.len() - 1));
+        assert_eq!(super::html_tag_end("a title=\"x>y"), None);
+        let doctype = "<!DOCTYPE html [<!ENTITY t \"<b>x</b>\">]>rest";
+        assert_eq!(
+            super::html_tag_end(doctype),
+            doctype.find("\">").map(|i| i + 1)
+        );
+    }
+
     use super::*;
 
     fn surface_ok(document: &Value, parent: &Value, nodes: Option<&Value>) -> bool {

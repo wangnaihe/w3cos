@@ -1264,6 +1264,23 @@ impl StreamingDocumentParser {
                 continue;
             }
 
+            // The tokenizer only starts a tag at `<` followed by an ASCII
+            // alpha, `/`, `!` or `?`; any other `<` is literal text.
+            match self.buffer[1..].chars().next() {
+                None if !self.eof_received => return Ok(DocumentParseProgress::Advanced),
+                Some(next) if !(next.is_ascii_alphabetic() || matches!(next, '/' | '!' | '?')) => {
+                    self.buffer.drain(..1);
+                    self.append_text("<");
+                    continue;
+                }
+                None => {
+                    self.buffer.drain(..1);
+                    self.append_text("<");
+                    return self.complete_document();
+                }
+                _ => {}
+            }
+
             if self.buffer.starts_with("<!--") {
                 let Some(end) = self.buffer.find("-->") else {
                     if self.eof_received {
@@ -1571,6 +1588,28 @@ mod tests {
                 .get_property("textContent")
                 .to_js_string(),
             "head"
+        );
+    }
+
+    #[test]
+    fn less_than_only_starts_a_tag_before_alpha_slash_bang_or_question() {
+        let (document, _) = parse_document(
+            "<!doctype html><body><p id=t>1 < 2, don't 'x' <3 and <b>bold</b> end <</p><p id=u>tail <",
+        );
+
+        assert_eq!(
+            document
+                .call_method("getElementById", vec![Value::string("t")])
+                .get_property("textContent")
+                .to_js_string(),
+            "1 < 2, don't 'x' <3 and bold end <"
+        );
+        assert_eq!(
+            document
+                .call_method("getElementById", vec![Value::string("u")])
+                .get_property("textContent")
+                .to_js_string(),
+            "tail <"
         );
     }
 
