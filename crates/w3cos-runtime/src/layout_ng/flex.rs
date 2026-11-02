@@ -506,6 +506,12 @@ pub(super) fn intrinsic_sizes(
     let style = flat[index].style;
     let row = row_axis(style.flex_direction);
     let wrap = style.flex_wrap != FlexWrap::NoWrap;
+    if !row
+        && wrap
+        && let Some(sum) = column_wrap_lines_width(flat, index, space)
+    {
+        return Some(MinMax::exact(sum));
+    }
     let mut sizes = MinMax::exact(0.0);
     let mut count = 0usize;
     for child in rendered_children(flat, index) {
@@ -539,6 +545,68 @@ pub(super) fn intrinsic_sizes(
         }
     }
     Some(sizes)
+}
+
+/// Inline size of a column wrap container with a definite block size: the
+/// sum of the line widths plus the gaps between lines (Blink
+/// FlexLayoutAlgorithm::ComputeMinMaxSizes lays a multi-line column out
+/// instead of taking the widest item). Lines break on the hypothetical outer
+/// main sizes against the inner block size; each line is as wide as its
+/// widest item's max-content margin box. `None` when the block size, or any
+/// item's main size, is not a definite length, so the caller keeps the
+/// widest-item size (one line).
+fn column_wrap_lines_width(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<f32> {
+    let style = flat[index].style;
+    let container = definite(style.height, None, style, space).flatten()?;
+    let inner = to_content(style, item_edges(style, space, 0.0, false), container);
+    let main_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
+    let cross_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
+    let mut lines: Vec<f32> = Vec::new();
+    let mut used = 0.0f32;
+    let mut width = 0.0f32;
+    let mut in_line = 0usize;
+    for child in rendered_children(flat, index) {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) || child_style.float != Float::None {
+            continue;
+        }
+        let basis = match child_style.flex_basis {
+            Dimension::Auto => child_style.height,
+            other => other,
+        };
+        let size = definite(basis, None, child_style, space).flatten()?;
+        let edges = item_edges(child_style, space, 0.0, false);
+        let mut content = to_content(child_style, edges, size);
+        if let Some(max) = definite(child_style.max_height, None, child_style, space).flatten() {
+            content = content.min(to_content(child_style, edges, max));
+        }
+        if let Some(min) = definite(child_style.min_height, None, child_style, space).flatten() {
+            content = content.max(to_content(child_style, edges, min));
+        }
+        let outer = content
+            + edges
+            + spacing_px(child_style, child_style.margin.top, 0.0, space)
+            + spacing_px(child_style, child_style.margin.bottom, 0.0, space);
+        let contribution = inline_contribution(flat, child, space)?.max;
+        if in_line > 0 && used + main_gap + outer > inner + EPS {
+            lines.push(width);
+            used = 0.0;
+            width = 0.0;
+            in_line = 0;
+        }
+        used += if in_line > 0 { main_gap } else { 0.0 } + outer;
+        width = width.max(contribution);
+        in_line += 1;
+    }
+    if in_line == 0 {
+        return None;
+    }
+    lines.push(width);
+    Some(lines.iter().sum::<f32>() + cross_gap * (lines.len() - 1) as f32)
 }
 
 /// Fit-content inline size of a column item (CSS Sizing 3 §5.2.1):
@@ -855,6 +923,18 @@ fn snap_to_inner(items: &mut [Item], inner: f32, gap_sum: f32) {
     let edges =
         items[last].margin_main_start + items[last].margin_main_end + items[last].main_edges;
     items[last].content = unit((inner - used - edges).max(items[last].min));
+}
+
+/// `justify-content: safe <position>` on an overflowing line aligns as
+/// `start` (CSS Align 3 §4.4), the physical start of the container's writing
+/// mode: the left edge or top edge even for a reversed main axis.
+fn safe_overflow_start(style: &Style, free: f32) -> bool {
+    free < -EPS
+        && style
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get("--w3cos-internal-justify-content"))
+            .is_some_and(|value| value.split_whitespace().any(|token| token == "safe"))
 }
 
 fn justify(kind: JustifyContent, free: f32, count: usize) -> (f32, f32) {
@@ -1355,6 +1435,9 @@ pub(super) fn layout(
     if reverse {
         lead = main_inner - lead;
     }
+    if safe_overflow_start(style, free) {
+        lead = if reverse { main_inner - free } else { 0.0 };
+    }
     let mut cursor = lead;
     let mut children = Vec::with_capacity(items.len());
     let mut oof = Vec::new();
@@ -1691,6 +1774,9 @@ fn layout_wrapped(
         let (mut lead, between) = justify(style.justify_content, free, line.len());
         if reverse {
             lead = inner_main - lead;
+        }
+        if safe_overflow_start(style, free) {
+            lead = if reverse { inner_main - free } else { 0.0 };
         }
         let mut cursor = lead;
         for item in line.iter() {
@@ -3359,5 +3445,63 @@ mod tests {
             ),
             &[(0, [0.0, 0.0, 125.0, 100.0]), (1, [0.0, 0.0, 100.0, 100.0])],
         );
+    }
+
+    fn safe_justify(direction: FlexDirection, safe: bool) -> Style {
+        let mut container = flex_style(direction, 90.0, Some(90.0));
+        if safe {
+            container.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+                "--w3cos-internal-justify-content".to_string(),
+                "safe flex-start".to_string(),
+            )]));
+        }
+        container
+    }
+
+    #[test]
+    fn safe_justify_content_aligns_an_overflowing_reverse_line_at_the_start() {
+        // flexbox-safe-overflow-position-003/-004 (headless Chrome passes
+        // both): `justify-content: safe flex-start` on a reversed main axis
+        // with a 100px item in a 90px container aligns as `start`, the
+        // physical left or top edge, so the item overflows right or bottom.
+        // Without `safe`, flex-start is the right or bottom edge and the
+        // item overflows left or up.
+        let item = || vec![leaf(fixed_item(100.0, 100.0))];
+        expect(
+            &Component::boxed(safe_justify(FlexDirection::RowReverse, true), item()),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+        expect(
+            &Component::boxed(safe_justify(FlexDirection::ColumnReverse, true), item()),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [0.0, 0.0, 100.0, 100.0])],
+        );
+        expect(
+            &Component::boxed(safe_justify(FlexDirection::RowReverse, false), item()),
+            &[(0, [0.0, 0.0, 90.0, 90.0]), (1, [-10.0, 0.0, 100.0, 100.0])],
+        );
+    }
+
+    #[test]
+    fn column_wrap_max_content_width_sums_the_lines() {
+        // col-wrap-001/-013/-020 (headless Chrome): a column wrap with a
+        // definite 100px height and two 100px items is two lines, so its
+        // max-content width is the sum of the line widths plus the column
+        // gap, not the widest item.
+        let nested = |gap: f32, widths: [f32; 2]| {
+            let mut inner = column_flow(FlexDirection::Column, FlexWrap::Wrap, 0.0, 100.0);
+            inner.width = Dimension::Auto;
+            inner.column_gap = Some(gap);
+            let items = widths.iter().map(|w| leaf(column_box(*w, 100.0))).collect();
+            Component::boxed(
+                flex_style(FlexDirection::Row, 400.0, Some(100.0)),
+                vec![Component::boxed(inner, items)],
+            )
+        };
+        let out = lay(&nested(0.0, [50.0, 50.0]));
+        assert_eq!(rect(&out, 1)[2], 100.0);
+        let out = lay(&nested(0.0, [30.0, 70.0]));
+        assert_eq!(rect(&out, 1)[2], 100.0);
+        let out = lay(&nested(80.0, [10.0, 10.0]));
+        assert_eq!(rect(&out, 1)[2], 100.0);
     }
 }
