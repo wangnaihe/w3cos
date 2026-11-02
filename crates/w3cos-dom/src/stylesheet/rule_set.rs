@@ -45,8 +45,11 @@ impl FollowingReach {
     /// `:last-of-type` / `:only-of-type`: only the last earlier sibling of the
     /// appended element's type can change.
     const PREVIOUS_OF_TYPE: Self = Self(2);
-    /// `:nth-last-*`, `:has(+ x)`: any sibling can change.
+    /// `:nth-last-*`, `~`-based `:has()`: any sibling can change.
     const ANY: Self = Self(4);
+    /// `:nth-last-child(k)` / `:nth-last-of-type(k)` with a constant `k`:
+    /// only the last `k` earlier siblings (of the appended type) can change.
+    const WINDOW: Self = Self(8);
 
     fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -54,6 +57,67 @@ impl FollowingReach {
 
     fn contains(self, other: Self) -> bool {
         self.0 & other.0 != 0
+    }
+}
+
+/// `FollowingReach` plus the window sizes of `FollowingReach::WINDOW`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Following {
+    reach: FollowingReach,
+    window_child: usize,
+    window_type: usize,
+}
+
+impl Following {
+    fn union(self, other: Self) -> Self {
+        Self {
+            reach: self.reach.union(other.reach),
+            window_child: self.window_child.max(other.window_child),
+            window_type: self.window_type.max(other.window_type),
+        }
+    }
+
+    /// What a compound right of `+`/`~` inherits from the compound on its
+    /// left: the right one can sit anywhere after the left one, so only a
+    /// dependency on the previous last element stays that narrow.
+    fn through_sibling_combinator(self) -> Self {
+        let reach = if self.reach.0 & !FollowingReach::PREVIOUS_LAST.0 == 0 {
+            self.reach
+        } else {
+            FollowingReach::ANY
+        };
+        Self {
+            reach,
+            ..Self::default()
+        }
+    }
+}
+
+/// Where a sibling sits relative to a tail append.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FollowingPosition {
+    /// It was the last element before the append.
+    pub(crate) last: bool,
+    /// It was the last element of the appended type before the append.
+    pub(crate) of_type: bool,
+    /// Elements from the end, 1 for the last earlier element.
+    pub(crate) distance: usize,
+    /// The same counted over the appended type; `usize::MAX` for other types.
+    pub(crate) type_distance: usize,
+}
+
+/// Which earlier siblings a tail append has to visit.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FollowingScan {
+    /// Some rule can change on any earlier sibling.
+    pub(crate) all: bool,
+    pub(crate) window_child: usize,
+    pub(crate) window_type: usize,
+}
+
+impl FollowingScan {
+    pub(crate) fn needed(&self) -> bool {
+        self.all || self.window_child > 0 || self.window_type > 0
     }
 }
 
@@ -72,6 +136,12 @@ struct PositionalAnchor {
     /// `FollowingReach`. Every anchor that counts only preceding siblings is
     /// unaffected by a tail append.
     following: FollowingReach,
+    /// For `FollowingReach::WINDOW`: the farthest earlier element, counted
+    /// from the end over all siblings, that `:nth-last-child(k)` can flip.
+    window_child: usize,
+    /// The same counted over siblings of the appended element's type
+    /// (`:nth-last-of-type(k)`).
+    window_type: usize,
     /// The compound counts siblings by their own attributes
     /// (`:nth-child(An+B of S)`), so a class change on any sibling, before or
     /// after it, can change its result.
@@ -332,12 +402,22 @@ impl RuleSet {
         let rule = &self.rules[index];
         let mut anchors = Vec::new();
         let mut empty = Vec::new();
-        let following = rule
-            .chain
-            .iter()
-            .flat_map(|compound| compound.pseudo_classes.iter())
-            .map(pseudo_following_reach)
-            .fold(FollowingReach::NONE, FollowingReach::union);
+        // A compound's result depends on the siblings after it through its own
+        // pseudo-classes, and a compound right of `+`/`~` also through the
+        // compounds to its left.
+        let mut following_by_position: Vec<Following> = Vec::new();
+        for (position, compound) in rule.chain.iter().enumerate() {
+            let mut own = compound_following(compound);
+            if position > 0
+                && matches!(
+                    rule.combinators[position - 1],
+                    super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
+                )
+            {
+                own = own.union(following_by_position[position - 1].through_sibling_combinator());
+            }
+            following_by_position.push(own);
+        }
         for (position, compound) in rule.chain.iter().enumerate() {
             let sibling_combinator = position > 0
                 && matches!(
@@ -368,11 +448,14 @@ impl RuleSet {
                     parent.pseudo_classes.clear();
                     parent
                 });
+                let following = following_by_position[position];
                 anchors.push(PositionalAnchor {
                     subject,
                     parent,
                     sibling_rhs,
-                    following,
+                    following: following.reach,
+                    window_child: following.window_child,
+                    window_type: following.window_type,
                     sibling_any,
                 });
             }
@@ -391,14 +474,16 @@ impl RuleSet {
         &self,
         ctx: &SelectorContext,
         parent: &SelectorContext,
-        previous_last: bool,
-        previous_of_type: bool,
+        previous: FollowingPosition,
     ) -> bool {
         self.positional_anchors.iter().any(|anchor| {
             let reach = anchor.following;
             let reaches = reach.contains(FollowingReach::ANY)
-                || (previous_last && reach.contains(FollowingReach::PREVIOUS_LAST))
-                || (previous_of_type && reach.contains(FollowingReach::PREVIOUS_OF_TYPE));
+                || (previous.last && reach.contains(FollowingReach::PREVIOUS_LAST))
+                || (previous.of_type && reach.contains(FollowingReach::PREVIOUS_OF_TYPE))
+                || (reach.contains(FollowingReach::WINDOW)
+                    && (previous.distance <= anchor.window_child
+                        || previous.type_distance <= anchor.window_type));
             reaches
                 && anchor.subject.matches(ctx)
                 && anchor
@@ -408,11 +493,26 @@ impl RuleSet {
         })
     }
 
-    /// Whether some rule reads following siblings of any child of `parent`
-    /// (`:nth-last-child`, ...), so a tail append has to look at every child
-    /// instead of only the previous last one.
-    pub(super) fn following_scan_needed(&self, parent: &SelectorContext) -> bool {
-        self.following_reach_needed(parent, FollowingReach::ANY)
+    /// How a tail append has to look at the siblings under `parent`.
+    pub(super) fn following_scan(&self, parent: &SelectorContext) -> FollowingScan {
+        let mut scan = FollowingScan::default();
+        for anchor in &self.positional_anchors {
+            if anchor
+                .parent
+                .as_ref()
+                .is_some_and(|compound| !compound.matches(parent))
+            {
+                continue;
+            }
+            if anchor.following.contains(FollowingReach::ANY) {
+                scan.all = true;
+            }
+            if anchor.following.contains(FollowingReach::WINDOW) {
+                scan.window_child = scan.window_child.max(anchor.window_child);
+                scan.window_type = scan.window_type.max(anchor.window_type);
+            }
+        }
+        scan
     }
 
     /// Whether some rule under `parent` reads the last earlier sibling of the
@@ -616,32 +716,79 @@ fn pseudo_nests_position(pseudo: &super::PseudoClass) -> bool {
     })
 }
 
-/// How far the compound's result depends on siblings after it. Selector lists
-/// are scanned as text and stay conservative.
-fn pseudo_following_reach(pseudo: &super::PseudoClass) -> FollowingReach {
+/// How far the compound's result depends on siblings after it.
+fn compound_following(compound: &super::CompoundSelector) -> Following {
+    compound
+        .pseudo_classes
+        .iter()
+        .map(pseudo_following)
+        .fold(Following::default(), Following::union)
+}
+
+/// `:nth-last-*(k)` with a constant `k` (no `n`, no `of S`).
+fn constant_nth(expression: &str) -> Option<usize> {
+    if super::split_nth_of_selector(expression).1.is_some() {
+        return None;
+    }
+    match super::parse_an_plus_b(expression)? {
+        (0, b) => Some(b.clamp(0, 1 << 20) as usize),
+        _ => None,
+    }
+}
+
+/// `:has(+ x)` only changes on the element just before an appended one; every
+/// other relative sibling combinator (`~`, `+ a + b`) reaches further back.
+fn has_following_reach(selector: &str) -> FollowingReach {
+    if !selector.contains('~') && selector.matches('+').count() == 1 {
+        FollowingReach::PREVIOUS_LAST
+    } else {
+        FollowingReach::ANY
+    }
+}
+
+fn pseudo_following(pseudo: &super::PseudoClass) -> Following {
+    let reach = |reach| Following {
+        reach,
+        ..Following::default()
+    };
     match pseudo {
         super::PseudoClass::LastChild | super::PseudoClass::OnlyChild => {
-            FollowingReach::PREVIOUS_LAST
+            reach(FollowingReach::PREVIOUS_LAST)
         }
         super::PseudoClass::LastOfType | super::PseudoClass::OnlyOfType => {
-            FollowingReach::PREVIOUS_OF_TYPE
+            reach(FollowingReach::PREVIOUS_OF_TYPE)
         }
-        super::PseudoClass::NthLastChild(_) | super::PseudoClass::NthLastOfType(_) => {
-            FollowingReach::ANY
+        super::PseudoClass::NthLastChild(expression) => match constant_nth(expression) {
+            Some(k) => Following {
+                reach: FollowingReach::WINDOW,
+                window_child: k,
+                window_type: 0,
+            },
+            None => reach(FollowingReach::ANY),
+        },
+        super::PseudoClass::NthLastOfType(expression) => match constant_nth(expression) {
+            Some(k) => Following {
+                reach: FollowingReach::WINDOW,
+                window_child: 0,
+                window_type: k,
+            },
+            None => reach(FollowingReach::ANY),
+        },
+        super::PseudoClass::Has(selector) if selector.contains('+') || selector.contains('~') => {
+            reach(has_following_reach(selector))
         }
-        _ if pseudo_has_sibling_scoped_relational(pseudo) => FollowingReach::ANY,
         _ => match selector_list_argument(pseudo) {
-            Some(selector) => selector_list_following_reach(&selector),
-            None => FollowingReach::NONE,
+            Some(selector) => reach(selector_list_following_reach(&selector)),
+            None => Following::default(),
         },
     }
 }
 
 fn selector_list_following_reach(selector: &str) -> FollowingReach {
-    if selector.contains(":has(") && (selector.contains('+') || selector.contains('~')) {
-        return FollowingReach::ANY;
-    }
     let mut reach = FollowingReach::NONE;
+    if selector.contains(":has(") && (selector.contains('+') || selector.contains('~')) {
+        reach = has_following_reach(selector);
+    }
     let mut rest = selector.to_string();
     for (needle, found) in [
         (":last-child", FollowingReach::PREVIOUS_LAST),
