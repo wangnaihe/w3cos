@@ -211,18 +211,28 @@ fn pack_keyword(keyword: &str, rtl: bool) -> Pack {
 /// vertical writing mode, grid-container items (whose baseline this engine
 /// does not export for a block grid), or auto margins in the block axis.
 fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
+    // A definite height, or an auto height over implicit tracks only: the
+    // auto-height forms with authored templates stay on legacy until the
+    // paired subgrid and grid-lanes baseline tests run on NG as well. Their
+    // references are plain templated grids that legacy renders wrongly, in
+    // the same way as the (legacy) test, so lifting the restriction turns
+    // those accidental passes into failures (subgrid-baseline-003/004,
+    // grid-lanes-baseline-alignment-affects-intrinsic-size-002,
+    // row-grid-lanes-item-baseline-003).
+    let style = flat[container].style;
+    (matches!(style.height, Dimension::Px(_))
+        || (columns_spec(style).is_none() && style.grid_rows().is_none()))
+        && baseline_shape_supported(flat, container, child)
+}
+
+fn baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
     use w3cos_std::style::WritingMode;
     let style = flat[container].style;
     let child_style = flat[child].style;
     let subgrid = |spec: Option<&str>| {
         spec.is_some_and(|text| text.contains("subgrid") || text.contains("masonry"))
     };
-    // A definite height only: the auto-height forms (intrinsic row sizes
-    // and the container's own baseline) stay on legacy until the paired
-    // subgrid and grid-lanes baseline tests (whose legacy output matches a
-    // legacy reference) run on NG as well.
     style.writing_mode == WritingMode::HorizontalTb
-        && matches!(style.height, Dimension::Px(_))
         && child_style.writing_mode == WritingMode::HorizontalTb
         && !has_marker(style, "--w3cos-internal-grid-lanes")
         && marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid")
@@ -234,6 +244,62 @@ fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
         && !matches!(child_style.margin.top, Spacing::Auto)
         && !matches!(child_style.margin.bottom, Spacing::Auto)
         && !percent_height(child_style)
+}
+
+/// Inline-axis (`justify-*: baseline`) alignment in a horizontal grid whose
+/// items are horizontal too: the synthesized inline-axis baseline is the
+/// item's start margin edge, so an item alone in its column baseline group
+/// sits at the start of its area. Shared groups bail where they are built.
+fn inline_baseline_container_ok(style: &Style) -> bool {
+    use w3cos_std::style::WritingMode;
+    style.writing_mode == WritingMode::HorizontalTb
+        && !has_marker(style, "--w3cos-internal-grid-lanes")
+        && marker(style, "--w3cos-internal-unrecognized-display") != Some("inline-grid")
+}
+
+/// The static-position alignment of an abspos grid child whose authored
+/// `align-self` / `justify-self` keyword the enums fold away: `self-start`,
+/// `self-end`, `left`, `right` and the `last baseline` forms (a box with
+/// no sharing group falls back to `end`, a `first baseline` to `start`).
+/// Only for a child in the container's own writing mode.
+fn abspos_keyword_pack(container: &Style, child: &Style, block: bool, rtl: bool) -> Option<Pack> {
+    // The transposed vertical path patches its own markers.
+    if child.writing_mode != container.writing_mode
+        || container.writing_mode != w3cos_std::style::WritingMode::HorizontalTb
+    {
+        return None;
+    }
+    let key = if block {
+        "--w3cos-internal-align-self"
+    } else {
+        "--w3cos-internal-justify-self"
+    };
+    let keyword = marker(child, key)?;
+    let child_rtl = child.direction == TextDirection::Rtl;
+    if keyword.contains("baseline") {
+        return Some(if keyword.contains("last") {
+            Pack::End
+        } else {
+            Pack::Start
+        });
+    }
+    match keyword {
+        "self-start" if block => Some(Pack::Start),
+        "self-end" if block => Some(Pack::End),
+        "self-start" => Some(if child_rtl == rtl {
+            Pack::Start
+        } else {
+            Pack::End
+        }),
+        "self-end" => Some(if child_rtl == rtl {
+            Pack::End
+        } else {
+            Pack::Start
+        }),
+        "left" if !block => Some(if rtl { Pack::End } else { Pack::Start }),
+        "right" if !block => Some(if rtl { Pack::Start } else { Pack::End }),
+        _ => None,
+    }
 }
 
 fn used_item_align(container: AlignItems, item: AlignSelf) -> AlignItems {
@@ -316,7 +382,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some("grid:areas");
     }
-    if is_baseline(style.justify_items) {
+    if is_baseline(style.justify_items) && !inline_baseline_container_ok(style) {
         return Some("grid:baseline");
     }
     if let Some(reason) = subgrid_or_template(flat, index, false) {
@@ -430,7 +496,9 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if is_baseline(used_item_align(
             style.justify_items,
             child_style.justify_self,
-        )) {
+        )) && !(inline_baseline_container_ok(style)
+            && baseline_shape_supported(flat, index, child))
+        {
             return Some("grid:baseline");
         }
         if block_baseline(style, child_style).is_some()
@@ -4737,6 +4805,19 @@ fn layout_impl(
         // stretch); only the plain `baseline` forms fall back there.
         let baseline = block_baseline(style, child_style)
             .filter(|_| block_baseline_supported(flat, index, item.index));
+        if is_baseline(used_item_align(
+            style.justify_items,
+            child_style.justify_self,
+        )) && items.iter().any(|other| {
+            other.index != item.index
+                && other.col == item.col
+                && is_baseline(used_item_align(
+                    style.justify_items,
+                    flat[other.index].style.justify_self,
+                ))
+        }) {
+            return super::bail("grid:baseline-column");
+        }
         if baseline.is_some() {
             if item.row_span != 1 {
                 return super::bail("grid:baseline-span");
@@ -5385,11 +5466,15 @@ fn layout_impl(
                 row_y.get(row_index).copied().unwrap_or(0),
             )
         };
-        let justify = align_pack(used_item_align(
-            style.justify_items,
-            child_style.justify_self,
-        ));
-        let align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        let justify = abspos_keyword_pack(style, child_style, false, rtl).unwrap_or_else(|| {
+            align_pack(used_item_align(
+                style.justify_items,
+                child_style.justify_self,
+            ))
+        });
+        let align = abspos_keyword_pack(style, child_style, true, rtl).unwrap_or_else(|| {
+            align_pack(used_item_align(style.align_items, child_style.align_self))
+        });
         let border_w = definite_border(
             child_style,
             false,
@@ -7254,6 +7339,40 @@ mod tests {
             },
             vec![Component::boxed(style, vec![leaf(abs)])],
         )
+    }
+
+    #[test]
+    fn horizontal_abspos_static_position_follows_authored_alignment_keywords() {
+        use w3cos_std::style::WritingMode::HorizontalTb;
+        // Chrome (grid-abspos-staticpos-align-self-last-baseline-001): the
+        // enums fold `last baseline` into `stretch`/`auto`; the authored
+        // keyword marker sends the static position to the area's end edge.
+        let build = |keyword: Option<&str>| {
+            let mut grid = vertical_abspos_grid(HorizontalTb, Position::Relative, AlignSelf::Auto);
+            if let Some(keyword) = keyword {
+                grid.children[0].children[0]
+                    .style
+                    .custom_properties
+                    .as_mut()
+                    .unwrap()
+                    .insert(
+                        "--w3cos-internal-align-self".to_string(),
+                        keyword.to_string(),
+                    );
+            }
+            grid
+        };
+        let top = |grid: &Component| rect(&lay(grid), 2)[1];
+        let start = top(&build(Some("first baseline")));
+        let end = top(&build(Some("last baseline")));
+        let self_end = top(&build(Some("self-end")));
+        let self_start = top(&build(Some("self-start")));
+        assert!(
+            end > start,
+            "last baseline sits below the first: {start} {end}"
+        );
+        assert_eq!(end, self_end);
+        assert_eq!(start, self_start);
     }
 
     #[test]
