@@ -18,9 +18,9 @@ def case(name, template, items, **container):
     return {"name": name, "container": {"template": template, **container}, "items": items}
 
 
-def it(id, h=None, w=None, text=None, place=None, order=None, margin=None, self_=None):
+def it(id, h=None, w=None, text=None, place=None, order=None, margin=None, self_=None, abs=None, min_w=None):
     d = {"id": id}
-    for k, v in (("h", h), ("w", w), ("text", text), ("place", place), ("order", order), ("margin", margin), ("self", self_)):
+    for k, v in (("min_w", min_w), ("abs", abs), ("h", h), ("w", w), ("text", text), ("place", place), ("order", order), ("margin", margin), ("self", self_)):
         if v is not None:
             d[k] = v
     return d
@@ -144,6 +144,100 @@ def dense_cases():
 CASES += dense_cases()
 
 
+def intrinsic_repeat_cases():
+    t = [it("a", text="XXXX"), it("b", text="XX", place="span 2"), it("c", text="XXX"), it("d", text="XXXXXX", place="span 2"), it("e", text="X")]
+    return [
+        case("ir-fill-auto", "repeat(auto-fill, auto)", t),
+        case("ir-fill-auto-fixed", "repeat(auto-fill, auto 20px)", t),
+        case("ir-fill-minmax-auto", "repeat(auto-fill, minmax(auto, 40px))", t),
+        case("ir-fit-auto", "repeat(auto-fit, auto)", t, width=300),
+        case("ir-fit-fixed", "repeat(auto-fit, minmax(30px, 1fr))", [it("a", h=10), it("b", h=20)]),
+        case("ir-fit-fixed-fill", "repeat(auto-fill, minmax(30px, 1fr))", [it("a", h=10), it("b", h=20)]),
+        case("ir-fit-span", "repeat(auto-fit, minmax(30px, 1fr))", [it("a", h=10), it("b", h=20, place="span 2"), it("c", h=15)]),
+        case("ir-fit-rows", "repeat(auto-fit, auto)", [it("a", text="XX", w=20), it("b", text="XXXX", w=30), it("c", w=10, h=20)], axis="row", height=100),
+        case("ir-fill-rows-indef", "repeat(auto-fill, 20px)", [it("a", w=10, h=10), it("b", w=20, h=10)], axis="row", height=90),
+    ]
+
+
+CASES += intrinsic_repeat_cases()
+
+
+def oof_cases():
+    base = [it("a", h=20), it("b", h=30), it("c", h=10)]
+    out = []
+    for pos in ("relative", "static"):
+        tag = pos[:3]
+        out += [
+            case(f"oof-{tag}-col-auto", "50px 50px", base + [it("o", w=10, h=10, abs={})], position=pos),
+            case(f"oof-{tag}-col-place", "50px 50px", base + [it("o", w=10, h=10, place="2", abs={})], position=pos),
+            case(f"oof-{tag}-col-inset", "50px 50px", base + [it("o", place="2", abs={"left": 5, "top": 5, "right": 5, "bottom": 5})], position=pos),
+            case(f"oof-{tag}-col-span", "50px 50px 50px", base + [it("o", w=10, h=10, place="2 / span 2", abs={"left": 0, "top": 0})], position=pos),
+            case(f"oof-{tag}-col-fillrev", "50px 50px", base + [it("o", w=10, h=10, abs={})], axis="column fill-reverse", position=pos),
+            case(f"oof-{tag}-col-fillrev-h", "50px 50px", base + [it("o", w=10, h=10, abs={})], axis="column fill-reverse", height=100, position=pos),
+            case(f"oof-{tag}-col-only", "50px 50px", [it("o", w=10, h=10, abs={})], position=pos),
+            case(f"oof-{tag}-col-gap", "50px 50px", base + [it("o", w=10, h=10, place="2", abs={"left": 2, "top": 2})], gap=[4, 6], position=pos),
+            case(f"oof-{tag}-col-order", "40px 40px", [it("o", w=10, h=10, abs={}), it("a", h=20), it("b", h=15)], position=pos),
+            case(f"oof-{tag}-row-auto", "30px 30px", [it(x, w=w, h=10) for x, w in zip("abc", [60, 40, 50])] + [it("o", w=10, h=10, abs={})], axis="row", position=pos),
+            case(f"oof-{tag}-row-place", "30px 30px", [it(x, w=w, h=10) for x, w in zip("abc", [60, 40, 50])] + [it("o", w=10, h=10, place="2", abs={})], axis="row", position=pos),
+            case(f"oof-{tag}-row-inset", "30px 30px", [it(x, w=w, h=10) for x, w in zip("abc", [60, 40, 50])] + [it("o", place="2", abs={"left": 3, "top": 3, "right": 3, "bottom": 3})], axis="row", position=pos),
+            case(f"oof-{tag}-row-fillrev", "30px 30px", [it(x, w=w, h=10) for x, w in zip("abc", [60, 40, 50])] + [it("o", w=10, h=10, abs={})], axis="row fill-reverse", position=pos),
+            case(f"oof-{tag}-row-h", "30px 30px", [it(x, w=w, h=10) for x, w in zip("abc", [60, 40, 50])] + [it("o", w=10, h=10, place="2", abs={})], axis="row", height=100, position=pos),
+        ]
+    for name, tmpl in (("mc", "minmax(0px, min-content) 5px"), ("xc", "5px minmax(0px, max-content)"), ("mm", "minmax(0px, min-content) 5% minmax(0px, max-content)")):
+        n = tmpl.count(" ") - tmpl.count(", ") + 1
+        out.append(case(f"oof-rel-span-{name}", tmpl, [it("a", text="XXXX XXXX", place="1 / -1")] + [it(f"o{i}", w=5, h=5, place=str(i), abs={}) for i in range(1, n + 1)]))
+    for mw in (15, 55):
+        out.append(case(f"oof-rel-span-minw{mw}", "minmax(0px, min-content) 5px", [it("a", text="XXXX XXXX", place="1 / -1", min_w=mw)] + [it(f"o{i}", w=5, h=5, place=str(i), abs={}) for i in (1, 2)], justify="start", width=100))
+    out.append(case("oof-rel-span-area", "minmax(0px, min-content) 5px", [it("a", text="XXXX XXXX", place="1 / -1", min_w=15)] + [it(f"o{i}", place=f"{i} / {i + 1}", abs={"left": 0, "right": 0, "top": 0, "bottom": 0}) for i in (1, 2)], justify="start", width=100, pad=10))
+    out.append(case("oof-rel-span-pct", "minmax(0px, min-content) 5px", [it("a", text="XXXX XXXX", place="1 / -1", min_w=15)] + [it(f"o{i}", place=f"{i} / {i + 1}", abs={"width": "100%", "height": "5px"}) for i in (1, 2)], justify="start", width=100, pad=10))
+    out.append(case("oof-rel-span-pcth", "minmax(0px, min-content) 5px", [it("a", text="XXXX XXXX", h=20, place="1 / -1", min_w=15)] + [it(f"o{i}", place=f"{i} / {i + 1}", abs={"width": "100%", "height": "5px"}) for i in (1, 2)], justify="start", width=100, pad=10, height=20))
+    for nm, mw in (("15", 15), ("55", 55)):  # fit-content tracks bail (oof)
+        out.append(case("oof-rel-span-fitautonoabs" + nm, "fit-content(100px) 5px minmax(0px, auto)", [it("a", text="XXXX XXXX", h=20, place="1 / -1", min_w=mw)], justify="start", width=100, pad=10, height=20))
+    # Insets against the initial containing block depend on the headless
+    # window size, so only the relative container has them.
+    return [c for c in out if not (c['name'].startswith('oof-sta-') and c['name'].endswith('-inset'))]
+
+
+CASES += oof_cases()
+
+
+def kw_cases():
+    out = []
+    for kw in ("min-content", "max-content", "fit-content"):
+        n = kw.split("-")[0]
+        txt = [it("a", text="XX XX"), it("b", text="XXXX X"), it("c", text="XXX"), it("d", text="X XX XXX")]
+        out.append(case(f"kw-{n}-auto", "auto auto", txt, kw=kw))
+        out.append(case(f"kw-{n}-auto3", "auto auto auto", txt, kw=kw, gap=[0, 7]))
+        out.append(case(f"kw-{n}-mixed", "30px auto minmax(10px, 1fr)", txt, kw=kw))
+        out.append(case(f"kw-{n}-fr", "1fr 2fr", txt, kw=kw))
+        out.append(case(f"kw-{n}-minmax", "minmax(20px, auto) minmax(auto, 50px)", txt, kw=kw))
+        out.append(case(f"kw-{n}-span", "auto auto auto", [it("a", text="XX XX"), it("b", text="XXXXXXXX XX", place="span 2"), it("c", text="XXX"), it("d", text="X XX XXX", place="1 / -1")], kw=kw))
+        out.append(case(f"kw-{n}-explicit", "auto auto auto", [it("a", text="XX XX", place="3"), it("b", text="XXXX X"), it("c", text="XXX", place="2")], kw=kw))
+        out.append(case(f"kw-{n}-pad", "auto auto", txt, kw=kw, pad=6))
+        out.append(case(f"kw-{n}-minw", "auto auto", [it("a", text="XX XX", min_w=45), it("b", text="XXXX X"), it("c", text="XX", w=15)], kw=kw))
+    return out
+
+
+CASES += kw_cases()
+
+
+def content_cases():
+    out = []
+    for axis in (None, "column fill-reverse", "row", "row fill-reverse"):
+        rows = axis is not None and axis.startswith("row")
+        nm = (axis or "col").replace(" ", "-")
+        for content in ("start", "center", "end", "space-between", "space-around", "space-evenly", "normal"):
+            items = [it("a", h=26), it("b", h=26), it("c", h=26), it("d", h=26)] if not rows else [it("a", w=26, h=20), it("b", w=26, h=30), it("c", w=26, h=20), it("d", w=26, h=10)]
+            tmpl = "80px 80px" if not rows else "40px 40px"
+            kw = {"axis": axis} if axis else {}
+            out.append(case(f"content-{nm}-{content}", tmpl, items, content=content, height=180, width=200, gap=[4, 4], **kw))
+            out.append(case(f"content-{nm}-{content}-auto", tmpl, items, content=content, width=200, gap=[4, 4], **kw))
+    return out
+
+
+CASES += content_cases()
+
+
 def html(c):
     k = c["container"]
     # The axis follows the template that is set, or the direction keyword.
@@ -155,13 +249,20 @@ def html(c):
         style.append(f"grid-lanes-direction:{k['axis']}")
     if k.get("align"):
         style.append(f"{'justify-items' if rows_axis else 'align-items'}:{k['align']}")
+    if k.get("justify"):
+        style.append(f"{'align-items' if rows_axis else 'justify-items'}:{k['justify']}")
+    if k.get("content"):
+        style.append(f"{'justify-content' if rows_axis else 'align-content'}:{k['content']}")
+    if k.get("pad"):
+        style.append(f"padding-top:{k['pad']}px;border:2px solid")
     if k.get("tolerance"):
         style.append(f"flow-tolerance:{k['tolerance']}")
     if k.get("pack"):
         style.append(f"{k['pack']}")
     if k.get("gap"):
         style.append(f"row-gap:{k['gap'][0]}px;column-gap:{k['gap'][1]}px")
-    style.append(f"width:{k.get('width', 200)}px")
+    style.append(f"width:{k['kw']}" if k.get("kw") else f"width:{k.get('width', 200)}px")
+    pos = k.get('position', 'relative')
     if k.get("height"):
         style.append(f"height:{k['height']}px")
     kids = []
@@ -171,16 +272,21 @@ def html(c):
             s.append(f"width:{i['w']}px")
         if "h" in i:
             s.append(f"height:{i['h']}px")
+        if "min_w" in i:
+            s.append(f"min-width:{i['min_w']}px")
         if "place" in i:
             s.append(f"{'grid-row' if rows_axis else 'grid-column'}:{i['place']}")
         if "order" in i:
             s.append(f"order:{i['order']}")
         if "self" in i:
             s.append(f"{'justify-self' if rows_axis else 'align-self'}:{i['self']}")
+        if "abs" in i:
+            s.append("position:absolute")
+            s += [f"{k}:{v}" if isinstance(v, str) else f"{k}:{v}px" for k, v in i["abs"].items()]
         if "margin" in i:
             s.append(f"margin:{i['margin']}px;padding:2px;border:1px solid")
         kids.append(f"<div id={c['name']}-{i['id']} style='{';'.join(s)}'>{i.get('text', '')}</div>")
-    return f"<div id={c['name']} class=case style='position:relative;{';'.join(style)}'>{''.join(kids)}</div>"
+    return f"<div id={c['name']} class=case style='position:{pos};{';'.join(style)}'>{''.join(kids)}</div>"
 
 
 def main():
@@ -189,7 +295,10 @@ def main():
     # One page per case: a failing case cannot hide the others.
     result = {}
     version = subprocess.run([CHROME, "--version"], capture_output=True, text=True).stdout.strip()
+    only = os.environ.get("W3COS_ONLY")
     for c in CASES:
+        if only and not c["name"].startswith(only):
+            continue
         body = html(c)
         page = (
             "<!doctype html><html><head><style>@font-face{font-family:Ahem;src:url(data:font/ttf;base64,"

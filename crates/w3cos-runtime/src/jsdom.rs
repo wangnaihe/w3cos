@@ -7960,6 +7960,15 @@ fn css_property_supported(property: &str, value: &str) -> bool {
     ) {
         return w3cos_dom::css_style::valid_multicol_declaration(&property, value);
     }
+    if property == "tab-size" {
+        return w3cos_dom::css_style::valid_tab_size_declaration(value);
+    }
+    if property == "flex-wrap" {
+        return w3cos_dom::css_style::normalize_flex_wrap(value).is_some();
+    }
+    if property == "flex-line-count" {
+        return flex_line_count_valid(value);
+    }
     matches!(
         property.as_str(),
         "align-content"
@@ -8037,6 +8046,7 @@ fn css_property_supported(property: &str, value: &str) -> bool {
             | "overflow"
             | "overflow-x"
             | "overflow-y"
+            | "overflow-clip-margin"
             | "padding"
             | "padding-bottom"
             | "padding-left"
@@ -9546,8 +9556,14 @@ fn scroll_container_axes(node: u32) -> (bool, bool) {
     dom::with_document(|document| {
         let style = Element::new(NodeId::from_u32(node)).get_computed_style(document);
         (
-            style.get_property("overflow-x") != "visible",
-            style.get_property("overflow-y") != "visible",
+            !matches!(
+                style.get_property("overflow-x").as_str(),
+                "visible" | "clip"
+            ),
+            !matches!(
+                style.get_property("overflow-y").as_str(),
+                "visible" | "clip"
+            ),
         )
     })
 }
@@ -9948,6 +9964,23 @@ fn offset_parent_node(node: u32) -> Option<u32> {
         ancestor = dom::parent_node(candidate);
     }
     None
+}
+
+/// Used border widths (left, top, right, bottom) of an element; a border
+/// whose style is `none`/`hidden` is zero.
+fn used_border_insets(node: u32) -> (f32, f32, f32, f32) {
+    if dom::node_type(node) != 1 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let mut style =
+        dom::with_document(|document| document.computed_style_for(NodeId::from_u32(node)).clone());
+    style.resolve_used_border_widths();
+    (
+        style.border_left_width.unwrap_or(style.border_width),
+        style.border_top_width.unwrap_or(style.border_width),
+        style.border_right_width.unwrap_or(style.border_width),
+        style.border_bottom_width.unwrap_or(style.border_width),
+    )
 }
 
 fn offset_position(node: u32) -> (f32, f32) {
@@ -11329,14 +11362,48 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         "getClientRects" => func(move |_, _| {
             crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
         }),
-        "offsetWidth" | "clientWidth" => Value::Number(forced_bounding_rect(node).width as f64),
-        "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
-        "scrollWidth" => Value::Number(forced_scroll_size(node).0),
-        "scrollHeight" => Value::Number(forced_scroll_size(node).1),
+        "offsetWidth" => Value::Number(forced_bounding_rect(node).width as f64),
+        "offsetHeight" => Value::Number(forced_bounding_rect(node).height as f64),
+        // CSSOM View: the padding box, so the used borders come off.
+        "clientWidth" => {
+            let (left, _, right, _) = used_border_insets(node);
+            Value::Number((forced_bounding_rect(node).width - left - right).max(0.0) as f64)
+        }
+        "clientHeight" => {
+            let (_, top, _, bottom) = used_border_insets(node);
+            Value::Number((forced_bounding_rect(node).height - top - bottom).max(0.0) as f64)
+        }
+        // The scrolling area starts at the padding edge and is never
+        // smaller than the padding box (CSSOM View), like clientWidth.
+        "scrollWidth" => {
+            let (left, _, right, _) = used_border_insets(node);
+            let client = (forced_bounding_rect(node).width - left - right).max(0.0) as f64;
+            let (extent, border_box) =
+                (forced_scroll_size(node).0, forced_bounding_rect(node).width);
+            Value::Number(if extent > border_box as f64 {
+                (extent - left as f64).max(client)
+            } else {
+                client
+            })
+        }
+        "scrollHeight" => {
+            let (_, top, _, bottom) = used_border_insets(node);
+            let client = (forced_bounding_rect(node).height - top - bottom).max(0.0) as f64;
+            let (extent, border_box) = (
+                forced_scroll_size(node).1,
+                forced_bounding_rect(node).height,
+            );
+            Value::Number(if extent > border_box as f64 {
+                (extent - top as f64).max(client)
+            } else {
+                client
+            })
+        }
         "offsetTop" => Value::Number(offset_position(node).1 as f64),
         "offsetLeft" => Value::Number(offset_position(node).0 as f64),
         "offsetParent" => element_or_null(offset_parent_node(node)),
-        "clientTop" | "clientLeft" => Value::Number(0.0),
+        "clientLeft" => Value::Number(used_border_insets(node).0 as f64),
+        "clientTop" => Value::Number(used_border_insets(node).1 as f64),
         "scrollTop" => Value::Number(dom::get_scroll_offset(node).1 as f64),
         "scrollLeft" => Value::Number(dom::get_scroll_offset(node).0 as f64),
         "scrollIntoView" => func(move |_, args| {
@@ -13734,6 +13801,7 @@ fn is_discrete_css2_property(property: &str) -> bool {
             | "clear"
             | "empty-cells"
             | "float"
+            | "flex-wrap"
     )
 }
 
@@ -13830,6 +13898,7 @@ fn discrete_css_initial_value(property: &str) -> Option<&'static str> {
         | "float" => Some("none"),
         "border-collapse" => Some("separate"),
         "empty-cells" => Some("show"),
+        "flex-wrap" => Some("nowrap"),
         _ => None,
     }
 }
@@ -13880,8 +13949,31 @@ fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
     ))
 }
 
+fn flex_line_count_valid(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) || w3cos_dom::css_style::parse_flex_line_count(&lower).is_some()
+}
+
 fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
     let value = value.trim();
+    // `balance` and its combined forms serialize canonically; an invalid
+    // `flex-wrap` or `flex-line-count` is dropped at parse time.
+    if property == "flex-wrap" && !value.is_empty() {
+        return w3cos_dom::css_style::normalize_flex_wrap(value);
+    }
+    if property == "flex-line-count" && !value.is_empty() && !flex_line_count_valid(value) {
+        return None;
+    }
+    // An invalid tab-size (negative, percentage) is dropped at parse time.
+    if property == "tab-size"
+        && !value.is_empty()
+        && !w3cos_dom::css_style::valid_tab_size_declaration(value)
+    {
+        return None;
+    }
     if property != "color" && !property.ends_with("-color") || value.is_empty() {
         return Some(value.to_string());
     }
@@ -14291,6 +14383,7 @@ fn resolved_horizontal_margin(node: u32, property: &str) -> Option<String> {
     let resolve = |spacing: Spacing, font_style: &w3cos_std::style::Style| match spacing {
         Spacing::Px(value) => value,
         Spacing::Percent(value) => percentage_basis * value / 100.0,
+        Spacing::Calc { percent, px } => percentage_basis * percent / 100.0 + px,
         Spacing::Rem(value) => value * 16.0,
         Spacing::Em(value) => value * font_style.font_size,
         Spacing::Ch(value) => value * font_style.ch_advance(),
@@ -33427,6 +33520,27 @@ try {
     }
 
     #[test]
+    fn tab_size_cssom_drops_invalid_values_and_computes_lengths() {
+        setup();
+        assert!(css_property_supported("tab-size", "2.5"));
+        assert!(css_property_supported("tabSize", "calc(10px + 1em)"));
+        for value in ["-10px", "-20", "30%", "calc(40% + 50px)"] {
+            assert!(!css_property_supported("tab-size", value), "{value}");
+        }
+        let element = create_in_body("div");
+        let style = element.get_property("style");
+        style.set_property("fontSize", Value::string("40px"));
+        style.set_property("tabSize", Value::string("calc(10px + 0.5em)"));
+        style.set_property("tabSize", Value::string("-10px"));
+        assert_eq!(
+            style.call_method("getPropertyValue", vec![Value::string("tab-size")]),
+            Value::string("calc(10px + 0.5em)")
+        );
+        let computed = window_value().call_method("getComputedStyle", vec![element]);
+        assert_eq!(computed.get_property("tabSize"), Value::string("30px"));
+    }
+
+    #[test]
     fn computed_style_exposes_discrete_css2_properties_and_wide_keywords() {
         setup();
         let parent = create_in_body("div");
@@ -33478,6 +33592,32 @@ try {
                 .get_property("float"),
             Value::string("right")
         );
+    }
+
+    #[test]
+    fn allow_discrete_transition_flips_flex_wrap_at_half_progress() {
+        setup();
+        for (easing, expected) in [
+            ("steps(1, jump-end)", "nowrap"),
+            ("steps(1, jump-start)", "wrap"),
+        ] {
+            let div = create_in_body("div");
+            let style = div.get_property("style");
+            style.set_property("flexWrap", Value::string("initial"));
+            style.set_property("transitionDuration", Value::string("100s"));
+            style.set_property("transitionDelay", Value::string("-30s"));
+            style.set_property("transitionTimingFunction", Value::string(easing));
+            style.set_property("transitionProperty", Value::string("flex-wrap"));
+            style.set_property("transitionBehavior", Value::string("allow-discrete"));
+            style.set_property("flexWrap", Value::string("wrap"));
+            assert_eq!(
+                window_value()
+                    .call_method("getComputedStyle", vec![div])
+                    .get_property("flex-wrap"),
+                Value::string(expected),
+                "{easing}"
+            );
+        }
     }
 
     #[test]
@@ -33535,6 +33675,31 @@ try {
         div.set_property("scrollLeft", Value::Number(123_456.0));
         assert_eq!(div.get_property("scrollTop").to_number(), 300.0);
         assert_eq!(div.get_property("scrollLeft").to_number(), 200.0);
+    }
+
+    #[test]
+    fn client_and_scroll_sizes_are_the_padding_box_inside_borders() {
+        setup();
+        let container = create_in_body("div");
+        let style = container.get_property("style");
+        style.set_property("border", Value::string("3px solid black"));
+        let container_id = node_id_of(&container).unwrap();
+        dom::with_document_mut(|document| {
+            document.set_layout_rect(
+                NodeId::from_u32(container_id),
+                w3cos_dom::DOMRect::new(0.0, 0.0, 106.0, 56.0),
+            );
+        });
+        dom::clear_document_dirty();
+        assert_eq!(container.get_property("offsetWidth").to_number(), 106.0);
+        assert_eq!(container.get_property("offsetHeight").to_number(), 56.0);
+        assert_eq!(container.get_property("clientWidth").to_number(), 100.0);
+        assert_eq!(container.get_property("clientHeight").to_number(), 50.0);
+        assert_eq!(container.get_property("clientLeft").to_number(), 3.0);
+        assert_eq!(container.get_property("clientTop").to_number(), 3.0);
+        // Without overflow the scrolling area is the padding box.
+        assert_eq!(container.get_property("scrollWidth").to_number(), 100.0);
+        assert_eq!(container.get_property("scrollHeight").to_number(), 50.0);
     }
 
     #[test]

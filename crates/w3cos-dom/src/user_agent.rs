@@ -25,6 +25,29 @@ pub const CONTROL_APPEARANCE_PROPERTY: &str = "--w3cos-internal-html-control-app
 /// Textarea line metrics remain distinct from single-line inputs, even when
 /// an author disables automatic control painting.
 pub const TEXTAREA_PROPERTY: &str = "--w3cos-internal-html-textarea";
+/// A `<textarea>`'s character width and height (HTML §4.10.11: the `cols`
+/// and `rows` attributes, 20 and 2 when missing or not a valid integer
+/// greater than zero), for its intrinsic size (HTML §15.5.15).
+pub const TEXTAREA_COLS_PROPERTY: &str = "--w3cos-internal-textarea-cols";
+pub const TEXTAREA_ROWS_PROPERTY: &str = "--w3cos-internal-textarea-rows";
+/// The type state of an `<input>` (HTML §4.10.5), lowercased; `text` for an
+/// invalid or missing type attribute.
+pub const INPUT_TYPE_PROPERTY: &str = "--w3cos-internal-input-type";
+/// The `width` / `height` attributes of an outer `<svg>`, as written (the
+/// serialized source carries a rasterization size in their place when
+/// they are absent). Set only when the attribute is present.
+/// Set on an HTML `<button>` element: `1`, or `empty` when the lowered
+/// button has no content and its paint label is the placeholder.
+pub const BUTTON_PROPERTY: &str = "--w3cos-internal-html-button";
+pub const SVG_WIDTH_PROPERTY: &str = "--w3cos-internal-svg-width";
+pub const SVG_HEIGHT_PROPERTY: &str = "--w3cos-internal-svg-height";
+/// Set on an outer `<svg>` whose author width / height is auto and whose
+/// attribute did not parse as an HTML dimension: the used `width` /
+/// `height` then holds the root's fallback size, not a specified one.
+pub const SVG_FALLBACK_WIDTH_PROPERTY: &str = "--w3cos-internal-svg-fallback-width";
+pub const SVG_FALLBACK_HEIGHT_PROPERTY: &str = "--w3cos-internal-svg-fallback-height";
+/// Set when that fallback width also replaced auto horizontal margins.
+pub const SVG_AUTO_MARGIN_PROPERTY: &str = "--w3cos-internal-svg-auto-margin";
 
 pub(crate) fn control_appearance<'a>(
     tag: &str,

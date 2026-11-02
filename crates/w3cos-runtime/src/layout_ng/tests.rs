@@ -195,6 +195,23 @@ fn percent_height_resolves_against_definite_parent() {
 }
 
 #[test]
+fn unresolved_logical_sizes_stay_on_ng() {
+    use w3cos_std::style::CustomProperties;
+    let mut sized = block();
+    sized.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-logical-size-inline-size".to_string(),
+        "max-content".to_string(),
+    )]));
+    let root = node(
+        block(),
+        vec![node(sized, vec![Component::text("x", Style::default())])],
+    );
+    let flat = pre_flatten(&root);
+    // Both engines ignore the unresolved logical size.
+    assert_eq!(block::unsupported_tree(&flat), None);
+}
+
+#[test]
 fn unsupported_trees_fall_back() {
     // An empty grid with no template is S5. `subgrid` stays on legacy.
     let grid_root = node(
@@ -987,44 +1004,58 @@ fn floated_inline_block_and_list_item_match_chrome() {
     assert_eq!(rect(&out, 6), (0.0, 80.0, 30.0, 10.0));
     assert_eq!(rect(&out, 7), (0.0, 90.0, 200.0, 10.0));
 
-    let flex = node(
-        block(),
-        vec![node(
+    // A floated flex or grid container is a BFC root laid out by its own
+    // algorithm (NGBlockNode::Layout) and placed by PositionFloat. The
+    // auto-width flex float is its max-content width: 30 + 5 gap + 20.
+    let item = |w: f32, h: f32| {
+        node(
             Style {
-                display: Display::Flex,
-                float: Float::Left,
-                width: Dimension::Px(40.0),
-                height: Dimension::Px(20.0),
-                ..Style::default()
+                width: Dimension::Px(w),
+                height: Dimension::Px(h),
+                ..block()
             },
             vec![],
-        )],
+        )
+    };
+    let floats = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: w3cos_std::style::FlexDirection::Row,
+                    float: Float::Left,
+                    column_gap: Some(5.0),
+                    ..Style::default()
+                },
+                vec![item(30.0, 10.0), item(20.0, 15.0)],
+            ),
+            node(
+                Style {
+                    display: Display::Grid,
+                    float: Float::Left,
+                    width: Dimension::Px(40.0),
+                    height: Dimension::Px(20.0),
+                    ..Style::default()
+                },
+                vec![],
+            ),
+        ],
     );
+    let flat = pre_flatten(&floats);
     assert!(
-        !block::unsupported_reasons(&pre_flatten(&flex))
-            .iter()
-            .any(|reason| reason == "float:display"),
-        "a floated flex container is blockified and supported"
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
     );
-    let grid = node(
-        block(),
-        vec![node(
-            Style {
-                display: Display::Grid,
-                float: Float::Left,
-                width: Dimension::Px(40.0),
-                height: Dimension::Px(20.0),
-                ..Style::default()
-            },
-            vec![],
-        )],
-    );
-    assert!(
-        !block::unsupported_reasons(&pre_flatten(&grid))
-            .iter()
-            .any(|reason| reason == "float:display"),
-        "a floated grid container is blockified and supported"
-    );
+    let out = layout_tree(&floats, &flat, 800.0, 600.0).expect("flex and grid floats");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 55.0, 15.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 30.0, 10.0));
+    assert_eq!(rect(&out, 3), (35.0, 0.0, 20.0, 15.0));
+    assert_eq!(rect(&out, 4), (55.0, 0.0, 40.0, 20.0));
     let inline_parent = node(
         block(),
         vec![
@@ -1769,8 +1800,32 @@ fn size_containment_uses_contain_intrinsic_size() {
     let flat = pre_flatten(&root);
     let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 800.0, 0.0));
-    // Without size containment the keyword is the content's intrinsic
-    // size: an empty box is 0 wide (Chrome).
+    // Without size containment a width keyword is the contents' size
+    // (Blink ComputeInlineSizeForFragment): min-content, max-content and
+    // fit-content of a block holding a 40px and a 60px wide block.
+    for (word, width) in [
+        ("min-content", 60.0),
+        ("max-content", 60.0),
+        ("fit-content", 60.0),
+    ] {
+        let mut keyword = block();
+        mark(&mut keyword, &[("--w3cos-internal-width-keyword", word)]);
+        let child = |w: f32| {
+            node(
+                Style {
+                    width: Dimension::Px(w),
+                    ..sized(10.0)
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(keyword, vec![child(40.0), child(60.0)])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1), (0.0, 0.0, width, 20.0), "{word}");
+    }
+    // An empty max-content block is zero wide.
     let mut keyword = block();
     mark(
         &mut keyword,
@@ -1780,6 +1835,321 @@ fn size_containment_uses_contain_intrinsic_size() {
     let flat = pre_flatten(&root);
     let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
     assert_eq!(rect(&ng, 1), (0.0, 0.0, 0.0, 0.0));
+}
+
+/// css-sizing-3 intrinsic keywords on min-width / max-width and
+/// `fit-content(<length-percentage>)`: the argument is clamped between the
+/// box's min-content and max-content sizes (here both 60px), resolved
+/// against the containing block in layout; in an intrinsic contribution a
+/// percentage argument is cyclic and the keyword acts as its initial value.
+#[test]
+fn width_limit_keywords_and_fit_content_function() {
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let child = |w: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                ..sized(10.0)
+            },
+            vec![],
+        )
+    };
+    let boxed = |style: Style, marks: &[(&str, &str)]| {
+        let mut style = Style {
+            display: Display::Block,
+            ..style
+        };
+        mark(&mut style, marks);
+        node(style, vec![child(40.0), child(60.0)])
+    };
+    let cases: Vec<(Style, Vec<(&str, &str)>, f32)> = vec![
+        (
+            block(),
+            vec![("--w3cos-internal-max-width-keyword", "min-content")],
+            60.0,
+        ),
+        (
+            Style {
+                width: Dimension::Px(10.0),
+                ..block()
+            },
+            vec![("--w3cos-internal-min-width-keyword", "max-content")],
+            60.0,
+        ),
+        (
+            Style {
+                width: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![("--w3cos-internal-max-width-keyword", "fit-content(30%)")],
+            60.0,
+        ),
+        (
+            block(),
+            vec![("--w3cos-internal-width-keyword", "fit-content(100px)")],
+            60.0,
+        ),
+        (
+            block(),
+            vec![("--w3cos-internal-width-keyword", "fit-content(5%)")],
+            60.0,
+        ),
+        (
+            block(),
+            vec![("--w3cos-internal-max-width-keyword", "fit-content")],
+            60.0,
+        ),
+    ];
+    for (style, marks, width) in cases {
+        let root = node(block(), vec![boxed(style, &marks)]);
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "{marks:?}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1), (0.0, 0.0, width, 20.0), "{marks:?}");
+    }
+    // Contributions to a min-content parent: a 200px box limited by
+    // max-width: fit-content(100px) contributes 60px; with a cyclic
+    // fit-content(50%) the limit is max-content (60px) as well, while
+    // min-width: fit-content(50%) floors a 10px box at min-content.
+    for (width, marks) in [
+        (
+            200.0,
+            ("--w3cos-internal-max-width-keyword", "fit-content(100px)"),
+        ),
+        (
+            200.0,
+            ("--w3cos-internal-max-width-keyword", "fit-content(50%)"),
+        ),
+        (
+            10.0,
+            ("--w3cos-internal-min-width-keyword", "fit-content(50%)"),
+        ),
+    ] {
+        let mut parent = block();
+        mark(
+            &mut parent,
+            &[("--w3cos-internal-width-keyword", "min-content")],
+        );
+        let inner = boxed(
+            Style {
+                width: Dimension::Px(width),
+                ..block()
+            },
+            &[marks],
+        );
+        let root = node(block(), vec![node(parent, vec![inner])]);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1).2, 60.0, "{marks:?}");
+    }
+}
+
+/// The automatic minimum width of a flex item is clamped by its definite
+/// max-width, and a child's min-width keyword raises the item's
+/// min-content size (flexbox-min-width-auto-001,
+/// flex-item-content-is-min-width-max-content).
+#[test]
+fn flex_auto_min_width_respects_max_width_and_child_keywords() {
+    use w3cos_std::style::FlexDirection;
+    let flex = || Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        width: Dimension::Px(1.0),
+        ..sized(10.0)
+    };
+    let content = |w: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                ..sized(10.0)
+            },
+            vec![],
+        )
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        max_width: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(flex(), vec![node(item, vec![content(80.0)])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 50.0);
+
+    let mut inner = Style {
+        width: Dimension::Px(30.0),
+        ..sized(10.0)
+    };
+    inner.width = Dimension::Auto;
+    inner
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-min-width-keyword".into(),
+            "max-content".into(),
+        );
+    let wide = node(inner, vec![content(30.0), content(40.0)]);
+    let root = node(
+        block(),
+        vec![node(flex(), vec![node(Style::default(), vec![wide])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 40.0);
+}
+
+/// A flex item's percentage margin resolves against zero in its
+/// container's min-content size and against the container's width in
+/// layout (calc-margins-percent-flex).
+#[test]
+fn flex_item_percent_margin_is_zero_in_min_content() {
+    use w3cos_std::style::FlexDirection;
+    let mut flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        ..sized(100.0)
+    };
+    flex.width = Dimension::Auto;
+    flex.custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-width-keyword".into(),
+            "min-content".into(),
+        );
+    let mut item = Style {
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    item.margin.left = Spacing::Percent(50.0);
+    let root = node(block(), vec![node(flex, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0);
+    assert_eq!(rect(&ng, 2).0, 50.0);
+}
+
+/// Intrinsic width keywords on a flex container resolve against its own
+/// min/max-content sizes, and a grid item with one is sized by it inside
+/// its area instead of being stretched.
+#[test]
+fn width_keywords_on_flex_containers_and_grid_items() {
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let child = |w: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                ..sized(10.0)
+            },
+            vec![],
+        )
+    };
+    // A single-line container's min-content size sums its items' (Flexbox
+    // §9.9.1); a multi-line one takes the largest.
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    for (word, wrap, width) in [
+        ("max-content", FlexWrap::NoWrap, 100.0),
+        ("min-content", FlexWrap::NoWrap, 100.0),
+        ("min-content", FlexWrap::Wrap, 60.0),
+        ("fit-content", FlexWrap::NoWrap, 100.0),
+        ("fit-content(80px)", FlexWrap::Wrap, 80.0),
+    ] {
+        let mut flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: wrap,
+            ..Style::default()
+        };
+        mark(&mut flex, &[("--w3cos-internal-width-keyword", word)]);
+        let root = node(block(), vec![node(flex, vec![child(40.0), child(60.0)])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "{word}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1).2, width, "flex {word}");
+    }
+    // A column-wrap container's max-content width sums its flex lines,
+    // broken at its max-height (col-wrap-002).
+    {
+        let mut flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            flex_wrap: FlexWrap::Wrap,
+            max_height: Dimension::Px(100.0),
+            ..Style::default()
+        };
+        mark(
+            &mut flex,
+            &[("--w3cos-internal-width-keyword", "max-content")],
+        );
+        let item = || {
+            node(
+                Style {
+                    width: Dimension::Px(50.0),
+                    height: Dimension::Auto,
+                    min_height: Dimension::Px(0.0),
+                    flex_grow: 0.0,
+                    flex_shrink: 0.0,
+                    flex_basis: Dimension::Px(100.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(flex, vec![item(), item()])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "column wrap");
+    }
+    for (word, width) in [
+        ("max-content", 60.0),
+        ("min-content", 60.0),
+        ("fit-content(30px)", 60.0),
+    ] {
+        let grid = Style {
+            display: Display::Grid,
+            width: Dimension::Px(300.0),
+            grid_template_columns: Some("200px".to_string()),
+            ..Style::default()
+        };
+        let mut item = block();
+        mark(&mut item, &[("--w3cos-internal-width-keyword", word)]);
+        let root = node(
+            block(),
+            vec![node(grid, vec![node(item, vec![child(40.0), child(60.0)])])],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(
+            block::unsupported_reasons(&flat),
+            Vec::<String>::new(),
+            "{word}"
+        );
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 2), (0.0, 0.0, width, 20.0), "grid item {word}");
+    }
 }
 
 /// CSS2 9.4.1: overflow other than visible is a BFC. The box sits beside
@@ -1835,6 +2205,63 @@ fn overflow_hidden_is_a_bfc_like_legacy() {
     let out = parity(&contained);
     assert_eq!(rect(&out, 0), (0.0, 0.0, 100.0, 40.0));
     assert_eq!(rect(&out, 1), (0.0, 10.0, 40.0, 30.0));
+}
+
+/// css-overflow-3: `auto` / `scroll` make a scroll container, which is a
+/// BFC like `hidden` (scrollbars take no space here). One whose content
+/// overflows a max-height clamp has a scroll range and stays on legacy.
+#[test]
+fn scroll_container_is_a_bfc_and_overflowing_one_falls_back() {
+    use w3cos_std::style::{Dimension as D, Display, Float, Overflow};
+    let float = Style {
+        display: Display::Block,
+        width: D::Px(40.0),
+        height: D::Px(30.0),
+        float: Float::Left,
+        ..Style::default()
+    };
+    let beside = Style {
+        display: Display::Block,
+        height: D::Px(20.0),
+        overflow: Overflow::Auto,
+        ..Style::default()
+    };
+    let root = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(100.0),
+            ..Style::default()
+        },
+        vec![node(float, vec![]), node(beside, vec![])],
+    );
+    let out = parity(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
+    assert_eq!(rect(&out, 2), (40.0, 0.0, 60.0, 20.0));
+
+    let clamped = node(
+        Style {
+            display: Display::Block,
+            width: D::Px(100.0),
+            max_height: D::Px(50.0),
+            overflow: Overflow::Scroll,
+            ..Style::default()
+        },
+        vec![node(
+            Style {
+                display: Display::Block,
+                height: D::Px(80.0),
+                ..Style::default()
+            },
+            vec![],
+        )],
+    );
+    let flat = pre_flatten(&clamped);
+    assert!(block::supports_tree(&flat));
+    let out = layout_tree(&clamped, &flat, 800.0, 600.0).expect("ng layout");
+    // Ours lays the clamped scroll container out (it is 50 high, the child
+    // overflows); main's version of this test sent it to legacy.
+    let sizes: Vec<_> = out.iter().map(|(r, _)| (r.width, r.height)).collect();
+    assert_eq!(sizes, vec![(100.0, 50.0), (100.0, 80.0)]);
 }
 
 fn ng_rects(root: &Component) -> Vec<(LayoutRect, usize)> {
@@ -2964,18 +3391,21 @@ fn auto_sized_fixed_track_inline_grid_shrinks_to_its_tracks() {
     let margin_root = node(block(), vec![node(margined, vec![])]);
     let margin_flat = pre_flatten(&margin_root);
     assert!(
-        !block::supports_tree(&margin_flat),
+        block::supports_tree(&margin_flat),
         "{:?}",
         block::unsupported_reasons(&margin_flat)
     );
+    let margin_out = layout_tree(&margin_root, &margin_flat, 800.0, 600.0).expect("margined");
+    assert_eq!(at(&margin_out, 1), (0.0, 10.0, 100.0, 40.0));
 
-    // A static box is the reference side of reftests that still fall back.
+    // A static box is laid out too (grid-template-areas, auto tracks and
+    // the other features switch with it so no reftest splits).
     let mut static_grid = grid("100px", "40px", AlignItems::Stretch);
     static_grid.position = Position::Static;
     let static_root = node(block(), vec![node(static_grid, vec![])]);
     let static_flat = pre_flatten(&static_root);
     assert!(
-        !block::supports_tree(&static_flat),
+        block::supports_tree(&static_flat),
         "{:?}",
         block::unsupported_reasons(&static_flat)
     );
@@ -3085,12 +3515,11 @@ fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
     use w3cos_std::style::{CustomProperties, Position};
     // Headless Chrome 155: auto/100px border-box widths, 3px padding
     // and 2px borders, auto auto columns containing 40px/30px items.
-    // A static bordered box stays on legacy (`inline grid-lanes`
-    // references); the relative one is laid out here.
+    // Static and relative boxes lay out identically.
     for (width, position, outer, second_x) in [
-        (Dimension::Auto, Position::Static, 0.0, 0.0),
+        (Dimension::Auto, Position::Static, 80.0, 45.0),
         (Dimension::Auto, Position::Relative, 80.0, 45.0),
-        (Dimension::Px(100.0), Position::Static, 0.0, 0.0),
+        (Dimension::Px(100.0), Position::Static, 100.0, 55.0),
         (Dimension::Px(100.0), Position::Relative, 100.0, 55.0),
     ] {
         let grid = Style {
@@ -3118,10 +3547,6 @@ fn intrinsic_inline_grid_border_boxes_include_padding_and_border() {
         };
         let root = node(block(), vec![node(grid, vec![item(40.0), item(30.0)])]);
         let flat = pre_flatten(&root);
-        if outer == 0.0 {
-            assert!(!block::supports_tree(&flat));
-            continue;
-        }
         assert!(
             block::supports_tree(&flat),
             "{:?}",
@@ -3383,7 +3808,7 @@ fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
     );
     let ordinary_flat = pre_flatten(&ordinary);
     assert!(
-        block::unsupported_reasons(&ordinary_flat)
+        !block::unsupported_reasons(&ordinary_flat)
             .iter()
             .any(|reason| *reason == "grid:intrinsic-track"),
         "{:?}",
@@ -3479,19 +3904,94 @@ fn replaced_content_box_matches_legacy() {
     );
     let out = parity(&block_image);
     assert_eq!(rect(&out, 1), (60.0, 0.0, 80.0, 40.0));
-    // An inline image is an atomic inline in the line box (see
-    // inline_images_match_chrome); a border-box image still takes legacy.
-    let mut border_box = image(Display::Block, Spacing::Px(0.0), Spacing::Px(0.0));
-    border_box.style.box_sizing = w3cos_std::style::BoxSizing::BorderBox;
-    let root = node(
+    let inline_image = node(
         Style {
             display: Display::Block,
             ..Style::default()
         },
-        vec![border_box],
+        vec![image(
+            Display::InlineBlock,
+            Spacing::Px(0.0),
+            Spacing::Px(0.0),
+        )],
     );
-    let flat = pre_flatten(&root);
-    assert_eq!(block::unsupported_reasons(&flat), vec!["image".to_string()]);
+    // An inline-block image in a block is an atomic inline on the root
+    // line (Chrome: image 0,0 80×40). The line box height depends on the
+    // strut font, so it is checked against legacy only.
+    let flat = pre_flatten(&inline_image);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = parity(&inline_image);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 80.0, 40.0));
+}
+
+/// Headless Chrome, body margin 0, a 100×50 image with display:block
+/// (Blink ComputeReplacedSizeInternal). With width and height auto the
+/// clamped width transfers to the height, then back; a min wins over a
+/// max, and em limits resolve against the font size.
+#[test]
+fn replaced_min_max_matches_chrome() {
+    use w3cos_std::style::Dimension as D;
+    let source = "w3cos-ng-replaced-min-max-100x50.png";
+    let image = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let cases = [
+        // min-width 150px beats max-width 80px.
+        (
+            Style {
+                min_width: D::Px(150.0),
+                max_width: D::Px(80.0),
+                ..Style::default()
+            },
+            (0.0, 0.0, 150.0, 75.0),
+        ),
+        // max-width 2.5em at font-size 20px.
+        (
+            Style {
+                max_width: D::Em(2.5),
+                font_size: 20.0,
+                ..Style::default()
+            },
+            (0.0, 0.0, 50.0, 25.0),
+        ),
+        // max-height 20px transfers 40px, then min-width 60px wins.
+        (
+            Style {
+                max_height: D::Px(20.0),
+                min_width: D::Px(60.0),
+                ..Style::default()
+            },
+            (0.0, 0.0, 60.0, 20.0),
+        ),
+    ];
+    for (extra, expected) in cases {
+        let root = node(
+            block(),
+            vec![Component::image(
+                source,
+                Style {
+                    display: Display::Block,
+                    ..extra
+                },
+            )],
+        );
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("image");
+        assert_eq!(rect(&out, 1), expected);
+    }
+    crate::image_loader::invalidate(source);
 }
 
 /// Headless Chrome, body margin 0. A canvas is a replaced box: attributes
@@ -3634,8 +4134,8 @@ fn definite_canvas_matches_chrome() {
     ));
     assert_eq!(at(&out, 1), (0.0, 0.0, 90.0, 50.0));
 
-    // An inline-block canvas outside any IFC text is an atomic inline of
-    // its block parent (see inline_canvases_match_chrome).
+    // An inline-block canvas is an atomic inline on the first line
+    // (CSS 2.1 10.8.1).
     let inline = node(
         block(),
         vec![canvas(
@@ -3648,24 +4148,9 @@ fn definite_canvas_matches_chrome() {
         )],
     );
     let flat = pre_flatten(&inline);
-    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
-    // A border-box canvas still takes legacy.
-    let border_box = node(
-        block(),
-        vec![block_canvas(
-            40,
-            20,
-            Style {
-                box_sizing: w3cos_std::style::BoxSizing::BorderBox,
-                ..Style::default()
-            },
-        )],
-    );
-    let flat = pre_flatten(&border_box);
-    assert_eq!(
-        block::unsupported_reasons(&flat),
-        vec!["kind:other".to_string()]
-    );
+    assert!(block::unsupported_reasons(&flat).is_empty());
+    let out = layout_tree(&inline, &flat, 800.0, 600.0).expect("inline canvas");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 20.0));
 }
 
 /// An inline `<canvas>` is an atomic inline in the line box (CSS 2.1
@@ -4112,6 +4597,2651 @@ fn inline_block_leading_block_shares_the_line_baseline() {
     );
 }
 
+/// flexbox-overflow-horiz-002: `align-items: center` is unsafe, so an
+/// item taller than its line overflows both sides (Chrome: big item at
+/// y=-20 in the 70px container, small item at y=25).
+#[test]
+fn centered_flex_item_overflows_its_line_unsafely() {
+    use w3cos_std::style::{AlignItems, FlexDirection, Float};
+    let big = node(
+        Style {
+            height: Dimension::Px(10.0),
+            border_width: 2.0,
+            border_top_width: Some(50.0),
+            border_bottom_width: Some(50.0),
+            flex_grow: 3.0,
+            flex_basis: Dimension::Px(0.0),
+            ..block()
+        },
+        vec![],
+    );
+    let small = node(
+        Style {
+            height: Dimension::Px(20.0),
+            flex_grow: 1.0,
+            flex_basis: Dimension::Px(0.0),
+            ..block()
+        },
+        vec![],
+    );
+    let fc = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            width: Dimension::Px(70.0),
+            height: Dimension::Px(70.0),
+            float: Float::Left,
+            ..Style::default()
+        },
+        vec![big, small],
+    );
+    let root = node(block(), vec![fc]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("centered flex float");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 70.0, 70.0));
+    assert_eq!(rect(&out, 2), (0.0, -20.0, 53.5, 110.0));
+    assert_eq!(rect(&out, 3), (53.5, 25.0, 16.5, 20.0));
+}
+
+/// CSS Flexbox §4.5: a scroll-container item has no automatic minimum, so
+/// it shrinks below its content while its sibling keeps its min-content.
+/// Chrome: (0,0,70,40) and (70,0,30,40). (A block-axis scroller that
+/// shrinks gets a scroll range and stays on legacy at run time.)
+#[test]
+fn scroll_container_flex_item_has_no_automatic_minimum() {
+    use w3cos_std::style::{FlexDirection, Overflow};
+    let sized = |width: f32, height: f32| {
+        node(
+            Style {
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let clipped = node(
+        Style {
+            overflow: Overflow::Hidden,
+            ..block()
+        },
+        vec![sized(150.0, 10.0)],
+    );
+    let plain = node(block(), vec![sized(30.0, 10.0)]);
+    let row = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(40.0),
+            ..Style::default()
+        },
+        vec![clipped, plain],
+    );
+    let root = node(block(), vec![row]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("scroll container flex items");
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 70.0, 40.0));
+    assert_eq!(rect(&out, 4), (70.0, 0.0, 30.0, 40.0));
+}
+
+/// Row baseline alignment (FlexLayoutAlgorithm::BaselineAscent): text-free
+/// items synthesize the border-box under edge, the line is the largest
+/// ascent plus the largest descent, and a definite single line wins.
+/// Rects from Chrome.
+#[test]
+fn flex_row_baseline_alignment_matches_chrome() {
+    let flex = |height: Dimension| Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Row,
+        align_items: AlignItems::Baseline,
+        width: Dimension::Px(300.0),
+        height,
+        ..block()
+    };
+    use w3cos_std::style::{AlignItems, AlignSelf};
+    let item = |height: Dimension, margin: Edges, align_self: AlignSelf| Style {
+        width: Dimension::Px(40.0),
+        height,
+        margin,
+        align_self,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                flex(Dimension::Auto),
+                vec![
+                    node(
+                        item(
+                            Dimension::Auto,
+                            margins(7.0, 0.0, 0.0, 0.0),
+                            AlignSelf::Auto,
+                        ),
+                        vec![node(sized(40.0), vec![])],
+                    ),
+                    node(
+                        item(
+                            Dimension::Px(10.0),
+                            margins(0.0, 0.0, 9.0, 0.0),
+                            AlignSelf::Auto,
+                        ),
+                        vec![],
+                    ),
+                    node(
+                        item(Dimension::Px(100.0), Edges::default(), AlignSelf::FlexStart),
+                        vec![],
+                    ),
+                ],
+            ),
+            node(
+                flex(Dimension::Px(30.0)),
+                vec![
+                    node(
+                        item(
+                            Dimension::Px(40.0),
+                            margins(30.0, 0.0, 0.0, 0.0),
+                            AlignSelf::Auto,
+                        ),
+                        vec![],
+                    ),
+                    node(
+                        item(Dimension::Px(10.0), Edges::default(), AlignSelf::Auto),
+                        vec![],
+                    ),
+                    node(
+                        item(Dimension::Auto, Edges::default(), AlignSelf::Stretch),
+                        vec![],
+                    ),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root, 1 flex, 2 item, 3 its child, 4, 5, 6 flex, 7, 8, 9.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 300.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 7.0, 40.0, 40.0));
+    assert_eq!(rect(&out, 4), (40.0, 37.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 5), (80.0, 0.0, 40.0, 100.0));
+    assert_eq!(rect(&out, 6), (0.0, 100.0, 300.0, 30.0));
+    assert_eq!(rect(&out, 7), (0.0, 130.0, 40.0, 40.0));
+    assert_eq!(rect(&out, 8), (40.0, 160.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 9), (80.0, 100.0, 40.0, 30.0));
+}
+
+/// A text run is an anonymous flex item laid out as block text (CSS
+/// Flexbox §4). Row: the flex base size is its max-content width and the
+/// automatic minimum its min-content width (§4.5); it stretches to the
+/// line. Column: its height at the used width is both, so a short
+/// definite column does not shrink it. A white-space-only run stays on
+/// legacy (the DOM is expected to drop it).
+#[test]
+fn flex_text_item_is_an_anonymous_block() {
+    use w3cos_std::style::FlexDirection;
+    let words = "Several short words wrap here";
+    let text_style = Style {
+        display: Display::Inline,
+        ..Style::default()
+    };
+    let sizes = inline::text_min_max(words, &text_style);
+    let min = sizes.min.expect("min-content");
+    assert!(min + 1.0 < sizes.max, "{min} {}", sizes.max);
+    let one_line = inline::block_text_layout(words, sizes.max, &text_style).0;
+    let flex = |width: f32, direction: FlexDirection, height: Dimension, items: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: direction,
+                width: Dimension::Px(width),
+                height,
+                ..block()
+            },
+            items,
+        )
+    };
+    let text = || Component::text(words, text_style.clone());
+    // The run's node takes the rect paint reads for a paragraph leaf, its
+    // line box (the item) starting at the item's top.
+    let painted = |width: f32| {
+        let (_, _, _, y, height) =
+            inline::paragraph_box(words, width, &text_style, &Style::default(), false);
+        (0.0, y, width, height)
+    };
+    let fixed = node(
+        Style {
+            width: Dimension::Px(30.0),
+            height: Dimension::Px(10.0),
+            ..block()
+        },
+        vec![],
+    );
+    // Preorder: 0 root, 1 flex, 2 text, 3 box.
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(
+            400.0,
+            FlexDirection::Row,
+            Dimension::Auto,
+            vec![text(), fixed],
+        )],
+    ));
+    close(rect(&out, 2), painted(sizes.max));
+    close(rect(&out, 3), (sizes.max, 0.0, 30.0, 10.0));
+    close(rect(&out, 1), (0.0, 0.0, 400.0, one_line.max(10.0)));
+
+    // Shrinks to the container, wrapping; never below min-content.
+    let mid = (min + sizes.max) / 2.0;
+    let wrapped = inline::block_text_layout(words, mid, &text_style).0;
+    assert!(wrapped > one_line + 1.0, "{wrapped} {one_line}");
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(mid, FlexDirection::Row, Dimension::Auto, vec![text()])],
+    ));
+    close(rect(&out, 2), painted(mid));
+    let narrow = inline::block_text_layout(words, min, &text_style).0;
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(1.0, FlexDirection::Row, Dimension::Auto, vec![text()])],
+    ));
+    close(rect(&out, 2), painted(min));
+    assert!(narrow > wrapped, "{narrow} {wrapped}");
+
+    // Column: stretched to the width; the 5px box does not shrink it.
+    let out = ng_rects(&node(
+        block(),
+        vec![flex(
+            mid,
+            FlexDirection::Column,
+            Dimension::Px(5.0),
+            vec![text()],
+        )],
+    ));
+    close(rect(&out, 2), painted(mid));
+
+    let space_root = node(
+        block(),
+        vec![flex(
+            100.0,
+            FlexDirection::Row,
+            Dimension::Auto,
+            vec![Component::text("  ", text_style.clone())],
+        )],
+    );
+    let space = pre_flatten(&space_root);
+    assert!(
+        block::unsupported_reasons(&space)
+            .iter()
+            .any(|r| r == "flex:text-space"),
+        "{:?}",
+        block::unsupported_reasons(&space)
+    );
+}
+
+/// Rects from headless Chrome (ngtools/fbw-probe.html, fbw-probe2.html).
+/// Per-line baseline groups (FlexLayoutAlgorithm::BuildFlexLines), the
+/// flipped minor group under `wrap-reverse`, and the exported first
+/// baseline of a multi-line container (BaselineAccumulator).
+#[test]
+fn flex_wrap_baseline_groups_match_chrome() {
+    use w3cos_std::style::{AlignItems, AlignSelf, FlexDirection, FlexWrap};
+    let wrap = |flex_wrap: FlexWrap, align_items: AlignItems, height: Dimension| Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap,
+        align_items,
+        width: Dimension::Px(100.0),
+        height,
+        ..block()
+    };
+    let outer = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        align_items: AlignItems::Baseline,
+        width: Dimension::Px(300.0),
+        ..block()
+    };
+    let item = |width: f32, height: f32, margin: Edges, align_self: AlignSelf| {
+        node(
+            Style {
+                width: Dimension::Px(width),
+                height: Dimension::Px(height),
+                margin,
+                align_self,
+                flex_shrink: 0.0,
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let none = Edges::default;
+    let lines = |flex_wrap: FlexWrap, b2_bottom: f32| {
+        node(
+            wrap(flex_wrap, AlignItems::Baseline, Dimension::Auto),
+            vec![
+                item(40.0, 20.0, margins(5.0, 0.0, 0.0, 0.0), AlignSelf::Auto),
+                item(
+                    40.0,
+                    40.0,
+                    margins(0.0, 0.0, b2_bottom, 0.0),
+                    AlignSelf::Auto,
+                ),
+                item(40.0, 10.0, margins(0.0, 0.0, 3.0, 0.0), AlignSelf::Auto),
+                item(40.0, 50.0, none(), AlignSelf::FlexStart),
+            ],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            lines(FlexWrap::Wrap, 0.0),
+            lines(FlexWrap::WrapReverse, 4.0),
+            node(
+                outer.clone(),
+                vec![
+                    node(
+                        wrap(FlexWrap::Wrap, AlignItems::FlexStart, Dimension::Auto),
+                        vec![
+                            item(40.0, 10.0, none(), AlignSelf::Auto),
+                            item(40.0, 30.0, none(), AlignSelf::Auto),
+                            item(40.0, 5.0, none(), AlignSelf::Auto),
+                        ],
+                    ),
+                    item(5.0, 5.0, none(), AlignSelf::Auto),
+                ],
+            ),
+            node(
+                outer,
+                vec![
+                    node(
+                        wrap(
+                            FlexWrap::WrapReverse,
+                            AlignItems::Baseline,
+                            Dimension::Px(120.0),
+                        ),
+                        vec![
+                            item(40.0, 10.0, none(), AlignSelf::Auto),
+                            item(40.0, 30.0, margins(0.0, 0.0, 6.0, 0.0), AlignSelf::Auto),
+                            item(40.0, 5.0, none(), AlignSelf::FlexStart),
+                        ],
+                    ),
+                    item(5.0, 5.0, none(), AlignSelf::Auto),
+                ],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root; 1 wrap, 2-5; 6 wrap-reverse, 7-10; 11 outer,
+    // 12 inner wrap, 13-15, 16; 17 outer, 18 inner wrap-reverse, 19-21, 22.
+    let expected = [
+        (1, (0.0, 0.0, 100.0, 90.0)),
+        (2, (0.0, 20.0, 40.0, 20.0)),
+        (3, (40.0, 0.0, 40.0, 40.0)),
+        (4, (0.0, 40.0, 40.0, 10.0)),
+        (5, (40.0, 40.0, 40.0, 50.0)),
+        (6, (0.0, 90.0, 100.0, 94.0)),
+        (7, (0.0, 160.0, 40.0, 20.0)),
+        (8, (40.0, 140.0, 40.0, 40.0)),
+        (9, (0.0, 127.0, 40.0, 10.0)),
+        (10, (40.0, 90.0, 40.0, 50.0)),
+        (11, (0.0, 184.0, 300.0, 35.0)),
+        (12, (0.0, 184.0, 100.0, 35.0)),
+        (16, (100.0, 189.0, 5.0, 5.0)),
+        (17, (0.0, 219.0, 300.0, 120.0)),
+        (18, (0.0, 219.0, 100.0, 120.0)),
+        (19, (0.0, 323.0, 40.0, 10.0)),
+        (20, (40.0, 303.0, 40.0, 30.0)),
+        (21, (0.0, 258.5, 40.0, 5.0)),
+        (22, (100.0, 258.5, 5.0, 5.0)),
+    ];
+    for (index, rect_expected) in expected {
+        assert_eq!(rect(&out, index), rect_expected, "node {index}");
+    }
+}
+
+/// Headless Chrome, body margin 0: a 100×50 image as a flex item. The flex
+/// algorithm sizes it; an automatic cross size transfers from the main size
+/// through the ratio, stretch distorts it, and a definite stretched cross
+/// size transfers into the flex base size (CSS Flexbox §9.2.3 B, §9.8).
+#[test]
+fn flex_image_item_matches_chrome() {
+    use w3cos_std::style::{AlignItems, Dimension as D, FlexDirection};
+    let source = "w3cos-ng-flex-image-100x50.png";
+    let image = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let flex = |container: Style, item: Style| {
+        node(
+            block(),
+            vec![node(
+                Style {
+                    display: Display::Flex,
+                    ..container
+                },
+                vec![Component::image(
+                    source,
+                    Style {
+                        // An `<img>` is inline-level; as a flex item it is
+                        // blockified (CSS Display §2.7).
+                        display: Display::InlineBlock,
+                        ..item
+                    },
+                )],
+            )],
+        )
+    };
+    // The CSS initial `flex-direction: row` (w3cos defaults to column).
+    let row = || Style {
+        flex_direction: FlexDirection::Row,
+        ..block()
+    };
+    let grow = Style {
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        flex_basis: D::Px(0.0),
+        ..Style::default()
+    };
+    let cases = [
+        // A: natural size, the line is the image's.
+        (
+            Style {
+                width: D::Px(400.0),
+                ..row()
+            },
+            Style::default(),
+            (400.0, 50.0),
+            (0.0, 0.0, 100.0, 50.0),
+        ),
+        // B: the definite stretched cross size 120 transfers to 240.
+        (
+            Style {
+                width: D::Px(400.0),
+                height: D::Px(120.0),
+                ..row()
+            },
+            Style::default(),
+            (400.0, 120.0),
+            (0.0, 0.0, 240.0, 120.0),
+        ),
+        // C: the automatic minimum keeps the natural width.
+        (
+            Style {
+                width: D::Px(60.0),
+                ..row()
+            },
+            Style::default(),
+            (60.0, 50.0),
+            (0.0, 0.0, 100.0, 50.0),
+        ),
+        // D: a column stretches the width; the height transfers.
+        (
+            Style {
+                width: D::Px(300.0),
+                flex_direction: FlexDirection::Column,
+                ..row()
+            },
+            Style::default(),
+            (300.0, 150.0),
+            (0.0, 0.0, 300.0, 150.0),
+        ),
+        // F: flexed to 400, the cross size transfers to 200.
+        (
+            Style {
+                width: D::Px(400.0),
+                ..row()
+            },
+            grow.clone(),
+            (400.0, 200.0),
+            (0.0, 0.0, 400.0, 200.0),
+        ),
+        // H: not stretched, natural size in a 120px line.
+        (
+            Style {
+                width: D::Px(400.0),
+                height: D::Px(120.0),
+                align_items: AlignItems::FlexStart,
+                ..row()
+            },
+            Style::default(),
+            (400.0, 120.0),
+            (0.0, 0.0, 100.0, 50.0),
+        ),
+        // I: a column's automatic minimum keeps the transferred height.
+        (
+            Style {
+                width: D::Px(300.0),
+                height: D::Px(40.0),
+                flex_direction: FlexDirection::Column,
+                ..row()
+            },
+            Style::default(),
+            (300.0, 40.0),
+            (0.0, 0.0, 300.0, 150.0),
+        ),
+        // J: min-width 0 shrinks it to 60; the height transfers to 30.
+        (
+            Style {
+                width: D::Px(60.0),
+                align_items: AlignItems::FlexStart,
+                ..row()
+            },
+            Style {
+                min_width: D::Px(0.0),
+                ..Style::default()
+            },
+            (60.0, 30.0),
+            (0.0, 0.0, 60.0, 30.0),
+        ),
+    ];
+    for (container, item, (cw, ch), expected) in cases {
+        let root = flex(container, item);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{:?}",
+            block::unsupported_reasons(&flat)
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("flex image");
+        assert_eq!(
+            rect(&out, 1),
+            (0.0, 0.0, cw, ch),
+            "{expected:?} {:?}",
+            rect(&out, 2)
+        );
+        assert_eq!(rect(&out, 2), expected);
+    }
+    crate::image_loader::invalidate(source);
+}
+
+/// Headless Chrome: an absolutely positioned flex row stretched between its
+/// insets has a definite block size (CSS Flexbox §9.8), so its stretched
+/// 100×50 image transfers that cross size into the container's
+/// shrink-to-fit width (flex-abspos-inset-cross-size-001).
+#[test]
+fn abspos_flex_row_transfers_inset_height_to_image() {
+    use w3cos_std::style::{Dimension as D, FlexDirection, Position, Spacing as S};
+    let source = "w3cos-ng-flex-abspos-image-100x50.png";
+    let image = image::RgbaImage::from_pixel(100, 50, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let edges = |v: f32| Edges {
+        top: S::Px(v),
+        right: S::Px(v),
+        bottom: S::Px(v),
+        left: S::Px(v),
+    };
+    let holder = |inset: f32, item: Style| {
+        node(
+            Style {
+                position: Position::Relative,
+                height: D::Px(200.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    display: Display::Flex,
+                    flex_direction: FlexDirection::Row,
+                    position: Position::Absolute,
+                    top: D::Px(inset),
+                    bottom: D::Px(inset),
+                    ..Style::default()
+                },
+                vec![Component::image(source, item)],
+            )],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            holder(
+                0.0,
+                Style {
+                    display: Display::InlineBlock,
+                    ..Style::default()
+                },
+            ),
+            holder(
+                10.0,
+                Style {
+                    margin: edges(5.0),
+                    padding: edges(3.0),
+                    display: Display::InlineBlock,
+                    ..Style::default()
+                },
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("abspos flex image");
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 400.0, 200.0));
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 400.0, 200.0));
+    assert_eq!(rect(&out, 5), (0.0, 210.0, 344.0, 180.0));
+    assert_eq!(rect(&out, 6), (5.0, 215.0, 334.0, 170.0));
+    crate::image_loader::invalidate(source);
+}
+
+/// flex-minimum-height-flex-items-021: a column item's definite cross size
+/// (`width: 0`) is clamped by `min-width: 100px`; the 300×150 image's height
+/// transfers to 50 and its automatic minimum keeps it in a 0px column.
+#[test]
+fn flex_column_image_cross_honors_min_width() {
+    use w3cos_std::style::{Dimension as D, FlexDirection};
+    let source = "w3cos-ng-flex-column-image-300x150.png";
+    let image = image::RgbaImage::from_pixel(300, 150, image::Rgba([0, 128, 0, 255]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    crate::image_loader::decode_and_install(source, &bytes.into_inner()).unwrap();
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                height: D::Px(0.0),
+                ..block()
+            },
+            vec![Component::image(
+                source,
+                Style {
+                    display: Display::InlineBlock,
+                    width: D::Px(0.0),
+                    min_width: D::Px(100.0),
+                    ..Style::default()
+                },
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("column image");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 800.0, 0.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
+    crate::image_loader::invalidate(source);
+}
+
+/// intrinsic-percent-replaced-001: a shrink-to-fit float with a definite
+/// height resolves its canvas child's percentage height during min/max
+/// (Blink CalculateChildPercentageBlockSizeForMinMax), so the canvas's
+/// ratio turns `height: 100%` into a 100px intrinsic width.
+#[test]
+fn float_min_max_resolves_child_percent_height() {
+    let canvas = Component::canvas(
+        10,
+        10,
+        Style {
+            display: Display::Block,
+            height: Dimension::Percent(100.0),
+            ..Style::default()
+        },
+    );
+    let float = node(
+        Style {
+            float: w3cos_std::style::Float::Left,
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![canvas],
+    );
+    let root = node(block(), vec![float]);
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("float canvas");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// A stretched replaced row item with a specified width keeps its
+/// automatic minimum at its min-content width under the stretched height,
+/// capped by the specified width (flex-minimum-width-flex-items-013).
+#[test]
+fn flex_stretched_replaced_auto_min_ignores_specified_width() {
+    use w3cos_std::style::{Dimension as D, FlexDirection};
+    let item = Component::canvas(
+        300,
+        150,
+        Style {
+            display: Display::Block,
+            width: D::Px(999.0),
+            ..Style::default()
+        },
+    );
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                width: D::Px(0.0),
+                height: D::Px(50.0),
+                ..block()
+            },
+            vec![item],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
+}
+
+/// A `<canvas>` flex item is replaced like an `<img>` (Blink
+/// LayoutHTMLCanvas is a LayoutReplaced): a stretched row item transfers
+/// the definite line height through its ratio, a column item stretches to
+/// the container width, and its automatic minimum keeps a row from
+/// shrinking it. Rects from headless Chrome (`canvas { display: block }`).
+#[test]
+fn flex_canvas_item_matches_chrome() {
+    use w3cos_std::style::{AlignSelf, Dimension as D, FlexDirection};
+    let canvas = |align_self: AlignSelf| {
+        Component::canvas(
+            40,
+            20,
+            Style {
+                display: Display::Block,
+                align_self,
+                ..Style::default()
+            },
+        )
+    };
+    let flex = |style: Style, items: Vec<Component>| {
+        node(
+            Style {
+                display: Display::Flex,
+                ..style
+            },
+            items,
+        )
+    };
+    let row = |width: f32, height: D| Style {
+        flex_direction: FlexDirection::Row,
+        width: D::Px(width),
+        height,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            flex(
+                row(300.0, D::Px(50.0)),
+                vec![canvas(AlignSelf::Auto), canvas(AlignSelf::FlexStart)],
+            ),
+            flex(
+                Style {
+                    flex_direction: FlexDirection::Column,
+                    width: D::Px(100.0),
+                    ..block()
+                },
+                vec![canvas(AlignSelf::Auto)],
+            ),
+            flex(
+                row(60.0, D::Auto),
+                vec![canvas(AlignSelf::Auto), canvas(AlignSelf::Auto)],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("flex canvas");
+    let expected = [
+        (2, (0.0, 0.0, 100.0, 50.0)),
+        (3, (100.0, 0.0, 40.0, 20.0)),
+        (5, (0.0, 50.0, 100.0, 50.0)),
+        (7, (0.0, 100.0, 40.0, 20.0)),
+        (8, (40.0, 100.0, 40.0, 20.0)),
+    ];
+    for (index, rect_) in expected {
+        assert_eq!(rect(&out, index), rect_, "canvas {index}");
+    }
+}
+
+/// Text fields (Blink LayoutTextControlSingleLine) against Chrome rects
+/// for /workspace/ngtools/ti/c1.html (body margin 0, divs 400px wide).
+#[cfg(feature = "skia")]
+#[test]
+fn text_field_matches_chrome() {
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "400px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    let input = |document: &mut w3cos_dom::Document,
+                 parent: w3cos_dom::Element,
+                 attrs: &[(&str, &str)],
+                 css: &[(&str, &str)]| {
+        let input = document.create_element("input");
+        for (k, v) in attrs {
+            input.set_attribute(document, k, v);
+        }
+        for (k, v) in css {
+            input.style_mut(document).set_property(k, v);
+        }
+        parent.append_child(document, input);
+        input
+    };
+    let text = |document: &mut w3cos_dom::Document, parent: w3cos_dom::Element, s: &str| {
+        let t = document.create_text_node(s);
+        parent.append_child(document, t);
+    };
+    let a = div(&mut document, &[]);
+    text(&mut document, a, "x");
+    input(&mut document, a, &[], &[]);
+    let b = div(&mut document, &[]);
+    text(&mut document, b, "x");
+    input(&mut document, b, &[], &[("height", "50px")]);
+    let c = div(&mut document, &[]);
+    input(&mut document, c, &[], &[("display", "block")]);
+    let d = div(
+        &mut document,
+        &[
+            ("display", "flex"),
+            ("flex-direction", "column"),
+            ("width", "300px"),
+        ],
+    );
+    input(&mut document, d, &[], &[]);
+    let f = div(&mut document, &[]);
+    text(&mut document, f, "x");
+    input(
+        &mut document,
+        f,
+        &[],
+        &[
+            ("width", "100px"),
+            ("padding", "5px"),
+            ("font-size", "20px"),
+        ],
+    );
+    input(&mut document, f, &[("type", "password")], &[]);
+    input(&mut document, f, &[("size", "5")], &[]);
+    let g = div(&mut document, &[]);
+    text(&mut document, g, "x");
+    input(
+        &mut document,
+        g,
+        &[],
+        &[
+            ("box-sizing", "border-box"),
+            ("width", "100px"),
+            ("height", "30px"),
+        ],
+    );
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let inputs: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::TextInput { .. }))
+        .collect();
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("text fields");
+    let legacy = crate::layout::compute(&tree, 800.0, 600.0).expect("legacy");
+    let legacy_rect = |index: usize| {
+        let r = legacy.iter().find(|(_, j)| *j == index).expect("legacy").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    let [i1, i2, i3, i4, i6, i7, i8, i9] = inputs[..] else {
+        panic!("eight inputs: {inputs:?}");
+    };
+    let size = |index: usize| {
+        let r = rect(&out, index);
+        (r.2, r.3)
+    };
+    // The intrinsic size is the legacy (Blink PreferredContentLogicalWidth)
+    // metric; the box metrics are font independent and match Chrome.
+    let (w1, h1) = size(i1);
+    assert_eq!((w1, h1), (legacy_rect(i1).2, legacy_rect(i1).3));
+    assert_eq!(
+        size(i2),
+        (w1, 56.0),
+        "height: 50px plus UA padding and border"
+    );
+    assert_eq!(size(i3), (w1, h1), "a block field fits its content");
+    assert_eq!(size(i4), (300.0, h1), "a column flex item stretches");
+    assert_eq!(size(i6).0, 114.0, "width: 100px plus padding and border");
+    assert_eq!(size(i7), (w1, h1), "password");
+    assert_eq!(size(i8), (legacy_rect(i8).2, h1), "size=5");
+    assert!(size(i8).0 < w1);
+    assert_eq!(size(i9), (100.0, 30.0), "border-box");
+    // The line box is the field's margin box (Chrome: the 50px field's div
+    // is 56px tall, the border-box one's 30px).
+    assert_eq!(rect(&out, i2 - 2).3, 56.0);
+    assert_eq!(rect(&out, i9 - 2).3, 30.0);
+    // The inner editor is centered: a taller content box moves the
+    // baseline (and the sibling text) down by half the extra height.
+    let text_offset = |input: usize| rect(&out, input - 1).1 - rect(&out, input).1;
+    assert_eq!(text_offset(i2) - text_offset(i1), (56.0 - h1) / 2.0);
+}
+
+#[test]
+fn svg_root_matches_chrome() {
+    // Expected sizes from Chrome (/workspace/ngtools/svg/s1.html).
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "400px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    let cases: &[(&[(&str, &str)], &[(&str, &str)], (f32, f32))] = &[
+        (&[], &[], (300.0, 150.0)),
+        (&[("width", "100"), ("height", "50")], &[], (100.0, 50.0)),
+        (&[("viewBox", "0 0 4 1")], &[], (400.0, 100.0)),
+        (
+            &[("viewBox", "0 0 4 1"), ("height", "40")],
+            &[],
+            (160.0, 40.0),
+        ),
+        (
+            &[("viewBox", "0 0 4 1"), ("width", "40")],
+            &[],
+            (40.0, 10.0),
+        ),
+        (&[("width", "50%")], &[], (200.0, 150.0)),
+        (
+            &[("viewBox", "0 0 4 1")],
+            &[("display", "block")],
+            (400.0, 100.0),
+        ),
+        (
+            &[("viewBox", "0 0 2 1")],
+            &[("width", "100px")],
+            (100.0, 50.0),
+        ),
+        (
+            &[("width", "100"), ("height", "50"), ("viewBox", "0 0 1 1")],
+            &[("width", "200px")],
+            (200.0, 50.0),
+        ),
+        (&[], &[("max-width", "50px")], (50.0, 150.0)),
+        (
+            &[("width", "100"), ("height", "50")],
+            &[("max-width", "60px")],
+            (60.0, 50.0),
+        ),
+        (
+            &[("width", "100")],
+            &[("padding", "5px"), ("border", "2px solid")],
+            (114.0, 164.0),
+        ),
+        (
+            &[("viewBox", "0 0 4 1")],
+            &[("padding", "5px"), ("border", "2px solid")],
+            (400.0, 110.5),
+        ),
+        (&[("width", "1in"), ("height", "2em")], &[], (96.0, 32.0)),
+        (
+            &[("width", "100"), ("height", "50")],
+            &[("height", "auto")],
+            (100.0, 50.0),
+        ),
+        (
+            &[("viewBox", "0 0 4 1")],
+            &[("height", "20px")],
+            (80.0, 20.0),
+        ),
+    ];
+    for (attrs, css, _) in cases {
+        let parent = div(&mut document, &[]);
+        let svg = document.create_element("svg");
+        for (k, v) in *attrs {
+            svg.set_attribute(&mut document, k, v);
+        }
+        for (k, v) in *css {
+            svg.style_mut(&mut document).set_property(k, v);
+        }
+        parent.append_child(&mut document, svg);
+    }
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let svgs: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::SvgDocument { .. }))
+        .collect();
+    assert_eq!(svgs.len(), cases.len());
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("svg roots");
+    for (index, (attrs, css, expected)) in svgs.iter().zip(cases) {
+        let r = rect(&out, *index);
+        assert_eq!((r.2, r.3), *expected, "{attrs:?} {css:?}");
+    }
+    // The DOM's fallback size is not a specified one: a flex item that
+    // has one stays on legacy (the flex algorithm reads the used size).
+    let column = div(&mut document, &[("display", "flex")]);
+    let svg = document.create_element("svg");
+    svg.set_attribute(&mut document, "viewBox", "0 0 4 1");
+    column.append_child(&mut document, svg);
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    assert_eq!(
+        block::unsupported_reasons(&flat),
+        vec!["svg:flex-fallback-size".to_string()]
+    );
+}
+
+#[test]
+fn button_matches_chrome() {
+    // Facts from Chrome (/workspace/ngtools/btn/b1-b3.html) that do not
+    // depend on the font: the UA box (2px border, 1px 6px padding,
+    // border-box), fit-content width, safe block-axis centering, and the
+    // baseline (last line, else the content-box bottom).
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "400px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    // Each line: "x" text, then a button.
+    let line = |document: &mut w3cos_dom::Document,
+                parent_css: &[(&str, &str)],
+                label: Option<&str>,
+                css: &[(&str, &str)]| {
+        let parent = div(document, parent_css);
+        let text = document.create_text_node("x ");
+        parent.append_child(document, text);
+        let button = document.create_element("button");
+        if let Some(label) = label {
+            let text = document.create_text_node(label);
+            button.append_child(document, text);
+        }
+        for (k, v) in css {
+            button.style_mut(document).set_property(k, v);
+        }
+        parent.append_child(document, button);
+    };
+    line(&mut document, &[], None, &[]);
+    line(&mut document, &[], None, &[("height", "60px")]);
+    line(&mut document, &[], Some("Hi"), &[]);
+    line(&mut document, &[], Some("Hi"), &[("height", "60px")]);
+    line(&mut document, &[], Some("Hi"), &[("height", "10px")]);
+    line(
+        &mut document,
+        &[],
+        Some("Hi"),
+        &[("height", "60px"), ("padding-top", "20px")],
+    );
+    line(
+        &mut document,
+        &[],
+        Some("Hi"),
+        &[("height", "60px"), ("overflow", "hidden")],
+    );
+    line(
+        &mut document,
+        &[],
+        Some("Hi"),
+        &[
+            ("box-sizing", "content-box"),
+            ("width", "100px"),
+            ("height", "40px"),
+        ],
+    );
+    // Block-level: fit-content, centered by auto margins.
+    let block = div(&mut document, &[]);
+    let button = document.create_element("button");
+    let text = document.create_text_node("Hi");
+    button.append_child(&mut document, text);
+    for (k, v) in [("display", "block"), ("margin", "0 auto")] {
+        button.style_mut(&mut document).set_property(k, v);
+    }
+    block.append_child(&mut document, button);
+    // Block children fill the content box and are centered as one.
+    let block_children = |document: &mut w3cos_dom::Document, height: &str| {
+        let parent = div(document, &[]);
+        let button = document.create_element("button");
+        for (k, v) in [("width", "200px"), ("height", height)] {
+            button.style_mut(document).set_property(k, v);
+        }
+        for word in ["aa", "bb"] {
+            let child = document.create_element("div");
+            let text = document.create_text_node(word);
+            child.append_child(document, text);
+            button.append_child(document, child);
+        }
+        parent.append_child(document, button);
+    };
+    block_children(&mut document, "auto");
+    block_children(&mut document, "100px");
+    // Flex items: a row item takes its content width, a column item
+    // stretches, and a stretched height centers the label.
+    for (css, label) in [
+        (&[("display", "flex")][..], "Hi"),
+        (
+            &[("display", "flex"), ("flex-direction", "column")][..],
+            "Hi",
+        ),
+        (&[("display", "flex"), ("height", "80px")][..], "Hi"),
+    ] {
+        let parent = div(&mut document, css);
+        let button = document.create_element("button");
+        let text = document.create_text_node(label);
+        button.append_child(&mut document, text);
+        parent.append_child(&mut document, button);
+    }
+
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let buttons: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::Button { .. }))
+        .collect();
+    assert_eq!(buttons.len(), 14);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("buttons");
+    let r = |n: usize| rect(&out, buttons[n]);
+    // The "x" text before a button: its top relative to the button's top
+    // moves with the button's baseline.
+    let offset = |n: usize| rect(&out, buttons[n] - 1).1 - r(n).1;
+    let near = |a: f32, b: f32| assert!((a - b).abs() < 0.01, "{a} != {b}");
+    // Empty: border and padding only; the baseline is the content-box
+    // bottom (Chrome 3 and 57).
+    assert_eq!((r(0).2, r(0).3), (16.0, 6.0));
+    assert_eq!(r(1).3, 60.0);
+    near(offset(1) - offset(0), 54.0);
+    // A label centered in a taller box moves the baseline by half the
+    // extra height; an overflowing one starts at the top (safe).
+    let (w, h) = (r(2).2, r(2).3);
+    // (Chrome 40; legacy reserved 2em of label, 56.)
+    assert!(w > 16.0 && w < 48.0, "fit-content label width {w}");
+    near(offset(3) - offset(2), (60.0 - h) / 2.0);
+    near(offset(4), offset(2));
+    // Padding moves the content box down by 19 and shrinks it to 35:
+    // Chrome's baseline moves from 37 to 46.5 against the 60px button.
+    near(offset(5) - offset(3), 9.5);
+    near(offset(6), offset(3)); // overflow does not move the baseline
+    assert_eq!((r(7).2, r(7).3), (116.0, 46.0));
+    // Block-level button: fit-content and centered.
+    assert_eq!(r(8).2, w);
+    // (LayoutUnit margins.)
+    assert!((r(8).0 - (400.0 - w) / 2.0).abs() <= 1.0 / 64.0);
+    // Block children: content width 184, centered as one block.
+    let child = |n: usize, k: usize| {
+        let first = buttons[n] + 1;
+        let index = if k == 0 {
+            first
+        } else {
+            flat[first].subtree_end
+        };
+        rect(&out, index)
+    };
+    assert_eq!(child(9, 0).2, 184.0);
+    let auto_h = r(9).3;
+    let shift = (100.0 - auto_h) / 2.0;
+    near(child(10, 0).1 - r(10).1, child(9, 0).1 - r(9).1 + shift);
+    near(child(10, 1).1 - r(10).1, child(9, 1).1 - r(9).1 + shift);
+    // Flex items.
+    assert_eq!(r(11).2, w);
+    assert_eq!(r(12).2, 400.0);
+    assert_eq!(r(13).3, 80.0);
+}
+
+#[cfg(feature = "skia")]
+#[test]
+fn textarea_matches_chrome() {
+    // Chrome's model (HTML §15.5.15 plus a 15px scrollbar): width is
+    // ceil(cols x character) + scrollbar, height rows x line height, plus
+    // the 1px border and 2px padding; fit-content when block-level; the
+    // inline baseline is the bottom margin edge, the flex one the first
+    // line. Chrome's host monospace face is DejaVu Sans Mono (character 8.03,
+    // line 15, ascent 12 at 13.33px: 182x36); the engine's pinned monospace
+    // face is Cousine (character 8, line 15, ascent 11; at 16px character 10,
+    // line 18), so the expected numbers follow that face.
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let div = |document: &mut w3cos_dom::Document, css: &[(&str, &str)]| {
+        let div = document.create_element("div");
+        div.style_mut(document).set_property("width", "600px");
+        for (k, v) in css {
+            div.style_mut(document).set_property(k, v);
+        }
+        document.body().append_child(document, div);
+        div
+    };
+    // Each line: a 10px inline-block probe, then a textarea.
+    let line = |document: &mut w3cos_dom::Document,
+                parent_css: &[(&str, &str)],
+                attrs: &[(&str, &str)],
+                css: &[(&str, &str)]| {
+        let parent = div(document, parent_css);
+        let probe = document.create_element("div");
+        for (k, v) in [
+            ("display", "inline-block"),
+            ("width", "10px"),
+            ("height", "10px"),
+        ] {
+            probe.style_mut(document).set_property(k, v);
+        }
+        parent.append_child(document, probe);
+        let textarea = document.create_element("textarea");
+        for (k, v) in attrs {
+            textarea.set_attribute(document, k, v);
+        }
+        textarea.style_mut(document).set_property("margin", "0");
+        for (k, v) in css {
+            textarea.style_mut(document).set_property(k, v);
+        }
+        let text = document.create_text_node("x");
+        textarea.append_child(document, text);
+        parent.append_child(document, textarea);
+    };
+    let inline = [("line-height", "0")];
+    let flex = [("display", "flex"), ("align-items", "baseline")];
+    line(&mut document, &inline, &[], &[]);
+    line(
+        &mut document,
+        &inline,
+        &[("cols", "10"), ("rows", "1")],
+        &[],
+    );
+    line(
+        &mut document,
+        &inline,
+        &[("cols", " 40"), ("rows", "5x")],
+        &[],
+    );
+    line(
+        &mut document,
+        &inline,
+        &[("cols", "0"), ("rows", "-3")],
+        &[],
+    );
+    line(&mut document, &inline, &[], &[("overflow", "hidden")]);
+    line(&mut document, &inline, &[], &[("overflow-x", "scroll")]);
+    line(&mut document, &inline, &[], &[("line-height", "20px")]);
+    line(&mut document, &inline, &[], &[("font", "16px monospace")]);
+    line(
+        &mut document,
+        &inline,
+        &[],
+        &[("width", "100px"), ("height", "50px")],
+    );
+    line(
+        &mut document,
+        &inline,
+        &[],
+        &[
+            ("box-sizing", "border-box"),
+            ("width", "100px"),
+            ("height", "50px"),
+        ],
+    );
+    line(&mut document, &inline, &[], &[("margin", "7px")]);
+    line(&mut document, &flex, &[], &[]);
+    line(&mut document, &flex, &[], &[("padding", "9px")]);
+    // Block-level: fit-content, not the container width.
+    let block = div(&mut document, &[]);
+    let textarea = document.create_element("textarea");
+    textarea
+        .style_mut(&mut document)
+        .set_property("display", "block");
+    block.append_child(&mut document, textarea);
+
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    let areas: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::TextInput { .. }))
+        .collect();
+    assert_eq!(areas.len(), 14);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("textareas");
+    let r = |n: usize| rect(&out, areas[n]);
+    let size = |n: usize| (r(n).2, r(n).3);
+    // Probe bottom minus the textarea's border-box top.
+    let baseline = |n: usize| {
+        let probe = rect(&out, areas[n] - 1);
+        probe.1 + probe.3 - r(n).1
+    };
+    let near = |a: f32, b: f32| assert!((a - b).abs() < 0.01, "{a} != {b}");
+    assert_eq!(size(0), (181.0, 36.0));
+    assert_eq!(size(1), (101.0, 21.0));
+    assert_eq!(size(2), (341.0, 81.0));
+    assert_eq!(size(3), (181.0, 36.0)); // invalid cols / rows: 20 x 2
+    assert_eq!(size(4), (166.0, 36.0)); // no scrollbar width
+    assert_eq!(size(5), (181.0, 51.0)); // and a scrollbar height
+    assert_eq!(size(6), (181.0, 46.0));
+    assert_eq!(size(7), (221.0, 42.0));
+    assert_eq!(size(8), (106.0, 56.0));
+    assert_eq!(size(9), (100.0, 50.0));
+    // Inline: the bottom margin edge (a scroll container).
+    near(baseline(0), 36.0);
+    near(baseline(10), 43.0);
+    // Flex items: the first line's baseline (border + padding + ascent).
+    near(baseline(11), 14.0);
+    near(baseline(12), 21.0);
+    assert_eq!(size(13), (181.0, 36.0));
+}
+
+/// Blink's min/max-content contributions treat a percentage width as auto
+/// and ignore a percentage min-width, so a shrink-to-fit float is sized by
+/// the 30px grandchild and the 40px sibling (40). Layout then resolves the
+/// percentages against that width: 50% is 20 and min-width 200% is 80.
+#[test]
+fn percent_widths_do_not_size_a_shrink_to_fit_float() {
+    use w3cos_std::style::Float;
+    let fixed = |w: f32, h: f32| {
+        node(
+            Style {
+                width: Dimension::Px(w),
+                height: Dimension::Px(h),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                float: Float::Left,
+                ..block()
+            },
+            vec![
+                node(
+                    Style {
+                        width: Dimension::Percent(50.0),
+                        ..block()
+                    },
+                    vec![fixed(30.0, 10.0)],
+                ),
+                node(
+                    Style {
+                        width: Dimension::Px(40.0),
+                        min_width: Dimension::Percent(200.0),
+                        height: Dimension::Px(10.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("percent float");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 20.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 20.0, 10.0));
+    assert_eq!(rect(&out, 4), (0.0, 10.0, 80.0, 10.0));
+}
+
+/// Text carries the runtime's leaf `width: 100%`, and width does not apply
+/// to a non-replaced inline box (CSS 2.1 10.3.1), so neither keeps a
+/// shrink-to-fit float's inline min/max off NG: the float sizes exactly
+/// as it does without those percentages.
+#[test]
+fn inline_min_max_ignores_text_and_inline_box_widths() {
+    use w3cos_std::style::Float;
+    let float_with = |width: Dimension| {
+        let text = |content: &str| {
+            Component::text(
+                content,
+                Style {
+                    display: Display::Inline,
+                    width,
+                    ..Style::default()
+                },
+            )
+        };
+        let span = node(
+            Style {
+                display: Display::Inline,
+                width,
+                ..Style::default()
+            },
+            vec![text("ab cd")],
+        );
+        let float = node(
+            Style {
+                float: Float::Left,
+                ..block()
+            },
+            vec![text("hi "), span],
+        );
+        node(block(), vec![float])
+    };
+    let rects = |root: &Component| {
+        let flat = pre_flatten(root);
+        let out = layout_tree(root, &flat, 800.0, 600.0).expect("inline float");
+        (rect(&out, 1), rect(&out, 2), rect(&out, 3))
+    };
+    let percent = float_with(Dimension::Percent(100.0));
+    let auto = float_with(Dimension::Auto);
+    assert!(rects(&percent).0.2 > 0.0);
+    assert_eq!(rects(&percent), rects(&auto));
+}
+
+#[test]
+fn relative_inline_moves_its_fragments_only() {
+    use w3cos_std::style::Position;
+    let tree = |position: Position| {
+        let text = |content: &str| {
+            Component::text(
+                content,
+                Style {
+                    display: Display::Inline,
+                    ..Style::default()
+                },
+            )
+        };
+        let span = node(
+            Style {
+                display: Display::Inline,
+                position,
+                left: Dimension::Px(10.0),
+                top: Dimension::Px(5.0),
+                ..Style::default()
+            },
+            vec![text("bb")],
+        );
+        node(
+            Style {
+                width: Dimension::Px(300.0),
+                ..block()
+            },
+            vec![text("aa "), span],
+        )
+    };
+    let rects = |root: &Component| {
+        let flat = pre_flatten(root);
+        assert!(block::supports_tree(&flat), "relative inline outside NG");
+        let out = layout_tree(root, &flat, 800.0, 600.0).expect("relative inline");
+        (rect(&out, 1), rect(&out, 2), rect(&out, 3))
+    };
+    let (text, span, inner) = rects(&tree(Position::Static));
+    let (moved_text, moved_span, moved_inner) = rects(&tree(Position::Relative));
+    assert_eq!(moved_text, text);
+    assert_eq!(moved_span, (span.0 + 10.0, span.1 + 5.0, span.2, span.3));
+    assert_eq!(
+        moved_inner,
+        (inner.0 + 10.0, inner.1 + 5.0, inner.2, inner.3)
+    );
+}
+
+#[test]
+fn inline_level_abspos_static_position_follows_floats_and_text_align() {
+    use w3cos_std::style::{Float, Position, TextAlign, TextDirection};
+    let case = |direction: TextDirection, text_align: TextAlign, float: Float| {
+        let container = node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                direction,
+                text_align,
+                ..block()
+            },
+            vec![
+                node(sized(50.0), vec![]),
+                node(
+                    Style {
+                        float,
+                        width: Dimension::Px(50.0),
+                        height: Dimension::Px(50.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+                node(
+                    Style {
+                        display: Display::Inline,
+                        position: Position::Absolute,
+                        width: Dimension::Px(20.0),
+                        height: Dimension::Px(20.0),
+                        direction,
+                        text_align,
+                        ..Style::default()
+                    },
+                    vec![],
+                ),
+            ],
+        );
+        let root = node(block(), vec![container]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "inline-level abspos outside NG"
+        );
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("inline-level abspos");
+        let (x, y, _, _) = rect(&out, 4);
+        (x, y)
+    };
+    let (ltr, rtl) = (TextDirection::Ltr, TextDirection::Rtl);
+    // The opportunity beside the float is [50, 100] (left float) or
+    // [0, 50] (right float); ltr places the left edge, rtl the right edge.
+    assert_eq!(case(ltr, TextAlign::Left, Float::Left), (50.0, 50.0));
+    assert_eq!(case(ltr, TextAlign::Center, Float::Left), (75.0, 50.0));
+    assert_eq!(case(ltr, TextAlign::Right, Float::Right), (50.0, 50.0));
+    assert_eq!(case(rtl, TextAlign::Right, Float::Right), (30.0, 50.0));
+    assert_eq!(case(rtl, TextAlign::Left, Float::Right), (-20.0, 50.0));
+    assert_eq!(case(rtl, TextAlign::Center, Float::Left), (55.0, 50.0));
+}
+
+/// css-sizing-4 aspect-ratio on non-replaced blocks (block-aspect-ratio-*
+/// WPT, Blink ComputeBlockSizeFromAspectRatio).
+#[test]
+fn block_aspect_ratio_sizes_the_auto_axis() {
+    use w3cos_std::style::CustomProperties;
+    fn ratio(mut style: Style, value: &str, auto: bool) -> Style {
+        let mut props = vec![(
+            "--w3cos-internal-aspect-ratio".to_string(),
+            value.to_string(),
+        )];
+        if auto {
+            props.push((
+                "--w3cos-internal-aspect-ratio-auto".to_string(),
+                "1".to_string(),
+            ));
+        }
+        style.custom_properties = Some(CustomProperties::from_iter(props));
+        style
+    }
+    let lay = |root: &Component| {
+        let flat = pre_flatten(root);
+        assert!(block::unsupported_reasons(&flat).is_empty());
+        let mut out = layout_tree(root, &flat, 800.0, 600.0).expect("ng layout");
+        out.sort_by_key(|(_, i)| *i);
+        out
+    };
+    let pad_left = Edges {
+        left: px(50.0),
+        ..margins(0.0, 0.0, 0.0, 0.0)
+    };
+    let root = node(
+        block(),
+        vec![
+            // Width 100, 1/1: height 100.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        ..block()
+                    },
+                    "1",
+                    false,
+                ),
+                vec![],
+            ),
+            // Height 100, auto width: width 100 from the ratio.
+            node(ratio(sized(100.0), "1", false), vec![]),
+            // Border-box 100 wide, 2/1: border-box height 50.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        padding: pad_left,
+                        box_sizing: BoxSizing::BorderBox,
+                        ..block()
+                    },
+                    "2",
+                    false,
+                ),
+                vec![],
+            ),
+            // `auto 1/1` uses the 50px content box whatever box-sizing says.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        padding: pad_left,
+                        box_sizing: BoxSizing::BorderBox,
+                        ..block()
+                    },
+                    "1",
+                    true,
+                ),
+                vec![],
+            ),
+            // Content taller than the ratio grows the box (automatic
+            // minimum); min-height: 0 removes that floor.
+            node(
+                ratio(
+                    Style {
+                        width: Dimension::Px(100.0),
+                        ..block()
+                    },
+                    "4",
+                    false,
+                ),
+                vec![node(sized(60.0), vec![])],
+            ),
+            // max-height 25 transfers a 100px max-width to a stretched box.
+            node(
+                ratio(
+                    Style {
+                        max_height: Dimension::Px(25.0),
+                        ..block()
+                    },
+                    "4",
+                    false,
+                ),
+                vec![],
+            ),
+        ],
+    );
+    let out = lay(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 100.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 3), (0.0, 200.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 4), (0.0, 250.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 5), (0.0, 300.0, 100.0, 60.0));
+    assert_eq!(rect(&out, 7), (0.0, 360.0, 100.0, 25.0));
+}
+
+/// `min-width: fit-content` on a fixed-width block-level flex container
+/// resolves against the line's available width less its computed margins,
+/// not its over-constrained used margins (flex-minimum-width-flex-items-014).
+#[test]
+fn flex_min_width_fit_content_uses_available_width() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let child = || {
+        node(
+            Style {
+                width: Dimension::Px(20.0),
+                ..sized(20.0)
+            },
+            vec![],
+        )
+    };
+    for (outer, expected) in [(800.0, 40.0), (30.0, 30.0), (10.0, 20.0)] {
+        let mut flex = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Wrap,
+            width: Dimension::Px(10.0),
+            ..Style::default()
+        };
+        flex.custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-min-width-keyword".into(),
+                "fit-content".into(),
+            );
+        let wrapper = Style {
+            width: Dimension::Px(outer),
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(wrapper, vec![node(flex, vec![child(), child()])])],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&ng, 2).2, expected, "outer {outer}");
+    }
+}
+
+/// A `width: min-content` block holding a `height: 100%` row flex
+/// container whose only item is an empty `aspect-ratio: 1` box: the
+/// stretched item's 50px height transfers to a 50px min-content width
+/// (aspect-ratio-intrinsic-size-005).
+#[test]
+fn flex_stretched_aspect_ratio_item_min_content_width() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let mut item = Style::default();
+    item.custom_properties
+        .get_or_insert_with(Default::default)
+        .insert("--w3cos-internal-aspect-ratio".into(), "1".into());
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Row,
+        flex_wrap: FlexWrap::NoWrap,
+        height: Dimension::Percent(100.0),
+        ..Style::default()
+    };
+    let mut wrapper = Style {
+        height: Dimension::Px(50.0),
+        ..block()
+    };
+    wrapper
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(
+            "--w3cos-internal-width-keyword".into(),
+            "min-content".into(),
+        );
+    let root = node(
+        block(),
+        vec![node(wrapper, vec![node(flex, vec![node(item, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 50.0);
+    assert_eq!(rect(&ng, 2).2, 50.0);
+    assert_eq!(rect(&ng, 3), (0.0, 0.0, 50.0, 50.0));
+}
+
+fn with_markers(mut style: Style, markers: &[(&str, &str)]) -> Style {
+    let props = style.custom_properties.get_or_insert_with(Default::default);
+    for (key, value) in markers {
+        props.insert((*key).into(), (*value).into());
+    }
+    style
+}
+
+/// A `width: min-content` block sizes to its block child's width
+/// transferred from a definite height through `aspect-ratio`, and a
+/// `width: min-content` aspect-ratio box with a definite height is that
+/// transferred width, floored by its content under `min-width: auto`
+/// (css-sizing aspect-ratio/intrinsic-size-001, -004, -010, -014).
+#[test]
+fn block_min_content_uses_aspect_ratio_with_definite_height() {
+    let ratio = |r: &str, height: f32| {
+        with_markers(
+            Style {
+                height: Dimension::Px(height),
+                ..block()
+            },
+            &[("--w3cos-internal-aspect-ratio", r)],
+        )
+    };
+    let min_content =
+        |style: Style| with_markers(style, &[("--w3cos-internal-width-keyword", "min-content")]);
+    let wide = || {
+        node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(1.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            // 001: auto-width child, 100px tall, 1/1.
+            node(
+                min_content(Style {
+                    height: Dimension::Px(100.0),
+                    ..block()
+                }),
+                vec![node(ratio("1", 100.0), vec![])],
+            ),
+            // 004: min-content width, 50px tall, 2/1.
+            node(min_content(ratio("2", 50.0)), vec![]),
+            // 010: 25px tall, 1/1, 100px-wide content.
+            node(min_content(ratio("1", 25.0)), vec![wide()]),
+            // 014: min-content block around a min-content 1/1 child.
+            node(
+                min_content(block()),
+                vec![node(min_content(ratio("1", 100.0)), vec![])],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0, "001 outer");
+    assert_eq!(rect(&ng, 2).2, 100.0, "001 child");
+    assert_eq!(rect(&ng, 3).2, 100.0, "004");
+    assert_eq!(rect(&ng, 4).2, 100.0, "010");
+    assert_eq!(rect(&ng, 6).2, 100.0, "014 outer");
+    assert_eq!(rect(&ng, 7).2, 100.0, "014 child");
+}
+
+/// `min-height: max-content` floors and `max-height: max-content` caps a
+/// block's specified height at its content height (css-sizing
+/// block-size-with-min-or-max-content-2, -3).
+#[test]
+fn block_height_limited_by_intrinsic_min_max_height_keywords() {
+    let tall = || {
+        node(
+            Style {
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let sized = |height: f32, key: &str| {
+        with_markers(
+            Style {
+                height: Dimension::Px(height),
+                ..block()
+            },
+            &[(key, "max-content")],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            node(
+                sized(0.0, "--w3cos-internal-min-height-keyword"),
+                vec![tall()],
+            ),
+            node(
+                sized(200.0, "--w3cos-internal-max-height-keyword"),
+                vec![tall()],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).3, 100.0, "min-height floor");
+    assert_eq!(rect(&ng, 3).3, 100.0, "max-height cap");
+    assert_eq!(rect(&ng, 3).1, 100.0, "next block follows the capped one");
+}
+
+/// An absolutely positioned box's specified width and height are limited
+/// by intrinsic min/max-width and min/max-height keywords (css-sizing
+/// block-size-with-min-or-max-content-6, -7).
+#[test]
+fn abspos_size_limited_by_intrinsic_min_max_keywords() {
+    let square = || {
+        node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let abspos = |size: f32, prefix: &str| {
+        with_markers(
+            Style {
+                position: w3cos_std::style::Position::Absolute,
+                width: Dimension::Px(size),
+                height: Dimension::Px(size),
+                ..block()
+            },
+            &[
+                (
+                    &format!("--w3cos-internal-{prefix}-width-keyword"),
+                    "max-content",
+                ),
+                (
+                    &format!("--w3cos-internal-{prefix}-height-keyword"),
+                    "max-content",
+                ),
+            ],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            node(abspos(0.0, "min"), vec![square()]),
+            node(abspos(200.0, "max"), vec![square()]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    for (index, label) in [(1, "min"), (3, "max")] {
+        assert_eq!(rect(&ng, index).2, 100.0, "{label} width");
+        assert_eq!(rect(&ng, index).3, 100.0, "{label} height");
+    }
+}
+
+/// A replaced box's intrinsic min/max keywords resolve to the size it has
+/// with that axis auto, here a 10x10 canvas's other axis through its
+/// ratio (css-sizing replaced-max-height-min-content,
+/// replaced-min-width-min-content).
+#[test]
+fn replaced_size_limited_by_intrinsic_min_max_keywords() {
+    let canvas = |width: f32, height: f32, key: &str| {
+        Component::canvas(
+            10,
+            10,
+            with_markers(
+                Style {
+                    display: Display::Block,
+                    width: Dimension::Px(width),
+                    height: Dimension::Px(height),
+                    ..Style::default()
+                },
+                &[(key, "min-content")],
+            ),
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            canvas(100.0, 1000.0, "--w3cos-internal-max-height-keyword"),
+            canvas(10.0, 100.0, "--w3cos-internal-min-width-keyword"),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "max-height");
+    assert_eq!(rect(&ng, 2), (0.0, 100.0, 100.0, 100.0), "min-width");
+}
+
+/// A column flex item's intrinsic `max-height` keyword caps its main size
+/// at its content block size (css-flexbox flex-item-max-height-min-content).
+#[test]
+fn column_flex_item_max_height_keyword_caps_main_size() {
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(200.0),
+        ..Style::default()
+    };
+    let item = with_markers(
+        Style {
+            flex_basis: Dimension::Px(200.0),
+            ..Style::default()
+        },
+        &[("--w3cos-internal-max-height-keyword", "min-content")],
+    );
+    let content = Style {
+        height: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![node(item, vec![node(content, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// `min-width: fit-content` contributes the box's max-content size under a
+/// max-content constraint, so a fit-content parent of a 10px box holding
+/// two 50px floats is 100px wide, and so is the box
+/// (css-sizing fit-content-min-inline-size).
+#[test]
+fn min_width_fit_content_contributes_max_content() {
+    use w3cos_std::style::Float;
+    let float = || {
+        node(
+            Style {
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(10.0),
+                float: Float::Left,
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let inner = with_markers(
+        Style {
+            width: Dimension::Px(10.0),
+            ..block()
+        },
+        &[("--w3cos-internal-min-width-keyword", "fit-content")],
+    );
+    let parent = with_markers(
+        block(),
+        &[("--w3cos-internal-width-keyword", "fit-content")],
+    );
+    let root = node(
+        block(),
+        vec![node(parent, vec![node(inner, vec![float(), float()])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0, "parent");
+    assert_eq!(rect(&ng, 2).2, 100.0, "box");
+}
+
+/// `height: fit-content` on an absolutely positioned box with both
+/// vertical insets is its content height, not the inset-stretched height;
+/// the auto margins then share the (negative) remainder
+/// (css-sizing fit-content-block-size-abspos).
+#[test]
+fn abspos_height_keyword_is_content_height() {
+    use w3cos_std::style::{Edges, Spacing};
+    let abspos = with_markers(
+        Style {
+            position: w3cos_std::style::Position::Absolute,
+            top: Dimension::Percent(50.0),
+            bottom: Dimension::Px(0.0),
+            margin: Edges {
+                top: Spacing::Auto,
+                right: Spacing::Auto,
+                bottom: Spacing::Auto,
+                left: Spacing::Auto,
+            },
+            ..block()
+        },
+        &[("--w3cos-internal-height-keyword", "fit-content")],
+    );
+    let content = Style {
+        width: Dimension::Px(50.0),
+        height: Dimension::Px(540.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(abspos, vec![node(content, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 180.0, 50.0, 540.0));
+}
+
+/// Intrinsic `max-width` keywords on a box with an aspect ratio and a
+/// definite height resolve against its transferred inline size, border-box
+/// edges included (css-sizing border-box-and-max-content-002).
+#[test]
+fn max_width_keyword_uses_aspect_ratio_size() {
+    use w3cos_std::style::{BoxSizing, Edges, Spacing};
+    let item = with_markers(
+        Style {
+            height: Dimension::Px(500.0),
+            box_sizing: BoxSizing::BorderBox,
+            padding: Edges {
+                top: Spacing::Px(10.0),
+                right: Spacing::Px(20.0),
+                bottom: Spacing::Px(10.0),
+                left: Spacing::Px(20.0),
+            },
+            ..block()
+        },
+        &[
+            ("--w3cos-internal-aspect-ratio", "1"),
+            ("--w3cos-internal-max-width-keyword", "max-content"),
+        ],
+    );
+    let wrapper = with_markers(
+        block(),
+        &[("--w3cos-internal-width-keyword", "max-content")],
+    );
+    let root = node(block(), vec![node(wrapper, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 500.0, "wrapper");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 500.0, 500.0), "item");
+}
+
+/// A block canvas with `width: 100%` is a compressible replaced element:
+/// its min-content contribution is zero and its max-content contribution
+/// its natural width, so a shrink-to-fit abspos box stays on NG
+/// (css-sizing keyword-sizes-on-abspos).
+#[test]
+fn abspos_shrink_to_fit_around_percent_width_canvas() {
+    use w3cos_std::style::Position;
+    let canvas = Style {
+        width: Dimension::Percent(100.0),
+        ..block()
+    };
+    let holder = |abs: Style| {
+        node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(1000.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![node(abs, vec![Component::canvas(300, 150, canvas.clone())])],
+        )
+    };
+    let abs = Style {
+        position: Position::Absolute,
+        left: Dimension::Px(0.0),
+        ..block()
+    };
+    let min = with_markers(
+        abs.clone(),
+        &[("--w3cos-internal-width-keyword", "min-content")],
+    );
+    let root = node(block(), vec![holder(abs), holder(min)]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 1200.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 300.0, "fit-content abspos");
+    assert_eq!(rect(&ng, 3).2, 300.0, "canvas fills it");
+    assert_eq!(rect(&ng, 5).2, 0.0, "min-content abspos");
+    assert_eq!(rect(&ng, 6).2, 0.0, "canvas compresses");
+}
+
+/// A canvas whose `height: 100%` was lowered to the computed-percent marker
+/// resolves it against an inset-stretched abspos height, both in layout and
+/// in the abspos box's shrink-to-fit width (intrinsic-percent-replaced-005).
+#[test]
+fn abspos_stretched_height_is_percentage_basis_for_intrinsic_width() {
+    use w3cos_std::style::Position;
+    let canvas = with_markers(
+        block(),
+        &[("--w3cos-internal-computed-height-percent", "100")],
+    );
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(500.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    position: Position::Absolute,
+                    left: Dimension::Px(0.0),
+                    top: Dimension::Px(0.0),
+                    bottom: Dimension::Px(0.0),
+                    ..block()
+                },
+                vec![Component::canvas(300, 150, canvas)],
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 200.0, 100.0), "abspos");
+    assert_eq!(rect(&ng, 3), (0.0, 0.0, 200.0, 100.0), "canvas");
+}
+
+/// A `calc()` of a percentage and a px length resolves against the
+/// containing block in block layout, and as a flex item's specified size
+/// suggestion (flexbox-min-width-auto-001).
+#[test]
+fn calc_percent_plus_px_sizes() {
+    use w3cos_std::style::Display;
+    let calc = |percent: f32, px: f32| Dimension::Calc { percent, px };
+    let sized = Style {
+        width: calc(10.0, 50.0),
+        height: Dimension::Px(5.0),
+        ..block()
+    };
+    let half = Style {
+        width: Dimension::Px(300.0),
+        max_width: calc(50.0, -10.0),
+        height: Dimension::Px(5.0),
+        ..block()
+    };
+    let item = Style {
+        flex_shrink: 1.0,
+        width: calc(10.0, 50.0),
+        ..block()
+    };
+    let wide = Style {
+        width: Dimension::Px(80.0),
+        height: Dimension::Px(10.0),
+        ..block()
+    };
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Row,
+        width: Dimension::Px(1.0),
+        ..block()
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![
+            node(sized, vec![]),
+            node(half, vec![]),
+            node(flex, vec![node(item, vec![node(wide, vec![])])]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 90.0, "calc(10% + 50px)");
+    assert_eq!(rect(&ng, 2).2, 190.0, "max-width calc(50% - 10px)");
+    let flexed = rect(&ng, 4).2;
+    assert!((flexed - 50.1).abs() < 0.02, "flex item min-width {flexed}");
+}
+
+/// CSS Flexbox §9.9.1 (flex intrinsic-size row-002..004): a floated row
+/// container takes its items' flex base sizes when they cannot shrink (min-
+/// and max-content) or grow, whatever their contents contribute.
+#[test]
+fn floated_flex_row_uses_item_flex_base_sizes() {
+    use w3cos_std::style::{Display, Float};
+    let width_of = |grow: f32, shrink: f32, inner: Option<f32>, min_zero: bool| {
+        let mut item = Style {
+            flex_grow: grow,
+            flex_shrink: shrink,
+            flex_basis: Dimension::Px(100.0),
+            ..block()
+        };
+        if min_zero {
+            item.min_width = Dimension::Px(0.0);
+        }
+        let kids = inner
+            .map(|w| {
+                vec![node(
+                    Style {
+                        width: Dimension::Px(w),
+                        ..block()
+                    },
+                    vec![],
+                )]
+            })
+            .unwrap_or_default();
+        let flex = Style {
+            display: Display::Flex,
+            flex_direction: w3cos_std::style::FlexDirection::Row,
+            float: Float::Left,
+            height: Dimension::Px(100.0),
+            ..block()
+        };
+        let root = node(
+            Style {
+                width: Dimension::Px(0.0),
+                ..block()
+            },
+            vec![node(flex, vec![node(item, kids)])],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        rect(&ng, 1).2
+    };
+    // row-003: `flex: 1 0 100px`, empty, in a zero-width parent.
+    assert_eq!(width_of(1.0, 0.0, None, false), 100.0);
+    // row-004: `flex: 0 1 100px; min-width: 0` around a 200px child.
+    assert_eq!(width_of(0.0, 1.0, Some(200.0), true), 100.0);
+}
+
+/// A size-contained replaced box takes `contain-intrinsic-size` instead of
+/// its natural size or ratio, per auto axis (contain-intrinsic-size-012).
+#[test]
+fn size_contained_image_uses_contain_intrinsic_size() {
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let mut auto = Style {
+        display: w3cos_std::style::Display::Block,
+        ..block()
+    };
+    mark(
+        &mut auto,
+        &[
+            ("--w3cos-internal-size-containment", "1"),
+            ("--w3cos-internal-contain-intrinsic-size", "100 200"),
+        ],
+    );
+    let mut fixed = auto.clone();
+    fixed.width = Dimension::Px(30.0);
+    let root = node(
+        block(),
+        vec![
+            Component::image("missing.png", auto),
+            Component::image("missing.png", fixed),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (_, _, w, h) = rect(&ng, 1);
+    assert_eq!((w, h), (100.0, 200.0), "both axes from the override");
+    let (_, _, w, h) = rect(&ng, 2);
+    assert_eq!((w, h), (30.0, 200.0), "no ratio transfers the width");
+}
+
+/// A mixed `calc()` margin resolves its percentage against the containing
+/// block's width, and against zero for intrinsic sizing, which leaves the
+/// length (css-sizing/calc-margins-*, grid-calc-margin).
+#[test]
+fn calc_margins_resolve_percent_and_zero_for_intrinsic() {
+    use w3cos_std::style::Display;
+    let calc = Spacing::Calc {
+        percent: 10.0,
+        px: 100.0,
+    };
+    let mut fixed_child = Style {
+        height: Dimension::Px(5.0),
+        ..block()
+    };
+    fixed_child.margin.left = calc;
+    let mut shrink_child = fixed_child.clone();
+    shrink_child.height = Dimension::Auto;
+    let mark = |style: &mut Style, pairs: &[(&str, &str)]| {
+        let props = style.custom_properties.get_or_insert_with(Default::default);
+        for (k, v) in pairs {
+            props.insert((*k).into(), (*v).into());
+        }
+    };
+    let mut shrink = Style {
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    mark(
+        &mut shrink,
+        &[("--w3cos-internal-width-keyword", "min-content")],
+    );
+    let mut flex = Style {
+        display: Display::Flex,
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    mark(
+        &mut flex,
+        &[("--w3cos-internal-width-keyword", "min-content")],
+    );
+    let root = node(
+        Style {
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![
+            node(block(), vec![node(fixed_child, vec![])]),
+            node(shrink, vec![node(shrink_child.clone(), vec![])]),
+            node(flex, vec![node(shrink_child, vec![])]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).0, 140.0, "10% of 400 + 100");
+    assert_eq!(rect(&ng, 3).2, 100.0, "min-content block against zero");
+    assert_eq!(rect(&ng, 5).2, 100.0, "min-content flex against zero");
+}
+
+/// A replaced row flex item's content size suggestion is its natural width
+/// at its definite height, not its specified `width`, which only caps it
+/// (flexbox-min-width-auto-002a).
+#[test]
+fn flex_replaced_item_min_width_auto_ignores_its_width() {
+    use w3cos_std::style::Display;
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Row,
+        width: Dimension::Px(0.0),
+        ..block()
+    };
+    let canvas = |width: f32| Style {
+        flex_shrink: 1.0,
+        width: Dimension::Px(width),
+        height: Dimension::Px(30.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            node(flex.clone(), vec![Component::canvas(16, 16, canvas(100.0))]),
+            node(flex, vec![Component::canvas(16, 16, canvas(20.0))]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 30.0, "transferred from height 30");
+    assert_eq!(rect(&ng, 4).2, 20.0, "specified width caps it");
+}
+
+/// The column counterpart: the natural height at the definite width
+/// (flexbox-min-height-auto-002a).
+#[test]
+fn flex_replaced_item_min_height_auto_ignores_its_height() {
+    use w3cos_std::style::Display;
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Column,
+        height: Dimension::Px(1.0),
+        ..block()
+    };
+    let canvas = Style {
+        flex_shrink: 1.0,
+        width: Dimension::Px(30.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![Component::canvas(16, 16, canvas)])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).3, 30.0, "transferred from width 30");
+}
+
+/// gap-003/008 pair a `block-size` the cascade ignores with `calc()` item
+/// widths; both sides stay on legacy together.
+#[test]
+fn flex_container_with_logical_size_and_calc_items_stays_on_legacy() {
+    use w3cos_std::style::{CustomProperties, Display};
+    let mut container = Style {
+        display: Display::Flex,
+        ..block()
+    };
+    container.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-logical-size-block-size".to_string(),
+        "100px".to_string(),
+    )]));
+    let item = Style {
+        width: Dimension::Calc {
+            percent: 50.0,
+            px: -10.0,
+        },
+        ..block()
+    };
+    let root = node(container, vec![node(item, vec![])]);
+    let flat = pre_flatten(&root);
+    assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
+}
+
+#[test]
+fn column_percent_descendant_keeps_the_container_on_legacy() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let column = |inner_percent: bool, height: Dimension| {
+        let item1 = Style {
+            flex_basis: Dimension::Percent(100.0),
+            flex_shrink: 1.0,
+            ..block()
+        };
+        let item2 = Style {
+            flex_grow: 1.0,
+            flex_basis: Dimension::Px(30.0),
+            ..block()
+        };
+        let inner = Style {
+            height: if inner_percent {
+                Dimension::Percent(100.0)
+            } else {
+                Dimension::Auto
+            },
+            min_height: Dimension::Px(100.0),
+            ..block()
+        };
+        let col = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            width: Dimension::Px(100.0),
+            height,
+            ..block()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                col,
+                vec![node(item1, vec![]), node(item2, vec![node(inner, vec![])])],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        flex::container_reason(&flat, 1)
+    };
+    // The item's own percentage resolves against a length height.
+    assert_eq!(column(false, Dimension::Px(100.0)), None);
+    // Without a definite height it cycles through the automatic minimum.
+    assert_eq!(column(false, Dimension::Auto), Some("flex:column-percent"));
+    // A percentage further down resolves against the flexed size.
+    assert_eq!(
+        column(true, Dimension::Px(100.0)),
+        Some("flex:column-percent")
+    );
+}
+
+#[test]
+fn column_item_automatic_minimum_counts_child_min_height() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let item1 = Style {
+        flex_basis: Dimension::Px(100.0),
+        flex_shrink: 1.0,
+        ..block()
+    };
+    let item2 = Style {
+        flex_grow: 1.0,
+        flex_shrink: 0.0,
+        flex_basis: Dimension::Px(30.0),
+        ..block()
+    };
+    let inner = Style {
+        min_height: Dimension::Px(100.0),
+        ..block()
+    };
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            col,
+            vec![node(item1, vec![]), node(item2, vec![node(inner, vec![])])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // The second item's content minimum is its child's 100px min-height,
+    // so the first item shrinks to nothing (019's layout).
+    assert_eq!(rect(&ng, 2).3, 0.0);
+    assert_eq!(rect(&ng, 3).3, 100.0);
+}
+
+/// A border-box image's lengths include its border and padding
+/// (box-sizing-replaced-001, flex-aspect-ratio-img-row-005).
+#[test]
+fn border_box_image_sizes_include_border_and_padding() {
+    use w3cos_std::style::{BoxSizing, Display, Spacing};
+    let base = Style {
+        display: Display::Block,
+        box_sizing: BoxSizing::BorderBox,
+        padding: w3cos_std::style::Edges {
+            top: Spacing::Px(5.0),
+            right: Spacing::Px(5.0),
+            bottom: Spacing::Px(5.0),
+            left: Spacing::Px(5.0),
+        },
+        ..block()
+    };
+    let plain = Style {
+        width: Dimension::Px(150.0),
+        height: Dimension::Px(100.0),
+        ..base.clone()
+    };
+    let limited = Style {
+        width: Dimension::Px(150.0),
+        height: Dimension::Px(100.0),
+        max_width: Dimension::Px(60.0),
+        min_height: Dimension::Px(120.0),
+        ..base.clone()
+    };
+    let root = node(
+        block(),
+        vec![
+            Component::image("missing.png", plain),
+            Component::image("missing.png", limited),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (_, _, w, h) = rect(&ng, 1);
+    assert_eq!((w, h), (150.0, 100.0));
+    let (_, _, w, h) = rect(&ng, 2);
+    assert_eq!((w, h), (60.0, 120.0));
+}
+
 /// `display: -webkit-box; -webkit-box-orient: vertical` lays out as a block
 /// flow root, and `-webkit-line-clamp: N` keeps its first N lines with an
 /// ellipsis on the last. Expected border boxes measured in headless Chrome
@@ -4224,6 +7354,633 @@ fn webkit_box_vertical_clamps_lines() {
     }
 }
 
+/// A column flex item's flexed size is not a percentage basis for its
+/// children while the container's height is indefinite
+/// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.
+#[test]
+fn indefinite_column_item_children_percent_is_auto() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let item = Style {
+        height: Dimension::Px(100.0),
+        min_height: Dimension::Px(0.0),
+        custom_properties: Some(
+            [(
+                "--w3cos-internal-flex-basis-content".to_string(),
+                "1".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        ..block()
+    };
+    let green = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let red = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(100.0),
+        ..block()
+    };
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            col,
+            vec![node(item, vec![node(green, vec![]), node(red, vec![])])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(flex::container_reason(&flat, 1), None);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (_, _, _, h) = rect(&ng, 2);
+    assert_eq!(h, 100.0, "the item keeps its specified height");
+    let (_, y, _, h) = rect(&ng, 4);
+    assert_eq!((y, h), (100.0, 0.0), "the percentage is auto");
+}
+
+/// A vertical `-webkit-box` whose children are all in-flow blocks is the
+/// block flow root its legacy lowering (a flex row of one item) paints the
+/// same way (webkit-line-clamp-039). The clamp reaches only its own lines.
+#[test]
+fn vertical_webkit_box_with_block_child_is_a_flow_root() {
+    use w3cos_std::style::CustomProperties;
+    let mut boxed = Style {
+        display: Display::Flex,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    boxed.custom_properties = Some(CustomProperties::from_iter([
+        (
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "-webkit-box".to_string(),
+        ),
+        (
+            "--w3cos-internal-webkit-box-orient".to_string(),
+            "vertical".to_string(),
+        ),
+        (
+            "--w3cos-internal-webkit-line-clamp".to_string(),
+            "5".to_string(),
+        ),
+    ]));
+    let child = Style {
+        height: Dimension::Px(30.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(boxed, vec![node(child, vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 200.0, 30.0));
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 200.0, 30.0));
+}
+
+/// A column item's automatic minimum counts adjacent inline text nodes as one
+/// line, so `XXX` followed by a whitespace text node does not double the
+/// nested column's height (flex-direction-column-overlap-001).
+#[test]
+fn column_item_min_content_counts_adjacent_text_nodes_as_one_line() {
+    use w3cos_std::style::FlexDirection;
+    let txt = |s: &str| {
+        Component::text(
+            s,
+            Style {
+                display: Display::Inline,
+                font_size: 18.0,
+                font_family: Some("serif".into()),
+                ..Style::default()
+            },
+        )
+    };
+    let mk = |st: Style| {
+        with_markers(
+            st,
+            &[("--w3cos-internal-inline-formatting-context", "true")],
+        )
+    };
+    let col = || Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        font_size: 18.0,
+        ..block()
+    };
+    let flex = Style {
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        flex_basis: Dimension::Percent(0.0),
+        min_height: Dimension::Px(0.0),
+        font_size: 18.0,
+        ..block()
+    };
+    let inner = node(
+        col(),
+        vec![
+            node(mk(flex), vec![txt("XXX"), txt(" ")]),
+            node(mk(block()), vec![txt("YYY")]),
+        ],
+    );
+    let root = node(block(), vec![node(col(), vec![inner])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert!((rect(&ng, 3).3 - 21.6).abs() < 0.1, "{:?}", rect(&ng, 3));
+    assert!((rect(&ng, 2).3 - 43.2).abs() < 0.2, "{:?}", rect(&ng, 2));
+}
+
+fn stretch(axes: &str, style: Style) -> Style {
+    with_markers(style, &[("--w3cos-internal-stretch", axes)])
+}
+
+/// `width: stretch` fills the containing block's content box minus the
+/// margins (CSS Sizing 4 stretch-fit sizing); `min-width: stretch` lifts a
+/// narrower `width`; the block size is the containing block's definite
+/// height, ignoring block margins that collapse with the parent's.
+#[test]
+fn stretch_sizes_block_children_against_the_content_box() {
+    let child = |axes: &str, style: Style| node(stretch(axes, style), vec![]);
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                ..block()
+            },
+            vec![child(
+                "w,h",
+                Style {
+                    margin: margins(10.0, 20.0, 10.0, 10.0),
+                    border_width: 2.0,
+                    padding: margins(3.0, 3.0, 3.0, 3.0),
+                    ..block()
+                },
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // 100 - 10 - 20 wide; the block margins collapse through the parent.
+    assert_eq!(rect(&out, 2), (10.0, 10.0, 70.0, 100.0));
+
+    // A parent bottom border keeps the child's bottom margin in the size.
+    let root = node(
+        block(),
+        vec![node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                border_bottom_width: Some(5.0),
+                ..block()
+            },
+            vec![child(
+                "h",
+                Style {
+                    margin: margins(10.0, 0.0, 10.0, 0.0),
+                    ..block()
+                },
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 2).3, 90.0);
+
+    // An indefinite containing block height leaves `height: stretch` auto.
+    let root = node(
+        Style {
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(stretch("h", block()), vec![node(sized(20.0), vec![])])],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 1).3, 20.0);
+
+    // `min-width: stretch` beats a narrower `width`.
+    let root = node(
+        Style {
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![child(
+            "minw",
+            Style {
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(10.0),
+                ..block()
+            },
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 1).2, 100.0);
+}
+
+/// A flex item's `width: stretch` fills the container's content box, and a
+/// flow-root box beside a float stretches into the space the float leaves
+/// (also for `min-width` / `max-width`).
+#[test]
+fn stretch_sizes_flex_items_and_boxes_beside_floats() {
+    let root = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: w3cos_std::style::FlexDirection::Row,
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(stretch("w", block()), vec![])],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 1).2, 100.0);
+
+    let beside = |axes: &str, width: Dimension| {
+        node(
+            Style {
+                width: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![
+                node(
+                    Style {
+                        float: w3cos_std::style::Float::Left,
+                        width: Dimension::Px(100.0),
+                        height: Dimension::Px(10.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+                node(
+                    stretch(
+                        axes,
+                        Style {
+                            display: Display::FlowRoot,
+                            width,
+                            height: Dimension::Px(10.0),
+                            ..block()
+                        },
+                    ),
+                    vec![],
+                ),
+            ],
+        )
+    };
+    for (axes, width) in [
+        ("minw", Dimension::Px(0.0)),
+        ("maxw", Dimension::Px(1000.0)),
+        ("w", Dimension::Auto),
+    ] {
+        let root = beside(axes, width);
+        let flat = pre_flatten(&root);
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        assert_eq!(rect(&out, 2), (100.0, 0.0, 100.0, 10.0), "{axes}");
+    }
+
+    let root = node(
+        Style {
+            width: Dimension::Px(200.0),
+            ..block()
+        },
+        vec![
+            node(
+                Style {
+                    float: w3cos_std::style::Float::Left,
+                    width: Dimension::Px(100.0),
+                    height: Dimension::Px(100.0),
+                    ..block()
+                },
+                vec![],
+            ),
+            node(
+                stretch(
+                    "w",
+                    Style {
+                        display: Display::FlowRoot,
+                        height: Dimension::Px(100.0),
+                        ..block()
+                    },
+                ),
+                vec![],
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&out, 2), (100.0, 0.0, 100.0, 100.0));
+}
+
+/// An absolutely positioned `width: stretch` fills the padding box between
+/// its insets; with no insets it starts at its static position.
+#[test]
+fn stretch_fills_an_absolute_box_between_insets() {
+    let abs = |style: Style| {
+        node(
+            stretch(
+                "w",
+                Style {
+                    position: w3cos_std::style::Position::Absolute,
+                    height: Dimension::Px(10.0),
+                    margin: margins(0.0, 3.0, 0.0, 2.0),
+                    ..style
+                },
+            ),
+            vec![],
+        )
+    };
+    let holder = |inner: Component| {
+        node(
+            Style {
+                position: w3cos_std::style::Position::Relative,
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(40.0),
+                padding: Edges {
+                    left: px(5.0),
+                    right: px(5.0),
+                    ..margins(0.0, 0.0, 0.0, 0.0)
+                },
+                ..block()
+            },
+            vec![inner],
+        )
+    };
+    let root = node(
+        block(),
+        vec![
+            holder(abs(Style {
+                left: Dimension::Px(0.0),
+                right: Dimension::Px(0.0),
+                ..block()
+            })),
+            holder(abs(block())),
+            holder(abs(Style {
+                right: Dimension::Px(10.0),
+                ..block()
+            })),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Padding box 60 wide: 60 - 5 margins, then minus the 5px start padding
+    // for the static position, then minus a 10px inset.
+    assert_eq!(rect(&out, 2).2, 55.0);
+    assert_eq!(rect(&out, 4).2, 50.0);
+    assert_eq!(rect(&out, 6).2, 45.0);
+}
+
+/// Inline edges written as `calc(0% + <len>)` are plain lengths: NG lays the
+/// text out with the same box as the `px` edge. An edge with a real
+/// percentage basis is no longer read as zero, so the run is rejected for
+/// the legacy path instead of being laid out without its padding
+/// (css-sizing/inline-intrinsic-size-calc).
+#[test]
+fn inline_zero_percent_calc_edges_are_lengths_and_real_percentages_fall_back() {
+    let inline_text = |left: Spacing, right: Spacing| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        style.padding.left = left;
+        style.margin.right = right;
+        node(block(), vec![Component::text("hi", style)])
+    };
+    let calc0 = inline_text(
+        Spacing::PaddingCalc {
+            percent: 0.0,
+            px: 30.0,
+        },
+        Spacing::Calc {
+            percent: 0.0,
+            px: 12.0,
+        },
+    );
+    let plain = inline_text(Spacing::Px(30.0), Spacing::Px(12.0));
+    for root in [&calc0, &plain] {
+        let flat = pre_flatten(root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    }
+    let calc_out = ng_rects(&calc0);
+    let plain_out = ng_rects(&plain);
+    assert_eq!(rect(&calc_out, 1), rect(&plain_out, 1));
+    assert!(rect(&calc_out, 1).2 >= 30.0, "the 30px padding is laid out");
+
+    let real = inline_text(
+        Spacing::PaddingCalc {
+            percent: 10.0,
+            px: 30.0,
+        },
+        Spacing::Px(0.0),
+    );
+    let flat = pre_flatten(&real);
+    assert!(
+        !block::unsupported_reasons(&flat).is_empty(),
+        "a percentage inline edge must not lay out as zero"
+    );
+}
+
+/// A mixed `calc()` padding resolves its percentage against the containing
+/// block's width and floors at zero (css-sizing/dynamic-change-inline-size,
+/// css-tables/tentative/padding-percentage).
+#[test]
+fn calc_padding_resolves_percent_and_floors_at_zero() {
+    let mut padded = block();
+    padded.padding.left = Spacing::PaddingCalc {
+        percent: 25.0,
+        px: 10.0,
+    };
+    padded.padding.top = Spacing::PaddingCalc {
+        percent: -50.0,
+        px: 100.0,
+    };
+    let root = node(
+        Style {
+            width: Dimension::Px(400.0),
+            ..block()
+        },
+        vec![node(padded, vec![node(sized(20.0), vec![])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let (x, y, w, _) = rect(&ng, 2);
+    assert_eq!(x, 110.0, "25% of 400 + 10");
+    assert_eq!(y, 0.0, "100 - 200 floors at zero");
+    assert_eq!(w, 290.0);
+}
+
+/// An absolutely positioned canvas is a replaced box: it takes its natural
+/// size (or the other axis through its ratio), is never stretched between
+/// its insets, and `stretch` fills the space between them and the margins
+/// (CSS 2.1 10.3.8 and 10.6.5; css-sizing/stretch/positioned-replaced-*).
+/// An element whose only child is that canvas makes no line box, so the
+/// canvas sits at the static position of a zero-sized line.
+#[test]
+fn abspos_replaced_canvas_sizes_and_stretch() {
+    use w3cos_std::style::Position;
+    let holder = |canvas_style: Style| {
+        node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(200.0),
+                height: Dimension::Px(200.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    margin: w3cos_std::style::Edges {
+                        left: Spacing::Px(10.0),
+                        top: Spacing::Px(20.0),
+                        ..Default::default()
+                    },
+                    ..block()
+                },
+                vec![Component::canvas(
+                    50,
+                    25,
+                    Style {
+                        position: Position::Absolute,
+                        display: Display::Inline,
+                        ..canvas_style
+                    },
+                )],
+            )],
+        )
+    };
+    let natural = holder(block());
+    let both_insets = holder(Style {
+        left: Dimension::Px(5.0),
+        right: Dimension::Px(5.0),
+        ..block()
+    });
+    let width_only = holder(Style {
+        width: Dimension::Px(100.0),
+        ..block()
+    });
+    let stretched = holder(stretch(
+        "w,h",
+        Style {
+            left: Dimension::Px(50.0),
+            top: Dimension::Px(50.0),
+            right: Dimension::Px(50.0),
+            bottom: Dimension::Px(50.0),
+            ..block()
+        },
+    ));
+    let static_stretch = holder(stretch("w,h", block()));
+    let root = node(
+        block(),
+        vec![natural, both_insets, width_only, stretched, static_stretch],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 800.0).expect("ng");
+    // Per holder: [holder, wrapper, canvas].
+    let canvas = |i: usize| rect(&ng, 1 + 3 * i + 2);
+    assert_eq!(canvas(0).2, 50.0, "natural width");
+    assert_eq!(canvas(0).3, 25.0, "natural height");
+    assert_eq!(canvas(1).2, 50.0, "not stretched between the insets");
+    assert_eq!(canvas(2).2, 100.0);
+    assert_eq!(canvas(2).3, 50.0, "height through the ratio");
+    assert_eq!((canvas(3).2, canvas(3).3), (100.0, 100.0), "stretched");
+    // Static position: below the wrapper's top margin, after its left margin.
+    assert_eq!(canvas(4).2, 190.0, "stretch from the static left, no inset");
+    assert_eq!(rect(&ng, 2).3, 0.0, "the wrapper makes no line box");
+}
+
+/// A canvas beside text in its parent is an OOF item of an inline
+/// formatting context, which stays on the legacy path.
+#[test]
+fn abspos_replaced_canvas_beside_text_falls_back() {
+    use w3cos_std::style::Position;
+    let root = node(
+        block(),
+        vec![node(
+            block(),
+            vec![
+                Component::text(
+                    "hi",
+                    Style {
+                        display: Display::Inline,
+                        ..Style::default()
+                    },
+                ),
+                Component::canvas(
+                    50,
+                    25,
+                    Style {
+                        position: Position::Absolute,
+                        display: Display::Inline,
+                        ..block()
+                    },
+                ),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(!block::unsupported_reasons(&flat).is_empty());
+}
+
+/// A column flex item with `width: min-content | max-content | fit-content`
+/// sizes its cross axis from the keyword, whether the container aligns to
+/// the start or stretches. Border boxes measured in headless Chrome
+/// (getBoundingClientRect, Ahem 20px/1) in an 80px column:
+/// min-content 40x40 (two lines), max-content 100x20, fit-content 80x60.
+#[test]
+fn flex_column_item_width_keywords_match_chrome() {
+    use w3cos_std::style::AlignItems;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    for align in [AlignItems::FlexStart, AlignItems::Stretch] {
+        let item = |word: &str, text: &str| {
+            let mut style = Style {
+                width: Dimension::Auto,
+                ..font.clone()
+            };
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert("--w3cos-internal-width-keyword".into(), word.into());
+            node(style, vec![Component::text(text, font.clone())])
+        };
+        let column = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            width: Dimension::Px(80.0),
+            align_items: align,
+            ..font.clone()
+        };
+        let root = node(
+            block(),
+            vec![node(
+                column,
+                vec![
+                    item("min-content", "XX XX"),
+                    item("max-content", "XX XX"),
+                    item("fit-content", "XX XX XX"),
+                ],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("stays on NG");
+        assert_eq!(rect(&rects, 2), (0.0, 0.0, 40.0, 40.0), "min-content");
+        assert_eq!(rect(&rects, 4), (0.0, 40.0, 100.0, 20.0), "max-content");
+        assert_eq!(rect(&rects, 6), (0.0, 60.0, 80.0, 60.0), "fit-content");
+    }
+}
+
 /// A text run directly inside a flex container is an anonymous flex item
 /// (CSS Flexbox 4); it is laid out as block text with its min-content as
 /// the automatic minimum. Border boxes measured in headless Chrome
@@ -4264,7 +8021,7 @@ fn flex_text_items_match_chrome() {
             .filter(|(index, want)| rect(rects, *index) != *want)
             .map(|(index, want)| format!("box {index}: {:?} want {want:?}", rect(rects, *index)))
             .collect();
-        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        assert!(bad.is_empty(), "case {}: {}", case.get(), bad.join("\n"));
     };
 
     // row-text: margins on a text item, then a sized one that overflows.
@@ -4453,8 +8210,9 @@ fn flex_text_items_match_chrome() {
     assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
 
     // A text run paints from the top of its rect with no line context, so a
-    // single line carries the font-content-box fragment an IFC line would
-    // (half-leading above the glyphs): 20px Ahem in a 40px line sits at y=10.
+    // single line's node takes the font-content-box rect an IFC line would
+    // (half-leading above the glyphs): 20px Ahem in a 40px line sits at y=10
+    // (`flex::text_item_paint_box`; the paint-rect convention of this branch).
     let normal = Style {
         line_height: 2.0,
         display: Display::Inline,
@@ -4468,22 +8226,9 @@ fn flex_text_items_match_chrome() {
         )],
     );
     let flat = pre_flatten(&root);
-    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+    let (rects, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
         .expect("a single-line text item lays out in NG");
-    check(&rects, &[(2, (0.0, 0.0, 40.0, 40.0))]);
-    let piece = texts
-        .iter()
-        .find(|piece| piece.index == 2)
-        .expect("text item has a line fragment");
-    assert_eq!(
-        (
-            piece.rect.x,
-            piece.rect.y,
-            piece.rect.width,
-            piece.rect.height
-        ),
-        (0.0, 10.0, 40.0, 20.0)
-    );
+    check(&rects, &[(2, (0.0, 10.0, 40.0, 20.0))]);
 }
 
 /// `overflow: auto | scroll` boxes lay out like `overflow: hidden` ones: a
@@ -5241,6 +8986,11 @@ fn inline_svgs_match_chrome() {
         ..font.clone()
     };
     let svg = |w: u32, h: u32, extra: Style| {
+        // The DOM keeps the written width / height as markers (the source
+        // alone cannot tell an authored size from a rasterization size).
+        let mut custom = extra.custom_properties.clone().unwrap_or_default();
+        custom.insert("--w3cos-internal-svg-width".to_string(), w.to_string());
+        custom.insert("--w3cos-internal-svg-height".to_string(), h.to_string());
         Component::svg_document(
             format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\"></svg>"
@@ -5258,6 +9008,17 @@ fn inline_svgs_match_chrome() {
                 font_size: 20.0,
                 line_height: 1.0,
                 line_height_is_normal: false,
+                width: if extra.width == Dimension::Auto {
+                    Dimension::Px(w as f32)
+                } else {
+                    extra.width
+                },
+                height: if extra.height == Dimension::Auto {
+                    Dimension::Px(h as f32)
+                } else {
+                    extra.height
+                },
+                custom_properties: Some(custom),
                 ..extra
             },
         )
@@ -5427,8 +9188,9 @@ fn inline_svgs_match_chrome() {
     assert_eq!(rect(&r, 1), (0.0, 0.0, 300.0, 34.0));
     assert_eq!(rect(&r, 3), (40.0, 0.0, 90.0, 30.0));
 
-    // A viewBox with an auto axis derives from the ratio in Chrome, and the
-    // lowering cannot tell which attributes were authored: legacy keeps it.
+    // A viewBox with an auto axis derives from the ratio in Chrome. The
+    // DOM's width / height markers tell the authored attributes, so this
+    // build lays it out (main's version of this test kept it on legacy).
     let viewbox = Component::svg_document(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"60\" height=\"30\" viewBox=\"0 0 60 30\"></svg>",
         60,
@@ -5450,20 +9212,38 @@ fn inline_svgs_match_chrome() {
         )],
     );
     let flat = pre_flatten(&root);
-    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
-    // A percentage width attribute, a float and a flex item stay on legacy.
+    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_some());
+    // A float stays on legacy.
     let percent = Component::svg_document(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"50%\" height=\"30\"></svg>",
         150,
         30,
         Style {
             display: Display::Inline,
+            width: Dimension::Percent(50.0),
+            height: Dimension::Px(30.0),
+            custom_properties: Some(
+                [
+                    ("--w3cos-internal-svg-width", "50%"),
+                    ("--w3cos-internal-svg-height", "30"),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ),
             ..font.clone()
         },
     );
     let root = node(block(), vec![node(font.clone(), vec![xx(), percent, xx()])]);
     let flat = pre_flatten(&root);
-    assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
+    // Ours resolves the written percentage against the containing block
+    // (main's version of this test kept it on legacy).
+    let (out, _) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng layout");
+    let svg_box = out
+        .iter()
+        .find(|(_, i)| *i == 3)
+        .map(|(r, _)| (r.width, r.height));
+    assert_eq!(svg_box, Some((400.0, 30.0)));
     let floated = svg(
         30,
         20,
@@ -5661,34 +9441,22 @@ fn replaced_flex_grid_items_match_chrome() {
         })],
     );
     assert_eq!(rect(&r, 2), (0.0, 0.0, 100.0, 50.0));
-    // A percentage size in an auto grid track, and an abspos flex container
-    // with an inset-derived height, stay on the legacy engine.
-    for (name, container, child) in [
-        (
-            "grid-max-width",
-            Style {
-                display: Display::Grid,
-                width: Dimension::Px(100.0),
-                ..Style::default()
-            },
-            img(Style {
-                width: Dimension::Px(200.0),
-                max_width: Dimension::Percent(100.0),
-                ..Style::default()
-            }),
-        ),
-        (
-            "abspos-flex",
-            Style {
-                display: Display::Flex,
-                position: Position::Absolute,
-                top: Dimension::Px(0.0),
-                bottom: Dimension::Px(0.0),
-                ..Style::default()
-            },
-            img(Style::default()),
-        ),
-    ] {
+    // A percentage size in an auto grid track stays on the legacy engine (an
+    // abspos flex container's inset-derived height is transferred through the
+    // item's ratio: abspos_flex_row_transfers_inset_height_to_image).
+    for (name, container, child) in [(
+        "grid-max-width",
+        Style {
+            display: Display::Grid,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        },
+        img(Style {
+            width: Dimension::Px(200.0),
+            max_width: Dimension::Percent(100.0),
+            ..Style::default()
+        }),
+    )] {
         let root = node(block(), vec![node(container, vec![child])]);
         let flat = pre_flatten(&root);
         assert!(!block::supports_tree(&flat), "{name} must fall back");
@@ -6441,13 +10209,28 @@ fn grid_lanes_matches_chrome() {
                 String::new(),
             ));
         }
+        if let Some(word) = container["kw"].as_str() {
+            markers.push((
+                "--w3cos-internal-width-keyword".to_string(),
+                word.to_string(),
+            ));
+        }
         let mut style = Style {
             display: Display::Flex,
-            width: Dimension::Px(number(&container["width"]).unwrap_or(200.0)),
+            width: if container["kw"].is_string() {
+                Dimension::Auto
+            } else {
+                Dimension::Px(number(&container["width"]).unwrap_or(200.0))
+            },
             height: number(&container["height"])
                 .map(Dimension::Px)
                 .unwrap_or(Dimension::Auto),
             custom_properties: Some(CustomProperties::from_iter(markers)),
+            position: if container["position"].as_str() == Some("static") {
+                w3cos_std::style::Position::Static
+            } else {
+                w3cos_std::style::Position::Relative
+            },
             ..font.clone()
         };
         if let Some(value) = container["align"].as_str() {
@@ -6456,6 +10239,28 @@ fn grid_lanes_matches_chrome() {
             } else {
                 style.align_items = align_items(value);
             }
+        }
+        if let Some(value) = container["justify"].as_str() {
+            if rows_axis {
+                style.align_items = align_items(value);
+            } else {
+                style.justify_items = align_items(value);
+            }
+        }
+        if let (Some(value), false) = (container["content"].as_str(), rows_axis) {
+            style.align_content = match value {
+                "start" => w3cos_std::style::AlignContent::FlexStart,
+                "center" => w3cos_std::style::AlignContent::Center,
+                "end" => w3cos_std::style::AlignContent::FlexEnd,
+                "space-between" => w3cos_std::style::AlignContent::SpaceBetween,
+                "space-around" => w3cos_std::style::AlignContent::SpaceAround,
+                "space-evenly" => w3cos_std::style::AlignContent::SpaceEvenly,
+                _ => w3cos_std::style::AlignContent::Stretch,
+            };
+        }
+        if let Some(pad) = number(&container["pad"]) {
+            style.padding = margins(pad, 0.0, 0.0, 0.0);
+            style.border_width = 2.0;
         }
         if let Some(gap) = container["gap"].as_array() {
             style.row_gap = number(&gap[0]);
@@ -6480,11 +10285,34 @@ fn grid_lanes_matches_chrome() {
                 order: item["order"].as_i64().unwrap_or(0) as i32,
                 ..font.clone()
             };
+            if let Some(min) = number(&item["min_w"]) {
+                item_style.min_width = Dimension::Px(min);
+            }
             if let Some(value) = item["self"].as_str() {
                 if rows_axis {
                     item_style.justify_self = align_self(value);
                 } else {
                     item_style.align_self = align_self(value);
+                }
+            }
+            if let Some(offsets) = item["abs"].as_object() {
+                item_style.position = w3cos_std::style::Position::Absolute;
+                for (side, value) in offsets {
+                    let value = match value.as_str() {
+                        Some(text) if text.ends_with('%') => {
+                            Dimension::Percent(text.trim_end_matches('%').parse().unwrap())
+                        }
+                        Some(text) => Dimension::Px(text.trim_end_matches("px").parse().unwrap()),
+                        None => Dimension::Px(number(value).unwrap()),
+                    };
+                    match side.as_str() {
+                        "width" => item_style.width = value,
+                        "height" => item_style.height = value,
+                        "left" => item_style.left = value,
+                        "top" => item_style.top = value,
+                        "right" => item_style.right = value,
+                        _ => item_style.bottom = value,
+                    }
                 }
             }
             if let Some(margin) = number(&item["margin"]) {
@@ -6547,4 +10375,256 @@ fn grid_lanes_matches_chrome() {
         }
     }
     assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// max-width-violation.html: an inflexible (clamped) item keeps its max
+/// width and the 0.8-grow sibling takes 0.8 of the remaining 650px.
+#[test]
+fn clamped_inflexible_item_leaves_free_space_to_fractional_grow() {
+    use w3cos_std::style::{FlexDirection, Overflow, Position};
+    let col1 = node(
+        Style {
+            width: Dimension::Px(800.0),
+            max_width: Dimension::Px(150.0),
+            overflow: Overflow::Auto,
+            ..block()
+        },
+        vec![Component::text("Column 1", Style::default())],
+    );
+    let col2 = node(
+        Style {
+            flex_grow: 0.8,
+            flex_shrink: 0.0,
+            flex_basis: Dimension::Px(0.0),
+            ..block()
+        },
+        // Its automatic minimum (60px) must not enter the initial free
+        // space, which counts flex base sizes (CSS Flexbox 9.7.3).
+        vec![node(
+            Style {
+                width: Dimension::Px(60.0),
+                ..sized(10.0)
+            },
+            vec![],
+        )],
+    );
+    let red = node(
+        Style {
+            position: Position::Absolute,
+            width: Dimension::Px(510.0),
+            height: Dimension::Px(10.0),
+            ..block()
+        },
+        vec![],
+    );
+    for with_red in [false, true] {
+        let mut kids = vec![col1.clone(), col2.clone()];
+        if with_red {
+            kids.insert(0, red.clone());
+        }
+        let fc = node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                width: Dimension::Px(800.0),
+                ..Style::default()
+            },
+            kids,
+        );
+        let root = node(block(), vec![fc]);
+        let flat = pre_flatten(&root);
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        let n = if with_red { 3 } else { 2 };
+        eprintln!(
+            "red={with_red} col1={:?} col2={:?}",
+            rect(&ng, n),
+            rect(&ng, n + 2)
+        );
+        assert_eq!(rect(&ng, n).2, 150.0);
+        assert!((rect(&ng, n + 2).2 - 520.0).abs() < 0.01);
+    }
+}
+
+/// A `vertical-lr` / `vertical-rl` block of Latin text in a horizontal
+/// block container (orthogonal flow): inline size from the height (or the
+/// initial containing block's height), lines stacking sideways, text turned
+/// a quarter turn. Expected values are from Chrome 156 with Ahem.
+#[test]
+fn orthogonal_vertical_blocks_match_chrome() {
+    use w3cos_std::style::WritingMode;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let vertical = |mode: WritingMode, height: Option<f32>, width: Option<f32>| {
+        let style = Style {
+            writing_mode: mode,
+            border_width: 2.0,
+            padding: margins(3.0, 1.0, 4.0, 5.0),
+            margin: margins(7.0, 3.0, 2.0, 6.0),
+            height: height.map_or(Dimension::Auto, Dimension::Px),
+            width: width.map_or(Dimension::Auto, Dimension::Px),
+            ..font.clone()
+        };
+        node(
+            style,
+            vec![Component::text(
+                "XXX XX",
+                Style {
+                    display: Display::Inline,
+                    writing_mode: mode,
+                    ..font.clone()
+                },
+            )],
+        )
+    };
+    let root = node(
+        Style { ..font.clone() },
+        vec![
+            vertical(WritingMode::VerticalRl, None, None),
+            vertical(WritingMode::VerticalRl, Some(30.0), None),
+            vertical(WritingMode::VerticalLr, Some(30.0), None),
+            vertical(WritingMode::VerticalLr, Some(30.0), Some(100.0)),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root, then (box, text) pairs at 1,2 / 3,4 / 5,6 / 7,8.
+    let boxed: Vec<_> = [1, 3, 5, 7].iter().map(|i| rect(&rects, *i)).collect();
+    assert_eq!(boxed[0], (6.0, 7.0, 20.0, 71.0));
+    assert_eq!(boxed[1], (6.0, 85.0, 30.0, 41.0));
+    assert_eq!(boxed[2], (6.0, 133.0, 30.0, 41.0));
+    assert_eq!(boxed[3], (6.0, 181.0, 110.0, 41.0));
+    let pieces = |index: usize| -> Vec<[f32; 4]> {
+        texts
+            .iter()
+            .filter(|t| t.index == index)
+            .map(|t| {
+                assert!(t.vertical);
+                [t.rect.x, t.rect.y, t.rect.width, t.rect.height]
+            })
+            .collect()
+    };
+    assert_eq!(pieces(2), vec![[13.0, 12.0, 10.0, 60.0]]);
+    assert_eq!(
+        pieces(4),
+        vec![[23.0, 90.0, 10.0, 30.0], [13.0, 90.0, 10.0, 20.0]]
+    );
+    assert_eq!(
+        pieces(6),
+        vec![[13.0, 138.0, 10.0, 30.0], [23.0, 138.0, 10.0, 20.0]]
+    );
+    assert_eq!(
+        pieces(8),
+        vec![[13.0, 186.0, 10.0, 30.0], [23.0, 186.0, 10.0, 20.0]]
+    );
+}
+
+/// Nested blocks inside orthogonal roots: block-direction margins collapse
+/// along the physical x axis, children stretch to the root's inline size
+/// (its physical height), and `vertical-rl` flows from the right edge.
+#[test]
+fn orthogonal_nested_blocks_match_chrome() {
+    use w3cos_std::style::WritingMode;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text = |mode: WritingMode, s: &str| {
+        Component::text(
+            s,
+            Style {
+                display: Display::Inline,
+                writing_mode: mode,
+                ..font.clone()
+            },
+        )
+    };
+    let build = |mode: WritingMode, first: Style, second: Style, margin: Edges| {
+        node(
+            Style {
+                writing_mode: mode,
+                height: Dimension::Px(100.0),
+                margin,
+                ..font.clone()
+            },
+            vec![
+                node(
+                    Style {
+                        writing_mode: mode,
+                        ..first
+                    },
+                    vec![text(mode, "XXX")],
+                ),
+                node(
+                    Style {
+                        writing_mode: mode,
+                        ..second
+                    },
+                    vec![text(mode, "XX XX")],
+                ),
+            ],
+        )
+    };
+    let rl = build(
+        WritingMode::VerticalRl,
+        Style {
+            margin: margins(0.0, 4.0, 0.0, 6.0),
+            padding: margins(2.0, 3.0, 2.0, 3.0),
+            ..font.clone()
+        },
+        Style {
+            height: Dimension::Px(40.0),
+            margin: margins(0.0, 0.0, 0.0, 5.0),
+            border_width: 1.0,
+            ..font.clone()
+        },
+        margins(5.0, 0.0, 5.0, 0.0),
+    );
+    let lr = build(
+        WritingMode::VerticalLr,
+        Style {
+            margin: margins(0.0, 4.0, 0.0, 6.0),
+            padding: margins(2.0, 3.0, 2.0, 3.0),
+            ..font.clone()
+        },
+        Style {
+            width: Dimension::Px(40.0),
+            margin: margins(5.0, 0.0, 0.0, 0.0),
+            border_width: 1.0,
+            ..font.clone()
+        },
+        margins(9.0, 0.0, 3.0, 0.0),
+    );
+    let root = node(font.clone(), vec![rl, lr]);
+    let flat = pre_flatten(&root);
+    let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0).expect("ng");
+    // 0 root; rl 1 (a1 2 + text 3, a2 4 + text 5); lr 6 (b1 7 + 8, b2 9 + 10).
+    assert_eq!(rect(&rects, 1), (0.0, 5.0, 53.0, 100.0));
+    assert_eq!(rect(&rects, 2), (33.0, 5.0, 16.0, 100.0));
+    assert_eq!(rect(&rects, 4), (5.0, 5.0, 22.0, 42.0));
+    assert_eq!(rect(&rects, 6), (0.0, 114.0, 68.0, 100.0));
+    assert_eq!(rect(&rects, 7), (6.0, 114.0, 16.0, 100.0));
+    assert_eq!(rect(&rects, 9), (26.0, 119.0, 42.0, 95.0));
+    let piece = |index: usize| -> Vec<[f32; 4]> {
+        texts
+            .iter()
+            .filter(|t| t.index == index)
+            .map(|t| [t.rect.x, t.rect.y, t.rect.width, t.rect.height])
+            .collect()
+    };
+    assert_eq!(piece(3), vec![[36.0, 7.0, 10.0, 30.0]]);
+    assert_eq!(
+        piece(5),
+        vec![[16.0, 6.0, 10.0, 20.0], [6.0, 6.0, 10.0, 20.0]]
+    );
+    assert_eq!(piece(8), vec![[9.0, 116.0, 10.0, 30.0]]);
 }

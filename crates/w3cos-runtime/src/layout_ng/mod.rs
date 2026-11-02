@@ -29,11 +29,12 @@ mod flex;
 mod grid;
 mod inline;
 mod oof;
+mod orthogonal;
 mod table;
 
 use crate::layout::{FlatNodeInfo, LayoutRect};
 use std::sync::OnceLock;
-use w3cos_std::Component;
+use w3cos_std::{Component, ComponentKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -105,6 +106,11 @@ pub(crate) struct ConstraintSpace {
     /// which floats were placed while our BFC block offset is still
     /// unresolved (the margin strut that started at `margin_base`).
     pub adjoining_from: usize,
+    /// Blink's `IsFixedBlockSizeIndefinite`: the box is laid out at a
+    /// fixed block size (a column flex item's flexed main size) that is
+    /// not definite for its children's percentages, because the flex
+    /// container's main size is indefinite (css-flexbox "definite sizes").
+    pub fixed_block_indefinite: bool,
     /// An intrinsic-size measurement (min/max-content of an inline
     /// formatting context): `available_inline` is a probe (0 or
     /// indefinite), not a containing-block size, so inline percentages of
@@ -153,6 +159,10 @@ pub(crate) struct BoxFragment {
     /// The piece ends a `-webkit-line-clamp` box: paint draws its text with
     /// a block ellipsis (U+2026) after it, trailing breaks removed.
     pub ellipsis: bool,
+    /// A text leaf of an orthogonal (vertical) flow: its rect is physical
+    /// and paint rotates the glyphs a quarter turn clockwise (sideways
+    /// glyphs of `text-orientation: mixed`).
+    pub vertical: bool,
     /// Children with their border-box offset from this border box.
     pub children: Vec<(f32, f32, BoxFragment)>,
 }
@@ -265,6 +275,8 @@ pub struct TextFragment {
     pub end: usize,
     pub rect: LayoutRect,
     pub text: String,
+    /// Sideways glyphs of a vertical flow (see `BoxFragment::vertical`).
+    pub vertical: bool,
 }
 
 /// Entry point used by tests: the per-node rects only.
@@ -289,22 +301,184 @@ pub(crate) fn layout_tree_with_text(
     viewport_w: f32,
     viewport_h: f32,
 ) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
-    let run_in = block::run_in_block_styles(flat);
-    if !run_in.is_empty() {
-        let mut overrides = run_in.iter().peekable();
-        let patched: Vec<FlatNodeInfo> = flat
-            .iter()
-            .enumerate()
-            .map(|(index, node)| FlatNodeInfo {
-                style: overrides
-                    .next_if(|(at, _)| *at == index)
-                    .map_or(node.style, |(_, style)| style),
-                ..*node
-            })
-            .collect();
-        return layout_flat_with_text(&patched, viewport_w, viewport_h);
+    // `flex-wrap: balance` is stored by the cascade as `nowrap` plus a
+    // marker (legacy keeps it unrecognized); this engine reads it as a
+    // balanced wrap.
+    let _ = root;
+    let balanced = balanced_wrap_styles(flat);
+    if balanced.is_empty() {
+        return layout_logical(flat, viewport_w, viewport_h);
     }
-    layout_flat_with_text(flat, viewport_w, viewport_h)
+    let patched = run_in_patched(flat, &balanced);
+    layout_logical(&patched, viewport_w, viewport_h)
+}
+
+/// The styles of flex containers with `flex-wrap: balance`, as `wrap` (or
+/// `wrap-reverse`) with the balance marker, keyed by flat index.
+fn balanced_wrap_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, w3cos_std::style::Style)> {
+    use w3cos_std::style::{Display, FlexWrap};
+    flat.iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let style = node.style;
+            if !matches!(style.display, Display::Flex) {
+                return None;
+            }
+            let properties = style.custom_properties.as_ref()?;
+            // A `-webkit-box` is a legacy flex box that ignores `flex-wrap`.
+            if properties
+                .get("--w3cos-internal-unrecognized-display")
+                .is_some()
+            {
+                return None;
+            }
+            let value = properties.get("--w3cos-internal-unrecognized-flex-wrap")?;
+            let mut wrap = FlexWrap::Wrap;
+            let mut balance = false;
+            for word in value.split_ascii_whitespace() {
+                match word {
+                    "balance" => balance = true,
+                    "wrap" => {}
+                    "wrap-reverse" => wrap = FlexWrap::WrapReverse,
+                    _ => return None,
+                }
+            }
+            if !balance {
+                return None;
+            }
+            let mut style = style.clone();
+            style.flex_wrap = wrap;
+            if let Some(properties) = style.custom_properties.as_mut() {
+                properties.remove("--w3cos-internal-unrecognized-flex-wrap");
+                properties.insert(flex::BALANCE_MARKER.to_string(), "1".to_string());
+            }
+            Some((index, style))
+        })
+        .collect()
+}
+
+fn layout_logical(
+    flat: &[FlatNodeInfo],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
+    // Logical properties (`inline-size`, `block-size`, block-axis margins and
+    // padding) resolved per writing mode apply to this engine only; the
+    // declared style stays what the legacy engine reads.
+    let logical: Vec<(usize, w3cos_std::style::Style)> = flat
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let overrides = node.style.logical_overrides.as_ref()?;
+            let mut style = node.style.clone();
+            overrides.apply(&mut style);
+            Some((index, style))
+        })
+        .collect();
+    // `text-spacing-trim` (default `normal`) halves fullwidth punctuation at
+    // line ends and between adjacent marks; it is not laid out yet, so a page
+    // that sets text in such punctuation keeps ignoring the logical sizes on
+    // both sides of a comparison instead of exposing the missing trim.
+    if logical.is_empty() || has_spacing_trim_punctuation(flat) {
+        return layout_with_run_in(flat, viewport_w, viewport_h);
+    }
+    // Which engine lays a page out is decided on the declared style, as it
+    // is for pages without logical properties: a reftest's test and
+    // reference keep choosing the same engine they chose before the
+    // logical axes were modelled, and only pages this engine lays out see
+    // the resolved values.
+    if declared_tree_unsupported(flat) {
+        return layout_with_run_in(flat, viewport_w, viewport_h);
+    }
+    let logical_flat = run_in_patched(flat, &logical);
+    layout_with_run_in(&logical_flat, viewport_w, viewport_h)
+}
+
+/// Whether any text holds fullwidth punctuation that `text-spacing-trim`
+/// trims (CJK brackets, stops and commas, and their fullwidth forms).
+fn has_spacing_trim_punctuation(flat: &[FlatNodeInfo]) -> bool {
+    let trimmed = |c: char| {
+        matches!(
+            c,
+            '\u{3001}'..='\u{3003}'
+                | '\u{3008}'..='\u{3011}'
+                | '\u{3014}'..='\u{301F}'
+                | '\u{FF01}'
+                | '\u{FF08}'
+                | '\u{FF09}'
+                | '\u{FF0C}'
+                | '\u{FF0E}'
+                | '\u{FF1A}'
+                | '\u{FF1B}'
+                | '\u{FF1F}'
+                | '\u{FF3B}'
+                | '\u{FF3D}'
+                | '\u{FF5B}'
+                | '\u{FF5D}'
+                | '\u{FF5F}'
+                | '\u{FF60}'
+        )
+    };
+    flat.iter().any(|node| match node.kind {
+        ComponentKind::Text { content } => content.chars().any(trimmed),
+        _ => false,
+    })
+}
+
+fn run_in_patched<'a>(
+    flat: &[FlatNodeInfo<'a>],
+    run_in: &'a [(usize, w3cos_std::style::Style)],
+) -> Vec<FlatNodeInfo<'a>> {
+    let mut overrides = run_in.iter().peekable();
+    flat.iter()
+        .enumerate()
+        .map(|(index, node)| FlatNodeInfo {
+            style: overrides
+                .next_if(|(at, _)| *at == index)
+                .map_or(node.style, |(_, style)| style),
+            ..*node
+        })
+        .collect()
+}
+
+fn declared_tree_unsupported(flat: &[FlatNodeInfo]) -> bool {
+    if flat.is_empty() {
+        return true;
+    }
+    let run_in = block::run_in_block_styles(flat);
+    if run_in.is_empty() {
+        return block::unsupported_tree(flat).is_some();
+    }
+    block::unsupported_tree(&run_in_patched(flat, &run_in)).is_some()
+}
+
+fn layout_with_run_in(
+    flat: &[FlatNodeInfo],
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(LayoutRect, usize)>, Vec<TextFragment>)> {
+    let run_in = block::run_in_block_styles(flat);
+    let run_in_flat;
+    let base: &[FlatNodeInfo] = if run_in.is_empty() {
+        flat
+    } else {
+        run_in_flat = run_in_patched(flat, &run_in);
+        &run_in_flat
+    };
+    // Vertical-writing-mode flex and grid containers lay out with transposed
+    // axes.
+    let mut vertical = grid::vertical_grid_styles(base);
+    let taken: Vec<usize> = vertical.iter().map(|(index, _)| *index).collect();
+    vertical.extend(
+        flex::vertical_flex_styles(base)
+            .into_iter()
+            .filter(|(index, _)| !taken.contains(index)),
+    );
+    if vertical.is_empty() {
+        return layout_flat_with_text(base, viewport_w, viewport_h);
+    }
+    let patched = run_in_patched(base, &vertical);
+    layout_flat_with_text(&patched, viewport_w, viewport_h)
 }
 
 fn layout_flat_with_text(
@@ -456,7 +630,14 @@ fn flatten(
         width: fragment.width,
         height: fragment.height,
     };
-    if let Some((start, end)) = fragment.text_range {
+    let whole = fragment
+        .vertical
+        .then(|| match flat[fragment.index].kind {
+            w3cos_std::ComponentKind::Text { content } => (0, content.len()),
+            _ => (0, 0),
+        })
+        .filter(|_| fragment.text_range.is_none());
+    if let Some((start, end)) = fragment.text_range.or(whole) {
         let mut text = match flat[fragment.index].kind {
             w3cos_std::ComponentKind::Text { content } => content[start..end].to_string(),
             _ => String::new(),
@@ -479,6 +660,7 @@ fn flatten(
             end,
             rect,
             text,
+            vertical: fragment.vertical,
         });
     }
     out.push((rect, fragment.index));

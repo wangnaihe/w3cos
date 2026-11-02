@@ -190,6 +190,62 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         if node.style.position == Position::Sticky {
             return Some("table:sticky");
         }
+        // The table width algorithms here know percentages and lengths,
+        // not their `calc()` mix (css-tables calc-percent-plus-0px-*).
+        if (offset == 0
+            || is_table_display(node.style.display)
+                && !matches!(
+                    node.style.display,
+                    Display::TableColumn | Display::TableColumnGroup
+                ))
+            && [
+                node.style.width,
+                node.style.min_width,
+                node.style.max_width,
+                node.style.height,
+                node.style.min_height,
+                node.style.max_height,
+            ]
+            .iter()
+            .any(|dim| matches!(dim, Dimension::Calc { .. }))
+        {
+            return Some("table:calc");
+        }
+        // A relatively positioned row, row group or cell moves its fragment
+        // by its insets and is the containing block of its absolute
+        // descendants; the grid here places them unmoved. One with auto
+        // insets and no absolute descendants is unaffected.
+        if offset != 0
+            && node.style.position == Position::Relative
+            && (![
+                node.style.top,
+                node.style.right,
+                node.style.bottom,
+                node.style.left,
+            ]
+            .iter()
+            .all(|inset| matches!(inset, Dimension::Auto))
+                || flat[table + offset + 1..node.subtree_end.max(table + offset + 1)]
+                    .iter()
+                    .any(|inner| super::oof::is_out_of_flow(inner.style)))
+            && matches!(
+                node.style.display,
+                Display::TableRow
+                    | Display::TableRowGroup
+                    | Display::TableHeaderGroup
+                    | Display::TableFooterGroup
+                    | Display::TableCell
+            )
+        {
+            return Some("table:relative-part");
+        }
+        // A percentage block size on a cell's child resolves against the
+        // cell's final height once the table, row or cell has a definite
+        // one (Chrome lays the cell out again at its stretched height).
+        // Cells are laid out once here, with an indefinite basis.
+        if offset != 0 && percent_height(node.style) && cell_height_definite(flat, table, node) {
+            return Some("table:cell-percent-height");
+        }
         // A text leaf that is itself a row, section, or column (e.g. a
         // `display: table-row` span with only text) has no cell to hold its
         // line; legacy paints it. Text cells and captions are laid out.
@@ -224,6 +280,53 @@ pub(super) fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
     None
 }
 
+fn percent_height(style: &Style) -> bool {
+    [style.height, style.min_height, style.max_height]
+        .iter()
+        .any(|dim| matches!(dim, Dimension::Percent(_) | Dimension::Calc { .. }))
+}
+
+/// Whether `node` is the in-flow child of a (possibly anonymous) cell of
+/// `table` whose cell, row, row group or table has a non-auto height.
+fn cell_height_definite(flat: &[FlatNodeInfo], table: usize, node: &FlatNodeInfo) -> bool {
+    if node.style.float != Float::None
+        || !matches!(node.style.position, Position::Static | Position::Relative)
+        || matches!(
+            node.style.display,
+            Display::TableCell
+                | Display::TableRow
+                | Display::TableRowGroup
+                | Display::TableHeaderGroup
+                | Display::TableFooterGroup
+                | Display::TableColumn
+                | Display::TableColumnGroup
+                | Display::TableCaption
+        )
+    {
+        return false;
+    }
+    let Some(parent) = node.parent else {
+        return false;
+    };
+    if !matches!(
+        flat[parent].style.display,
+        Display::TableCell | Display::TableRow
+    ) {
+        return false;
+    }
+    let mut at = Some(parent);
+    while let Some(index) = at {
+        if flat[index].style.height != Dimension::Auto {
+            return true;
+        }
+        if index == table {
+            break;
+        }
+        at = flat[index].parent;
+    }
+    false
+}
+
 fn snap(value: f32) -> f32 {
     used_box_spacing(value)
 }
@@ -245,6 +348,16 @@ fn length_px(
     basis: Option<f32>,
     space: &ConstraintSpace,
 ) -> Option<f32> {
+    // A column's mixed `calc()` width is auto in an auto-layout table
+    // (css-tables auto-layout-calc-width-001).
+    if matches!(dim, Dimension::Calc { .. })
+        && matches!(
+            style.display,
+            Display::TableColumn | Display::TableColumnGroup
+        )
+    {
+        return None;
+    }
     block::resolve_length(dim, basis, style, space)
 }
 
@@ -254,7 +367,7 @@ fn ua_cell(style: &Style) -> bool {
 
 /// Used cell padding. A definite width absorbs the UA's 1px so the outer
 /// cell matches a `cellpadding=0` reference; an auto width keeps it.
-fn cell_padding(style: &Style, space: &ConstraintSpace, collapsed: bool) -> [f32; 4] {
+fn cell_padding(style: &Style, space: &ConstraintSpace) -> [f32; 4] {
     let cb = space.available_inline;
     let mut pad = [
         spacing_px(style, style.padding.top, cb, space),
@@ -268,6 +381,9 @@ fn cell_padding(style: &Style, space: &ConstraintSpace, collapsed: bool) -> [f32
             pad[1] += UA_CELL_PADDING;
             pad[3] += UA_CELL_PADDING;
         }
+        // A definite height absorbs the UA block padding in both border
+        // models; the collapsed model's used height then matches the
+        // separated one (`height` + the authored 1px padding).
         let definite_height = length_px(style.height, style, None, space).is_some();
         if !definite_height {
             pad[0] += UA_CELL_PADDING;
@@ -293,7 +409,7 @@ fn border_box_of(
     basis: Option<f32>,
 ) -> Option<f32> {
     let specified = length_px(dim, style, basis, space)?;
-    let pad = cell_padding(style, space, style.border_collapse);
+    let pad = cell_padding(style, space);
     let border = border_widths(style);
     let edges = pad[1] + pad[3] + border[1] + border[3];
     Some(match style.box_sizing {
@@ -320,7 +436,7 @@ fn border_box_block(style: &Style, dim: Dimension, space: &ConstraintSpace) -> O
 
 fn content_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> Option<f32> {
     let specified = length_px(style.width, style, Some(space.available_inline), space)?;
-    let pad = cell_padding(style, space, collapsed);
+    let pad = cell_padding(style, space);
     let border = if collapsed {
         [0.0; 4]
     } else {
@@ -340,7 +456,7 @@ fn content_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool)
 
 fn max_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> Option<f32> {
     let specified = length_px(style.max_width, style, Some(space.available_inline), space)?;
-    let pad = cell_padding(style, space, collapsed);
+    let pad = cell_padding(style, space);
     let border = if collapsed {
         [0.0; 4]
     } else {
@@ -355,7 +471,7 @@ fn max_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> 
 
 fn min_contribution(style: &Style, space: &ConstraintSpace, collapsed: bool) -> Option<f32> {
     let specified = length_px(style.min_width, style, Some(space.available_inline), space)?;
-    let pad = cell_padding(style, space, collapsed);
+    let pad = cell_padding(style, space);
     let border = if collapsed {
         [0.0; 4]
     } else {
@@ -709,7 +825,7 @@ fn build_columns(
             continue;
         }
         let content = cell_content_minmax(flat, cell.index, space).why("table:cell")?;
-        let pad = cell_padding(style, space, collapsed);
+        let pad = cell_padding(style, space);
         let border = if collapsed {
             [0.0; 4]
         } else {
@@ -763,7 +879,7 @@ fn build_columns(
             continue;
         }
         let content = cell_content_minmax(flat, cell.index, space).why("table:cell")?;
-        let pad = cell_padding(style, space, collapsed);
+        let pad = cell_padding(style, space);
         let border = if collapsed {
             [0.0; 4]
         } else {
@@ -1374,6 +1490,7 @@ pub(super) fn append_text_leaf_line(
             height: font_height,
             text_range: Some((0, content.len())),
             ellipsis: false,
+            vertical: false,
             children: Vec::new(),
         },
     ));
@@ -1798,7 +1915,7 @@ pub(super) fn layout_with_block_size(
     let mut cells: Vec<CellLayout> = Vec::with_capacity(grid.cells.len());
     for cell in &grid.cells {
         let style = flat[cell.index].style;
-        let pad = cell_padding(style, space, collapsed);
+        let pad = cell_padding(style, space);
         let border = border_widths(style);
         let span = cell.column_span.max(1);
         let track: f32 = columns
@@ -1845,7 +1962,14 @@ pub(super) fn layout_with_block_size(
             .iter()
             .map(|(_, y, child)| y + child.height)
             .fold(0.0f32, f32::max);
-        let stretched = specified > 0.0 && content_bottom > 0.0 && content_bottom + 0.5 < extent;
+        // The cell is stretched only when its specified height is what
+        // sizes the box. A height smaller than the content-sized box is just
+        // the row minimum: the box is sized by its content and borders, and
+        // the children stay where block layout put them.
+        let stretched = specified > 0.0
+            && specified + 0.5 >= extent
+            && content_bottom > 0.0
+            && content_bottom + 0.5 < extent;
         let content_height = if collapsed {
             (extent - border[0] - border[2]).max(0.0)
         } else if stretched {
@@ -2457,6 +2581,7 @@ pub(super) fn layout_with_block_size(
             index,
             text_range: None,
             ellipsis: false,
+            vertical: false,
             width: rect.2,
             height: rect.3,
             children,

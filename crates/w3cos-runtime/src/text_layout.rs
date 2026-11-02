@@ -405,7 +405,14 @@ pub fn prepare_text_for_white_space(text: &str, white_space: WhiteSpace) -> Stri
     match white_space {
         WhiteSpace::Normal | WhiteSpace::NoWrap => collapse_css_whitespace_sequences(&text),
         WhiteSpace::PreLine => collapse_pre_line_whitespace(&text),
-        WhiteSpace::Pre | WhiteSpace::PreWrap => expand_tabs(&text),
+        // A `pre` line never soft-wraps, so its preserved tabs stay tab
+        // characters and are advanced to the block's tab stops from the
+        // line start when the line is measured and painted (Blink shapes a
+        // tab as a ShapeResult whose width depends on its line position;
+        // `tab-size` is honoured there). pre-wrap still expands to columns
+        // because wrapping measures partial runs.
+        WhiteSpace::Pre => text.replace(FORCED_LINE_BREAK, "\n"),
+        WhiteSpace::PreWrap => expand_tabs(&text),
     }
 }
 
@@ -2465,7 +2472,7 @@ mod tests {
         );
         assert_eq!(
             prepare_text_for_white_space(source, WhiteSpace::Pre),
-            "This text\n        should   be"
+            "This text\n\tshould   be"
         );
     }
 

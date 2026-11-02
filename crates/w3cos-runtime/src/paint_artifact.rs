@@ -7,7 +7,7 @@
 use w3cos_std::color::Color;
 use w3cos_std::component::ComponentKind;
 use w3cos_std::style::{
-    Display, Overflow, Position, Spacing, Style, Transform2D, Visibility, WhiteSpace,
+    Contain, Display, Overflow, Position, Spacing, Style, Transform2D, Visibility, WhiteSpace,
 };
 
 use crate::layout::LayoutRect;
@@ -295,6 +295,9 @@ pub struct PaintArtifact {
     /// pieces in place of the node's single rect, at the node's own position
     /// in paint order.
     pub text_fragments: Vec<Vec<(LayoutRect, String)>>,
+    /// Per node: its text pieces are sideways glyphs of a vertical flow
+    /// (`TextFragment::vertical`); paint rotates them a quarter turn.
+    pub vertical_text: Vec<bool>,
     pub generation: u64,
 }
 
@@ -320,6 +323,7 @@ impl Default for PaintArtifact {
             rect_by_index: Vec::new(),
             column_fragments: Vec::new(),
             text_fragments: Vec::new(),
+            vertical_text: Vec::new(),
             generation: 0,
         }
     }
@@ -457,7 +461,8 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
         Some(w3cos_std::style::Dimension::Vw(value)) => value * rect.width / 100.0,
         Some(w3cos_std::style::Dimension::Vh(value)) => value * rect.height / 100.0,
         Some(w3cos_std::style::Dimension::Percent(value)) => value * auto / 100.0,
-        Some(w3cos_std::style::Dimension::Auto) | None => auto,
+        Some(w3cos_std::style::Dimension::Auto | w3cos_std::style::Dimension::Calc { .. })
+        | None => auto,
     };
     let top = resolve(clip.top, 0.0);
     let right = resolve(clip.right, rect.width);
@@ -2163,6 +2168,7 @@ impl PaintArtifact {
     /// Install LayoutNG's text pieces (see `text_fragments`).
     pub(crate) fn set_text_fragments(&mut self, fragments: &[crate::layout_ng::TextFragment]) {
         self.text_fragments.clear();
+        self.vertical_text.clear();
         if fragments.is_empty() {
             return;
         }
@@ -2171,7 +2177,19 @@ impl PaintArtifact {
             if let Some(slot) = self.text_fragments.get_mut(fragment.index) {
                 slot.push((fragment.rect, fragment.text.clone()));
             }
+            if fragment.vertical {
+                if self.vertical_text.is_empty() {
+                    self.vertical_text = vec![false; self.nodes.len()];
+                }
+                if let Some(flag) = self.vertical_text.get_mut(fragment.index) {
+                    *flag = true;
+                }
+            }
         }
+    }
+
+    pub(crate) fn is_vertical_text(&self, index: usize) -> bool {
+        self.vertical_text.get(index).copied().unwrap_or(false)
     }
 
     pub(crate) fn text_fragments_of(&self, index: usize) -> &[(LayoutRect, String)] {
@@ -2429,6 +2447,28 @@ impl PaintArtifact {
         // Reused snapshots include paint-only UA children; reconstruct them
         // from their live hosts rather than accumulating another copy.
         nodes.retain(|node| !node.is_paint_only());
+        // `z-index` applies to flex and grid items even when they are not
+        // positioned: such an item paints like a positioned box at that level
+        // and forms a stacking context. Paint reads only layout rects, so
+        // modelling it as a zero-offset relative box changes ordering alone.
+        let z_items: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.style.z_index != 0
+                    && node.style.position == Position::Static
+                    && node.parent.is_some_and(|parent| {
+                        matches!(
+                            nodes[parent].style.display,
+                            Display::Flex | Display::Grid | Display::InlineFlex
+                        )
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in z_items {
+            nodes[index].style.position = Position::Relative;
+        }
         let mut has_percentage_padding = false;
         for node in &mut nodes {
             crate::background_image::annotate_fixed_background_viewport(&mut node.style, viewport);
@@ -2440,7 +2480,7 @@ impl PaintArtifact {
                 node.style.padding.left,
             ]
             .into_iter()
-            .any(|edge| matches!(edge, Spacing::Percent(_)));
+            .any(|edge| matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. }));
         }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
@@ -2490,8 +2530,14 @@ impl PaintArtifact {
                     &mut style.padding.bottom,
                     &mut style.padding.left,
                 ] {
-                    if let Spacing::Percent(percent) = *edge {
-                        *edge = Spacing::Px(basis * percent / 100.0);
+                    match *edge {
+                        Spacing::Percent(percent) => {
+                            *edge = Spacing::Px(basis * percent / 100.0);
+                        }
+                        Spacing::PaddingCalc { percent, px } => {
+                            *edge = Spacing::Px((basis * percent / 100.0 + px).max(0.0));
+                        }
+                        _ => {}
                     }
                 }
                 child_bases[index] = if matches!(style.display, Display::Inline | Display::Contents)
@@ -2914,15 +2960,32 @@ impl PaintArtifact {
         // clip below do apply to the box itself, so each refreshes this value.
         let mut self_clip = properties.clip;
         let mut overflow_clip = None;
-        if establishes_overflow_clip(node.style.display)
-            && (matches!(
-                overflow_x,
+        // `hidden`/`scroll`/`auto` on either axis clips both (the other axis
+        // computes to a scroll container too); `clip` bounds only its axis.
+        let clips_content = |overflow| {
+            matches!(
+                overflow,
                 Overflow::Hidden | Overflow::Scroll | Overflow::Auto
-            ) || matches!(
-                overflow_y,
-                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
-            ))
-        {
+            )
+        };
+        let scroll_overflow = clips_content(overflow_x) || clips_content(overflow_y);
+        // A document element's `clip` and the `clip` of a body that
+        // propagates to the viewport apply to the viewport, not to the box.
+        let propagates_to_viewport = index == 0
+            || (Some(index) == self.body_index
+                && node.style.contain == Contain::None
+                && self.nodes.first().is_some_and(|root| {
+                    root.style.resolved_overflow_x() == Overflow::Visible
+                        && root.style.resolved_overflow_y() == Overflow::Visible
+                        && !root.style.overflow_clip_x
+                        && !root.style.overflow_clip_y
+                }));
+        // The overflow of the document element (and of a propagating body)
+        // belongs to the viewport: no clip at the box (CSS Overflow 3 3.3).
+        let scroll_clip = scroll_overflow && !(propagates_to_viewport && self.body_index.is_some());
+        let clips_x = (node.style.overflow_clip_x && !propagates_to_viewport) || scroll_clip;
+        let clips_y = (node.style.overflow_clip_y && !propagates_to_viewport) || scroll_clip;
+        if establishes_overflow_clip(node.style.display) && (clips_x || clips_y) {
             properties.clip = self.properties.clips.len();
             overflow_clip = Some(properties.clip);
             self.properties.clips.push(ClipNode {
@@ -2937,7 +3000,47 @@ impl PaintArtifact {
                     // not the wrapper's descendant overflow clip. Chrome clips
                     // grid descendants against the wrapper padding box while
                     // captions retain their separate inherited clip chain.
-                    overflow_clip_rect(&node.style, rect)
+                    let mut clip = overflow_clip_rect(&node.style, rect);
+                    // `overflow-clip-margin` moves the edge of an
+                    // `overflow: clip` axis outward from its reference box.
+                    let (visual_box, margin) = node.style.overflow_clip_margin;
+                    if !scroll_clip
+                        && (node.style.overflow_clip_x || node.style.overflow_clip_y)
+                        && (visual_box != 0 || margin > 0.0)
+                    {
+                        let base = match visual_box {
+                            2 => rect,
+                            1 => {
+                                let padding = node.style.padding_lengths();
+                                LayoutRect {
+                                    x: clip.x + padding.left,
+                                    y: clip.y + padding.top,
+                                    width: (clip.width - padding.left - padding.right).max(0.0),
+                                    height: (clip.height - padding.top - padding.bottom).max(0.0),
+                                }
+                            }
+                            _ => clip,
+                        };
+                        if node.style.overflow_clip_x {
+                            clip.x = base.x - margin;
+                            clip.width = base.width + 2.0 * margin;
+                        }
+                        if node.style.overflow_clip_y {
+                            clip.y = base.y - margin;
+                            clip.height = base.height + 2.0 * margin;
+                        }
+                    }
+                    // A single-axis `overflow: clip` leaves the other axis
+                    // unbounded.
+                    if !clips_x {
+                        clip.x = -1.0e7;
+                        clip.width = 2.0e7;
+                    }
+                    if !clips_y {
+                        clip.y = -1.0e7;
+                        clip.height = 2.0e7;
+                    }
+                    clip
                 }),
             });
         }
@@ -5377,6 +5480,88 @@ mod tests {
     }
 
     #[test]
+    fn overflow_clip_clips_paint_without_becoming_a_scroll_container() {
+        let node = |parent, style| PaintNode {
+            kind: ComponentKind::Box,
+            style,
+            parent,
+            sticky_counter_signal: None,
+        };
+        let nodes = vec![
+            node(None, Style::default()),
+            node(
+                Some(0),
+                Style {
+                    overflow_clip_x: true,
+                    ..Style::default()
+                },
+            ),
+        ];
+        let artifact = PaintArtifact::build(nodes, &[(rect(0.0), 0), (rect(0.0), 1)], 1);
+
+        let clip = artifact.node_properties[1].clip;
+        assert_ne!(clip, 0);
+        assert_eq!(artifact.node_properties[1].scroll, 0);
+        let rect = artifact.properties.clips[clip].rect.unwrap();
+        assert!(
+            rect.y <= -1.0e6 && rect.height >= 1.0e6,
+            "y stays unbounded"
+        );
+        assert!(rect.width < 1.0e6, "x is clipped");
+    }
+
+    #[test]
+    fn overflow_clip_margin_moves_the_clip_edge_and_body_clip_propagates() {
+        let node = |parent, style| PaintNode {
+            kind: ComponentKind::Box,
+            style,
+            parent,
+            sticky_counter_signal: None,
+        };
+        let nodes = vec![
+            node(None, Style::default()),
+            node(Some(0), Style::default()),
+            node(
+                Some(1),
+                Style {
+                    overflow_clip_x: true,
+                    overflow_clip_y: true,
+                    overflow_clip_margin: (2, 10.0),
+                    ..Style::default()
+                },
+            ),
+        ];
+        let artifact =
+            PaintArtifact::build(nodes, &[(rect(0.0), 0), (rect(0.0), 1), (rect(50.0), 2)], 1);
+        let clip = artifact.node_properties[2].clip;
+        assert_ne!(clip, 0);
+        let clip_rect = artifact.properties.clips[clip].rect.unwrap();
+        let border = artifact.rect_by_index[2].unwrap();
+        assert_eq!(clip_rect.x, border.x - 10.0);
+        assert_eq!(clip_rect.width, border.width + 20.0);
+
+        // A body whose overflow propagates to the viewport does not clip.
+        let nodes = vec![
+            node(None, Style::default()),
+            node(
+                Some(0),
+                Style {
+                    overflow_clip_x: true,
+                    overflow_clip_y: true,
+                    ..Style::default()
+                },
+            ),
+        ];
+        let artifact = PaintArtifact::build_with_body_background(
+            nodes,
+            &[(rect(0.0), 0), (rect(0.0), 1)],
+            1,
+            Some(1),
+        );
+        assert_eq!(artifact.node_properties[1].clip, 0);
+    }
+
+    #[test]
     fn body_background_propagates_through_anonymous_table_wrappers() {
         let node = |parent, display, background| PaintNode {
             kind: ComponentKind::Box,
@@ -6053,9 +6238,15 @@ mod tests {
         floating.transform.translate_x = 40.0;
         // z-index does not apply to this static, non-flex/grid float.
         floating.z_index = -10;
+        // `Style::default()` is `display: flex`, which would make the float a
+        // flex item (where z-index does apply); the parent must be a block.
+        let block_parent = Style {
+            display: Display::Block,
+            ..Style::default()
+        };
         let artifact = PaintArtifact::build(
             [
-                node(ComponentKind::Column, Style::default(), None),
+                node(ComponentKind::Column, block_parent, None),
                 node(ComponentKind::Row, floating, Some(0)),
                 node(
                     ComponentKind::Text {
@@ -6077,6 +6268,41 @@ mod tests {
             artifact.paint_order_key(2),
             artifact.paint_order_key(1)
         );
+    }
+
+    #[test]
+    fn static_flex_item_z_index_orders_like_a_positioned_box() {
+        // z-index applies to flex items even when `position` is static, so a
+        // negative-z item paints below its parent's normal-flow ink.
+        let node = |kind, style, parent| PaintNode {
+            kind,
+            style,
+            parent,
+            sticky_counter_signal: None,
+        };
+        let build = |parent_display| {
+            let item = Style {
+                z_index: -10,
+                ..Style::default()
+            };
+            let parent = Style {
+                display: parent_display,
+                ..Style::default()
+            };
+            let artifact = PaintArtifact::build(
+                [
+                    node(ComponentKind::Column, parent, None),
+                    node(ComponentKind::Row, Style::default(), Some(0)),
+                    node(ComponentKind::Row, item, Some(0)),
+                ],
+                &[(rect(0.0), 0), (rect(0.0), 1), (rect(0.0), 2)],
+                1,
+            );
+            // The later sibling carries the negative z-index.
+            artifact.paint_order_key(2) < artifact.paint_order_key(1)
+        };
+        assert!(build(Display::Flex), "flex item honours z-index");
+        assert!(!build(Display::Block), "block child ignores z-index");
     }
 
     #[test]

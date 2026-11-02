@@ -2,12 +2,38 @@ use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, BoxSizing, Clear, ColumnFill, Contain, CssClipRect, Dimension, Display, Edges,
-    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, Position, Spacing, Style,
-    TextDirection, UnicodeBidi, WillChange, parse_css_integer_clamped,
+    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, PhysicalSide, Position, Spacing,
+    Style, TextDirection, UnicodeBidi, WillChange, WritingMode, parse_css_integer_clamped,
 };
+
+/// The one switch for resolving logical properties to physical ones by the
+/// element's `writing-mode` (`inline-size`/`block-size` and their min/max,
+/// `margin-block-start/end`, `padding-block-start/end`).
+///
+/// The declared style (`Style::width`, `margin`, ...) always keeps the
+/// logical properties as the legacy layout engine reads them (the sizes are
+/// markers, the block longhands are ignored), so the reftests whose test and
+/// reference both relied on that keep rendering the same there. While this
+/// switch is on, the cascade also resolves them per writing mode into
+/// `Style::logical_overrides`, which only the engine that lays the logical
+/// axes out applies. That engine falls back, with both sides of a reftest,
+/// for the features it does not lay out.
+pub const NG_LOGICAL_PROPERTIES: bool = true;
+
+/// Whether the resolution also covers the block axis (`block-size`, its
+/// min/max, `margin-block-start/end`, `padding-block-start/end`) or only the
+/// inline axis. Reftests rely on block-axis spacers to place features the
+/// layout engine does not lay out yet (`text-box-trim`, `text-spacing-trim`,
+/// grid-lanes `flow-tolerance`, text-group-align, grid baseline
+/// `align-content`); resolving the spacers exposes those features, so the
+/// block axis follows once they are laid out.
+pub const NG_BLOCK_AXIS_LOGICAL_PROPERTIES: bool = false;
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
+/// Computed `tab-size` (CSS Text 3 4.2, inherited): `<number>` spaces as a
+/// bare number, a `<length>` resolved at the declaring element as `Npx`.
+pub const TAB_SIZE_PROPERTY: &str = "--w3cos-internal-tab-size";
 /// `contain` with a real `size` (or `strict`) token: size containment
 /// (CSS Contain 2 3.1; `inline-size` alone is not). `Contain` folds tokens.
 pub const SIZE_CONTAINMENT_PROPERTY: &str = "--w3cos-internal-size-containment";
@@ -18,9 +44,43 @@ pub const WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-width-keyword";
 /// `height` / `min-height` / `max-height` intrinsic keyword. The dimension
 /// is left untouched so legacy layout keeps the value it already stored.
 pub const HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-height-keyword";
+/// `min-width: min-content | max-content | fit-content`; `min_width` stays
+/// auto and layouts that do not resolve the keyword ignore it.
+pub const MIN_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-width-keyword";
+/// `max-width: min-content | max-content | fit-content`; `max_width` stays
+/// none and layouts that do not resolve the keyword ignore it. All three
+/// width markers also carry `fit-content(<length-percentage>)`, serialized
+/// with its argument in a canonical unit (`fit-content(100px)`).
+pub const MAX_WIDTH_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-width-keyword";
+/// `min-height: min-content | max-content | fit-content`; `min_height`
+/// stays `Auto`. In a block container's block axis all of them are its
+/// content height (css-sizing-3); NG block layout reads the marker.
+pub const MIN_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-min-height-keyword";
+/// `max-height: min-content | max-content | fit-content`; `max_height`
+/// stays `Auto` (none).
+pub const MAX_HEIGHT_KEYWORD_PROPERTY: &str = "--w3cos-internal-max-height-keyword";
+/// `flex-basis: content` (alone or as the third `flex` token). The
+/// dimension stays `Auto`; layouts that care read the marker.
+pub const FLEX_BASIS_CONTENT_PROPERTY: &str = "--w3cos-internal-flex-basis-content";
+/// A `safe` / `unsafe` overflow-position keyword in a self-alignment
+/// declaration. The legacy fields drop it; grid-lanes reads the marker to
+/// stay off the real lanes pass (which would ignore the keyword).
+pub const OVERFLOW_ALIGNMENT_PROPERTY: &str = "--w3cos-internal-overflow-alignment";
+/// `width | height | min-/max-` set to `stretch` (or `-webkit-fill-available`):
+/// a comma list of the axes that carry it (`w`, `h`, `minw`, `minh`, `maxw`,
+/// `maxh`). The dimension stays auto / none; LayoutNG resolves the keyword
+/// against the containing block (CSS Sizing 4 stretch-fit sizing) and
+/// layouts that do not leave it as the initial value.
+pub const STRETCH_PROPERTY: &str = "--w3cos-internal-stretch";
 /// Authored `justify-content` keyword. The enum folds `stretch`, `normal`,
 /// `left`, and `right` into `flex-start`; grid needs the keyword.
 pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
+/// Authored `align-self` / `align-items` keyword (lower-cased). The enums
+/// fold `start`, `self-end`, `normal`, `last baseline`, ... into other
+/// values; LayoutNG reads the keyword for the static position of an
+/// abspos flex child.
+pub const ALIGN_SELF_KEYWORD_PROPERTY: &str = "--w3cos-internal-align-self";
+pub const ALIGN_ITEMS_KEYWORD_PROPERTY: &str = "--w3cos-internal-align-items";
 /// Authored `align-items` / `justify-items: stretch`. The enum folds
 /// `normal` into `stretch`, but a replaced grid item behaves as `start`
 /// for `normal` and stretches only for the explicit keyword. Present only
@@ -49,13 +109,74 @@ pub const RUN_IN_BLOCK_PROPERTY: &str = "--w3cos-internal-run-in-block";
 /// `gap` / `row-gap` / `column-gap` contains a percentage. The used gap
 /// stays unset (legacy ignores it). Value is `row`, `column`, or `both`.
 pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
+/// A percentage `row-gap` / `column-gap` as `<percent> <px>`: the gap is
+/// `percent`% of the content box plus `px` (`10%`, or `calc(10% + 25px)`).
+/// LayoutNG grid resolves it; other layouts keep the marker above only.
+pub const ROW_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-row-gap-percent";
+pub const COLUMN_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-column-gap-percent";
 /// `flex-wrap` keyword this engine does not model (`balance`, …). The used
 /// value falls through to `nowrap`.
 pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
+/// `flex-line-count`: the minimum flex line count of a balancing flex
+/// container (a positive integer). Neither layout reads it for other
+/// boxes; LayoutNG's balancing step does.
+pub const FLEX_LINE_COUNT_PROPERTY: &str = "--w3cos-internal-flex-line-count";
 /// `aspect-ratio` as a width/height number. The dimension fields stay
 /// untouched, so legacy layout never consults it. LayoutNG reads it only
 /// as a column flex container's definite block size.
 pub const ASPECT_RATIO_PROPERTY: &str = "--w3cos-internal-aspect-ratio";
+/// Present when `aspect-ratio` is `auto && <ratio>`: a non-replaced box
+/// then applies the ratio to its content box whatever `box-sizing` says
+/// (css-sizing-4 aspect-ratio).
+pub const ASPECT_RATIO_AUTO_PROPERTY: &str = "--w3cos-internal-aspect-ratio-auto";
+/// `word-break: auto-phrase` (CSS Text 4). The used `word_break` stays
+/// `normal`; the marker only suppresses hyphenation (soft hyphens).
+pub const WORD_BREAK_AUTO_PHRASE_PROPERTY: &str = "--w3cos-internal-word-break-auto-phrase";
+/// Prefix of the markers left by logical sizing properties the cascade does
+/// not resolve (`inline-size`, `block-size` and their min/max forms). The
+/// suffix is the property name; NG layout bails `sizing:logical` on them.
+pub const LOGICAL_SIZE_PROPERTY_PREFIX: &str = "--w3cos-internal-logical-size-";
+
+/// `N%`, or `calc()` of one percentage plus or minus one px length.
+fn parse_percent_gap(value: &str) -> Option<String> {
+    let value = value.trim();
+    let percent = |token: &str| token.strip_suffix('%')?.trim().parse::<f32>().ok();
+    if let Some(p) = percent(value) {
+        return (p >= 0.0).then(|| format!("{p} 0"));
+    }
+    let lower = value.to_ascii_lowercase();
+    let inner = lower.strip_prefix("calc(")?.strip_suffix(')')?;
+    let tokens: Vec<&str> = inner.split_whitespace().collect();
+    let [first, op, second] = tokens.as_slice() else {
+        return None;
+    };
+    let sign = match *op {
+        "+" => 1.0,
+        "-" => -1.0,
+        _ => return None,
+    };
+    let (p, px) = if let Some(p) = percent(first) {
+        (p, sign * parse_px(second)?)
+    } else if sign > 0.0 {
+        (percent(second)?, parse_px(first)?)
+    } else {
+        return None;
+    };
+    Some(format!("{p} {px}"))
+}
+
+fn update_percent_gap_values(style: &mut Style, row: Option<&str>, column: Option<&str>) {
+    if let Some(row) = row {
+        set_marker(style, ROW_GAP_PERCENT_PROPERTY, parse_percent_gap(row));
+    }
+    if let Some(column) = column {
+        set_marker(
+            style,
+            COLUMN_GAP_PERCENT_PROPERTY,
+            parse_percent_gap(column),
+        );
+    }
+}
 /// `-webkit-box-orient`: `vertical` (`block-axis`) or `horizontal`
 /// (`inline-axis`). Legacy keeps the `-webkit-box` row it already lays out;
 /// LayoutNG reads this for a block-flow `-webkit-box`.
@@ -91,7 +212,7 @@ fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>
 /// `None` drops an invalid declaration. `Some(None)` is `auto` (no ratio).
 /// `Some(Some(w/h))` is a positive ratio. `0` and a zero denominator are
 /// invalid. `auto && <ratio>` is the ratio.
-fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
+fn parse_aspect_ratio(value: &str) -> Option<Option<(f32, bool)>> {
     let value = value.trim().to_ascii_lowercase();
     if value.is_empty() {
         return None;
@@ -102,9 +223,16 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
     ) {
         return Some(None);
     }
-    let value = value.strip_prefix("auto").unwrap_or(&value).trim();
+    // `auto && <ratio>`: the keyword may come first or last.
+    let (value, auto) = if let Some(rest) = value.strip_prefix("auto") {
+        (rest.trim(), true)
+    } else if let Some(rest) = value.strip_suffix("auto") {
+        (rest.trim(), true)
+    } else {
+        (value.as_str(), false)
+    };
     if value.is_empty() {
-        return Some(None);
+        return if auto { Some(None) } else { None };
     }
     let ratio = if let Some((width, height)) = value.split_once('/') {
         let width = width.trim().parse::<f32>().ok()?;
@@ -116,10 +244,62 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
     } else {
         value.parse::<f32>().ok()?
     };
-    (ratio.is_finite() && ratio > 0.0).then_some(Some(ratio))
+    (ratio.is_finite() && ratio > 0.0).then_some(Some((ratio, auto)))
+}
+
+/// `stretch` token of the size property a keyword marker belongs to.
+fn stretch_token_of(key: &str) -> Option<&'static str> {
+    Some(match key {
+        WIDTH_KEYWORD_PROPERTY => "w",
+        HEIGHT_KEYWORD_PROPERTY => "h",
+        MIN_WIDTH_KEYWORD_PROPERTY => "minw",
+        MIN_HEIGHT_KEYWORD_PROPERTY => "minh",
+        MAX_WIDTH_KEYWORD_PROPERTY => "maxw",
+        MAX_HEIGHT_KEYWORD_PROPERTY => "maxh",
+        _ => return None,
+    })
+}
+
+fn is_stretch_keyword(value: &str) -> bool {
+    let value = value.trim();
+    value.eq_ignore_ascii_case("stretch") || value.eq_ignore_ascii_case("-webkit-fill-available")
+}
+
+/// Adds or removes one axis of the `stretch` marker.
+fn set_stretch(style: &mut Style, token: &str, on: bool) {
+    let current = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(STRETCH_PROPERTY))
+        .cloned()
+        .unwrap_or_default();
+    let mut tokens: Vec<&str> = current
+        .split(',')
+        .filter(|t| !t.is_empty() && *t != token)
+        .collect();
+    if on {
+        tokens.push(token);
+    }
+    let joined = tokens.join(",");
+    match style.custom_properties.as_mut() {
+        Some(props) if joined.is_empty() => {
+            props.remove(STRETCH_PROPERTY);
+        }
+        _ if joined.is_empty() => {}
+        _ => {
+            style
+                .custom_properties
+                .get_or_insert_with(Default::default)
+                .insert(STRETCH_PROPERTY.to_string(), joined);
+        }
+    }
 }
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
+    // A later size declaration of the same property replaces `stretch`.
+    if let Some(token) = stretch_token_of(key) {
+        set_stretch(style, token, false);
+    }
     match value {
         Some(value) => {
             style
@@ -133,6 +313,28 @@ fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
             }
         }
     }
+}
+
+/// Sets one axis (0 = width, 1 = height) of the `contain-intrinsic-size`
+/// marker from a longhand value; an invalid value is dropped.
+fn set_contain_intrinsic_axis(style: &mut Style, axis: usize, value: &str) {
+    let Some(parsed) = contain_intrinsic_axis(value) else {
+        return;
+    };
+    let mut axes: Vec<String> = style
+        .custom_properties
+        .as_ref()
+        .and_then(|props| props.get(CONTAIN_INTRINSIC_SIZE_PROPERTY))
+        .map(|v| v.split_ascii_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    axes.resize(2, "none".to_string());
+    axes[axis] = parsed;
+    let both_none = axes.iter().all(|a| a == "none");
+    set_marker(
+        style,
+        CONTAIN_INTRINSIC_SIZE_PROPERTY,
+        (!both_none).then(|| axes.join(" ")),
+    );
 }
 
 /// One `contain-intrinsic-*` axis value: `none`, `<length>` or
@@ -156,6 +358,15 @@ pub struct CSSStyleDeclaration {
     /// Document merges these with stylesheet rules using importance and
     /// inline precedence; raw values retain their priority markers.
     pub inline_declarations: Vec<(String, String)>,
+    /// Resolve logical properties to physical ones in `inner` (the shadow of
+    /// a cascade declaration does; the declared style does not).
+    pub map_logical: bool,
+    /// With `map_logical`: also resolve the block axis.
+    pub map_block_axis: bool,
+    /// The cascade's declaration keeps a shadow of itself that maps logical
+    /// properties, created at the first logical declaration.
+    pub shadow_logical: bool,
+    pub(crate) shadow: Option<Box<CSSStyleDeclaration>>,
 }
 
 /// CSSOM ignores a declaration whose value is not valid for the property.
@@ -181,6 +392,13 @@ fn invalid_cssom_declaration(name: &str, value: &str) -> bool {
             keyword != "currentcolor" && Color::from_css(value).is_none()
         }
         "list-style" | "listStyle" => list_style_properties(value).is_none(),
+        // A bare number is only a valid `flex-basis` when it is zero, so
+        // `flex: 0 0 4` matches no branch of the grammar and is dropped
+        // (flexbox_flex-*-unitless-basis WPT).
+        "flex" => {
+            let parts: Vec<&str> = value.split_whitespace().collect();
+            parts.len() == 3 && parts[2].parse::<f32>().is_ok_and(|number| number != 0.0)
+        }
         _ => false,
     }
 }
@@ -194,6 +412,10 @@ impl CSSStyleDeclaration {
                 ..Style::default()
             },
             inline_declarations: Vec::new(),
+            map_logical: false,
+            map_block_axis: false,
+            shadow_logical: false,
+            shadow: None,
         }
     }
 
@@ -216,6 +438,10 @@ impl CSSStyleDeclaration {
         Self {
             inner: style,
             inline_declarations: Vec::new(),
+            map_logical: false,
+            map_block_axis: false,
+            shadow_logical: false,
+            shadow: None,
         }
     }
 
@@ -257,7 +483,132 @@ impl CSSStyleDeclaration {
         true
     }
 
+    /// Whether the property is one `map_logical` resolves per writing mode.
+    fn is_mapped_logical_property(name: &str) -> bool {
+        matches!(
+            name,
+            "inline-size"
+                | "inlineSize"
+                | "min-inline-size"
+                | "minInlineSize"
+                | "max-inline-size"
+                | "maxInlineSize"
+                | "block-size"
+                | "blockSize"
+                | "min-block-size"
+                | "minBlockSize"
+                | "max-block-size"
+                | "maxBlockSize"
+                | "margin-block-start"
+                | "marginBlockStart"
+                | "margin-block-end"
+                | "marginBlockEnd"
+                | "padding-block-start"
+                | "paddingBlockStart"
+                | "padding-block-end"
+                | "paddingBlockEnd"
+        )
+    }
+
     pub fn set_property(&mut self, name: &str, value: &str) {
+        if NG_LOGICAL_PROPERTIES
+            && self.shadow_logical
+            && self.shadow.is_none()
+            && Self::is_mapped_logical_property(name)
+        {
+            let mut shadow = self.clone();
+            shadow.map_logical = true;
+            shadow.map_block_axis = NG_BLOCK_AXIS_LOGICAL_PROPERTIES;
+            shadow.shadow_logical = false;
+            self.shadow = Some(Box::new(shadow));
+        }
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.set_property_unshadowed(name, value);
+        }
+        self.set_property_unshadowed(name, value);
+    }
+
+    /// The physical values the logical properties resolve to, where they
+    /// differ from the declared style (see `Style::logical_overrides`).
+    pub fn logical_overrides(&self) -> Option<w3cos_std::style::LogicalOverrides> {
+        let shadow = self.shadow.as_ref()?;
+        let (a, b) = (&self.inner, &shadow.inner);
+        let diff = |declared: Dimension, mapped: Dimension| (declared != mapped).then_some(mapped);
+        let edge = |declared: Spacing, mapped: Spacing| (declared != mapped).then_some(mapped);
+        let mut overrides = w3cos_std::style::LogicalOverrides {
+            width: diff(a.width, b.width),
+            height: diff(a.height, b.height),
+            min_width: diff(a.min_width, b.min_width),
+            min_height: diff(a.min_height, b.min_height),
+            max_width: diff(a.max_width, b.max_width),
+            max_height: diff(a.max_height, b.max_height),
+            margin: [
+                edge(a.margin.top, b.margin.top),
+                edge(a.margin.right, b.margin.right),
+                edge(a.margin.bottom, b.margin.bottom),
+                edge(a.margin.left, b.margin.left),
+            ],
+            padding: [
+                edge(a.padding.top, b.padding.top),
+                edge(a.padding.right, b.padding.right),
+                edge(a.padding.bottom, b.padding.bottom),
+                edge(a.padding.left, b.padding.left),
+            ],
+            markers: Vec::new(),
+        };
+        let marker = |properties: &Option<w3cos_std::style::CustomProperties>, key: &str| {
+            properties.as_ref().and_then(|p| p.get(key)).cloned()
+        };
+        let mut keys: Vec<&String> = Vec::new();
+        for properties in [&a.custom_properties, &b.custom_properties]
+            .into_iter()
+            .flatten()
+        {
+            keys.extend(
+                properties
+                    .keys()
+                    .filter(|key| key.starts_with("--w3cos-internal-")),
+            );
+        }
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            let (declared, mapped) = (
+                marker(&a.custom_properties, key),
+                marker(&b.custom_properties, key),
+            );
+            if declared != mapped {
+                overrides.markers.push((key.clone(), mapped));
+            }
+        }
+        (overrides != w3cos_std::style::LogicalOverrides::default()).then_some(overrides)
+    }
+
+    fn set_property_unshadowed(&mut self, name: &str, value: &str) {
+        if matches!(
+            name,
+            "align-items"
+                | "alignItems"
+                | "align-self"
+                | "alignSelf"
+                | "justify-items"
+                | "justifyItems"
+                | "justify-self"
+                | "justifySelf"
+                | "place-items"
+                | "placeItems"
+                | "place-self"
+                | "placeSelf"
+        ) && value
+            .split_whitespace()
+            .any(|token| matches!(token.to_ascii_lowercase().as_str(), "safe" | "unsafe"))
+        {
+            set_marker(
+                &mut self.inner,
+                OVERFLOW_ALIGNMENT_PROPERTY,
+                Some("1".to_string()),
+            );
+        }
         if self.replace_existing_inset(name, value) {
             return;
         }
@@ -291,6 +642,9 @@ impl CSSStyleDeclaration {
             return;
         }
         if !valid_multicol_declaration(name, value) {
+            return;
+        }
+        if matches!(name, "tab-size" | "tabSize") && !valid_tab_size_declaration(value) {
             return;
         }
         if name == "resize"
@@ -387,7 +741,18 @@ impl CSSStyleDeclaration {
                     run_in_block.then(|| "1".to_string()),
                 );
                 self.inner.display = parse_display(value);
-                let grid_lanes = keyword == "grid-lanes";
+                // `inline grid-lanes` is the atomic-inline form of the same
+                // container (css-grid-3). It keeps its unrecognized-display
+                // marker (legacy keeps `flex`) and also carries the lanes
+                // marker, so LayoutNG lays it out as a lane container on a
+                // line; the boxes it cannot place there stay on the legacy
+                // path through the unrecognized-display gate.
+                let keyword = if keyword.split_whitespace().eq(["inline", "grid-lanes"]) {
+                    "inline grid-lanes".to_string()
+                } else {
+                    keyword
+                };
+                let grid_lanes = keyword == "grid-lanes" || keyword == "inline grid-lanes";
                 set_marker(
                     &mut self.inner,
                     UNRECOGNIZED_DISPLAY_PROPERTY,
@@ -430,6 +795,12 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => {
                 self.inner.align_items = parse_align_items(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    ALIGN_ITEMS_KEYWORD_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
                 set_marker(
                     &mut self.inner,
                     ALIGN_ITEMS_STRETCH_PROPERTY,
@@ -437,14 +808,37 @@ impl CSSStyleDeclaration {
                 );
             }
             "flex-wrap" | "flexWrap" => {
-                self.inner.flex_wrap = parse_flex_wrap(value);
+                // An invalid value is dropped at parse time.
+                if let Some(keyword) = normalize_flex_wrap(value) {
+                    self.inner.flex_wrap = parse_flex_wrap(&keyword);
+                    set_marker(
+                        &mut self.inner,
+                        UNRECOGNIZED_FLEX_WRAP_PROPERTY,
+                        (!css_wide_keyword(&keyword) && !is_known_flex_wrap(&keyword))
+                            .then_some(keyword),
+                    );
+                }
+            }
+            "flex-line-count" | "flexLineCount" => {
                 let keyword = value.trim().to_ascii_lowercase();
-                set_marker(
-                    &mut self.inner,
-                    UNRECOGNIZED_FLEX_WRAP_PROPERTY,
-                    (!css_wide_keyword(&keyword) && !is_known_flex_wrap(&keyword))
-                        .then_some(keyword),
-                );
+                if css_wide_keyword(&keyword) {
+                    set_marker(&mut self.inner, FLEX_LINE_COUNT_PROPERTY, None);
+                } else if let Some(count) = parse_flex_line_count(&keyword) {
+                    set_marker(
+                        &mut self.inner,
+                        FLEX_LINE_COUNT_PROPERTY,
+                        Some(count.to_string()),
+                    );
+                }
+            }
+            "flex-flow" | "flexFlow" => {
+                // `<'flex-direction'> || <'flex-wrap'>`; an omitted
+                // longhand resets to its initial value (row, nowrap).
+                if let Some((direction, wrap)) = parse_flex_flow(value) {
+                    self.inner.flex_direction = direction;
+                    self.inner.flex_wrap = wrap;
+                    set_marker(&mut self.inner, UNRECOGNIZED_FLEX_WRAP_PROPERTY, None);
+                }
             }
             "-webkit-box-orient" | "webkit-box-orient" | "webkitBoxOrient" => {
                 let keyword = value.trim().to_ascii_lowercase();
@@ -486,9 +880,20 @@ impl CSSStyleDeclaration {
                     self.inner.flex_shrink = v
                 }
             }
-            "flex" => apply_flex_shorthand(&mut self.inner, value),
+            "flex" => {
+                apply_flex_shorthand(&mut self.inner, value);
+                let content = value.split_whitespace().count() > 1
+                    && value.split_whitespace().last() == Some("content");
+                set_marker(
+                    &mut self.inner,
+                    FLEX_BASIS_CONTENT_PROPERTY,
+                    content.then(|| "1".to_string()),
+                );
+            }
 
-            "gap" => {
+            // `grid-gap`, `grid-row-gap`, and `grid-column-gap` are the legacy
+            // aliases (CSS Box Alignment) that Chrome still parses.
+            "gap" | "grid-gap" | "gridGap" => {
                 let parts = split_css_whitespace(value);
                 let row_pct = parts.first().is_some_and(|part| part.contains('%'));
                 let column_pct = parts
@@ -496,6 +901,10 @@ impl CSSStyleDeclaration {
                     .map(|part| part.contains('%'))
                     .unwrap_or(row_pct);
                 update_percent_gap(&mut self.inner, Some(row_pct), Some(column_pct));
+                if let Some(row) = parts.first() {
+                    let column = parts.get(1).unwrap_or(row);
+                    update_percent_gap_values(&mut self.inner, Some(row), Some(column));
+                }
                 if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
                     self.inner.row_gap = Some(v);
                     self.inner.column_gap =
@@ -503,12 +912,14 @@ impl CSSStyleDeclaration {
                     self.inner.gap = v;
                 }
             }
-            "row-gap" | "rowGap" => {
+            "row-gap" | "rowGap" | "grid-row-gap" | "gridRowGap" => {
                 update_percent_gap(&mut self.inner, Some(value.contains('%')), None);
+                update_percent_gap_values(&mut self.inner, Some(value), None);
                 self.inner.row_gap = parse_px(value);
             }
-            "column-gap" | "columnGap" => {
+            "column-gap" | "columnGap" | "grid-column-gap" | "gridColumnGap" => {
                 update_percent_gap(&mut self.inner, None, Some(value.contains('%')));
+                update_percent_gap_values(&mut self.inner, None, Some(value));
                 self.inner.column_gap = parse_px(value);
             }
             "column-width" | "columnWidth" => {
@@ -641,52 +1052,97 @@ impl CSSStyleDeclaration {
                 }
             }
             "margin-top" | "marginTop" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.top = v
                 }
             }
             "margin-right" | "marginRight" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.right = v
                 }
             }
             "margin-bottom" | "marginBottom" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.bottom = v
                 }
             }
             "margin-left" | "marginLeft" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.left = v
                 }
             }
             "margin-inline" | "marginInline" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_spacing(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_margin_spacing(value)) {
                     let end = values
                         .get(1)
-                        .and_then(|value| parse_spacing(value))
+                        .and_then(|value| parse_margin_spacing(value))
                         .unwrap_or(start);
                     self.inner.margin.left = start;
                     self.inner.margin.right = end;
                 }
             }
             "margin-inline-start" | "marginInlineStart" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.left = v
                 }
             }
             "margin-inline-end" | "marginInlineEnd" => {
-                if let Some(v) = parse_spacing(value) {
+                if let Some(v) = parse_margin_spacing(value) {
                     self.inner.margin.right = v
+                }
+            }
+            // The block axis follows the writing mode (CSS Writing Modes):
+            // block-start is the top edge in horizontal-tb, the right edge in
+            // vertical-rl / sideways-rl and the left edge in vertical-lr /
+            // sideways-lr. Layout only models the horizontal box, but the
+            // edge sizes themselves are the same in every mode.
+            "margin-block-start" | "marginBlockStart"
+                if self.map_logical && self.map_block_axis =>
+            {
+                if let Some(v) = parse_margin_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.margin.top = v,
+                        PhysicalSide::Right => self.inner.margin.right = v,
+                        PhysicalSide::Left => self.inner.margin.left = v,
+                    }
+                }
+            }
+            "margin-block-end" | "marginBlockEnd" if self.map_logical && self.map_block_axis => {
+                if let Some(v) = parse_margin_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.margin.bottom = v,
+                        PhysicalSide::Right => self.inner.margin.left = v,
+                        PhysicalSide::Left => self.inner.margin.right = v,
+                    }
+                }
+            }
+            "padding-block-start" | "paddingBlockStart"
+                if self.map_logical && self.map_block_axis =>
+            {
+                if let Some(v) = parse_padding_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.padding.top = v,
+                        PhysicalSide::Right => self.inner.padding.right = v,
+                        PhysicalSide::Left => self.inner.padding.left = v,
+                    }
+                }
+            }
+            "padding-block-end" | "paddingBlockEnd" if self.map_logical && self.map_block_axis => {
+                if let Some(v) = parse_padding_spacing(value) {
+                    match self.inner.writing_mode.block_start_side() {
+                        PhysicalSide::Top => self.inner.padding.bottom = v,
+                        PhysicalSide::Right => self.inner.padding.left = v,
+                        PhysicalSide::Left => self.inner.padding.right = v,
+                    }
                 }
             }
             "margin-block" | "marginBlock" => {
                 let values = split_css_whitespace(value);
-                if let Some(start) = values.first().and_then(|value| parse_spacing(value)) {
+                if let Some(start) = values.first().and_then(|value| parse_margin_spacing(value)) {
                     let end = values
                         .get(1)
-                        .and_then(|value| parse_spacing(value))
+                        .and_then(|value| parse_margin_spacing(value))
                         .unwrap_or(start);
                     self.inner.margin.top = start;
                     self.inner.margin.bottom = end;
@@ -700,70 +1156,174 @@ impl CSSStyleDeclaration {
                     BoxSizing::ContentBox
                 }
             }
-            "width" => {
+            "inline-size" | "inlineSize" | "min-inline-size" | "minInlineSize"
+            | "max-inline-size" | "maxInlineSize" | "block-size" | "blockSize"
+            | "min-block-size" | "minBlockSize" | "max-block-size" | "maxBlockSize" => {
+                // In horizontal-tb the logical axes are the physical ones
+                // (inline-size is width, block-size is height) and the
+                // property takes the physical value grammar, keywords
+                // included. Other writing modes are not modelled by layout:
+                // the size is only recorded so layout can tell the box is
+                // sized by something it ignores.
+                let horizontal = self.map_logical
+                    && self.inner.writing_mode.is_horizontal()
+                    && (self.map_block_axis || !name.to_ascii_lowercase().contains("block"));
+                let css_name: String = name
+                    .chars()
+                    .flat_map(|c| {
+                        if c.is_ascii_uppercase() {
+                            vec!['-', c.to_ascii_lowercase()]
+                        } else {
+                            vec![c]
+                        }
+                    })
+                    .collect();
+                if horizontal {
+                    let physical = css_name
+                        .replace("inline-size", "width")
+                        .replace("block-size", "height");
+                    // The CSSOM declaration list keeps the logical name only:
+                    // an extra physical entry would be replayed by the
+                    // cascade even where the element turns out to be vertical.
+                    let declarations = self.inline_declarations.clone();
+                    self.set_property(&physical, raw_value);
+                    self.inline_declarations = declarations;
+                    return;
+                }
                 let keyword = value.trim().to_ascii_lowercase();
-                if matches!(
-                    keyword.as_str(),
-                    "max-content" | "min-content" | "fit-content"
-                ) {
+                // An intrinsic keyword on an inline size is the same keyword
+                // on the physical width in horizontal-tb, which the width
+                // keyword path already resolves.
+                let intrinsic = is_intrinsic_size_keyword(&keyword);
+                let physical = css_name
+                    .strip_suffix("inline-size")
+                    .filter(|_| intrinsic)
+                    .map(|prefix| format!("{prefix}width"));
+                // In the block axis the intrinsic keywords behave as the
+                // property's initial value for non-replaced boxes, which is
+                // what the unresolved block size already means here.
+                let initial =
+                    matches!(keyword.as_str(), "" | "auto" | "none" | "initial" | "unset")
+                        || (intrinsic && css_name.ends_with("block-size"));
+                set_marker(
+                    &mut self.inner,
+                    &format!("{LOGICAL_SIZE_PROPERTY_PREFIX}{css_name}"),
+                    (!initial && physical.is_none()).then(|| keyword.clone()),
+                );
+                if let Some(physical) = physical {
+                    self.set_property(&physical, raw_value);
+                }
+            }
+            "width" => {
+                if is_stretch_keyword(value) {
+                    self.inner.width = Dimension::Auto;
+                    set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "w", true);
+                } else if let Some(keyword) = inline_size_keyword(value) {
                     self.inner.width = Dimension::Auto;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
+                    // An invalid fit-content() argument drops the declaration.
                 } else if let Some((width, max_width)) = parse_min_percent_and_fixed(value) {
                     self.inner.width = width;
                     self.inner.max_width = max_width;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
-                } else if let Some(width) =
+                } else if let Some(width) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.width = width;
                     set_marker(&mut self.inner, WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "height" => {
                 let keyword = value.trim().to_ascii_lowercase();
-                if is_intrinsic_size_keyword(&keyword) {
+                if is_stretch_keyword(value) {
+                    self.inner.height = Dimension::Auto;
+                    set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "h", true);
+                } else if is_intrinsic_size_keyword(&keyword) {
+                    // Block-axis intrinsic keywords behave as `auto`; an
+                    // earlier fixed height does not survive them.
+                    self.inner.height = Dimension::Auto;
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, Some(keyword));
                 } else if let Some((height, max_height)) = parse_min_percent_and_fixed(value) {
                     self.inner.height = height;
                     self.inner.max_height = max_height;
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
-                } else if let Some(height) =
+                } else if let Some(height) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.height = height;
                     set_marker(&mut self.inner, HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "min-width" | "minWidth" => {
-                if let Some(value) =
+                if is_stretch_keyword(value) {
+                    self.inner.min_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "minw", true);
+                } else if let Some(keyword) = inline_size_keyword(value) {
+                    self.inner.min_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if is_intrinsic_size_keyword(&value.trim().to_ascii_lowercase()) {
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.min_width = value;
+                    set_marker(&mut self.inner, MIN_WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "min-height" | "minHeight" => {
-                if let Some(value) =
+                let keyword = value.trim().to_ascii_lowercase();
+                if is_stretch_keyword(value) {
+                    self.inner.min_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "minh", true);
+                } else if is_intrinsic_size_keyword(&keyword) {
+                    self.inner.min_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.min_height = value;
+                    set_marker(&mut self.inner, MIN_HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "max-width" | "maxWidth" => {
-                if value.trim().eq_ignore_ascii_case("none") {
+                if is_stretch_keyword(value) {
                     self.inner.max_width = Dimension::Auto;
-                } else if let Some(value) =
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "maxw", true);
+                } else if let Some(keyword) = inline_size_keyword(value) {
+                    self.inner.max_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, Some(keyword));
+                } else if value.trim().eq_ignore_ascii_case("none") {
+                    self.inner.max_width = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.max_width = value;
+                    set_marker(&mut self.inner, MAX_WIDTH_KEYWORD_PROPERTY, None);
                 }
             }
             "max-height" | "maxHeight" => {
-                if value.trim().eq_ignore_ascii_case("none") {
+                let keyword = value.trim().to_ascii_lowercase();
+                if is_stretch_keyword(value) {
                     self.inner.max_height = Dimension::Auto;
-                } else if let Some(value) =
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
+                    set_stretch(&mut self.inner, "maxh", true);
+                } else if is_intrinsic_size_keyword(&keyword) {
+                    self.inner.max_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, Some(keyword));
+                } else if value.trim().eq_ignore_ascii_case("none") {
+                    self.inner.max_height = Dimension::Auto;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
+                } else if let Some(value) = parse_size_calc(value).or_else(|| {
                     parse_dimension_checked(value).filter(dimension_is_non_negative_or_auto)
-                {
+                }) {
                     self.inner.max_height = value;
+                    set_marker(&mut self.inner, MAX_HEIGHT_KEYWORD_PROPERTY, None);
                 }
             }
             "aspect-ratio" | "aspectRatio" => {
@@ -771,7 +1331,12 @@ impl CSSStyleDeclaration {
                     set_marker(
                         &mut self.inner,
                         ASPECT_RATIO_PROPERTY,
-                        ratio.map(|ratio| ratio.to_string()),
+                        ratio.map(|(ratio, _)| ratio.to_string()),
+                    );
+                    set_marker(
+                        &mut self.inner,
+                        ASPECT_RATIO_AUTO_PROPERTY,
+                        ratio.and_then(|(_, auto)| auto.then(|| "1".to_string())),
                     );
                 }
             }
@@ -816,7 +1381,32 @@ impl CSSStyleDeclaration {
                 }
             }
 
-            "overflow" => self.inner.overflow = parse_overflow(value),
+            "overflow" => {
+                let tokens: Vec<&str> = value.split_whitespace().collect();
+                if tokens.len() == 2 && tokens.iter().all(|token| is_overflow_keyword(token)) {
+                    let (x, clip_x) = parse_overflow_axis(tokens[0]);
+                    let (y, clip_y) = parse_overflow_axis(tokens[1]);
+                    self.inner.overflow = x;
+                    self.inner.overflow_x = Some(x);
+                    self.inner.overflow_y = Some(y);
+                    self.inner.overflow_clip_x = clip_x;
+                    self.inner.overflow_clip_y = clip_y;
+                } else if tokens.len() <= 1 {
+                    let (overflow, clip) = parse_overflow_axis(value);
+                    self.inner.overflow = overflow;
+                    if clip || self.inner.overflow_clip_x || self.inner.overflow_clip_y {
+                        self.inner.overflow_x = None;
+                        self.inner.overflow_y = None;
+                    }
+                    self.inner.overflow_clip_x = clip;
+                    self.inner.overflow_clip_y = clip;
+                }
+            }
+            "overflow-clip-margin" => {
+                if let Some(margin) = parse_overflow_clip_margin(value) {
+                    self.inner.overflow_clip_margin = margin;
+                }
+            }
             "resize" => {
                 let value = value.trim().to_ascii_lowercase();
                 self.inner
@@ -836,8 +1426,16 @@ impl CSSStyleDeclaration {
                     self.inner.clip = clip;
                 }
             }
-            "overflow-x" | "overflowX" => self.inner.overflow_x = Some(parse_overflow(value)),
-            "overflow-y" | "overflowY" => self.inner.overflow_y = Some(parse_overflow(value)),
+            "overflow-x" | "overflowX" => {
+                let (overflow, clip) = parse_overflow_axis(value);
+                self.inner.overflow_x = Some(overflow);
+                self.inner.overflow_clip_x = clip;
+            }
+            "overflow-y" | "overflowY" => {
+                let (overflow, clip) = parse_overflow_axis(value);
+                self.inner.overflow_y = Some(overflow);
+                self.inner.overflow_clip_y = clip;
+            }
             "overflow-anchor" | "overflowAnchor" => {
                 self.inner.overflow_anchor = !value.trim().eq_ignore_ascii_case("none")
             }
@@ -1149,6 +1747,20 @@ impl CSSStyleDeclaration {
                     _ => {}
                 }
             }
+            // The longhands. Logical names map to the physical axes of
+            // horizontal-tb, the only writing mode the cascade models.
+            "contain-intrinsic-width"
+            | "containIntrinsicWidth"
+            | "contain-intrinsic-inline-size"
+            | "containIntrinsicInlineSize" => {
+                set_contain_intrinsic_axis(&mut self.inner, 0, value);
+            }
+            "contain-intrinsic-height"
+            | "containIntrinsicHeight"
+            | "contain-intrinsic-block-size"
+            | "containIntrinsicBlockSize" => {
+                set_contain_intrinsic_axis(&mut self.inner, 1, value);
+            }
             "filter" => {
                 let v = value.trim();
                 if v.is_empty() || v.eq_ignore_ascii_case("none") {
@@ -1263,6 +1875,18 @@ impl CSSStyleDeclaration {
                         "--w3cos-internal-text-align-last".to_string(),
                         value.trim().to_ascii_lowercase(),
                     );
+            }
+            "tab-size" | "tabSize" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                let properties = self
+                    .inner
+                    .custom_properties
+                    .get_or_insert_with(Default::default);
+                if matches!(keyword.as_str(), "inherit" | "unset") {
+                    properties.remove(TAB_SIZE_PROPERTY);
+                } else if let Some(computed) = computed_tab_size(value, self.inner.font_size) {
+                    properties.insert(TAB_SIZE_PROPERTY.to_string(), computed);
+                }
             }
             "white-space" | "whiteSpace" => {
                 if value.trim().eq_ignore_ascii_case("break-spaces") {
@@ -1424,7 +2048,15 @@ impl CSSStyleDeclaration {
             "font-feature-settings" | "fontFeatureSettings" => {
                 self.inner.font_feature_kern = parse_kern_feature_override(value);
             }
-            "word-break" | "wordBreak" => self.inner.word_break = parse_word_break(value),
+            "word-break" | "wordBreak" => {
+                self.inner.word_break = parse_word_break(value);
+                let auto_phrase = value.trim().eq_ignore_ascii_case("auto-phrase");
+                set_marker(
+                    &mut self.inner,
+                    WORD_BREAK_AUTO_PHRASE_PROPERTY,
+                    auto_phrase.then(|| "1".to_string()),
+                );
+            }
             "hanging-punctuation" | "hangingPunctuation" => {
                 self.inner.hanging_punctuation_last = value
                     .split_ascii_whitespace()
@@ -1439,6 +2071,16 @@ impl CSSStyleDeclaration {
                     "anywhere" => LineBreak::Anywhere,
                     _ => LineBreak::Auto,
                 };
+            }
+            "writing-mode" | "writingMode" => {
+                // `inherit` and `unset` are resolved against the parent by
+                // the cascade before the declarations are applied.
+                let value = value.trim().to_ascii_lowercase();
+                if value == "initial" {
+                    self.inner.writing_mode = WritingMode::HorizontalTb;
+                } else if let Some(mode) = WritingMode::from_keyword(&value) {
+                    self.inner.writing_mode = mode;
+                }
             }
             "direction" => {
                 self.inner.direction = if value.trim().eq_ignore_ascii_case("rtl") {
@@ -1479,13 +2121,28 @@ impl CSSStyleDeclaration {
             "visibility" => self.inner.visibility = parse_visibility(value),
 
             // Flex extras
-            "flex-basis" | "flexBasis" => self.inner.flex_basis = parse_dimension(value),
+            "flex-basis" | "flexBasis" => {
+                self.inner.flex_basis = parse_dimension(value);
+                set_marker(
+                    &mut self.inner,
+                    FLEX_BASIS_CONTENT_PROPERTY,
+                    (value.trim() == "content").then(|| "1".to_string()),
+                );
+            }
             "order" => {
                 if let Ok(v) = value.parse() {
                     self.inner.order = v
                 }
             }
-            "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "align-self" | "alignSelf" => {
+                self.inner.align_self = parse_align_self(value);
+                let keyword = value.trim().to_ascii_lowercase();
+                set_marker(
+                    &mut self.inner,
+                    ALIGN_SELF_KEYWORD_PROPERTY,
+                    (!css_wide_keyword(&keyword)).then_some(keyword),
+                );
+            }
             "vertical-align" | "verticalAlign" => {
                 let value = value.trim();
                 const KEYWORD_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
@@ -1543,6 +2200,33 @@ impl CSSStyleDeclaration {
                     safe.then(|| "1".to_string()),
                 );
             }
+            "place-self" | "placeSelf" => {
+                // `<'align-self'> <'justify-self'>?`: one value sets both. A
+                // position or baseline prefix belongs to the keyword after it.
+                let mut groups: Vec<String> = Vec::new();
+                let mut prefix: Option<&str> = None;
+                for token in value.split_whitespace() {
+                    let lower = token.to_ascii_lowercase();
+                    if prefix.is_none()
+                        && matches!(lower.as_str(), "safe" | "unsafe" | "first" | "last")
+                    {
+                        prefix = Some(token);
+                        continue;
+                    }
+                    groups.push(match prefix.take() {
+                        Some(p) => format!("{p} {token}"),
+                        None => token.to_string(),
+                    });
+                }
+                if let Some(p) = prefix {
+                    groups.push(p.to_string());
+                }
+                if let Some(align) = groups.first().cloned() {
+                    let justify = groups.get(1).cloned().unwrap_or_else(|| align.clone());
+                    self.set_property("align-self", &align);
+                    self.set_property("justify-self", &justify);
+                }
+            }
             "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
             "justify-items" | "justifyItems" => {
                 self.inner.justify_items = parse_align_items(value);
@@ -1551,6 +2235,41 @@ impl CSSStyleDeclaration {
                     JUSTIFY_ITEMS_STRETCH_PROPERTY,
                     (value.trim() == "stretch").then(|| "stretch".to_string()),
                 );
+            }
+            "place-content" | "placeContent" => {
+                // `<'align-content'> <'justify-content'>?` (CSS Box Alignment).
+                // An overflow-position or baseline-position prefix belongs to
+                // the keyword after it. With one value, justify-content takes
+                // the same value, except a baseline value, which gives start.
+                let mut groups: Vec<String> = Vec::new();
+                let mut prefix: Option<&str> = None;
+                for token in value.split_whitespace() {
+                    let lower = token.to_ascii_lowercase();
+                    if prefix.is_none()
+                        && matches!(lower.as_str(), "safe" | "unsafe" | "first" | "last")
+                    {
+                        prefix = Some(token);
+                        continue;
+                    }
+                    groups.push(match prefix.take() {
+                        Some(p) => format!("{p} {token}"),
+                        None => token.to_string(),
+                    });
+                }
+                if let Some(p) = prefix {
+                    groups.push(p.to_string());
+                }
+                if let Some(align) = groups.first().cloned() {
+                    let justify = match groups.get(1) {
+                        Some(justify) => justify.clone(),
+                        None if align.to_ascii_lowercase().ends_with("baseline") => {
+                            "start".to_string()
+                        }
+                        None => align.clone(),
+                    };
+                    self.set_property("align-content", &align);
+                    self.set_property("justify-content", &justify);
+                }
             }
             "place-items" | "placeItems" => {
                 let mut values = value.split_whitespace();
@@ -1597,6 +2316,16 @@ impl CSSStyleDeclaration {
                 self.inner.grid_ng_mut().grid_template_areas = Some(value.trim().to_string());
             }
             "grid-area" | "gridArea" => apply_grid_area(&mut self.inner, value),
+            "grid-column-start" | "gridColumnStart" => {
+                apply_grid_line(&mut self.inner, false, false, value)
+            }
+            "grid-column-end" | "gridColumnEnd" => {
+                apply_grid_line(&mut self.inner, false, true, value)
+            }
+            "grid-row-start" | "gridRowStart" => {
+                apply_grid_line(&mut self.inner, true, false, value)
+            }
+            "grid-row-end" | "gridRowEnd" => apply_grid_line(&mut self.inner, true, true, value),
 
             // Outline
             "outline" => {
@@ -1667,6 +2396,23 @@ impl CSSStyleDeclaration {
             existing != name && !longhands.iter().any(|longhand| existing == longhand)
         });
         self.inline_declarations.push((name.to_string(), value));
+    }
+
+    fn overflow_axis_keyword(&self, y: bool) -> String {
+        let clip = if y {
+            self.inner.overflow_clip_y
+        } else {
+            self.inner.overflow_clip_x
+        };
+        if clip {
+            return "clip".to_string();
+        }
+        let overflow = if y {
+            self.inner.resolved_overflow_y()
+        } else {
+            self.inner.resolved_overflow_x()
+        };
+        format!("{overflow:?}").to_lowercase()
     }
 
     pub fn get_property(&self, name: &str) -> String {
@@ -1881,10 +2627,41 @@ impl CSSStyleDeclaration {
             "flex-direction" | "flexDirection" => {
                 format!("{:?}", self.inner.flex_direction).to_lowercase()
             }
+            "flex-wrap" | "flexWrap" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(UNRECOGNIZED_FLEX_WRAP_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| {
+                    match self.inner.flex_wrap {
+                        FlexWrap::NoWrap => "nowrap",
+                        FlexWrap::Wrap => "wrap",
+                        FlexWrap::WrapReverse => "wrap-reverse",
+                    }
+                    .to_string()
+                }),
+            "flex-line-count" | "flexLineCount" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(FLEX_LINE_COUNT_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| "1".into()),
             "justify-content" | "justifyContent" => {
                 format!("{:?}", self.inner.justify_content).to_lowercase()
             }
             "align-items" | "alignItems" => format!("{:?}", self.inner.align_items).to_lowercase(),
+            "overflow"
+                if self.inner.overflow_clip_x
+                    || self.inner.overflow_clip_y
+                    || self.inner.overflow_x.is_some()
+                    || self.inner.overflow_y.is_some() =>
+            {
+                let x = self.overflow_axis_keyword(false);
+                let y = self.overflow_axis_keyword(true);
+                if x == y { x } else { format!("{x} {y}") }
+            }
             "overflow" => format!("{:?}", self.inner.overflow).to_lowercase(),
             "resize" => self
                 .inner
@@ -1893,6 +2670,14 @@ impl CSSStyleDeclaration {
                 .and_then(|properties| properties.get(RESIZE_PROPERTY))
                 .cloned()
                 .unwrap_or_else(|| "none".into()),
+            // Computed tab-size: a number, or an absolute length in px.
+            "tab-size" | "tabSize" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(TAB_SIZE_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| "8".into()),
             "clip" => self.inner.clip.map_or_else(
                 || "auto".to_string(),
                 |clip| {
@@ -1908,12 +2693,8 @@ impl CSSStyleDeclaration {
                     )
                 },
             ),
-            "overflow-x" | "overflowX" => {
-                format!("{:?}", self.inner.resolved_overflow_x()).to_lowercase()
-            }
-            "overflow-y" | "overflowY" => {
-                format!("{:?}", self.inner.resolved_overflow_y()).to_lowercase()
-            }
+            "overflow-x" | "overflowX" => self.overflow_axis_keyword(false),
+            "overflow-y" | "overflowY" => self.overflow_axis_keyword(true),
             "box-sizing" | "boxSizing" => match self.inner.box_sizing {
                 BoxSizing::ContentBox => "content-box".to_string(),
                 BoxSizing::BorderBox => "border-box".to_string(),
@@ -2143,6 +2924,9 @@ fn apply_background_shorthand(style: &mut Style, value: &str) {
 
 fn parse_padding_spacing(value: &str) -> Option<Spacing> {
     let value = value.trim();
+    if let Some(calc) = parse_padding_calc(value) {
+        return Some(calc);
+    }
     let environments = [
         ("env(safe-area-inset-top)", SafeAreaEdge::Top),
         ("env(safe-area-inset-right)", SafeAreaEdge::Right),
@@ -2239,7 +3023,7 @@ fn parse_padding_shorthand(value: &str) -> Option<Edges> {
 fn parse_margin_shorthand(value: &str) -> Option<Edges> {
     let parts: Vec<Spacing> = split_css_whitespace(value)
         .iter()
-        .map(|part| parse_spacing(part))
+        .map(|part| parse_margin_spacing(part))
         .collect::<Option<_>>()?;
     expand_edge_spacing(&parts)
 }
@@ -2364,6 +3148,10 @@ pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
+        w3cos_std::style::Dimension::Calc { percent, px } => {
+            let (sign, px) = if *px < 0.0 { ('-', -px) } else { ('+', *px) };
+            format!("calc({percent}% {sign} {px}px)")
+        }
     }
 }
 
@@ -2460,6 +3248,180 @@ fn is_known_display(value: &str) -> bool {
     )
 }
 
+/// `<integer [1,∞]>`: an integer literal of at least one, or a math
+/// function resolving to a number, which rounds to an integer and clamps
+/// to one (`calc(NaN)` computes to 1).
+pub fn parse_flex_line_count(value: &str) -> Option<u32> {
+    let value = value.trim().to_ascii_lowercase();
+    let digits = value.strip_prefix('+').unwrap_or(&value);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        return digits.parse::<u32>().ok().filter(|count| *count >= 1);
+    }
+    if !(value.starts_with("calc(") || value.starts_with("round(")) {
+        return None;
+    }
+    let mut parser = MathNumber {
+        text: value.as_bytes(),
+        pos: 0,
+    };
+    let result = parser.sum()?;
+    parser.skip_space();
+    if parser.pos != parser.text.len() {
+        return None;
+    }
+    if result.is_nan() {
+        return Some(1);
+    }
+    Some(result.round().clamp(1.0, f64::from(u32::MAX)) as u32)
+}
+
+/// A unitless `calc()` / `round()` expression (CSS Values 4 §10).
+struct MathNumber<'a> {
+    text: &'a [u8],
+    pos: usize,
+}
+
+impl MathNumber<'_> {
+    fn skip_space(&mut self) {
+        while self.text.get(self.pos).is_some_and(u8::is_ascii_whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        self.skip_space();
+        if self.text.get(self.pos) == Some(&byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn word(&mut self, word: &str) -> bool {
+        self.skip_space();
+        if self.text[self.pos..].starts_with(word.as_bytes()) {
+            self.pos += word.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sum(&mut self) -> Option<f64> {
+        let mut total = self.product()?;
+        loop {
+            self.skip_space();
+            if self.eat(b'+') {
+                total += self.product()?;
+            } else if self.eat(b'-') {
+                total -= self.product()?;
+            } else {
+                return Some(total);
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<f64> {
+        let mut total = self.factor()?;
+        loop {
+            if self.eat(b'*') {
+                total *= self.factor()?;
+            } else if self.eat(b'/') {
+                total /= self.factor()?;
+            } else {
+                return Some(total);
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<f64> {
+        self.skip_space();
+        if self.word("calc(") {
+            let value = self.sum()?;
+            return self.eat(b')').then_some(value);
+        }
+        if self.eat(b'(') {
+            let value = self.sum()?;
+            return self.eat(b')').then_some(value);
+        }
+        if self.word("round(") {
+            let strategy = ["nearest", "up", "down", "to-zero"]
+                .into_iter()
+                .find(|name| self.word(name));
+            if strategy.is_some() && !self.eat(b',') {
+                return None;
+            }
+            let value = self.sum()?;
+            let step = if self.eat(b',') { self.sum()? } else { 1.0 };
+            if !self.eat(b')') {
+                return None;
+            }
+            let quotient = value / step;
+            let rounded = match strategy.unwrap_or("nearest") {
+                "up" => quotient.ceil(),
+                "down" => quotient.floor(),
+                "to-zero" => quotient.trunc(),
+                _ => quotient.round(),
+            };
+            return Some(rounded * step);
+        }
+        if self.word("nan") {
+            return Some(f64::NAN);
+        }
+        if self.word("infinity") {
+            return Some(f64::INFINITY);
+        }
+        if self.word("-infinity") {
+            return Some(f64::NEG_INFINITY);
+        }
+        let start = self.pos;
+        if matches!(self.text.get(self.pos), Some(b'+' | b'-')) {
+            self.pos += 1;
+        }
+        while self
+            .text
+            .get(self.pos)
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'.')
+        {
+            self.pos += 1;
+        }
+        std::str::from_utf8(&self.text[start..self.pos])
+            .ok()?
+            .parse::<f64>()
+            .ok()
+    }
+}
+
+/// `flex-wrap: <'flex-wrap'>` after CSS Flexbox 2: `nowrap | wrap |
+/// wrap-reverse | balance | [wrap | wrap-reverse] && balance`, serialized
+/// as `balance` or `wrap-reverse balance` for the combined forms. CSS-wide
+/// keywords pass through. `None` for an invalid value.
+pub fn normalize_flex_wrap(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if css_wide_keyword(&value) {
+        return Some(value);
+    }
+    let words: Vec<&str> = value.split_ascii_whitespace().collect();
+    match words.as_slice() {
+        ["nowrap" | "wrap" | "wrap-reverse" | "balance"] => Some(value),
+        [a, b] => {
+            let (wrap, balance) = match (*a, *b) {
+                ("balance", wrap) | (wrap, "balance") => (wrap, true),
+                (wrap, _) => (wrap, false),
+            };
+            (balance && matches!(wrap, "wrap" | "wrap-reverse")).then(|| {
+                if wrap == "wrap-reverse" {
+                    "wrap-reverse balance".to_string()
+                } else {
+                    "balance".to_string()
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
 fn is_known_flex_wrap(value: &str) -> bool {
     matches!(value, "nowrap" | "wrap" | "wrap-reverse")
 }
@@ -2541,6 +3503,36 @@ fn parse_flex_direction(value: &str) -> FlexDirection {
         "column-reverse" => FlexDirection::ColumnReverse,
         _ => FlexDirection::Column,
     }
+}
+
+/// `min-content | max-content | fit-content | fit-content(<length-percentage>)`
+/// on a width property, as the marker value layout reads. A negative or
+/// unparsable argument makes the declaration invalid (`None`).
+fn inline_size_keyword(value: &str) -> Option<String> {
+    let keyword = value.trim().to_ascii_lowercase();
+    if matches!(
+        keyword.as_str(),
+        "max-content" | "min-content" | "fit-content"
+    ) {
+        return Some(keyword);
+    }
+    let argument = keyword
+        .strip_prefix("fit-content(")?
+        .strip_suffix(')')?
+        .trim();
+    let argument = match parse_dimension_checked(argument)? {
+        Dimension::Px(n) => format!("{n}px"),
+        Dimension::Percent(n) => format!("{n}%"),
+        Dimension::Em(n) => format!("{n}em"),
+        Dimension::Rem(n) => format!("{n}rem"),
+        Dimension::Vw(n) => format!("{n}vw"),
+        Dimension::Vh(n) => format!("{n}vh"),
+        _ => return None,
+    };
+    if argument.starts_with('-') {
+        return None;
+    }
+    Some(format!("fit-content({argument})"))
 }
 
 fn is_intrinsic_size_keyword(value: &str) -> bool {
@@ -2684,13 +3676,67 @@ fn apply_grid_shorthand(style: &mut Style, value: &str) {
     }
 }
 
+/// A `grid-{row,column}-{start,end}` longhand. LayoutNG reads the cascaded
+/// `start / end` pair, so the longhand rewrites one side of it. A lone
+/// custom ident in the shorthand also names the end line (CSS Grid 8.4).
+fn apply_grid_line(style: &mut Style, row: bool, end: bool, value: &str) {
+    let value = value.trim();
+    let value = if css_wide_keyword(&value.to_ascii_lowercase()) || value.is_empty() {
+        "auto"
+    } else {
+        value
+    };
+    remember_grid_placement(style);
+    let ng = style.grid_ng_mut();
+    let current = if row {
+        ng.grid_row_used.as_deref()
+    } else {
+        ng.grid_column_used.as_deref()
+    };
+    let (mut start_line, mut end_line) = match current.map(split_grid_slash).as_deref() {
+        Some([start, end]) => ((*start).to_string(), (*end).to_string()),
+        Some([only]) if is_grid_custom_ident(only) => ((*only).to_string(), (*only).to_string()),
+        Some([only]) if !only.is_empty() => ((*only).to_string(), "auto".to_string()),
+        _ => ("auto".to_string(), "auto".to_string()),
+    };
+    if end {
+        end_line = value.to_string();
+    } else {
+        start_line = value.to_string();
+    }
+    let pair = Some(format!("{start_line} / {end_line}"));
+    if row {
+        ng.grid_row_used = pair;
+    } else {
+        ng.grid_column_used = pair;
+    }
+}
+
+fn is_grid_custom_ident(value: &str) -> bool {
+    let mut tokens = value.split_whitespace();
+    let (Some(token), None) = (tokens.next(), tokens.next()) else {
+        return false;
+    };
+    let lower = token.to_ascii_lowercase();
+    !matches!(lower.as_str(), "auto" | "span")
+        && !css_wide_keyword(&lower)
+        && token.parse::<i64>().is_err()
+}
+
 fn apply_grid_area(style: &mut Style, value: &str) {
     let value = value.trim();
     style.grid_ng_mut().grid_area = Some(value.to_string());
     remember_grid_placement(style);
     let parts = split_grid_slash(value);
     let (row, column) = match parts.as_slice() {
-        [only] => ((*only).to_string(), "auto".to_string()),
+        [only] => (
+            (*only).to_string(),
+            if is_grid_custom_ident(only) {
+                (*only).to_string()
+            } else {
+                "auto".to_string()
+            },
+        ),
         [row_start, column_start] => ((*row_start).to_string(), (*column_start).to_string()),
         [row_start, column_start, row_end] => (
             format!("{row_start} / {row_end}"),
@@ -2735,12 +3781,98 @@ fn parse_align_items(value: &str) -> AlignItems {
     }
 }
 
+/// `flex-flow: <'flex-direction'> || <'flex-wrap'>`, or `initial` /
+/// `unset` / `revert` for both initial values. `None` drops the
+/// declaration (an unknown or repeated component, or `inherit`, which
+/// this declaration cannot resolve).
+fn parse_flex_flow(value: &str) -> Option<(FlexDirection, FlexWrap)> {
+    let lower = value.trim().to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        return Some((FlexDirection::Row, FlexWrap::NoWrap));
+    }
+    let (mut direction, mut wrap) = (None, None);
+    let mut any = false;
+    for token in lower.split_ascii_whitespace() {
+        any = true;
+        match token {
+            "row" | "column" | "row-reverse" | "column-reverse" if direction.is_none() => {
+                direction = Some(parse_flex_direction(token));
+            }
+            "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => {
+                wrap = Some(parse_flex_wrap(token));
+            }
+            _ => return None,
+        }
+    }
+    any.then(|| {
+        (
+            direction.unwrap_or(FlexDirection::Row),
+            wrap.unwrap_or(FlexWrap::NoWrap),
+        )
+    })
+}
+
 fn parse_flex_wrap(value: &str) -> FlexWrap {
     match value.trim() {
         "nowrap" => FlexWrap::NoWrap,
         "wrap" => FlexWrap::Wrap,
         "wrap-reverse" => FlexWrap::WrapReverse,
         _ => FlexWrap::NoWrap,
+    }
+}
+
+/// `overflow-clip-margin: [<visual-box> || <length [0,∞)>]`; `None` when
+/// the value is invalid.
+fn parse_overflow_clip_margin(value: &str) -> Option<(u8, f32)> {
+    let mut visual_box = None;
+    let mut length = None;
+    for token in value.split_whitespace() {
+        let token = token.to_ascii_lowercase();
+        let parsed_box = match token.as_str() {
+            "padding-box" => Some(0),
+            "content-box" => Some(1),
+            "border-box" => Some(2),
+            _ => None,
+        };
+        if let Some(parsed_box) = parsed_box {
+            visual_box.replace(parsed_box).is_none().then_some(())?;
+        } else {
+            let px = match token.strip_suffix("px") {
+                Some(number) => number.parse::<f32>().ok()?,
+                None => {
+                    let zero = token.parse::<f32>().ok()?;
+                    (zero == 0.0).then_some(zero)?
+                }
+            };
+            if px < 0.0 || !px.is_finite() {
+                return None;
+            }
+            length.replace(px).is_none().then_some(())?;
+        }
+    }
+    if visual_box.is_none() && length.is_none() {
+        return None;
+    }
+    Some((visual_box.unwrap_or(0), length.unwrap_or(0.0)))
+}
+
+fn is_overflow_keyword(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "visible" | "hidden" | "scroll" | "auto" | "clip"
+    )
+}
+
+/// Parses one overflow axis. `clip` keeps the `Visible` layout value and
+/// reports the paint-only clip flag separately.
+fn parse_overflow_axis(value: &str) -> (Overflow, bool) {
+    if value.trim().eq_ignore_ascii_case("clip") {
+        (Overflow::Visible, true)
+    } else {
+        (parse_overflow(value), false)
     }
 }
 
@@ -2961,9 +4093,266 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     None
 }
 
+/// A `calc()` value of a sizing property that is a linear sum of
+/// percentages and absolute lengths (`calc(10% + 50px)`,
+/// `calc((100% - 20px) / 2)`). Without a percentage it is a px length;
+/// with only percentages, a percentage; otherwise `Dimension::Calc`.
+/// Relative units and anything else return `None` (the declaration is
+/// dropped, as before).
+fn parse_calc_length(value: &str) -> Option<(f32, f32, bool, bool)> {
+    let lower = value.trim().to_ascii_lowercase();
+    if !lower.starts_with("calc(") {
+        return None;
+    }
+    let tokens = calc_tokens(&lower)?;
+    let mut pos = 0;
+    let result = calc_sum(&tokens, &mut pos)?;
+    if pos != tokens.len() {
+        return None;
+    }
+    let CalcValue::Length {
+        percent,
+        px,
+        has_percent,
+        has_px,
+    } = result
+    else {
+        return None;
+    };
+    (percent.is_finite() && px.is_finite()).then_some((percent, px, has_percent, has_px))
+}
+
+fn parse_size_calc(value: &str) -> Option<Dimension> {
+    let (percent, px, has_percent, has_px) = parse_calc_length(value)?;
+    Some(match (has_percent, has_px) {
+        (false, _) => Dimension::Px(px.max(0.0)),
+        (true, false) => Dimension::Percent(percent.max(0.0)),
+        (true, true) => Dimension::Calc { percent, px },
+    })
+}
+
+/// A margin `calc()` of absolute lengths and one percentage. Margins may
+/// be negative, so nothing is clamped here.
+fn parse_margin_calc(value: &str) -> Option<Spacing> {
+    let (percent, px, has_percent, has_px) = parse_calc_length(value)?;
+    Some(match (has_percent, has_px) {
+        (false, _) => Spacing::Px(px),
+        (true, false) => Spacing::Percent(percent),
+        (true, true) => Spacing::Calc { percent, px },
+    })
+}
+
+/// A padding `calc()` of absolute lengths and one percentage. Padding
+/// cannot be negative, so a pure length or percentage is floored at zero
+/// here and a mix keeps its sum for LayoutNG to floor once the basis is known.
+fn parse_padding_calc(value: &str) -> Option<Spacing> {
+    let (percent, px, has_percent, has_px) = parse_calc_length(value)?;
+    Some(match (has_percent, has_px) {
+        (false, _) => Spacing::Px(px.max(0.0)),
+        (true, false) => Spacing::Percent(percent.max(0.0)),
+        (true, true) => Spacing::PaddingCalc { percent, px },
+    })
+}
+
+fn parse_margin_spacing(value: &str) -> Option<Spacing> {
+    parse_margin_calc(value).or_else(|| parse_spacing(value))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CalcToken {
+    Open,
+    Close,
+    Op(char),
+    Value(CalcValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CalcValue {
+    Number(f32),
+    Length {
+        percent: f32,
+        px: f32,
+        has_percent: bool,
+        has_px: bool,
+    },
+}
+
+fn calc_tokens(input: &str) -> Option<Vec<CalcToken>> {
+    let bytes = input.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if input[i..].starts_with("calc(") {
+            tokens.push(CalcToken::Open);
+            i += 5;
+            continue;
+        }
+        let operand_expected = matches!(
+            tokens.last(),
+            None | Some(CalcToken::Open) | Some(CalcToken::Op(_))
+        );
+        match c {
+            b'(' => {
+                tokens.push(CalcToken::Open);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(CalcToken::Close);
+                i += 1;
+            }
+            b'*' | b'/' => {
+                tokens.push(CalcToken::Op(c as char));
+                i += 1;
+            }
+            b'+' | b'-' if !operand_expected => {
+                // `+` and `-` need whitespace on both sides (css-values).
+                let spaced = i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes.get(i + 1).is_some_and(|b| b.is_ascii_whitespace());
+                if !spaced {
+                    return None;
+                }
+                tokens.push(CalcToken::Op(c as char));
+                i += 1;
+            }
+            _ => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && !matches!(bytes[i], b'(' | b')' | b'*' | b'/')
+                {
+                    i += 1;
+                }
+                tokens.push(CalcToken::Value(calc_operand(&input[start..i])?));
+            }
+        }
+    }
+    Some(tokens)
+}
+
+fn calc_operand(token: &str) -> Option<CalcValue> {
+    if let Ok(number) = token.parse::<f32>() {
+        return Some(CalcValue::Number(number));
+    }
+    if let Some(percent) = token.strip_suffix('%') {
+        return Some(CalcValue::Length {
+            percent: percent.parse().ok()?,
+            px: 0.0,
+            has_percent: true,
+            has_px: false,
+        });
+    }
+    if !token.ends_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(CalcValue::Length {
+        percent: 0.0,
+        px: parse_px(token)?,
+        has_percent: false,
+        has_px: true,
+    })
+}
+
+fn calc_sum(tokens: &[CalcToken], pos: &mut usize) -> Option<CalcValue> {
+    let mut acc = calc_product(tokens, pos)?;
+    while let Some(CalcToken::Op(op @ ('+' | '-'))) = tokens.get(*pos) {
+        let sign = if *op == '-' { -1.0 } else { 1.0 };
+        *pos += 1;
+        let rhs = calc_product(tokens, pos)?;
+        acc = match (acc, rhs) {
+            (CalcValue::Number(a), CalcValue::Number(b)) => CalcValue::Number(a + sign * b),
+            (
+                CalcValue::Length {
+                    percent: ap,
+                    px: ax,
+                    has_percent: ah,
+                    has_px: axh,
+                },
+                CalcValue::Length {
+                    percent: bp,
+                    px: bx,
+                    has_percent: bh,
+                    has_px: bxh,
+                },
+            ) => CalcValue::Length {
+                percent: ap + sign * bp,
+                px: ax + sign * bx,
+                has_percent: ah || bh,
+                has_px: axh || bxh,
+            },
+            _ => return None,
+        };
+    }
+    Some(acc)
+}
+
+fn calc_product(tokens: &[CalcToken], pos: &mut usize) -> Option<CalcValue> {
+    let mut acc = calc_primary(tokens, pos)?;
+    while let Some(CalcToken::Op(op @ ('*' | '/'))) = tokens.get(*pos) {
+        let divide = *op == '/';
+        *pos += 1;
+        let rhs = calc_primary(tokens, pos)?;
+        acc = match (acc, rhs, divide) {
+            (CalcValue::Number(a), CalcValue::Number(b), false) => CalcValue::Number(a * b),
+            (CalcValue::Number(a), CalcValue::Number(b), true) if b != 0.0 => {
+                CalcValue::Number(a / b)
+            }
+            (CalcValue::Length { .. }, CalcValue::Number(b), true) if b != 0.0 => {
+                calc_scale(acc, 1.0 / b)
+            }
+            (CalcValue::Length { .. }, CalcValue::Number(b), false) => calc_scale(acc, b),
+            (CalcValue::Number(a), CalcValue::Length { .. }, false) => calc_scale(rhs, a),
+            _ => return None,
+        };
+    }
+    Some(acc)
+}
+
+fn calc_scale(value: CalcValue, factor: f32) -> CalcValue {
+    match value {
+        CalcValue::Number(n) => CalcValue::Number(n * factor),
+        CalcValue::Length {
+            percent,
+            px,
+            has_percent,
+            has_px,
+        } => CalcValue::Length {
+            percent: percent * factor,
+            px: px * factor,
+            has_percent,
+            has_px,
+        },
+    }
+}
+
+fn calc_primary(tokens: &[CalcToken], pos: &mut usize) -> Option<CalcValue> {
+    match tokens.get(*pos)? {
+        CalcToken::Open => {
+            *pos += 1;
+            let value = calc_sum(tokens, pos)?;
+            if tokens.get(*pos) != Some(&CalcToken::Close) {
+                return None;
+            }
+            *pos += 1;
+            Some(value)
+        }
+        CalcToken::Value(value) => {
+            *pos += 1;
+            Some(*value)
+        }
+        _ => None,
+    }
+}
+
 fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
     match *value {
-        Dimension::Auto => true,
+        Dimension::Auto | Dimension::Calc { .. } => true,
         Dimension::Px(value)
         | Dimension::Percent(value)
         | Dimension::Rem(value)
@@ -3594,6 +4983,217 @@ fn parse_kern_feature_override(value: &str) -> Option<bool> {
             _ => None,
         }
     })
+}
+
+/// `tab-size: <number [0,inf]> | <length [0,inf]>` (CSS Text 3 4.2).
+/// Percentages and negative values are invalid; font-relative lengths
+/// resolve against `font_size` (the declaring element's, so descendants
+/// inherit pixels). Returns the computed value stored under
+/// [`TAB_SIZE_PROPERTY`].
+pub(crate) fn computed_tab_size(value: &str, font_size: f32) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "initial" {
+        return Some("8".into());
+    }
+    let finite = |number: &str| {
+        number
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|number| number.is_finite() && *number >= 0.0)
+    };
+    if let Some(number) = finite(&value) {
+        return Some(format!("{number}"));
+    }
+    if let Some(body) = value
+        .strip_prefix("calc(")
+        .and_then(|body| body.strip_suffix(')'))
+    {
+        return computed_tab_size_calc(body, font_size);
+    }
+    let pixels = [
+        ("px", 1.0),
+        ("rem", 16.0),
+        ("em", font_size),
+        ("ex", font_size * 0.5),
+        ("in", 96.0),
+        ("cm", 96.0 / 2.54),
+        ("mm", 96.0 / 25.4),
+        ("pt", 96.0 / 72.0),
+        ("pc", 16.0),
+        ("q", 96.0 / 101.6),
+    ]
+    .into_iter()
+    .find_map(|(unit, scale)| {
+        let number = value.strip_suffix(unit)?;
+        // `rem` also ends in `em`; the earlier entry wins.
+        if unit == "em" && number.ends_with('r') {
+            return None;
+        }
+        finite(number).map(|number| number * scale)
+    })?;
+    Some(format!("{pixels}px"))
+}
+
+/// Whether `value` is a valid `tab-size` declaration value (a CSS-wide
+/// keyword, or a non-negative number or length).
+pub fn valid_tab_size_declaration(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "unset" | "revert" | "revert-layer"
+    ) || computed_tab_size(value, 16.0).is_some()
+}
+
+/// A `calc()` sum of terms that are all numbers or all lengths, joined by
+/// ` + ` / ` - `; a negative result clamps to 0 (CSS Values 4 10.12, the
+/// property only allows non-negative values).  Nested functions are not
+/// resolved.
+fn computed_tab_size_calc(body: &str, font_size: f32) -> Option<String> {
+    if body.contains('(') {
+        return None;
+    }
+    let mut total = 0.0f32;
+    let mut lengths = None;
+    let mut sign = 1.0f32;
+    let mut expect_term = true;
+    for token in body.split_whitespace() {
+        if expect_term {
+            let (magnitude, term_sign) = match token.strip_prefix('-') {
+                Some(rest) if !rest.is_empty() => (rest, -1.0),
+                _ => (token, 1.0),
+            };
+            let computed = computed_tab_size(magnitude, font_size)?;
+            let is_length = computed.ends_with("px");
+            if *lengths.get_or_insert(is_length) != is_length {
+                return None;
+            }
+            let number = computed.trim_end_matches("px").parse::<f32>().ok()?;
+            total += sign * term_sign * number;
+            expect_term = false;
+        } else {
+            sign = match token {
+                "+" => 1.0,
+                "-" => -1.0,
+                _ => return None,
+            };
+            expect_term = true;
+        }
+    }
+    if expect_term {
+        return None;
+    }
+    let total = total.max(0.0);
+    Some(if lengths? {
+        format!("{total}px")
+    } else {
+        format!("{total}")
+    })
+}
+
+#[cfg(test)]
+mod grid_longhand_tests {
+    use super::{COLUMN_GAP_PERCENT_PROPERTY, CSSStyleDeclaration, ROW_GAP_PERCENT_PROPERTY};
+
+    #[test]
+    fn place_self_sets_both_axes() {
+        use w3cos_std::style::AlignSelf;
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("place-self", "start");
+        let used = style.to_style();
+        assert_eq!(used.align_self, AlignSelf::FlexStart);
+        assert_eq!(used.justify_self, AlignSelf::FlexStart);
+        style.set_property("place-self", "center stretch");
+        let used = style.to_style();
+        assert_eq!(used.align_self, AlignSelf::Center);
+        assert_eq!(used.justify_self, AlignSelf::Stretch);
+    }
+
+    #[test]
+    fn grid_line_longhands_rewrite_one_side_of_the_pair() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("grid-column-start", "2");
+        style.set_property("grid-row-end", "span 2");
+        let used = style.to_style();
+        assert_eq!(used.grid_column_used(), Some("2 / auto"));
+        assert_eq!(used.grid_row_used(), Some("auto / span 2"));
+        // A lone custom ident in the shorthand is also the end line.
+        style.set_property("grid-column", "a");
+        style.set_property("grid-column-start", "1");
+        assert_eq!(style.to_style().grid_column_used(), Some("1 / a"));
+        style.set_property("grid-row", "1 / 3");
+        style.set_property("grid-row-start", "initial");
+        assert_eq!(style.to_style().grid_row_used(), Some("auto / 3"));
+    }
+
+    #[test]
+    fn percentage_gaps_keep_their_value() {
+        let gap = |style: &CSSStyleDeclaration, name: &str| {
+            style
+                .to_style()
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(name))
+                .cloned()
+        };
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("gap", "calc(10% + 25px)");
+        assert_eq!(
+            gap(&style, ROW_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("10 25")
+        );
+        assert_eq!(
+            gap(&style, COLUMN_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("10 25")
+        );
+        style.set_property("gap", "5% 8px");
+        assert_eq!(
+            gap(&style, ROW_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("5 0")
+        );
+        assert_eq!(gap(&style, COLUMN_GAP_PERCENT_PROPERTY), None);
+        style.set_property("row-gap", "4px");
+        assert_eq!(gap(&style, ROW_GAP_PERCENT_PROPERTY), None);
+        style.set_property("grid-column-gap", "20%");
+        assert_eq!(
+            gap(&style, COLUMN_GAP_PERCENT_PROPERTY).as_deref(),
+            Some("20 0")
+        );
+        style.set_property("grid-gap", "3px 6px");
+        let used = style.to_style();
+        assert_eq!((used.row_gap, used.column_gap), (Some(3.0), Some(6.0)));
+    }
+}
+
+#[cfg(test)]
+mod place_content_tests {
+    use super::{CSSStyleDeclaration, JUSTIFY_CONTENT_PROPERTY};
+    use w3cos_std::style::{AlignContent, JustifyContent};
+
+    fn justify_marker(style: &CSSStyleDeclaration) -> Option<String> {
+        style
+            .to_style()
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(JUSTIFY_CONTENT_PROPERTY))
+            .cloned()
+    }
+
+    #[test]
+    fn place_content_sets_both_content_alignments() {
+        let mut style = CSSStyleDeclaration::new();
+        style.set_property("place-content", "start");
+        assert_eq!(style.to_style().align_content, AlignContent::FlexStart);
+        assert_eq!(justify_marker(&style).as_deref(), Some("start"));
+        style.set_property("place-content", "end space-between");
+        assert_eq!(style.to_style().align_content, AlignContent::FlexEnd);
+        assert_eq!(
+            style.to_style().justify_content,
+            JustifyContent::SpaceBetween
+        );
+        // A baseline value only applies to align-content; justify gets start.
+        style.set_property("place-content", "first baseline");
+        assert_eq!(justify_marker(&style).as_deref(), Some("start"));
+    }
 }
 
 #[cfg(test)]
@@ -4670,6 +6270,136 @@ mod font_shorthand_tests {
             assert_eq!(parse_font_line_height(value, 20.0), None, "{value}");
             assert!(!is_valid_font_line_height_token(value), "{value}");
         }
+    }
+
+    #[test]
+    fn contain_intrinsic_longhands_set_one_axis() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("contain-intrinsic-inline-size", "100px");
+        declaration.set_property("contain-intrinsic-block-size", "auto 50px");
+        let marker = |d: &CSSStyleDeclaration| {
+            d.inner
+                .custom_properties
+                .as_ref()
+                .and_then(|p| p.get(super::CONTAIN_INTRINSIC_SIZE_PROPERTY).cloned())
+        };
+        assert_eq!(marker(&declaration).as_deref(), Some("100 50"));
+        declaration.set_property("contain-intrinsic-width", "none");
+        assert_eq!(marker(&declaration).as_deref(), Some("none 50"));
+        declaration.set_property("contain-intrinsic-height", "none");
+        assert_eq!(marker(&declaration), None);
+    }
+
+    /// Margins keep a mixed `calc()` (which may be negative) for LayoutNG.
+    #[test]
+    fn margin_calc_parses_percent_and_px() {
+        use w3cos_std::style::Spacing;
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("margin-left", "calc(10% + 100px)");
+        declaration.set_property("margin-top", "calc(50% - 20px)");
+        declaration.set_property("margin-right", "calc(5px + 7px)");
+        let style = declaration.inner.clone();
+        assert_eq!(
+            style.margin.left,
+            Spacing::Calc {
+                percent: 10.0,
+                px: 100.0
+            }
+        );
+        assert_eq!(
+            style.margin.top,
+            Spacing::Calc {
+                percent: 50.0,
+                px: -20.0
+            }
+        );
+        assert_eq!(style.margin.right, Spacing::Px(12.0));
+        declaration.set_property("margin", "calc(10px + 5%) 0");
+        let style = declaration.inner.clone();
+        assert_eq!(
+            style.margin.bottom,
+            Spacing::Calc {
+                percent: 5.0,
+                px: 10.0
+            }
+        );
+    }
+
+    /// Padding keeps a mixed `calc()` (floored at zero once resolved) and
+    /// floors a pure length or percentage straight away.
+    #[test]
+    fn padding_calc_parses_percent_and_px() {
+        use w3cos_std::style::Spacing;
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("padding-left", "calc(25% + 10px)");
+        declaration.set_property("padding-top", "calc(100px - 50%)");
+        declaration.set_property("padding-right", "calc(5px - 20px)");
+        declaration.set_property("padding-bottom", "calc(10% * 2)");
+        let style = declaration.inner.clone();
+        assert_eq!(
+            style.padding.left,
+            Spacing::PaddingCalc {
+                percent: 25.0,
+                px: 10.0
+            }
+        );
+        assert_eq!(
+            style.padding.top,
+            Spacing::PaddingCalc {
+                percent: -50.0,
+                px: 100.0
+            }
+        );
+        assert_eq!(style.padding.right, Spacing::Px(0.0));
+        assert_eq!(style.padding.bottom, Spacing::Percent(20.0));
+        declaration.set_property("padding", "calc(10% + 5px) 0");
+        assert_eq!(
+            declaration.inner.padding.bottom,
+            Spacing::PaddingCalc {
+                percent: 10.0,
+                px: 5.0
+            }
+        );
+    }
+
+    /// Size properties keep a mixed `calc()` for LayoutNG to resolve.
+    #[test]
+    fn size_calc_parses_percent_and_px() {
+        use w3cos_std::style::Dimension;
+        assert_eq!(
+            super::parse_size_calc("calc(10% + 50px)"),
+            Some(Dimension::Calc {
+                percent: 10.0,
+                px: 50.0
+            })
+        );
+        assert_eq!(
+            super::parse_size_calc("calc((100% - 20px) / 2)"),
+            Some(Dimension::Calc {
+                percent: 50.0,
+                px: -10.0
+            })
+        );
+        assert_eq!(
+            super::parse_size_calc("calc(20px + 5px)"),
+            Some(Dimension::Px(25.0))
+        );
+        assert_eq!(
+            super::parse_size_calc("calc(50% * 2)"),
+            Some(Dimension::Percent(100.0))
+        );
+        assert_eq!(super::parse_size_calc("calc(10% + 2em)"), None);
+        assert_eq!(super::parse_size_calc("calc(10%+5px)"), None);
+        assert_eq!(super::parse_size_calc("10px"), None);
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("width", "calc(10% + 50px)");
+        assert_eq!(
+            declaration.to_style().width,
+            Dimension::Calc {
+                percent: 10.0,
+                px: 50.0
+            }
+        );
     }
 
     /// `font-148` puts a length-valued `calc()` where the size belongs.
@@ -6278,6 +8008,302 @@ mod tests {
     }
 
     #[test]
+    fn block_axis_margin_and_padding_longhands_follow_the_writing_mode() {
+        // The declared style ignores the longhands, like before the model
+        // existed; the shadow of a cascade declaration maps them.
+        let mut declared = CSSStyleDeclaration::new();
+        declared.shadow_logical = true;
+        declared.set_property("margin-block-start", "40px");
+        declared.set_property("padding-block-end", "4px");
+        assert_eq!(declared.inner.margin.top, Spacing::Px(0.0));
+        assert_eq!(declared.inner.padding.bottom, Spacing::Px(0.0));
+        if NG_BLOCK_AXIS_LOGICAL_PROPERTIES {
+            let overrides = declared.logical_overrides().expect("overrides");
+            assert_eq!(overrides.margin[0], Some(Spacing::Px(40.0)));
+            assert_eq!(overrides.padding[2], Some(Spacing::Px(4.0)));
+            assert_eq!(overrides.margin[2], None);
+            let mut resolved = declared.to_style();
+            overrides.apply(&mut resolved);
+            assert_eq!(resolved.margin.top, Spacing::Px(40.0));
+            assert_eq!(resolved.padding.bottom, Spacing::Px(4.0));
+        } else {
+            assert!(declared.logical_overrides().is_none());
+        }
+
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.map_logical = true;
+        declaration.map_block_axis = true;
+        declaration.set_property("margin-block-start", "40px");
+        declaration.set_property("marginBlockEnd", "6px");
+        declaration.set_property("padding-block-start", "3px");
+        declaration.set_property("paddingBlockEnd", "4px");
+        assert_eq!(declaration.inner.margin.top, Spacing::Px(40.0));
+        assert_eq!(declaration.inner.margin.bottom, Spacing::Px(6.0));
+        assert_eq!(declaration.inner.padding.top, Spacing::Px(3.0));
+        assert_eq!(declaration.inner.padding.bottom, Spacing::Px(4.0));
+
+        let mut vertical = CSSStyleDeclaration::new();
+        vertical.map_logical = true;
+        vertical.map_block_axis = true;
+        vertical.set_property("writing-mode", "vertical-rl");
+        vertical.set_property("margin-block-start", "40px");
+        vertical.set_property("padding-block-end", "4px");
+        assert_eq!(vertical.inner.margin.top, Spacing::Px(0.0));
+        assert_eq!(vertical.inner.margin.right, Spacing::Px(40.0));
+        assert_eq!(vertical.inner.padding.bottom, Spacing::Px(0.0));
+        assert_eq!(vertical.inner.padding.left, Spacing::Px(4.0));
+
+        let mut lr = CSSStyleDeclaration::new();
+        lr.map_logical = true;
+        lr.map_block_axis = true;
+        lr.set_property("writing-mode", "vertical-lr");
+        lr.set_property("margin-block-start", "7px");
+        lr.set_property("padding-block-end", "5px");
+        assert_eq!(lr.inner.margin.left, Spacing::Px(7.0));
+        assert_eq!(lr.inner.padding.right, Spacing::Px(5.0));
+    }
+
+    #[test]
+    fn writing_mode_parses_and_logical_sizes_map_in_horizontal_tb_only() {
+        let mut declaration = CSSStyleDeclaration::new();
+        assert_eq!(declaration.inner.writing_mode, WritingMode::HorizontalTb);
+        declaration.map_logical = true;
+        declaration.map_block_axis = true;
+        {
+            declaration.set_property("inline-size", "200px");
+            declaration.set_property("maxBlockSize", "10px");
+            declaration.set_property("min-inline-size", "5px");
+            declaration.set_property("minBlockSize", "7px");
+            declaration.set_property("max-inline-size", "50%");
+            declaration.set_property("block-size", "40px");
+            let style = &declaration.inner;
+            assert_eq!(style.width, Dimension::Px(200.0));
+            assert_eq!(style.max_height, Dimension::Px(10.0));
+            assert_eq!(style.min_width, Dimension::Px(5.0));
+            assert_eq!(style.min_height, Dimension::Px(7.0));
+            assert_eq!(style.max_width, Dimension::Percent(50.0));
+            assert_eq!(style.height, Dimension::Px(40.0));
+            assert!(style.custom_properties.as_ref().is_none_or(|properties| {
+                properties
+                    .keys()
+                    .all(|key| !key.starts_with(LOGICAL_SIZE_PROPERTY_PREFIX))
+            }));
+            // Keywords take the physical grammar: an inline-size keyword is the
+            // width keyword.
+            declaration.set_property("inline-size", "max-content");
+            assert_eq!(declaration.inner.width, Dimension::Auto);
+            assert_eq!(
+                declaration
+                    .inner
+                    .custom_properties
+                    .as_ref()
+                    .and_then(|properties| properties.get(WIDTH_KEYWORD_PROPERTY))
+                    .map(String::as_str),
+                Some("max-content")
+            );
+        }
+        // The declared style (no mapping) records the marker like any other
+        // mode, and the cascade's shadow carries the physical value.
+        let mut declared = CSSStyleDeclaration::new();
+        declared.shadow_logical = true;
+        declared.set_property("inline-size", "200px");
+        declared.set_property("block-size", "30px");
+        assert_eq!(declared.inner.width, Dimension::Auto);
+        assert!(
+            declared
+                .inner
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties
+                    .contains_key("--w3cos-internal-logical-size-inline-size"))
+        );
+        let overrides = declared.logical_overrides().expect("overrides");
+        assert_eq!(overrides.width, Some(Dimension::Px(200.0)));
+        assert_eq!(
+            overrides.height,
+            NG_BLOCK_AXIS_LOGICAL_PROPERTIES.then_some(Dimension::Px(30.0))
+        );
+        assert!(overrides.markers.iter().any(|(key, value)| key
+            == "--w3cos-internal-logical-size-inline-size"
+            && value.is_none()));
+        // No logical property, no shadow.
+        let mut plain = CSSStyleDeclaration::new();
+        plain.shadow_logical = true;
+        plain.set_property("width", "10px");
+        assert!(plain.logical_overrides().is_none());
+        for (keyword, mode) in [
+            ("vertical-rl", WritingMode::VerticalRl),
+            ("vertical-lr", WritingMode::VerticalLr),
+            ("sideways-rl", WritingMode::SidewaysRl),
+            ("sideways-lr", WritingMode::SidewaysLr),
+            ("tb-rl", WritingMode::VerticalRl),
+            ("lr-tb", WritingMode::HorizontalTb),
+            ("horizontal-tb", WritingMode::HorizontalTb),
+        ] {
+            let mut declaration = CSSStyleDeclaration::new();
+            declaration.set_property("writing-mode", keyword);
+            assert_eq!(declaration.inner.writing_mode, mode, "{keyword}");
+        }
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("writing-mode", "vertical-rl");
+        declaration.set_property("writing-mode", "nonsense");
+        assert_eq!(declaration.inner.writing_mode, WritingMode::VerticalRl);
+        declaration.set_property("writing-mode", "initial");
+        assert_eq!(declaration.inner.writing_mode, WritingMode::HorizontalTb);
+
+        // Vertical modes keep the recorded marker and leave the physical
+        // axes alone.
+        let mut vertical = CSSStyleDeclaration::new();
+        vertical.inner.writing_mode = WritingMode::VerticalLr;
+        vertical.set_property("block-size", "40px");
+        assert_eq!(vertical.inner.height, Dimension::Auto);
+        assert!(
+            vertical
+                .inner
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties
+                    .contains_key("--w3cos-internal-logical-size-block-size"))
+        );
+    }
+
+    #[test]
+    fn width_keyword_and_auto_phrase_markers() {
+        let mut declaration = CSSStyleDeclaration::new();
+        // Logical sizes are only recorded outside horizontal-tb.
+        declaration.inner.writing_mode = WritingMode::VerticalRl;
+        declaration.set_property("inline-size", "200px");
+        declaration.set_property("maxBlockSize", "10px");
+        assert_eq!(declaration.inner.width, Dimension::Auto);
+        let has = |declaration: &CSSStyleDeclaration, key: &str| {
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key(key))
+        };
+        assert!(has(
+            &declaration,
+            "--w3cos-internal-logical-size-inline-size"
+        ));
+        assert!(has(
+            &declaration,
+            "--w3cos-internal-logical-size-max-block-size"
+        ));
+        declaration.set_property("inline-size", "auto");
+        assert!(!has(
+            &declaration,
+            "--w3cos-internal-logical-size-inline-size"
+        ));
+        declaration.set_property("inline-size", "max-content");
+        assert!(!has(
+            &declaration,
+            "--w3cos-internal-logical-size-inline-size"
+        ));
+        assert!(has(&declaration, WIDTH_KEYWORD_PROPERTY));
+        declaration.set_property("block-size", "40px");
+        assert!(has(
+            &declaration,
+            "--w3cos-internal-logical-size-block-size"
+        ));
+        // Block-axis intrinsic keywords behave as the initial value.
+        declaration.set_property("block-size", "min-content");
+        assert!(!has(
+            &declaration,
+            "--w3cos-internal-logical-size-block-size"
+        ));
+        declaration.set_property("width", "max-content");
+        assert_eq!(declaration.inner.width, Dimension::Auto);
+        let marker = |declaration: &CSSStyleDeclaration, key: &str| {
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(key).cloned())
+        };
+        assert_eq!(
+            marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("max-content")
+        );
+        declaration.set_property("width", "fit-content( 50% )");
+        assert_eq!(
+            marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("fit-content(50%)")
+        );
+        declaration.set_property("width", "fit-content(-1px)");
+        assert_eq!(
+            marker(&declaration, WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("fit-content(50%)")
+        );
+        declaration.set_property("min-width", "fit-content(100px)");
+        assert_eq!(
+            marker(&declaration, MIN_WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("fit-content(100px)")
+        );
+        declaration.set_property("max-width", "200px");
+        declaration.set_property("max-width", "min-content");
+        assert_eq!(declaration.inner.max_width, Dimension::Auto);
+        assert_eq!(
+            marker(&declaration, MAX_WIDTH_KEYWORD_PROPERTY).as_deref(),
+            Some("min-content")
+        );
+        declaration.set_property("max-width", "30px");
+        assert_eq!(declaration.inner.max_width, Dimension::Px(30.0));
+        assert!(marker(&declaration, MAX_WIDTH_KEYWORD_PROPERTY).is_none());
+        declaration.set_property("min-height", "20px");
+        declaration.set_property("min-height", "Max-Content");
+        assert_eq!(declaration.inner.min_height, Dimension::Auto);
+        assert_eq!(
+            marker(&declaration, MIN_HEIGHT_KEYWORD_PROPERTY).as_deref(),
+            Some("max-content")
+        );
+        declaration.set_property("min-height", "10px");
+        assert_eq!(declaration.inner.min_height, Dimension::Px(10.0));
+        assert!(marker(&declaration, MIN_HEIGHT_KEYWORD_PROPERTY).is_none());
+        declaration.set_property("max-height", "min-content");
+        assert_eq!(declaration.inner.max_height, Dimension::Auto);
+        assert!(marker(&declaration, MAX_HEIGHT_KEYWORD_PROPERTY).is_some());
+        declaration.set_property("max-height", "none");
+        assert!(marker(&declaration, MAX_HEIGHT_KEYWORD_PROPERTY).is_none());
+        declaration.set_property("word-break", "auto-phrase");
+        assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_some());
+        declaration.set_property("word-break", "normal");
+        assert!(marker(&declaration, WORD_BREAK_AUTO_PHRASE_PROPERTY).is_none());
+    }
+
+    #[test]
+    fn stretch_keyword_sets_and_clears_axis_tokens() {
+        let mut declaration = CSSStyleDeclaration::new();
+        let token = |declaration: &CSSStyleDeclaration| {
+            declaration
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(STRETCH_PROPERTY).cloned())
+                .unwrap_or_default()
+        };
+        declaration.set_property("width", "stretch");
+        declaration.set_property("height", "-WEBKIT-fill-available");
+        assert_eq!(declaration.inner.width, Dimension::Auto);
+        assert_eq!(declaration.inner.height, Dimension::Auto);
+        let mut tokens: Vec<String> = token(&declaration).split(',').map(String::from).collect();
+        tokens.sort();
+        assert_eq!(tokens, ["h", "w"]);
+        declaration.set_property("min-width", "stretch");
+        declaration.set_property("max-height", "stretch");
+        assert!(token(&declaration).contains("minw"));
+        assert!(token(&declaration).contains("maxh"));
+        // A later size replaces stretch; an invalid value keeps it.
+        declaration.set_property("width", "10px");
+        assert_eq!(declaration.inner.width, Dimension::Px(10.0));
+        assert!(!token(&declaration).split(',').any(|t| t == "w"));
+        declaration.set_property("height", "bogus");
+        assert!(token(&declaration).split(',').any(|t| t == "h"));
+        declaration.set_property("height", "min-content");
+        assert!(!token(&declaration).split(',').any(|t| t == "h"));
+    }
+
+    #[test]
     fn flex_shorthand_sets_grow_shrink_and_basis() {
         let mut declaration = CSSStyleDeclaration::new();
         declaration.set_property("flex", "1");
@@ -6289,6 +8315,16 @@ mod tests {
         assert_eq!(declaration.inner.flex_grow, 0.0);
         assert_eq!(declaration.inner.flex_shrink, 0.0);
         assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+
+        // A unitless non-zero basis is invalid and leaves the values alone.
+        declaration.set_property("flex", "2 3 4");
+        assert_eq!(declaration.inner.flex_grow, 0.0);
+        assert_eq!(declaration.inner.flex_shrink, 0.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+        declaration.set_property("flex", "2 3 0");
+        assert_eq!(declaration.inner.flex_grow, 2.0);
+        assert_eq!(declaration.inner.flex_shrink, 3.0);
+        assert_eq!(declaration.inner.flex_basis, Dimension::Px(0.0));
     }
 
     #[test]
@@ -6424,12 +8460,28 @@ fn aspect_ratio_is_stored_as_a_width_over_height_marker() {
     let mut declaration = CSSStyleDeclaration::new();
     declaration.set_property("aspect-ratio", "1 / 1");
     assert_eq!(ratio(&declaration).as_deref(), Some("1"));
+    let auto = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key(ASPECT_RATIO_AUTO_PROPERTY))
+    };
+    assert!(!auto(&declaration));
     declaration.set_property("aspect-ratio", "auto 2 / 1");
     assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    assert!(auto(&declaration));
     declaration.set_property("aspect-ratio", "1/0");
     assert_eq!(ratio(&declaration).as_deref(), Some("2"));
+    assert!(auto(&declaration));
+    declaration.set_property("aspect-ratio", "4 / 1 auto");
+    assert_eq!(ratio(&declaration).as_deref(), Some("4"));
+    assert!(auto(&declaration));
+    declaration.set_property("aspect-ratio", "3");
+    assert!(!auto(&declaration));
     declaration.set_property("aspect-ratio", "auto");
     assert_eq!(ratio(&declaration), None);
+    assert!(!auto(&declaration));
 }
 
 #[test]
@@ -6643,6 +8695,124 @@ fn unrecognized_display_and_flex_wrap_keep_a_marker() {
 }
 
 #[test]
+fn flex_line_count_stores_a_positive_integer_marker() {
+    let mut declaration = CSSStyleDeclaration::new();
+    let marker = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(FLEX_LINE_COUNT_PROPERTY))
+            .cloned()
+    };
+    declaration.set_property("flex-line-count", "3");
+    assert_eq!(marker(&declaration).as_deref(), Some("3"));
+    declaration.set_property("flex-line-count", "+2");
+    assert_eq!(marker(&declaration).as_deref(), Some("2"));
+    // Invalid values (zero, negative, fractional, keywords) are ignored.
+    for value in ["0", "-1", "1.5", "auto", "wrap"] {
+        declaration.set_property("flex-line-count", value);
+        assert_eq!(marker(&declaration).as_deref(), Some("2"), "{value}");
+    }
+    declaration.set_property("flex-line-count", "initial");
+    assert_eq!(marker(&declaration), None);
+}
+
+#[test]
+fn overflow_clip_margin_parses_box_and_length() {
+    let mut style = CSSStyleDeclaration::new();
+    style.set_property("overflow-clip-margin", "content-box 12px");
+    assert_eq!(style.inner.overflow_clip_margin, (1, 12.0));
+    style.set_property("overflow-clip-margin", "border-box");
+    assert_eq!(style.inner.overflow_clip_margin, (2, 0.0));
+    style.set_property("overflow-clip-margin", "5");
+    style.set_property("overflow-clip-margin", "-3px");
+    assert_eq!(style.inner.overflow_clip_margin, (2, 0.0));
+    style.set_property("overflow-clip-margin", "7px");
+    assert_eq!(style.inner.overflow_clip_margin, (0, 7.0));
+}
+
+#[test]
+fn overflow_clip_is_a_paint_only_flag_per_axis() {
+    let mut style = CSSStyleDeclaration::new();
+    style.set_property("overflow", "clip");
+    assert_eq!(style.get_property("overflow"), "clip");
+    assert_eq!(style.get_property("overflow-x"), "clip");
+    assert!(style.inner.overflow_clip_x && style.inner.overflow_clip_y);
+    assert_eq!(style.inner.resolved_overflow_x(), Overflow::Visible);
+
+    style.set_property("overflow-y", "hidden");
+    assert_eq!(style.get_property("overflow"), "clip hidden");
+    assert!(style.inner.overflow_clip_x && !style.inner.overflow_clip_y);
+
+    style.set_property("overflow", "visible clip");
+    assert_eq!(style.get_property("overflow-x"), "visible");
+    assert_eq!(style.get_property("overflow-y"), "clip");
+    assert!(!style.inner.overflow_clip_x && style.inner.overflow_clip_y);
+
+    style.set_property("overflow", "scroll");
+    assert!(!style.inner.overflow_clip_x && !style.inner.overflow_clip_y);
+    assert_eq!(style.get_property("overflow-x"), "scroll");
+}
+
+#[test]
+fn flex_wrap_balance_forms_normalize_and_serialize() {
+    for (value, expected) in [
+        ("nowrap", "nowrap"),
+        ("wrap", "wrap"),
+        ("wrap-reverse", "wrap-reverse"),
+        ("balance", "balance"),
+        ("wrap balance", "balance"),
+        ("balance wrap", "balance"),
+        ("wrap-reverse balance", "wrap-reverse balance"),
+        ("balance wrap-reverse", "wrap-reverse balance"),
+    ] {
+        assert_eq!(
+            normalize_flex_wrap(value).as_deref(),
+            Some(expected),
+            "{value}"
+        );
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("flex-wrap", value);
+        assert_eq!(declaration.get_property("flex-wrap"), expected, "{value}");
+    }
+    for value in [
+        "auto",
+        "nowrap wrap",
+        "wrap wrap",
+        "balance balance",
+        "balance nowrap",
+        "nowrap balance",
+        "wrap balance wrap",
+        "wrap 2 balance",
+        "balance 0",
+    ] {
+        assert_eq!(normalize_flex_wrap(value), None, "{value}");
+    }
+    // An invalid declaration leaves the previous value alone.
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("flex-wrap", "wrap");
+    declaration.set_property("flex-wrap", "auto");
+    assert_eq!(declaration.get_property("flex-wrap"), "wrap");
+}
+
+#[test]
+fn flex_line_count_math_functions_round_and_clamp() {
+    assert_eq!(parse_flex_line_count("2"), Some(2));
+    assert_eq!(parse_flex_line_count("round(up, calc(7/2))"), Some(4));
+    assert_eq!(parse_flex_line_count("calc(NaN)"), Some(1));
+    assert_eq!(parse_flex_line_count("calc(0)"), Some(1));
+    assert_eq!(parse_flex_line_count("calc(1 + 2 * 3)"), Some(7));
+    for value in ["0", "-1", "1.5", "auto", "wrap", "calc(", "round(up)x"] {
+        assert_eq!(parse_flex_line_count(value), None, "{value}");
+    }
+    let mut declaration = CSSStyleDeclaration::new();
+    assert_eq!(declaration.get_property("flex-line-count"), "1");
+    declaration.set_property("flex-line-count", "round(up, calc(7/2))");
+    assert_eq!(declaration.get_property("flex-line-count"), "4");
+}
+
+#[test]
 fn table_display_values_round_trip_without_falling_back_to_flex() {
     for (value, expected) in [
         ("table", Display::Table),
@@ -6657,4 +8827,45 @@ fn table_display_values_round_trip_without_falling_back_to_flex() {
         assert_eq!(declaration.inner.display, expected);
         assert_eq!(declaration.get_property("display"), value);
     }
+}
+
+#[test]
+fn flex_flow_sets_direction_and_wrap() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("flex-flow", "column wrap");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::Column);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::Wrap);
+    // An omitted longhand resets to its initial value.
+    declaration.set_property("flex-flow", "wrap-reverse");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::Row);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::WrapReverse);
+    declaration.set_property("flex-flow", "row-reverse");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
+    // Invalid declarations are dropped.
+    declaration.set_property("flex-flow", "column column");
+    declaration.set_property("flex-flow", "wrap bogus");
+    assert_eq!(declaration.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(declaration.inner.flex_wrap, FlexWrap::NoWrap);
+}
+
+#[test]
+fn flex_basis_content_is_a_marker_over_an_auto_basis() {
+    let marked = |declaration: &CSSStyleDeclaration| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .is_some_and(|props| props.contains_key(FLEX_BASIS_CONTENT_PROPERTY))
+    };
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("flex", "1 1 content");
+    assert!(marked(&declaration));
+    assert_eq!(declaration.inner.flex_basis, Dimension::Auto);
+    declaration.set_property("flex", "1 1 auto");
+    assert!(!marked(&declaration));
+    declaration.set_property("flex-basis", "content");
+    assert!(marked(&declaration));
+    declaration.set_property("flex-basis", "10px");
+    assert!(!marked(&declaration));
 }

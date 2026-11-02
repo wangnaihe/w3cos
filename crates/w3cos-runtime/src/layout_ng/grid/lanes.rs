@@ -83,10 +83,33 @@ fn track_of(reverse: bool, lanes: usize, start: usize, span: usize) -> usize {
     if reverse { lanes - start - span } else { start }
 }
 
+/// The sum of fixed (`px` / `em`) tracks plus gaps: the intrinsic grid-axis
+/// size. `None` when any track is not fixed.
+fn fixed_tracks_size(template: &super::Template, gap: f32, font: f32) -> Option<f32> {
+    let mut total = 0.0;
+    for track in &template.tracks {
+        total += match track {
+            Spec::One(Breadth::Px(value)) => *value,
+            Spec::One(Breadth::Em(value)) => value * font,
+            _ => return None,
+        };
+    }
+    let count = template.tracks.len();
+    Some(total + gap * count.saturating_sub(1) as f32)
+}
+
 /// Whether the real lanes pass lays out this container. Everything else
 /// stays on the previous handling (an ordinary grid or the legacy engine).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
-    reason(flat, index).is_none()
+    let why = reason(flat, index);
+    #[cfg(any(test, feature = "layout-ng-trace"))]
+    if let Some(why) = why
+        && why != "lanes:none"
+        && super::super::trace()
+    {
+        eprintln!("[layout-ng] lanes-ineligible {why}");
+    }
+    why.is_none()
 }
 
 fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -97,8 +120,11 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let Some(Direction { columns, .. }) = lane_direction(style) else {
         return Some("lanes:direction");
     };
-    if has_marker(style, block::WIDTH_KEYWORD) || has_marker(style, super::HEIGHT_KEYWORD) {
+    if has_marker(style, super::HEIGHT_KEYWORD) {
         return Some("lanes:size-keyword");
+    }
+    if has_marker(style, "--w3cos-internal-overflow-alignment") {
+        return Some("lanes:overflow-alignment");
     }
     if marker(style, PACK).is_some_and(|pack| pack != "normal" && pack != "dense") {
         return Some("lanes:pack");
@@ -106,7 +132,7 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if parse_flow(style.grid_flow()).is_none_or(|flow| flow.column) {
         return Some("lanes:flow");
     }
-    if style.direction == TextDirection::Rtl || has_marker(style, "--w3cos-internal-percent-gap") {
+    if has_marker(style, "--w3cos-internal-percent-gap") {
         return Some("lanes:direction");
     }
     let (grid_spec, other_spec) = if columns {
@@ -134,36 +160,103 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     if template.tracks.is_empty() && template.auto_fit.is_none() {
         return Some("lanes:no-template");
     }
-    if template.auto_fit == Some(true) {
-        return Some("lanes:auto-fit");
-    }
     if template.auto_fit.is_some()
-        && template
-            .auto_tracks
-            .iter()
-            .any(|track| repeat_basis(track, INF / 2, style.font_size).is_none())
+        && !columns
+        && !matches!(style.height, Dimension::Px(_))
+        && !matches!(style.min_height, Dimension::Px(_))
     {
-        return Some("lanes:intrinsic-repeat");
+        // The repetition count needs a definite grid-axis size.
+        return Some("lanes:repeat-indefinite");
+    }
+    if has_marker(style, block::WIDTH_KEYWORD)
+        && (!columns || block::size_contained(style) || template.auto_fit.is_some())
+    {
+        // The intrinsic width of column lanes follows the track sizing under
+        // the min/max-content constraints; row lanes and auto-repeat stay off.
+        return Some("lanes:size-keyword");
     }
     if style.grid_auto_row_spec().is_some() || style.grid_auto_column_spec().is_some() {
         return Some("lanes:auto-tracks");
     }
     // Content alignment on the stacking axis is not modelled.
+    // Column lanes model it as one group offset (`stack_lead`); row lanes
+    // keep `start` only.
     let stacking_aligned = if columns {
-        row_pack(style) != Pack::Stretch
+        false
     } else {
         !matches!(column_pack(style), Pack::Stretch | Pack::Start)
     };
     if stacking_aligned {
         return Some("lanes:stacking-alignment");
     }
-    if tolerance_spec(style).is_none() {
-        return Some("lanes:tolerance");
+    let content_shifted = columns && row_pack(style) != Pack::Stretch;
+    match tolerance_spec(style) {
+        None => return Some("lanes:tolerance"),
+        // A percentage resolves against the intrinsic grid-axis size,
+        // which the ordinary-grid reference does not model.
+        // Row lanes take the intrinsic height from the tracks themselves
+        // (`layout_rows` resolves it against the track sum), so only the
+        // column axis stays off.
+        Some(Tolerance::Percent(_)) if columns && matches!(style.width, Dimension::Auto) => {
+            return Some("lanes:percent-tolerance");
+        }
+        Some(_) => {}
     }
+    // Items with an explicit line plus a span (`4 / span 2`; a lone `1 / auto` is fine) over intrinsic
+    // column tracks feed the track sizing in ways the ordinary-grid
+    // reference does not match. Span-only placements follow main's
+    // opening-based placement, as do row lanes (Chrome goldens,
+    // column-explicit-placement-003, column-auto-placement-001).
+    let intrinsic_axis = columns
+        && template
+            .tracks
+            .iter()
+            .chain(&template.auto_tracks)
+            .any(spec_is_intrinsic);
     for child in rendered_children(flat, index) {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
-            return Some("lanes:oof");
+            let Direction { track_reverse, .. } = lane_direction(style)?;
+            // Track reversal and rtl mirror the grid-axis lines; auto-fit
+            // collapse renumbers them.
+            if track_reverse
+                || style.direction == TextDirection::Rtl
+                || template.auto_fit == Some(true)
+                || template
+                    .tracks
+                    .iter()
+                    .chain(&template.auto_tracks)
+                    .any(|spec| matches!(spec, Spec::Fit(_)))
+            {
+                // fit-content tracks next to auto tracks distribute spanning
+                // items differently from Blink; the track edges only show
+                // through out-of-flow areas.
+                return Some("lanes:oof");
+            }
+            continue;
+        }
+        if template.auto_fit.is_some()
+            && placement(child_style, !columns).is_some_and(|value| {
+                let value = value.trim();
+                !value.starts_with("span") && !value.eq_ignore_ascii_case("auto")
+            })
+        {
+            // An explicit line may fall past the resolved repetition,
+            // which needs implicit tracks this pass does not build.
+            return Some("lanes:repeat-explicit");
+        }
+        if has_marker(child_style, "--w3cos-internal-overflow-alignment") {
+            return Some("lanes:overflow-alignment");
+        }
+        if content_shifted && stack_align(style, child_style, columns) != StackAlign::Normal {
+            // Item alignment inside the openings of a shifted group.
+            return Some("lanes:stacking-alignment");
+        }
+        if intrinsic_axis
+            && placement(child_style, !columns)
+                .is_some_and(|value| value.contains('/') && value.contains("span"))
+        {
+            return Some("lanes:intrinsic-span");
         }
         if block::is_replaced_item(flat, child)
             || columns_spec(child_style).is_some_and(is_subgrid_axis)
@@ -439,6 +532,16 @@ struct Entry {
 }
 
 /// Lay out one lanes container. `None` falls back to the legacy engine.
+thread_local! {
+    static AS_GRID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last `layout` bailed only because the box should lay out as
+/// an ordinary grid. Reading clears it.
+pub(super) fn take_as_grid() -> bool {
+    AS_GRID.with(|flag| flag.replace(false))
+}
+
 pub(super) fn layout(
     flat: &[FlatNodeInfo],
     index: usize,
@@ -452,7 +555,27 @@ pub(super) fn layout(
         track_reverse,
     } = lane_direction(style).why("lanes:direction")?;
     let metrics: BoxMetrics = block::resolve_inline(style, space);
-    let content_width = sized.map_or(metrics.content_width, |(width, _)| width);
+    let mut content_width = sized.map_or(metrics.content_width, |(width, _)| width);
+    if let Some(keyword) = marker(style, block::WIDTH_KEYWORD).filter(|_| sized.is_none()) {
+        // `min-content` / `max-content` / `fit-content` of column lanes is
+        // the track sum under the matching constraint.
+        let sizes = intrinsic_columns(flat, index, space)?;
+        let (min, max) = (sizes.min.unwrap_or(sizes.max), sizes.max);
+        let edges = metrics.border[1] + metrics.border[3] + metrics.padding[1] + metrics.padding[3];
+        let available = space.available_inline - metrics.margin[1] - metrics.margin[3] - edges;
+        let content = block::keyword_content_size(
+            keyword,
+            min,
+            max,
+            Some(available),
+            Some(space.available_inline),
+            style,
+            space,
+            edges,
+        )
+        .why("lanes:size-keyword")?;
+        content_width = block::clamp_inline_size(style, space, edges, content).max(0.0);
+    }
     let [bt, br, bb, bl] = metrics.border;
     let [pt, pr, pb, pl] = metrics.padding;
     let inner_width = content_width.max(0.0);
@@ -498,13 +621,39 @@ pub(super) fn layout(
     if template.auto_fit.is_some() && grid_available.is_none() {
         return crate::layout_ng::bail("lanes:repeat-indefinite");
     }
-    let inflow = rendered_children(flat, index).count();
-    let specs = expand_auto(
+    let inflow = rendered_children(flat, index)
+        .filter(|&child| !oof::is_out_of_flow(flat[child].style))
+        .count();
+    // An intrinsic repetition (and `auto-fit`) resolves its count from a
+    // hypothetical track sizing (CSS Grid 3 3.1.1).
+    let intrinsic_repeat = template
+        .auto_tracks
+        .iter()
+        .any(|track| repeat_basis(track, INF / 2, font).is_none());
+    let forced = if template.auto_fit == Some(true) || intrinsic_repeat {
+        Some(repeat_count(
+            flat,
+            index,
+            style,
+            space,
+            &template,
+            columns,
+            grid_available.unwrap_or(0),
+            grid_gap_u,
+            font,
+            inflow,
+            inner_width,
+        )?)
+    } else {
+        None
+    };
+    let mut specs = expand_auto(
         &template,
         grid_available.unwrap_or(0),
         grid_gap_u,
         font,
         inflow,
+        forced,
     )
     .why("lanes:repeat")?;
     let lanes = specs.len();
@@ -514,7 +663,15 @@ pub(super) fn layout(
 
     let mut entries = Vec::new();
     let names = super::expanded_names(&template, lanes);
-    for (ordinal, child) in rendered_children(flat, index).enumerate() {
+    let mut oof_children = Vec::new();
+    let in_flow = rendered_children(flat, index).filter(|&child| {
+        let out = oof::is_out_of_flow(flat[child].style);
+        if out {
+            oof_children.push(child);
+        }
+        !out
+    });
+    for (ordinal, child) in in_flow.enumerate() {
         let child_style = flat[child].style;
         let place =
             resolve_axis(placement(child_style, !columns), &names, lanes).why("lanes:placement")?;
@@ -523,7 +680,15 @@ pub(super) fn layout(
             Some(start) => Some(start as usize),
             None => None,
         };
-        if place.span > lanes || start.is_some_and(|start| start + place.span > lanes) {
+        // A repeat can resolve to fewer tracks than an auto-placed item
+        // spans; the box then lays out as an ordinary grid, which adds
+        // implicit tracks for the span.
+        if start.is_none() && template.auto_fit.is_some() && place.span > lanes {
+            AS_GRID.with(|flag| flag.set(true));
+            return crate::layout_ng::bail("lanes:span-implicit");
+        }
+        let span = place.span;
+        if span > lanes || start.is_some_and(|start| start + span > lanes) {
             return crate::layout_ng::bail("lanes:span");
         }
         entries.push(Entry {
@@ -531,10 +696,17 @@ pub(super) fn layout(
             source: ordinal,
             order: child_style.order,
             start,
-            span: place.span,
+            span,
         });
     }
     entries.sort_by_key(|entry| (entry.order, entry.source));
+    if template.auto_fit == Some(true) {
+        collapse_empty_repeats(&template, &mut specs, &mut entries)?;
+    }
+    let lanes = specs.len();
+    for entry in entries.iter_mut().filter(|entry| entry.start.is_none()) {
+        entry.span = entry.span.min(lanes);
+    }
 
     let used_of = |extent: i64| {
         let mut used = specified_height.map(units).unwrap_or(extent.max(0));
@@ -550,7 +722,7 @@ pub(super) fn layout(
         fill: fill_reverse,
         track: track_reverse,
     };
-    let (children, mut pending_oof, stacking_extent) = if columns {
+    let (children, mut pending_oof, stacking_extent, geometry) = if columns {
         stack_columns(
             flat,
             style,
@@ -564,6 +736,7 @@ pub(super) fn layout(
             reverse,
             &used_of,
             min_h.is_some() || max_h.is_some(),
+            true,
         )?
     } else {
         stack_rows(
@@ -579,6 +752,7 @@ pub(super) fn layout(
             specified_height.map(units),
             font,
             reverse,
+            true,
         )?
     };
 
@@ -599,12 +773,50 @@ pub(super) fn layout(
     let border_width = inner_width + bl + br + pl + pr;
     let border_height = height + bt + bb + pt + pb;
     let (ox, oy) = (from_units(origin_x), from_units(origin_y));
+    let rtl = style.direction == TextDirection::Rtl;
+    if rtl && !pending_oof.is_empty() {
+        return crate::layout_ng::bail("lanes:rtl-oof");
+    }
+    // The pass lays out in logical (ltr) coordinates; `direction: rtl`
+    // mirrors every border box inside the content box (Blink converts
+    // logical to physical at the end).
     let mut children: Vec<(f32, f32, BoxFragment)> = children
         .into_iter()
-        .map(|(x, y, fragment)| (x + ox, y + oy, fragment))
+        .map(|(x, y, fragment)| {
+            let x = if rtl {
+                inner_width - x - fragment.width
+            } else {
+                x
+            };
+            (x + ox, y + oy, fragment)
+        })
         .collect();
     for candidate in &mut pending_oof {
         *candidate = candidate.translated(ox, oy);
+    }
+    if !oof_children.is_empty() {
+        let frame = OofFrame {
+            columns,
+            fill_reverse,
+            origin_x,
+            origin_y,
+            inner_u,
+            used,
+            height,
+            lanes,
+            padding: [pt, pr, pb, pl],
+            geometry: &geometry,
+            names: &super::expanded_names(&template, lanes),
+        };
+        place_oof_children(
+            flat,
+            style,
+            space,
+            &oof_children,
+            &frame,
+            &mut children,
+            &mut pending_oof,
+        )?;
     }
     if style.position != Position::Static && !pending_oof.is_empty() {
         let cb = oof::ContainingBlock {
@@ -637,6 +849,7 @@ pub(super) fn layout(
             height: border_height,
             text_range: None,
             ellipsis: false,
+            vertical: false,
             children,
         },
         last_baseline: LastBaseline::NoLines,
@@ -657,7 +870,16 @@ struct Reverse {
 }
 
 type Placed = Vec<(f32, f32, BoxFragment)>;
-type Stacked = (Placed, Vec<OofCandidate>, i64);
+/// Placement of the lane axis (sizes and offsets per track).
+#[derive(Default, Clone)]
+struct Geometry {
+    sizes: Vec<i64>,
+    pos: Vec<i64>,
+    collapsed: Vec<bool>,
+    between: i64,
+}
+
+type Stacked = (Placed, Vec<OofCandidate>, i64, Geometry);
 
 struct Prepared {
     content_width: f32,
@@ -756,6 +978,21 @@ impl Openings {
             }
         }
         space
+    }
+}
+
+/// Offset of the whole stack along the stacking axis (Chrome-verified:
+/// `space-between` acts as `start`, `space-around` and `space-evenly` as
+/// `center`; a plain `normal` stacks from the end under `fill-reverse`).
+fn stack_lead(pack: Pack, fill_reverse: bool, free: i64) -> i64 {
+    if pack == Pack::Stretch && fill_reverse {
+        return free;
+    }
+    let free = free.max(0);
+    match pack {
+        Pack::End => free,
+        Pack::Center | Pack::SpaceAround | Pack::SpaceEvenly => free / 2,
+        _ => 0,
     }
 }
 
@@ -860,10 +1097,11 @@ fn stack_columns(
     reverse: Reverse,
     used_of: &dyn Fn(i64) -> i64,
     clamped: bool,
+    exact: bool,
 ) -> Option<Stacked> {
+    let rtl = style.direction == TextDirection::Rtl;
     let lanes = specs.len();
-    let mut col_min = vec![0_i64; lanes];
-    let mut col_max = vec![0_i64; lanes];
+    let mut contribs = Contribs::new(lanes, exact);
     // Virtual items: an auto-placed item contributes at every start line.
     for entry in entries {
         let (min_c, max_c) = inline_minmax(flat, entry.index, space).why("lanes:intrinsic")?;
@@ -872,25 +1110,12 @@ fn stack_columns(
             None => 0..=lanes - entry.span,
         };
         for start in starts {
-            super::add_span_contrib(&mut col_min, &mut col_max, start, entry.span, min_c, max_c);
+            contribs.add(start, entry.span, min_c, max_c);
         }
     }
     let stretch = column_pack(style) == Pack::Stretch;
     let collapsed = vec![false; lanes];
-    let tracks: Vec<_> = specs
-        .iter()
-        .enumerate()
-        .map(|(lane, spec)| {
-            track_from_spec(
-                spec,
-                col_min[lane],
-                col_max[lane],
-                Some(inner_u),
-                font,
-                stretch,
-            )
-        })
-        .collect();
+    let tracks = contribs.tracks(specs, Some(inner_u), font, column_gap_u, stretch);
     let sizes = finalize(&tracks, Some(inner_u), column_gap_u);
     let free = inner_u - gap_sum(&collapsed, column_gap_u) - sizes.iter().sum::<i64>();
     let (lead, between) = pack_gap(column_pack(style), free, lanes, column_gap_u);
@@ -934,21 +1159,28 @@ fn stack_columns(
             from_units(area),
             prepared.content_width,
             prepared.specified_content_h,
+            space.percentage_block,
         )?;
         let fragment = laid.fragment;
         let item_oof = laid.oof;
         let [mt, mr, mb, ml] = prepared.margin.map(units);
+        // Under rtl the layout is logical (mirrored at the end), so the
+        // inline-start margin is the physical right one.
+        let (start_margin, end_margin) = if rtl { (mr, ml) } else { (ml, mr) };
         let (ml, _mr, inline_offset) = axis_offset(
             area,
             units(fragment.width),
-            ml,
-            mr,
+            start_margin,
+            end_margin,
             false,
             false,
             prepared.justify,
         );
         let contribution = (units(fragment.height) + mt + mb + row_gap_u).max(0);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
+        if rtl && dx != 0.0 {
+            return crate::layout_ng::bail("lanes:rtl-relative");
+        }
         let size_of = |lane: usize| {
             let track = track_of(reverse.track, lanes, lane, entry.span);
             span_sum(&sizes, &collapsed, track, entry.span, between)
@@ -1004,10 +1236,11 @@ fn stack_columns(
     let aligned = records
         .iter()
         .any(|record| record.prepared.stack != StackAlign::Normal);
-    if (reverse.fill && used < extent) || (aligned && (used < extent || clamped)) {
+    if aligned && (used < extent || clamped) {
         return crate::layout_ng::bail("lanes:stacking-overflow");
     }
     let spaces = openings.finish(row_gap_u, used);
+    let lead = stack_lead(row_pack(style), reverse.fill, used - extent);
     for (record, room) in records.into_iter().zip(spaces) {
         let Record {
             source,
@@ -1039,22 +1272,29 @@ fn stack_columns(
                     from_units(area),
                     prepared.content_width,
                     Some(from_units(target.max(0))),
+                    space.percentage_block,
                 )?;
                 fragment = laid.fragment;
                 oof = laid.oof;
             }
         }
         let y = if reverse.fill {
-            // Items stack from the end of the container: the margin box
+            // Items stack from the end of the group: the margin box
             // mirrors; margins keep their physical sides.
-            used - at - units(fragment.height) - after
+            lead + extent - at - units(fragment.height) - after
         } else {
-            at + before
+            lead + at + before
         };
         placed.push((source, cross + dx, from_units(y) + dy, fragment, oof));
     }
     placed.sort_by_key(|item| item.0);
-    Some(unzip_placed(placed, extent))
+    let geometry = Geometry {
+        sizes: sizes.clone(),
+        pos: column_x.clone(),
+        collapsed: collapsed.clone(),
+        between,
+    };
+    Some(unzip_placed(placed, extent, geometry))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1071,14 +1311,15 @@ fn stack_rows(
     specified_block: Option<i64>,
     font: f32,
     reverse: Reverse,
+    exact: bool,
 ) -> Option<Stacked> {
+    let rtl = style.direction == TextDirection::Rtl;
     let lanes = specs.len();
     let inner = from_units(inner_u);
     // Items do not depend on the lane in the inline axis, so each one is
     // measured once and contributes at every candidate start line.
     let mut measured = Vec::with_capacity(entries.len());
-    let mut row_min = vec![0_i64; lanes];
-    let mut row_max = vec![0_i64; lanes];
+    let mut contribs = Contribs::new(lanes, exact);
     for entry in entries {
         let prepared = prepare(flat, style, space, entry.index, inner, false, None)?;
         let laid = layout_item(
@@ -1088,6 +1329,7 @@ fn stack_rows(
             inner,
             prepared.content_width,
             prepared.specified_content_h,
+            space.percentage_block,
         )?;
         let [mt, _, mb, _] = prepared.margin.map(units);
         let block_of = |fragment: &BoxFragment| units(fragment.height) + mt + mb;
@@ -1106,6 +1348,7 @@ fn stack_rows(
                     inner,
                     sized.content_width,
                     sized.specified_content_h,
+                    space.percentage_block,
                 )?;
                 Some(block_of(&laid.fragment))
             };
@@ -1118,33 +1361,13 @@ fn stack_rows(
             None => 0..=lanes - entry.span,
         };
         for start in starts {
-            super::add_span_contrib(
-                &mut row_min,
-                &mut row_max,
-                start,
-                entry.span,
-                min_block,
-                max_block,
-            );
+            contribs.add(start, entry.span, min_block, max_block);
         }
         measured.push((prepared, laid.fragment, laid.oof));
     }
     let stretch_rows = row_pack(style) == Pack::Stretch;
     let collapsed = vec![false; lanes];
-    let tracks: Vec<_> = specs
-        .iter()
-        .enumerate()
-        .map(|(lane, spec)| {
-            track_from_spec(
-                spec,
-                row_min[lane],
-                row_max[lane],
-                definite_block,
-                font,
-                stretch_rows,
-            )
-        })
-        .collect();
+    let tracks = contribs.tracks(specs, definite_block, font, row_gap_u, stretch_rows);
     let mut sizes = if tracks.iter().any(|track| track.flex > 0.0) {
         finalize(&tracks, definite_block, row_gap_u)
     } else {
@@ -1203,7 +1426,7 @@ fn stack_rows(
             let target_border = (lane_size - mt - mb).max(0);
             let target_content = (target_border - units(prepared.edges_v)).max(0);
             let measured_content = units(fragment.height) - units(prepared.edges_v);
-            if target_content > measured_content {
+            if target_content != measured_content {
                 let relaid = layout_item(
                     flat,
                     entry.index,
@@ -1211,6 +1434,7 @@ fn stack_rows(
                     inner,
                     prepared.content_width,
                     Some(from_units(target_content)),
+                    space.percentage_block,
                 )?;
                 fragment = relaid.fragment;
                 item_oof = relaid.oof;
@@ -1227,6 +1451,9 @@ fn stack_rows(
         );
         let contribution = (units(fragment.width) + ml + mr + column_gap_u).max(0);
         let (dx, dy) = oof::relative_offset(flat[entry.index].style, space);
+        if rtl && dx != 0.0 {
+            return crate::layout_ng::bail("lanes:rtl-relative");
+        }
         let size_of = |lane: usize| {
             let track = track_of(reverse.track, lanes, lane, entry.span);
             span_sum(&sizes, &collapsed, track, entry.span, between)
@@ -1260,8 +1487,8 @@ fn stack_rows(
             index: entry.index,
             cross: y,
             at,
-            before: ml,
-            after: mr,
+            before: if rtl { mr } else { ml },
+            after: if rtl { ml } else { mr },
             dx,
             dy,
             fragment,
@@ -1279,7 +1506,11 @@ fn stack_rows(
     let aligned = records
         .iter()
         .any(|record| record.prepared.stack != StackAlign::Normal);
-    if (reverse.fill || aligned) && !records.is_empty() && extent > inner_u {
+    if rtl && aligned {
+        // Stack alignment keywords are not mirrored yet.
+        return crate::layout_ng::bail("lanes:rtl-stack-align");
+    }
+    if aligned && !records.is_empty() && extent > inner_u {
         return crate::layout_ng::bail("lanes:stacking-overflow");
     }
     let spaces = openings.finish(column_gap_u, inner_u);
@@ -1316,6 +1547,7 @@ fn stack_rows(
                     inner,
                     from_units(width.max(0)),
                     Some(from_units(content_h.max(0))),
+                    space.percentage_block,
                 )?;
                 fragment = laid.fragment;
                 oof = laid.oof;
@@ -1330,12 +1562,19 @@ fn stack_rows(
         placed.push((source, from_units(x) + dx, cross + dy, fragment, oof));
     }
     placed.sort_by_key(|item| item.0);
-    Some(unzip_placed(placed, used))
+    let geometry = Geometry {
+        sizes: sizes.clone(),
+        pos: row_y.clone(),
+        collapsed: collapsed.clone(),
+        between,
+    };
+    Some(unzip_placed(placed, used, geometry))
 }
 
 fn unzip_placed(
     placed: Vec<(usize, f32, f32, BoxFragment, Vec<OofCandidate>)>,
     extent: i64,
+    geometry: Geometry,
 ) -> Stacked {
     let mut children = Vec::with_capacity(placed.len());
     let mut oof = Vec::new();
@@ -1343,10 +1582,588 @@ fn unzip_placed(
         oof.extend(item_oof.iter().map(|candidate| candidate.translated(x, y)));
         children.push((x, y, fragment));
     }
-    (children, oof, extent)
+    (children, oof, extent, geometry)
 }
 
 fn is_dense(style: &Style) -> bool {
     marker(style, PACK) == Some("dense")
         || parse_flow(style.grid_flow()).is_some_and(|flow| flow.dense)
+}
+
+fn spec_is_intrinsic(spec: &Spec) -> bool {
+    let intrinsic = |breadth: &Breadth| {
+        matches!(
+            breadth,
+            Breadth::Auto | Breadth::MinContent | Breadth::MaxContent
+        )
+    };
+    match spec {
+        Spec::One(breadth) | Spec::Fit(breadth) => intrinsic(breadth),
+        Spec::MinMax(min, max) => intrinsic(min) || intrinsic(max),
+    }
+}
+
+/// Block-axis (row lanes) or inline-axis (column lanes) min-content and
+/// max-content contributions of an item to the grid axis.
+fn grid_axis_contribution(
+    flat: &[FlatNodeInfo],
+    style: &Style,
+    space: &ConstraintSpace,
+    child: usize,
+    columns: bool,
+    inner: f32,
+) -> Option<(i64, i64)> {
+    if columns {
+        return inline_minmax(flat, child, space).why("lanes:intrinsic");
+    }
+    let block_of = |width: Option<i64>| -> Option<i64> {
+        let prepared = prepare(flat, style, space, child, inner, false, width)?;
+        let laid = layout_item(
+            flat,
+            child,
+            space,
+            inner,
+            prepared.content_width,
+            prepared.specified_content_h,
+            space.percentage_block,
+        )?;
+        let [mt, _, mb, _] = prepared.margin.map(units);
+        Some(units(laid.fragment.height) + mt + mb)
+    };
+    let natural = block_of(None)?;
+    if !matches!(flat[child].style.width, Dimension::Auto) {
+        return Some((natural, natural));
+    }
+    let (min_c, max_c) = inline_minmax(flat, child, space).why("lanes:intrinsic")?;
+    let min_block = block_of(Some(min_c))?;
+    let max_block = block_of(Some(max_c))?.max(min_block);
+    Some((min_block, max_block))
+}
+
+/// Number of repetitions of an `auto-fill` / `auto-fit` repeat. Every
+/// track (including those outside the repeat) takes the size of a
+/// hypothetical sizing where the repeat is expanded once, item placement is
+/// ignored, and a spanning item contributes its size less the spanned gaps
+/// divided by its span to every track (Chromium
+/// `GetIntrinsicRepeaterTrackSizes`, which uses the growth limit).
+#[allow(clippy::too_many_arguments)]
+fn repeat_count(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    style: &Style,
+    space: &ConstraintSpace,
+    template: &super::Template,
+    columns: bool,
+    available: i64,
+    gap: i64,
+    font: f32,
+    inflow: usize,
+    inner: f32,
+) -> Option<usize> {
+    let fit = template.auto_fit?;
+    let repeat_len = template.auto_tracks.len();
+    // One repetition first, only to resolve the largest item span.
+    let mut one: Vec<Spec> = Vec::new();
+    one.extend_from_slice(&template.tracks[..template.auto_at]);
+    one.extend_from_slice(&template.auto_tracks);
+    one.extend_from_slice(&template.tracks[template.auto_at..]);
+    let names = super::expanded_names(template, one.len());
+    let mut items: Vec<(usize, i64, i64)> = Vec::new();
+    let needs_items = one.iter().any(spec_is_intrinsic);
+    let mut largest = 1;
+    if needs_items {
+        for child in rendered_children(flat, index) {
+            let child_style = flat[child].style;
+            if oof::is_out_of_flow(child_style) {
+                continue;
+            }
+            let span = resolve_axis(placement(child_style, !columns), &names, one.len())
+                .map_or(1, |place| place.span)
+                .max(1);
+            largest = largest.max(span);
+            let (min_c, max_c) = grid_axis_contribution(flat, style, space, child, columns, inner)?;
+            items.push((span, min_c, max_c));
+        }
+    }
+    // Expand the repeat to cover every automatic placement of each item:
+    // 2 + (largest span - 2) / tracks in the repeat, rounded down.
+    let reps = if largest < 2 || repeat_len == 0 {
+        1
+    } else {
+        (2 + (largest - 2) / repeat_len).min(super::MAX_REPEAT)
+    };
+    let mut specs: Vec<Spec> = Vec::new();
+    specs.extend_from_slice(&template.tracks[..template.auto_at]);
+    let from = specs.len();
+    for _ in 0..reps {
+        specs.extend_from_slice(&template.auto_tracks);
+    }
+    let to = specs.len();
+    specs.extend_from_slice(&template.tracks[template.auto_at..]);
+    let total = specs.len();
+    let mut contribs = Contribs::new(total, true);
+    for &(span, min_c, max_c) in &items {
+        let span = span.min(total.max(1));
+        for start in 0..=(total - span) {
+            contribs.add(start, span, min_c, max_c);
+        }
+    }
+    let sizes: Vec<i64> = contribs
+        .tracks(&specs, Some(available), font, gap, false)
+        .iter()
+        .map(|track| {
+            if track.cap < INF {
+                track.cap
+            } else {
+                track.base
+            }
+        })
+        .collect();
+    // The hypothetical size of a repeat entry is the largest track with
+    // that index.
+    let entry_sizes: Vec<i64> = (0..repeat_len)
+        .map(|entry| {
+            (0..reps)
+                .map(|rep| sizes[from + rep * repeat_len + entry])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let repeat_sum: i64 = entry_sizes.iter().sum();
+    let outside_sum: i64 = sizes[..from].iter().sum::<i64>() + sizes[to..].iter().sum::<i64>();
+    let outside_len = total - (to - from);
+    let denominator = repeat_sum + repeat_len as i64 * gap;
+    if repeat_len == 0 || denominator <= 0 {
+        return Some(if fit { inflow.max(1) } else { 1 });
+    }
+    let room = available + gap - outside_sum - outside_len as i64 * gap;
+    Some(((room / denominator).max(1) as usize).min(super::MAX_REPEAT))
+}
+
+/// CSS Grid 3 3.3.1: `auto-fit` collapses the repeated tracks no item is
+/// expected to occupy. Tracks holding an explicitly placed item are
+/// occupied, and so are the first N unoccupied tracks, N being the sum of
+/// the auto-placed items' spans. A collapsed track takes no placement; it
+/// is dropped (its gap goes with it).
+fn collapse_empty_repeats(
+    template: &super::Template,
+    specs: &mut Vec<Spec>,
+    entries: &mut [Entry],
+) -> Option<()> {
+    let lanes = specs.len();
+    let added = lanes.saturating_sub(template.tracks.len());
+    let (from, to) = (template.auto_at, template.auto_at + added);
+    let mut occupied = vec![false; lanes];
+    let mut auto_spans = 0;
+    for entry in entries.iter() {
+        match entry.start {
+            Some(start) => {
+                for slot in occupied.iter_mut().skip(start).take(entry.span) {
+                    *slot = true;
+                }
+            }
+            None => auto_spans += entry.span,
+        }
+    }
+    for slot in occupied.iter_mut() {
+        if auto_spans == 0 {
+            break;
+        }
+        if !*slot {
+            *slot = true;
+            auto_spans -= 1;
+        }
+    }
+    let kept: Vec<bool> = (0..lanes)
+        .map(|lane| occupied[lane] || lane < from || lane >= to)
+        .collect();
+    if kept.iter().all(|keep| *keep) {
+        return Some(());
+    }
+    let mut new_index = vec![0_usize; lanes + 1];
+    for lane in 0..lanes {
+        new_index[lane + 1] = new_index[lane] + usize::from(kept[lane]);
+    }
+    if new_index[lanes] == 0 {
+        return crate::layout_ng::bail("lanes:auto-fit-empty");
+    }
+    for entry in entries.iter_mut() {
+        if let Some(start) = entry.start {
+            entry.span = new_index[(start + entry.span).min(lanes)] - new_index[start];
+            entry.start = Some(new_index[start]);
+        }
+    }
+    let mut lane = 0;
+    specs.retain(|_| {
+        let keep = kept[lane];
+        lane += 1;
+        keep
+    });
+    Some(())
+}
+
+/// Track-sizing contributions of the (virtual) items of a lanes axis.
+/// With `exact`, spanning items size the tracks by the CSS Grid 12.5
+/// spanning-item steps; otherwise they spread evenly.
+struct Contribs {
+    min: Vec<i64>,
+    max: Vec<i64>,
+    has_item: Vec<bool>,
+    spanning: Vec<super::SpanItem>,
+    exact: bool,
+}
+
+impl Contribs {
+    fn new(lanes: usize, exact: bool) -> Self {
+        Self {
+            min: vec![0; lanes],
+            max: vec![0; lanes],
+            has_item: vec![false; lanes],
+            spanning: Vec::new(),
+            exact,
+        }
+    }
+
+    fn add(&mut self, start: usize, span: usize, min_c: i64, max_c: i64) {
+        if self.exact && span > 1 {
+            if start + span <= self.min.len() {
+                self.spanning.push(super::SpanItem {
+                    start,
+                    span,
+                    minimum: min_c,
+                    min_c,
+                    max_c,
+                });
+            }
+            return;
+        }
+        if span == 1 && start < self.has_item.len() {
+            self.has_item[start] = true;
+        }
+        super::add_span_contrib(&mut self.min, &mut self.max, start, span, min_c, max_c);
+    }
+
+    fn tracks(
+        &self,
+        specs: &[Spec],
+        available: Option<i64>,
+        font: f32,
+        gap: i64,
+        stretch: bool,
+    ) -> Vec<super::Track> {
+        let mut tracks: Vec<super::Track> = specs
+            .iter()
+            .enumerate()
+            .map(|(lane, spec)| {
+                track_from_spec(
+                    spec,
+                    self.min[lane],
+                    self.min[lane],
+                    self.max[lane],
+                    available,
+                    font,
+                    stretch,
+                )
+            })
+            .collect();
+        if self.exact {
+            super::accommodate_spanning_items(
+                &mut tracks,
+                specs,
+                &self.has_item,
+                &self.spanning,
+                available,
+                font,
+                gap,
+            );
+        }
+        tracks
+    }
+}
+
+/// The content-box min/max-content widths of a lanes container measured as
+/// an item of another formatting context. Only column lanes are measured.
+pub(super) fn measured(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<super::MinMax> {
+    match lane_direction(flat[index].style) {
+        Some(Direction { columns: true, .. }) => intrinsic_columns(flat, index, space),
+        _ => crate::layout_ng::bail("grid:lanes-measure"),
+    }
+}
+
+/// Min-content and max-content sizes of column lanes: the tracks sized by
+/// the items' contributions (an auto-placed item contributes at every start
+/// line) under a zero and an unbounded constraint.
+fn intrinsic_columns(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    space: &ConstraintSpace,
+) -> Option<super::MinMax> {
+    let style = flat[index].style;
+    let template = parse_template(columns_spec(style).why("lanes:no-template")?, false)
+        .why("lanes:template")?;
+    if template.auto_fit.is_some() || !template.auto_tracks.is_empty() {
+        return crate::layout_ng::bail("lanes:intrinsic-repeat");
+    }
+    let specs = template.tracks.clone();
+    let lanes = specs.len();
+    if lanes == 0 {
+        return crate::layout_ng::bail("lanes:no-template");
+    }
+    let names = super::expanded_names(&template, lanes);
+    let mut contribs = Contribs::new(lanes, false);
+    for child in rendered_children(flat, index) {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) {
+            continue;
+        }
+        let place =
+            resolve_axis(placement(child_style, false), &names, lanes).why("lanes:placement")?;
+        let span = place.span;
+        let starts = match place.start {
+            Some(start) if start < 0 => return crate::layout_ng::bail("lanes:negative-line"),
+            Some(start) => start as usize..=start as usize,
+            None if span <= lanes => 0..=lanes - span,
+            None => return crate::layout_ng::bail("lanes:span"),
+        };
+        if span > lanes || *starts.end() + span > lanes {
+            return crate::layout_ng::bail("lanes:span");
+        }
+        let (min_c, max_c) = inline_minmax(flat, child, space).why("lanes:intrinsic")?;
+        for start in starts {
+            contribs.add(start, span, min_c, max_c);
+        }
+    }
+    let gap = units(style.column_gap.unwrap_or(style.gap).max(0.0));
+    Some(super::measure_columns(
+        &specs,
+        &vec![false; lanes],
+        &contribs.min,
+        &contribs.max,
+        gap,
+        style.font_size.max(0.0),
+    ))
+}
+
+/// Layout state an out-of-flow child of a lanes container needs.
+struct OofFrame<'a> {
+    columns: bool,
+    fill_reverse: bool,
+    origin_x: i64,
+    origin_y: i64,
+    inner_u: i64,
+    used: i64,
+    height: f32,
+    lanes: usize,
+    /// Top, right, bottom and left padding.
+    padding: [f32; 4],
+    geometry: &'a Geometry,
+    names: &'a [Vec<String>],
+}
+
+/// Out-of-flow children of a lanes container behave as in a grid whose
+/// grid-axis tracks are the lanes and whose other axis is one area spanning
+/// the content box (CSS Grid 3 abspos; Blink GridLanesLayoutAlgorithm).
+/// Under `fill-reverse` the static position sits at the end of the
+/// stacking axis, as the content does.
+fn place_oof_children(
+    flat: &[FlatNodeInfo],
+    style: &Style,
+    space: &ConstraintSpace,
+    oof_children: &[usize],
+    frame: &OofFrame,
+    children: &mut Vec<(f32, f32, BoxFragment)>,
+    pending_oof: &mut Vec<OofCandidate>,
+) -> Option<()> {
+    let OofFrame {
+        columns: lane_columns,
+        fill_reverse,
+        origin_x,
+        origin_y,
+        inner_u,
+        used,
+        height,
+        lanes,
+        padding: [pt, pr, pb, pl],
+        geometry,
+        ..
+    } = *frame;
+    let none = Geometry::default();
+    let (col_geom, row_geom) = if lane_columns {
+        (geometry, &none)
+    } else {
+        (&none, geometry)
+    };
+    let names = frame.names;
+    let empty_names: &[Vec<String>] = &[];
+    let (names_cols, names_rows, explicit_cols, explicit_rows) = if lane_columns {
+        (names, empty_names, lanes, 0)
+    } else {
+        (empty_names, names, 0, lanes)
+    };
+    for &child in oof_children {
+        let child_style = flat[child].style;
+        let padded = |a: Spacing, b: Spacing| {
+            [a, b]
+                .iter()
+                .any(|side| matches!(side, Spacing::Px(px) if *px > 0.0))
+        };
+        let column = super::resolve_abspos_axis(
+            placement(child_style, false),
+            names_cols,
+            explicit_cols,
+            padded(style.padding.left, style.padding.right),
+        )
+        .why("lanes:oof-column")?;
+        let row = super::resolve_abspos_axis(
+            placement(child_style, true),
+            names_rows,
+            explicit_rows,
+            padded(style.padding.top, style.padding.bottom),
+        )
+        .why("lanes:oof-row")?;
+        let col = column.start.unwrap_or(0).max(0) as usize;
+        let row_index = row.start.unwrap_or(0).max(0) as usize;
+        let static_only = style.position == Position::Static;
+        let area_w = if col_geom.sizes.is_empty() || static_only {
+            inner_u
+        } else {
+            span_sum(
+                &col_geom.sizes,
+                &col_geom.collapsed,
+                col,
+                column.span,
+                col_geom.between,
+            )
+        };
+        let area_h = if row_geom.sizes.is_empty() || static_only {
+            used
+        } else {
+            span_sum(
+                &row_geom.sizes,
+                &row_geom.collapsed,
+                row_index,
+                row.span,
+                row_geom.between,
+            )
+        };
+        let (col_at, row_at) = if static_only {
+            (0, 0)
+        } else {
+            (
+                col_geom.pos.get(col).copied().unwrap_or(0),
+                row_geom.pos.get(row_index).copied().unwrap_or(0),
+            )
+        };
+        let mut justify = align_pack(used_item_align(
+            style.justify_items,
+            child_style.justify_self,
+        ));
+        let mut align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        if fill_reverse {
+            if lane_columns {
+                align = Pack::End;
+            } else {
+                justify = Pack::End;
+            }
+        }
+        let border_w = super::definite_border(
+            child_style,
+            false,
+            from_units(area_w),
+            from_units(used),
+            space,
+        );
+        let border_h = super::definite_border(
+            child_style,
+            true,
+            from_units(inner_u),
+            from_units(area_h),
+            space,
+        );
+        let inline_off = border_w
+            .map(|size| axis_offset(area_w, size, 0, 0, false, false, justify).2)
+            .unwrap_or(0);
+        let block_off = border_h
+            .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
+            .unwrap_or(0);
+        let candidate = OofCandidate {
+            index: child,
+            static_inline: from_units(origin_x + col_at + inline_off),
+            static_block: from_units(origin_y + row_at + block_off),
+            static_rtl: false,
+        };
+        if static_only {
+            pending_oof.push(candidate);
+            continue;
+        }
+        let (start_auto, end_auto) = super::abspos_auto_lines(placement(child_style, false));
+        let (x0, x1) = super::abspos_area(
+            &col_geom.sizes,
+            &col_geom.pos,
+            column.start,
+            column.span,
+            start_auto,
+            end_auto,
+            (-units(pl), inner_u + units(pr)),
+        );
+        let (start_auto, end_auto) = super::abspos_auto_lines(placement(child_style, true));
+        let (y0, y1) = super::abspos_area(
+            &row_geom.sizes,
+            &row_geom.pos,
+            row.start,
+            row.span,
+            start_auto,
+            end_auto,
+            (-units(pt), units(height) + units(pb)),
+        );
+        let (area_w, area_h) = (x1 - x0, y1 - y0);
+        let border_w = super::definite_border(
+            child_style,
+            false,
+            from_units(area_w),
+            from_units(area_h),
+            space,
+        );
+        let border_h = super::definite_border(
+            child_style,
+            true,
+            from_units(area_w),
+            from_units(area_h),
+            space,
+        );
+        let inline_off = border_w
+            .map(|size| axis_offset(area_w, size, 0, 0, false, false, justify).2)
+            .unwrap_or(0);
+        let block_off = border_h
+            .map(|size| axis_offset(area_h, size, 0, 0, false, false, align).2)
+            .unwrap_or(0);
+        let cb = oof::ContainingBlock {
+            x: from_units(origin_x + x0),
+            y: from_units(origin_y + y0),
+            width: from_units(area_w),
+            height: from_units(area_h),
+            rtl: false,
+        };
+        let candidate = OofCandidate {
+            static_inline: from_units(origin_x + x0 + inline_off),
+            static_block: from_units(origin_y + y0 + block_off),
+            ..candidate
+        };
+        let (placed, rest) = oof::resolve(
+            flat,
+            vec![candidate],
+            &cb,
+            false,
+            space.viewport_w,
+            space.viewport_h,
+        )
+        .why("lanes:oof-resolve")?;
+        children.extend(placed);
+        pending_oof.extend(rest);
+    }
+    Some(())
 }
