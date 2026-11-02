@@ -24056,6 +24056,63 @@ mod tests {
         el
     }
 
+    #[test]
+    fn long_unbreakable_text_in_a_wide_offscreen_container_measures_its_real_advance() {
+        // Mirrors the editor's DomCharWidthReader: 256 repeated characters in
+        // spans separated by <br> inside a very wide, off-screen container,
+        // read back as offsetWidth / 256. The layout used to wrap such text at
+        // a fixed 360px probe, yielding ~1.4px per character, which made the
+        // reader distrust the font info and re-measure forever.
+        setup();
+        set_viewport(1280.0, 800.0);
+        let document = document_value();
+        let container = document.call_method("createElement", vec![Value::string("div")]);
+        let container_style = container.get_property("style");
+        container_style.set_property("position", Value::string("absolute"));
+        container_style.set_property("top", Value::string("-50000px"));
+        container_style.set_property("width", Value::string("50000px"));
+        let reg = document.call_method("createElement", vec![Value::string("div")]);
+        reg.get_property("style")
+            .set_property("fontSize", Value::string("12px"));
+        container.call_method("appendChild", vec![reg.clone()]);
+        let mut spans = vec![];
+        for chr in ["n", "0", "|", "m"] {
+            reg.call_method(
+                "appendChild",
+                vec![document.call_method("createElement", vec![Value::string("br")])],
+            );
+            let span = document.call_method("createElement", vec![Value::string("span")]);
+            span.set_property("textContent", Value::string(&chr.repeat(256)));
+            reg.call_method("appendChild", vec![span.clone()]);
+            spans.push((chr, span));
+        }
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![container.clone()]);
+        // The first read flushes layout; read again once geometry exists.
+        let _ = reg.get_property("offsetWidth");
+        reg.call_method(
+            "appendChild",
+            vec![document.call_method("createElement", vec![Value::string("div")])],
+        );
+        let _ = reg.get_property("offsetWidth");
+        let mut advances = vec![];
+        for (chr, span) in &spans {
+            let width = span.get_property("offsetWidth").to_number() / 256.0;
+            let height = span.get_property("offsetHeight").to_number();
+            assert!(
+                width > 2.0,
+                "{chr:?} advance {width} is implausibly small (wrapped at the probe width?)"
+            );
+            assert!(
+                height < 20.0,
+                "{chr:?} wrapped onto several lines (height {height})"
+            );
+            advances.push(width);
+        }
+        assert!(advances[0] > 5.0, "n advance {}", advances[0]);
+    }
+
     fn wrapper_weak(value: &Value) -> WeakRealmObject {
         weak_realm_object(value)
     }
