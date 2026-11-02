@@ -20,6 +20,28 @@ pub(super) struct RuleSet {
     /// and its reach: 0 subject, 1 earlier compound (descendants may change),
     /// 2 earlier compound followed by a sibling combinator.
     relational_anchors: Vec<(CompoundSelector, u8)>,
+    /// Compounds whose match can change when an element is inserted into or
+    /// removed from the sibling list: those carrying a positional pseudo-class
+    /// (`:first-child`, `:nth-child()`, ...) and those to the right of a `+`/`~`.
+    positional_anchors: Vec<PositionalAnchor>,
+    /// Compounds carrying `:empty`, which watch their own child list.
+    empty_anchors: Vec<CompoundSelector>,
+    /// Some positional/sibling dependency is not captured by the anchors
+    /// (nested selector lists, `:nth-child(.. of S)`), so callers must fall
+    /// back to restyling every sibling.
+    positional_unbounded: bool,
+}
+
+/// Static part (pseudo-classes dropped, which only widens the match) of a
+/// compound whose result depends on its position among its siblings.
+#[derive(Debug)]
+struct PositionalAnchor {
+    subject: CompoundSelector,
+    /// Static part of the parent compound when joined by `>`; every sibling
+    /// shares one parent, so the anchor can only apply when it matches.
+    parent: Option<CompoundSelector>,
+    /// The compound sits right of `+` or `~`.
+    sibling_rhs: bool,
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +200,9 @@ impl RuleSet {
         self.has_structural_dependencies = false;
         self.has_sibling_scoped_relational = false;
         self.relational_anchors.clear();
+        self.positional_anchors.clear();
+        self.empty_anchors.clear();
+        self.positional_unbounded = false;
         for index in 0..self.rules.len() {
             self.index_rule(index);
         }
@@ -204,6 +229,8 @@ impl RuleSet {
             .iter()
             .flat_map(|compound| &compound.pseudo_classes)
             .any(pseudo_has_structural_dependency);
+
+        self.index_positional_anchors(index);
 
         let last = self.rules[index].chain.len().saturating_sub(1);
         let mut anchors = Vec::new();
@@ -262,6 +289,83 @@ impl RuleSet {
         }
     }
 
+    fn index_positional_anchors(&mut self, index: usize) {
+        let rule = &self.rules[index];
+        let mut anchors = Vec::new();
+        let mut empty = Vec::new();
+        let mut unbounded = false;
+        for (position, compound) in rule.chain.iter().enumerate() {
+            unbounded |= compound
+                .pseudo_classes
+                .iter()
+                .any(pseudo_is_positionally_opaque);
+            let sibling_rhs = position > 0
+                && matches!(
+                    rule.combinators[position - 1],
+                    super::Combinator::AdjacentSibling | super::Combinator::GeneralSibling
+                );
+            let positional = compound.pseudo_classes.iter().any(pseudo_is_positional);
+            let watches_children = compound
+                .pseudo_classes
+                .iter()
+                .any(|pseudo| matches!(pseudo, super::PseudoClass::Empty));
+            if !(positional || sibling_rhs || watches_children) {
+                continue;
+            }
+            let mut subject = compound.clone();
+            subject.pseudo_classes.clear();
+            if watches_children {
+                empty.push(subject.clone());
+            }
+            if positional || sibling_rhs {
+                let parent = (position > 0
+                    && matches!(rule.combinators[position - 1], super::Combinator::Child))
+                .then(|| {
+                    let mut parent = rule.chain[position - 1].clone();
+                    parent.pseudo_classes.clear();
+                    parent
+                });
+                anchors.push(PositionalAnchor {
+                    subject,
+                    parent,
+                    sibling_rhs,
+                });
+            }
+        }
+        self.positional_unbounded |= unbounded;
+        self.positional_anchors.extend(anchors);
+        self.empty_anchors.extend(empty);
+    }
+
+    pub(super) fn positional_unbounded(&self) -> bool {
+        self.positional_unbounded
+    }
+
+    /// Whether `ctx` (a child of `parent`) could change match result when its
+    /// sibling list changes. `siblings_only` keeps the `+`/`~` anchors, the
+    /// only ones a class/attribute change on a sibling can reach.
+    pub(super) fn positional_anchor_matches(
+        &self,
+        ctx: &SelectorContext,
+        parent: &SelectorContext,
+        siblings_only: bool,
+    ) -> bool {
+        self.positional_anchors.iter().any(|anchor| {
+            (!siblings_only || anchor.sibling_rhs)
+                && anchor.subject.matches(ctx)
+                && anchor
+                    .parent
+                    .as_ref()
+                    .is_none_or(|compound| compound.matches(parent))
+        })
+    }
+
+    /// Whether `ctx` carries `:empty` somewhere in a rule, so its own child
+    /// list is observed.
+    pub(super) fn empty_anchor_matches(&self, ctx: &SelectorContext) -> bool {
+        self.empty_anchors.iter().any(|anchor| anchor.matches(ctx))
+    }
+
     /// Candidates among rules without a pseudo-element.
     pub(super) fn candidate_indices_for_context(&self, ctx: &SelectorContext) -> Vec<usize> {
         self.main.candidates_for_context(ctx)
@@ -318,6 +422,58 @@ fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {
     match pseudo {
         super::PseudoClass::Has(_) => true,
         super::PseudoClass::Not(selector) => selector.contains('+') || selector.contains('~'),
+        _ => false,
+    }
+}
+
+/// Position-dependent pseudo-classes whose subject is the sibling itself.
+fn pseudo_is_positional(pseudo: &super::PseudoClass) -> bool {
+    matches!(
+        pseudo,
+        super::PseudoClass::FirstChild
+            | super::PseudoClass::LastChild
+            | super::PseudoClass::FirstOfType
+            | super::PseudoClass::LastOfType
+            | super::PseudoClass::OnlyChild
+            | super::PseudoClass::OnlyOfType
+            | super::PseudoClass::NthChild(_)
+            | super::PseudoClass::NthLastChild(_)
+            | super::PseudoClass::NthOfType(_)
+            | super::PseudoClass::NthLastOfType(_)
+    )
+}
+
+/// Pseudo-classes whose sibling/structural reach the anchors cannot bound:
+/// selector lists that may nest a positional or sibling selector, and
+/// `:nth-*(An+B of S)`, which also reads sibling attributes.
+fn pseudo_is_positionally_opaque(pseudo: &super::PseudoClass) -> bool {
+    match pseudo {
+        super::PseudoClass::Has(_) => true,
+        super::PseudoClass::Not(selector)
+        | super::PseudoClass::Is(selector)
+        | super::PseudoClass::Where(selector) => {
+            let selector = selector.to_ascii_lowercase();
+            selector.contains('+')
+                || selector.contains('~')
+                || selector.contains(":nth-")
+                || [
+                    ":empty",
+                    ":first-child",
+                    ":last-child",
+                    ":first-of-type",
+                    ":last-of-type",
+                    ":only-child",
+                    ":only-of-type",
+                ]
+                .iter()
+                .any(|needle| selector.contains(needle))
+        }
+        super::PseudoClass::NthChild(expression)
+        | super::PseudoClass::NthLastChild(expression)
+        | super::PseudoClass::NthOfType(expression)
+        | super::PseudoClass::NthLastOfType(expression) => {
+            expression.to_ascii_lowercase().contains(" of ")
+        }
         _ => false,
     }
 }

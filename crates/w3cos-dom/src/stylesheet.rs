@@ -461,6 +461,28 @@ pub(crate) fn relational_anchor(ctx: &SelectorContext) -> Option<u8> {
     RULES.with(|rules| rules.borrow().relational_anchor(ctx))
 }
 
+/// Whether sibling-list dependencies are fully described by the positional
+/// anchors, so a child-list change need only restyle anchored siblings.
+pub(crate) fn positional_dependencies_bounded() -> bool {
+    RULES.with(|rules| !rules.borrow().positional_unbounded())
+}
+
+pub(crate) fn positional_anchor_matches(
+    ctx: &SelectorContext,
+    parent: &SelectorContext,
+    siblings_only: bool,
+) -> bool {
+    RULES.with(|rules| {
+        rules
+            .borrow()
+            .positional_anchor_matches(ctx, parent, siblings_only)
+    })
+}
+
+pub(crate) fn empty_anchor_matches(ctx: &SelectorContext) -> bool {
+    RULES.with(|rules| rules.borrow().empty_anchor_matches(ctx))
+}
+
 pub(crate) fn has_structural_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 8 != 0)
 }
