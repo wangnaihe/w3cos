@@ -1793,10 +1793,24 @@ fn side_keyword_needs_direction(style: &Style) -> bool {
     is_rtl(style) || style.flex_direction == FlexDirection::RowReverse
 }
 
+/// A `start` / `end` / `left` / `right` keyword on a horizontal-tb column
+/// or reversed column, whose physical resolution ignores the direction.
+fn is_physical_column_side(style: &Style) -> bool {
+    matches!(
+        style.flex_direction,
+        FlexDirection::Column | FlexDirection::ColumnReverse
+    ) && style.writing_mode == w3cos_std::style::WritingMode::HorizontalTb
+        && matches!(
+            side_keyword(style),
+            Some("start" | "end" | "left" | "right")
+        )
+}
+
 /// A side keyword outside a plain or reversed row needs the item direction
 /// too, so those containers stay on legacy.
 fn rtl_justify_unsupported(style: &Style) -> bool {
     side_keyword(style).is_some()
+        && !is_physical_column_side(style)
         && side_keyword_needs_direction(style)
         && (!matches!(
             style.flex_direction,
@@ -1811,6 +1825,21 @@ fn rtl_justify_unsupported(style: &Style) -> bool {
 /// `left` / `right` are physical, `start` / `end` follow the direction;
 /// the main axis starts at the inline start unless the row is reversed.
 fn justify_kind(style: &Style) -> JustifyContent {
+    // A horizontal-tb column's main axis is the block axis, which neither
+    // the direction nor `left` / `right` reach (Box Alignment: they behave
+    // as `start`): `start`, `left` and `right` pack to the physical top,
+    // `end` to the bottom. In `column-reverse` the top is the main end.
+    if is_physical_column_side(style)
+        && let Some(keyword) = side_keyword(style)
+    {
+        let top = keyword != "end";
+        let reverse = style.flex_direction == FlexDirection::ColumnReverse;
+        return if top != reverse {
+            JustifyContent::FlexStart
+        } else {
+            JustifyContent::FlexEnd
+        };
+    }
     // The enum folds `left` / `right` into `flex-start`, so even a plain
     // ltr row reads the authored keyword.
     if matches!(
@@ -4840,11 +4869,46 @@ mod tests {
     }
 
     #[test]
-    fn rtl_column_side_keywords_stay_on_legacy() {
-        stays_legacy(&Component::boxed(
-            rtl_style(FlexDirection::Column, Some("start")),
-            vec![leaf(block_box(Some(10.0), Some(10.0)))],
-        ));
+    fn column_side_keywords_resolve_to_the_physical_block_edges() {
+        // (direction, keyword, first y, second y) in a 60px column of two
+        // 10px items: `start` / `left` / `right` pack to the top, `end` to
+        // the bottom, whatever the direction; a reversed column runs
+        // bottom to top, so the first item is the lower one.
+        for (direction, keyword, first, second) in [
+            (FlexDirection::Column, "start", 0.0, 10.0),
+            (FlexDirection::Column, "left", 0.0, 10.0),
+            (FlexDirection::Column, "right", 0.0, 10.0),
+            (FlexDirection::Column, "end", 40.0, 50.0),
+            (FlexDirection::ColumnReverse, "start", 10.0, 0.0),
+            (FlexDirection::ColumnReverse, "left", 10.0, 0.0),
+            (FlexDirection::ColumnReverse, "right", 10.0, 0.0),
+            (FlexDirection::ColumnReverse, "end", 50.0, 40.0),
+        ] {
+            for rtl in [false, true] {
+                let mut style = flex_style(direction, 100.0, Some(60.0));
+                if rtl {
+                    style.direction = TextDirection::Rtl;
+                }
+                style.custom_properties = Some(w3cos_std::style::CustomProperties::from_iter([(
+                    "--w3cos-internal-justify-content".to_string(),
+                    keyword.to_string(),
+                )]));
+                let root = Component::boxed(
+                    style,
+                    vec![
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                        leaf(block_box(Some(10.0), Some(10.0))),
+                    ],
+                );
+                let out = lay(&root);
+                assert_eq!(rect(&out, 1)[1], first, "{direction:?} {keyword} rtl={rtl}");
+                assert_eq!(
+                    rect(&out, 2)[1],
+                    second,
+                    "{direction:?} {keyword} rtl={rtl}"
+                );
+            }
+        }
     }
 
     fn vertical_flex(
