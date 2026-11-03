@@ -739,9 +739,32 @@ fn compound_reads_style_attribute(compound: &super::CompoundSelector) -> bool {
         super::PseudoClass::Has(selector)
         | super::PseudoClass::Not(selector)
         | super::PseudoClass::Is(selector)
-        | super::PseudoClass::Where(selector) => selector.to_ascii_lowercase().contains("style"),
+        | super::PseudoClass::Where(selector) => selector_text_reads_style_attribute(selector),
         _ => false,
     })
+}
+
+/// Whether selector text contains an attribute selector on `style`
+/// (`[style]`, `[ STYLE*="x" ]`). A class or tag that merely contains the
+/// word (`.monaco-style`, `:not(.inline-style)`) cannot observe the attribute.
+/// An escape could spell the name differently, so any backslash stays
+/// conservative.
+fn selector_text_reads_style_attribute(selector: &str) -> bool {
+    if selector.contains('\\') {
+        return true;
+    }
+    let lower = selector.to_ascii_lowercase();
+    lower.match_indices('[').any(|(at, _)| {
+        let rest = lower[at + 1..].trim_start();
+        // `[ns|style]` and `[*|style]` name the same attribute.
+        let rest = rest.strip_prefix("*|").unwrap_or(rest);
+        rest.strip_prefix("style").is_some_and(|after| {
+            !after
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || next == '-' || next == '_')
+        })
+    }) || (lower.contains('|') && lower.contains("style"))
 }
 
 fn pseudo_has_sibling_dependency(pseudo: &super::PseudoClass) -> bool {

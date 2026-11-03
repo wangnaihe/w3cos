@@ -2765,6 +2765,40 @@ mod tests {
         assert!(!has_sibling_dependencies());
     }
 
+    #[test]
+    fn style_attribute_dependency_needs_an_attribute_selector() {
+        setup();
+        assert!(!has_style_attribute_dependencies());
+        for selector in [
+            ".monaco-style",
+            "div:not(.inline-style)",
+            ":is(.a-style, .b)",
+            ":where(styled-box)",
+            "li:not([data-style])",
+            "li:not([styles])",
+        ] {
+            register_rule(selector, &[("color", "red")]);
+            assert!(
+                !has_style_attribute_dependencies(),
+                "{selector} cannot observe the style attribute"
+            );
+        }
+        for selector in [
+            "[style]",
+            "div[style*=\"x\"]",
+            "div:not([ STYLE ])",
+            ":is(p, [style^=a])",
+            "div:has([style=\"a\"])",
+        ] {
+            setup();
+            register_rule(selector, &[("color", "red")]);
+            assert!(
+                has_style_attribute_dependencies(),
+                "{selector} observes the style attribute"
+            );
+        }
+    }
+
     fn nth_of_fixture() -> (Document, Vec<NodeId>) {
         let mut document = Document::new();
         let list = document.create_element("ul");
