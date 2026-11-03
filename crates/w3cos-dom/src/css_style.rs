@@ -25,6 +25,11 @@ pub const JUSTIFY_CONTENT_PROPERTY: &str = "--w3cos-internal-justify-content";
 /// `normal` into `stretch`, but a replaced grid item behaves as `start`
 /// for `normal` and stretches only for the explicit keyword. Present only
 /// when the keyword is exactly `stretch`.
+/// `last baseline` alignment of the named property (`align-items`,
+/// `justify-items`, `align-self`, `justify-self`). The typed enums keep
+/// their old fallback value; the layout engines that implement the keyword
+/// read this marker.
+pub const LAST_BASELINE_PREFIX: &str = "--w3cos-internal-last-baseline-";
 pub const ALIGN_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-align-items-stretch";
 pub const JUSTIFY_ITEMS_STRETCH_PROPERTY: &str = "--w3cos-internal-justify-items-stretch";
 /// A display keyword this engine does not model (`inline-grid`,
@@ -117,6 +122,19 @@ fn parse_aspect_ratio(value: &str) -> Option<Option<f32>> {
         value.parse::<f32>().ok()?
     };
     (ratio.is_finite() && ratio > 0.0).then_some(Some(ratio))
+}
+
+fn set_last_baseline(style: &mut Style, property: &str, value: &str) {
+    let last = value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        == ["last", "baseline"];
+    set_marker(
+        style,
+        &format!("{LAST_BASELINE_PREFIX}{property}"),
+        last.then(|| "1".to_string()),
+    );
 }
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
@@ -430,11 +448,21 @@ impl CSSStyleDeclaration {
             }
             "align-items" | "alignItems" => {
                 self.inner.align_items = parse_align_items(value);
+                set_last_baseline(&mut self.inner, "align-items", value);
                 set_marker(
                     &mut self.inner,
                     ALIGN_ITEMS_STRETCH_PROPERTY,
                     (value.trim() == "stretch").then(|| "stretch".to_string()),
                 );
+            }
+            "flex-flow" | "flexFlow" => {
+                // CSS Flexbox 3: `<flex-direction> || <flex-wrap>`. An omitted
+                // part resets to its initial value; an invalid declaration is
+                // dropped whole. CSS-wide keywords reset both parts.
+                if let Some((direction, wrap)) = parse_flex_flow(value) {
+                    self.set_property("flex-direction", direction);
+                    self.set_property("flex-wrap", wrap);
+                }
             }
             "flex-wrap" | "flexWrap" => {
                 self.inner.flex_wrap = parse_flex_wrap(value);
@@ -1485,7 +1513,10 @@ impl CSSStyleDeclaration {
                     self.inner.order = v
                 }
             }
-            "align-self" | "alignSelf" => self.inner.align_self = parse_align_self(value),
+            "align-self" | "alignSelf" => {
+                self.inner.align_self = parse_align_self(value);
+                set_last_baseline(&mut self.inner, "align-self", value);
+            }
             "vertical-align" | "verticalAlign" => {
                 let value = value.trim();
                 const KEYWORD_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
@@ -1543,9 +1574,13 @@ impl CSSStyleDeclaration {
                     safe.then(|| "1".to_string()),
                 );
             }
-            "justify-self" | "justifySelf" => self.inner.justify_self = parse_align_self(value),
+            "justify-self" | "justifySelf" => {
+                self.inner.justify_self = parse_align_self(value);
+                set_last_baseline(&mut self.inner, "justify-self", value);
+            }
             "justify-items" | "justifyItems" => {
                 self.inner.justify_items = parse_align_items(value);
+                set_last_baseline(&mut self.inner, "justify-items", value);
                 set_marker(
                     &mut self.inner,
                     JUSTIFY_ITEMS_STRETCH_PROPERTY,
@@ -2531,6 +2566,41 @@ fn parse_clear(value: &str) -> Clear {
         "both" => Clear::Both,
         _ => Clear::None,
     }
+}
+
+/// `flex-flow` longhands as `(flex-direction, flex-wrap)`, `None` when the
+/// value is not `<flex-direction> || <flex-wrap>`.
+fn parse_flex_flow(value: &str) -> Option<(&'static str, &'static str)> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if css_wide_keyword(&lowered) {
+        return Some(("row", "nowrap"));
+    }
+    let mut direction = None;
+    let mut wrap = None;
+    for token in lowered.split_whitespace() {
+        match token {
+            "row" | "row-reverse" | "column" | "column-reverse" if direction.is_none() => {
+                direction = Some(match token {
+                    "row" => "row",
+                    "row-reverse" => "row-reverse",
+                    "column" => "column",
+                    _ => "column-reverse",
+                });
+            }
+            "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => {
+                wrap = Some(match token {
+                    "nowrap" => "nowrap",
+                    "wrap" => "wrap",
+                    _ => "wrap-reverse",
+                });
+            }
+            _ => return None,
+        }
+    }
+    if direction.is_none() && wrap.is_none() {
+        return None;
+    }
+    Some((direction.unwrap_or("row"), wrap.unwrap_or("nowrap")))
 }
 
 fn parse_flex_direction(value: &str) -> FlexDirection {
@@ -6657,4 +6727,91 @@ fn table_display_values_round_trip_without_falling_back_to_flex() {
         assert_eq!(declaration.inner.display, expected);
         assert_eq!(declaration.get_property("display"), value);
     }
+}
+
+#[test]
+fn last_baseline_alignment_sets_a_layout_marker() {
+    let marker = |declaration: &CSSStyleDeclaration, property: &str| {
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(&format!("{LAST_BASELINE_PREFIX}{property}")))
+            .map(|value| value.to_string())
+    };
+    let mut d = CSSStyleDeclaration::new();
+    for (property, key) in [
+        ("align-items", "align-items"),
+        ("align-self", "align-self"),
+        ("justify-self", "justify-self"),
+        ("justify-items", "justify-items"),
+    ] {
+        assert_eq!(marker(&d, key), None);
+        d.set_property(property, "last baseline");
+        assert_eq!(marker(&d, key).as_deref(), Some("1"), "{property}");
+        // Whitespace and case do not matter; any other value clears it.
+        d.set_property(property, "  LAST   Baseline ");
+        assert_eq!(marker(&d, key).as_deref(), Some("1"), "{property}");
+        d.set_property(property, "baseline");
+        assert_eq!(marker(&d, key), None, "{property}");
+        d.set_property(property, "last baseline");
+        d.set_property(property, "first baseline");
+        assert_eq!(marker(&d, key), None, "{property}");
+    }
+    // The typed fields are unchanged by the marker.
+    d.set_property("align-items", "last baseline");
+    assert_eq!(d.inner.align_items, parse_align_items("last baseline"));
+}
+
+#[test]
+fn flex_flow_shorthand_expands_to_direction_and_wrap() {
+    use w3cos_std::style::{FlexDirection, FlexWrap};
+    let apply = |declaration: &mut CSSStyleDeclaration, value: &str| {
+        declaration.set_property("flex-flow", value);
+        (
+            declaration.inner.flex_direction,
+            declaration.inner.flex_wrap,
+        )
+    };
+    let mut d = CSSStyleDeclaration::new();
+    assert_eq!(
+        apply(&mut d, "column wrap"),
+        (FlexDirection::Column, FlexWrap::Wrap)
+    );
+    // Either order; an omitted part resets to its initial value.
+    assert_eq!(
+        apply(&mut d, "wrap-reverse row-reverse"),
+        (FlexDirection::RowReverse, FlexWrap::WrapReverse)
+    );
+    assert_eq!(
+        apply(&mut d, "column"),
+        (FlexDirection::Column, FlexWrap::NoWrap)
+    );
+    assert_eq!(apply(&mut d, "wrap"), (FlexDirection::Row, FlexWrap::Wrap));
+    assert_eq!(
+        apply(&mut d, "COLUMN-REVERSE NOWRAP"),
+        (FlexDirection::ColumnReverse, FlexWrap::NoWrap)
+    );
+    // CSS-wide keywords reset both parts.
+    apply(&mut d, "column wrap");
+    assert_eq!(
+        apply(&mut d, "initial"),
+        (FlexDirection::Row, FlexWrap::NoWrap)
+    );
+    // Invalid declarations (duplicate or unknown parts) are ignored whole.
+    apply(&mut d, "column wrap");
+    for bad in ["column row", "wrap nowrap", "foo", "column wrap extra", ""] {
+        assert_eq!(
+            apply(&mut d, bad),
+            (FlexDirection::Column, FlexWrap::Wrap),
+            "{bad:?}"
+        );
+    }
+    // The camelCase CSSOM name and the longhands keep working.
+    d.set_property("flexFlow", "row-reverse wrap");
+    assert_eq!(d.inner.flex_direction, FlexDirection::RowReverse);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
+    d.set_property("flex-direction", "column");
+    assert_eq!(d.inner.flex_direction, FlexDirection::Column);
+    assert_eq!(d.inner.flex_wrap, FlexWrap::Wrap);
 }

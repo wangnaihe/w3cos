@@ -6548,3 +6548,205 @@ fn grid_lanes_matches_chrome() {
     }
     assert!(bad.is_empty(), "{bad:#?}");
 }
+
+/// A definite-height grid shorter than its tracks keeps the track sizes and
+/// the rows overflow it. `center` and `end` are unsafe, distributed
+/// alignments fall back to start (headless Chrome 156: two 40px rows, 4px
+/// gap, 50px box: rows at y=0/44 for start, -17/27 for center, -34/10 for
+/// end).
+#[test]
+fn grid_short_height_overflow_matches_chrome() {
+    use w3cos_std::style::AlignContent;
+    let run = |align: AlignContent, rows: &str| {
+        let mut grid = Style {
+            display: Display::Grid,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(50.0),
+            gap: 4.0,
+            align_content: align,
+            ..Style::default()
+        };
+        grid.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        let item = || {
+            node(
+                Style {
+                    height: Dimension::Px(40.0),
+                    ..block()
+                },
+                vec![],
+            )
+        };
+        let root = node(block(), vec![node(grid, vec![item(), item()])]);
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+        (rect(&out, 1).3, rect(&out, 2).1, rect(&out, 3).1)
+    };
+    for rows in ["40px 40px", "1fr 40px", "auto auto"] {
+        assert_eq!(
+            run(AlignContent::Stretch, rows),
+            (50.0, 0.0, 44.0),
+            "{rows}"
+        );
+        assert_eq!(run(AlignContent::FlexStart, rows), (50.0, 0.0, 44.0));
+        assert_eq!(
+            run(AlignContent::Center, rows),
+            (50.0, -17.0, 27.0),
+            "{rows}"
+        );
+        assert_eq!(
+            run(AlignContent::FlexEnd, rows),
+            (50.0, -34.0, 10.0),
+            "{rows}"
+        );
+        assert_eq!(run(AlignContent::SpaceBetween, rows), (50.0, 0.0, 44.0));
+        assert_eq!(run(AlignContent::SpaceAround, rows), (50.0, 0.0, 44.0));
+        assert_eq!(run(AlignContent::SpaceEvenly, rows), (50.0, 0.0, 44.0));
+    }
+}
+
+/// `align-items: baseline` on block items (headless Chrome 156, Ahem,
+/// body margin 0): a row's baseline-aligned items share the largest
+/// ascent, the row is as tall as ascent plus largest descent, and an item
+/// without a line box takes its border-box bottom edge as baseline.
+#[test]
+fn grid_item_baseline_groups_match_chrome() {
+    use w3cos_std::style::AlignSelf;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = |size: f32| Style {
+        font_family: Some("Ahem".into()),
+        font_size: size,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let text_item = |size: f32, extra: Style| {
+        let base = font(size);
+        node(
+            Style {
+                margin: extra.margin,
+                padding: extra.padding,
+                border_width: extra.border_width,
+                align_self: extra.align_self,
+                ..base.clone()
+            },
+            vec![Component::text("X", base)],
+        )
+    };
+    let plain = Style::default();
+    let grid = |rows: &str, columns: &str, height: Option<f32>| {
+        let mut style = Style {
+            display: Display::Grid,
+            width: Dimension::Px(200.0),
+            align_items: w3cos_std::style::AlignItems::Baseline,
+            grid_template_columns: Some(columns.to_string()),
+            gap: 0.0,
+            ..block()
+        };
+        if let Some(height) = height {
+            style.height = Dimension::Px(height);
+        }
+        style.grid_ng_mut().grid_template_rows = Some(rows.to_string());
+        style
+    };
+    let run = |root: Component| {
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        layout_tree(&root, &flat, 300.0, 300.0).expect("ng")
+    };
+    // a: 10px item with margins, 20px item with bottom padding, and an
+    // empty 30px box that has no baseline of its own.
+    let out = run(node(
+        block(),
+        vec![node(
+            grid("auto", "50px 50px 50px", None),
+            vec![
+                text_item(
+                    10.0,
+                    Style {
+                        margin: margins(4.0, 0.0, 2.0, 0.0),
+                        ..plain.clone()
+                    },
+                ),
+                text_item(
+                    20.0,
+                    Style {
+                        padding: margins(0.0, 0.0, 6.0, 0.0),
+                        ..plain.clone()
+                    },
+                ),
+                node(
+                    Style {
+                        height: Dimension::Px(30.0),
+                        ..block()
+                    },
+                    vec![],
+                ),
+            ],
+        )],
+    ));
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 200.0, 40.0));
+    assert_eq!(rect(&out, 2), (0.0, 22.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 4), (50.0, 14.0, 50.0, 26.0));
+    assert_eq!(rect(&out, 6), (100.0, 0.0, 50.0, 30.0));
+    // c: a definite 60px row keeps the group at the row start.
+    let out = run(node(
+        block(),
+        vec![node(
+            grid("60px", "50px 50px", None),
+            vec![
+                text_item(10.0, plain.clone()),
+                text_item(30.0, plain.clone()),
+            ],
+        )],
+    ));
+    assert_eq!(rect(&out, 2), (0.0, 16.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 4), (50.0, 0.0, 50.0, 30.0));
+    // b: two rows; `align-self` start/end items leave the baseline group.
+    let out = run(node(
+        block(),
+        vec![node(
+            Style {
+                gap: 3.0,
+                ..grid("auto auto", "50px 50px", None)
+            },
+            vec![
+                text_item(
+                    10.0,
+                    Style {
+                        margin: margins(4.0, 4.0, 4.0, 4.0),
+                        padding: margins(3.0, 3.0, 3.0, 3.0),
+                        border_width: 2.0,
+                        ..plain.clone()
+                    },
+                ),
+                text_item(
+                    30.0,
+                    Style {
+                        margin: margins(1.0, 0.0, 0.0, 0.0),
+                        ..plain.clone()
+                    },
+                ),
+                text_item(
+                    10.0,
+                    Style {
+                        align_self: AlignSelf::FlexStart,
+                        ..plain.clone()
+                    },
+                ),
+                text_item(
+                    10.0,
+                    Style {
+                        align_self: AlignSelf::FlexEnd,
+                        ..plain.clone()
+                    },
+                ),
+            ],
+        )],
+    ));
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 200.0, 49.0));
+    assert_eq!(rect(&out, 2), (4.0, 12.0, 42.0, 20.0));
+    assert_eq!(rect(&out, 4), (53.0, 1.0, 50.0, 30.0));
+    assert_eq!(rect(&out, 6), (0.0, 39.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 8), (53.0, 39.0, 50.0, 10.0));
+}
