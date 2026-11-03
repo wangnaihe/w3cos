@@ -8,14 +8,43 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::collections::hash_map::RandomState;
 use std::sync::{Arc, OnceLock};
+
+/// The hasher every custom-property map is built with. `RandomState` is
+/// seeded per instance, so two maps with identical entries iterate in
+/// different orders and an equality test has to hash and look up every key of
+/// one in the other. Sharing one process-wide state (still randomly keyed, so
+/// still resistant to crafted collisions) makes equal maps that were built or
+/// cloned the same way lay out identically, and [`CustomProperties`] equality
+/// can then compare them entry by entry in iteration order without hashing.
+fn shared_state() -> RandomState {
+    static STATE: OnceLock<RandomState> = OnceLock::new();
+    STATE.get_or_init(RandomState::new).clone()
+}
+
+fn with_shared_state(map: HashMap<String, String>) -> HashMap<String, String> {
+    use std::hash::BuildHasher;
+    let shared = shared_state();
+    if map.hasher().hash_one("--") == shared.hash_one("--") {
+        return map;
+    }
+    let mut rebuilt = HashMap::with_capacity_and_hasher(map.len(), shared);
+    rebuilt.extend(map);
+    rebuilt
+}
 
 /// The shared map plus a lazily computed content fingerprint. Any mutation
 /// resets the fingerprint, so it always describes the current entries.
-#[derive(Default)]
 struct Inner {
     map: HashMap<String, String>,
     fingerprint: OnceLock<u64>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self::from_map(HashMap::with_hasher(shared_state()))
+    }
 }
 
 impl Clone for Inner {
@@ -36,6 +65,18 @@ impl Clone for Inner {
 
 thread_local! {
     static MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EQ_ORDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EQ_LOOKUP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Content comparisons of distinct maps with equal fingerprints on this
+/// thread: `(settled by walking both maps in order, needed per-key lookups)`.
+#[doc(hidden)]
+pub fn eq_path_counts() -> (usize, usize) {
+    (
+        EQ_ORDERED.with(std::cell::Cell::get),
+        EQ_LOOKUP.with(std::cell::Cell::get),
+    )
 }
 
 /// Whole-map clones performed on this thread. Lets tests prove a cascade
@@ -64,9 +105,27 @@ fn entry_hash(key: &str, value: &str) -> u64 {
 impl Inner {
     fn from_map(map: HashMap<String, String>) -> Self {
         Self {
-            map,
+            map: with_shared_state(map),
             fingerprint: OnceLock::new(),
         }
+    }
+
+    /// Exact entry comparison for maps of equal length. Equal maps that share
+    /// a layout (same hasher, built or cloned alike) are confirmed by one
+    /// pairwise walk with no hashing; any divergence in order falls back to
+    /// per-key lookups, so the answer never depends on layout.
+    fn entries_equal(&self, other: &Inner) -> bool {
+        if self
+            .map
+            .iter()
+            .zip(other.map.iter())
+            .all(|(left, right)| left == right)
+        {
+            EQ_ORDERED.with(|count| count.set(count.get() + 1));
+            return true;
+        }
+        EQ_LOOKUP.with(|count| count.set(count.get() + 1));
+        self.map == other.map
     }
 
     /// Order-independent hash of every entry. Two maps with different
@@ -310,7 +369,7 @@ impl PartialEq for CustomProperties {
         // fingerprint rejects them without hashing every entry again.
         self.0.map.len() == other.0.map.len()
             && self.0.fingerprint() == other.0.fingerprint()
-            && self.0.map == other.0.map
+            && self.0.entries_equal(&other.0)
     }
 }
 
@@ -336,7 +395,9 @@ impl From<CustomProperties> for HashMap<String, String> {
 
 impl FromIterator<(String, String)> for CustomProperties {
     fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
-        Self(Arc::new(Inner::from_map(iter.into_iter().collect())))
+        let mut map = HashMap::with_hasher(shared_state());
+        map.extend(iter);
+        Self(Arc::new(Inner::from_map(map)))
     }
 }
 
@@ -419,6 +480,49 @@ mod tests {
         stamp(&mut third, "1");
         assert_eq!(third.get("--marker").map(String::as_str), Some("1"));
         assert!(third.ptr_eq(&second));
+    }
+
+    #[test]
+
+    fn equal_maps_built_or_cloned_alike_compare_without_lookups() {
+        let build = || -> CustomProperties {
+            (0..400)
+                .map(|n| (format!("--v{n}"), n.to_string()))
+                .collect()
+        };
+        let (a, b) = (build(), build());
+        assert!(!a.ptr_eq(&b));
+        let before = eq_path_counts();
+        assert_eq!(a, b);
+        let mut c = a.clone();
+        c.insert("--extra".into(), "1".into());
+        c.remove("--extra");
+        assert!(!a.ptr_eq(&c));
+        assert_eq!(a, c);
+        let after = eq_path_counts();
+        assert_eq!(after.1, before.1, "shared layout needs no per-key lookups");
+        assert_eq!(after.0, before.0 + 2);
+        // A foreign map is rehashed onto the shared state when wrapped; its
+        // insertion order differs, so the compare may need lookups but is exact.
+        let foreign: HashMap<String, String> = (0..400)
+            .map(|n| (format!("--v{n}"), n.to_string()))
+            .collect();
+        assert_eq!(CustomProperties::from(foreign), a);
+    }
+
+    #[test]
+    fn different_insertion_order_still_compares_equal() {
+        let forward: CustomProperties = (0..300)
+            .map(|n| (format!("--v{n}"), n.to_string()))
+            .collect();
+        let backward: CustomProperties = (0..300)
+            .rev()
+            .map(|n| (format!("--v{n}"), n.to_string()))
+            .collect();
+        assert_eq!(forward, backward);
+        let mut changed = backward.clone();
+        changed.insert("--v3".into(), "other".into());
+        assert_ne!(forward, changed);
     }
 
     #[test]
