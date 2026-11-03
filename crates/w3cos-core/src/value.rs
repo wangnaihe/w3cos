@@ -2146,6 +2146,11 @@ fn dom_shape_method_key(key: &str) -> bool {
             | "createTextNode"
             | "push"
             | "__proto__"
+            // The detach fast path caches a negative scan of DOM prototype
+            // chains. Authored lifecycle state on any shared/custom
+            // prototype must invalidate that proof before the next removal.
+            | "__w3cos_custom_element_upgraded"
+            | "disconnectedCallback"
     )
 }
 
