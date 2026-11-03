@@ -161,6 +161,7 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
         && matches!(style.display, Display::InlineBlock | Display::ListItem);
     if !atomic
         && !blockified_float
+        && !(oof::is_out_of_flow(style) && style.display == Display::Inline)
         && !matches!(style.display, Display::Block | Display::FlowRoot)
         && !lowered_ifc
         && !author_flex
@@ -477,6 +478,7 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     let style = info.style;
     match style.position {
         Position::Static => None,
+        _ if inline_level_oof(flat, index) => inline_level_oof_reason(flat, index),
         _ if inline::is_atomic_inline(flat, index) || style.display == Display::Inline => {
             Some("position:inline")
         }
@@ -499,6 +501,48 @@ fn position_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             None
         }
     }
+}
+
+/// An absolutely positioned `display: inline` box (a non-replaced box;
+/// its used display is block, CSS2 9.7, but the original display type is
+/// inline-level: IsOriginalDisplayInlineType).
+fn inline_level_oof(flat: &[FlatNodeInfo], index: usize) -> bool {
+    oof::is_out_of_flow(flat[index].style)
+        && inline::is_inline_box(flat, index)
+        && !inline::is_atomic_inline(flat, index)
+}
+
+/// An inline-level out-of-flow box with only block-level siblings in a
+/// block container: its static position is computed in the container's
+/// block context (see `layout_block_in`). Anything that shares an
+/// inline formatting context with it stays on legacy.
+fn inline_level_oof_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
+    let info = &flat[index];
+    let Some(parent) = info.parent else {
+        return Some("position:root");
+    };
+    let parent_style = flat[parent].style;
+    if !matches!(parent_style.display, Display::Block | Display::FlowRoot)
+        || matches!(flat[parent].kind, ComponentKind::Text { .. })
+        || inline::is_inline_container(flat, parent)
+        || inline::is_inline_box(flat, parent)
+        || inline::rendered_children(flat, parent).any(|sibling| {
+            sibling != index
+                && !oof::is_out_of_flow(flat[sibling].style)
+                && !is_blockified_float(flat, sibling)
+                && flat[sibling].style.float == Float::None
+                && matches!(
+                    flat[sibling].style.display,
+                    Display::Inline | Display::InlineBlock | Display::InlineTable
+                )
+        })
+    {
+        return Some("position:inline-static");
+    }
+    if info.style.position == Position::Fixed {
+        return oof::fixed_reason(flat, index);
+    }
+    None
 }
 
 /// Inline text whose parent is a block container but not an inline
@@ -593,7 +637,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     }
     match info.kind {
         ComponentKind::Root | ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => {
-            if inline::is_inline_box(flat, index) {
+            if inline::is_inline_box(flat, index) && !inline_level_oof(flat, index) {
                 // Validated with its IFC container (container_reason).
                 (!inline::in_inline_container(flat, index)).then_some("display:inline")
             } else if is_author_flex(info.style) {
@@ -2358,9 +2402,24 @@ fn layout_block_in(
                 cursor + pending.sum()
             };
             let content_width = metrics.content_width;
+            // NGBlockLayoutAlgorithm::HandleOutOfFlowPositioned: an
+            // inline-level box sits where a zero-width inline would on a
+            // line past the floats, aligned by the container's text-align.
+            let inline_level = inline_level_oof(flat, child);
+            let line_offset = if inline_level {
+                let edge = bfc_x + bl + pl;
+                let (left, right) = exclusions.band(bfc_y + bt + pt + block, 0.0);
+                let start = left.map_or(edge, |l| l.max(edge));
+                let end = right.map_or(edge + content_width, |r| r.min(edge + content_width));
+                (start - edge) + inline::align_offset(style, (end - start).max(0.0))
+            } else {
+                0.0
+            };
             oof_candidates.push(OofCandidate {
                 index: child,
-                static_inline: if child_space.rtl {
+                static_inline: if inline_level {
+                    bl + pl + line_offset
+                } else if child_space.rtl {
                     bl + pl + content_width
                 } else {
                     bl + pl
