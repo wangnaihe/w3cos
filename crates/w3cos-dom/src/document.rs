@@ -3418,11 +3418,14 @@ impl Document {
         }
         if node.node_type == NodeType::Element
             && node.is_html_element
-            && node.tag.as_static().eq_ignore_ascii_case("table")
+            && (node.tag.as_static().eq_ignore_ascii_case("table")
+                || node.tag.as_static().eq_ignore_ascii_case("img"))
         {
-            // HTML table dimensions are cascaded presentational hints.
-            // Keep it inside the cascade so authored auto/percent/important
-            // values win, and computed style and component layout agree.
+            // HTML table and image dimensions are cascaded presentational
+            // hints. Keep them inside the cascade so authored
+            // auto/percent/important values win (an authored `width: auto`
+            // drops the attribute), and computed style and component layout
+            // agree.
             for property in ["width", "height"] {
                 let Some(dimension) = node
                     .attributes
@@ -3433,7 +3436,10 @@ impl Document {
                     continue;
                 };
                 // Retain the existing zero-width behavior; height allows zero.
-                let valid = |value: f32| value > 0.0 || (property == "height" && value == 0.0);
+                let is_image = node.tag.as_static().eq_ignore_ascii_case("img");
+                let valid = |value: f32| {
+                    value > 0.0 || ((property == "height" || is_image) && value == 0.0)
+                };
                 let value = match dimension {
                     w3cos_std::style::Dimension::Px(value) if valid(value) => {
                         Some(format!("{value}px"))
@@ -11496,7 +11502,10 @@ impl Document {
                             .unwrap_or("");
                         let mut image_style = style;
                         replaced_table::lower_image_style(&mut image_style);
-                        if matches!(image_style.width, w3cos_std::style::Dimension::Auto)
+                        // An `img` takes its dimension attributes through the
+                        // cascade (presentational hints); `object` has none.
+                        if tag.as_str() == "object"
+                            && matches!(image_style.width, w3cos_std::style::Dimension::Auto)
                             && let Some(width) = node
                                 .attributes
                                 .iter()
@@ -11507,7 +11516,8 @@ impl Document {
                         {
                             image_style.width = width;
                         }
-                        if matches!(image_style.height, w3cos_std::style::Dimension::Auto)
+                        if tag.as_str() == "object"
+                            && matches!(image_style.height, w3cos_std::style::Dimension::Auto)
                             && let Some(height) = node
                                 .attributes
                                 .iter()
@@ -20542,6 +20552,35 @@ mod image_component_tests {
         let image = tree.children.first().expect("image component");
         assert_eq!(image.style.width, Dimension::Percent(100.0));
         assert_eq!(image.style.height, Dimension::Px(50.0));
+    }
+
+    #[test]
+    fn image_dimension_attributes_are_presentational_hints_overridden_by_author_css() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#auto", &[("width", "auto")]);
+        crate::stylesheet::register_rule("#tall", &[("height", "30px")]);
+
+        let mut document = Document::new();
+        for id in ["plain", "auto", "tall"] {
+            let image = document.create_element("img");
+            image.set_attribute(&mut document, "src", "stripe.png");
+            image.set_attribute(&mut document, "id", id);
+            image.set_attribute(&mut document, "width", "40");
+            image.set_attribute(&mut document, "height", "20");
+            document.body().append_child(&mut document, image);
+        }
+
+        let tree = document.to_component_tree();
+        crate::stylesheet::clear_rules();
+        let plain = &tree.children[0].style;
+        assert_eq!(plain.width, Dimension::Px(40.0));
+        assert_eq!(plain.height, Dimension::Px(20.0));
+        let auto = &tree.children[1].style;
+        assert_eq!(auto.width, Dimension::Auto);
+        assert_eq!(auto.height, Dimension::Px(20.0));
+        let tall = &tree.children[2].style;
+        assert_eq!(tall.width, Dimension::Px(40.0));
+        assert_eq!(tall.height, Dimension::Px(30.0));
     }
 
     #[test]
