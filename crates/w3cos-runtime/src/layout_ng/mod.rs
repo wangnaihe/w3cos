@@ -119,10 +119,11 @@ pub(crate) struct ConstraintSpace {
     /// Sizing 3 5.2.1; the final layout re-resolves them against the real
     /// containing block.
     pub percent_unresolved: bool,
-    /// The box is a replaced grid item sized in its grid area: a
-    /// percentage block size of its own that has no definite basis is
-    /// cyclic and behaves as `auto` (CSS Sizing 3 5.2.2). Not inherited by
-    /// children.
+    /// Grid track sizing (and the layout of grid items in their areas): a
+    /// replaced box's percentage block size with no definite basis is
+    /// cyclic and behaves as `auto` (CSS Grid 6.6, CSS Sizing 3 5.2.2).
+    /// Inherited by descendants, but reset by flex layout, whose
+    /// flex-basis measurement resolves such percentages later.
     pub cyclic_percent_auto: bool,
 }
 

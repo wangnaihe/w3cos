@@ -4680,7 +4680,7 @@ pub(super) fn layout_block_in(
         adjoining_from: 0,
         fixed_block_indefinite: false,
         percent_unresolved: false,
-        cyclic_percent_auto: false,
+        cyclic_percent_auto: space.cyclic_percent_auto,
     };
 
     // CSS Sizing 4 stretch-fit sizing: a child's `stretch` sizes resolve

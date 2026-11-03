@@ -2294,6 +2294,7 @@ fn layout_with(
     let item_space = ConstraintSpace {
         available_inline: inner_width,
         percentage_block: specified_height,
+        cyclic_percent_auto: false,
         ..*space
     };
     let stretch_styles = block::stretch_child_styles(flat, index, &item_space, false, false);
@@ -2332,6 +2333,7 @@ fn layout_with(
         {
             basis_space = ConstraintSpace {
                 percentage_block: Some((line - cross_edges).max(0.0)),
+                cyclic_percent_auto: false,
                 ..*space
             };
             &basis_space
@@ -2344,6 +2346,7 @@ fn layout_with(
             // height, so the ratio can transfer it to the width.
             basis_space = ConstraintSpace {
                 percentage_block: Some(height),
+                cyclic_percent_auto: false,
                 ..*space
             };
             &basis_space
@@ -2461,6 +2464,7 @@ fn layout_with(
             {
                 let line = ConstraintSpace {
                     available_inline: available,
+                    cyclic_percent_auto: false,
                     ..*space
                 };
                 block::replaced_size(flat[child].kind, child_style, &line)?.0

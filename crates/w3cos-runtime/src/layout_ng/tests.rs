@@ -5745,6 +5745,48 @@ fn canvas_grid_item_is_sized_like_an_image() {
     assert_eq!(sizes, vec![(100.0, 50.0), (400.0, 200.0)]);
 }
 
+/// A percentage block size inside a grid item resolves against the item
+/// (a fixed 50px row), and a track sized from a min-content contribution
+/// treats an indefinite one as auto (grid-min-content-width-percent-
+/// height-aspect-ratio-001).
+#[test]
+fn grid_item_descendant_percent_canvas_is_sized_in_track_sizing() {
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    let grid = document.create_element("div");
+    for (k, v) in [
+        ("display", "grid"),
+        ("width", "min-content"),
+        ("height", "100px"),
+        ("grid-template-rows", "50px"),
+    ] {
+        grid.style_mut(&mut document).set_property(k, v);
+    }
+    document.body().append_child(&mut document, grid);
+    let item = document.create_element("div");
+    item.style_mut(&mut document).set_property("height", "100%");
+    grid.append_child(&mut document, item);
+    let canvas = document.create_element("canvas");
+    canvas.set_attribute(&mut document, "width", "20");
+    canvas.set_attribute(&mut document, "height", "10");
+    canvas
+        .style_mut(&mut document)
+        .set_property("height", "100%");
+    item.append_child(&mut document, canvas);
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("ng");
+    let index = (0..flat.len())
+        .find(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::Canvas { .. }))
+        .unwrap();
+    let r = rect(&out, index);
+    assert_eq!((r.2, r.3), (100.0, 50.0));
+}
+
 #[test]
 fn svg_root_matches_chrome() {
     // Expected sizes from Chrome (/workspace/ngtools/svg/s1.html).
