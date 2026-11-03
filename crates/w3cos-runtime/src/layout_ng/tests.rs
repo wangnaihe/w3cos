@@ -12082,3 +12082,104 @@ fn grid_item_baseline_groups_match_chrome() {
     assert_eq!(rect(&out, 6), (0.0, 39.0, 50.0, 10.0));
     assert_eq!(rect(&out, 8), (53.0, 39.0, 50.0, 10.0));
 }
+
+/// An absolutely positioned `display: inline` box in a block container
+/// whose children are all block-level: its static position is where a
+/// zero-width inline would sit on a line at the current block offset,
+/// beside floats and aligned by the container's `text-align`
+/// (testdata/chrome-inline-oof.json, Chrome 156).
+#[test]
+fn inline_level_abspos_static_position_matches_chrome() {
+    use w3cos_std::style::{Float, Position, TextAlign, TextDirection};
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/chrome-inline-oof.json")).unwrap();
+    for case in golden["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let rects = &case["rects"];
+        let want = |id: &str| {
+            let r = &rects[id];
+            let f = |i: usize| r[i].as_f64().unwrap() as f32;
+            (f(0), f(1), f(2), f(3))
+        };
+        let (align, dir) = match name {
+            "left" | "float-left" | "float-right" | "float-then-flow" => {
+                (TextAlign::Left, TextDirection::Ltr)
+            }
+            "right" | "float-left-right-align" | "float-right-right-align" | "inset-top" => {
+                (TextAlign::Right, TextDirection::Ltr)
+            }
+            "center" | "float-left-center" | "padding" => (TextAlign::Center, TextDirection::Ltr),
+            "rtl" | "rtl-float-right" => (TextAlign::Start, TextDirection::Rtl),
+            "rtl-text-left" => (TextAlign::Left, TextDirection::Rtl),
+            other => panic!("unmapped case {other}"),
+        };
+        let float = |side: Float| {
+            node(
+                Style {
+                    float: side,
+                    width: Dimension::Px(50.0),
+                    height: Dimension::Px(50.0),
+                    ..block()
+                },
+                vec![],
+            )
+        };
+        let inflow = || node(sized(50.0), vec![]);
+        let abs = node(
+            Style {
+                display: Display::Inline,
+                position: Position::Absolute,
+                top: if name == "inset-top" {
+                    Dimension::Px(10.0)
+                } else {
+                    Dimension::Auto
+                },
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(50.0),
+                ..Style::default()
+            },
+            vec![],
+        );
+        let (kids, ids): (Vec<Component>, Vec<&str>) = match name {
+            "float-left" | "float-left-right-align" | "float-left-center" => {
+                (vec![float(Float::Left), abs], vec!["f", "a"])
+            }
+            "float-right" | "float-right-right-align" | "rtl-float-right" => {
+                (vec![float(Float::Right), abs], vec!["f", "a"])
+            }
+            "float-then-flow" => (vec![float(Float::Left), inflow(), abs], vec!["f", "i", "a"]),
+            _ => (vec![inflow(), abs], vec!["i", "a"]),
+        };
+        let padded = name == "padding";
+        let container = node(
+            Style {
+                width: Dimension::Px(if padded { 80.0 } else { 100.0 }),
+                height: Dimension::Px(100.0),
+                padding: if padded {
+                    margins(0.0, 10.0, 0.0, 10.0)
+                } else {
+                    Edges::default()
+                },
+                position: Position::Relative,
+                text_align: align,
+                direction: dir,
+                ..block()
+            },
+            kids,
+        );
+        let root = node(block(), vec![container]);
+        let out = ng_rects(&root);
+        close(rect(&out, 1), want("c"));
+        for (position, id) in ids.iter().enumerate() {
+            let actual = rect(&out, 2 + position);
+            let expected = want(id);
+            assert!(
+                (actual.0 - expected.0).abs() < 0.05
+                    && (actual.1 - expected.1).abs() < 0.05
+                    && (actual.2 - expected.2).abs() < 0.05
+                    && (actual.3 - expected.3).abs() < 0.05,
+                "{name}/{id}: {actual:?} vs {expected:?}"
+            );
+        }
+    }
+}
