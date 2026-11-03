@@ -3751,6 +3751,10 @@ struct Item {
     block_pack: Pack,
     /// Block-axis baseline alignment: `Some(last)`.
     baseline: Option<bool>,
+    /// A non-replaced ratio item whose block axis is stretched: its auto
+    /// inline size follows the stretched block size once the rows are known
+    /// (a stretch in the block axis wins over `normal` in the inline axis).
+    ratio_stretch: Option<block::BoxAspectRatio>,
 }
 
 fn layout_item(
@@ -3806,7 +3810,8 @@ fn inline_minmax(
             // (fit-content, and a percentage fit-content(), as auto).
             let sizes = if item_width_keyword(flat, index).is_some() {
                 block::keyword_width_contribution(flat, index, space, edges, sizes)?
-            } else if matches!(style.width, Dimension::Auto) {
+            } else if matches!(style.width, Dimension::Auto | Dimension::Percent(_)) {
+                // A percentage width is cyclic and contributes as `auto`.
                 // A definite block size transfers through the aspect ratio
                 // to the inline contribution (css-sizing-4).
                 let block_edges =
@@ -4758,6 +4763,30 @@ fn layout_impl(
     let mut col_max = vec![0_i64; column_specs.len()];
     let mut col_has_item = vec![false; column_specs.len()];
     let mut contribs = Vec::new();
+    // Column sizing resolves an item's percentage block size against its
+    // area when every row it spans is a fixed length (Blink sizes the
+    // columns with the definite row sizes in hand).
+    let fixed_row_space = |item: &Placed| -> ConstraintSpace {
+        let mut item_space = *space;
+        let spanned = row_specs.get(item.row..item.row + item.row_span);
+        if let Some(spanned) = spanned
+            && !spanned.is_empty()
+            && spanned
+                .iter()
+                .all(|spec| matches!(spec, Spec::One(Breadth::Px(px)) if px.is_finite()))
+        {
+            let sum: f32 = spanned
+                .iter()
+                .map(|spec| match spec {
+                    Spec::One(Breadth::Px(px)) => *px,
+                    _ => 0.0,
+                })
+                .sum();
+            let gaps = from_units(row_gap_u) * (item.row_span as f32 - 1.0);
+            item_space.percentage_block = Some((sum + gaps).max(0.0));
+        }
+        item_space
+    };
     for item in &items {
         let child_style = flat[item.index].style;
         if columns_spec(child_style).is_some_and(is_subgrid_axis) {
@@ -4787,7 +4816,7 @@ fn layout_impl(
         let (min_c, max_c) = if child_style.grid_rows().is_some_and(is_subgrid_axis) {
             row_subgrid_inline(flat, item.index, space).why("grid:intrinsic")?
         } else {
-            inline_minmax(flat, item.index, space).why("grid:intrinsic")?
+            inline_minmax(flat, item.index, &fixed_row_space(item)).why("grid:intrinsic")?
         };
         let mut min_c = min_c;
         let mut minimum = inline_minimum(flat, item.index, space)
@@ -4987,8 +5016,14 @@ fn layout_impl(
             // With both sizes auto, the inline axis still fills the area and
             // the block size follows the ratio (grid-aspect-ratio-038); a
             // definite size on either axis transfers instead.
+            let block_stretch_wins = ratio_item
+                && !replaced
+                && align == Pack::Stretch
+                && explicit_stretch(style, child_style.align_self, true)
+                && !explicit_stretch(style, child_style.justify_self, false);
             let both_auto = ratio_item
                 && !replaced
+                && !block_stretch_wins
                 && matches!(child_style.width, Dimension::Auto)
                 && matches!(child_style.height, Dimension::Auto)
                 && !has_marker(child_style, HEIGHT_KEYWORD)
@@ -5067,7 +5102,8 @@ fn layout_impl(
             // A non-stretched auto width is fit-content within the grid area:
             // min(max-content, max(min-content, area)). The contributions are
             // margin boxes; this is the content box.
-            let (min_c, max_c) = inline_minmax(flat, item.index, space).why("grid:intrinsic")?;
+            let (min_c, max_c) =
+                inline_minmax(flat, item.index, &fixed_row_space(item)).why("grid:intrinsic")?;
             let fit = from_units(max_c).min(from_units(min_c).max(area));
             (fit - ml - mr - edges_h).max(0.0)
         } else {
@@ -5088,6 +5124,19 @@ fn layout_impl(
         } else {
             resolve_block(child_style.height, None, child_style, space, edges_v)
                 .why("grid:percent")?
+        };
+        let ratio_stretch = if ratio_item
+            && !replaced
+            && justify != Pack::Stretch
+            && matches!(child_style.width, Dimension::Auto)
+            && matches!(child_style.height, Dimension::Auto)
+            && !has_marker(child_style, HEIGHT_KEYWORD)
+            && width_keyword.is_none()
+            && align == Pack::Stretch
+        {
+            block::BoxAspectRatio::new(child_style, edges_h, edges_v)
+        } else {
+            None
         };
         let stretch_block = align == Pack::Stretch
             && specified_content_h.is_none()
@@ -5116,6 +5165,7 @@ fn layout_impl(
             inline_pack: justify,
             block_pack: align,
             baseline,
+            ratio_stretch,
         });
     }
 
@@ -5427,6 +5477,22 @@ fn layout_impl(
                 } else {
                     return super::bail("grid:replaced-ratio");
                 }
+            } else if let Some(ratio) = item.ratio_stretch {
+                let mut item_space = *space;
+                item_space.available_inline = from_units(span_sum(
+                    &columns,
+                    &collapsed,
+                    item.col,
+                    item.col_span,
+                    col_between,
+                ));
+                block::clamp_inline_size(
+                    flat[item.index].style,
+                    &item_space,
+                    item.edges_h,
+                    ratio.inline_from_block(from_units(target_content)),
+                )
+                .max(0.0)
             } else {
                 item.content_width
             };
