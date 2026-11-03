@@ -189,7 +189,7 @@ struct CompoundSelector {
 }
 
 impl CompoundSelector {
-    fn matches(&self, ctx: &SelectorContext) -> bool {
+    fn matches_without_pseudo_classes(&self, ctx: &SelectorContext) -> bool {
         if self.unsupported {
             return false;
         }
@@ -274,6 +274,10 @@ impl CompoundSelector {
                         })
                 }
             })
+    }
+
+    fn matches(&self, ctx: &SelectorContext) -> bool {
+        self.matches_without_pseudo_classes(ctx)
             && self.pseudo_classes.iter().all(|pseudo| match pseudo {
                 PseudoClass::FirstChild => ctx.is_first_child,
                 PseudoClass::Root => ctx.is_root,
@@ -282,6 +286,55 @@ impl CompoundSelector {
                 PseudoClass::FocusWithin => ctx.is_focus_within,
                 _ => false,
             })
+    }
+
+    /// Same answer as `matches_without_pseudo_classes` on the node's selector
+    /// context, read straight from the node. Returns `None` when the compound
+    /// has attribute selectors, which need the full context. Building that
+    /// context copies every class and attribute into fresh strings, so the
+    /// common tag/id/class compound skips it.
+    fn matches_node_directly(&self, document: &Document, node: NodeId) -> Option<bool> {
+        if !self.attributes.is_empty() {
+            return None;
+        }
+        if self.unsupported {
+            return Some(false);
+        }
+        let dom_node = document.get_node(node);
+        if let Some(tag) = &self.tag {
+            let node_tag = dom_node.tag.as_static();
+            let actual_tag = if self.any_namespace || !tag.contains(':') {
+                node_tag
+                    .rsplit_once(':')
+                    .map_or(node_tag, |(_, local)| local)
+            } else {
+                node_tag
+            };
+            let tag_matches = if document.is_html_document() && dom_node.is_html_element {
+                tag.eq_ignore_ascii_case(actual_tag)
+            } else {
+                tag == actual_tag
+            };
+            if !tag_matches {
+                return Some(false);
+            }
+        }
+        if let Some(id) = &self.id {
+            let node_id = dom_node
+                .attributes
+                .iter()
+                .find(|(name, _)| name.as_static() == "id")
+                .map(|(_, value)| value.as_str());
+            if node_id != Some(id.as_str()) {
+                return Some(false);
+            }
+        }
+        Some(self.classes.iter().all(|class| {
+            dom_node
+                .class_list
+                .iter()
+                .any(|have| have.as_static() == class.as_str())
+        }))
     }
 
     fn specificity(&self) -> u32 {
@@ -1468,9 +1521,11 @@ fn compound_matches_node(
     compound: &CompoundSelector,
     target_id: Option<&str>,
 ) -> bool {
-    let mut basic = compound.clone();
-    basic.pseudo_classes.clear();
-    if !basic.matches(&selector_context_for_node(document, node)) {
+    let basic_matches = match compound.matches_node_directly(document, node) {
+        Some(matched) => matched,
+        None => compound.matches_without_pseudo_classes(&selector_context_for_node(document, node)),
+    };
+    if !basic_matches {
         return false;
     }
     compound
@@ -2661,6 +2716,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn direct_compound_match_agrees_with_selector_context_match() {
+        setup();
+        let selectors = [
+            "div", "DIV", "span", "*", "*|div", ".a", ".a.b", ".b.a", ".missing", "div.a",
+            "div.a.b", "#x", "div#x", "#y", "span#y.c", "svg|rect", "x|item", "item", "ns:item",
+            "*|item", ".A", "#X",
+        ];
+        let compounds: Vec<CompoundSelector> = selectors
+            .iter()
+            .filter_map(|selector| {
+                let chars: Vec<char> = selector.chars().collect();
+                parse_compound(&chars, 0).map(|(compound, _)| compound)
+            })
+            .collect();
+        assert!(compounds.len() >= 18);
+        for html_document in [true, false] {
+            let mut document = Document::new();
+            document.set_html_document(html_document);
+            let body = document.body().id;
+            let mut nodes = Vec::new();
+            for (tag, id, class) in [
+                ("div", Some("x"), Some("a b")),
+                ("DIV", None, Some("a")),
+                ("span", Some("y"), Some("c a")),
+                ("ns:item", None, None),
+                ("item", Some("x"), Some("A")),
+                ("rect", None, Some("b a b")),
+            ] {
+                let element = document.create_element(tag);
+                if let Some(id) = id {
+                    element.set_attribute(&mut document, "id", id);
+                }
+                if let Some(class) = class {
+                    element.set_attribute(&mut document, "class", class);
+                }
+                document.append_child(body, element.id);
+                nodes.push(element.id);
+            }
+            let mut compared = 0;
+            let mut matched = 0;
+            for compound in &compounds {
+                for node in &nodes {
+                    let direct = compound.matches_node_directly(&document, *node);
+                    let via_context = compound.matches_without_pseudo_classes(
+                        &selector_context_for_node(&document, *node),
+                    );
+                    assert_eq!(
+                        direct,
+                        Some(via_context),
+                        "html_document={html_document} compound={compound:?} tag={}",
+                        document.get_node(*node).tag.as_str()
+                    );
+                    compared += 1;
+                    matched += usize::from(via_context);
+                }
+            }
+            assert_eq!(compared, compounds.len() * nodes.len());
+            assert!(matched > 8, "the probe set must exercise matches");
+            assert!(matched < compared, "the probe set must exercise misses");
+        }
+    }
+
+    #[test]
+    fn attribute_compounds_fall_back_to_the_context_match() {
+        setup();
+        let chars: Vec<char> = "div[data-x=\"1\"]".chars().collect();
+        let (compound, _) = parse_compound(&chars, 0).expect("parse");
+        let mut document = Document::new();
+        let element = document.create_element("div");
+        document.append_child(document.body().id, element.id);
+        assert_eq!(compound.matches_node_directly(&document, element.id), None);
+        assert!(!compound_matches_node(
+            &document, element.id, &compound, None
+        ));
+        element.set_attribute(&mut document, "data-x", "1");
+        assert!(compound_matches_node(
+            &document, element.id, &compound, None
+        ));
     }
 
     #[test]
