@@ -5,13 +5,17 @@
 //! ```text
 //! cargo run -p w3cos-compiler --example split_workspace -- \
 //!     --root <project dir> --entry out/main.js --out <workspace dir> \
-//!     [--segment-mb 8] [--dylib] \
+//!     [--segment-mb 8] [--dylib] [--mimalloc] \
 //!     [--hot-modules hot.txt]                 # module path suffixes, one per line
 //!     [--hot-from-stacks stacks.txt --hot-fraction 0.8 --hot-write hot.txt]
 //!     [--hot-opt-level 1] [--hot-profile dev]
 //! ```
 //!
 //! The hot list names modules, not segments, so it survives regeneration.
+//!
+//! `--mimalloc` links mimalloc (MIT) into the executable as the process-wide
+//! `malloc`; see `split_profile::MIMALLOC_DEPENDENCY` for why that is the
+//! allocator arrangement that is safe for a dylib split.
 //! `--hot-from-stacks` ranks modules from symbolized samples (see
 //! `scripts/symbolize-prof-stacks.py`); the stacks must come from a build of
 //! the *same* generation, because they name modules by `mN` namespace.
@@ -19,14 +23,16 @@
 use std::path::PathBuf;
 use w3cos_compiler::esm_codegen::try_generate_split_with_bodies_and_stylesheet;
 use w3cos_compiler::esm_resolver::{EsmBundle, EsmResolver};
-use w3cos_compiler::split_profile::HotModules;
+use w3cos_compiler::split_profile::{
+    HotModules, allocator_dependency, allocator_main_prelude, allocator_profile,
+};
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut opts = std::collections::HashMap::<String, String>::new();
     while let Some(arg) = args.next() {
         let key = arg.trim_start_matches("--").to_string();
-        if key == "dylib" {
+        if key == "dylib" || key == "mimalloc" {
             opts.insert(key, String::new());
         } else {
             opts.insert(
@@ -42,6 +48,7 @@ fn main() {
     let segment_bytes =
         opt("segment-mb").map_or(8, |v| v.parse().expect("--segment-mb")) * 1_000_000;
     let dylib = opts.contains_key("dylib");
+    let mimalloc = opts.contains_key("mimalloc");
     let opt_level: u8 = opt("hot-opt-level").map_or(1, |v| v.parse().expect("--hot-opt-level"));
     let profile = opt("hot-profile").unwrap_or_else(|| "dev".into());
 
@@ -155,8 +162,10 @@ fn main() {
     std::fs::write(
         out.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"w3cos-split-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core:?} }}\nw3cos-runtime = {{ path = {rt:?}, default-features = false }}\n{root_deps}\n[workspace]\nmembers = [{}]\n\n[profile.dev]\ndebug = 0\n{overrides}",
-            members.join(", ")
+            "[package]\nname = \"w3cos-split-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {core:?} }}\nw3cos-runtime = {{ path = {rt:?}, default-features = false }}\n{root_deps}{alloc_dep}\n[workspace]\nmembers = [{}]\n\n[profile.dev]\ndebug = 0\n{overrides}{alloc_profile}",
+            members.join(", "),
+            alloc_dep = allocator_dependency(mimalloc),
+            alloc_profile = allocator_profile(mimalloc)
         ),
     )
     .unwrap();
@@ -164,7 +173,8 @@ fn main() {
     std::fs::write(
         out.join("src/main.rs"),
         format!(
-            "{}mod esm_bundle;\nfn main() {{ let v = esm_bundle::run_entry(); println!(\"run_entry -> {{:?}}\", v.to_js_string()); }}\n",
+            "{}{}mod esm_bundle;\nfn main() {{ let v = esm_bundle::run_entry(); println!(\"run_entry -> {{:?}}\", v.to_js_string()); }}\n",
+            allocator_main_prelude(mimalloc),
             if dylib { "extern crate w3cos_base;\n" } else { "" }
         ),
     )
