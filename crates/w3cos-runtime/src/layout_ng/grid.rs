@@ -3770,6 +3770,7 @@ fn layout_item(
     nested.percentage_block = percentage_block;
     nested.available_inline = area;
     nested.rtl = false;
+    nested.cyclic_percent_auto = block::is_replaced_grid_item(flat, index);
     nested.bfc_x = 0.0;
     nested.bfc_y = 0.0;
     nested.forced_bfc = false;
@@ -4787,6 +4788,7 @@ fn layout_impl(
     };
     let fixed_row_space = |item: &Placed| -> ConstraintSpace {
         let mut item_space = *space;
+        item_space.cyclic_percent_auto = block::is_replaced_grid_item(flat, item.index);
         if let Some(block) = fixed_row_block(item) {
             item_space.percentage_block = Some(block);
         }

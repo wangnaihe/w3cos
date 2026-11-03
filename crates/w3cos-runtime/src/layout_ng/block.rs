@@ -845,10 +845,48 @@ fn anonymous_block_text(flat: &[FlatNodeInfo], index: usize) -> bool {
 /// 4, Grid 6.1), so its UA `inline`/`inline-block` display is not an atomic
 /// inline of an IFC; the container sizes it from its replaced size.
 pub(super) fn is_replaced_item(flat: &[FlatNodeInfo], index: usize) -> bool {
-    matches!(flat[index].kind, ComponentKind::Image { .. })
-        && flat[index].parent.is_some_and(|parent| {
+    let parent = flat[index].parent;
+    (matches!(flat[index].kind, ComponentKind::Image { .. })
+        && parent.is_some_and(|parent| {
             is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-        })
+        }))
+        || is_replaced_grid_item(flat, index)
+}
+
+/// A `<canvas>` grid item: sized like an image grid item (Blink
+/// LayoutHTMLCanvas is LayoutReplaced). An `<svg>` root stays legacy: its
+/// DOM style carries fallback sizes the grid item sizing would read as
+/// specified.
+pub(super) fn is_replaced_grid_item(flat: &[FlatNodeInfo], index: usize) -> bool {
+    matches!(flat[index].kind, ComponentKind::Canvas { .. })
+        && flat[index]
+            .parent
+            .is_some_and(|parent| is_author_grid(flat[parent].style))
+}
+
+/// The reasons a replaced grid item keeps legacy: floats and abspos are
+/// not items, and a percentage size in an automatic track is cyclic.
+fn replaced_grid_item_reason(
+    flat: &[FlatNodeInfo],
+    index: usize,
+    prefix: &'static str,
+) -> Option<&'static str> {
+    let style = flat[index].style;
+    if style.float != Float::None
+        || matches!(
+            style.position,
+            Position::Absolute | Position::Fixed | Position::Sticky
+        )
+    {
+        return Some(prefix);
+    }
+    if [style.width, style.min_width, style.max_width]
+        .iter()
+        .any(|dim| matches!(dim, Dimension::Percent(_)))
+    {
+        return Some(prefix);
+    }
+    None
 }
 
 fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
@@ -1288,7 +1326,8 @@ fn canvas_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str
         .parent
         .is_some_and(|parent| is_author_grid(flat[parent].style))
     {
-        return Some("canvas:flex-grid-item");
+        return replaced_grid_item_reason(flat, index, "canvas:grid-item")
+            .or_else(|| unsupported_box_style(style, &[inline::VALIGN_MARKER], true));
     }
     if info
         .parent
@@ -1611,6 +1650,12 @@ fn replaced_attr_content_size(
     }
     let sub = |dim: Dimension, basis: Option<f32>| -> Option<Dimension> {
         match dim {
+            // A percentage against an indefinite size behaves as `auto`
+            // (CSS 2.1 10.5 / 10.7; a cyclic percentage in a grid track's
+            // contribution, CSS Sizing 3 5.2.2).
+            Dimension::Percent(_) if basis.is_none() && space.cyclic_percent_auto => {
+                Some(Dimension::Auto)
+            }
             Dimension::Percent(_)
             | Dimension::Calc { .. }
             | Dimension::Vw(_)
@@ -4114,6 +4159,7 @@ pub(super) fn layout_root(
         adjoining_from: 0,
         fixed_block_indefinite: false,
         percent_unresolved: false,
+        cyclic_percent_auto: false,
     };
     let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
@@ -4634,6 +4680,7 @@ pub(super) fn layout_block_in(
         adjoining_from: 0,
         fixed_block_indefinite: false,
         percent_unresolved: false,
+        cyclic_percent_auto: false,
     };
 
     // CSS Sizing 4 stretch-fit sizing: a child's `stretch` sizes resolve

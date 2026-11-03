@@ -492,6 +492,7 @@ pub(super) fn layout(
         adjoining_from: 0,
         fixed_block_indefinite: false,
         percent_unresolved: false,
+        cyclic_percent_auto: false,
     };
     let inner_style = &styles[0];
     let inline_sized = if inner_style.width == Dimension::Auto {

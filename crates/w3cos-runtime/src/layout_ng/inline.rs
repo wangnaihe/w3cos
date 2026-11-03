@@ -3195,6 +3195,7 @@ pub(super) fn inline_min_max(
             &ConstraintSpace {
                 available_inline: available,
                 percent_unresolved: true,
+                cyclic_percent_auto: false,
                 ..*space
             },
         )

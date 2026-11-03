@@ -5705,6 +5705,46 @@ fn text_field_matches_chrome() {
     assert_eq!(text_offset(i2) - text_offset(i1), (56.0 - h1) / 2.0);
 }
 
+/// A `<canvas>` is a replaced grid item: it keeps its natural size (start
+/// aligned) and an authored stretch fills the inline area (the ratio sets the height).
+#[test]
+fn canvas_grid_item_is_sized_like_an_image() {
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    for stretch in [false, true] {
+        let grid = document.create_element("div");
+        grid.style_mut(&mut document)
+            .set_property("display", "grid");
+        grid.style_mut(&mut document).set_property("width", "400px");
+        document.body().append_child(&mut document, grid);
+        let canvas = document.create_element("canvas");
+        canvas.set_attribute(&mut document, "width", "100");
+        canvas.set_attribute(&mut document, "height", "50");
+        if stretch {
+            canvas
+                .style_mut(&mut document)
+                .set_property("justify-self", "stretch");
+        }
+        grid.append_child(&mut document, canvas);
+    }
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("ng");
+    let canvases: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::Canvas { .. }))
+        .collect();
+    assert_eq!(canvases.len(), 2);
+    let sizes: Vec<(f32, f32)> = canvases
+        .iter()
+        .map(|&i| (rect(&out, i).2, rect(&out, i).3))
+        .collect();
+    assert_eq!(sizes, vec![(100.0, 50.0), (400.0, 200.0)]);
+}
+
 #[test]
 fn svg_root_matches_chrome() {
     // Expected sizes from Chrome (/workspace/ngtools/svg/s1.html).
