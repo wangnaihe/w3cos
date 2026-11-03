@@ -13438,18 +13438,27 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     if left == right {
         return true;
     }
+    // Source identity is not a CSS paint difference. Coalescing carries its
+    // boundaries separately rather than keeping transparent wrappers. The
+    // custom properties are compared apart from the style so the (large,
+    // theme-variable) map is never cloned just to drop those two markers.
+    const IGNORED: [&str; 2] = [
+        w3cos_std::inline_text::SOURCE_RUN,
+        w3cos_std::inline_text::FRAGMENT_ENDS,
+    ];
+    let empty = w3cos_std::custom_properties::CustomProperties::default();
+    let properties_match = left
+        .custom_properties
+        .as_ref()
+        .unwrap_or(&empty)
+        .eq_ignoring(right.custom_properties.as_ref().unwrap_or(&empty), &IGNORED);
+    if !properties_match {
+        return false;
+    }
     let mut left = left.clone();
     let mut right = right.clone();
     for style in [&mut left, &mut right] {
-        // Source identity is not a CSS paint difference. Coalescing carries
-        // its boundaries separately rather than keeping transparent wrappers.
-        if let Some(properties) = style.custom_properties.as_mut() {
-            properties.remove(w3cos_std::inline_text::SOURCE_RUN);
-            properties.remove(w3cos_std::inline_text::FRAGMENT_ENDS);
-            if properties.is_empty() {
-                style.custom_properties = None;
-            }
-        }
+        style.custom_properties = None;
         if style
             .background_image
             .as_deref()
@@ -23971,6 +23980,42 @@ mod image_component_tests {
         properties.insert("--tone".to_string(), "dark".to_string());
         custom.custom_properties = Some(properties);
         assert!(!equivalent_text_style(&base, &custom));
+    }
+
+    #[test]
+    fn equivalent_text_style_never_clones_the_custom_property_map() {
+        let theme: std::collections::HashMap<String, String> = (0..300)
+            .map(|i| (format!("--vscode-v{i}"), format!("#{i:06x}")))
+            .collect();
+        let styled = |run: &str| {
+            let mut style = w3cos_std::style::Style::default();
+            let mut properties =
+                w3cos_std::custom_properties::CustomProperties::from(theme.clone());
+            properties.insert(
+                w3cos_std::inline_text::SOURCE_RUN.to_string(),
+                run.to_string(),
+            );
+            style.custom_properties = Some(properties);
+            style
+        };
+        let (left, right) = (styled("1"), styled("2"));
+        let before = w3cos_std::custom_properties::map_clone_count();
+        assert!(equivalent_text_style(&left, &right));
+        let mut recolored = styled("3");
+        recolored.color = w3cos_std::Color::rgb(9, 9, 9);
+        assert!(!equivalent_text_style(&left, &recolored));
+        let mut themed = styled("4");
+        themed
+            .custom_properties
+            .as_mut()
+            .unwrap()
+            .insert("--vscode-v5".to_string(), "other".to_string());
+        assert!(!equivalent_text_style(&left, &themed));
+        assert_eq!(
+            w3cos_std::custom_properties::map_clone_count(),
+            before,
+            "text-style comparison must not copy the theme map"
+        );
     }
 
     #[test]
