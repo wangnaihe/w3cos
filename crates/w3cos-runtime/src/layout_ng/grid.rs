@@ -44,6 +44,7 @@ const MAX_TRACKS: usize = 1024;
 const INF: i64 = i64::MAX / 4;
 const HEIGHT_KEYWORD: &str = "--w3cos-internal-height-keyword";
 const JUSTIFY_KEYWORD: &str = "--w3cos-internal-justify-content";
+const LAST_BASELINE_PREFIX: &str = "--w3cos-internal-last-baseline-";
 const ALIGN_ITEMS_STRETCH: &str = "--w3cos-internal-align-items-stretch";
 const JUSTIFY_ITEMS_STRETCH: &str = "--w3cos-internal-justify-items-stretch";
 
@@ -226,6 +227,42 @@ fn align_pack(align: AlignItems) -> Pack {
     }
 }
 
+/// Whether the item's used alignment in the axis is `last baseline`. An
+/// in-flow item then needs baseline-sharing groups; an out-of-flow item
+/// falls back to end alignment for its static position (CSS Align 3
+/// 9.3, Blink ComputeStaticPositionAlignment fallback).
+fn last_baseline(container: &Style, child: &Style, block: bool) -> bool {
+    let (items, own) = if block {
+        ("align-items", "align-self")
+    } else {
+        ("justify-items", "justify-self")
+    };
+    let item_self = if block {
+        child.align_self
+    } else {
+        child.justify_self
+    };
+    let key = |name: &str| format!("{LAST_BASELINE_PREFIX}{name}");
+    has_marker(child, &key(own))
+        || (item_self == AlignSelf::Auto && has_marker(container, &key(items)))
+}
+
+/// An item whose first baseline the block layout reports exactly: a
+/// block container that is not replaced, scrolled, or a grid/flex/table
+/// box (those need their own baseline sets), with definite block margins.
+fn baseline_item(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    matches!(style.display, Display::Block | Display::FlowRoot)
+        && !matches!(flat[index].kind, w3cos_std::ComponentKind::Image { .. })
+        && style.resolved_overflow_x() == w3cos_std::style::Overflow::Visible
+        && style.resolved_overflow_y() == w3cos_std::style::Overflow::Visible
+        && !subgrid_style(style)
+        && !has_marker(style, "--w3cos-internal-size-containment")
+        && !matches!(style.margin.top, Spacing::Auto)
+        && !matches!(style.margin.bottom, Spacing::Auto)
+        && style.float == Float::None
+}
+
 fn is_baseline(align: AlignItems) -> bool {
     align == AlignItems::Baseline
 }
@@ -250,9 +287,6 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     }
     if style.grid_areas().is_some() {
         return Some("grid:areas");
-    }
-    if is_baseline(style.align_items) || is_baseline(style.justify_items) {
-        return Some("grid:baseline");
     }
     if let Some(reason) = subgrid_or_template(flat, index, false) {
         return Some(reason);
@@ -321,11 +355,20 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if placement(child_style, true).is_some_and(|value| parse_axis_syntax(value).is_none()) {
             return Some("grid:row");
         }
+        // A block-axis `last baseline` needs baseline-sharing groups. An
+        // in-flow inline-axis `last baseline` is not implemented and keeps
+        // the pre-marker behavior (the default alignment), as it did before
+        // the marker existed: grid-lanes-baseline-alignment-affects-intrinsic-
+        // size-010 and its ordinary-grid reference stay on the same engine
+        // and agree. Only an out-of-flow static position reads it (End).
+        if last_baseline(style, child_style, true) {
+            return Some("grid:last-baseline");
+        }
+        // `justify-self: baseline` shares row-axis baselines only with
+        // orthogonal items; a parallel item falls back to start alignment
+        // (css-align-3 9.3), which `Pack::Start` already is.
         if is_baseline(used_item_align(style.align_items, child_style.align_self))
-            || is_baseline(used_item_align(
-                style.justify_items,
-                child_style.justify_self,
-            ))
+            && !baseline_item(flat, child)
         {
             return Some("grid:baseline");
         }
@@ -863,7 +906,7 @@ fn inline_grid_tracks(flat: &[FlatNodeInfo], index: usize, intrinsic: bool) -> b
     }) {
         return false;
     }
-    if is_baseline(style.align_items) || is_baseline(style.justify_items) {
+    if is_baseline(style.align_items) {
         return false;
     }
     if has_marker(style, "--w3cos-internal-grid-lanes")
@@ -2734,6 +2777,8 @@ struct Item {
     edges_h: f32,
     inline_pack: Pack,
     block_pack: Pack,
+    /// `align-self: baseline` (first baseline, block axis).
+    baseline: bool,
 }
 
 fn layout_item(
@@ -3453,6 +3498,7 @@ pub(super) fn layout(
             edges_h,
             inline_pack: justify,
             block_pack: align,
+            baseline: is_baseline(used_item_align(style.align_items, child_style.align_self)),
         });
     }
 
@@ -3473,7 +3519,14 @@ pub(super) fn layout(
     let mut fragments = Vec::with_capacity(built.len());
     let mut row_min = vec![0_i64; row_specs.len()];
     let mut row_max = vec![0_i64; row_specs.len()];
-    for item in &built {
+    // Baseline sharing groups (CSS Grid 6.3): the items of a row aligned
+    // by their first baseline. A group is as tall as its largest ascent
+    // plus its largest descent, measured on margin boxes.
+    let mut item_ascent = vec![0_i64; built.len()];
+    let mut group_ascent = vec![0_i64; row_specs.len()];
+    let mut group_descent = vec![0_i64; row_specs.len()];
+    let mut grouped = vec![false; row_specs.len()];
+    for (position, item) in built.iter().enumerate() {
         let laid = layout_item(
             flat,
             item.index,
@@ -3511,12 +3564,35 @@ pub(super) fn layout(
                 row_max[track] = row_max[track].max(extra);
                 row_min[track] = row_min[track].max(extra);
             }
+        } else if item.baseline {
+            if item.row_span != 1 || item.row >= row_max.len() || row_sub {
+                return super::bail("grid:baseline-span");
+            }
+            // No line box: the baseline is synthesized from the border
+            // box's bottom edge.
+            let baseline = match laid.first_baseline {
+                LastBaseline::At(value) => units(value),
+                LastBaseline::NoLines | LastBaseline::Unknown => units(laid.fragment.height),
+            };
+            let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
+            let ascent = item.margin_u[0] + baseline;
+            item_ascent[position] = ascent;
+            group_ascent[item.row] = group_ascent[item.row].max(ascent);
+            group_descent[item.row] = group_descent[item.row].max(margin_box - ascent);
+            grouped[item.row] = true;
         } else if item.row_span == 1 && item.row < row_max.len() {
             let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
             row_max[item.row] = row_max[item.row].max(margin_box);
             row_min[item.row] = row_min[item.row].max(margin_box);
         }
         fragments.push(laid);
+    }
+    for row in 0..row_max.len() {
+        if grouped[row] {
+            let size = group_ascent[row] + group_descent[row];
+            row_max[row] = row_max[row].max(size);
+            row_min[row] = row_min[row].max(size);
+        }
     }
     let stretch_rows = row_pack(style) == Pack::Stretch;
     let intrinsic_row_size = if inline_intrinsic && definite_block.is_none() {
@@ -3711,6 +3787,8 @@ pub(super) fn layout(
             continue;
         }
         let item = &built[index];
+        let baseline_shift = (item.baseline && !item.auto_margin[0] && !item.auto_margin[2])
+            .then(|| group_ascent[item.row] - item_ascent[index]);
         let fragment = fragments[index].fragment.clone();
         let area = span_sum(&columns, &collapsed, item.col, item.col_span, col_between);
         let row_size = span_sum(&rows, &row_collapsed, item.row, item.row_span, row_between);
@@ -3732,6 +3810,7 @@ pub(super) fn layout(
             item.auto_margin[2],
             item.block_pack,
         );
+        let block_offset = baseline_shift.unwrap_or(block_offset);
         let mut x = from_units(origin_x + column_x[item.col] + ml + inline_offset);
         let y =
             from_units(origin_y + row_y.get(item.row).copied().unwrap_or(0) + mt + block_offset);
@@ -3780,11 +3859,19 @@ pub(super) fn layout(
         } else {
             span_sum(&rows, &row_collapsed, row_index, row.span, row_between)
         };
-        let justify = align_pack(used_item_align(
-            style.justify_items,
-            child_style.justify_self,
-        ));
-        let align = align_pack(used_item_align(style.align_items, child_style.align_self));
+        let justify = if last_baseline(style, child_style, false) {
+            Pack::End
+        } else {
+            align_pack(used_item_align(
+                style.justify_items,
+                child_style.justify_self,
+            ))
+        };
+        let align = if last_baseline(style, child_style, true) {
+            Pack::End
+        } else {
+            align_pack(used_item_align(style.align_items, child_style.align_self))
+        };
         let border_w = definite_border(
             child_style,
             false,
@@ -5008,6 +5095,54 @@ mod tests {
                 (2, [0.0, 30.0, 100.0, 10.0]),
             ],
         );
+    }
+
+    #[test]
+    fn abspos_static_position_last_baseline_falls_back_to_end() {
+        // Chrome, grid 200x100, 30x20 abspos child with no insets: `last
+        // baseline` (align-self, justify-self, or inherited from the
+        // container items) falls back to end alignment (auto tracks; Chrome
+        // 200x100 grid); an explicit
+        // `align-self: start` or a first `baseline` stays at the start.
+        let marker = |property: &str| {
+            CustomProperties::from_iter([(
+                format!("{LAST_BASELINE_PREFIX}{property}"),
+                "1".to_string(),
+            )])
+        };
+        let child = |own: Option<&str>| {
+            let mut abs = block_box(Some(30.0), Some(20.0));
+            abs.position = Position::Absolute;
+            abs.custom_properties = own.map(marker);
+            abs
+        };
+        let run = |container: Style, child: Style| {
+            let out = lay(&Component::boxed(container, vec![leaf(child)]));
+            let r = rect(&out, 1);
+            (r[0], r[1])
+        };
+        let grid = || grid_style(200.0, Some(100.0), None);
+        assert_eq!(run(grid(), child(Some("align-self"))), (0.0, 80.0));
+        assert_eq!(run(grid(), child(Some("justify-self"))), (170.0, 0.0));
+        let mut items = grid();
+        items.custom_properties = Some(CustomProperties::from_iter([
+            (
+                format!("{LAST_BASELINE_PREFIX}align-items"),
+                "1".to_string(),
+            ),
+            (
+                format!("{LAST_BASELINE_PREFIX}justify-items"),
+                "1".to_string(),
+            ),
+        ]));
+        assert_eq!(run(items.clone(), child(None)), (170.0, 80.0));
+        let mut own_start = child(None);
+        own_start.align_self = AlignSelf::FlexStart;
+        assert_eq!(run(items, own_start), (170.0, 0.0));
+        let mut first = child(None);
+        first.align_self = AlignSelf::Baseline;
+        first.justify_self = AlignSelf::Baseline;
+        assert_eq!(run(grid(), first), (0.0, 0.0));
     }
 
     #[test]

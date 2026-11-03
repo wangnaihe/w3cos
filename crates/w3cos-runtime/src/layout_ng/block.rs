@@ -75,9 +75,12 @@ pub(super) fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
 
 fn is_value_carrier_marker(key: &str) -> bool {
     let name = key.trim_start_matches("--w3cos-internal-");
-    matches!(
-        name,
-        "font-size-origin"
+    // `last baseline` alignment: grid reads it, the typed fields keep the
+    // fallback value every other layout mode already used.
+    name.starts_with("last-baseline-")
+        || matches!(
+            name,
+            "font-size-origin"
             | "font-specified-size"
             | "html-standard-font"
             | "list-style-image"
@@ -122,7 +125,8 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "clamp-lines"
             // Read with the run-in display marker (run_in_block_styles).
             | "run-in-block"
-    ) || name.starts_with("decoration-owner")
+        )
+        || name.starts_with("decoration-owner")
 }
 
 /// Why a box is outside the current stage (`None`: supported).  The reason
