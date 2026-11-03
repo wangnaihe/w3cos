@@ -185,6 +185,62 @@ impl CustomProperties {
         Self::default()
     }
 
+    /// Apply `edit` (a pure function of the map, `tag` and `arg`) and share
+    /// the outcome with every later caller that starts from the same
+    /// allocation and asks for the same edit. A cascade that stamps the same
+    /// marker onto thousands of elements inheriting one big map would
+    /// otherwise clone that map for each of them; here the first caller pays
+    /// and the rest get the same `Arc` back (which also makes their later
+    /// equality checks pointer compares). Remembers the last few edits per
+    /// thread.
+    pub fn edit_shared(&mut self, tag: &'static str, arg: &str, edit: impl FnOnce(&mut Self)) {
+        const SLOTS: usize = 16;
+        if self.is_empty() {
+            // A fresh empty map is never the base of a later call.
+            edit(self);
+            return;
+        }
+        struct Memo {
+            base: CustomProperties,
+            tag: &'static str,
+            arg: String,
+            result: CustomProperties,
+        }
+        thread_local! {
+            static MEMOS: std::cell::RefCell<(Vec<Memo>, usize)> =
+                const { std::cell::RefCell::new((Vec::new(), 0)) };
+        }
+        let hit = MEMOS.with(|memos| {
+            memos
+                .borrow()
+                .0
+                .iter()
+                .find(|memo| memo.base.ptr_eq(self) && memo.tag == tag && memo.arg == arg)
+                .map(|memo| memo.result.clone())
+        });
+        if let Some(result) = hit {
+            *self = result;
+            return;
+        }
+        let base = self.clone();
+        edit(self);
+        let memo = Memo {
+            base,
+            tag,
+            arg: arg.to_string(),
+            result: self.clone(),
+        };
+        MEMOS.with(|memos| {
+            let (slots, next) = &mut *memos.borrow_mut();
+            if slots.len() < SLOTS {
+                slots.push(memo);
+            } else {
+                slots[*next] = memo;
+                *next = (*next + 1) % SLOTS;
+            }
+        });
+    }
+
     /// Whether both values share one map allocation.
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -386,6 +442,48 @@ impl<'de> Deserialize<'de> for CustomProperties {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn edit_shared_clones_once_per_base_and_edit() {
+        let base: CustomProperties = (0..300)
+            .map(|n| (format!("--v{n}"), n.to_string()))
+            .collect();
+        let stamp = |props: &mut CustomProperties, value: &str| {
+            props.edit_shared("stamp", value, |p| {
+                p.insert("--marker".into(), value.into());
+            });
+        };
+        let before = map_clone_count();
+        let mut first = base.clone();
+        stamp(&mut first, "1");
+        let mut second = base.clone();
+        stamp(&mut second, "1");
+        assert_eq!(
+            map_clone_count(),
+            before + 1,
+            "second stamp reuses the first"
+        );
+        assert!(first.ptr_eq(&second));
+        assert_eq!(first.get("--marker").map(String::as_str), Some("1"));
+        assert!(base.get("--marker").is_none());
+        // Another value or another base is its own edit.
+        let mut other_value = base.clone();
+        stamp(&mut other_value, "2");
+        assert!(!other_value.ptr_eq(&first));
+        assert_eq!(other_value.get("--marker").map(String::as_str), Some("2"));
+        let mut other_base = base.clone();
+        other_base.insert("--extra".into(), "x".into());
+        stamp(&mut other_base, "1");
+        assert!(!other_base.ptr_eq(&first));
+        assert_eq!(other_base.get("--extra").map(String::as_str), Some("x"));
+        // Writing to a shared result unshares it and leaves the memo intact.
+        first.insert("--marker".into(), "changed".into());
+        let mut third = base.clone();
+        stamp(&mut third, "1");
+        assert_eq!(third.get("--marker").map(String::as_str), Some("1"));
+        assert!(third.ptr_eq(&second));
+    }
+
+    #[test]
+
     fn equal_maps_built_or_cloned_alike_compare_without_lookups() {
         let build = || -> CustomProperties {
             (0..400)
