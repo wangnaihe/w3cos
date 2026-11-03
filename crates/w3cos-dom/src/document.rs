@@ -2320,12 +2320,84 @@ impl Document {
         if self.focused_node == focused_node && self.focus_visible == visible {
             return;
         }
+        let previous = self.focused_node;
         self.focused_node = focused_node;
         self.focus_visible = visible;
-        // Focus can affect ancestors (:focus-within), sibling combinators and
-        // relational selectors. Conservatively invalidate the document scope.
-        self.invalidate_style_subtree(NodeId::ROOT);
-        self.record_layout_dirty(NodeId::ROOT);
+        for root in self.focus_invalidation_roots(previous, focused_node) {
+            self.invalidate_style_subtree(root);
+            self.record_layout_dirty(root);
+        }
+    }
+
+    /// Subtrees whose selector matching can differ after focus moved from
+    /// `previous` to `current` (or only its visibility flipped).
+    ///
+    /// `:focus` / `:focus-visible` change on the two focused nodes and
+    /// `:focus-within` on the ancestor chains that differ. Descendant and
+    /// child combinators can only carry that change into descendants, so the
+    /// subtree of each changed node is enough. Sibling, structural and
+    /// relational selectors can reach other parts of the tree; those, and a
+    /// focused node that is no longer attached, keep the document-wide scope.
+    fn focus_invalidation_roots(
+        &self,
+        previous: Option<NodeId>,
+        current: Option<NodeId>,
+    ) -> Vec<NodeId> {
+        let whole_document = vec![NodeId::ROOT];
+        if stylesheet::tree_order_affects_matching() {
+            return whole_document;
+        }
+        let (Some(old_chain), Some(new_chain)) =
+            (self.focus_chain(previous), self.focus_chain(current))
+        else {
+            return whole_document;
+        };
+        let common = old_chain
+            .iter()
+            .zip(&new_chain)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut candidates: Vec<NodeId> = Vec::with_capacity(4);
+        candidates.extend(previous);
+        candidates.extend(current);
+        candidates.extend(old_chain.get(common).copied());
+        candidates.extend(new_chain.get(common).copied());
+        candidates.sort_by_key(|id| id.0);
+        candidates.dedup();
+        // Drop roots already covered by an ancestor that is also a root.
+        let covered = |id: NodeId| {
+            let mut cursor = self.nodes[id.0 as usize].as_ref().and_then(|n| n.parent);
+            while let Some(ancestor) = cursor {
+                if candidates.contains(&ancestor) {
+                    return true;
+                }
+                cursor = self
+                    .nodes
+                    .get(ancestor.0 as usize)
+                    .and_then(Option::as_ref)
+                    .and_then(|node| node.parent);
+            }
+            false
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter(|id| !covered(*id))
+            .collect()
+    }
+
+    /// Ancestor chain of `node` (outermost first, `node` last). `None` when a
+    /// link in the chain no longer exists. An absent node has an empty chain.
+    fn focus_chain(&self, node: Option<NodeId>) -> Option<Vec<NodeId>> {
+        let mut chain = Vec::new();
+        let mut current = node;
+        while let Some(id) = current {
+            let dom_node = self.nodes.get(id.0 as usize)?.as_ref()?;
+            chain.push(id);
+            current = dom_node.parent;
+        }
+        chain.reverse();
+        Some(chain)
     }
 
     pub fn is_focused(&self, id: NodeId) -> bool {
@@ -17677,6 +17749,174 @@ mod generated_counter_format_tests {
                 w3cos_std::style::Spacing::Em(1.0)
             );
         }
+    }
+
+    struct FocusFixture {
+        document: Document,
+        wrap_a: NodeId,
+        field_a: NodeId,
+        leaf_a: NodeId,
+        field_b: NodeId,
+        leaf_b: NodeId,
+        leaf_other: NodeId,
+        side_a: NodeId,
+        side_b: NodeId,
+    }
+
+    fn focus_fixture() -> FocusFixture {
+        let mut document = Document::new();
+        let mut make = |document: &mut Document, parent: crate::Element, class: &str| {
+            let node = document.create_element("div");
+            node.set_attribute(document, "class", class);
+            parent.append_child(document, node);
+            node
+        };
+        let body = document.body();
+        let wrap_a = make(&mut document, body, "wrap");
+        let field_a = make(&mut document, wrap_a, "field");
+        let leaf_a = make(&mut document, field_a, "leaf");
+        let side_a = make(&mut document, wrap_a, "side");
+        let wrap_b = make(&mut document, body, "wrap");
+        let field_b = make(&mut document, wrap_b, "field");
+        let leaf_b = make(&mut document, field_b, "leaf");
+        let side_b = make(&mut document, wrap_b, "side");
+        let other = make(&mut document, body, "other");
+        let leaf_other = make(&mut document, other, "leaf");
+        FocusFixture {
+            document,
+            wrap_a: wrap_a.id,
+            field_a: field_a.id,
+            leaf_a: leaf_a.id,
+            field_b: field_b.id,
+            leaf_b: leaf_b.id,
+            leaf_other: leaf_other.id,
+            side_a: side_a.id,
+            side_b: side_b.id,
+        }
+    }
+
+    fn marked(document: &Document, id: NodeId) -> bool {
+        document.computed_style_for(id).z_index == 7
+    }
+
+    #[test]
+    fn focus_change_restyles_only_the_chains_that_changed() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".field:focus .leaf", &[("z-index", "7")]);
+        crate::stylesheet::register_rule(".wrap:focus-within .leaf", &[("z-index", "7")]);
+        crate::stylesheet::register_rule(".wrap:focus-within .side", &[("z-index", "7")]);
+        let mut f = focus_fixture();
+        assert!(!crate::stylesheet::tree_order_affects_matching());
+        for id in [f.leaf_a, f.leaf_b, f.leaf_other] {
+            assert!(!marked(&f.document, id));
+        }
+
+        // Focus entering the document changes :focus-within on every
+        // ancestor up to the root, so the first move is document-wide.
+        f.document.set_focus_state(Some(f.field_a), true);
+        assert!(marked(&f.document, f.leaf_a));
+        assert!(marked(&f.document, f.side_a));
+        assert!(!marked(&f.document, f.side_b), "primes the style cache");
+        assert!(!marked(&f.document, f.leaf_b));
+        assert!(!marked(&f.document, f.leaf_other));
+        let other_revision = f.document.style_revisions[f.leaf_other.0 as usize];
+
+        f.document.set_focus_state(Some(f.field_b), true);
+        assert!(!marked(&f.document, f.leaf_a), "left chain must restyle");
+        assert!(!marked(&f.document, f.side_a), "lost :focus-within");
+        assert!(marked(&f.document, f.leaf_b));
+        assert!(marked(&f.document, f.side_b), "gained :focus-within");
+
+        // Moving to an ancestor keeps :focus-within on it but drops :focus.
+        f.document.set_focus_state(Some(f.wrap_a), true);
+        assert!(
+            marked(&f.document, f.leaf_a),
+            "wrap_a is focus-within itself"
+        );
+        assert!(!marked(&f.document, f.leaf_b));
+        f.document.set_focus_state(Some(f.field_a), true);
+        assert!(marked(&f.document, f.leaf_a));
+        assert_eq!(
+            f.document.style_revisions[f.leaf_other.0 as usize], other_revision,
+            "moving focus within the document leaves unrelated subtrees alone"
+        );
+        f.document.set_focus_state(None, false);
+        for id in [f.leaf_a, f.leaf_b, f.leaf_other] {
+            assert!(!marked(&f.document, id));
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn focus_moving_between_ancestor_and_descendant_restyles_the_ancestor() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".wrap:focus .side", &[("z-index", "7")]);
+        let mut f = focus_fixture();
+        f.document.set_focus_state(Some(f.field_b), true);
+        f.document.set_focus_state(Some(f.wrap_a), true);
+        assert!(marked(&f.document, f.side_a));
+        f.document.set_focus_state(Some(f.field_a), true);
+        assert!(
+            !marked(&f.document, f.side_a),
+            "wrap_a lost :focus although it is still focus-within"
+        );
+        f.document.set_focus_state(Some(f.wrap_a), true);
+        assert!(marked(&f.document, f.side_a));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn focus_visible_flip_restyles_only_the_focused_subtree() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".field:focus-visible .leaf", &[("z-index", "7")]);
+        let mut f = focus_fixture();
+        f.document.set_focus_state(Some(f.field_a), false);
+        assert!(!marked(&f.document, f.leaf_a));
+        let before_b = f.document.style_revisions[f.leaf_b.0 as usize];
+        let before_a = f.document.style_revisions[f.leaf_a.0 as usize];
+        f.document.set_focus_state(Some(f.field_a), true);
+        assert!(marked(&f.document, f.leaf_a));
+        assert_ne!(f.document.style_revisions[f.leaf_a.0 as usize], before_a);
+        assert_eq!(f.document.style_revisions[f.leaf_b.0 as usize], before_b);
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn focus_change_stays_document_wide_when_selectors_reach_other_nodes() {
+        for rule in [
+            ".field:focus ~ .other .leaf",
+            ".wrap:has(.field:focus) + .other .leaf",
+        ] {
+            crate::stylesheet::clear_rules();
+            crate::stylesheet::register_rule(rule, &[("z-index", "7")]);
+            let mut f = focus_fixture();
+            assert!(crate::stylesheet::tree_order_affects_matching());
+            f.document.set_focus_state(Some(f.field_b), true);
+            let other_revision = f.document.style_revisions[f.leaf_other.0 as usize];
+            f.document.set_focus_state(Some(f.field_a), true);
+            assert_ne!(
+                f.document.style_revisions[f.leaf_other.0 as usize], other_revision,
+                "{rule}"
+            );
+        }
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn focus_moving_to_a_detached_node_still_restyles_the_old_chain() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".field:focus .leaf", &[("z-index", "7")]);
+        let mut f = focus_fixture();
+        f.document.set_focus_state(Some(f.field_a), true);
+        let detached = f.document.create_element("div");
+        let detached_id = detached.id;
+        f.document.set_focus_state(Some(detached_id), true);
+        assert!(!marked(&f.document, f.leaf_a), "focus left field_a");
+        f.document.set_focus_state(Some(f.field_a), true);
+        assert!(marked(&f.document, f.leaf_a));
+        f.document.set_focus_state(Some(detached_id), true);
+        assert!(!marked(&f.document, f.leaf_a));
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
