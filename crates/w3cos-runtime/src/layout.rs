@@ -3761,6 +3761,27 @@ fn text_height_at_content_width_for_taffy(
     (text_intrinsic_size_at(content, style, wrap_width).1 - vertical).max(0.0)
 }
 
+/// Border-box size of an inline element's own text laid out on its own, wrapped
+/// at `available_width`. Used for inline elements whose text was merged into
+/// the enclosing block's text run and therefore never received a layout rect.
+pub(crate) fn inline_text_box_size(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    available_width: f32,
+) -> (f32, f32) {
+    let single = text_intrinsic_size_at(content, style, UNBOUNDED_TEXT_WRAP_WIDTH);
+    let width = if available_width.is_finite() && available_width > 0.0 {
+        single.0.min(available_width)
+    } else {
+        single.0
+    };
+    if width >= single.0 {
+        return single;
+    }
+    let height = text_intrinsic_size_at(content, style, width.max(1.0)).1;
+    (width, height)
+}
+
 fn text_max_content_width_for_taffy(content: &str, style: &w3cos_std::style::Style) -> f32 {
     let width = text_intrinsic_size_at(content, style, UNBOUNDED_TEXT_WRAP_WIDTH).0;
     if style.box_sizing == WBoxSizing::BorderBox {
@@ -21857,6 +21878,7 @@ fn build_taffy_tree(
                             } else {
                                 used
                             };
+                            wide_text_width = Some(w);
                         }
                         if comp.style.display == WDisplay::InlineBlock {
                             w += comp
