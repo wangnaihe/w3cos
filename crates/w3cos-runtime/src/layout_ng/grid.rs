@@ -4766,26 +4766,68 @@ fn layout_impl(
     // Column sizing resolves an item's percentage block size against its
     // area when every row it spans is a fixed length (Blink sizes the
     // columns with the definite row sizes in hand).
-    let fixed_row_space = |item: &Placed| -> ConstraintSpace {
-        let mut item_space = *space;
-        let spanned = row_specs.get(item.row..item.row + item.row_span);
-        if let Some(spanned) = spanned
-            && !spanned.is_empty()
-            && spanned
+    let fixed_row_block = |item: &Placed| -> Option<f32> {
+        let spanned = row_specs.get(item.row..item.row + item.row_span)?;
+        if spanned.is_empty()
+            || !spanned
                 .iter()
                 .all(|spec| matches!(spec, Spec::One(Breadth::Px(px)) if px.is_finite()))
         {
-            let sum: f32 = spanned
-                .iter()
-                .map(|spec| match spec {
-                    Spec::One(Breadth::Px(px)) => *px,
-                    _ => 0.0,
-                })
-                .sum();
-            let gaps = from_units(row_gap_u) * (item.row_span as f32 - 1.0);
-            item_space.percentage_block = Some((sum + gaps).max(0.0));
+            return None;
+        }
+        let sum: f32 = spanned
+            .iter()
+            .map(|spec| match spec {
+                Spec::One(Breadth::Px(px)) => *px,
+                _ => 0.0,
+            })
+            .sum();
+        let gaps = from_units(row_gap_u) * (item.row_span as f32 - 1.0);
+        Some((sum + gaps).max(0.0))
+    };
+    let fixed_row_space = |item: &Placed| -> ConstraintSpace {
+        let mut item_space = *space;
+        if let Some(block) = fixed_row_block(item) {
+            item_space.percentage_block = Some(block);
         }
         item_space
+    };
+    // A replaced item whose block axis is explicitly stretched into a fixed
+    // row (and whose inline axis is not) contributes the inline size its
+    // ratio transfers from the stretched block size.
+    let stretched_replaced_contribution = |item: &Placed| -> Option<(i64, i64)> {
+        let child_style = flat[item.index].style;
+        if !block::is_replaced(flat[item.index].kind)
+            || !matches!(child_style.width, Dimension::Auto)
+            || !matches!(child_style.height, Dimension::Auto)
+            || has_marker(child_style, HEIGHT_KEYWORD)
+            || item_width_keyword(flat, item.index).is_some()
+            || !explicit_stretch(style, child_style.align_self, true)
+            || explicit_stretch(style, child_style.justify_self, false)
+            || matches!(child_style.margin.top, Spacing::Auto)
+            || matches!(child_style.margin.bottom, Spacing::Auto)
+            || matches!(child_style.margin.left, Spacing::Auto)
+            || matches!(child_style.margin.right, Spacing::Auto)
+        {
+            return None;
+        }
+        let row = fixed_row_block(item)?;
+        let side = |spacing| spacing_px(child_style, spacing, 0.0, space);
+        let border = block::border_widths(child_style);
+        let edges_h = border[1]
+            + border[3]
+            + side(child_style.padding.left)
+            + side(child_style.padding.right);
+        let edges_v = border[0]
+            + border[2]
+            + side(child_style.padding.top)
+            + side(child_style.padding.bottom);
+        let margins_v = side(child_style.margin.top) + side(child_style.margin.bottom);
+        let margins_h = side(child_style.margin.left) + side(child_style.margin.right);
+        let content_h = (row - margins_v - edges_v).max(0.0);
+        let width = block::replaced_content_inline_at_block(flat, item.index, space, content_h)?;
+        let total = units((width + edges_h + margins_h).max(0.0));
+        Some((total, total))
     };
     for item in &items {
         let child_style = flat[item.index].style;
@@ -4815,6 +4857,8 @@ fn layout_impl(
         }
         let (min_c, max_c) = if child_style.grid_rows().is_some_and(is_subgrid_axis) {
             row_subgrid_inline(flat, item.index, space).why("grid:intrinsic")?
+        } else if let Some(contribution) = stretched_replaced_contribution(item) {
+            contribution
         } else {
             inline_minmax(flat, item.index, &fixed_row_space(item)).why("grid:intrinsic")?
         };
