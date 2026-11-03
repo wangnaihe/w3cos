@@ -277,6 +277,8 @@ fn try_generate_with_bodies_and_stylesheet_parts(
 struct GeneratedParts {
     header: String,
     modules: Vec<(String, String)>,
+    /// Source path of each entry of `modules`.
+    module_paths: Vec<std::path::PathBuf>,
     tail: String,
 }
 
@@ -301,12 +303,14 @@ fn generate_parts(
     let mut parse_cache = ModuleParseCache::default();
     let mut async_init_namespaces = HashSet::new();
     let mut modules = Vec::with_capacity(bundle.modules.len());
+    let mut module_paths = Vec::with_capacity(bundle.modules.len());
     for module in &bundle.modules {
         let generated = generate_module_with_bodies(bundle, module, &mut parse_cache)?;
         if generated.has_async_init {
             async_init_namespaces.insert(module.namespace.clone());
         }
         modules.push((module.namespace.clone(), generated.code));
+        module_paths.push(module.path.clone());
     }
     let has_async_init = !async_init_namespaces.is_empty();
 
@@ -449,6 +453,7 @@ fn generate_parts(
     Ok(GeneratedParts {
         header,
         modules,
+        module_paths,
         tail: out,
     })
 }
@@ -464,6 +469,8 @@ pub struct SplitSegment {
     pub code: String,
     /// Module namespaces (`mN`) it defines.
     pub modules: Vec<String>,
+    /// Source path of each module in `modules`, in the same order.
+    pub module_paths: Vec<std::path::PathBuf>,
 }
 
 /// A bundle split across several crates so Code-OSS scale graphs stay
@@ -658,6 +665,10 @@ fn split_parts(parts: GeneratedParts, segment_bytes: usize) -> SplitBundle {
             modules: modules
                 .iter()
                 .map(|&m| parts.modules[m].0.clone())
+                .collect(),
+            module_paths: modules
+                .iter()
+                .map(|&m| parts.module_paths[m].clone())
                 .collect(),
         });
     }
@@ -3869,6 +3880,9 @@ mod tests {
                 module("m2", &["m1", "m3"]),
                 module("m3", &[]),
             ],
+            module_paths: (0..4)
+                .map(|index| std::path::PathBuf::from(format!("/app/m{index}.js")))
+                .collect(),
             tail: "pub fn run_entry() {}\n".into(),
         };
         let split = split_parts(parts, 1);
@@ -3892,6 +3906,12 @@ mod tests {
                 assert!(index < segment_of(&segment.modules[0]));
             }
             assert!(segment.code.contains("\npub mod "));
+        }
+        for segment in &split.segments {
+            assert_eq!(segment.modules.len(), segment.module_paths.len());
+            for (namespace, path) in segment.modules.iter().zip(&segment.module_paths) {
+                assert_eq!(path, &PathBuf::from(format!("/app/{namespace}.js")));
+            }
         }
         let m0 = &split.segments[segment_of("m0")];
         assert!(
