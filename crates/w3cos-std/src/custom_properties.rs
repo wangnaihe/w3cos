@@ -167,6 +167,40 @@ impl CustomProperties {
         })
     }
 
+    /// Whether both maps hold the same entries once `ignored` keys are left
+    /// out of each. Never clones a map: the content fingerprint (minus the
+    /// ignored entries' hashes) rejects different maps in O(#ignored), and a
+    /// fingerprint match is verified by lookups without allocating.
+    pub fn eq_ignoring(&self, other: &Self, ignored: &[&str]) -> bool {
+        if self.ptr_eq(other) {
+            return true;
+        }
+        fn adjusted(inner: &Inner, ignored: &[&str]) -> (usize, u64) {
+            let mut len = inner.map.len();
+            let mut fingerprint = inner.fingerprint();
+            for key in ignored {
+                if let Some((key, value)) = inner.map.get_key_value(*key) {
+                    len -= 1;
+                    // The fingerprint folds `len` in once and one hash per entry.
+                    fingerprint = fingerprint
+                        .wrapping_sub(entry_hash(key, value))
+                        .wrapping_sub(1);
+                }
+            }
+            (len, fingerprint)
+        }
+        let (left_len, left_fingerprint) = adjusted(&self.0, ignored);
+        let (right_len, right_fingerprint) = adjusted(&other.0, ignored);
+        left_len == right_len
+            && left_fingerprint == right_fingerprint
+            && self
+                .0
+                .map
+                .iter()
+                .filter(|(key, _)| !ignored.contains(&key.as_str()))
+                .all(|(key, value)| other.0.map.get(key) == Some(value))
+    }
+
     /// Retain matching properties, unsharing the map only when one goes.
     pub fn retain(&mut self, mut keep: impl FnMut(&String, &String) -> bool) {
         if self
@@ -290,6 +324,41 @@ impl<'de> Deserialize<'de> for CustomProperties {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn eq_ignoring_skips_listed_keys_without_cloning() {
+        let base: HashMap<String, String> = (0..200)
+            .map(|i| (format!("--v{i}"), format!("{i}")))
+            .collect();
+        let mut left = CustomProperties::from(base.clone());
+        let mut right = CustomProperties::from(base);
+        left.insert("--run".into(), "1".into());
+        right.insert("--run".into(), "2".into());
+        right.insert("--ends".into(), "3,4".into());
+        assert!(left != right);
+        let before = map_clone_count();
+        assert!(left.eq_ignoring(&right, &["--run", "--ends"]));
+        assert!(right.eq_ignoring(&left, &["--run", "--ends"]));
+        // A real difference is still seen, including one hidden by a same-size swap.
+        right.insert("--v7".into(), "x".into());
+        assert!(!left.eq_ignoring(&right, &["--run", "--ends"]));
+        let mut other = CustomProperties::from(
+            (0..200)
+                .map(|i| (format!("--w{i}"), format!("{i}")))
+                .collect::<HashMap<_, _>>(),
+        );
+        other.insert("--run".into(), "1".into());
+        assert!(!left.eq_ignoring(&other, &["--run"]));
+        assert!(CustomProperties::default().eq_ignoring(&left_only("--run"), &["--run"]));
+        assert!(!CustomProperties::default().eq_ignoring(&left_only("--x"), &["--run"]));
+        assert_eq!(map_clone_count(), before, "comparison must not clone a map");
+    }
+
+    fn left_only(key: &str) -> CustomProperties {
+        let mut map = CustomProperties::default();
+        map.insert(key.into(), "1".into());
+        map
+    }
+
     use super::*;
 
     #[test]
