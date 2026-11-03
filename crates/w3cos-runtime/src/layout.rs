@@ -3200,13 +3200,7 @@ fn component_min_content_width_with_preferred_width(
                     let advance = advances.get(index).copied().flatten();
                     let eligible = child.children.is_empty()
                         && is_plain_inline_word_fragment(&child.kind, &child.style)
-                        && child
-                            .style
-                            .custom_properties
-                            .as_ref()
-                            .is_some_and(|properties| {
-                                properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-                            });
+                        && child.style.text_source_run.is_some();
                     if !eligible || advance.is_none() {
                         previous_style = None;
                         cursor = 0.0;
@@ -19950,11 +19944,7 @@ fn quote_word_fragment_advances(
     let mut start = 0;
     while start < virtual_line.children.len() {
         let first = &virtual_line.children[start];
-        let source = first
-            .style
-            .custom_properties
-            .as_ref()
-            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN));
+        let source = w3cos_std::inline_text::source_run(&first.style);
         let mut end = start + 1;
         while source.is_some()
             && end < virtual_line.children.len()
@@ -20046,9 +20036,7 @@ fn inline_fragment_shaped_advances_for_width(
         .iter()
         .map(|child| {
             let mut style = child.style.clone();
-            if style.custom_properties.as_ref().is_some_and(|properties| {
-                properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-            }) {
+            if style.text_source_run.is_some() {
                 // Generated pieces retain one authored text run. Inline box
                 // decoration is laid out separately, not a per-word font boundary.
                 style.padding = w3cos_std::style::Edges::ZERO;
@@ -20115,16 +20103,13 @@ fn inline_fragment_shaped_advances_for_width(
             // run. Its used width occupies LayoutUnits, while glyph positions
             // inside the run retain their original fractional precision.
             if !interior_endpoints && ((end == component.children.len()
-                && first_style.custom_properties.as_ref().is_some_and(|properties|
-                    properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)))
+                && first_style.text_source_run.is_some())
                 || component.children.get(end).is_some_and(|next|
                 next.children.is_empty() && next.style.display == WDisplay::Inline
                     && next.style.position == WPos::Static && next.style.float == WFloat::None
                     && matches!(&next.kind, ComponentKind::Text { content } if !content.is_empty())
-                    && (first_style.custom_properties.as_ref()
-                            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
-                            .is_some_and(|source| next.style.custom_properties.as_ref()
-                                .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
+                    && (w3cos_std::inline_text::source_run(first_style)
+                            .is_some_and(|source| w3cos_std::inline_text::source_run(&next.style)
                                 != Some(source))
                         || next.style.font_family != first_style.font_family
                         || next.style.font_size != first_style.font_size
@@ -21798,13 +21783,7 @@ fn build_taffy_tree(
                     if passive_inline_edges
                         && parent_display == Some(WDisplay::Inline)
                         && !nowrap
-                        && comp
-                            .style
-                            .custom_properties
-                            .as_ref()
-                            .is_none_or(|properties| {
-                                !properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-                            })
+                        && comp.style.text_source_run.is_none()
                     {
                         // A raw nested inline can retain one unsplit text
                         // leaf. Its normal text fits the containing line,
@@ -27908,13 +27887,7 @@ mod tests {
             font_family: Some("PingFang SC".into()),
             ..Style::default()
         };
-        plain
-            .custom_properties
-            .get_or_insert_with(Default::default)
-            .insert(
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:before-font-change".into(),
-            );
+        w3cos_std::inline_text::set_source_run(&mut plain, "text:before-font-change");
         let texts = [
             "Test", " ", "passes", " ", "if", " ", "the", " ", "filled", " ", "blue", " ",
             "square", " ", "is", " ", "in", " ", "the", " ",
@@ -27929,10 +27902,7 @@ mod tests {
         let expected = 336.015625;
         let mut bold = plain.clone();
         bold.font_weight = 700;
-        bold.custom_properties.as_mut().unwrap().insert(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:after-font-change".into(),
-        );
+        w3cos_std::inline_text::set_source_run(&mut bold, "text:after-font-change");
         let mut children = texts
             .into_iter()
             .map(|text| Component::text(text, plain.clone()))
@@ -28016,13 +27986,7 @@ mod tests {
             font_weight: 700,
             ..Style::default()
         };
-        plain
-            .custom_properties
-            .get_or_insert_with(Default::default)
-            .insert(
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:fixture".into(),
-            );
+        w3cos_std::inline_text::set_source_run(&mut plain, "text:fixture");
         let expected =
             crate::render_skia::measure_skia_inline_fragment_advances(&texts, &plain).unwrap();
         let children = texts
@@ -35731,13 +35695,7 @@ mod tests {
             ComponentKind::Text { content } if content == "Before")
             })
             .unwrap();
-        let source = |style: &w3cos_std::Style| {
-            style
-                .custom_properties
-                .as_ref()
-                .and_then(|p| p.get(w3cos_std::inline_text::SOURCE_RUN))
-                .cloned()
-        };
+        let source = |style: &w3cos_std::Style| style.text_source_run.clone();
         assert_ne!(source(quote.unwrap().style), source(word.style));
         w3cos_dom::stylesheet::clear_rules();
     }
@@ -35819,18 +35777,9 @@ mod tests {
             font_family: Some("PingFang SC".into()),
             ..Style::default()
         };
-        plain
-            .custom_properties
-            .get_or_insert_with(Default::default)
-            .insert(
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "pseudo:before:text".into(),
-            );
+        w3cos_std::inline_text::set_source_run(&mut plain, "pseudo:before:text");
         let mut quote = plain.clone();
-        quote.custom_properties.as_mut().unwrap().insert(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "pseudo:before:quote".into(),
-        );
+        w3cos_std::inline_text::set_source_run(&mut quote, "pseudo:before:quote");
         quote
             .custom_properties
             .as_mut()
@@ -36030,18 +35979,9 @@ mod tests {
             font_family: Some("PingFang SC".into()),
             ..Style::default()
         };
-        plain
-            .custom_properties
-            .get_or_insert_with(Default::default)
-            .insert(
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:float-after-image".into(),
-            );
+        w3cos_std::inline_text::set_source_run(&mut plain, "text:float-after-image");
         let mut counter = plain.clone();
-        counter.custom_properties.as_mut().unwrap().insert(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:float-before-image".into(),
-        );
+        w3cos_std::inline_text::set_source_run(&mut counter, "text:float-before-image");
         let counter_width = component_max_content_width(&Component::text("1", counter.clone()));
         let words = ["\"Before", " ", "beforeright", " ", "afterleft"];
         let raw =

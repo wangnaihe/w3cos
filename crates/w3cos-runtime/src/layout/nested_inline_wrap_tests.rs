@@ -606,11 +606,8 @@ fn resolved_bidi_words_keep_contextual_advances_in_rtl_container() {
     use w3cos_std::{Style, style::TextDirection};
     let style = Style {
         display: WDisplay::Inline,
+        text_source_run: Some("text:bidi".into()),
         custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
-            (
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:bidi".into(),
-            ),
             ("--w3cos-internal-bidi-visual-order".into(), "1".into()),
             ("--w3cos-internal-bidi-resolved-level".into(), "2".into()),
             ("--w3cos-internal-bidi-logical-order".into(), "0".into()),
@@ -664,13 +661,11 @@ fn terminal_authored_inline_source_uses_layout_unit_endpoint() {
         display: WDisplay::Inline,
         font_size: 16.0,
         font_weight: 700,
-        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([
-            (
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:terminal".into(),
-            ),
-            ("--w3cos-internal-html-standard-font".into(), "1".into()),
-        ])),
+        text_source_run: Some("text:terminal".into()),
+        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
+            "--w3cos-internal-html-standard-font".into(),
+            "1".into(),
+        )])),
         ..Style::default()
     };
     let fragments = ["no", " ", "red"];
@@ -891,18 +886,12 @@ fn decorated_source_uses_one_layout_unit_endpoint() {
         font_family: Some("sans-serif".into()),
         font_size: 16.0,
         text_decoration: w3cos_std::style::TextDecoration::Underline,
-        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:link".into(),
-        )])),
+        text_source_run: Some("text:link".into()),
         ..Style::default()
     };
     let mut suffix = link.clone();
     suffix.text_decoration = w3cos_std::style::TextDecoration::None;
-    suffix.custom_properties.as_mut().unwrap().insert(
-        w3cos_std::inline_text::SOURCE_RUN.into(),
-        "text:suffix".into(),
-    );
+    w3cos_std::inline_text::set_source_run(&mut suffix, "text:suffix");
     let root = Component::row(
         Style {
             display: WDisplay::Inline,
@@ -2076,10 +2065,7 @@ fn generated_border_words_use_shared_layout_advances() {
         font_size: 16.0,
         font_family: Some("sans-serif".into()),
         border_top_width: Some(3.0),
-        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:1".into(),
-        )])),
+        text_source_run: Some("text:1".into()),
         ..Default::default()
     };
     let words = ["Filler", " ", "Text", " ", "Filler", " ", "Text"];
@@ -2139,10 +2125,7 @@ fn generated_border_box_words_keep_horizontal_edges_in_used_width() {
         font_family: Some("sans-serif".into()),
         box_sizing: WBoxSizing::BorderBox,
         border_top_width: Some(3.0),
-        custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-            w3cos_std::inline_text::SOURCE_RUN.into(),
-            "text:1".into(),
-        )])),
+        text_source_run: Some("text:1".into()),
         ..Default::default()
     };
     let mut children = words

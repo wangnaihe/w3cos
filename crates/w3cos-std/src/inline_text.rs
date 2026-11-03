@@ -2,7 +2,15 @@
 use crate::Style;
 
 pub const FRAGMENT_ENDS: &str = "--w3cos-internal-text-fragment-ends";
-pub const SOURCE_RUN: &str = "--w3cos-internal-text-source-run";
+
+/// The authored text run this style's generated piece belongs to.
+pub fn source_run(style: &Style) -> Option<&str> {
+    style.text_source_run.as_deref()
+}
+
+pub fn set_source_run(style: &mut Style, source: impl AsRef<str>) {
+    style.text_source_run = Some(std::sync::Arc::from(source.as_ref()));
+}
 pub const DECORATION_COLOR: &str = "--w3cos-internal-text-decoration-color";
 
 /// Anonymous text paints its decorating element's used properties; CSS
@@ -242,11 +250,7 @@ pub fn append_source_fragment_ends(
     if text.is_empty() {
         return;
     }
-    let source = style
-        .custom_properties
-        .as_ref()
-        .and_then(|p| p.get(SOURCE_RUN))
-        .cloned();
+    let source = style.text_source_run.as_deref().map(str::to_owned);
     if source.is_some() && source == *previous_source && output.last().copied() == Some(offset) {
         output.pop();
     }
@@ -268,7 +272,8 @@ pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
         ends.push(text.len());
     }
     if ends.len() > 1 {
-        properties.remove(SOURCE_RUN);
+        style.text_source_run = None;
+        let properties = style.custom_properties.get_or_insert_with(Default::default);
         let offsets = ends
             .iter()
             .map(usize::to_string)

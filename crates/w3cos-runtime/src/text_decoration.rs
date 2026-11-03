@@ -587,10 +587,7 @@ mod tests {
                 opacity,
                 color: w3cos_std::Color::rgb(0, 0, 238),
                 text_decoration: w3cos_std::style::TextDecoration::Underline,
-                custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-                    w3cos_std::inline_text::SOURCE_RUN.into(),
-                    "text:unit-source".into(),
-                )])),
+                text_source_run: Some("text:unit-source".into()),
                 ..Style::default()
             };
             let parent = Style {

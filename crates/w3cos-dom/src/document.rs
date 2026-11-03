@@ -5490,13 +5490,10 @@ impl Document {
                                             "1".into(),
                                         );
                                 }
-                                item_style
-                                    .custom_properties
-                                    .get_or_insert_with(Default::default)
-                                    .insert(
-                                        w3cos_std::inline_text::SOURCE_RUN.into(),
-                                        format!("pseudo:{}:{pseudo_element}:{index}", id.as_u32()),
-                                    );
+                                w3cos_std::inline_text::set_source_run(
+                                    &mut item_style,
+                                    format!("pseudo:{}:{pseudo_element}:{index}", id.as_u32()),
+                                );
                                 w3cos_std::Component::text(text, item_style)
                             }
                             GeneratedContentItem::Image(source) => {
@@ -7849,13 +7846,7 @@ impl Document {
                 // after assigning the text node's used display so inherited
                 // `caption-side`/`empty-cells` do not split a text run.
                 normalize_css_table_internal_used_style(&mut style);
-                style
-                    .custom_properties
-                    .get_or_insert_with(Default::default)
-                    .insert(
-                        w3cos_std::inline_text::SOURCE_RUN.into(),
-                        format!("text:{}", id.as_u32()),
-                    );
+                w3cos_std::inline_text::set_source_run(&mut style, format!("text:{}", id.as_u32()));
                 let text = preserved_authored_text(text, style.white_space);
                 w3cos_std::Component::text(text.as_ref(), style)
             }
@@ -8117,13 +8108,10 @@ impl Document {
                             // belong to the one original DOM text node. Retain
                             // that identity for shaping/decoration; never join
                             // independently authored nodes under one source.
-                            style
-                                .custom_properties
-                                .get_or_insert_with(Default::default)
-                                .insert(
-                                    w3cos_std::inline_text::SOURCE_RUN.into(),
-                                    format!("text:{}", child_ids[0].as_u32()),
-                                );
+                            w3cos_std::inline_text::set_source_run(
+                                &mut style,
+                                format!("text:{}", child_ids[0].as_u32()),
+                            );
                         }
                         let component = match tag.as_str() {
                             "button" => w3cos_std::Component::button(text, style),
@@ -9119,10 +9107,8 @@ impl Document {
                     // The principal owns decoration, not source identity.
                     // Replacing the coalesced child's style must retain its
                     // authored boundaries across the preserved BR lines.
-                    for key in [
-                        w3cos_std::inline_text::SOURCE_RUN,
-                        w3cos_std::inline_text::FRAGMENT_ENDS,
-                    ] {
+                    style.text_source_run = children[0].style.text_source_run.clone();
+                    for key in [w3cos_std::inline_text::FRAGMENT_ENDS] {
                         if let Some(value) = children[0]
                             .style
                             .custom_properties
@@ -13517,11 +13503,8 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     // Source identity is not a CSS paint difference. Coalescing carries its
     // boundaries separately rather than keeping transparent wrappers. The
     // custom properties are compared apart from the style so the (large,
-    // theme-variable) map is never cloned just to drop those two markers.
-    const IGNORED: [&str; 2] = [
-        w3cos_std::inline_text::SOURCE_RUN,
-        w3cos_std::inline_text::FRAGMENT_ENDS,
-    ];
+    // theme-variable) map is never cloned just to drop the fragment marker.
+    const IGNORED: [&str; 1] = [w3cos_std::inline_text::FRAGMENT_ENDS];
     let empty = w3cos_std::custom_properties::CustomProperties::default();
     let properties_match = left
         .custom_properties
@@ -13535,6 +13518,7 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     let mut right = right.clone();
     for style in [&mut left, &mut right] {
         style.custom_properties = None;
+        style.text_source_run = None;
         if style
             .background_image
             .as_deref()
@@ -18459,11 +18443,7 @@ mod image_component_tests {
                         .unwrap()
                         .insert("--w3cos-internal-bidi-resolved-level".into(), level.into());
                     if let Some(source) = source {
-                        style
-                            .custom_properties
-                            .as_mut()
-                            .unwrap()
-                            .insert(w3cos_std::inline_text::SOURCE_RUN.into(), source.into());
+                        w3cos_std::inline_text::set_source_run(&mut style, source);
                     }
                     Component::text(content, style)
                 })
@@ -22178,9 +22158,7 @@ mod image_component_tests {
             let fragments = runs
                 .iter()
                 .filter(|(_, style)| {
-                    style.custom_properties.as_ref().is_some_and(|properties| {
-                        properties.get(w3cos_std::inline_text::SOURCE_RUN) == Some(&source)
-                    })
+                    w3cos_std::inline_text::source_run(style) == Some(source.as_str())
                 })
                 .collect::<Vec<_>>();
             assert!(!fragments.is_empty(), "missing source {source}");
@@ -24207,12 +24185,7 @@ mod image_component_tests {
     fn equivalent_text_style_ignores_run_identity_and_none_background_only() {
         let base = w3cos_std::style::Style::default();
         let mut run = base.clone();
-        let mut properties = w3cos_std::custom_properties::CustomProperties::default();
-        properties.insert(
-            w3cos_std::inline_text::SOURCE_RUN.to_string(),
-            "7".to_string(),
-        );
-        run.custom_properties = Some(properties);
+        w3cos_std::inline_text::set_source_run(&mut run, "7");
         run.background_image = Some("none".to_string().into());
         assert!(equivalent_text_style(&base, &run));
         assert!(equivalent_text_style(&run, &base));
@@ -24233,13 +24206,10 @@ mod image_component_tests {
             .collect();
         let styled = |run: &str| {
             let mut style = w3cos_std::style::Style::default();
-            let mut properties =
-                w3cos_std::custom_properties::CustomProperties::from(theme.clone());
-            properties.insert(
-                w3cos_std::inline_text::SOURCE_RUN.to_string(),
-                run.to_string(),
-            );
-            style.custom_properties = Some(properties);
+            style.custom_properties = Some(w3cos_std::custom_properties::CustomProperties::from(
+                theme.clone(),
+            ));
+            w3cos_std::inline_text::set_source_run(&mut style, run);
             style
         };
         let (left, right) = (styled("1"), styled("2"));
@@ -24569,10 +24539,7 @@ mod image_component_tests {
     fn synthetic_pieces_of_one_text_source_do_not_create_authored_boundaries() {
         let style = w3cos_std::Style {
             display: Display::Inline,
-            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-                "--w3cos-internal-text-source-run".into(),
-                "pseudo:42:before:1".into(),
-            )])),
+            text_source_run: Some("pseudo:42:before:1".into()),
             ..Default::default()
         };
         let mut row = w3cos_std::Component::row(
@@ -27265,6 +27232,74 @@ mod computed_style_cache_tests {
             );
         }
         assert!(!stylesheet::declares_sampled_transition("left", "left"));
+    }
+
+    #[test]
+    fn text_nodes_stamp_their_source_run_without_copying_the_variable_map() {
+        stylesheet::clear_rules();
+        let mut document = Document::new();
+        let body = document.body();
+        {
+            let mut style = body.style_mut(&mut document);
+            for index in 0..32 {
+                style.set_property(&format!("--theme-color-{index}"), "#123456");
+            }
+        }
+        let block = document.create_element("div");
+        body.append_child(&mut document, block);
+        for index in 0..16 {
+            let paragraph = document.create_element("p");
+            let text = document.create_text_node(&format!("plain {index} "));
+            paragraph.append_child(&mut document, text);
+            let bold = document.create_element("b");
+            bold.set_text_content(&mut document, &format!("bold {index}"));
+            paragraph.append_child(&mut document, bold);
+            block.append_child(&mut document, paragraph);
+        }
+
+        let tree = document.to_component_tree();
+        fn collect(
+            component: &w3cos_std::Component,
+            runs: &mut Vec<(String, w3cos_std::style::Style)>,
+        ) {
+            if let w3cos_std::component::ComponentKind::Text { content } = &component.kind {
+                runs.push((content.clone(), component.style.clone()));
+            }
+            for child in &component.children {
+                collect(child, runs);
+            }
+        }
+        let mut runs = Vec::new();
+        collect(&tree.children[0], &mut runs);
+        assert!(runs.len() >= 16, "{} text runs", runs.len());
+
+        // Fragments of one text node share its run id; each text node has its own.
+        let stamped = runs
+            .iter()
+            .filter(|(_, style)| w3cos_std::inline_text::source_run(style).is_some())
+            .collect::<Vec<_>>();
+        let distinct = stamped
+            .iter()
+            .filter_map(|(_, style)| w3cos_std::inline_text::source_run(style))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), 16, "one run id per authored text node");
+
+        // The stamp lives on the style, so the inherited map is shared by
+        // every text node instead of copied once per node.
+        let first = stamped[0]
+            .1
+            .custom_properties
+            .as_ref()
+            .expect("inherited vars");
+        assert!(first.contains_key("--theme-color-0"));
+        for (_, style) in &stamped {
+            let properties = style.custom_properties.as_ref().expect("inherited vars");
+            assert!(properties.ptr_eq(first), "text nodes share one map");
+            assert!(
+                !properties.contains_key("--w3cos-internal-text-source-run"),
+                "the run id is not a custom property"
+            );
+        }
     }
 
     #[test]
