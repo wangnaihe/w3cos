@@ -297,6 +297,11 @@ pub struct Style {
 
     // CSS Custom Properties (#34)
     pub custom_properties: Option<crate::custom_properties::CustomProperties>,
+    /// Identity of the authored text run a generated text piece came from
+    /// (`text:<node>` / `pseudo:...`). Kept out of `custom_properties` so
+    /// stamping it per text node never clones the shared variable map.
+    #[serde(skip)]
+    pub text_source_run: Option<std::sync::Arc<str>>,
 
     // CSS Containment — layout isolation boundaries (Chrome-inspired)
     pub contain: Contain,
@@ -462,6 +467,7 @@ impl Default for Style {
             direction: TextDirection::Ltr,
             unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
+            text_source_run: None,
             contain: Contain::None,
             will_change: WillChange::default(),
             filter: None,
@@ -638,6 +644,7 @@ impl Style {
             direction,
             unicode_bidi,
             custom_properties,
+            text_source_run,
             contain,
             will_change,
             filter,
@@ -764,6 +771,7 @@ impl Style {
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
             custom_properties: custom_properties_b,
+            text_source_run: text_source_run_b,
             contain: contain_b,
             will_change: will_change_b,
             filter: filter_b,
@@ -888,6 +896,7 @@ impl Style {
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
             && custom_properties == custom_properties_b
+            && text_source_run == text_source_run_b
             && contain == contain_b
             && will_change == will_change_b
             && filter == filter_b

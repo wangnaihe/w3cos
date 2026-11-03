@@ -2129,17 +2129,8 @@ impl PaintArtifact {
         if !matches!(source.kind, ComponentKind::Text { .. }) || isolates(&source.style) {
             return Vec::new();
         }
-        let anonymous = source
-            .style
-            .custom_properties
-            .as_ref()
-            .is_some_and(|properties| {
-                properties
-                    .get(w3cos_std::inline_text::SOURCE_RUN)
-                    .is_some_and(|source| {
-                        source.starts_with("text:") || source.starts_with("pseudo:")
-                    })
-            });
+        let anonymous = w3cos_std::inline_text::source_run(&source.style)
+            .is_some_and(|source| source.starts_with("text:") || source.starts_with("pseudo:"));
         let baseline_offset = |style: &Style| {
             style
                 .custom_properties

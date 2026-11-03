@@ -22,11 +22,7 @@ struct SourceDecoration {
 }
 
 pub(crate) fn remove_generated_border_edges(style: &mut Style) {
-    if style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|properties| properties.contains_key(w3cos_std::inline_text::SOURCE_RUN))
-    {
+    if style.text_source_run.is_some() {
         // Logical slice edges affect fitting and painting, not font shaping.
         style.border_width = 0.0;
         style.border_top_width = Some(0.0);
@@ -333,9 +329,7 @@ pub(crate) fn build(
                 rect.width > 0.0 && {
                     let node = &artifact.nodes[index];
                     let mut style = node.style.clone();
-                    if style.custom_properties.as_ref().is_some_and(|properties| {
-                        properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-                    }) {
+                    if style.text_source_run.is_some() {
                         // Decoration is paint-only for generated pieces of
                         // one source. Do not relax the layout classifier.
                         style.text_decoration = w3cos_std::style::TextDecoration::None;
@@ -401,10 +395,7 @@ fn share_source_decoration(
         return;
     };
     let style = &artifact.nodes[*first_index].style;
-    if !style
-        .custom_properties
-        .as_ref()
-        .is_some_and(|properties| properties.contains_key(w3cos_std::inline_text::SOURCE_RUN))
+    if style.text_source_run.is_none()
         || (style.text_decoration == w3cos_std::style::TextDecoration::None
             && artifact.ancestor_text_decorations(*first_index).is_empty())
     {
@@ -653,10 +644,7 @@ mod tests {
             color: w3cos_std::Color::rgb(0, 128, 0),
             border_color: w3cos_std::Color::rgb(0, 128, 0),
             border_styles: [Some(w3cos_std::style::BorderLineStyle::Solid); 4],
-            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "text:1".into(),
-            )])),
+            text_source_run: Some("text:1".into()),
             ..Style::default()
         };
         let parent = Style {
@@ -780,10 +768,7 @@ mod tests {
             display: Display::Inline,
             font_family: Some("serif".into()),
             font_size: 16.0,
-            custom_properties: Some(w3cos_std::style::CustomProperties::from_iter([(
-                w3cos_std::inline_text::SOURCE_RUN.into(),
-                "pseudo:1:before:2".into(),
-            )])),
+            text_source_run: Some("pseudo:1:before:2".into()),
             ..Style::default()
         };
         let mut quote_style = text_style.clone();
