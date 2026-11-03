@@ -6337,6 +6337,160 @@ fn inline_level_abspos_static_position_follows_floats_and_text_align() {
     assert_eq!(case(rtl, TextAlign::Center, Float::Left), (55.0, 50.0));
 }
 
+/// css-sizing-4 aspect-ratio on a non-replaced absolutely positioned box
+/// (aspect-ratio/abspos-*, Blink ComputeOutOfFlow{Inline,Block}Dimensions).
+#[test]
+fn abspos_aspect_ratio_sizes_the_auto_axis() {
+    use w3cos_std::style::{CustomProperties, Position};
+    let abs = |ratio: &str, style: Style| {
+        node(
+            Style {
+                position: Position::Absolute,
+                custom_properties: Some(CustomProperties::from_iter([(
+                    "--w3cos-internal-aspect-ratio".to_string(),
+                    ratio.to_string(),
+                )])),
+                ..style
+            },
+            vec![],
+        )
+    };
+    let holder = |width: f32, height: Dimension, inner: Component| {
+        node(
+            Style {
+                position: Position::Relative,
+                width: Dimension::Px(width),
+                height,
+                ..block()
+            },
+            vec![inner],
+        )
+    };
+    let zero = Dimension::Px(0.0);
+    let insets =
+        |left: Option<Dimension>, top: Option<Dimension>, bottom: Option<Dimension>| Style {
+            left: left.unwrap_or(Dimension::Auto),
+            top: top.unwrap_or(Dimension::Auto),
+            bottom: bottom.unwrap_or(Dimension::Auto),
+            ..block()
+        };
+    let root = node(
+        block(),
+        vec![
+            // All four insets 0 in a 100x500 box: inline stretch, block by ratio.
+            holder(
+                100.0,
+                Dimension::Px(500.0),
+                abs(
+                    "1",
+                    Style {
+                        right: zero,
+                        ..insets(Some(zero), Some(zero), Some(zero))
+                    },
+                ),
+            ),
+            // Only the block insets set in a 300x50 box: height 50, width 100.
+            holder(
+                300.0,
+                Dimension::Px(50.0),
+                abs("2", insets(Some(zero), Some(zero), Some(zero))),
+            ),
+            // A specified width wins over stretching the height.
+            holder(
+                100.0,
+                Dimension::Px(500.0),
+                abs(
+                    "1",
+                    Style {
+                        width: Dimension::Px(100.0),
+                        right: zero,
+                        ..insets(Some(zero), Some(zero), Some(zero))
+                    },
+                ),
+            ),
+            // A specified height wins over stretching the width.
+            holder(
+                500.0,
+                Dimension::Px(100.0),
+                abs(
+                    "1",
+                    Style {
+                        height: Dimension::Px(100.0),
+                        right: zero,
+                        ..insets(Some(zero), Some(zero), Some(zero))
+                    },
+                ),
+            ),
+            // Stretched width 200 limited by max-height 100 through the ratio.
+            holder(
+                200.0,
+                Dimension::Auto,
+                abs(
+                    "1",
+                    Style {
+                        right: zero,
+                        max_height: Dimension::Px(100.0),
+                        ..insets(Some(zero), Some(zero), None)
+                    },
+                ),
+            ),
+            // Height 100 with 150px padding: content 100 -> 400 border box.
+            holder(
+                800.0,
+                Dimension::Px(600.0),
+                abs(
+                    "1",
+                    Style {
+                        height: Dimension::Px(100.0),
+                        padding: Edges {
+                            top: px(150.0),
+                            right: px(150.0),
+                            bottom: px(150.0),
+                            left: px(150.0),
+                        },
+                        ..block()
+                    },
+                ),
+            ),
+            // Width 100, 2/1: ratio height 50 is floored by the 100px content
+            // (automatic minimum size, abspos-012).
+            holder(
+                800.0,
+                Dimension::Px(600.0),
+                node(
+                    Style {
+                        position: Position::Absolute,
+                        width: Dimension::Px(100.0),
+                        custom_properties: Some(CustomProperties::from_iter([(
+                            "--w3cos-internal-aspect-ratio".to_string(),
+                            "2".to_string(),
+                        )])),
+                        ..block()
+                    },
+                    vec![node(
+                        Style {
+                            height: Dimension::Px(100.0),
+                            ..block()
+                        },
+                        vec![],
+                    )],
+                ),
+            ),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let size = |i: usize| (rect(&out, i).2, rect(&out, i).3);
+    assert_eq!(size(14), (100.0, 100.0));
+    assert_eq!(size(2), (100.0, 100.0));
+    assert_eq!(size(4), (100.0, 50.0));
+    assert_eq!(size(6), (100.0, 100.0));
+    assert_eq!(size(8), (100.0, 100.0));
+    assert_eq!(size(10), (100.0, 100.0));
+    assert_eq!(size(12), (400.0, 400.0));
+}
+
 /// css-sizing-4 aspect-ratio on non-replaced blocks (block-aspect-ratio-*
 /// WPT, Blink ComputeBlockSizeFromAspectRatio).
 #[test]

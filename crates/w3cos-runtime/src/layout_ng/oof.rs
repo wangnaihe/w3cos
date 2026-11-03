@@ -14,10 +14,15 @@
 //! the box's fragment.
 
 use super::Why;
-use super::block::{border_widths, clamp_inline_size, intrinsic_sizes_at, layout_block_sized};
+use super::block::{
+    BoxAspectRatio, border_widths, clamp_inline_size, intrinsic_sizes_at, layout_block_sized,
+    non_visible_overflow,
+};
 use super::{BoxFragment, ConstraintSpace, MarginStrut};
 use crate::layout::{FlatNodeInfo, resolve_spacing_for_layout};
-use w3cos_std::style::{BoxSizing, Dimension, Position, Spacing, Style, TextDirection};
+use w3cos_std::style::{
+    BoxSizing, Dimension, Position, Spacing, Style, TextDirection, WritingMode,
+};
 
 /// An out-of-flow box waiting for its containing block, with its static
 /// position (NGLogicalStaticPosition: the margin-box inline-start edge
@@ -346,6 +351,86 @@ pub(super) fn layout_out_of_flow(
             },
         }
     };
+    // css-sizing-4 `aspect-ratio` on a non-replaced absolutely positioned
+    // box (Blink ComputeOutOfFlowInline/BlockDimensions): a specified size
+    // on one axis fixes the other through the ratio (it wins over stretching
+    // between insets); with both auto, a box stretched between its inline
+    // insets keeps that width and derives the height, one stretched only
+    // between its block insets derives the width from that height, and
+    // otherwise the shrink-to-fit width derives the height. The min/max
+    // block sizes reach the inline size through the ratio.
+    let ratio = (replaced_dims.is_none()
+        && !stretch_w
+        && !stretch_h
+        && centered_inline.is_none()
+        && style.writing_mode == WritingMode::HorizontalTb
+        && !content_height_keyword(style)
+        && width_keyword.is_none()
+        && super::block::marker(style, super::block::WIDTH_KEYWORD).is_none()
+        && super::block::marker(style, super::block::MIN_HEIGHT_KEYWORD).is_none()
+        && super::block::marker(style, super::block::MAX_HEIGHT_KEYWORD).is_none())
+    .then(|| BoxAspectRatio::new(style, edges_h, edges_v))
+    .flatten();
+    let mut ratio_height = None;
+    // A height the ratio derived is floored by the content (the automatic
+    // minimum size, css-sizing-4) unless min-height is set or it scrolls.
+    let mut floor_height = false;
+    let width = match ratio {
+        Some(r) => {
+            let max_h = length(style.max_height, h, style, &space).map(content_h);
+            let min_h = length(style.min_height, h, style, &space).map(content_h);
+            let clamp_h = |mut v: f32| {
+                if let Some(max) = max_h {
+                    v = v.min(max);
+                }
+                if let Some(min) = min_h {
+                    v = v.max(min);
+                }
+                v
+            };
+            let specified_height = length(style.height, h, style, &space).map(content_h);
+            let specified_width = length(style.width, w, style, &space).is_some();
+            let top_inset = length(style.top, h, style, &space);
+            let bottom_inset = length(style.bottom, h, style, &space);
+            if specified_width {
+                if specified_height.is_none() {
+                    ratio_height = Some(clamp_h(r.block_from_inline(width)));
+                    floor_height = true;
+                }
+                width
+            } else if let Some(height) = specified_height {
+                let mut inline = r.inline_from_block(clamp_h(height));
+                if style.min_width == Dimension::Auto && !non_visible_overflow(style) {
+                    let sizes =
+                        intrinsic_sizes_at(flat, index, &space, block).why("oof-intrinsic")?;
+                    let min = sizes.min.or_else(|| super::bail("oof-ratio-min"))?;
+                    inline = inline.max(min);
+                }
+                clamp_inline_size(style, &space, edges_h, inline)
+            } else if !(left.is_some() && right.is_some())
+                && let (Some(t), Some(bo)) = (top_inset, bottom_inset)
+            {
+                let stretched = clamp_h(
+                    (h - t - bo - mt.unwrap_or(0.0) - mb.unwrap_or(0.0) - edges_v).max(0.0),
+                );
+                ratio_height = Some(stretched);
+                clamp_inline_size(style, &space, edges_h, r.inline_from_block(stretched))
+            } else {
+                let mut inline = width;
+                if let Some(max) = max_h {
+                    inline = inline.min(r.inline_from_block(max));
+                }
+                if let Some(min) = min_h {
+                    inline = inline.max(r.inline_from_block(min));
+                }
+                let inline = clamp_inline_size(style, &space, edges_h, inline);
+                ratio_height = Some(clamp_h(r.block_from_inline(inline)));
+                floor_height = true;
+                inline
+            }
+        }
+        None => width,
+    };
     // Intrinsic min-width / max-width keywords (css-sizing-3).
     let available = w
         - left.unwrap_or(0.0)
@@ -453,6 +538,14 @@ pub(super) fn layout_out_of_flow(
         Some((_, replaced_h)) => Some(replaced_h),
         None => specified_h.or(stretched),
     };
+    if let Some(mut ratio_h) = ratio_height {
+        if floor_height && style.min_height == Dimension::Auto && !non_visible_overflow(style) {
+            let auto = layout_block_sized(flat, index, &space, true, Some((width, None)))
+                .why("oof-layout")?;
+            ratio_h = ratio_h.max((auto.fragment.height - edges_v).max(0.0));
+        }
+        fixed_h = Some(ratio_h);
+    }
     // An intrinsic min-height / max-height keyword is the content height
     // (css-sizing-3); a specified or stretched height is limited by it.
     let min_keyword = replaced_dims.is_none()
