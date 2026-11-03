@@ -168,8 +168,61 @@ impl SplitBundle {
     }
 }
 
+/// Manifest line that links mimalloc into the split executable as the
+/// process-wide `malloc`/`free` (MIT licensed, Microsoft). The `override`
+/// feature compiles mimalloc's C interface into the executable, which exports
+/// `malloc`, `free`, `calloc`, `realloc`, `posix_memalign`, ... to every shared
+/// object in the process. That is the only arrangement that is consistent for
+/// a dylib-split bundle: each segment dylib carries its own copy of the Rust
+/// allocator shim, so a `#[global_allocator]` defined in one image would let
+/// a `Box` allocated in a segment be freed by another image's allocator.
+/// Overriding libc's `malloc` makes every image, `libstd`, and C code such as
+/// Skia and HarfBuzz allocate from the same heap.
+pub const MIMALLOC_DEPENDENCY: &str =
+    "libmimalloc-sys = { version = \"=0.1.49\", features = [\"override\", \"v2\"] }\n";
+
+/// mimalloc is C code compiled by its build script with the package's
+/// `opt-level`; at the dev profile's `opt-level = 0` it is built `-O0` and is
+/// no faster than glibc, so the debug profile pins it to `-O3`.
+pub const MIMALLOC_PROFILE: &str = "\n[profile.dev.package.libmimalloc-sys]\nopt-level = 3\n";
+
+/// The profile table that keeps mimalloc optimized in debug builds, or nothing.
+pub fn allocator_profile(mimalloc: bool) -> &'static str {
+    if mimalloc { MIMALLOC_PROFILE } else { "" }
+}
+
+/// The dependency line for the split executable's `Cargo.toml`, or nothing.
+pub fn allocator_dependency(mimalloc: bool) -> &'static str {
+    if mimalloc { MIMALLOC_DEPENDENCY } else { "" }
+}
+
+/// The statement for the top of the split executable's `main.rs` that forces
+/// the linker to keep mimalloc's object code, or nothing.
+pub fn allocator_main_prelude(mimalloc: bool) -> &'static str {
+    if mimalloc {
+        "use libmimalloc_sys as _;\n"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mimalloc_is_opt_in_and_overrides_libc() {
+        assert_eq!(allocator_dependency(false), "");
+        assert_eq!(allocator_main_prelude(false), "");
+        assert_eq!(allocator_profile(false), "");
+        assert!(allocator_profile(true).contains("libmimalloc-sys"));
+        assert!(allocator_profile(true).contains("opt-level = 3"));
+        let dep = allocator_dependency(true);
+        assert!(dep.starts_with("libmimalloc-sys = "));
+        assert!(dep.contains("\"override\""), "must export malloc/free");
+        assert!(dep.contains("=0.1.49"), "version is pinned");
+        assert!(dep.ends_with('\n'));
+        assert_eq!(allocator_main_prelude(true), "use libmimalloc_sys as _;\n");
+    }
+
     use super::*;
     use std::path::PathBuf;
 
