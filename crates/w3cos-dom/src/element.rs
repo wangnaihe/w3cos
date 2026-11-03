@@ -35,8 +35,13 @@ impl Element {
     }
 
     pub fn set_text_content(&self, doc: &mut Document, text: &str) {
+        let old_text = doc.get_node(self.id).text_content.as_deref().unwrap_or("");
+        if old_text == text && doc.get_node(self.id).text_content.is_some() {
+            return;
+        }
+        let flipped = old_text.is_empty() != text.is_empty();
         doc.get_node_mut(self.id).text_content = Some(crate::node::CompactStr::from(text));
-        doc.mark_text_dirty(self.id);
+        doc.mark_text_dirty_with(self.id, flipped);
     }
 
     pub fn append_child(&self, doc: &mut Document, child: Element) {

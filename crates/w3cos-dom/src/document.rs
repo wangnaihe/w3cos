@@ -1199,8 +1199,13 @@ impl Document {
             if child_node.node_type != NodeType::Text || child_node.next_sibling != 0 {
                 return None;
             }
+            let old_text = self.get_node(child).text_content.as_deref().unwrap_or("");
+            if old_text == text {
+                return Some(child);
+            }
+            let flipped = old_text.is_empty() != text.is_empty();
             self.get_node_mut(child).text_content = Some(crate::node::CompactStr::from(text));
-            self.mark_text_dirty(parent);
+            self.mark_text_dirty_with(parent, flipped);
             return Some(child);
         }
         let child = self.alloc_node(DomNode::new_text(NodeId(0), text));
@@ -2126,19 +2131,26 @@ impl Document {
     /// Text mutations can change the parent's `:empty` state. Relational
     /// selectors such as `:has()` conservatively fall back to document scope.
     pub(crate) fn mark_text_dirty(&mut self, id: NodeId) {
-        if self.text_box_is_stable(id)
-            && !stylesheet::has_structural_dependencies()
-            && !stylesheet::has_relational_dependencies()
-        {
+        self.mark_text_dirty_with(id, true);
+    }
+
+    /// `emptiness_flipped` is false when the write kept the node's text
+    /// empty or non-empty. Selectors read text only through `:empty`, so a
+    /// same-emptiness write leaves structural and relational matching alone
+    /// and only the node's own box can change. Unknown callers pass true.
+    pub(crate) fn mark_text_dirty_with(&mut self, id: NodeId, emptiness_flipped: bool) {
+        let structural = emptiness_flipped && stylesheet::has_structural_dependencies();
+        let relational = emptiness_flipped && stylesheet::has_relational_dependencies();
+        if self.text_box_is_stable(id) && !structural && !relational {
             self.note_repaint_without_layout();
             return;
         }
-        let changes_box = self.text_mutation_changes_used_box(id);
-        if stylesheet::has_relational_dependencies() {
+        let changes_box = self.text_mutation_changes_used_box(id, structural || relational);
+        if relational {
             let invalidation_root = self.get_node(id).parent.unwrap_or(id);
             self.invalidate_style_subtree(invalidation_root);
             self.invalidate_relational_observers(invalidation_root);
-        } else if stylesheet::has_structural_dependencies() {
+        } else if structural {
             let invalidation_root = self.get_node(id).parent.unwrap_or(id);
             self.invalidate_style_subtree(invalidation_root);
         } else if !changes_box {
@@ -2171,8 +2183,8 @@ impl Document {
     }
 
     /// `true` when replacing this node's text can change a used border box.
-    fn text_mutation_changes_used_box(&self, id: NodeId) -> bool {
-        if stylesheet::has_structural_dependencies() || stylesheet::has_relational_dependencies() {
+    fn text_mutation_changes_used_box(&self, id: NodeId, selectors_watch_text: bool) -> bool {
+        if selectors_watch_text {
             return true;
         }
         let style = self.computed_style_for(id);
@@ -30687,6 +30699,87 @@ mod computed_style_cache_tests {
             document.computed_style_for(parent.id).color,
             w3cos_std::Color::rgb(255, 0, 0)
         );
+        crate::stylesheet::clear_rules();
+    }
+
+    /// A host with a structural (`:first-child`), `:empty` and `:has()` rule,
+    /// a sibling that must stay cached, and a text child.
+    fn text_write_fixture() -> (Document, NodeId, NodeId, NodeId, Element) {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".box:empty", &[("color", "red")]);
+        crate::stylesheet::register_rule("li:first-child", &[("color", "blue")]);
+        crate::stylesheet::register_rule(".row:has(.flag)", &[("color", "green")]);
+        let mut document = Document::new();
+        let list = document.create_element("ul");
+        let first = document.create_element("li");
+        let second = document.create_element("li");
+        let inner = document.create_element("span");
+        let text = document.create_text_node("one");
+        first.class_list_add(&mut document, "box");
+        inner.append_child(&mut document, text);
+        first.append_child(&mut document, inner);
+        list.append_child(&mut document, first);
+        list.append_child(&mut document, second);
+        document.body().append_child(&mut document, list);
+        for id in [list.id, first.id, second.id, inner.id] {
+            document.computed_style_for(id);
+        }
+        (document, first.id, second.id, inner.id, text)
+    }
+
+    #[test]
+    fn text_write_that_keeps_emptiness_leaves_the_surrounding_subtree_cached() {
+        let (mut document, first, second, inner, text) = text_write_fixture();
+        text.set_text_content(&mut document, "two");
+        assert!(document.computed_style_cache_is_current(first));
+        assert!(document.computed_style_cache_is_current(second));
+        assert!(document.computed_style_cache_is_current(inner));
+        assert_eq!(
+            document.get_node(text.id).text_content.as_deref(),
+            Some("two")
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn text_write_that_flips_emptiness_still_restyles_the_parent_subtree() {
+        let (mut document, first, _second, inner, text) = text_write_fixture();
+        text.set_text_content(&mut document, "");
+        assert!(!document.computed_style_cache_is_current(inner));
+        assert!(document.computed_style_cache_is_current(first));
+        text.set_text_content(&mut document, "back");
+        assert!(!document.computed_style_cache_is_current(inner));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn identical_text_write_changes_nothing() {
+        let (mut document, first, _second, inner, text) = text_write_fixture();
+        let layout = document.layout_generation();
+        let structure = document.structure_generation();
+        text.set_text_content(&mut document, "one");
+        assert_eq!(document.layout_generation(), layout);
+        assert_eq!(document.structure_generation(), structure);
+        assert!(document.computed_style_cache_is_current(first));
+        assert!(document.computed_style_cache_is_current(inner));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inline_text_child_rewrite_keeps_unrelated_nodes_cached() {
+        let (mut document, first, second, inner, _text) = text_write_fixture();
+        let layout = document.layout_generation();
+        assert!(document.set_inline_text_child(inner, "one").is_some());
+        assert_eq!(document.layout_generation(), layout, "same text is a no-op");
+        assert!(document.set_inline_text_child(inner, "three").is_some());
+        assert!(
+            document.layout_generation() > layout,
+            "new text still relays out"
+        );
+        assert!(document.computed_style_cache_is_current(first));
+        assert!(document.computed_style_cache_is_current(second));
+        assert!(document.set_inline_text_child(inner, "").is_some());
+        assert!(!document.computed_style_cache_is_current(first));
         crate::stylesheet::clear_rules();
     }
 }
