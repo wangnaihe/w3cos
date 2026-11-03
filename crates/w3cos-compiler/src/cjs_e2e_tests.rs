@@ -956,3 +956,73 @@ fn optional_calls_keep_receiver_and_functions_inherit_function_prototype_match_n
     assert_eq!(lines, expected);
     std::fs::remove_dir_all(root).ok();
 }
+
+#[test]
+fn toolbar_hidden_actions_leave_no_undefined_after_coalesce_in_place() {
+    let root = write_fixture(
+        "w3cos_toolbar_coalesce",
+        &[
+            ("package.json", r#"{"name":"tbcoalesce","type":"module"}"#),
+            (
+                "main.mjs",
+                r#"function coalesceInPlace(array) {
+  let to = 0;
+  for (let i = 0; i < array.length; i++) {
+    if (!!array[i]) { array[to] = array[i]; to += 1; }
+  }
+  array.length = to;
+}
+class Separator {
+  static clean(actions) {
+    while (actions.length > 0 && actions[0].id === Separator.ID) { actions.shift(); }
+    while (actions.length > 0 && actions[actions.length - 1].id === Separator.ID) { actions.pop(); }
+    for (let i = actions.length - 2; i >= 0; i--) {
+      if (actions[i].id === Separator.ID && actions[i + 1].id === Separator.ID) { actions.splice(i + 1, 1); }
+    }
+    return actions;
+  }
+  static ID = 'sep';
+  id = Separator.ID;
+}
+const mk = (id) => ({ id });
+const primary = [mk('a'), mk('b'), mk('c'), mk('d')];
+const extra = [];
+for (let i = 0; i < primary.length; i++) {
+  if (i === 1 || i === 3) { extra[i] = primary[i]; primary[i] = undefined; }
+}
+console.log("1", primary.length, extra.length, 0 in extra, 1 in extra);
+coalesceInPlace(primary);
+coalesceInPlace(extra);
+console.log("2", primary.length, extra.length, JSON.stringify(primary), JSON.stringify(extra));
+console.log("3", Separator.clean(primary).map((a) => a.id).join(","), Separator.clean(extra).map((a) => a.id).join(","));
+const lone = [undefined, mk('x'), undefined];
+coalesceInPlace(lone);
+console.log("4", lone.length, lone[0].id);
+const holes = [];
+holes[2] = mk('h');
+coalesceInPlace(holes);
+console.log("5", holes.length, holes[0].id);
+const direct = [1, 2, 3, 4];
+direct.length = 2;
+function setLength(arr, n) { arr.length = n; }
+const viaParam = [1, 2, 3, 4];
+setLength(viaParam, 1);
+setLength(direct, 3);
+console.log("6", direct.length, viaParam.length, 2 in direct);
+"#,
+            ),
+        ],
+    );
+    let lines = compile_and_run(&root, &root.join("main.mjs"), "w3cos_toolbar_coalesce");
+    assert_eq!(
+        lines,
+        vec![
+            "1 4 4 false true",
+            "2 2 2 [{\"id\":\"a\"},{\"id\":\"c\"}] [{\"id\":\"b\"},{\"id\":\"d\"}]",
+            "3 a,c b,d",
+            "4 1 x",
+            "5 1 h",
+            "6 3 1 false",
+        ]
+    );
+}
