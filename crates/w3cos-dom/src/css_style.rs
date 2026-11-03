@@ -648,6 +648,10 @@ impl CSSStyleDeclaration {
                 | "borderRight"
                 | "borderBottom"
                 | "borderLeft"
+                | "border-block"
+                | "border-inline"
+                | "borderBlock"
+                | "borderInline"
                 | "border-inline-start"
                 | "border-inline-end"
                 | "border-block-start"
@@ -1694,6 +1698,16 @@ impl CSSStyleDeclaration {
             }
             "border-left" | "borderLeft" => {
                 apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
+            }
+            // The two-sided logical shorthands set both edges of the axis
+            // (horizontal-tb mapping, like the -start/-end longhands).
+            "border-block" | "borderBlock" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Top);
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Bottom);
+            }
+            "border-inline" | "borderInline" => {
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left);
+                apply_border_side_shorthand(&mut self.inner, value, BorderSide::Right);
             }
             "border-inline-start" | "borderInlineStart" => {
                 apply_border_side_shorthand(&mut self.inner, value, BorderSide::Left)
@@ -2782,7 +2796,10 @@ impl CSSStyleDeclaration {
                         parse_border_line_style(value)
                     } else if matches!(name.as_str(), "border-style" | "borderStyle") {
                         parse_border_line_style_edges(value).map(|edges| edges[edge])
-                    } else if name == "border" || name == shorthand {
+                    } else if name == "border"
+                        || name == shorthand
+                        || border_axis_shorthand(name, edge)
+                    {
                         let parts = split_css_whitespace(value);
                         if parts.iter().all(|part| {
                             parse_border_width(part).is_some()
@@ -2861,7 +2878,11 @@ impl CSSStyleDeclaration {
                         } else {
                             parse_border_color_edges(value).map(|edges| edges[edge])
                         }
-                    } else if name == "border" || name == shorthand || name == shorthand_alias {
+                    } else if name == "border"
+                        || name == shorthand
+                        || name == shorthand_alias
+                        || border_axis_shorthand(name, edge)
+                    {
                         border_shorthand_color(value, style.color, parse_border_width)
                     } else {
                         None
@@ -2916,7 +2937,8 @@ impl CSSStyleDeclaration {
                     parse_border_width(value)
                 } else if matches!(name.as_str(), "border-width" | "borderWidth") {
                     parse_border_width_edges(value).map(|widths| widths[edge])
-                } else if name == "border" || name == shorthand {
+                } else if name == "border" || name == shorthand || border_axis_shorthand(name, edge)
+                {
                     let parts = split_css_whitespace(value);
                     if !parts.is_empty()
                         && parts.iter().all(|part| {
@@ -2938,6 +2960,17 @@ impl CSSStyleDeclaration {
                     None
                 }
             })
+    }
+}
+
+/// The two-sided logical border shorthand that covers the physical `edge`
+/// (0 top, 1 right, 2 bottom, 3 left) in horizontal-tb: `border-block`
+/// sets top and bottom, `border-inline` left and right.
+fn border_axis_shorthand(name: &str, edge: usize) -> bool {
+    if edge % 2 == 0 {
+        matches!(name, "border-block" | "borderBlock")
+    } else {
+        matches!(name, "border-inline" | "borderInline")
     }
 }
 
@@ -8387,6 +8420,48 @@ mod tests {
         assert_eq!(declaration.inner.border_left_width, Some(0.0));
         assert_eq!(declaration.inner.border_right_width, Some(0.0));
         assert_eq!(declaration.inner.border_top_width, Some(1.0));
+    }
+
+    #[test]
+    fn border_block_and_inline_shorthands_set_both_edges_of_the_axis() {
+        let mut declaration = CSSStyleDeclaration::new();
+        declaration.set_property("border-block", "10px solid green");
+        assert_eq!(declaration.inner.border_top_width, Some(10.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(10.0));
+        assert_eq!(declaration.inner.border_left_width, None);
+        assert_eq!(declaration.inner.border_right_width, None);
+        assert_eq!(
+            declaration.inner.border_top_color,
+            declaration.inner.border_bottom_color
+        );
+        assert!(declaration.inner.border_top_color.is_some());
+
+        declaration.set_property("borderInline", "2px dashed red");
+        assert_eq!(declaration.inner.border_left_width, Some(2.0));
+        assert_eq!(declaration.inner.border_right_width, Some(2.0));
+        // The block axis is untouched by the inline shorthand.
+        assert_eq!(declaration.inner.border_top_width, Some(10.0));
+
+        // The cascade-level style keeps the line style and colour too, so
+        // the edges paint (and are not masked to zero as a `none` edge).
+        let mut painted = CSSStyleDeclaration::new();
+        painted.set_property("border-block", "10px solid green");
+        let style = painted.to_style();
+        assert_eq!(style.border_top_width, Some(10.0));
+        assert_eq!(style.border_bottom_width, Some(10.0));
+        assert_eq!(style.border_left_width, Some(0.0));
+        assert_eq!(
+            style.border_styles[0],
+            Some(w3cos_std::style::BorderLineStyle::Solid)
+        );
+        assert_eq!(style.border_top_color, Color::from_css("green"));
+
+        // `none` resets both edges; an invalid value changes nothing.
+        declaration.set_property("border-block", "none");
+        assert_eq!(declaration.inner.border_top_width, Some(0.0));
+        assert_eq!(declaration.inner.border_bottom_width, Some(0.0));
+        declaration.set_property("border-inline", "bogus");
+        assert_eq!(declaration.inner.border_left_width, Some(2.0));
     }
 
     #[test]
