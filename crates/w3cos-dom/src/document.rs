@@ -31215,4 +31215,87 @@ mod tree_mutation_tests {
         assert_eq!(document.nodes.capacity(), capacity);
         assert!(document.nodes.len() <= capacity);
     }
+
+    fn restyles(document: &Document, before: u64) -> u64 {
+        document.style_revision_clock - before
+    }
+
+    #[test]
+    fn rewriting_an_attribute_with_the_same_text_does_not_restyle() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("[data-k=\"v\"]", &[("z-index", "7")]);
+        let mut document = Document::new();
+        let node = document.create_element("div");
+        document.body().append_child(&mut document, node);
+        node.set_attribute(&mut document, "data-k", "v");
+        assert_eq!(document.computed_style_for(node.id).z_index, 7);
+        let before = document.style_revision_clock;
+        node.set_attribute(&mut document, "data-k", "v");
+        assert_eq!(restyles(&document, before), 0);
+        node.set_attribute(&mut document, "data-k", "w");
+        assert!(restyles(&document, before) >= 1);
+        assert_ne!(document.computed_style_for(node.id).z_index, 7);
+        node.set_attribute(&mut document, "data-k", "v");
+        assert_eq!(document.computed_style_for(node.id).z_index, 7);
+    }
+
+    #[test]
+    fn assigning_the_same_class_name_does_not_restyle() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".a.b", &[("z-index", "7")]);
+        let mut document = Document::new();
+        let node = document.create_element("div");
+        document.body().append_child(&mut document, node);
+        node.set_class_name(&mut document, "a b");
+        assert_eq!(document.computed_style_for(node.id).z_index, 7);
+        let before = document.style_revision_clock;
+        node.set_class_name(&mut document, "a b");
+        node.set_attribute(&mut document, "class", "a b");
+        assert_eq!(restyles(&document, before), 0);
+        assert_eq!(document.get_elements_by_class_name("a").len(), 1);
+        // Same tokens in a different spelling still reach [class=...] selectors.
+        node.set_class_name(&mut document, "a  b");
+        assert!(restyles(&document, before) >= 1);
+        assert_eq!(document.computed_style_for(node.id).z_index, 7);
+        node.set_class_name(&mut document, "a");
+        assert_ne!(document.computed_style_for(node.id).z_index, 7);
+        assert_eq!(document.get_elements_by_class_name("b").len(), 0);
+        assert_eq!(document.get_elements_by_class_name("a").len(), 1);
+    }
+
+    #[test]
+    fn a_class_name_assignment_restyles_once_not_once_per_token() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".d", &[("z-index", "7")]);
+        let mut document = Document::new();
+        let node = document.create_element("div");
+        document.body().append_child(&mut document, node);
+        let before = document.style_revision_clock;
+        node.set_class_name(&mut document, "a b c d a");
+        assert_eq!(restyles(&document, before), 1);
+        assert_eq!(node.class_name(&document), "a b c d");
+        assert_eq!(document.computed_style_for(node.id).z_index, 7);
+        let before = document.style_revision_clock;
+        node.set_attribute_ns(&mut document, None, "class", None, "class", "x y z");
+        assert_eq!(restyles(&document, before), 1);
+        assert_eq!(node.class_name(&document), "x y z");
+        assert_eq!(document.get_elements_by_class_name("y").len(), 1);
+        assert_eq!(document.get_elements_by_class_name("a").len(), 0);
+    }
+
+    #[test]
+    fn removing_an_absent_class_does_not_restyle() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".a", &[("z-index", "7")]);
+        let mut document = Document::new();
+        let node = document.create_element("div");
+        document.body().append_child(&mut document, node);
+        node.class_list_add(&mut document, "a");
+        let before = document.style_revision_clock;
+        node.class_list_remove(&mut document, "missing");
+        assert_eq!(restyles(&document, before), 0);
+        node.class_list_remove(&mut document, "a");
+        assert!(restyles(&document, before) >= 1);
+        assert_ne!(document.computed_style_for(node.id).z_index, 7);
+    }
 }
