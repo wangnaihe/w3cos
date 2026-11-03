@@ -7553,10 +7553,12 @@ impl Document {
                 style
                     .custom_properties
                     .get_or_insert_with(Default::default)
-                    .insert(
-                        "--w3cos-internal-quirks-percentage-height".to_string(),
-                        "1".to_string(),
-                    );
+                    .edit_shared("quirks-percentage-height", "", |properties| {
+                        properties.insert(
+                            "--w3cos-internal-quirks-percentage-height".to_string(),
+                            "1".to_string(),
+                        );
+                    });
             } else if !matches!(
                 style.position,
                 w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
@@ -7594,13 +7596,16 @@ impl Document {
                 // positioned child is the viewport, not this block. Keep the
                 // percentage so `inherit` can read it back.
                 if let w3cos_std::style::Dimension::Percent(value) = style.height {
+                    let value = format!("{value}");
                     style
                         .custom_properties
                         .get_or_insert_with(Default::default)
-                        .insert(
-                            "--w3cos-internal-computed-height-percent".to_string(),
-                            format!("{value}"),
-                        );
+                        .edit_shared("computed-height-percent", &value, |properties| {
+                            properties.insert(
+                                "--w3cos-internal-computed-height-percent".to_string(),
+                                value.clone(),
+                            );
+                        });
                 }
                 style.height = w3cos_std::style::Dimension::Auto;
             }
@@ -7634,18 +7639,17 @@ impl Document {
                     let source = self.get_node(*child);
                     source.tag.as_str() == "source" && has_source(source)
                 });
+            let state = if source_pending {
+                "source-pending"
+            } else {
+                "no-source"
+            };
             style
                 .custom_properties
                 .get_or_insert_with(Default::default)
-                .insert(
-                    VIDEO_CONTROLS.into(),
-                    if source_pending {
-                        "source-pending"
-                    } else {
-                        "no-source"
-                    }
-                    .into(),
-                );
+                .edit_shared("video-controls", state, |properties| {
+                    properties.insert(VIDEO_CONTROLS.into(), state.into());
+                });
         }
         if style.text_transform != w3cos_std::style::TextTransform::None {
             if style.text_transform == w3cos_std::style::TextTransform::Capitalize {
@@ -27318,6 +27322,53 @@ mod computed_style_cache_tests {
         assert_eq!(resized.font_size, 21.0);
         assert_eq!(marker(&resized, FONT_SPECIFIED_SIZE).as_deref(), Some("21"));
         assert_eq!(marker(&parent, FONT_SPECIFIED_SIZE).as_deref(), Some("15"));
+    }
+
+    #[test]
+    fn sibling_frames_stamping_the_same_marker_share_one_variable_map() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(".percentage", &[("height", "20%")]);
+        let mut document = Document::new();
+        let body = document.body();
+        for index in 0..32 {
+            body.style_mut(&mut document)
+                .set_property(&format!("--theme-color-{index}"), "#123456");
+        }
+        let container = document.create_element("div");
+        for _ in 0..3 {
+            let child = document.create_element("div");
+            child.set_attribute(&mut document, "class", "percentage");
+            container.append_child(&mut document, child);
+        }
+        body.append_child(&mut document, container);
+
+        let tree = document.to_component_tree();
+        let maps: Vec<_> = tree.children[0]
+            .children
+            .iter()
+            .map(|child| child.style.custom_properties.clone().expect("variables"))
+            .collect();
+        assert_eq!(maps.len(), 3);
+        for map in &maps {
+            assert_eq!(
+                map.get("--w3cos-internal-computed-height-percent")
+                    .map(String::as_str),
+                Some("20")
+            );
+            assert!(map.contains_key("--theme-color-31"));
+        }
+        assert!(maps[0].ptr_eq(&maps[1]) && maps[1].ptr_eq(&maps[2]));
+        assert!(
+            !tree.children[0]
+                .style
+                .custom_properties
+                .as_ref()
+                .unwrap()
+                .contains_key("--w3cos-internal-computed-height-percent"),
+            "the marker belongs to the children only"
+        );
+
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
