@@ -5745,6 +5745,42 @@ fn canvas_grid_item_is_sized_like_an_image() {
     assert_eq!(sizes, vec![(100.0, 50.0), (400.0, 200.0)]);
 }
 
+/// An `<svg>` grid item: the DOM's fallback `px` size (1x1 from a
+/// `viewBox="0 0 1 1"`) is read as `auto`, so the used size follows the
+/// ratio from the one authored axis instead of being a 1px specified size.
+#[test]
+fn svg_grid_item_fallback_size_is_auto() {
+    let mut document = w3cos_dom::Document::new();
+    let html = document.create_element("html");
+    let body = document.body();
+    html.append_child(&mut document, body);
+    body.style_mut(&mut document).set_property("margin", "0");
+    for (property, value) in [("height", "100px"), ("width", "100px")] {
+        let grid = document.create_element("div");
+        grid.style_mut(&mut document)
+            .set_property("display", "grid");
+        grid.style_mut(&mut document).set_property("width", "400px");
+        document.body().append_child(&mut document, grid);
+        let svg = document.create_element("svg");
+        svg.set_attribute(&mut document, "viewBox", "0 0 1 1");
+        svg.style_mut(&mut document).set_property(property, value);
+        grid.append_child(&mut document, svg);
+    }
+    let tree = document.to_component_tree();
+    let flat = pre_flatten(&tree);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&tree, &flat, 800.0, 600.0).expect("ng");
+    let svgs: Vec<usize> = (0..flat.len())
+        .filter(|&i| matches!(flat[i].kind, w3cos_std::ComponentKind::SvgDocument { .. }))
+        .collect();
+    assert_eq!(svgs.len(), 2);
+    let sizes: Vec<(f32, f32)> = svgs
+        .iter()
+        .map(|&i| (rect(&out, i).2, rect(&out, i).3))
+        .collect();
+    assert_eq!(sizes, vec![(100.0, 100.0), (100.0, 100.0)]);
+}
+
 /// A percentage block size inside a grid item resolves against the item
 /// (a fixed 50px row), and a track sized from a min-content contribution
 /// treats an indefinite one as auto (grid-min-content-width-percent-

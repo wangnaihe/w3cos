@@ -317,16 +317,25 @@ pub(crate) fn layout_tree_with_text(
     let hidden: Vec<(usize, w3cos_std::style::Style)> = flat
         .iter()
         .enumerate()
-        .filter(|(_, node)| {
-            is_empty_inline_text(node)
+        .filter_map(|(index, node)| {
+            if is_empty_inline_text(node)
                 && !node
                     .parent
                     .is_some_and(|parent| parent_has_break_beside_boxes(flat, parent))
-        })
-        .map(|(index, node)| {
-            let mut style = node.style.clone();
-            style.display = w3cos_std::style::Display::None;
-            (index, style)
+            {
+                let mut style = node.style.clone();
+                style.display = w3cos_std::style::Display::None;
+                return Some((index, style));
+            }
+            // The DOM's fallback `px` size of an svg grid item is `auto`
+            // for layout (the legacy engine keeps reading the `px`).
+            if node
+                .parent
+                .is_some_and(|parent| block::is_author_grid(flat[parent].style))
+            {
+                return block::svg_fallback_auto_style(node.style).map(|style| (index, style));
+            }
+            None
         })
         .collect();
     if !hidden.is_empty() {

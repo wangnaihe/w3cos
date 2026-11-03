@@ -570,8 +570,14 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if percent_block(child_style) {
             return Some("grid:percent-block");
         }
+        // An svg root always carries `flex-shrink: 0` from the DOM, which
+        // is inert for a grid item.
+        let inert_shrink = matches!(
+            flat[child].kind,
+            w3cos_std::ComponentKind::SvgDocument { .. }
+        ) && child_style.flex_shrink == 0.0;
         if child_style.flex_grow != 0.0
-            || child_style.flex_shrink != 1.0
+            || (child_style.flex_shrink != 1.0 && !inert_shrink)
             || child_style.flex_basis != Dimension::Auto
         {
             return Some("grid:flex");

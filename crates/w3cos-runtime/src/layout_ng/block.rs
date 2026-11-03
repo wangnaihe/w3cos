@@ -853,15 +853,16 @@ pub(super) fn is_replaced_item(flat: &[FlatNodeInfo], index: usize) -> bool {
         || is_replaced_grid_item(flat, index)
 }
 
-/// A `<canvas>` grid item: sized like an image grid item (Blink
-/// LayoutHTMLCanvas is LayoutReplaced). An `<svg>` root stays legacy: its
-/// DOM style carries fallback sizes the grid item sizing would read as
-/// specified.
+/// A `<canvas>` or `<svg>` grid item: sized like an image grid item (Blink
+/// LayoutHTMLCanvas / LayoutSVGRoot are LayoutReplaced). The DOM's fallback
+/// svg sizes reach layout as `auto` (`block::svg_fallback_auto_style`, applied in `layout_tree_with_text`).
 pub(super) fn is_replaced_grid_item(flat: &[FlatNodeInfo], index: usize) -> bool {
-    matches!(flat[index].kind, ComponentKind::Canvas { .. })
-        && flat[index]
-            .parent
-            .is_some_and(|parent| is_author_grid(flat[parent].style))
+    matches!(
+        flat[index].kind,
+        ComponentKind::Canvas { .. } | ComponentKind::SvgDocument { .. }
+    ) && flat[index]
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
 }
 
 /// The reasons a replaced grid item keeps legacy: floats and abspos are
@@ -2228,6 +2229,26 @@ const SVG_MARKERS: [&str; 4] = [
     SVG_FALLBACK_HEIGHT_MARKER,
 ];
 
+/// The style of an svg grid item with the DOM's fallback sizes read as
+/// `auto` (Blink: an svg root without `width`/`height` attributes has `auto`
+/// computed sizes); `None` when the style already is that. The DOM keeps the
+/// fallback `px` for the legacy engine, which has no replaced-ratio sizing.
+pub(super) fn svg_fallback_auto_style(style: &Style) -> Option<Style> {
+    let width = svg_specified(style, true).is_some() && style.width != Dimension::Auto;
+    let height = svg_specified(style, false).is_some() && style.height != Dimension::Auto;
+    if !(width || height) {
+        return None;
+    }
+    let mut auto = style.clone();
+    if width {
+        auto.width = Dimension::Auto;
+    }
+    if height {
+        auto.height = Dimension::Auto;
+    }
+    Some(auto)
+}
+
 /// `Some(Auto)` when the DOM put a fallback size on that axis of an svg
 /// (its used width/height is then not a specified size).
 fn svg_specified(style: &Style, width: bool) -> Option<Dimension> {
@@ -2402,7 +2423,19 @@ fn svg_box_reason(flat: &[FlatNodeInfo], index: usize, source: &str) -> Option<&
         .parent
         .is_some_and(|parent| is_author_grid(flat[parent].style))
     {
-        return Some("svg:flex-grid-item");
+        return replaced_grid_item_reason(flat, index, "svg:grid-item").or_else(|| {
+            unsupported_box_style(
+                style,
+                &[
+                    inline::VALIGN_MARKER,
+                    SVG_MARKERS[0],
+                    SVG_MARKERS[1],
+                    SVG_MARKERS[2],
+                    SVG_MARKERS[3],
+                ],
+                true,
+            )
+        });
     }
     if info
         .parent
