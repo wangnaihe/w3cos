@@ -3767,6 +3767,27 @@ fn inline_minmax(
             // (fit-content, and a percentage fit-content(), as auto).
             let sizes = if item_width_keyword(flat, index).is_some() {
                 block::keyword_width_contribution(flat, index, space, edges, sizes)?
+            } else if matches!(style.width, Dimension::Auto) {
+                // A definite block size transfers through the aspect ratio
+                // to the inline contribution (css-sizing-4).
+                let block_edges =
+                    border[0] + border[2] + pad(style.padding.top) + pad(style.padding.bottom);
+                match block::ratio_inline_size(flat, index, space, edges, block_edges, sizes)? {
+                    // A scroll container's automatic minimum is zero, so
+                    // its min-content contribution stays compressible
+                    // (grid-aspect-ratio-027).
+                    Some(inline)
+                        if style.min_width == Dimension::Auto
+                            && block::non_visible_overflow(style) =>
+                    {
+                        MinMax {
+                            min: Some(0.0),
+                            max: inline,
+                        }
+                    }
+                    Some(inline) => MinMax::exact(inline),
+                    None => sizes,
+                }
             } else {
                 sizes
             };
@@ -4338,6 +4359,64 @@ fn layout_impl(
         other => resolve_block(other, space.percentage_block, style, space, edges_v)
             .why("grid:percent")?,
     };
+    // css-sizing-4 aspect-ratio on the grid container itself: a definite
+    // block size gives an auto inline size (floored by the automatic
+    // minimum, the min-content size, of a non-scroll container) and an
+    // auto block size follows the used inline size (Blink
+    // ComputeInlineSizeFromAspectRatio / ComputeBlockSizeFromAspectRatio).
+    let mut ratio_block_floor = false;
+    if !measure
+        && !block::size_contained(style)
+        && !matches!(sized, Some((_, Some(_))))
+        && let Some(ratio) = block::BoxAspectRatio::of(style, &metrics)
+    {
+        let clamp_block = |mut h: f32| {
+            if let Some(max) = max_h {
+                h = h.min(max);
+            }
+            if let Some(min) = min_h {
+                h = h.max(min);
+            }
+            h
+        };
+        let edges_h = bl + br + pl + pr;
+        match specified_height {
+            Some(height)
+                if sized.is_none()
+                    && style.width == Dimension::Auto
+                    && keyword.is_none()
+                    && !block::is_inline_grid(style) =>
+            {
+                let mut width = ratio.inline_from_block(clamp_block(height));
+                if style.min_width == Dimension::Auto && !block::non_visible_overflow(style) {
+                    let floor = min_max(flat, index, space)
+                        .why("grid:ratio-min")?
+                        .min
+                        .or_else(|| super::bail("grid:ratio-min"))?;
+                    width = width.max(floor);
+                }
+                width = block::clamp_inline_size(style, space, edges_h, width);
+                let mut definite = style.clone();
+                definite.width = Dimension::Px(width);
+                definite.min_width = Dimension::Auto;
+                definite.max_width = Dimension::Auto;
+                definite.box_sizing = BoxSizing::ContentBox;
+                metrics = block::resolve_inline(&definite, space);
+                inner_width = metrics.content_width.max(0.0);
+            }
+            None if style.height == Dimension::Auto
+                && !has_marker(style, block::MIN_HEIGHT_KEYWORD)
+                && !has_marker(style, block::MAX_HEIGHT_KEYWORD) =>
+            {
+                specified_height = Some(clamp_block(ratio.block_from_inline(inner_width)));
+                // The automatic minimum size floors it at the content height
+                // (grid-aspect-ratio-039).
+                ratio_block_floor =
+                    style.min_height == Dimension::Auto && !block::non_visible_overflow(style);
+            }
+            _ => {}
+        }
+    }
     let font = style.font_size.max(0.0);
     let column_gap = style.column_gap.unwrap_or(style.gap).max(0.0);
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
@@ -4867,10 +4946,27 @@ fn layout_impl(
             }
             align = Pack::Start;
         }
-        if replaced {
+        // An item with a preferred aspect ratio also behaves as `start` for
+        // `normal` (Blink ComputeNormalBehavior); its auto axis follows the
+        // ratio instead of filling the area.
+        let ratio_item = block::marker(child_style, "--w3cos-internal-aspect-ratio")
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .is_some_and(|ratio| ratio.is_finite() && ratio > 0.0);
+        if replaced || ratio_item {
             // `normal` is `start` for a replaced item; only an authored
             // `stretch` fills the area.
-            if justify == Pack::Stretch && !explicit_stretch(style, child_style.justify_self, false)
+            // With both sizes auto, the inline axis still fills the area and
+            // the block size follows the ratio (grid-aspect-ratio-038); a
+            // definite size on either axis transfers instead.
+            let both_auto = ratio_item
+                && !replaced
+                && matches!(child_style.width, Dimension::Auto)
+                && matches!(child_style.height, Dimension::Auto)
+                && !has_marker(child_style, HEIGHT_KEYWORD)
+                && item_width_keyword(flat, item.index).is_none();
+            if justify == Pack::Stretch
+                && !both_auto
+                && !explicit_stretch(style, child_style.justify_self, false)
             {
                 justify = Pack::Start;
             }
@@ -5188,6 +5284,9 @@ fn layout_impl(
         .map(units)
         .or(intrinsic_row_size)
         .unwrap_or(base);
+    if ratio_block_floor {
+        used = used.max(base);
+    }
     if let Some(min) = min_h {
         used = used.max(units(min));
     }

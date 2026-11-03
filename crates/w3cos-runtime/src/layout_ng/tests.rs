@@ -11280,3 +11280,145 @@ fn image_ratio_without_authored_size_or_with_object_fit_keeps_natural_box() {
     );
     assert_eq!((fitted.2, fitted.3), (8.0 * 100.0 / 16.0, 100.0));
 }
+
+/// css-sizing-4 / css-grid 6.2: a grid item with a preferred ratio is
+/// `start` aligned for `normal`, so its auto axis follows the ratio
+/// (aspect-ratio/grid-aspect-ratio-001, -007); the grid container itself
+/// takes its auto inline size from a definite height and its auto block
+/// size from the inline size (-008, -009).
+#[test]
+fn grid_ratio_item_and_container_sizes() {
+    use w3cos_std::style::Display;
+    let ratio = [("--w3cos-internal-aspect-ratio", "1")];
+    let grid = |style: Style| Style {
+        display: Display::Grid,
+        ..style
+    };
+    // Item: height 100 + ratio 1 in an auto grid is a 100x100 square.
+    let item = with_markers(
+        Style {
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        &ratio,
+    );
+    let root = node(
+        block(),
+        vec![node(grid(Style::default()), vec![node(item, vec![])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(
+        rect(&ng, 2),
+        (0.0, 0.0, 100.0, 100.0),
+        "item width from ratio"
+    );
+    // Item: width 100 + ratio 1 in a 200px row stays 100 tall.
+    let item = with_markers(
+        Style {
+            width: Dimension::Px(100.0),
+            ..block()
+        },
+        &ratio,
+    );
+    let mut tall = grid(Style::default());
+    tall.grid_ng_mut().grid_template_rows = Some("200px".to_string());
+    let root = node(block(), vec![node(tall, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(
+        rect(&ng, 2),
+        (0.0, 0.0, 100.0, 100.0),
+        "item height from ratio"
+    );
+    // Item: both sizes auto fills the 100px column; height follows the ratio
+    // (grid-aspect-ratio-038).
+    let item = with_markers(block(), &ratio);
+    let mut fixed = grid(Style::default());
+    fixed.grid_template_columns = Some("100px".to_string());
+    fixed.grid_ng_mut().grid_template_rows = Some("50px".to_string());
+    let root = node(block(), vec![node(fixed, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(
+        rect(&ng, 2),
+        (0.0, 0.0, 100.0, 100.0),
+        "auto item fills inline"
+    );
+    // Container: definite height gives the width, definite width the height.
+    let child = node(block(), vec![]);
+    let by_height = with_markers(
+        grid(Style {
+            height: Dimension::Px(100.0),
+            ..Style::default()
+        }),
+        &ratio,
+    );
+    let root = node(block(), vec![node(by_height, vec![child.clone()])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "container width");
+    assert_eq!(rect(&ng, 2), (0.0, 0.0, 100.0, 100.0), "its stretched item");
+    let by_width = with_markers(
+        grid(Style {
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        }),
+        &ratio,
+    );
+    let root = node(block(), vec![node(by_width, vec![child])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0), "container height");
+}
+
+/// A grid container's ratio height is floored by its content height
+/// (automatic minimum size; grid-aspect-ratio-039).
+#[test]
+fn grid_ratio_container_height_floors_at_content() {
+    use w3cos_std::style::Display;
+    let container = with_markers(
+        Style {
+            display: Display::Grid,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        },
+        &[("--w3cos-internal-aspect-ratio", "2")],
+    );
+    let item = Style {
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(container, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// A scroll-container grid item with a ratio and a definite height has a
+/// compressible min-content contribution (grid-aspect-ratio-027).
+#[test]
+fn grid_ratio_scroll_item_min_content_is_zero() {
+    use w3cos_std::style::{Display, Overflow};
+    let mut container = Style {
+        display: Display::Grid,
+        width: Dimension::Px(0.0),
+        ..Style::default()
+    };
+    container.grid_template_columns = Some("min-content".to_string());
+    let item = with_markers(
+        Style {
+            height: Dimension::Px(100.0),
+            overflow_x: Some(Overflow::Auto),
+            overflow_y: Some(Overflow::Auto),
+            ..block()
+        },
+        &[("--w3cos-internal-aspect-ratio", "2")],
+    );
+    let root = node(block(), vec![node(container, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 2).2, 0.0);
+}
