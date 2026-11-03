@@ -123,9 +123,12 @@ pub(super) fn contain_intrinsic_size(style: &Style) -> (f32, f32) {
 
 pub(super) fn is_value_carrier_marker(key: &str) -> bool {
     let name = key.trim_start_matches("--w3cos-internal-");
-    matches!(
-        name,
-        "font-size-origin"
+    // `last baseline` alignment: grid reads it, the typed fields keep the
+    // fallback value every other layout mode already used.
+    name.starts_with("last-baseline-")
+        || matches!(
+            name,
+            "font-size-origin"
             | "font-specified-size"
             | "html-standard-font"
             | "list-style-image"
@@ -201,7 +204,8 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             | "clamp-lines"
             // Read with the run-in display marker (run_in_block_styles).
             | "run-in-block"
-    ) || name.starts_with("decoration-owner")
+        )
+        || name.starts_with("decoration-owner")
         // Logical sizes the cascade does not resolve. Legacy layout ignores
         // them too, so both engines size the box the same way; falling back
         // only for these boxes moved tests and references apart.

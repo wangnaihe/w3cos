@@ -269,12 +269,9 @@ fn reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
         {
             return Some("lanes:item");
         }
-        if is_baseline(used_item_align(style.align_items, child_style.align_self))
-            || is_baseline(used_item_align(
-                style.justify_items,
-                child_style.justify_self,
-            ))
-        {
+        // `justify-*: baseline` shares column baselines only with orthogonal
+        // items; the parallel items here fall back to start (css-align-3 9.3).
+        if is_baseline(used_item_align(style.align_items, child_style.align_self)) {
             return Some("lanes:baseline");
         }
         let margin = child_style.margin;

@@ -49,6 +49,7 @@ const JUSTIFY_KEYWORD: &str = "--w3cos-internal-justify-content";
 /// ([`vertical_grid_styles`]); `flip-y` when the inline axis runs bottom to
 /// top (`direction: rtl`).
 pub(super) const VERTICAL_MARKER: &str = "--w3cos-internal-vertical-grid";
+const LAST_BASELINE_PREFIX: &str = "--w3cos-internal-last-baseline-";
 const ALIGN_ITEMS_STRETCH: &str = "--w3cos-internal-align-items-stretch";
 const JUSTIFY_ITEMS_STRETCH: &str = "--w3cos-internal-justify-items-stretch";
 
@@ -257,7 +258,6 @@ fn baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
 fn inline_baseline_container_ok(style: &Style) -> bool {
     use w3cos_std::style::WritingMode;
     style.writing_mode == WritingMode::HorizontalTb
-        && !has_marker(style, "--w3cos-internal-grid-lanes")
 }
 
 /// The static-position alignment of an abspos grid child whose authored
@@ -359,6 +359,45 @@ fn align_pack(align: AlignItems) -> Pack {
         AlignItems::Center => Pack::Center,
         AlignItems::Stretch => Pack::Stretch,
         AlignItems::Baseline => Pack::Start,
+    }
+}
+
+/// Whether the item's used alignment in the axis is `last baseline`, read
+/// from the marker `set_last_baseline` writes (own value, or the
+/// container's items value when the item's own is `auto`). An out-of-flow
+/// item falls back to end alignment for its static position (CSS Align 3
+/// 9.3, Blink ComputeStaticPositionAlignment fallback).
+fn last_baseline(container: &Style, child: &Style, block: bool) -> bool {
+    // Only a horizontal child in a horizontal grid: the vertical-writing-mode
+    // static-position pages (grid-abspos-staticpos-*-vertWM-last-baseline-*)
+    // match through the transposed path's own markers, not this fallback.
+    use w3cos_std::style::WritingMode;
+    if container.writing_mode != WritingMode::HorizontalTb
+        || child.writing_mode != WritingMode::HorizontalTb
+    {
+        return false;
+    }
+    let (items, own) = if block {
+        ("align-items", "align-self")
+    } else {
+        ("justify-items", "justify-self")
+    };
+    let item_self = if block {
+        child.align_self
+    } else {
+        child.justify_self
+    };
+    let key = |name: &str| format!("{LAST_BASELINE_PREFIX}{name}");
+    has_marker(child, &key(own))
+        || (item_self == AlignSelf::Auto && has_marker(container, &key(items)))
+}
+
+/// Drop the authored `last baseline` markers from a style the transposed
+/// vertical path rewrites: its keyword markers are patched for the swapped
+/// axes, while these are keyed by the authored (physical) properties.
+fn strip_last_baseline_markers(style: &mut Style) {
+    if let Some(props) = style.custom_properties.as_mut() {
+        props.retain(|key, _| !key.starts_with(LAST_BASELINE_PREFIX));
     }
 }
 
@@ -518,7 +557,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             style.justify_items,
             child_style.justify_self,
         )) && !(inline_baseline_container_ok(style)
-            && baseline_shape_supported(flat, index, child))
+            && child_style.writing_mode == w3cos_std::style::WritingMode::HorizontalTb)
         {
             return Some("grid:baseline");
         }
@@ -4927,19 +4966,9 @@ fn layout_impl(
         // stretch); only the plain `baseline` forms fall back there.
         let baseline = block_baseline(style, child_style)
             .filter(|_| block_baseline_supported(flat, index, item.index));
-        if is_baseline(used_item_align(
-            style.justify_items,
-            child_style.justify_self,
-        )) && items.iter().any(|other| {
-            other.index != item.index
-                && other.col == item.col
-                && is_baseline(used_item_align(
-                    style.justify_items,
-                    flat[other.index].style.justify_self,
-                ))
-        }) {
-            return super::bail("grid:baseline-column");
-        }
+        // `justify-self: baseline` shares column baselines only with
+        // orthogonal items (css-align-3 9.3); the parallel items this path
+        // lays out fall back to start alignment, which `Pack::Start` is.
         if baseline.is_some() {
             if item.row_span != 1 {
                 return super::bail("grid:baseline-span");
@@ -5620,13 +5649,21 @@ fn layout_impl(
             )
         };
         let justify = abspos_keyword_pack(style, child_style, false, rtl).unwrap_or_else(|| {
-            align_pack(used_item_align(
-                style.justify_items,
-                child_style.justify_self,
-            ))
+            if last_baseline(style, child_style, false) {
+                Pack::End
+            } else {
+                align_pack(used_item_align(
+                    style.justify_items,
+                    child_style.justify_self,
+                ))
+            }
         });
         let align = abspos_keyword_pack(style, child_style, true, rtl).unwrap_or_else(|| {
-            align_pack(used_item_align(style.align_items, child_style.align_self))
+            if last_baseline(style, child_style, true) {
+                Pack::End
+            } else {
+                align_pack(used_item_align(style.align_items, child_style.align_self))
+            }
         });
         let border_w = definite_border(
             child_style,
@@ -5985,6 +6022,8 @@ fn vertical_inert_marker(key: &str) -> bool {
         key,
         "--w3cos-internal-list-style-image" | "--w3cos-internal-left-float-after-inline"
     ) || super::orthogonal::INERT_MARKERS.contains(&key)
+        // The transposed styles drop these (`strip_last_baseline_markers`).
+        || key.starts_with(LAST_BASELINE_PREFIX)
 }
 
 /// Authored alignment the transposed static position does not model for an
@@ -6191,12 +6230,14 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             VERTICAL_MARKER.to_string(),
             if rtl { "flip-y" } else { "-" }.to_string(),
         );
+        strip_last_baseline_markers(&mut transposed);
         patched.push((index, transposed));
         for child in items {
             let child_style = flat[child].style;
             let column = placement(child_style, false).map(str::to_string);
             let row = placement(child_style, true).map(str::to_string);
             let mut item = child_style.clone();
+            strip_last_baseline_markers(&mut item);
             {
                 let ng = item.grid_ng_mut();
                 ng.grid_placement_cascaded = true;
@@ -7941,6 +7982,54 @@ mod tests {
                 (2, [0.0, 30.0, 100.0, 10.0]),
             ],
         );
+    }
+
+    #[test]
+    fn abspos_static_position_last_baseline_falls_back_to_end() {
+        // Chrome, grid 200x100, 30x20 abspos child with no insets: `last
+        // baseline` (align-self, justify-self, or inherited from the
+        // container items) falls back to end alignment (auto tracks; Chrome
+        // 200x100 grid); an explicit
+        // `align-self: start` or a first `baseline` stays at the start.
+        let marker = |property: &str| {
+            CustomProperties::from_iter([(
+                format!("{LAST_BASELINE_PREFIX}{property}"),
+                "1".to_string(),
+            )])
+        };
+        let child = |own: Option<&str>| {
+            let mut abs = block_box(Some(30.0), Some(20.0));
+            abs.position = Position::Absolute;
+            abs.custom_properties = own.map(marker);
+            abs
+        };
+        let run = |container: Style, child: Style| {
+            let out = lay(&Component::boxed(container, vec![leaf(child)]));
+            let r = rect(&out, 1);
+            (r[0], r[1])
+        };
+        let grid = || grid_style(200.0, Some(100.0), None);
+        assert_eq!(run(grid(), child(Some("align-self"))), (0.0, 80.0));
+        assert_eq!(run(grid(), child(Some("justify-self"))), (170.0, 0.0));
+        let mut items = grid();
+        items.custom_properties = Some(CustomProperties::from_iter([
+            (
+                format!("{LAST_BASELINE_PREFIX}align-items"),
+                "1".to_string(),
+            ),
+            (
+                format!("{LAST_BASELINE_PREFIX}justify-items"),
+                "1".to_string(),
+            ),
+        ]));
+        assert_eq!(run(items.clone(), child(None)), (170.0, 80.0));
+        let mut own_start = child(None);
+        own_start.align_self = AlignSelf::FlexStart;
+        assert_eq!(run(items, own_start), (170.0, 0.0));
+        let mut first = child(None);
+        first.align_self = AlignSelf::Baseline;
+        first.justify_self = AlignSelf::Baseline;
+        assert_eq!(run(grid(), first), (0.0, 0.0));
     }
 
     #[test]
