@@ -143,7 +143,7 @@ fn grid_item_flow(flat: &[FlatNodeInfo], index: usize, patched: bool) -> Option<
         )
         || !plain_flow_style(style, flow)
         || (!patched && style.direction != TextDirection::Ltr)
-        || style.position != Position::Absolute
+        || !matches!(style.position, Position::Absolute | Position::Static)
         || block::is_author_flex(style)
         || block::is_author_grid(style)
         || has_internal_marker(style, GRID_ITEM_MARKERS)

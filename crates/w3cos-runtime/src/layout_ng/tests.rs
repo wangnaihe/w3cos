@@ -11091,6 +11091,116 @@ fn vertical_grid_abspos_items_with_text_are_orthogonal_roots() {
     }
 }
 
+/// A static item with text of a vertical inline-grid without templates
+/// (implicit auto tracks in a 250x250 box) is an orthogonal root of the
+/// grid's frame, aligned by its own `justify-self` / `align-self`. Measured
+/// with Chrome (wpt grid-self-alignment-stretch-vertical-lr/rl-009).
+#[test]
+fn vertical_grid_static_text_items_stretch_and_align() {
+    use w3cos_std::style::{AlignSelf, CustomProperties, Position, TextDirection, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let marked = |style: Style, keys: &[&str]| Style {
+        custom_properties: Some(CustomProperties::from_iter(
+            keys.iter()
+                .map(|k| (format!("--w3cos-internal-{k}"), "none".to_string())),
+        )),
+        ..style
+    };
+    // (row, column, justify-self, align-self)
+    let cells = [
+        (1, 1, AlignSelf::Stretch, AlignSelf::FlexStart),
+        (1, 2, AlignSelf::FlexStart, AlignSelf::Stretch),
+        (2, 1, AlignSelf::FlexStart, AlignSelf::FlexStart),
+        (2, 2, AlignSelf::Stretch, AlignSelf::Stretch),
+    ];
+    let expected = [
+        (
+            WritingMode::VerticalLr,
+            [
+                (0.0, 0.0, 20.0, 125.0),
+                (0.0, 125.0, 125.0, 80.0),
+                (125.0, 0.0, 20.0, 80.0),
+                (125.0, 125.0, 125.0, 125.0),
+            ],
+        ),
+        (
+            WritingMode::VerticalRl,
+            [
+                (230.0, 0.0, 20.0, 125.0),
+                (125.0, 125.0, 125.0, 80.0),
+                (105.0, 0.0, 20.0, 80.0),
+                (0.0, 125.0, 125.0, 125.0),
+            ],
+        ),
+    ];
+    for (mode, rects_expected) in expected {
+        let mut grid = marked(
+            Style {
+                display: Display::Flex,
+                position: Position::Relative,
+                writing_mode: mode,
+                direction: TextDirection::Ltr,
+                width: Dimension::Px(250.0),
+                height: Dimension::Px(250.0),
+                ..font.clone()
+            },
+            &["align-items"],
+        );
+        grid.custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                "--w3cos-internal-unrecognized-display".to_string(),
+                "inline-grid".to_string(),
+            );
+        let items: Vec<Component> = cells
+            .iter()
+            .map(|&(row, column, justify, align)| {
+                let mut style = marked(
+                    Style {
+                        writing_mode: mode,
+                        justify_self: justify,
+                        align_self: align,
+                        grid_column: Some(column.to_string()),
+                        ..font.clone()
+                    },
+                    &["justify-self"],
+                );
+                style.grid_ng_mut().grid_row = Some(row.to_string());
+                node(
+                    style,
+                    vec![Component::text(
+                        "XX X",
+                        marked(
+                            Style {
+                                display: Display::Inline,
+                                writing_mode: mode,
+                                ..font.clone()
+                            },
+                            &["text-source-run"],
+                        ),
+                    )],
+                )
+            })
+            .collect();
+        let root = node(block(), vec![node(grid, items)]);
+        let flat = pre_flatten(&root);
+        let (rects, texts) = layout_tree_with_text(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("{mode:?}: grid fell back"));
+        assert_eq!(rect(&rects, 1), (0.0, 0.0, 250.0, 250.0), "{mode:?}");
+        for (i, want) in rects_expected.iter().enumerate() {
+            assert_eq!(rect(&rects, 2 + 2 * i), *want, "{mode:?} item {i}");
+        }
+        assert!(texts.iter().all(|t| t.vertical) && !texts.is_empty());
+    }
+}
+
 /// Nested blocks inside orthogonal roots: block-direction margins collapse
 /// along the physical x axis, children stretch to the root's inline size
 /// (its physical height), and `vertical-rl` flows from the right edge.

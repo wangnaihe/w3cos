@@ -1183,7 +1183,12 @@ fn inline_grid_tracks_for(
     if intrinsic {
         !fixed && axis_line(columns_spec(style), false) && axis_line(style.grid_rows(), true)
     } else {
-        columns_spec(style).is_some() && style.grid_rows().is_some() && fixed
+        (columns_spec(style).is_some() && style.grid_rows().is_some() && fixed)
+            // A transposed vertical grid with definite physical sizes sizes
+            // its auto tracks inside them.
+            || ((patching || has_marker(style, VERTICAL_MARKER))
+                && matches!(style.width, Dimension::Px(_))
+                && matches!(style.height, Dimension::Px(_)))
     }
 }
 
@@ -6252,8 +6257,19 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         let mut items = Vec::new();
         let mut simple = true;
         let rtl = style.direction == TextDirection::Rtl;
+        // A scroll container paints its scrollbars in the physical frame the
+        // transposed layout does not model (grid-container-scrollbar-vertical-*),
+        // so static text items keep their previous path there.
+        let static_text_ok = !block::non_visible_overflow(style);
         for child in rendered_children(flat, index) {
             let child_style = flat[child].style;
+            // A horizontal (ltr) text item of a vertical grid is an ordinary
+            // box of the transposed (physical) grid.
+            let static_horizontal_text = static_text_ok
+                && child_style.position == Position::Static
+                && child_style.direction == TextDirection::Ltr
+                && flat[child].subtree_end > child + 1
+                && horizontal_text_item(flat, child);
             if !matches!(
                 flat[child].kind,
                 w3cos_std::ComponentKind::Box
@@ -6262,11 +6278,17 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             ) || (flat[child].subtree_end > child + 1
                 && !(child_style.position == Position::Absolute
                     && (super::orthogonal::grid_item_text_flow(flat, child).is_some()
-                        || horizontal_text_item(flat, child))))
+                        || horizontal_text_item(flat, child)))
+                && !(child_style.position == Position::Static
+                    && static_text_ok
+                    && (super::orthogonal::grid_item_text_flow(flat, child).is_some()
+                        || static_horizontal_text)))
                 || !(child_style.writing_mode == style.writing_mode
-                    || child_style.position == Position::Absolute)
+                    || child_style.position == Position::Absolute
+                    || static_horizontal_text)
                 || !(child_style.direction == style.direction
-                    || child_style.position == Position::Absolute)
+                    || child_style.position == Position::Absolute
+                    || static_horizontal_text)
                 || !(child_style.position == Position::Static
                     || (child_style.position == Position::Absolute
                         && !rtl
