@@ -33,6 +33,7 @@ pub mod npm_bridge;
 mod ns_merge_e2e_tests;
 pub mod parser;
 pub mod scope_analysis;
+pub mod split_profile;
 pub mod style_matcher;
 pub mod ts_transpiler;
 pub mod ts_types;
