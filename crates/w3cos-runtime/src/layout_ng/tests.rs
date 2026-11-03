@@ -4982,6 +4982,74 @@ fn flex_row_last_baseline_group_matches_chrome() {
     assert_eq!(rect(&out, 8), (80.0, 80.0 + 55.0, 40.0, 10.0));
 }
 
+/// A block grid container exports its first-row and last-row baselines
+/// (CSS Grid §10.2) when its parent is a grid: a grid row that baseline-aligns it uses the first
+/// baseline of the first row's first item, and the last baseline of the last
+/// item in the last row for `last baseline`.
+#[test]
+fn block_grid_exports_first_and_last_baseline() {
+    let build = |markers: &[(&str, &str)]| {
+        let grid = Style {
+            display: Display::Grid,
+            width: Dimension::Px(100.0),
+            grid_template_columns: Some("50px 50px".to_string()),
+            ..block()
+        };
+        let cell = |height: f32| {
+            node(
+                Style {
+                    height: Dimension::Px(height),
+                    ..block()
+                },
+                vec![],
+            )
+        };
+        let sibling = Style {
+            width: Dimension::Px(40.0),
+            height: Dimension::Px(10.0),
+            ..block()
+        };
+        let outer = with_markers(
+            Style {
+                display: Display::Grid,
+                align_items: w3cos_std::style::AlignItems::Baseline,
+                width: Dimension::Px(300.0),
+                grid_template_columns: Some("100px 100px".to_string()),
+                ..block()
+            },
+            markers,
+        );
+        node(
+            block(),
+            vec![node(
+                outer,
+                vec![
+                    node(grid, vec![cell(20.0), cell(30.0)]),
+                    node(sibling, vec![]),
+                ],
+            )],
+        )
+    };
+    for (markers, expected_y) in [
+        (&[][..], 10.0),
+        (
+            &[
+                ("--w3cos-internal-align-items", "last baseline"),
+                ("--w3cos-internal-last-baseline-align-items", "1"),
+            ][..],
+            20.0,
+        ),
+    ] {
+        let root = build(markers);
+        let flat = pre_flatten(&root);
+        let out = layout_tree(&root, &flat, 800.0, 600.0)
+            .unwrap_or_else(|| panic!("{:?}", block::unsupported_reasons(&flat)));
+        // Preorder: 0 root, 1 outer grid, 2 nested grid, 3, 4 cells, 5 sibling.
+        assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 30.0), "{markers:?}");
+        assert_eq!(rect(&out, 5).1, expected_y, "{markers:?}");
+    }
+}
+
 /// A text run is an anonymous flex item laid out as block text (CSS
 /// Flexbox §4). Row: the flex base size is its max-content width and the
 /// automatic minimum its min-content width (§4.5); it stretches to the

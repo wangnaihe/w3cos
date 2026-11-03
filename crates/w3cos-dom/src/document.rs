@@ -4331,6 +4331,45 @@ impl Document {
                 _ => {}
             }
         }
+        // `inherit` of the box-alignment longhands, directly or through
+        // `place-items` / `place-content` (`grid-self-alignment-baseline-
+        // with-grid-001` passes `place-items: inherit` to a nested grid).
+        if let Some(parent) = inherited {
+            for (longhand, names) in [
+                (
+                    "align-items",
+                    &["align-items", "alignItems", "place-items", "placeItems"][..],
+                ),
+                (
+                    "justify-items",
+                    &["justify-items", "justifyItems", "place-items", "placeItems"][..],
+                ),
+                (
+                    "align-content",
+                    &[
+                        "align-content",
+                        "alignContent",
+                        "place-content",
+                        "placeContent",
+                    ][..],
+                ),
+                (
+                    "justify-content",
+                    &[
+                        "justify-content",
+                        "justifyContent",
+                        "place-content",
+                        "placeContent",
+                    ][..],
+                ),
+            ] {
+                if declared_value(names)
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("inherit"))
+                {
+                    crate::css_style::inherit_box_alignment(&mut style, parent, longhand);
+                }
+            }
+        }
         if let Some(value) = declared_value(&["z-index", "zIndex"]) {
             match value.trim().to_ascii_lowercase().as_str() {
                 "inherit" => {

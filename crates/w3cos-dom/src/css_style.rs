@@ -317,6 +317,48 @@ fn set_last_baseline(style: &mut Style, property: &str, value: &str) {
     );
 }
 
+/// `inherit` for a box-alignment longhand (`align-items`, `justify-items`,
+/// `align-content`, `justify-content`, also reached through the `place-*`
+/// shorthands): the computed value is the parent's, which here is the typed
+/// field plus the markers that carry what the enum folds away (the authored
+/// keyword, `stretch`, `last baseline`, `safe`).
+pub fn inherit_box_alignment(style: &mut Style, parent: &Style, longhand: &str) {
+    let keys: Vec<String> = match longhand {
+        "align-items" => {
+            style.align_items = parent.align_items;
+            vec![
+                ALIGN_ITEMS_KEYWORD_PROPERTY.to_string(),
+                ALIGN_ITEMS_STRETCH_PROPERTY.to_string(),
+                format!("{LAST_BASELINE_PREFIX}align-items"),
+            ]
+        }
+        "justify-items" => {
+            style.justify_items = parent.justify_items;
+            vec![
+                JUSTIFY_ITEMS_STRETCH_PROPERTY.to_string(),
+                format!("{LAST_BASELINE_PREFIX}justify-items"),
+            ]
+        }
+        "align-content" => {
+            style.align_content = parent.align_content;
+            vec!["--w3cos-internal-safe-align-content".to_string()]
+        }
+        "justify-content" => {
+            style.justify_content = parent.justify_content;
+            vec![JUSTIFY_CONTENT_PROPERTY.to_string()]
+        }
+        _ => return,
+    };
+    for key in keys {
+        let value = parent
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(&key))
+            .map(|value| value.to_string());
+        set_marker(style, &key, value);
+    }
+}
+
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
     // A later size declaration of the same property replaces `stretch`.
     if let Some(token) = stretch_token_of(key) {
@@ -9022,6 +9064,49 @@ fn last_baseline_alignment_sets_a_layout_marker() {
     // The typed fields are unchanged by the marker.
     d.set_property("align-items", "last baseline");
     assert_eq!(d.inner.align_items, parse_align_items("last baseline"));
+}
+
+#[test]
+fn inherit_box_alignment_copies_typed_values_and_markers() {
+    let mut parent = CSSStyleDeclaration::new();
+    parent.set_property("align-items", "last baseline");
+    parent.set_property("justify-items", "start");
+    parent.set_property("place-content", "end");
+    let mut child = CSSStyleDeclaration::new();
+    for longhand in [
+        "align-items",
+        "justify-items",
+        "align-content",
+        "justify-content",
+    ] {
+        inherit_box_alignment(&mut child.inner, &parent.inner, longhand);
+    }
+    assert_eq!(child.inner.align_items, parent.inner.align_items);
+    assert_eq!(child.inner.justify_items, parent.inner.justify_items);
+    assert_eq!(child.inner.align_content, parent.inner.align_content);
+    assert_eq!(child.inner.justify_content, parent.inner.justify_content);
+    let marker = |style: &Style, key: &str| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|props| props.get(key))
+            .map(|value| value.to_string())
+    };
+    for key in [
+        ALIGN_ITEMS_KEYWORD_PROPERTY.to_string(),
+        format!("{LAST_BASELINE_PREFIX}align-items"),
+        JUSTIFY_CONTENT_PROPERTY.to_string(),
+    ] {
+        assert_eq!(
+            marker(&child.inner, &key),
+            marker(&parent.inner, &key),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        marker(&child.inner, &format!("{LAST_BASELINE_PREFIX}align-items")).as_deref(),
+        Some("1")
+    );
 }
 
 #[test]

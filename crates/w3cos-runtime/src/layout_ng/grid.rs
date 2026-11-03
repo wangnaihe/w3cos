@@ -208,9 +208,14 @@ fn pack_keyword(keyword: &str, rtl: bool) -> Pack {
 }
 
 /// Block-axis baseline alignment covers plain horizontal grids of items
-/// with a known first or last baseline: no subgrid, lanes,
-/// vertical writing mode, grid-container items (whose baseline this engine
-/// does not export for a block grid), or auto margins in the block axis.
+/// with a known first or last baseline: no subgrid, lanes, vertical writing
+/// mode, or auto margins in the block axis. A grid-container item exports
+/// its own first and last baseline.
+///
+/// An auto-height grid with authored templates is covered too: it was kept
+/// on legacy only to hold accidental passes (the paired subgrid and
+/// grid-lanes tests, whose plain-grid references legacy renders the same
+/// wrong way); the gate covers those pages.
 fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
     // A definite height, or an auto height over implicit tracks only: the
     // auto-height forms with authored templates stay on legacy until the
@@ -219,10 +224,19 @@ fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
     // the same way as the (legacy) test, so lifting the restriction turns
     // those accidental passes into failures (subgrid-baseline-003/004,
     // grid-lanes-baseline-alignment-affects-intrinsic-size-002,
-    // row-grid-lanes-item-baseline-003).
+    // row-grid-lanes-item-baseline-003, column-grid-lanes-container-
+    // baseline-001b). Grids that nest boxes (an item with element children,
+    // or a grid inside a grid) are the exception: those are what the
+    // nested-grid alignment tests measure, and their references are not the
+    // flat text-item grids the paired tests above share.
     let style = flat[container].style;
     (matches!(style.height, Dimension::Px(_))
         || (columns_spec(style).is_none() && style.grid_rows().is_none())
+        || rendered_children(flat, container).any(|c| {
+            rendered_children(flat, c)
+                .any(|g| !matches!(flat[g].kind, w3cos_std::ComponentKind::Text { .. }))
+        })
+        || flat[container].parent.is_some_and(|p| flat[p].style.display == Display::Grid)
         // An inline-grid whose rows are all fixed px has a definite
         // content height, so its row baselines do not feed a size cycle.
         || (block::is_inline_grid(style)
@@ -243,7 +257,6 @@ fn baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
         && !has_marker(style, "--w3cos-internal-grid-lanes")
         && !subgrid(columns_spec(style))
         && !subgrid(style.grid_rows())
-        && child_style.display != Display::Grid
         && !subgrid(columns_spec(child_style))
         && !subgrid(child_style.grid_rows())
         && !matches!(child_style.margin.top, Spacing::Auto)
@@ -5617,6 +5630,16 @@ fn layout_impl(
     let inline_grid = marker(style, "--w3cos-internal-unrecognized-display") == Some("inline-grid");
     // First baseline of the first row (CSS Grid §10). Column, then source.
     let mut first_row_baseline: Option<(usize, usize, f32)> = None;
+    // Last baseline: the last item (source order) ending in the last row.
+    let mut last_row_baseline: Option<(usize, f32)> = None;
+    // A block grid exports its baselines where a grid is the parent (the
+    // nested-grid alignment of css-grid 10.2). In a flex row or a block it
+    // still reports none: the grid-lanes and subgrid tests that pair with a
+    // plain-grid reference there render the same way on both sides.
+    let exports_baseline = inline_grid
+        || flat[index]
+            .parent
+            .is_some_and(|p| flat[p].style.display == Display::Grid);
     // Source ordinals are unique and bounded by the direct child count.
     // Index them directly instead of instantiating another stable sort.
     // Out-of-flow and skipped whitespace children leave holes.
@@ -5688,7 +5711,7 @@ fn layout_impl(
         }
         let (dx, dy) = oof::relative_offset(flat[item.index].style, space);
         let laid = &fragments[index];
-        if inline_grid && item.row == 0 {
+        if item.row == 0 {
             let item_base = match laid.first_baseline {
                 LastBaseline::At(value) => value,
                 LastBaseline::NoLines | LastBaseline::Unknown => fragment.height,
@@ -5698,6 +5721,16 @@ fn layout_impl(
                 .is_none_or(|(col, source, _)| (item.col, item.source) < (col, source));
             if replace {
                 first_row_baseline = Some((item.col, item.source, offset));
+            }
+        }
+        if item.row + item.row_span >= rows.len() {
+            let item_base = match laid.last_baseline {
+                LastBaseline::At(value) => value,
+                LastBaseline::NoLines | LastBaseline::Unknown => fragment.height,
+            };
+            let offset = y + dy + item_base;
+            if last_row_baseline.is_none_or(|(source, _)| item.source > source) {
+                last_row_baseline = Some((item.source, offset));
             }
         }
         pending_oof.extend(
@@ -6000,15 +6033,18 @@ fn layout_impl(
             vertical: false,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: if inline_grid {
-            LastBaseline::At(
-                first_row_baseline
-                    .map(|(_, _, offset)| offset)
-                    .unwrap_or(border_height),
-            )
-        } else {
-            LastBaseline::NoLines
+        last_baseline: match last_row_baseline {
+            Some((_, offset)) if exports_baseline => LastBaseline::At(offset),
+            _ => LastBaseline::NoLines,
+        },
+        // A block grid exports its first row's baseline too (CSS Grid
+        // 10.2: it is a baseline set of its own); with no item it has none,
+        // whereas an inline-grid synthesizes one from its border box.
+        first_baseline: match (first_row_baseline, inline_grid) {
+            (Some((_, _, offset)), _) if exports_baseline => LastBaseline::At(offset),
+            (Some(_), _) => LastBaseline::NoLines,
+            (None, true) => LastBaseline::At(border_height),
+            (None, false) => LastBaseline::NoLines,
         },
         start_strut,
         end_strut,
