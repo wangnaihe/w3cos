@@ -403,8 +403,9 @@ pub struct Style {
     pub border_bottom_left_radius: Option<f32>,
     pub border_width: f32,
     pub border_color: Color,
-    /// Computed keyword provenance, top/right/bottom/left. CSS currentColor
-    /// is inherited as a keyword, not as the parent's resolved RGBA value.
+    /// Computed keyword provenance, top/right/bottom/left. A currentColor
+    /// declaration on this element resolves against its foreground color;
+    /// explicit `inherit` copies the parent's computed edge color instead.
     /// None leaves native numeric styles without CSS provenance unchanged.
     #[serde(default)]
     pub border_current_color: Option<[bool; 4]>,
