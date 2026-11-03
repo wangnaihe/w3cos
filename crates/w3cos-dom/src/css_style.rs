@@ -65,6 +65,10 @@ pub const ASPECT_RATIO_PROPERTY: &str = "--w3cos-internal-aspect-ratio";
 /// (`inline-axis`). Legacy keeps the `-webkit-box` row it already lays out;
 /// LayoutNG reads this for a block-flow `-webkit-box`.
 pub const WEBKIT_BOX_ORIENT_PROPERTY: &str = "--w3cos-internal-webkit-box-orient";
+/// `transform: translate*(<percentage>)` as `"x,y"` percentages of the
+/// border box. Set only under `W3COS_LAYOUT_NG`; the paint tree resolves it
+/// against the laid-out box (the pixel part stays in `Style::transform`).
+pub const TRANSLATE_PERCENT_PROPERTY: &str = "--w3cos-internal-translate-percent";
 /// `-webkit-line-clamp`: a positive line count. Legacy ignores it.
 /// (The standard `line-clamp` is not stored: NG does not model it.)
 pub const WEBKIT_LINE_CLAMP_PROPERTY: &str = "--w3cos-internal-webkit-line-clamp";
@@ -1125,6 +1129,12 @@ impl CSSStyleDeclaration {
             // Transform
             "transform" => {
                 self.inner.transform = parse_transform(value);
+                // LayoutNG only: percentages resolve against the border box,
+                // known after layout (paint reads the marker).
+                let percent = crate::document::layout_ng_requested()
+                    .then(|| parse_translate_percent(value))
+                    .flatten();
+                set_marker(&mut self.inner, TRANSLATE_PERCENT_PROPERTY, percent);
             }
 
             // Compositor hints (standard CSS — UA picks GPU/CPU internally)
@@ -3521,6 +3531,32 @@ fn apply_border_side_shorthand(style: &mut Style, value: &str, side: BorderSide)
     }
 }
 
+/// `translate`/`translateX`/`translateY` percentages of a `transform`
+/// value as `"x,y"` (percent of the border-box width and height). `None`
+/// when the value has none.
+fn parse_translate_percent(value: &str) -> Option<String> {
+    let percent = |part: Option<&str>| {
+        part.and_then(|p| p.trim().strip_suffix('%'))
+            .and_then(|p| p.trim().parse::<f32>().ok())
+    };
+    let (mut x, mut y) = (None, None);
+    let v = value.trim();
+    if let Some(inner) = extract_fn(v, "translateX") {
+        x = percent(Some(inner));
+    }
+    if let Some(inner) = extract_fn(v, "translateY") {
+        y = percent(Some(inner));
+    }
+    if let Some(start) = v.find("translate(") {
+        let rest = &v[start + "translate(".len()..];
+        let inner = rest.split(')').next().unwrap_or("");
+        let mut parts = inner.split(',');
+        x = percent(parts.next()).or(x);
+        y = percent(parts.next()).or(y);
+    }
+    (x.is_some() || y.is_some()).then(|| format!("{},{}", x.unwrap_or(0.0), y.unwrap_or(0.0)))
+}
+
 fn parse_transform(value: &str) -> w3cos_std::style::Transform2D {
     let mut t = w3cos_std::style::Transform2D::IDENTITY;
     let v = value.trim();
@@ -5266,6 +5302,18 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn translate_percentages_are_split_from_the_pixel_translation() {
+        use super::parse_translate_percent as pct;
+        assert_eq!(pct("translateX(-50%)").as_deref(), Some("-50,0"));
+        assert_eq!(pct("translateY(25%)").as_deref(), Some("0,25"));
+        assert_eq!(pct("translate(-100%, 10%)").as_deref(), Some("-100,10"));
+        assert_eq!(pct("translate(50%, 3px)").as_deref(), Some("50,0"));
+        assert_eq!(pct("translate(5px)"), None);
+        assert_eq!(pct("translateX(10px) scale(2)"), None);
+        assert_eq!(pct("none"), None);
+    }
+
     #[test]
     fn resize_keywords_round_trip_and_invalid_values_keep_the_valid_declaration() {
         let mut declaration = super::CSSStyleDeclaration::new();
