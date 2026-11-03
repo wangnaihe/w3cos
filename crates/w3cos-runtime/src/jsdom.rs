@@ -9877,7 +9877,10 @@ fn merged_inline_text_rect(node: u32) -> Option<w3cos_dom::DOMRect> {
         .iter()
         .filter_map(|child| dom::get_text_content(*child))
         .collect::<String>();
-    if text.is_empty() || text.chars().all(char::is_whitespace) {
+    if text
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}'))
+    {
         return None;
     }
     let (width, height) = crate::layout::inline_text_box_size(&text, &style, parent_rect.width);
@@ -24133,13 +24136,22 @@ mod tests {
             .set_property("fontSize", Value::string("12px"));
         container.call_method("appendChild", vec![reg.clone()]);
         let mut spans = vec![];
-        for chr in ["n", "0", "|", "m"] {
+        for chr in [
+            "n", "0", "|", "m", "\u{ff4d}", "\u{2192}", "\u{b7}", "\u{a0}",
+        ] {
             reg.call_method(
                 "appendChild",
                 vec![document.call_method("createElement", vec![Value::string("br")])],
             );
             let span = document.call_method("createElement", vec![Value::string("span")]);
-            span.set_property("textContent", Value::string(&chr.repeat(256)));
+            // The editor measures the space with innerText on 256 no-break
+            // spaces; every other character goes through textContent.
+            let property = if chr == "\u{a0}" {
+                "innerText"
+            } else {
+                "textContent"
+            };
+            span.set_property(property, Value::string(&chr.repeat(256)));
             reg.call_method("appendChild", vec![span.clone()]);
             spans.push((chr, span));
         }
