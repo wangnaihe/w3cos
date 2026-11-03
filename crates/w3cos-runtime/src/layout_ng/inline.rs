@@ -41,6 +41,62 @@ use w3cos_std::style::{
 
 const EPSILON: f32 = 1.0 / 128.0;
 
+/// `tab-size` (--w3cos-internal-tab-size): `n<number>` or `l<px>`; absent is
+/// the initial 8.
+const TAB_SIZE_MARKER: &str = "--w3cos-internal-tab-size";
+
+/// A leaf of nothing but preserved tabs (white-space: pre, so no wrap
+/// opportunity or hanging). NGInlineItemsBuilder keeps each tab as an item
+/// character; its advance depends on the inline position, so only a leaf
+/// at the start of its line (position 0) is modelled.
+fn tab_only(content: &str, style: &Style) -> bool {
+    !content.is_empty()
+        && content.bytes().all(|b| b == b'\t')
+        && style.white_space == WhiteSpace::Pre
+        && !style.break_spaces
+}
+
+/// Blink's `Font::TabWidth` for `count` consecutive tabs from the line
+/// start: the tab size is `n` space advances (the space glyph plus
+/// letter-spacing and word-spacing) or an absolute length, each tab runs to
+/// the next multiple of it, and a tab narrower than half a space takes the
+/// following stop. A zero tab size gives no advance.
+fn tab_width(content: &str, style: &Style) -> f32 {
+    let mut bare = style.clone();
+    bare.letter_spacing = 0.0;
+    bare.word_spacing = 0.0;
+    bare.padding = Style::default().padding;
+    bare.border_width = 0.0;
+    bare.border_top_width = None;
+    bare.border_right_width = None;
+    bare.border_bottom_width = None;
+    bare.border_left_width = None;
+    let space = max_content_width(" ", &bare);
+    let spaced = space + style.letter_spacing + style.word_spacing;
+    let base = match marker_value(style, TAB_SIZE_MARKER) {
+        Some(v) if v.starts_with('n') => v[1..].parse::<f32>().unwrap_or(8.0) * spaced,
+        Some(v) if v.starts_with('l') => v[1..].parse::<f32>().unwrap_or(0.0),
+        _ => 8.0 * spaced,
+    };
+    if base <= 0.0 {
+        return 0.0;
+    }
+    let mut position = 0.0f32;
+    for _ in content.bytes() {
+        let mut distance = base - position % base;
+        if distance < space / 2.0 {
+            distance += base;
+        }
+        position += distance;
+    }
+    position
+}
+
+/// Advance of `text` when it is a modelled tab leaf, else `None`.
+fn tab_advance(text: &str, style: &Style) -> Option<f32> {
+    tab_only(text, style).then(|| tab_width(text, style))
+}
+
 fn has_marker(style: &Style, key: &str) -> bool {
     style
         .custom_properties
@@ -439,6 +495,10 @@ fn supported_script_in(content: &str, reordered: bool) -> bool {
 /// the primary font's: the engines resolve those used-font metrics on
 /// different paths (paint wrapper, line metrics), so legacy keeps them.
 fn fallback_grows_line(content: &str, style: &Style) -> bool {
+    // Tabs shape with the primary font (no glyph fallback).
+    if tab_only(content, style) {
+        return false;
+    }
     #[cfg(feature = "skia")]
     if style.line_height_is_normal && !latin1(content) {
         return crate::render_skia::text_fallback_grows_normal_line(content, style);
@@ -467,12 +527,15 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     {
         return Some("text:edges");
     }
-    if content.is_empty() || content.contains(['\n', '\r', '\t']) {
+    if content.is_empty()
+        || content.contains(['\n', '\r'])
+        || (content.contains('\t') && !tab_only(content, style))
+    {
         return Some("text:content");
     }
     // (A visual-order fragment from the cascade's bidi pass: paint draws
     // the paragraph leaf as given.)
-    if !supported_script_in(content, bidi_fragment(style)) {
+    if !tab_only(content, style) && !supported_script_in(content, bidi_fragment(style)) {
         return Some("text:script");
     }
     if fallback_grows_line(content, style) {
@@ -546,6 +609,7 @@ fn inline_text_reason(
     content: &str,
     style: &Style,
     sole: bool,
+    first: bool,
     container: &Style,
 ) -> Option<&'static str> {
     if style.display != Display::Inline {
@@ -613,7 +677,8 @@ fn inline_text_reason(
             _ => false,
         };
     if content.is_empty()
-        || content.contains(['\r', '\t'])
+        || content.contains('\r')
+        || (content.contains('\t') && !(first && tab_only(content, style)))
         || (content.contains('\n') && !newline_ok)
     {
         return Some("text:content");
@@ -623,7 +688,7 @@ fn inline_text_reason(
     if fragment && content.contains('\u{2028}') && content != FORCED_BREAK && !paragraph {
         return Some("bidi:frozen-break");
     }
-    if !supported_script_in(content, fragment) {
+    if !tab_only(content, style) && !supported_script_in(content, fragment) {
         return Some("text:script");
     }
     if fallback_grows_line(content, style) {
@@ -1002,7 +1067,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if info.style.white_space != style.white_space {
             return Some("text:white-space");
         }
-        if let Some(reason) = inline_text_reason(content, info.style, sole, style) {
+        if let Some(reason) = inline_text_reason(content, info.style, sole, position == 0, style) {
             return Some(reason);
         }
         if content == FORCED_BREAK {
@@ -1098,6 +1163,19 @@ fn text_line_metrics(content: &str, style: &Style) -> (f32, f32) {
     (height, baseline)
 }
 
+/// `text_line_metrics` of a leaf whose font is chosen by its characters: a
+/// tab shapes with the primary font (the space glyph), not a fallback.
+fn text_line_metrics_of(content: &str, style: &Style) -> (f32, f32) {
+    text_line_metrics(
+        if tab_only(content, style) {
+            " "
+        } else {
+            content
+        },
+        style,
+    )
+}
+
 /// Whether a text leaf painted alone in its rect (no inline line context)
 /// puts its glyphs on the baseline `text_line_metrics` gives an IFC: the
 /// line box is the font box, so paint's centring has nothing to offset.
@@ -1107,7 +1185,7 @@ pub(super) fn leaf_paints_like_ifc(content: &str, style: &Style) -> bool {
         let Some(font) = crate::render_skia::resolved_font_geometry(style) else {
             return false;
         };
-        let (line, _) = text_line_metrics(content, style);
+        let (line, _) = text_line_metrics_of(content, style);
         font.line_gap.abs() < 0.01 && (line - font.height()).abs() < 0.01
     }
     #[cfg(not(feature = "skia"))]
@@ -1249,6 +1327,7 @@ fn same_run(a: &Style, b: &Style) -> bool {
 fn run_advances(texts: &[&str], style: &Style) -> Vec<f32> {
     #[cfg(feature = "skia")]
     if texts.len() > 1
+        && !texts.iter().any(|t| t.contains('\t'))
         && let Some(advances) =
             crate::render_skia::measure_skia_inline_fragment_advances(texts, style)
         && advances.len() == texts.len()
@@ -1460,7 +1539,7 @@ fn paragraph_height(
     } else {
         strut(container)
     };
-    let (line, baseline) = text_line_metrics(content, style);
+    let (line, baseline) = text_line_metrics_of(content, style);
     let ascent = strut_ascent.max(baseline);
     let single_height = ascent + strut_descent.max(line - baseline);
     let forced = has_forced_break(content, style);
@@ -1483,6 +1562,9 @@ fn paragraph_height(
 /// so a paragraph wider than 360px but narrower than the available width
 /// (the runtime-bench text edit) was treated as one line.
 fn max_content_width(content: &str, style: &Style) -> f32 {
+    if let Some(advance) = tab_advance(content, style) {
+        return advance;
+    }
     #[cfg(feature = "skia")]
     {
         text_intrinsic_size(content, style).0
@@ -1758,7 +1840,7 @@ pub(super) fn layout_inline_beside(
         } else {
             strut(container)
         };
-        let (line, baseline) = text_line_metrics(content, style);
+        let (line, baseline) = text_line_metrics_of(content, style);
         let ascent = strut_ascent.max(baseline);
         let single = ascent + strut_descent.max(line - baseline);
         let line_count = content.split('\n').count();
@@ -1978,7 +2060,8 @@ pub(super) fn layout_inline_beside(
             let text_raw = if content == FORCED_BREAK {
                 0.0
             } else if bare.is_some() {
-                text_intrinsic_size(content, measure).0
+                tab_advance(content, measure)
+                    .unwrap_or_else(|| text_intrinsic_size(content, measure).0)
             } else {
                 advances[offset]
             };
@@ -1986,7 +2069,7 @@ pub(super) fn layout_inline_beside(
             let box_start = start_edges(&opens[k]);
             let box_end = end_edges(&closes[k]);
             let raw = text_raw + inline_edges + box_start + box_end;
-            let (height, baseline) = text_line_metrics(content, style);
+            let (height, baseline) = text_line_metrics_of(content, style);
             let parent = parents[k].map_or(container, |b| flat[b].style);
             let shift = vertical_align_shift(style, baseline, height - baseline, parent)
                 .why("vertical-align")?;
@@ -2573,7 +2656,8 @@ pub(super) fn layout_inline_beside(
 /// spaces are the only opportunities (Latin-1 without other soft-wrap
 /// characters), the whole text for nowrap / pre.
 pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
-    let width = |t: &str| snap(text_intrinsic_size(t, style).0);
+    let width =
+        |t: &str| snap(tab_advance(t, style).unwrap_or_else(|| text_intrinsic_size(t, style).0));
     let max = content
         .split(['\n', '\u{2028}', '\u{2029}'])
         .map(width)
