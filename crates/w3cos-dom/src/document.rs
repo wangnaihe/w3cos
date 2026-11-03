@@ -5047,8 +5047,9 @@ impl Document {
             // Resolve it only after text color inheritance has completed.
             style.border_color = style.color;
         }
-        // An inherited currentColor keyword resolves against this element's
-        // text color. Concrete colors still inherit as computed color values.
+        // currentColor authored on this element resolves against this
+        // element's text color. Explicit inherit copies the parent's computed
+        // color value, rather than re-resolving its currentColor provenance.
         let color_properties = [
             ["border", "border-color", "border-top", "border-top-color"],
             [
@@ -5070,9 +5071,7 @@ impl Document {
             if let Some((property, value)) = declared_property_value(properties) {
                 let value = value.trim();
                 keywords[side] = if value.eq_ignore_ascii_case("inherit") {
-                    inherited
-                        .and_then(|parent| parent.border_current_color)
-                        .is_none_or(|sides| sides[side])
+                    inherited.is_none()
                 } else if matches!(
                     value.to_ascii_lowercase().as_str(),
                     "initial" | "unset" | "revert" | "revert-layer" | "currentcolor"
@@ -26641,6 +26640,50 @@ mod image_component_tests {
     }
 
     #[test]
+    fn pseudo_border_inherit_copies_computed_color_without_rebinding_current_color() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#item::before",
+            &[
+                ("content", "'Before'"),
+                ("color", "red"),
+                ("border", "inherit"),
+            ],
+        );
+        let mut document = Document::new();
+        let item = document.create_element("div");
+        item.set_attribute(&mut document, "id", "item");
+        item.style_mut(&mut document)
+            .set_property("border", "2px solid");
+        document.body().append_child(&mut document, item);
+
+        let parent = document.computed_style_for(item.id);
+        let pseudo = document
+            .generated_pseudo_component(item.id, "::before", &parent)
+            .expect("generated before box");
+        assert_eq!(pseudo.style.color, w3cos_std::Color::rgb(255, 0, 0));
+        for color in [
+            pseudo.style.border_top_color,
+            pseudo.style.border_right_color,
+            pseudo.style.border_bottom_color,
+            pseudo.style.border_left_color,
+        ] {
+            assert_eq!(
+                color.unwrap_or(pseudo.style.border_color),
+                parent.border_color
+            );
+        }
+        assert!(
+            !pseudo
+                .style
+                .border_current_color
+                .is_some_and(|flags| flags.into_iter().any(|flag| flag)),
+            "a copied pseudo border must not rebind to the pseudo foreground color"
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn direction_declared_on_table_row_does_not_reorder_columns() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("#table", &[("display", "table")]);
@@ -28683,7 +28726,7 @@ mod computed_style_cache_tests {
     }
 
     #[test]
-    fn border_inherit_keeps_parent_current_color_keyword() {
+    fn border_inherit_copies_parent_computed_current_color() {
         crate::stylesheet::clear_rules();
         crate::stylesheet::register_rule("p", &[("border", "medium solid")]);
         crate::stylesheet::register_rule("em", &[("color", "red"), ("border", "inherit")]);
@@ -28704,9 +28747,12 @@ mod computed_style_cache_tests {
             child_style.border_bottom_color,
             child_style.border_left_color,
         ] {
-            assert_eq!(color.unwrap_or(child_style.border_color), child_style.color);
+            assert_eq!(
+                color.unwrap_or(child_style.border_color),
+                parent_style.border_color
+            );
         }
-        assert_eq!(child_style.border_current_color, Some([true; 4]));
+        assert_eq!(child_style.border_current_color, Some([false; 4]));
         crate::stylesheet::clear_rules();
     }
 
@@ -29284,7 +29330,7 @@ mod computed_style_cache_tests {
     }
 
     #[test]
-    fn inherited_omitted_border_color_resolves_current_color_on_child() {
+    fn inherited_omitted_border_color_copies_parent_computed_color() {
         for child_tag in ["div", "span"] {
             crate::stylesheet::clear_rules();
             crate::stylesheet::register_rule("#parent", &[("color", "red"), ("border", "none")]);
@@ -29312,13 +29358,145 @@ mod computed_style_cache_tests {
             ] {
                 assert_eq!(
                     color.unwrap_or(style.border_color),
-                    w3cos_std::Color::rgb(0, 128, 0),
-                    "{child_tag}: inherited currentColor resolves on the child"
+                    w3cos_std::Color::rgb(255, 0, 0),
+                    "{child_tag}: explicit inherit copies the parent's computed color"
                 );
             }
-            assert_eq!(style.border_current_color, Some([true; 4]));
+            assert_eq!(style.border_current_color, Some([false; 4]));
             crate::stylesheet::clear_rules();
         }
+    }
+
+    #[test]
+    fn explicit_current_color_still_resolves_against_the_child() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("color", "red"), ("border", "none")]);
+        crate::stylesheet::register_rule(
+            "#child",
+            &[
+                ("border-color", "currentColor"),
+                ("border-style", "solid"),
+                ("color", "green"),
+            ],
+        );
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        let style = document.computed_style_for(child.id);
+        for color in [
+            style.border_top_color,
+            style.border_right_color,
+            style.border_bottom_color,
+            style.border_left_color,
+        ] {
+            assert_eq!(
+                color.unwrap_or(style.border_color),
+                w3cos_std::Color::rgb(0, 128, 0)
+            );
+        }
+        assert_eq!(style.border_current_color, Some([true; 4]));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn inherited_current_color_recomputes_after_parent_color_mutation() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("color", "red"), ("border", "solid")]);
+        crate::stylesheet::register_rule(
+            "#child",
+            &[("color", "green"), ("border-color", "inherit")],
+        );
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        assert_eq!(
+            document.computed_style_for(child.id).border_top_color,
+            Some(w3cos_std::Color::rgb(255, 0, 0))
+        );
+        parent
+            .style_mut(&mut document)
+            .set_property("color", "blue");
+        assert!(!document.computed_style_cache_is_current(child.id));
+        let style = document.computed_style_for(child.id);
+        assert_eq!(
+            style.border_top_color,
+            Some(w3cos_std::Color::rgb(0, 0, 255))
+        );
+        assert_eq!(style.border_current_color, Some([false; 4]));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn root_border_color_inherit_uses_initial_current_color() {
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let root = document.create_element("html");
+        root.style_mut(&mut document).set_property("color", "red");
+        root.style_mut(&mut document)
+            .set_property("border-style", "solid");
+        root.style_mut(&mut document)
+            .set_property("border-color", "inherit");
+
+        let style = document.computed_style_inherited(root.id, None);
+        for color in [
+            style.border_top_color,
+            style.border_right_color,
+            style.border_bottom_color,
+            style.border_left_color,
+        ] {
+            assert_eq!(
+                color.unwrap_or(style.border_color),
+                w3cos_std::Color::rgb(255, 0, 0)
+            );
+        }
+        assert_eq!(style.border_current_color, Some([true; 4]));
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn side_color_inherit_copies_only_the_parent_computed_edge() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("#parent", &[("color", "red"), ("border", "solid")]);
+        crate::stylesheet::register_rule(
+            "#child",
+            &[
+                ("color", "green"),
+                ("border", "solid"),
+                ("border-right-color", "inherit"),
+            ],
+        );
+        let mut document = Document::new();
+        let parent = document.create_element("div");
+        parent.set_attribute(&mut document, "id", "parent");
+        let child = document.create_element("div");
+        child.set_attribute(&mut document, "id", "child");
+        parent.append_child(&mut document, child);
+        document.body().append_child(&mut document, parent);
+
+        let style = document.computed_style_for(child.id);
+        assert_eq!(
+            style.border_right_color,
+            Some(w3cos_std::Color::rgb(255, 0, 0))
+        );
+        for color in [
+            style.border_top_color,
+            style.border_bottom_color,
+            style.border_left_color,
+        ] {
+            assert_eq!(color, Some(w3cos_std::Color::rgb(0, 128, 0)));
+        }
+        assert_eq!(style.border_current_color, Some([true, false, true, true]));
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
