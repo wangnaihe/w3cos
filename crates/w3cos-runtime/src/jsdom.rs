@@ -1279,10 +1279,15 @@ pub fn node_id_of(value: &Value) -> Option<u32> {
     }
     let object = value.object_ref_raw()?;
     let object = object.borrow();
+    // Strict equality and SameValueZero call this for every pair of objects,
+    // nearly all of which are not DOM wrappers: one failed lookup answers
+    // them, so the generation is only read for an object that has an id.
     let direct = object.get_direct("__node_id");
+    if !direct.is_number() {
+        return None;
+    }
     let generation = object.get_direct("__w3cos_realm_generation");
-    if direct.is_number() && generation.is_number() && bridge_realm_is_current(generation.to_u32())
-    {
+    if generation.is_number() && bridge_realm_is_current(generation.to_u32()) {
         return Some(direct.to_u32());
     }
     None
@@ -23474,6 +23479,36 @@ pub fn reset_bridge() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_id_of_needs_both_an_id_and_the_current_generation() {
+        setup();
+        let current = realm_generation();
+        let wrapper = |id: Option<f64>, generation: Option<u32>| {
+            let mut properties = HashMap::new();
+            if let Some(id) = id {
+                properties.insert("__node_id".to_string(), Value::Number(id));
+            }
+            if let Some(generation) = generation {
+                properties.insert(
+                    "__w3cos_realm_generation".to_string(),
+                    Value::Number(generation as f64),
+                );
+            }
+            Value::object(properties)
+        };
+        assert_eq!(node_id_of(&wrapper(Some(7.0), Some(current))), Some(7));
+        // A plain object, an id without a generation, a generation without
+        // an id and a stale generation are all not DOM wrappers.
+        assert_eq!(node_id_of(&wrapper(None, None)), None);
+        assert_eq!(node_id_of(&wrapper(Some(7.0), None)), None);
+        assert_eq!(node_id_of(&wrapper(None, Some(current))), None);
+        assert_eq!(
+            node_id_of(&wrapper(Some(7.0), Some(current.wrapping_add(1)))),
+            None
+        );
+        assert_eq!(node_id_of(&Value::Number(3.0)), None);
+    }
 
     #[test]
     fn window_post_message_carries_transferred_ports() {
