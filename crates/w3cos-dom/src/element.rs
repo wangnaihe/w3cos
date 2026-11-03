@@ -69,12 +69,19 @@ impl Element {
             return;
         }
         let atom_name = cached_attr_name(name);
-        let value_atom = Atom::intern(value);
         let existing_index = doc
             .get_node(self.id)
             .attributes
             .iter()
             .position(|(key, _)| *key == atom_name);
+        // Rewriting an attribute with the text it already has changes
+        // neither selector matching nor any used value.
+        if let Some(index) = existing_index
+            && doc.get_node(self.id).attributes[index].1.as_str() == value
+        {
+            return;
+        }
+        let value_atom = Atom::intern(value);
         if let Some(existing_index) = existing_index {
             let old_value = doc.get_node(self.id).attributes[existing_index].1;
             let node = doc.get_node_mut(self.id);
@@ -126,7 +133,7 @@ impl Element {
                 .split([' ', '\t', '\n', '\r', '\x0c'])
                 .filter(|class| !class.is_empty())
             {
-                self.class_list_add(doc, class);
+                self.class_list_add_quiet(doc, Atom::intern(class));
             }
         }
         doc.mark_selector_dirty(self.id);
@@ -182,19 +189,29 @@ impl Element {
         self.class_list_add_atom(doc, Atom::intern(class));
     }
 
-    fn class_list_add_atom(&self, doc: &mut Document, atom: Atom) {
+    /// Adds `atom` to the class list and class index without invalidating
+    /// styles. Returns whether the class was new.
+    fn class_list_add_quiet(&self, doc: &mut Document, atom: Atom) -> bool {
         let node = doc.get_node_mut(self.id);
-        if !node.class_list.contains(&atom) {
-            node.class_list.push(atom);
-            doc.add_to_class_index(self.id, &atom);
-            if stylesheet::has_rules() {
-                doc.mark_selector_dirty(self.id);
-            }
+        if node.class_list.contains(&atom) {
+            return false;
+        }
+        node.class_list.push(atom);
+        doc.add_to_class_index(self.id, &atom);
+        true
+    }
+
+    fn class_list_add_atom(&self, doc: &mut Document, atom: Atom) {
+        if self.class_list_add_quiet(doc, atom) && stylesheet::has_rules() {
+            doc.mark_selector_dirty(self.id);
         }
     }
 
     pub fn class_list_remove(&self, doc: &mut Document, class: &str) {
         let atom = Atom::intern(class);
+        if !doc.get_node(self.id).class_list.contains(&atom) {
+            return;
+        }
         doc.get_node_mut(self.id).class_list.retain(|c| *c != atom);
         doc.remove_from_class_index(self.id, &atom);
         doc.mark_selector_dirty(self.id);
@@ -335,32 +352,53 @@ impl Element {
     }
 
     pub fn set_class_name(&self, doc: &mut Document, name: &str) {
-        let node = doc.get_node_mut(self.id);
         let class_attr = cached_attr_name("class");
-        if let Some(index) = node
-            .attributes
-            .iter()
-            .position(|(name, _)| *name == class_attr)
-        {
-            node.clear_attribute_namespace(index);
-        }
-        let old_classes = std::mem::take(&mut node.class_list);
-        for class in old_classes {
-            doc.remove_from_class_index(self.id, &class);
-        }
         // One intern of the attribute text. A single token reuses that atom
         // for the class list so "row" is not hashed twice per element.
         let whole = Atom::intern(name);
-        let mut reused_whole = false;
+        let mut next = crate::node::ClassList::new();
         for class in name
             .split([' ', '\t', '\n', '\r', '\x0c'])
             .filter(|class| !class.is_empty())
         {
-            if !reused_whole && class.len() == name.len() {
-                self.class_list_add_atom(doc, whole);
-                reused_whole = true;
+            let atom = if class.len() == name.len() {
+                whole
             } else {
-                self.class_list_add(doc, class);
+                Atom::intern(class)
+            };
+            if !next.contains(&atom) {
+                next.push(atom);
+            }
+        }
+        let node = doc.get_node(self.id);
+        let index = node
+            .attributes
+            .iter()
+            .position(|(name, _)| *name == class_attr);
+        // Assigning the class text the element already has is invisible to
+        // selectors and to layout: skip the restyle and the index churn.
+        if let Some(index) = index
+            && node.attributes[index].1.as_str() == name
+            && !node
+                .attribute_namespaces
+                .iter()
+                .any(|attribute| attribute.attribute_index == index)
+            && node.class_list.len() == next.len()
+            && node.class_list.iter().zip(next.iter()).all(|(a, b)| a == b)
+        {
+            return;
+        }
+        let node = doc.get_node_mut(self.id);
+        if let Some(index) = index {
+            node.clear_attribute_namespace(index);
+        }
+        let old_classes = std::mem::replace(&mut node.class_list, next);
+        for class in old_classes.iter() {
+            doc.remove_from_class_index(self.id, class);
+        }
+        for position in 0..doc.get_node(self.id).class_list.len() {
+            if let Some(class) = doc.get_node(self.id).class_list.get(position).copied() {
+                doc.add_to_class_index(self.id, &class);
             }
         }
         let node = doc.get_node_mut(self.id);
@@ -374,6 +412,7 @@ impl Element {
         } else {
             node.attributes.push((class_attr, value));
         }
+        // One restyle for the whole assignment, not one per class token.
         if stylesheet::has_rules() {
             doc.mark_selector_dirty(self.id);
         }
