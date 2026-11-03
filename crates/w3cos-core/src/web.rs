@@ -707,6 +707,16 @@ pub fn date_class() -> Value {
     value
 }
 
+/// ECMA-262 TimeClip: out-of-range or non-finite → NaN, otherwise truncate
+/// toward zero (and normalise -0 to +0).
+fn time_clip(milliseconds: f64) -> f64 {
+    if !milliseconds.is_finite() || milliseconds.abs() > 8.64e15 {
+        f64::NAN
+    } else {
+        milliseconds.trunc() + 0.0
+    }
+}
+
 fn date_prototype() -> Value {
     date_class().get_property("prototype")
 }
@@ -798,6 +808,7 @@ fn date_field_getters(milliseconds: f64) -> Vec<(String, Value)> {
 }
 
 pub fn date_value(milliseconds: f64) -> Value {
+    let milliseconds = time_clip(milliseconds);
     let mut fields: HashMap<String, Value> = date_field_getters(milliseconds).into_iter().collect();
     fields.extend([
         (
@@ -827,10 +838,13 @@ pub fn date_value(milliseconds: f64) -> Value {
     Value::object_with_prototype(&date_prototype(), fields)
 }
 
+/// Whole milliseconds since the epoch. `Date.now()` and `new Date()` are
+/// integral per ECMA-262 (TimeClip); a fractional value leaks into elapsed-time
+/// logs (`durationMs=20515.64...`) and breaks `Number.isInteger(Date.now())`.
 fn now_milliseconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64() * 1000.0)
+        .map(|duration| duration.as_millis() as f64)
         .unwrap_or(f64::NAN)
 }
 
@@ -3085,6 +3099,30 @@ mod tests {
     /// Test helper: unwrap a caught JS-exception payload into its Value.
     fn payload_value(payload: Box<dyn std::any::Any + Send>) -> Value {
         crate::promise::payload_to_value(payload)
+    }
+
+    #[test]
+    fn date_now_is_an_integer_and_tracks_the_clock() {
+        for _ in 0..50 {
+            let now = date_class().call_method("now", vec![]).to_number();
+            assert_eq!(now, now.trunc(), "Date.now() must be integral: {now}");
+        }
+        let a = date_class().call_method("now", vec![]).to_number();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let b = date_class().call_method("now", vec![]).to_number();
+        assert!(b - a >= 10.0 && b - a < 2000.0, "elapsed {}", b - a);
+    }
+
+    #[test]
+    fn date_value_applies_time_clip() {
+        let time = |ms: f64| date_value(ms).call_method("getTime", vec![]).to_number();
+        assert_eq!(time(1.9), 1.0);
+        assert_eq!(time(-1.9), -1.0);
+        assert!(time(8.64e15 + 1.0).is_nan());
+        assert!(time(f64::INFINITY).is_nan());
+        assert!(time(f64::NAN).is_nan());
+        assert_eq!(time(8.64e15), 8.64e15);
+        assert!(time(-0.0).is_sign_positive());
     }
 
     #[test]
