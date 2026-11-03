@@ -4921,6 +4921,67 @@ fn flex_row_baseline_alignment_matches_chrome() {
     assert_eq!(rect(&out, 9), (80.0, 100.0, 40.0, 30.0));
 }
 
+/// `align-items: last baseline` in a row flex line (CSS Align 9.3): the
+/// items' last baselines coincide and the group sits flush with the cross
+/// end; a line without a definite height is the largest ascent plus the
+/// largest descent. An item with its own non-baseline `align-self` stays out.
+#[test]
+fn flex_row_last_baseline_group_matches_chrome() {
+    use w3cos_std::style::AlignSelf;
+    let flex = |height: Dimension| {
+        with_markers(
+            Style {
+                display: Display::Flex,
+                flex_direction: w3cos_std::style::FlexDirection::Row,
+                width: Dimension::Px(300.0),
+                height,
+                ..block()
+            },
+            &[("--w3cos-internal-last-baseline-align-items", "1")],
+        )
+    };
+    let item = |height: f32, margin: Edges, align_self: AlignSelf| Style {
+        width: Dimension::Px(40.0),
+        height: Dimension::Px(height),
+        margin,
+        align_self,
+        ..block()
+    };
+    let items = || {
+        vec![
+            node(
+                item(40.0, margins(0.0, 0.0, 20.0, 0.0), AlignSelf::Auto),
+                vec![],
+            ),
+            node(item(60.0, Edges::default(), AlignSelf::Auto), vec![]),
+            node(item(10.0, Edges::default(), AlignSelf::Center), vec![]),
+        ]
+    };
+    let root = node(
+        block(),
+        vec![
+            node(flex(Dimension::Auto), items()),
+            node(flex(Dimension::Px(120.0)), items()),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // Preorder: 0 root, 1 flex, 2, 3, 4 items, 5 flex, 6, 7, 8 items.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 300.0, 80.0));
+    assert_eq!(rect(&out, 2), (0.0, 20.0, 40.0, 40.0));
+    assert_eq!(rect(&out, 3), (40.0, 0.0, 40.0, 60.0));
+    assert_eq!(rect(&out, 4), (80.0, 35.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 5), (0.0, 80.0, 300.0, 120.0));
+    assert_eq!(rect(&out, 6), (0.0, 140.0, 40.0, 40.0));
+    assert_eq!(rect(&out, 7), (40.0, 80.0 + 40.0, 40.0, 60.0));
+    assert_eq!(rect(&out, 8), (80.0, 80.0 + 55.0, 40.0, 10.0));
+}
+
 /// A text run is an anonymous flex item laid out as block text (CSS
 /// Flexbox §4). Row: the flex base size is its max-content width and the
 /// automatic minimum its min-content width (§4.5); it stretches to the
