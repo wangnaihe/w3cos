@@ -520,6 +520,22 @@ fn build_constructors() -> HashMap<String, Value> {
     ] {
         node.set_property(property, Value::Undefined);
     }
+    // Real accessors for the read-only identity/tree getters. Sanitizers
+    // (DOMPurify) capture them up front via
+    // `Object.getOwnPropertyDescriptor(Node.prototype, "nodeName").get` and
+    // fall back to a getter returning null when the slot is a plain data
+    // placeholder, which made every sanitize call throw inside
+    // `toLowerCase(null)`.
+    for property in [
+        "nodeName",
+        "nodeType",
+        "ownerDocument",
+        "nextSibling",
+        "childNodes",
+        "parentNode",
+    ] {
+        install_prototype_getter(&node, property);
+    }
     node.set_property(
         "cloneNode",
         Value::function(|receiver, args| crate::jsdom::node_prototype_clone_node(receiver, args)),
@@ -2142,6 +2158,20 @@ pub fn prototype_for_node(node_type: u16, tag: &str, is_svg: bool) -> Value {
         11 => prototype("DocumentFragment"),
         _ => prototype("Node"),
     }
+}
+
+/// Install a getter-only accessor that answers through the receiver's DOM
+/// bridge (element wrappers) or its own data (document-like plain objects).
+fn install_prototype_getter(prototype: &Value, property: &'static str) {
+    let getter = Value::function(move |receiver, _args| {
+        crate::jsdom::prototype_getter_value(&receiver, property)
+    });
+    let descriptor = Value::object(HashMap::from([
+        ("get".to_string(), getter),
+        ("enumerable".to_string(), Value::Bool(true)),
+        ("configurable".to_string(), Value::Bool(true)),
+    ]));
+    w3cos_core::class::define_property(prototype, property, &descriptor);
 }
 
 #[cfg(test)]

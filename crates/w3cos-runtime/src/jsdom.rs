@@ -1241,6 +1241,37 @@ pub(crate) fn activate_declarative_shadow_root(host: u32, template: u32, mode: &
 /// (`const orig = HTMLElement.prototype.focus; ... orig.apply(this, args)`,
 /// as the workbench's window focus handling does) need a callable that
 /// forwards to the receiver's bridge method.
+/// Value behind a prototype getter installed by `dom_constructors`.
+pub(crate) fn prototype_getter_value(receiver: &Value, name: &str) -> Value {
+    if let Some(node) = node_id_of(receiver) {
+        let value = element_computed_get(node, name);
+        if !value.is_undefined() {
+            return value;
+        }
+        // Some members (`attributes`, ...) are answered by the wrapper's
+        // own lookup rather than the computed table; read through it once,
+        // guarding against landing back on this prototype getter.
+        thread_local! {
+            static IN_PROTOTYPE_GETTER: Cell<bool> = const { Cell::new(false) };
+        }
+        if IN_PROTOTYPE_GETTER.with(|flag| flag.replace(true)) {
+            return Value::Undefined;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IN_PROTOTYPE_GETTER.with(|flag| flag.set(false));
+            }
+        }
+        let _reset = Reset;
+        return receiver.get_property(name);
+    }
+    receiver
+        .as_object()
+        .and_then(|object| object.borrow().own_data(name))
+        .unwrap_or(Value::Undefined)
+}
+
 pub(crate) fn element_prototype_method(name: &'static str) -> Value {
     let forwarder = func(move |this, args| {
         let mut method = node_id_of(&this)
@@ -32751,6 +32782,40 @@ try {
         assert!(doc.get_property("activeElement") == input);
         input.call_method("blur", vec![]);
         assert!(doc.get_property("activeElement") == doc.get_property("body"));
+    }
+
+    #[test]
+    fn node_prototype_getters_are_real_accessors_for_dompurify() {
+        setup();
+        let window = window_value();
+        let getter = |proto: &Value, name: &str| {
+            w3cos_core::class::get_own_property_descriptor(proto, name).get_property("get")
+        };
+        let node_proto = window.get_property("Node").get_property("prototype");
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("span")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+        let get_name = getter(&node_proto, "nodeName");
+        assert!(get_name.is_callable(), "Node.prototype nodeName getter");
+        assert_eq!(get_name.call(child.clone(), vec![]).to_js_string(), "SPAN");
+        assert_eq!(
+            getter(&node_proto, "nodeType").call(child.clone(), vec![]),
+            Value::Number(1.0)
+        );
+        assert!(getter(&node_proto, "parentNode").call(child.clone(), vec![]) == parent);
+        let kids = getter(&node_proto, "childNodes").call(parent.clone(), vec![]);
+        assert_eq!(kids.get_property("length"), Value::Number(1.0));
+        assert_eq!(
+            getter(&node_proto, "ownerDocument").call(child.clone(), vec![]),
+            document_value()
+        );
+        assert!(child.get_property("attributes").is_object());
+        // Instances still read through the bridge.
+        assert_eq!(child.get_property("nodeName").to_js_string(), "SPAN");
+        assert_eq!(
+            document_value().get_property("nodeName").to_js_string(),
+            "#document"
+        );
     }
 
     #[test]
