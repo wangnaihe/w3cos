@@ -478,9 +478,8 @@ fn supported_script_in(content: &str, reordered: bool) -> bool {
             || (0xFE70..=0xFEFF).contains(&u)
             || (0x10800..=0x10FFF).contains(&u)
             || (0x1E800..=0x1EFFF).contains(&u);
-        let bidi_control = matches!(u, 0x061C | 0x200E | 0x200F)
-            || (0x202A..=0x202E).contains(&u)
-            || (0x2066..=0x2069).contains(&u);
+        let bidi_control =
+            matches!(u, 0x061C) || (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u);
         // The ideographic space and the zero width space are break
         // opportunities the NG breaker knows (`is_soft_wrap_char`), and
         // their width matches Chrome when no line needs the break (see

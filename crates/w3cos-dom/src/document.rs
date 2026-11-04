@@ -2658,6 +2658,50 @@ impl Document {
     // Child iteration helper
     // -----------------------------------------------------------------------
 
+    /// HTML "auto directionality" of `id` (`dir=auto`): the bidi class of
+    /// the first strong character (L, R or AL) in its descendant text,
+    /// skipping `bdi`, `script`, `style` and `textarea` subtrees and
+    /// descendants with a valid `dir` attribute of their own.
+    fn auto_directionality(&self, id: NodeId) -> Option<&'static str> {
+        use unicode_bidi::BidiClass;
+        for child in self.children_ids(id) {
+            let node = self.get_node(child);
+            match node.node_type {
+                NodeType::Text => {
+                    for c in node.text_content.as_deref().unwrap_or("").chars() {
+                        match unicode_bidi::bidi_class(c) {
+                            BidiClass::L => return Some("ltr"),
+                            BidiClass::R | BidiClass::AL => return Some("rtl"),
+                            _ => {}
+                        }
+                    }
+                }
+                NodeType::Element => {
+                    let skipped = node.is_html_element
+                        && matches!(
+                            node.tag.as_static(),
+                            "bdi" | "script" | "style" | "textarea"
+                        );
+                    let own_dir = node.attributes.iter().any(|(name, value)| {
+                        name.as_static().eq_ignore_ascii_case("dir")
+                            && matches!(
+                                value.trim().to_ascii_lowercase().as_str(),
+                                "ltr" | "rtl" | "auto"
+                            )
+                    });
+                    if !skipped
+                        && !own_dir
+                        && let Some(dir) = self.auto_directionality(child)
+                    {
+                        return Some(dir);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn children_ids(&self, parent: NodeId) -> Vec<NodeId> {
         let mut result = Vec::new();
         let mut current = self.get_node(parent).first_child;
@@ -3359,7 +3403,14 @@ impl Document {
                     .map(|(_, value)| value.trim().to_ascii_lowercase())
             })
             .flatten()
-            .filter(|value| matches!(value.as_str(), "ltr" | "rtl"));
+            .and_then(|value| match value.as_str() {
+                "ltr" | "rtl" => Some(value),
+                // HTML 3.2.6.4 auto directionality: the first strong
+                // character of the element's text (no strong character:
+                // the inherited direction).
+                "auto" => self.auto_directionality(id).map(str::to_string),
+                _ => None,
+            });
         if let Some(value) = &direction_hint {
             user_normal.push(("direction".to_string(), value.to_string(), 0));
             if node.is_html_element && !matches!(node.tag.as_static(), "bdi" | "bdo") {
@@ -19385,6 +19436,25 @@ mod image_component_tests {
                 "used run boundaries must survive shared storage"
             );
         }
+    }
+
+    #[test]
+    fn dir_auto_takes_the_first_strong_character_direction() {
+        let mut document = Document::new();
+        let block = document.create_element("div");
+        block.set_attribute(&mut document, "dir", "auto");
+        let skipped = document.create_element("bdi");
+        let hebrew = document.create_text_node("\u{5d0}");
+        skipped.append_child(&mut document, hebrew);
+        let text = document.create_text_node("\u{200e}TES");
+        block.append_child(&mut document, skipped);
+        block.append_child(&mut document, text);
+        let rtl = document.create_element("div");
+        rtl.set_attribute(&mut document, "dir", "auto");
+        let mark = document.create_text_node("\u{200f}TES");
+        rtl.append_child(&mut document, mark);
+        assert_eq!(document.auto_directionality(block.id), Some("ltr"));
+        assert_eq!(document.auto_directionality(rtl.id), Some("rtl"));
     }
 
     #[test]
