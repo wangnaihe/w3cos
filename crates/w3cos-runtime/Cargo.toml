@@ -43,7 +43,7 @@ layout-ng-trace = []
 # open a real provider unless W3COS_GEOLOCATION_DEVICE_TESTS=1.
 web-geolocation = [
     "dep:zbus",
-    "dep:objc2",
+    "dep:objc2_06",
     "dep:objc2-foundation",
     "dep:objc2-core-location",
     "dep:windows",
@@ -160,7 +160,7 @@ security-framework = "3.7"
 # AVFoundation; the bindings crate exposes AVAuthorizationStatus. Camera crates
 # are target-gated, so Linux CI does not compile them or link new libraries.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6.3", optional = true }
+objc2_06 = { package = "objc2", version = "0.6.3", optional = true, default-features = false }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSError", "NSObject"] }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 nokhwa = { version = "0.10.11", default-features = false, optional = true, features = ["input-avfoundation", "decoding"] }

@@ -504,6 +504,54 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
     })
 }
 
+/// The physical font box used by a resolved text run, excluding CSS
+/// line-height leading. CSSOM text fragments expose this box while their line
+/// origins still advance by the used `line-height`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FontBoxMetrics {
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+impl FontBoxMetrics {
+    pub fn height(self) -> f32 {
+        self.ascent + self.descent
+    }
+}
+
+pub(crate) fn font_box_metrics_for_text(
+    style: &w3cos_std::style::Style,
+    text: &str,
+) -> Option<FontBoxMetrics> {
+    let runs = FontRegistry::global().resolve_style_runs(style, text);
+    let mut ascent = 0.0_f32;
+    let mut descent = 0.0_f32;
+    let mut found = false;
+    for run in runs {
+        let font = run.font.and_then(|font| font.parsed());
+        let font = font
+            .as_deref()
+            .unwrap_or_else(|| host_ui_font().font.as_ref());
+        let metrics = font.horizontal_line_metrics(style.font_size)?;
+        // CSS inline boxes use the face's rounded ascent/descent, while the
+        // CSS line box keeps its fractional used line-height.  This mirrors
+        // the physical font-box contract used by the shaping renderer and
+        // leaves the remaining fraction in lower leading.
+        ascent = ascent.max(metrics.ascent.max(0.0).round());
+        descent = descent.max((-metrics.descent).max(0.0).round());
+        found = true;
+    }
+    if !found {
+        let metrics = host_ui_font()
+            .font
+            .horizontal_line_metrics(style.font_size)?;
+        ascent = metrics.ascent.max(0.0).round();
+        descent = (-metrics.descent).max(0.0).round();
+    }
+    let metrics = FontBoxMetrics { ascent, descent };
+    (metrics.height().is_finite() && metrics.height() > 0.0).then_some(metrics)
+}
+
 fn finish_host_font(family: String, data: Arc<Vec<u8>>, index: u32) -> HostUiFont {
     // Collection index 0 shares `cached_parsed_font` with `@font-face`,
     // so a page that names the host face does not parse those bytes twice.
@@ -819,6 +867,14 @@ impl FontRegistry {
         style: FontFaceStyle,
         text: &str,
     ) -> Option<LoadedFont> {
+        let is_cascade_winner_for_all = |font: &LoadedFont| {
+            !stack.contains(',')
+                || text.chars().all(|character| {
+                    let glyph = crate::text_layout::font_glyph_character(character);
+                    self.resolve_render_stack(stack, weight, style, Some(glyph))
+                        .is_some_and(|resolved| resolved.cache_key() == font.cache_key())
+                })
+        };
         let key = face_hit_key(stack, weight, style);
         if let Some(cached) = FACE_HIT.with(|slot| {
             slot.borrow()
@@ -829,6 +885,7 @@ impl FontRegistry {
                 && text.chars().all(|character| {
                     cached.supports_character(crate::text_layout::font_glyph_character(character))
                 })
+                && is_cascade_winner_for_all(&cached)
             {
                 return Some(cached);
             }
@@ -842,6 +899,12 @@ impl FontRegistry {
         if text.chars().any(|character| {
             !font.supports_character(crate::text_layout::font_glyph_character(character))
         }) {
+            return None;
+        }
+        // Coverage alone is insufficient for a multi-family stack. A later
+        // fallback may cover the complete string while an earlier family wins
+        // individual characters (for example `Ahem, Second` and `ŢT`).
+        if !is_cascade_winner_for_all(&font) {
             return None;
         }
         FACE_HIT.with(|slot| *slot.borrow_mut() = Some((key, font.clone())));
@@ -1884,7 +1947,10 @@ mod tests {
     /// family order - decides which face paints each character.
     #[test]
     fn ahem_does_not_claim_latin_extended_a() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -1931,7 +1997,10 @@ mod tests {
     /// must move to the next family rather than being painted by the first.
     #[test]
     fn an_uncovered_character_falls_through_to_the_next_family() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(ahem_bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -1956,6 +2025,12 @@ mod tests {
             font_family: Some("\"Ahem\", Second".into()),
             ..Default::default()
         };
+        let primed = registry.resolve_style_runs(&style, "\u{0162}");
+        assert_eq!(
+            primed[0].font.as_ref().map(|font| font.family.as_str()),
+            Some("Second"),
+            "the uncovered first character primes the later fallback face"
+        );
         let runs = registry.resolve_style_runs(&style, "\u{0162}T");
         let families = runs
             .iter()
