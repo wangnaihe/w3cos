@@ -1976,6 +1976,15 @@ impl CSSStyleDeclaration {
                         value.trim().to_ascii_lowercase(),
                     );
             }
+            "text-justify" | "textJustify" => {
+                self.inner
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-text-justify".to_string(),
+                        value.trim().to_ascii_lowercase(),
+                    );
+            }
             "tab-size" | "tabSize" => {
                 let keyword = value.trim().to_ascii_lowercase();
                 let properties = self

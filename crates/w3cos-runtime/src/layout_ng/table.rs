@@ -1482,7 +1482,7 @@ pub(super) fn append_text_leaf_line(
     let border = border_widths(style);
     let free = content_width - advance;
     result.fragment.children.push((
-        border[3] + pad_l + inline::align_offset(style, free),
+        border[3] + pad_l + inline::line_align_offset(style, free, true),
         border[0] + pad_t + ascent - content_ascent,
         BoxFragment {
             index: result.fragment.index,

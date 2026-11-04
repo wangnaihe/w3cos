@@ -164,6 +164,10 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // read it for preserved tabs; `text:tab` gates the leaves whose
             // stops need a line position NG does not pass yet.
             | "tab-size"
+            // `text-align-last` / `text-justify`: inline line alignment
+            // reads them; unsupported values gate as `text:align-last`.
+            | "text-align-last"
+            | "text-justify"
             // Grid reads these. The cascade leaves the legacy fields alone:
             // height stays the dimension it already stored, and justify-content
             // stays the enum flex already uses.

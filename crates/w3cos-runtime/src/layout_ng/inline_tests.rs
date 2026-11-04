@@ -2914,3 +2914,77 @@ fn break_all_breaks_between_any_clusters() {
         "{texts:?}"
     );
 }
+
+fn ja_style(word_break: w3cos_std::style::WordBreak, auto_phrase: bool) -> Style {
+    let mut properties = std::collections::HashMap::new();
+    properties.insert(
+        "--w3cos-internal-text-language".to_string(),
+        "ja".to_string(),
+    );
+    if auto_phrase {
+        properties.insert(
+            "--w3cos-internal-word-break-auto-phrase".to_string(),
+            "1".to_string(),
+        );
+    }
+    Style {
+        word_break,
+        custom_properties: Some(properties.into_iter().collect()),
+        ..Style::default()
+    }
+}
+
+/// keep-all leaves no opportunity between CJK ideographs, so such an item
+/// is unbreakable (it overflows instead of falling back).
+#[test]
+fn keep_all_cjk_item_has_no_internal_opportunity() {
+    use w3cos_std::style::WordBreak;
+    let text = "東京\u{a0}へ\u{a0}行きましょう。";
+    assert!(!inline::internal_opportunity(
+        text,
+        &ja_style(WordBreak::KeepAll, false)
+    ));
+    assert!(inline::internal_opportunity(
+        text,
+        &ja_style(WordBreak::Normal, false)
+    ));
+    // Japanese auto-phrase: no opportunity inside a phrase (kPhrase).
+    assert!(!inline::internal_opportunity(
+        text,
+        &ja_style(WordBreak::Normal, true)
+    ));
+}
+
+/// Paragraph min-content of non-Latin-1 text is its widest segment between
+/// crate::line_break opportunities.
+#[test]
+fn cjk_text_min_content_follows_break_mode() {
+    use w3cos_std::style::WordBreak;
+    let text = "東京\u{a0}へ\u{a0}行きましょう。";
+    let keep = inline::text_min_max(text, &ja_style(WordBreak::KeepAll, false));
+    assert_eq!(keep.min, Some(keep.max));
+    let normal = inline::text_min_max(text, &ja_style(WordBreak::Normal, false));
+    assert!(normal.min.is_some_and(|min| min < normal.max), "{normal:?}");
+}
+
+#[test]
+fn text_align_last_justify_without_opportunities_starts_the_line() {
+    let mut style = Style::default();
+    let props = style.custom_properties.get_or_insert_with(Default::default);
+    props.insert("--w3cos-internal-text-align-last".into(), "justify".into());
+    // Justification with opportunities is not laid out by NG.
+    assert_eq!(inline::line_align_offset(&style, 50.0, true), 0.0);
+    style
+        .custom_properties
+        .as_mut()
+        .unwrap()
+        .insert("--w3cos-internal-text-justify".into(), "none".into());
+    assert_eq!(inline::line_align_offset(&style, 50.0, true), 0.0);
+    style
+        .custom_properties
+        .as_mut()
+        .unwrap()
+        .insert("--w3cos-internal-text-align-last".into(), "right".into());
+    assert_eq!(inline::line_align_offset(&style, 50.0, true), 50.0);
+    assert_eq!(inline::line_align_offset(&style, 50.0, false), 0.0);
+}
