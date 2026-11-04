@@ -784,7 +784,11 @@ fn inline_text_reason(
             }
             _ => false,
         };
-    if content.is_empty()
+    // An empty collapsible text item (a text node collapsed away) makes no
+    // NGInlineItem: NGInlineItemsBuilder::AppendText skips empty strings.
+    let empty_collapsed =
+        content.is_empty() && matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap);
+    if (content.is_empty() && !empty_collapsed)
         || content.contains('\r')
         || (content.contains('\t')
             && !(first && tab_only(content, style))
@@ -1176,6 +1180,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         }
         if info.style.white_space != style.white_space {
             return Some("text:white-space");
+        }
+        // Empty items stay on the legacy engine beside atomic inlines: the
+        // whitespace between inline-blocks and <br> leaves only these, and
+        // those pages and their references must keep one engine.
+        if content.is_empty()
+            && entries
+                .iter()
+                .any(|e| matches!(e, InlineEntry::Leaf(c) if is_atomic_inline(flat, *c)))
+        {
+            return Some("text:content");
         }
         if let Some(reason) = inline_text_reason(content, info.style, sole, position == 0, style) {
             return Some(reason);
