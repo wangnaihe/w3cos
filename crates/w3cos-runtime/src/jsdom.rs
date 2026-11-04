@@ -33490,7 +33490,8 @@ try {
         let second = win.call_method("getComputedStyle", vec![div.clone()]);
         assert!(first.strict_eq(&second));
         assert_eq!(
-            first.call_method("getPropertyValue", vec![Value::string("padding-top")])
+            first
+                .call_method("getPropertyValue", vec![Value::string("padding-top")])
                 .to_js_string(),
             "3px"
         );
