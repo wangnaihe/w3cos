@@ -450,6 +450,12 @@ pub struct Document {
     text_stable_stamp: Vec<u32>,
     style_revision_clock: u64,
     style_revisions: Vec<u64>,
+    /// Per-node clock of the last mutable access (`get_node_mut`,
+    /// `get_style_mut`, allocation). Feeds incremental component patching.
+    mutation_seq: Vec<u64>,
+    mutation_clock: u64,
+    /// Bumped by document-wide inputs to component lowering.
+    global_seq: u64,
     focused_node: Option<NodeId>,
     focus_visible: bool,
     computed_style_cache: RefCell<HashMap<NodeId, CachedComputedStyle>>,
@@ -497,6 +503,14 @@ pub struct Document {
     // Quirks mode changes percentage-height containing-block traversal.
     quirks_mode: bool,
 }
+
+#[path = "document/component_patch.rs"]
+mod component_patch;
+pub use component_patch::{ComponentBaseline, ComponentPatch};
+
+#[cfg(test)]
+#[path = "document/component_patch_tests.rs"]
+mod component_patch_tests;
 
 #[path = "document/table_mutation.rs"]
 mod table_mutation;
@@ -557,6 +571,7 @@ impl Document {
         if (self.minimum_font_size, self.minimum_logical_font_size) != (hard, logical) {
             self.minimum_font_size = hard;
             self.minimum_logical_font_size = logical;
+            self.global_seq += 1;
             self.computed_style_cache.borrow_mut().clear();
         }
     }
@@ -577,6 +592,7 @@ impl Document {
             return;
         }
         self.normal_line_height_provider = Some((provider, revision));
+        self.global_seq += 1;
         self.computed_style_cache.borrow_mut().clear();
     }
 
@@ -584,6 +600,7 @@ impl Document {
     /// No network request or authored DOM mutation occurs during lowering.
     pub fn set_css_image_dimensions_provider(&mut self, provider: fn(&str) -> Option<(u32, u32)>) {
         self.css_image_dimensions_provider = Some(provider);
+        self.global_seq += 1;
     }
 
     pub fn new() -> Self {
@@ -608,6 +625,9 @@ impl Document {
             text_stable_stamp: Vec::new(),
             style_revision_clock: 0,
             style_revisions: Vec::new(),
+            mutation_seq: Vec::new(),
+            mutation_clock: 0,
+            global_seq: 0,
             focused_node: None,
             focus_visible: false,
             computed_style_cache: RefCell::new(HashMap::new()),
@@ -721,6 +741,18 @@ impl Document {
     pub fn set_render_body(&mut self, body: NodeId) {
         debug_assert_eq!(self.get_node(body).node_type, NodeType::Element);
         self.body_id = body;
+        self.global_seq += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_computed_style_counters(&self) {
+        self.computed_style_cache_hits.set(0);
+        self.computed_style_cache_misses.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn computed_style_calls_for_test(&self) -> usize {
+        self.computed_style_cache_hits.get() + self.computed_style_cache_misses.get()
     }
 
     pub fn set_html_document(&mut self, html_document: bool) {
@@ -728,6 +760,7 @@ impl Document {
             return;
         }
         self.html_document = html_document;
+        self.global_seq += 1;
         self.mark_dirty(NodeId::ROOT);
     }
 
@@ -736,6 +769,7 @@ impl Document {
             return;
         }
         self.quirks_mode = quirks_mode;
+        self.global_seq += 1;
         self.mark_dirty(NodeId::ROOT);
     }
 
@@ -1424,6 +1458,11 @@ impl Document {
             self.layout_rects[idx] = DOMRect::zero();
             self.scroll_offsets[idx] = (0.0, 0.0);
             self.style_revisions[idx] = style_revision;
+            self.mutation_clock += 1;
+            if idx >= self.mutation_seq.len() {
+                self.mutation_seq.resize(idx + 1, 0);
+            }
+            self.mutation_seq[idx] = self.mutation_clock;
             NodeId(slot)
         } else {
             let id = NodeId(self.nodes.len() as u32);
@@ -1434,6 +1473,10 @@ impl Document {
             self.layout_rects.push(DOMRect::zero());
             self.scroll_offsets.push((0.0, 0.0));
             self.style_revisions.push(style_revision);
+            self.mutation_clock += 1;
+            self.mutation_seq.resize(self.nodes.len(), 0);
+            let last = self.nodes.len() - 1;
+            self.mutation_seq[last] = self.mutation_clock;
             // Update tag index. One reserve covers a page of the same tag.
             let ids = self.tag_index.entry(tag).or_default();
             if ids.capacity() < PAGE_SLOTS {
@@ -1590,6 +1633,7 @@ impl Document {
         } else {
             self.image_render_sources.remove(&id);
         }
+        self.note_mutation(id);
         self.record_layout_dirty(id);
     }
 
@@ -1600,10 +1644,12 @@ impl Document {
         } else {
             self.embedded_document_hosts.remove(&id);
         }
+        self.note_mutation(id);
         self.record_layout_dirty(id);
     }
 
     pub fn get_node_mut(&mut self, id: NodeId) -> &mut DomNode {
+        self.note_mutation(id);
         self.nodes[id.0 as usize]
             .as_mut()
             .expect("accessing freed node")
@@ -1614,6 +1660,7 @@ impl Document {
     }
 
     pub fn get_style_mut(&mut self, id: NodeId) -> &mut CSSStyleDeclaration {
+        self.note_mutation(id);
         Arc::make_mut(&mut self.styles[id.0 as usize])
     }
 

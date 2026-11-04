@@ -520,6 +520,12 @@ pub struct EventListener {
 pub struct EventRegistry {
     listeners: Vec<(NodeId, EventListener)>,
     next_id: u32,
+    /// Nodes whose listener set was touched, oldest first. Component lowering
+    /// reads `has_listeners`, so an incremental consumer needs to know which
+    /// nodes changed. Bounded: the oldest entries are dropped in bulk and
+    /// `changes_since` then reports that history was lost.
+    changed: Vec<NodeId>,
+    changed_base: u64,
 }
 
 impl EventRegistry {
@@ -527,7 +533,30 @@ impl EventRegistry {
         Self {
             listeners: Vec::new(),
             next_id: 1,
+            changed: Vec::new(),
+            changed_base: 0,
         }
+    }
+
+    fn note_changed(&mut self, node: NodeId) {
+        const LIMIT: usize = 8192;
+        if self.changed.len() >= LIMIT {
+            self.changed_base += self.changed.len() as u64;
+            self.changed.clear();
+        }
+        self.changed.push(node);
+    }
+
+    /// Monotonic count of recorded listener-set changes.
+    pub(crate) fn change_count(&self) -> u64 {
+        self.changed_base + self.changed.len() as u64
+    }
+
+    /// Nodes touched after `count` was read from [`Self::change_count`], or
+    /// `None` when that history has already been dropped.
+    pub(crate) fn changes_since(&self, count: u64) -> Option<&[NodeId]> {
+        let start = count.checked_sub(self.changed_base)?;
+        self.changed.get(start as usize..)
     }
 
     pub fn add(&mut self, node: NodeId, event_type: EventType, handler: EventHandler) -> u32 {
@@ -543,6 +572,7 @@ impl EventRegistry {
     ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
+        self.note_changed(node);
         self.listeners.push((
             node,
             EventListener {
@@ -556,16 +586,19 @@ impl EventRegistry {
     }
 
     pub fn remove(&mut self, node: NodeId, listener_id: u32) {
+        self.note_changed(node);
         self.listeners
             .retain(|(id, l)| !(*id == node && l.id == listener_id));
     }
 
     pub fn remove_by_type(&mut self, node: NodeId, event_type: EventType) {
+        self.note_changed(node);
         self.listeners
             .retain(|(id, l)| !(*id == node && l.event_type == event_type));
     }
 
     pub fn remove_all(&mut self, node: NodeId) {
+        self.note_changed(node);
         self.listeners.retain(|(id, _)| *id != node);
     }
 
