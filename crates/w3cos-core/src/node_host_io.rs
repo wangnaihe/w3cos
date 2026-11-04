@@ -460,8 +460,16 @@ pub(crate) fn install(host: &Value) {
             &argv,
             optional_string(&arg(&args, 2)),
             string_list(&arg(&args, 3)),
-            if cols.is_finite() && cols > 0.0 { cols as u16 } else { 80 },
-            if rows.is_finite() && rows > 0.0 { rows as u16 } else { 24 },
+            if cols.is_finite() && cols > 0.0 {
+                cols as u16
+            } else {
+                80
+            },
+            if rows.is_finite() && rows > 0.0 {
+                rows as u16
+            } else {
+                24
+            },
         );
         let (child, master) = match spawned {
             Ok(pair) => pair,

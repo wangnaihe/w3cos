@@ -115,7 +115,10 @@ pub const NATIVE_REPLACEMENTS: &[(&str, &str)] = &[
     ("@vscode/native-watchdog", "internal/w3cos_native_watchdog"),
     ("@w3cos/native-watchdog", "internal/w3cos_native_watchdog"),
     ("node-pty", "internal/w3cos_node_pty"),
-    ("@homebridge/node-pty-prebuilt-multiarch", "internal/w3cos_node_pty"),
+    (
+        "@homebridge/node-pty-prebuilt-multiarch",
+        "internal/w3cos_node_pty",
+    ),
     ("@w3cos/node-pty", "internal/w3cos_node_pty"),
     ("@vscode/spdlog", "internal/w3cos_spdlog"),
     ("@w3cos/spdlog", "internal/w3cos_spdlog"),
