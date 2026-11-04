@@ -2645,3 +2645,51 @@ fn break_all_breaks_between_letters() {
         assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
     }
 }
+
+/// An empty collapsible text node makes no inline item (NGInlineItemsBuilder
+/// skips empty strings): its neighbours share one line.  Rects from Chrome
+/// (Ahem 20px, `XX` + empty Text + `YY`).
+#[test]
+fn empty_collapsible_text_is_skipped() {
+    let _ahem = AhemGuard::new();
+    let mut container = Style {
+        display: Display::Block,
+        width: Dimension::Px(120.0),
+        ..Style::default()
+    };
+    font(&mut container, 20.0, LineHeight::Number(1.0));
+    container
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(inline::IFC_MARKER.into(), "1".into());
+    let text = |content: &str| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        Component::text(content, style)
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            container,
+            vec![text("XX"), text(""), text("YY")],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let expected: [(usize, [f32; 4]); 3] = [
+        (1, [0.0, 0.0, 120.0, 20.0]),
+        (2, [0.0, 0.0, 40.0, 20.0]),
+        (4, [40.0, 0.0, 40.0, 20.0]),
+    ];
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
+    }
+}
