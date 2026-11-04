@@ -18740,6 +18740,22 @@ pub fn document_value() -> Value {
     value
 }
 
+/// A document-like receiver other than the main document that carries its
+/// own `name` method; main-document methods captured and `.call`ed on it
+/// forward there.
+fn foreign_document_method(receiver: &Value, name: &str) -> Option<Value> {
+    if !receiver.is_object() || node_id_of(receiver).is_some() {
+        return None;
+    }
+    if *receiver == document_value() {
+        return None;
+    }
+    receiver
+        .as_object()
+        .and_then(|object| object.borrow().own_data(name))
+        .filter(|method| method.is_callable())
+}
+
 fn build_document_value() -> Value {
     let mut props: HashMap<String, Value> = HashMap::new();
     let implementation = dom_implementation_value();
@@ -19024,7 +19040,13 @@ fn build_document_value() -> Value {
     );
     props.insert(
         "getElementsByTagName".to_string(),
-        func(|_, args| {
+        func(|this, args| {
+            // Captured as `const gebtn = document.getElementsByTagName` and
+            // re-targeted with `.call(otherDoc, ...)` (DOMPurify does this
+            // with DOMParser output): answer for that document, not this one.
+            if let Some(other) = foreign_document_method(&this, "getElementsByTagName") {
+                return other.call(this, args);
+            }
             let tag = arg(&args, 0).to_js_string();
             let html_document =
                 document_value().get_property("contentType").to_js_string() == "text/html";
@@ -32729,6 +32751,38 @@ try {
         assert!(doc.get_property("activeElement") == input);
         input.call_method("blur", vec![]);
         assert!(doc.get_property("activeElement") == doc.get_property("body"));
+    }
+
+    #[test]
+    fn captured_document_get_elements_by_tag_name_honors_the_receiver() {
+        setup();
+        let gebtn = document_value().get_property("getElementsByTagName");
+        let parser = crate::jsdom::dom_parser_class();
+        let parsed = w3cos_core::intrinsics::construct(&parser, vec![]).call_method(
+            "parseFromString",
+            vec![Value::string("<p id=x>hi</p>"), Value::string("text/html")],
+        );
+        let body = gebtn
+            .call(parsed.clone(), vec![Value::string("body")])
+            .get_property("0");
+        assert!(
+            body != document_value().get_property("body"),
+            "must not return the live body"
+        );
+        assert!(body == parsed.get_property("body"));
+        assert_eq!(
+            body.get_property("firstChild")
+                .get_property("id")
+                .to_js_string(),
+            "x"
+        );
+        // Plain calls still answer for the main document.
+        assert!(
+            gebtn
+                .call(document_value(), vec![Value::string("body")])
+                .get_property("0")
+                == document_value().get_property("body")
+        );
     }
 
     #[test]
