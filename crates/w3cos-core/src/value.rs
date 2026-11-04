@@ -763,6 +763,11 @@ impl ArrayStorage {
         self.vec_mut().pop()
     }
 
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        self.vec_mut().truncate(new_len);
+        self.refresh_heap_accounting();
+    }
+
     pub(crate) fn remove(&mut self, index: usize) -> Value {
         self.vec_mut().remove(index)
     }
@@ -1525,6 +1530,24 @@ static LENGTH_WRITE: OnceLock<fn(&Value)> = OnceLock::new();
 /// Collection length fast-paths use this to notice prototype overrides.
 pub fn install_length_write_hook(hook: fn(&Value)) {
     let _ = LENGTH_WRITE.set(hook);
+}
+
+/// `array.length = n`: truncate, or extend with holes. A value that is not a
+/// uint32 is a RangeError in JS; the array is left untouched here. Growth is
+/// capped so a stray huge length cannot allocate gigabytes of hole slots.
+fn set_array_length(array: &mut ArrayStorage, value: &Value) {
+    const MAX_GROWTH: usize = 1 << 24;
+    let n = value.to_number();
+    if !(n.is_finite() && n >= 0.0 && n.fract() == 0.0 && n <= u32::MAX as f64) {
+        return;
+    }
+    let new_len = n as usize;
+    let len = array.len();
+    if new_len < len {
+        array.truncate(new_len);
+    } else if new_len > len && new_len - len <= MAX_GROWTH {
+        array.resize_with(new_len, array_hole);
+    }
 }
 
 fn note_length_write(value: &Value) {
@@ -2720,6 +2743,8 @@ impl Value {
                     a.resize_with(idx + 1, array_hole);
                 }
                 a[idx] = value;
+            } else if key == "length" && crate::binary::typed_array_property(self, key).is_none() {
+                set_array_length(&mut arr.borrow_mut(), &value);
             }
             return true;
         }
@@ -6729,6 +6754,26 @@ mod tests {
             Some(crate::promise::PromiseStatus::Rejected(reason))
                 if reason == Value::string("close")
         ));
+    }
+
+    #[test]
+    fn writing_array_length_truncates_or_extends_with_holes() {
+        let arr = Value::array((0..5).map(|n| Value::Number(n as f64)).collect());
+        arr.set_property("length", Value::Number(2.0));
+        assert_eq!(arr.get_property("length").to_number(), 2.0);
+        assert!(arr.get_property("2").is_undefined());
+        assert_eq!(arr.get_property("1").to_number(), 1.0);
+        arr.set_property("length", Value::Number(4.0));
+        assert_eq!(arr.get_property("length").to_number(), 4.0);
+        assert!(arr.get_property("3").is_undefined());
+        arr.set_property("length", Value::Number(0.0));
+        assert_eq!(arr.get_property("length").to_number(), 0.0);
+        // Not a uint32: JS throws a RangeError; the array must stay intact.
+        arr.set_property("0", Value::Number(9.0));
+        for bad in [-1.0, 1.5, f64::NAN, f64::INFINITY] {
+            arr.set_property("length", Value::Number(bad));
+            assert_eq!(arr.get_property("length").to_number(), 1.0, "{bad}");
+        }
     }
 
     #[test]
