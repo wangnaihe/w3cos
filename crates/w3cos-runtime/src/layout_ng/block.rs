@@ -92,6 +92,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "background-inherit"
             | "text-source-run"
             | "text-fragment-ends"
+            // CSSOM getClientRects ownership metadata (#325): the CSSOM
+            // writeback reads it from the laid-out text; box layout never does.
+            | "cssom-owner-ranges"
+            | "cssom-box-owners"
             | "quirks-mode"
             | "document-element"
             | "size-containment"
