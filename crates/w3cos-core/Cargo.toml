@@ -24,6 +24,7 @@ base64 = "0.22"
 rustc-hash = "2"
 regex = "1"
 fancy-regex = "0.18"
+regex-syntax = "0.8"
 num-bigint = "0.4"
 num-traits = "0.2"
 # `w3cos-node` crypto / zlib host functions.
