@@ -10189,6 +10189,7 @@ impl Document {
                             style.white_space,
                             w3cos_std::style::WhiteSpace::Normal
                                 | w3cos_std::style::WhiteSpace::PreLine
+                                | w3cos_std::style::WhiteSpace::PreWrap
                         )
                         && (!matches!(style.width, w3cos_std::style::Dimension::Auto)
                             || style.text_indent != w3cos_std::style::Dimension::Px(0.0)

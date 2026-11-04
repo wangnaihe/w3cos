@@ -1980,8 +1980,10 @@ impl CSSStyleDeclaration {
             }
             "white-space" | "whiteSpace" => {
                 if value.trim().eq_ignore_ascii_case("break-spaces") {
-                    // Only the break-after-every-space opportunities are
-                    // modelled; space preservation keeps the previous value.
+                    // break-spaces preserves spaces and newlines and wraps
+                    // like pre-wrap, with a break opportunity after every
+                    // preserved space and no hanging (CSS Text 3 4.1.1).
+                    self.inner.white_space = w3cos_std::style::WhiteSpace::PreWrap;
                     self.inner.break_spaces = true;
                 } else if let Some(white_space) = parse_white_space(value) {
                     self.inner.white_space = white_space;
@@ -7046,6 +7048,23 @@ fn transform_to_css(transform: w3cos_std::style::Transform2D) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn break_spaces_is_pre_wrap_with_the_break_spaces_flag() {
+        let mut declaration = super::CSSStyleDeclaration::new();
+        declaration.set_property("white-space", "break-spaces");
+        assert_eq!(
+            declaration.inner.white_space,
+            w3cos_std::style::WhiteSpace::PreWrap
+        );
+        assert!(declaration.inner.break_spaces);
+        declaration.set_property("white-space", "pre-wrap");
+        assert_eq!(
+            declaration.inner.white_space,
+            w3cos_std::style::WhiteSpace::PreWrap
+        );
+        assert!(!declaration.inner.break_spaces);
+    }
+
     #[test]
     fn resize_keywords_round_trip_and_invalid_values_keep_the_valid_declaration() {
         let mut declaration = super::CSSStyleDeclaration::new();

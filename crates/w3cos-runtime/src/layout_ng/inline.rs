@@ -305,15 +305,18 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.line_break == LineBreak::Anywhere {
         return Some("text:line-break");
     }
-    if style.break_spaces {
-        return Some("text:break-spaces");
-    }
+    // break-spaces: the sole-leaf wrap runs through crate::line_break
+    // (BreakSpace::AfterEverySpace); multi-item lines stay on legacy.
     // break-all / keep-all only change the opportunities
     // (crate::line_break::BreakMode); break-word adds emergency breaks.
+    // break-word (overflow-wrap: break-word / anywhere, word-break:
+    // break-word) only adds emergency breaks inside a word that overflows its
+    // line; line building bails when one is needed ("break-word-overflow").
     if !matches!(
         style.word_break,
         WordBreak::Normal | WordBreak::BreakAll | WordBreak::KeepAll
-    ) {
+    ) && !break_word_supported(style)
+    {
         return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
@@ -833,7 +836,8 @@ fn inline_text_reason(
             w3cos_std::style::WordBreak::Normal
                 | w3cos_std::style::WordBreak::KeepAll
                 | w3cos_std::style::WordBreak::BreakAll
-        ) {
+        ) && !break_word_supported(style)
+        {
             return Some("text:word-break");
         }
         // BreakSpaceType::kAfterEverySpace between items is not modelled
@@ -1930,6 +1934,15 @@ fn max_content_width(content: &str, style: &Style) -> f32 {
     }
 }
 
+/// `break-word` is modelled only where its extra emergency breaks are never
+/// needed (line building bails otherwise) and the item's intrinsic width
+/// cannot depend on trailing preserved spaces: not for plain `pre-wrap`, whose
+/// shrink-to-fit width still comes from the legacy leaf measure.
+fn break_word_supported(style: &Style) -> bool {
+    style.word_break == WordBreak::BreakWord
+        && (style.white_space != WhiteSpace::PreWrap || style.break_spaces)
+}
+
 /// A forced line break inside a leaf: a coalesced `<br>` or a preserved
 /// newline.
 fn has_forced_break(content: &str, style: &Style) -> bool {
@@ -2583,6 +2596,16 @@ fn layout_lines(
             opportunity = f.opportunity(line_top, assumed_line, space.available_inline);
             continue;
         }
+        if !fits
+            && current.is_empty()
+            && can_wrap
+            && flat[item.index].style.word_break == WordBreak::BreakWord
+            && !item.whitespace_only
+        {
+            // An unbreakable word wider than the line takes an emergency
+            // break (overflow-wrap: break-word), which S2 does not model.
+            return super::bail("break-word-overflow");
+        }
         if fits || current.is_empty() || !can_wrap {
             current.push(i);
             i += 1;
@@ -2678,6 +2701,11 @@ fn layout_lines(
             }
             None => {
                 // No opportunity on this line: the item overflows.
+                if flat[item.index].style.word_break == WordBreak::BreakWord
+                    && !item.whitespace_only
+                {
+                    return super::bail("break-word-overflow");
+                }
                 current.push(i);
                 i += 1;
             }
@@ -3211,6 +3239,36 @@ pub(super) fn inline_min_max(
 #[cfg(test)]
 mod tab_tests {
     use super::*;
+
+    #[test]
+    fn sole_break_spaces_leaf_and_break_word_stay_on_ng() {
+        let break_spaces = Style {
+            white_space: WhiteSpace::PreWrap,
+            break_spaces: true,
+            ..Style::default()
+        };
+        assert_eq!(text_style_reason("a b", &break_spaces), None);
+        let break_word = Style {
+            word_break: WordBreak::BreakWord,
+            ..Style::default()
+        };
+        assert_eq!(text_style_reason("abc", &break_word), None);
+        // Plain pre-wrap + break-word keeps the legacy shrink-to-fit width.
+        let pre_wrap_break_word = Style {
+            white_space: WhiteSpace::PreWrap,
+            word_break: WordBreak::BreakWord,
+            ..Style::default()
+        };
+        assert_eq!(
+            text_style_reason("abc", &pre_wrap_break_word),
+            Some("text:word-break")
+        );
+        let break_spaces_break_word = Style {
+            break_spaces: true,
+            ..pre_wrap_break_word
+        };
+        assert_eq!(text_style_reason("abc", &break_spaces_break_word), None);
+    }
 
     #[test]
     fn preserved_tabs_stay_on_ng_only_on_the_first_line() {
