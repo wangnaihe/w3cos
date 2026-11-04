@@ -1,4 +1,6 @@
 pub mod animations_web;
+#[cfg(not(feature = "dynamic-js"))]
+mod aot_script;
 pub mod audio_web;
 mod background_image;
 pub mod badging_web;

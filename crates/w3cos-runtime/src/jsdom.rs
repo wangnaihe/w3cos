@@ -1026,14 +1026,14 @@ fn is_default_document(value: &Value) -> bool {
     })
 }
 
-fn get_expando(node: u32, key: &str) -> Option<Value> {
+pub(crate) fn get_expando(node: u32, key: &str) -> Option<Value> {
     if let Some(id) = known_expando(key) {
         return KNOWN_EXPANDS.with(|props| props.borrow().get(&(node, id)).cloned());
     }
     ELEMENT_PROPS.with(|p| p.borrow().get(&(node, key.to_string())).cloned())
 }
 
-fn set_expando(node: u32, key: &str, value: Value) {
+pub(crate) fn set_expando(node: u32, key: &str, value: Value) {
     if key == "dispatchEvent" {
         note_dispatch_override();
     }
@@ -5002,6 +5002,20 @@ fn disconnected_lifecycle_may_be_observable(root: u32) -> bool {
 }
 
 fn insert_child_or_fragment(parent: u32, child: u32, reference: Option<u32>) {
+    #[cfg(not(feature = "dynamic-js"))]
+    let roots = if dom::node_type(child) == 11 {
+        dom::children(child)
+    } else {
+        vec![child]
+    };
+    insert_child_or_fragment_inner(parent, child, reference);
+    #[cfg(not(feature = "dynamic-js"))]
+    for root in roots {
+        crate::aot_script::notify_inserted(root);
+    }
+}
+
+fn insert_child_or_fragment_inner(parent: u32, child: u32, reference: Option<u32>) {
     let foreign_owner = parent != 0
         && get_expando(parent, "ownerDocument").is_some_and(|owner| !is_default_document(&owner));
     if reference.is_none() && !foreign_owner && fresh_simple_element(parent, child) {
