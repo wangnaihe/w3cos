@@ -147,3 +147,21 @@ fn native_watchdog_matches_native_watchdog_js() {
     let expected: Vec<&str> = NATIVE_WATCHDOG_NODE.lines().collect();
     assert_eq!(lines, expected);
 }
+
+#[test]
+fn node_pty_runs_programs_on_a_pseudo_terminal() {
+    let lines = run("node_pty", include_str!("fixtures/node_native/node_pty.js"));
+    let expected = [
+        "api function",
+        "pid number true sh 100 30",
+        "size true",
+        "echo true got true",
+        "exit 3",
+        "resized 120 40",
+        "second 40 120 0",
+        "killed 0 15",
+        "missing ENOENT",
+        "done",
+    ];
+    assert_eq!(lines, expected);
+}
