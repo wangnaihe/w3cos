@@ -712,30 +712,19 @@ fn js_pattern(source: &str, flags: &str) -> String {
 
 /// Cheap syntax check used at construction time; no automaton is built.
 ///
-/// fancy-regex checks its own constructs; the AST pass then catches errors
-/// it leaves to the delegate (e.g. `a{2,1}`). The AST parser rejects
-/// lookaround and backreferences, so only its non-"unsupported" errors count.
+/// When fancy-regex's parse tree and the regex-syntax AST both accept the
+/// pattern it is valid. Anything the AST parser rejects (lookaround,
+/// backreferences, duplicate group names, ...) falls back to a real compile,
+/// so construction-time SyntaxErrors match the eager behaviour exactly.
 fn pattern_parses(source: &str, flags: &str) -> bool {
-    use regex_syntax::ast::ErrorKind;
     let pattern = js_pattern(source, flags);
     if fancy_regex::Expr::parse_tree(&pattern).is_err() {
         return false;
     }
-    match regex_syntax::ast::parse::Parser::new().parse(&pattern) {
-        Ok(_) => true,
-        Err(error) => {
-            matches!(
-                error.kind(),
-                ErrorKind::UnsupportedLookAround
-                    | ErrorKind::UnsupportedBackreference
-                    | ErrorKind::GroupNameInvalid
-                    | ErrorKind::FlagUnrecognized
-                    | ErrorKind::EscapeUnrecognized
-                    | ErrorKind::GroupUnclosed
-                    | ErrorKind::GroupUnopened
-            ) && build_regex(source, flags).is_some()
-        }
-    }
+    regex_syntax::ast::parse::Parser::new()
+        .parse(&pattern)
+        .is_ok()
+        || build_regex(source, flags).is_some()
 }
 
 fn build_regex_uncached(source: &str, flags: &str) -> Option<Regex> {
@@ -884,6 +873,7 @@ mod tests {
         assert!(!pattern_parses("a{2,1}", ""));
         assert!(pattern_parses(r"(?<=a)b(c)\1?", ""));
         assert!(pattern_parses(r"[\p{L}--[a-z]]", "v"));
+        assert!(pattern_parses("(?<x>a)|(?<x>b)", ""));
     }
 
     #[test]
