@@ -495,19 +495,17 @@ fn supported_script_in(content: &str, reordered: bool) -> bool {
             || (0x1E800..=0x1EFFF).contains(&u);
         let bidi_control =
             matches!(u, 0x061C) || (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u);
-        // The ideographic space and the zero width space are break
-        // opportunities the NG breaker knows (`is_soft_wrap_char`), and
-        // their width matches Chrome when no line needs the break (see
-        // `unicode_breakable_spaces_in_text_match_chrome`). The other spaces
-        // (U+2000..U+200A, 202F, 205F, 1680, 180E), the joiners and the
-        // word joiner need break, no-break or intrinsic-size rules the
-        // breaker does not have, so they stay on legacy.
-        let breakable_space = matches!(u, 0x3000 | 0x200B);
-        let other_space = !breakable_space
-            && (matches!(u, 0x1680 | 0x180E | 0x205F)
-                || (0x2000..=0x200D).contains(&u)
-                || u == 0x202F
-                || (0x2060..=0x2064).contains(&u));
+        // Break opportunities come from crate::line_break (UAX #14 via
+        // ICU, as Blink's LazyLineBreakIterator): the ideographic space,
+        // the zero width space and the other space separators of class BA
+        // (U+1680, U+2000..U+2006, U+2008..U+200A, U+205F) allow a break
+        // after them; the GL ones (U+2007, U+202F, U+180E, U+2060) never
+        // do. None of them is a collapsible or hanging space in
+        // NGLineBreaker (only U+0020 / tab trail; break-spaces aside), so
+        // they keep their advance at the line end and in min-/max-content,
+        // as Chrome measures. The joiners (U+200C, U+200D) and the
+        // invisible operators (U+2061..U+2064) still stay on legacy.
+        let other_space = matches!(u, 0x200C | 0x200D) || (0x2061..=0x2064).contains(&u);
         let special = (0xD800..=0xDFFF).contains(&u) || (0xFFF0..=0xFFFF).contains(&u);
         !((rtl && !reordered) || bidi_control || other_space || special)
     })

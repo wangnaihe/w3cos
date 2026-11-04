@@ -10445,11 +10445,9 @@ fn unicode_breakable_spaces_in_text_match_chrome() {
     assert!(block::unsupported_reasons(&flat).is_empty());
     assert!(layout_tree_with_text(&root, &flat, 800.0, 600.0).is_none());
 
-    // Spaces that stay on legacy: joiners (Chrome gives them no advance, the
-    // fallback face does), no-break and fallback-width spaces, word joiner.
+    // The other space separators (BA and GL) and the word joiner lay out
+    // on NG: crate::line_break gives their UAX #14 opportunities.
     for text in [
-        "XX\u{200c}XX",
-        "XX\u{200d}XX",
         "XX\u{202f}XX",
         "XX\u{2007}XX",
         "XX\u{2060}XX",
@@ -10457,7 +10455,18 @@ fn unicode_breakable_spaces_in_text_match_chrome() {
         "XX\u{205f}XX",
         "XX\u{2003}XX",
         "XX\u{2009}XX",
+        "XX\u{1680}XX",
     ] {
+        let root = build(text, 200.0);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::unsupported_reasons(&flat).is_empty(),
+            "{text:?} lays out on NG"
+        );
+    }
+    // Joiners stay on legacy (Chrome gives them no advance, the fallback
+    // face does).
+    for text in ["XX\u{200c}XX", "XX\u{200d}XX"] {
         let root = build(text, 200.0);
         let flat = pre_flatten(&root);
         assert!(
