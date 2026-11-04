@@ -204,6 +204,9 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             | "clamp-lines"
             // Read with the run-in display marker (run_in_block_styles).
             | "run-in-block"
+            // Paint resolves it against the laid-out border box
+            // (paint_artifact::resolve_translate_percent).
+            | "translate-percent"
         )
         || name.starts_with("decoration-owner")
         // Logical sizes the cascade does not resolve. Legacy layout ignores

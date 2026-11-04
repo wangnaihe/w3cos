@@ -950,7 +950,7 @@ fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Co
 /// Whether the opt-in LayoutNG engine is requested (`W3COS_LAYOUT_NG`, or
 /// its verify mode). Mirrors `layout_ng::mode()`; the DOM crate cannot see
 /// the runtime crate.
-fn layout_ng_requested() -> bool {
+pub(crate) fn layout_ng_requested() -> bool {
     static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQUESTED.get_or_init(|| {
         ["W3COS_LAYOUT_NG", "W3COS_LAYOUT_NG_VERIFY"]
