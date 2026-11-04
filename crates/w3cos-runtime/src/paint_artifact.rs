@@ -156,6 +156,30 @@ pub fn reuse_or_clone_paint_nodes<'a>(
     (out, clones)
 }
 
+/// `transform: translate*(<percentage>)` resolves against the border box
+/// (CSS Transforms 1, 13.1). The DOM keeps the percentages in
+/// `--w3cos-internal-translate-percent` (LayoutNG only) as `"x,y"`; add them
+/// to the pixel translation once the box is laid out.
+fn resolve_translate_percent(nodes: &mut [PaintNode], layout_cache: &[(LayoutRect, usize)]) {
+    for (rect, index) in layout_cache {
+        let Some(node) = nodes.get_mut(*index) else {
+            continue;
+        };
+        let Some((x, y)) = node
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get("--w3cos-internal-translate-percent"))
+            .and_then(|value| value.split_once(','))
+            .and_then(|(x, y)| Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?)))
+        else {
+            continue;
+        };
+        node.style.transform.translate_x += rect.width * x / 100.0;
+        node.style.transform.translate_y += rect.height * y / 100.0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PaintProperties {
     pub transform: PropertyNodeId,
@@ -2441,6 +2465,9 @@ impl PaintArtifact {
             ]
             .into_iter()
             .any(|edge| matches!(edge, Spacing::Percent(_)));
+        }
+        if crate::layout_ng::mode() != crate::layout_ng::Mode::Off {
+            resolve_translate_percent(&mut nodes, layout_cache);
         }
         let has_background_image = |style: &Style| {
             style.background_image.as_deref().is_some_and(|value| {
@@ -5537,6 +5564,42 @@ mod tests {
             );
             assert_eq!(source.border_width, 32.0, "computed width retained");
         }
+    }
+
+    #[test]
+    fn translate_percent_marker_resolves_against_the_border_box() {
+        let mut style = Style::default();
+        style.transform.translate_x = 4.0;
+        style.custom_properties = Some(Default::default());
+        style
+            .custom_properties
+            .as_mut()
+            .unwrap()
+            .insert("--w3cos-internal-translate-percent".into(), "-50,10".into());
+        let mut nodes = vec![
+            PaintNode {
+                kind: ComponentKind::Box,
+                style,
+                parent: None,
+                sticky_counter_signal: None,
+            },
+            PaintNode {
+                kind: ComponentKind::Box,
+                style: Style::default(),
+                parent: Some(0),
+                sticky_counter_signal: None,
+            },
+        ];
+        let rect = |width, height| LayoutRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+        };
+        resolve_translate_percent(&mut nodes, &[(rect(60.0, 20.0), 0), (rect(8.0, 8.0), 1)]);
+        assert_eq!(nodes[0].style.transform.translate_x, 4.0 - 30.0);
+        assert_eq!(nodes[0].style.transform.translate_y, 2.0);
+        assert!(nodes[1].style.transform.is_identity());
     }
 
     #[test]
