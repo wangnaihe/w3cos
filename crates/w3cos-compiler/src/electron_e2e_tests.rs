@@ -887,3 +887,45 @@ fn electron_parent_port_queues_messages_until_a_listener_is_added() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A burst posted on a `MessageChannelMain` port arrives in one task (like
+/// Node's MessagePort::OnMessage), not one event-loop turn per message: the
+/// ptyHost / SharedProcess replies otherwise wait one busy turn each.
+const MESSAGE_PORT_MAIN_BURST: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-port-burst", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, MessageChannelMain } = require('electron')
+app.whenReady().then(() => {
+  const { port1, port2 } = new MessageChannelMain()
+  const got = []
+  port2.on('message', (e) => got.push(e.data))
+  port2.start()
+  setTimeout(() => {
+    for (let i = 0; i < 5; i++) port1.postMessage(i)
+    setTimeout(() => {
+      console.log('burst ' + got.join(','))
+      port1.postMessage('after')
+      setTimeout(() => { console.log('last ' + got[got.length - 1]); app.quit() }, 0)
+    }, 0)
+  }, 5)
+})
+"#,
+    ),
+];
+
+#[test]
+fn electron_message_port_main_delivers_a_burst_in_one_task() {
+    let root = write_fixture("w3cos_electron_port_burst", MESSAGE_PORT_MAIN_BURST);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_port_burst",
+        &[],
+    );
+    assert_eq!(lines, ["burst 0,1,2,3,4", "last after"], "{lines:#?}");
+    std::fs::remove_dir_all(root).ok();
+}

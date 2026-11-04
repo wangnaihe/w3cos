@@ -88,9 +88,21 @@ function t7(next) {
   });
 }
 
+// A burst on one port arrives in one callback (Node's MessagePort::OnMessage),
+// before an immediate queued after it.
+function t8(next) {
+  const { port1, port2 } = new MessageChannel();
+  let got = 0;
+  port2.on('message', () => { got++; });
+  setTimeout(() => {
+    for (let i = 0; i < 5; i++) port1.postMessage(i);
+    setImmediate(() => { console.log('t8 burst', got); port2.close(); next(); });
+  }, 5);
+}
+
 if (isMainThread) {
   console.log('main', isMainThread, threadId, workerData, parentPort);
-  t1(() => t2(() => t3(() => t4(() => t5(() => t6(() => t7(() => console.log('done'))))))));
+  t1(() => t2(() => t3(() => t4(() => t5(() => t6(() => t7(() => t8(() => console.log('done')))))))));
 } else if (workerData === 'env') {
   parentPort.postMessage(typeof process.env.W3COS_T7 + ' ' + process.env.W3COS_T7 + ' ' + process.env.W3COS_T7_INHERIT);
 } else {

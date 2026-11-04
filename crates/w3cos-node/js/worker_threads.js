@@ -39,7 +39,7 @@ function checkTransfer(transferList) {
 }
 
 // One end of a MessageChannel. Messages wait until the port starts (a
-// 'message' listener or start()), then arrive one per macrotask. A started
+// 'message' listener or start()), then a macrotask delivers everything queued. A started
 // port keeps the thread alive until it is closed or unref()'d.
 class MessagePort extends EventEmitter {
   constructor() {
@@ -67,11 +67,13 @@ class MessagePort extends EventEmitter {
   _schedule() {
     if (!this._started || this._scheduled || this._queue.length === 0) return;
     this._scheduled = true;
+    // Node's MessagePort::OnMessage delivers the whole queue (up to 1000,
+    // including what arrives meanwhile) in one callback.
     setImmediate(() => {
       this._scheduled = false;
-      if (!this._started || this._closed || this._queue.length === 0) return;
-      const data = this._queue.shift();
-      this.emit('message', clone.deserialize(data));
+      for (let n = 0; n < 1000 && this._started && !this._closed && this._queue.length > 0; n++) {
+        this.emit('message', clone.deserialize(this._queue.shift()));
+      }
       this._schedule();
     });
   }

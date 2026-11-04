@@ -211,6 +211,7 @@ t5 exit 0
 t6 path ERR_WORKER_PATH TypeError
 t7 message string 7 undefined
 t7 default undefined undefined inherited undefined
+t8 burst 5
 done
 "#;
 
