@@ -12219,3 +12219,82 @@ fn inline_level_abspos_static_position_matches_chrome() {
         }
     }
 }
+
+/// A tab leaf at the start of a `white-space: pre` line advances by the
+/// computed `tab-size` (an absolute length here, which needs no font):
+/// `n` tabs are `n` sizes, a size under half a space takes the next stop,
+/// zero is no advance, and the next inline item follows (testdata/
+/// chrome-tab-size.json, Chrome 156).
+#[test]
+fn tab_size_length_matches_chrome() {
+    use w3cos_std::style::{CustomProperties, Position};
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/chrome-tab-size.json")).unwrap();
+    let marker = |size: &str| {
+        Some(CustomProperties::from_iter([(
+            "--w3cos-internal-tab-size".to_string(),
+            format!("{size}px"),
+        )]))
+    };
+    for case in golden["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let rects = &case["rects"];
+        let want = |id: &str, i: usize| rects[id][i].as_f64().unwrap() as f32;
+        let (size, tabs, inline_block) = match name {
+            "one-tab" | "invalid-keeps-previous" => ("40", 1, false),
+            "two-tabs" => ("40", 2, false),
+            "narrow-tab" => ("1", 1, false),
+            "zero" => ("0", 1, false),
+            "then-inline-block" => ("30", 1, true),
+            "inherited-length" => ("25", 1, true),
+            other => panic!("unmapped case {other}"),
+        };
+        let leaf = Style {
+            display: Display::Inline,
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            custom_properties: marker(size),
+            ..Style::default()
+        };
+        let text = Component::text("\t".repeat(tabs), leaf.clone());
+        let container = Style {
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            custom_properties: marker(size),
+            ..block()
+        };
+        if inline_block {
+            let span = node(
+                Style {
+                    display: Display::InlineBlock,
+                    width: Dimension::Px(20.0),
+                    height: Dimension::Px(20.0),
+                    ..Style::default()
+                },
+                vec![],
+            );
+            let root = node(block(), vec![node(container, vec![text, span])]);
+            let out = ng_rects(&root);
+            // 0 root, 1 container, 2 tab leaf, 3 span.
+            let actual = rect(&out, 3);
+            assert!(
+                (actual.0 - want("s", 0)).abs() < 0.05 && (actual.2 - want("s", 2)).abs() < 0.05,
+                "{name}: {actual:?}"
+            );
+        } else {
+            let pre = Style {
+                position: Position::Absolute,
+                left: Dimension::Px(0.0),
+                top: Dimension::Px(0.0),
+                ..container
+            };
+            let root = node(block(), vec![node(pre, vec![text])]);
+            let out = ng_rects(&root);
+            let actual = rect(&out, 1);
+            assert!(
+                (actual.2 - want("p", 2)).abs() < 0.05,
+                "{name}: width {} vs {}",
+                actual.2,
+                want("p", 2)
+            );
+        }
+    }
+}

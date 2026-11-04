@@ -129,6 +129,7 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
         || matches!(
             name,
             "font-size-origin"
+            | "tab-size"
             | "font-specified-size"
             | "html-standard-font"
             | "list-style-image"
