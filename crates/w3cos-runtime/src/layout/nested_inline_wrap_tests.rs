@@ -71,9 +71,31 @@ fn parsed_block_only_inline_block_distinguishes_content_and_empty_baselines() {
 
 #[test]
 fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
     use crate::html_parser_host::InertParserScriptHost;
     use crate::html_parser_state::StreamingDocumentParser;
     use std::rc::Rc;
+    const OWNER: u64 = 202611040001;
+    const FAMILY: &str = "W3cos anonymous table Tinos";
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: FAMILY.into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     for heights in [[100, 80, 60], [60, 120, 80], [0, 0, 0]] {
         for anonymous in [true, false] {
             w3cos_dom::stylesheet::clear_rules();
@@ -101,7 +123,7 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 "https://example.test/anonymous-height.html",
             )
             .unwrap();
-            parser.write(&format!("<!doctype html><body style='font:16px/normal serif'><div>{content}</div></body>")).unwrap();
+            parser.write(&format!("<!doctype html><body style='font:16px/normal \"{FAMILY}\"'><div>{content}</div></body>")).unwrap();
             parser.finish().unwrap();
             let root = crate::dom::to_component_tree();
             let flat = pre_flatten(&root);
@@ -120,7 +142,9 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 .map(|(index, _)| index)
                 .collect();
             assert_eq!(cells.len(), 3);
-            let height = (*heights.iter().max().unwrap()).max(22) as f32;
+            // Chrome156 with the same bundled Tinos bytes: both anonymous
+            // fixup and an authored table row use an 18px empty-line floor.
+            let height = (*heights.iter().max().unwrap()).max(18) as f32;
             for layouts in [
                 compute(&root, 800.0, 600.0).unwrap(),
                 LayoutEngine::new()
@@ -132,7 +156,7 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                 let outer = LayoutRect {
                     x: 8.0,
                     y: 8.0,
-                    width: 131.79688,
+                    width: 111.0625,
                     height,
                 };
                 assert_eq!(
@@ -146,9 +170,9 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
                     "anonymous={anonymous}, heights={heights:?}"
                 );
                 for (index, (x, width)) in cells.iter().zip([
-                    (8.0, 50.265625),
-                    (58.265625, 42.609375),
-                    (100.875, 38.921875),
+                    (8.0, 43.53125),
+                    (51.53125, 33.765625),
+                    (85.296875, 33.765625),
                 ]) {
                     assert_eq!(
                         rect(*index),
