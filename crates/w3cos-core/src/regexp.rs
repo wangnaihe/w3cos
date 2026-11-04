@@ -880,6 +880,26 @@ mod tests {
         assert!(build_regex(r"{(\d+)}", "g").is_some());
     }
 
+    /// Every unique regex literal in the Code-OSS `out/` bundle (one JSON
+    /// `[source, flags]` pair per line): the lazy construction-time verdict
+    /// must equal eager full compilation for each one.
+    #[test]
+    fn code_oss_regex_literals_lazy_verdict_matches_eager_compile() {
+        let corpus = include_str!("../tests/fixtures/code_oss_regex_literals.txt");
+        let mut mismatches = Vec::new();
+        let mut total = 0;
+        for line in corpus.lines().filter(|line| !line.is_empty()) {
+            let (source, flags): (String, String) = serde_json::from_str(line).unwrap();
+            total += 1;
+            let eager = build_regex_uncached(&source, &flags).is_some();
+            if pattern_parses(&source, &flags) != eager {
+                mismatches.push(format!("/{source}/{flags} eager={eager}"));
+            }
+        }
+        assert!(total > 4000, "corpus truncated: {total}");
+        assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+    }
+
     #[test]
     fn repeated_builds_share_one_compiled_program() {
         let first = build_regex(r"(?:\p{L}+)\s*(\d+)", "iu").unwrap();
