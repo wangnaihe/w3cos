@@ -715,24 +715,28 @@ pub(super) fn container_min_max_at(
     let row = row_axis(style.flex_direction);
     let line = match block {
         Some(block) => Some(block),
-        None => match definite(style.height, space.percentage_block, style, space)
-            .why("flex:percent")?
-        {
-            Some(size) => {
-                if [style.padding.top, style.padding.bottom]
-                    .iter()
-                    .any(|side| matches!(side, Spacing::Percent(_) | Spacing::PaddingCalc { .. }))
-                {
-                    return super::bail("flex:intrinsic-percent-padding");
+        // A percentage height of an indefinite containing block is `auto`
+        // (CSS2 §10.5).
+        None => {
+            match definite(style.height, space.percentage_block, style, space).unwrap_or(None) {
+                Some(size) => {
+                    if [style.padding.top, style.padding.bottom]
+                        .iter()
+                        .any(|side| {
+                            matches!(side, Spacing::Percent(_) | Spacing::PaddingCalc { .. })
+                        })
+                    {
+                        return super::bail("flex:intrinsic-percent-padding");
+                    }
+                    Some(to_content(
+                        style,
+                        item_edges(style, space, 0.0, false),
+                        size,
+                    ))
                 }
-                Some(to_content(
-                    style,
-                    item_edges(style, space, 0.0, false),
-                    size,
-                ))
+                None => None,
             }
-            None => None,
-        },
+        }
     };
     let multiline = style.flex_wrap != FlexWrap::NoWrap;
     let column_line = if !row && multiline {
@@ -1457,11 +1461,22 @@ fn inline_contribution(
     let edges = border[1] + border[3] + pad(style.padding.left) + pad(style.padding.right);
     let margin = spacing_px(style, style.margin.left, 0.0, space)
         + spacing_px(style, style.margin.right, 0.0, space);
-    let sizes = match definite(style.width, None, style, space).why("flex:percent")? {
+    // A percentage (or percentage calc) width has no definite basis while
+    // sizing intrinsically, so it contributes as `auto` (css-sizing-3
+    // §5.2.1, Blink's ComputeMinAndMaxContentContribution). A replaced
+    // box's is compressible: its min-content contribution is zero
+    // (§5.2.2).
+    let cyclic = matches!(style.width, Dimension::Percent(_) | Dimension::Calc { .. })
+        && definite(style.width, None, style, space).is_none();
+    let sizes = match definite(style.width, None, style, space).unwrap_or(None) {
         Some(size) => MinMax::exact(to_content(style, edges, size) + edges),
         None => {
             let inner = block::intrinsic_sizes(flat, index, space).why("flex:intrinsic")?;
-            inner.map(|size| size + edges)
+            let mut sizes = inner.map(|size| size + edges);
+            if cyclic && block::is_replaced(flat[index].kind) {
+                sizes.min = Some(edges);
+            }
+            sizes
         }
     };
     Some(sizes.map(|size| size + margin))
@@ -1490,6 +1505,19 @@ fn block_content_min(flat: &[FlatNodeInfo], index: usize, space: &ConstraintSpac
     }
     if block::size_contained(info.style) {
         return Some(block::contain_intrinsic_size(info.style).1);
+    }
+    // A nested row flex container's block size is its tallest line, not
+    // the sum of its items: lay it out (Blink lays out the flex item to
+    // get its content block size, FlexLayoutAlgorithm::ConstructAndAppend
+    // FlexItems).
+    if block::is_author_flex(info.style) && row_axis(info.style.flex_direction) {
+        let laid =
+            block::layout_block_sized(flat, index, space, false, None).why("flex:nested-row")?;
+        let border = block::border_widths(info.style);
+        let pad = |spacing| spacing_px(info.style, spacing, 0.0, space);
+        let edges =
+            border[0] + border[2] + pad(info.style.padding.top) + pad(info.style.padding.bottom);
+        return Some((laid.fragment.height - edges).max(0.0));
     }
     if let w3cos_std::ComponentKind::Text { .. } = info.kind {
         let line = info.style.font_size * info.style.line_height.max(1.0);
@@ -2440,7 +2468,10 @@ fn layout_with(
                 || !block::marker(child_style, block::WIDTH_KEYWORD)
                     .is_some_and(|_| !block::is_replaced(flat[child].kind)));
         let mut cross =
-            match definite(cross_dim, cross_basis, child_style, space).why("flex:percent")? {
+            // A percentage cross size against an indefinite container cross size
+            // behaves as `auto` for sizing but does not stretch (css-flexbox
+            // §9.8; Blink treats the unresolvable percentage as auto).
+            match definite(cross_dim, cross_basis, child_style, space).unwrap_or(None) {
                 // The used cross size honors the cross min/max sizes
                 // (Blink ComputeInlineSizeForFragment / ComputeBlockSize
                 // clamp a fixed size too).
@@ -3776,11 +3807,12 @@ fn clamp_cross(
     } else {
         (style.min_width, style.max_width)
     };
-    if let Some(max) = definite(max_dim, basis, style, space).why("flex:percent")? {
+    // Percentages of an indefinite basis are `none` / `0` (css-sizing-3).
+    if let Some(max) = definite(max_dim, basis, style, space).unwrap_or(None) {
         size = size.min(to_content(style, edges, max));
     }
     if !matches!(min_dim, Dimension::Auto) {
-        if let Some(min) = definite(min_dim, basis, style, space).why("flex:percent")? {
+        if let Some(min) = definite(min_dim, basis, style, space).unwrap_or(None) {
             size = size.max(to_content(style, edges, min));
         }
     }
