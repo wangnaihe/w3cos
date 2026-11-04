@@ -411,7 +411,12 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.break_spaces {
         return Some("text:break-spaces");
     }
-    if style.word_break != WordBreak::Normal {
+    // break-all is a LineBreakType of the UAX #14 iterator the NG breaker
+    // uses (crate::line_break::BreakMode); overflow-wrap emergency breaks and
+    // keep-all on a paragraph leaf are not modelled.
+    if !matches!(style.word_break, WordBreak::Normal | WordBreak::BreakAll)
+        || break_all_jamo(content, style)
+    {
         return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
@@ -812,11 +817,11 @@ fn inline_text_reason(
         if sole && line_relative_align(style).is_some() {
             return Some("vertical-align-keyword");
         }
-        // break-all / overflow-wrap add emergency breaks inside an item.
-        if !matches!(
-            style.word_break,
-            w3cos_std::style::WordBreak::Normal | w3cos_std::style::WordBreak::KeepAll
-        ) {
+        // overflow-wrap adds emergency breaks inside an item (break-all is
+        // an iterator break type, below).
+        if style.word_break == w3cos_std::style::WordBreak::BreakWord
+            || break_all_jamo(content, style)
+        {
             return Some("text:word-break");
         }
         // BreakSpaceType::kAfterEverySpace between items is not modelled
@@ -1351,13 +1356,24 @@ struct InlineItem {
     font_height: f32,
 }
 
+/// break-all over conjoining Hangul jamo: the syllable-boundary pieces are
+/// shaped apart (NGShapeResult::SubRange of one cluster run is not
+/// modelled), so their prefix widths overshoot the line.
+fn break_all_jamo(content: &str, style: &Style) -> bool {
+    style.word_break == WordBreak::BreakAll
+        && content.chars().any(|c| matches!(c, '\u{1100}'..='\u{11FF}' | '\u{A960}'..='\u{A97F}' | '\u{D7B0}'..='\u{D7FF}'))
+}
+
 /// A soft-wrap opportunity inside the item's non-space core: the engine's
 /// legacy set (spaces, hyphens, CJK) or any UAX #14 opportunity of
 /// crate::line_break.
 fn internal_opportunity(content: &str, style: &Style) -> bool {
     let core = content.trim_matches(' ');
-    if core.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        // FillAscii: no opportunity between ASCII letters and digits.
+    if core.bytes().all(|b| b.is_ascii_alphanumeric())
+        && style.word_break != w3cos_std::style::WordBreak::BreakAll
+    {
+        // FillAscii: no opportunity between ASCII letters and digits
+        // (break-all adds one between any two, ShouldBreakAfterBreakAll).
         return false;
     }
     core.chars().any(is_soft_wrap_char)
