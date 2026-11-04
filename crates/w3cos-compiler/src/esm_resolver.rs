@@ -1282,6 +1282,14 @@ impl EsmResolver {
             for specifier in collect_new_url_js_literals(&source) {
                 self.link_dynamic_import(&module.path, &specifier, from_dir, visited, graph);
             }
+            // Code-OSS `importAMDNodeModule("@xterm/xterm", "lib/xterm.js")`:
+            // amdX appends `<script src=…/node_modules/<name>/<path>>` and
+            // waits for its AMD `define`. Link the file as a lazily evaluated
+            // classic script registered under its path, which the runtime
+            // runs when that `<script src>` is inserted.
+            for (name, inner) in collect_amd_node_module_literals(&source) {
+                self.link_amd_node_module(&module.path, &name, &inner, visited, graph);
+            }
         }
 
         Ok(())
@@ -1336,6 +1344,57 @@ impl EsmResolver {
             specifier: specifier.to_string(),
             target,
         });
+    }
+
+    /// Link `<project>/node_modules/<name>/<inner>` (the file amdX's
+    /// `importAMDNodeModule(name, inner)` loads with a `<script src>`) as a
+    /// lazily evaluated classic script. Packages the app excludes are skipped.
+    fn link_amd_node_module(
+        &self,
+        referrer: &Path,
+        name: &str,
+        inner: &str,
+        visited: &mut HashSet<PathBuf>,
+        graph: &mut ModuleGraph,
+    ) {
+        if name.is_empty()
+            || name.contains("://")
+            || name.starts_with('.')
+            || name.starts_with('/')
+            || inner.starts_with('/')
+            || inner.split('/').any(|segment| segment == "..")
+        {
+            return;
+        }
+        let bare = if inner.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}/{inner}")
+        };
+        if self.is_excluded_dynamic_import(&bare) {
+            return;
+        }
+        let file = self
+            .project_root
+            .join("node_modules")
+            .join(name)
+            .join(inner);
+        if !file.is_file() {
+            self.commonjs_diagnostics.borrow_mut().push(format!(
+                "{}: importAMDNodeModule('{name}', '{inner}') names a missing file {}",
+                referrer.display(),
+                file.display()
+            ));
+            return;
+        }
+        let file = normalize_path(&file);
+        self.classic_scripts.borrow_mut().insert(file.clone());
+        let specifier = file.to_string_lossy().to_string();
+        let from_dir = file
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        self.link_dynamic_import(referrer, &specifier, &from_dir, visited, graph);
     }
 
     /// Resolve a path-like specifier (e.g. `vs/workbench/workbench.desktop.main.js`)
@@ -2168,6 +2227,106 @@ pub fn collect_dynamic_import_literals(source: &str) -> Vec<String> {
                     found.push(specifier);
                 }
                 index = after;
+            }
+            _ => index += 1,
+        }
+    }
+    found
+}
+
+/// `(name, path)` string-literal argument pairs of
+/// `importAMDNodeModule("name", "path")` calls (Code-OSS `vs/amdX.js`), in
+/// source order and deduplicated. Comments, strings and calls with computed
+/// arguments are skipped; a member call (`x.importAMDNodeModule(`) counts
+/// (bundlers rename imports to `amdX.importAMDNodeModule`).
+pub fn collect_amd_node_module_literals(source: &str) -> Vec<(String, String)> {
+    const CALLEE: &[u8] = b"importAMDNodeModule";
+    let bytes = source.as_bytes();
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut index = 0;
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+    let skip_ws = |mut cursor: usize| {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        cursor
+    };
+    // A plain `'…'`/`"…"` literal (no escapes) at `cursor`: (text, end).
+    let literal = |cursor: usize| -> Option<(String, usize)> {
+        let quote @ (b'\'' | b'"') = *bytes.get(cursor)? else {
+            return None;
+        };
+        let start = cursor + 1;
+        let length = bytes[start..]
+            .iter()
+            .position(|&byte| byte == quote || byte == b'\\' || byte == b'\n')?;
+        (bytes[start + length] == quote).then(|| {
+            (
+                source[start..start + length].to_string(),
+                start + length + 1,
+            )
+        })
+    };
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index += 2;
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != quote {
+                    if bytes[index] == b'\\' {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'i' if bytes[index..].starts_with(CALLEE)
+                && (index == 0 || !is_ident(bytes[index - 1]))
+                && !bytes
+                    .get(index + CALLEE.len())
+                    .copied()
+                    .is_some_and(is_ident) =>
+            {
+                index += CALLEE.len();
+                let cursor = skip_ws(index);
+                if bytes.get(cursor) != Some(&b'(') {
+                    continue;
+                }
+                let Some((name, end)) = literal(skip_ws(cursor + 1)) else {
+                    continue;
+                };
+                let cursor = skip_ws(end);
+                let (inner, end) = match bytes.get(cursor) {
+                    Some(b',') => match literal(skip_ws(cursor + 1)) {
+                        Some(pair) => pair,
+                        None => continue,
+                    },
+                    Some(b')') => (String::new(), cursor),
+                    _ => continue,
+                };
+                let cursor = skip_ws(end);
+                // `importAMDNodeModule(name, path, isBuilt)` is fine; any
+                // other trailing argument is ignored too.
+                if !matches!(bytes.get(cursor), Some(b')') | Some(b',')) {
+                    continue;
+                }
+                let pair = (name, inner);
+                if !found.contains(&pair) {
+                    found.push(pair);
+                }
+                index = cursor;
             }
             _ => index += 1,
         }
@@ -4025,6 +4184,115 @@ import("./literal.js");
                 "./lazy.js".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn collect_amd_node_module_literals_takes_literal_pairs_only() {
+        let source = r#"
+            import { importAMDNodeModule } from "../amdX.js";
+            const a = await importAMDNodeModule("@xterm/xterm", "lib/xterm.js");
+            const b = (await amdX.importAMDNodeModule('@xterm/addon-search', 'lib/addon-search.js', false)).SearchAddon;
+            importAMDNodeModule("@xterm/xterm", "lib/xterm.js");
+            // importAMDNodeModule("in-comment", "x.js")
+            const s = "importAMDNodeModule('in-string', 'x.js')";
+            importAMDNodeModule(name, "lib/x.js");
+            importAMDNodeModule("computed", path);
+            myimportAMDNodeModule("other", "x.js");
+            importAMDNodeModule("bare");
+        "#;
+        assert_eq!(
+            collect_amd_node_module_literals(source),
+            vec![
+                ("@xterm/xterm".to_string(), "lib/xterm.js".to_string()),
+                (
+                    "@xterm/addon-search".to_string(),
+                    "lib/addon-search.js".to_string()
+                ),
+                ("bare".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn amd_node_module_literals_link_lazy_classic_scripts() {
+        let root = std::env::temp_dir().join(format!(
+            "w3cos-amd-node-module-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            "package.json",
+            r#"{"name":"app","type":"module","w3cos":{"exclude":["@xterm/addon-webgl"]}}"#,
+        );
+        write(
+            "main.js",
+            r#"import { importAMDNodeModule } from "./amdX.js";
+export const t = () => importAMDNodeModule("@xterm/xterm", "lib/xterm.js");
+export const w = () => importAMDNodeModule("@xterm/addon-webgl", "lib/addon-webgl.js");
+export const m = () => importAMDNodeModule("@xterm/missing", "lib/missing.js");
+"#,
+        );
+        write(
+            "amdX.js",
+            "export async function importAMDNodeModule(name, path) { return [name, path]; }\n",
+        );
+        // A UMD bundle like xterm.js: no ES module syntax.
+        write(
+            "node_modules/@xterm/xterm/lib/xterm.js",
+            "!function(e,t){if(\"object\"==typeof exports&&\"object\"==typeof module)module.exports=t();else if(\"function\"==typeof define&&define.amd)define([],t)}(globalThis,()=>({Terminal:1}));\n",
+        );
+        write(
+            "node_modules/@xterm/xterm/package.json",
+            r#"{"name":"@xterm/xterm","main":"lib/xterm.js"}"#,
+        );
+        write(
+            "node_modules/@xterm/addon-webgl/lib/addon-webgl.js",
+            "module.exports = {};\n",
+        );
+
+        let resolver = EsmResolver::new(&root);
+        let graph = resolver
+            .build_graph_from_entry(&root.join("main.js"))
+            .unwrap();
+        let xterm = normalize_path(&root.join("node_modules/@xterm/xterm/lib/xterm.js"));
+        let edges = resolver.dynamic_imports();
+        assert!(
+            edges.iter().any(|edge| edge.target == xterm),
+            "xterm.js is a lazily linked module: {edges:?}"
+        );
+        assert!(graph.nodes.iter().any(|node| node.module.path == xterm));
+        // Registered under its absolute path, which `<script src>` maps to.
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.specifier == xterm.to_string_lossy())
+        );
+        // Linked as a classic (CommonJS) record.
+        assert!(resolver.prepare_commonjs(&xterm).unwrap());
+        // Excluded packages stay out of the graph.
+        assert!(
+            !graph.nodes.iter().any(|node| node
+                .module
+                .path
+                .to_string_lossy()
+                .contains("addon-webgl"))
+        );
+        // A missing file is reported, not fatal.
+        assert!(
+            resolver
+                .commonjs_diagnostics()
+                .iter()
+                .any(|line| line.contains("@xterm/missing")),
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
