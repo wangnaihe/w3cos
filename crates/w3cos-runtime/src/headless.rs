@@ -178,7 +178,7 @@ fn finish_headless_frame(
         for (rect, index) in layout_cache {
             if let Some(node) = flat.get(*index) {
                 eprintln!(
-                    "W3COS_HEADLESS_LAYOUT index={index} parent={:?} display={:?} position={:?} left={:?} top={:?} float={:?} kind={:?} width={:?} height={:?} margin={:?} padding={:?} align_self={:?} text_align={:?} justify_content={:?} rect={rect:?} font_family={:?} font_size={} word_spacing={} white_space={:?} line_height={} normal={} direction={:?} rendered_text={:?} font_metric={:?}",
+                    "W3COS_HEADLESS_LAYOUT index={index} parent={:?} display={:?} position={:?} left={:?} top={:?} float={:?} kind={:?} width={:?} height={:?} margin={:?} padding={:?} align_self={:?} align_items={:?} text_align={:?} justify_content={:?} rect={rect:?} font_family={:?} font_size={} word_spacing={} white_space={:?} line_height={} normal={} direction={:?} rendered_text={:?} font_metric={:?}",
                     node.parent,
                     node.style.display,
                     node.style.position,
@@ -191,6 +191,7 @@ fn finish_headless_frame(
                     node.style.margin,
                     node.style.padding,
                     node.style.align_self,
+                    node.style.align_items,
                     node.style.text_align,
                     node.style.justify_content,
                     node.style.font_family,
@@ -401,7 +402,7 @@ fn component_rect_independent(component: &w3cos_std::Component) -> bool {
             style.padding.left,
         ]
         .into_iter()
-        .any(|edge| matches!(edge, Spacing::Percent(_)));
+        .any(|edge| matches!(edge, Spacing::Percent(_) | Spacing::PaddingCalc { .. }));
         let background_image = style.background_image.as_deref().is_some_and(|value| {
             value.split(',').any(|layer| {
                 let layer = layer.trim();

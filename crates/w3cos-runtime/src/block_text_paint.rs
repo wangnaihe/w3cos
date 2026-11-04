@@ -6,6 +6,9 @@ use std::borrow::Cow;
 use w3cos_std::style::Display;
 use w3cos_std::{ComponentKind, Style};
 
+/// Style marker of a text piece to paint rotated (see `is_vertical_text`).
+pub(crate) const VERTICAL_TEXT: &str = "--w3cos-internal-vertical-text";
+
 pub(crate) fn replay<'a>(
     nodes: &[(usize, LayoutRect, &'a ComponentKind, &'a Style)],
     artifact: &PaintArtifact,
@@ -49,6 +52,16 @@ pub(crate) fn replay<'a>(
             }
             if let Some(properties) = piece_style.custom_properties.as_mut() {
                 properties.remove("--w3cos-internal-float-line-bands");
+            }
+            if artifact.is_vertical_text(index) {
+                // A piece of a vertical flow was laid out as a horizontal
+                // line in transposed space: paint turns it a quarter turn
+                // clockwise inside its physical rect.
+                piece_style.writing_mode = w3cos_std::style::WritingMode::HorizontalTb;
+                piece_style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(VERTICAL_TEXT.to_string(), String::new());
             }
             for (piece, text) in pieces {
                 output.push(ReplayNode {
@@ -184,6 +197,7 @@ mod tests {
             end,
             rect,
             text: text.into(),
+            vertical: false,
         };
         artifact.set_text_fragments(&[
             piece(0, 4, r(40.0, 0.0, 80.0), "XXX-"),
