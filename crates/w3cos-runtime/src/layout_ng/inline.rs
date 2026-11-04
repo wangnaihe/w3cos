@@ -62,6 +62,12 @@ fn tab_only(content: &str, style: &Style) -> bool {
 /// the next multiple of it, and a tab narrower than half a space takes the
 /// following stop. A zero tab size gives no advance.
 fn tab_width(content: &str, style: &Style) -> f32 {
+    tab_width_from(content.len(), 0.0, style)
+}
+
+/// `count` tabs starting at inline offset `start` from the line start; the
+/// advance they add.
+fn tab_width_from(count: usize, start: f32, style: &Style) -> f32 {
     let mut bare = style.clone();
     bare.letter_spacing = 0.0;
     bare.word_spacing = 0.0;
@@ -71,7 +77,9 @@ fn tab_width(content: &str, style: &Style) -> f32 {
     bare.border_right_width = None;
     bare.border_bottom_width = None;
     bare.border_left_width = None;
-    let space = max_content_width(" ", &bare);
+    // The space glyph's unsnapped advance (SimpleFontData::SpaceWidth): the
+    // width of a long run spreads the LayoutUnit ceil of one shape.
+    let space = max_content_width(&" ".repeat(64), &bare) / 64.0;
     let spaced = space + style.letter_spacing + style.word_spacing;
     let base = match marker_value(style, TAB_SIZE_MARKER) {
         Some(v) if v.starts_with('n') => v[1..].parse::<f32>().unwrap_or(8.0) * spaced,
@@ -81,20 +89,114 @@ fn tab_width(content: &str, style: &Style) -> f32 {
     if base <= 0.0 {
         return 0.0;
     }
-    let mut position = 0.0f32;
-    for _ in content.bytes() {
+    let mut position = start;
+    for _ in 0..count {
         let mut distance = base - position % base;
         if distance < space / 2.0 {
             distance += base;
         }
         position += distance;
     }
-    position
+    position - start
+}
+
+/// Preserved tabs inside other text of a `white-space: pre` leaf: one line
+/// per forced break, so each tab's inline offset is known while items are
+/// collected.
+fn tabs_in_pre_text(content: &str, style: &Style) -> bool {
+    content.contains('\t')
+        && style.white_space == WhiteSpace::Pre
+        && !style.break_spaces
+        && !content.contains(['\n', '\r'])
+}
+
+/// The text with tabs read as spaces: they shape with the primary font.
+fn detab(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.contains('\t') {
+        content.replace('\t', " ").into()
+    } else {
+        content.into()
+    }
+}
+
+/// NGInlineItemsBuilder / ShapeResultSpacing for tabs in a pre container:
+/// each run of tabs becomes its own piece whose advance runs to the next
+/// tab stop from its inline offset on the line (the sum of the items before
+/// it since the last forced break); the text between them is shaped alone.
+fn split_tabs(
+    flat: &[FlatNodeInfo],
+    items: Vec<InlineItem>,
+    run: &mut usize,
+) -> Option<Vec<InlineItem>> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut x = 0.0f32;
+    for item in items {
+        if item.forced {
+            x = 0.0;
+            out.push(item);
+            continue;
+        }
+        let text = item_text(flat, &item);
+        if item.atomic.is_some() || !text.contains('\t') {
+            // Line positions advance by snapped widths (LayoutUnit).
+            x += snap(item.raw);
+            out.push(item);
+            continue;
+        }
+        let style = flat[item.index].style;
+        if !zero_edges(style) {
+            return super::bail("tab-edges");
+        }
+        let base = item.range.map_or(0, |r| r.0);
+        let bytes = text.as_bytes();
+        let mut segments = Vec::new();
+        let mut s = 0;
+        while s < bytes.len() {
+            let tab = bytes[s] == b'\t';
+            let mut e = s;
+            while e < bytes.len() && (bytes[e] == b'\t') == tab {
+                e += 1;
+            }
+            segments.push((s, e, tab));
+            s = e;
+        }
+        let last = segments.len() - 1;
+        x += snap(item.box_start);
+        for (n, &(s, e, tab)) in segments.iter().enumerate() {
+            let piece = &text[s..e];
+            let width = if tab {
+                tab_width_from(e - s, x, style)
+            } else {
+                max_content_width(piece, style)
+            };
+            let mut p = item.clone();
+            p.range = Some((base + s, base + e));
+            p.box_start = if n == 0 { item.box_start } else { 0.0 };
+            p.box_end = if n == last { item.box_end } else { 0.0 };
+            p.raw = width + p.box_start + p.box_end;
+            p.raw_hang = p.raw;
+            p.starts_space = piece.starts_with(' ');
+            p.ends_space = piece.ends_with(' ');
+            p.whitespace_only = piece.trim_end_matches(' ').is_empty();
+            p.internal_break = false;
+            p.run = *run;
+            *run += 1;
+            x += snap(width);
+            out.push(p);
+        }
+        x += snap(item.box_end);
+    }
+    Some(out)
 }
 
 /// Advance of `text` when it is a modelled tab leaf, else `None`.
 fn tab_advance(text: &str, style: &Style) -> Option<f32> {
     tab_only(text, style).then(|| tab_width(text, style))
+}
+
+/// A sole line-width leaf: paint wraps and draws its whole text itself.
+fn paragraph_leaf(style: &Style, sole: bool) -> bool {
+    sole && has_marker(style, LINE_WIDTH_MARKER)
 }
 
 fn has_marker(style: &Style, key: &str) -> bool {
@@ -499,6 +601,7 @@ fn fallback_grows_line(content: &str, style: &Style) -> bool {
     if tab_only(content, style) {
         return false;
     }
+    let content = &*detab(content);
     #[cfg(feature = "skia")]
     if style.line_height_is_normal && !latin1(content) {
         return crate::render_skia::text_fallback_grows_normal_line(content, style);
@@ -678,7 +781,9 @@ fn inline_text_reason(
         };
     if content.is_empty()
         || content.contains('\r')
-        || (content.contains('\t') && !(first && tab_only(content, style)))
+        || (content.contains('\t')
+            && !(first && tab_only(content, style))
+            && !(tabs_in_pre_text(content, style) && !paragraph_leaf(style, sole)))
         || (content.contains('\n') && !newline_ok)
     {
         return Some("text:content");
@@ -688,7 +793,7 @@ fn inline_text_reason(
     if fragment && content.contains('\u{2028}') && content != FORCED_BREAK && !paragraph {
         return Some("bidi:frozen-break");
     }
-    if !tab_only(content, style) && !supported_script_in(content, fragment) {
+    if !tab_only(content, style) && !supported_script_in(&detab(content), fragment) {
         return Some("text:script");
     }
     if fallback_grows_line(content, style) {
@@ -1166,14 +1271,11 @@ fn text_line_metrics(content: &str, style: &Style) -> (f32, f32) {
 /// `text_line_metrics` of a leaf whose font is chosen by its characters: a
 /// tab shapes with the primary font (the space glyph), not a fallback.
 fn text_line_metrics_of(content: &str, style: &Style) -> (f32, f32) {
-    text_line_metrics(
-        if tab_only(content, style) {
-            " "
-        } else {
-            content
-        },
-        style,
-    )
+    if tab_only(content, style) {
+        text_line_metrics(" ", style)
+    } else {
+        text_line_metrics(&detab(content), style)
+    }
 }
 
 /// Whether a text leaf painted alone in its rect (no inline line context)
@@ -2110,6 +2212,14 @@ pub(super) fn layout_inline_beside(
         }
         run += 1;
         start = end;
+    }
+
+    if container.white_space == WhiteSpace::Pre
+        && items
+            .iter()
+            .any(|i| i.atomic.is_none() && !i.forced && item_text(flat, i).contains('\t'))
+    {
+        items = split_tabs(flat, items, &mut run)?;
     }
 
     // NGLineBreaker.
