@@ -933,11 +933,15 @@ class MessagePortMain extends EventEmitter {
   _schedule() {
     if (!this._started || this._scheduled || this._queue.length === 0) return;
     this._scheduled = true;
+    // Like Node's MessagePort::OnMessage: one task delivers everything queued
+    // (up to 1000, including what arrives meanwhile), so a burst costs one
+    // event-loop turn instead of one turn per message.
     task(() => {
       this._scheduled = false;
-      if (!this._started || this._closed || this._queue.length === 0) return;
-      const data = structuredCodec.deserialize(this._queue.shift());
-      this.emit('message', { data, ports: [] });
+      for (let n = 0; n < 1000 && this._started && !this._closed && this._queue.length > 0; n++) {
+        const data = structuredCodec.deserialize(this._queue.shift());
+        this.emit('message', { data, ports: [] });
+      }
       this._schedule();
     });
   }
