@@ -7070,6 +7070,7 @@ fn paint_nodes_as_flat<'a>(
         .iter()
         .filter(|node| !node.is_paint_only())
         .map(|node| layout::FlatNodeInfo {
+            component: None,
             stable_id: 0,
             kind: &node.kind,
             style: &node.style,

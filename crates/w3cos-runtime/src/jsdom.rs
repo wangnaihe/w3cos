@@ -9765,6 +9765,42 @@ fn block_in_inline_host(node: u32) -> bool {
         })
 }
 
+fn inline_with_only_out_of_flow_children(node: u32) -> bool {
+    let style = block_inline_parent_style(node);
+    if !matches!(style.display, w3cos_std::style::Display::Inline) {
+        return false;
+    }
+    let mut has_out_of_flow_child = false;
+    for child in dom::children(node) {
+        match dom::node_type(child) {
+            1 => {
+                let child_style = dom::with_document(|document| {
+                    document.computed_style_for(NodeId::from_u32(child))
+                });
+                if matches!(child_style.display, w3cos_std::style::Display::None) {
+                    continue;
+                }
+                if !matches!(
+                    child_style.position,
+                    w3cos_std::style::Position::Absolute | w3cos_std::style::Position::Fixed
+                ) {
+                    return false;
+                }
+                has_out_of_flow_child = true;
+            }
+            3 if !dom::get_text_content(child)
+                .unwrap_or_default()
+                .trim()
+                .is_empty() =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    has_out_of_flow_child
+}
+
 fn block_in_inline_fragment_bounds(
     node: u32,
     mut child_rect: impl FnMut(u32) -> Option<w3cos_dom::DOMRect>,
@@ -9810,13 +9846,46 @@ fn block_in_inline_fragment_bounds(
     bounds
 }
 
+fn published_fragment_bounds(node: u32) -> Option<w3cos_dom::DOMRect> {
+    let rects = crate::incremental_layout::client_rects(node)?;
+    let mut bounds: Option<w3cos_dom::DOMRect> = None;
+    for rect in rects {
+        if rect.width == 0.0 || rect.height == 0.0 {
+            continue;
+        }
+        bounds = Some(bounds.map_or(rect, |bounds| {
+            let left = bounds.x.min(rect.x);
+            let top = bounds.y.min(rect.y);
+            let right = (bounds.x + bounds.width).max(rect.x + rect.width);
+            let bottom = (bounds.y + bounds.height).max(rect.y + rect.height);
+            w3cos_dom::DOMRect::new(left, top, right - left, bottom - top)
+        }));
+    }
+    bounds
+}
+
+fn forced_client_rects(node: u32) -> Vec<w3cos_dom::DOMRect> {
+    let bounds = forced_bounding_rect(node);
+    crate::incremental_layout::client_rects(node)
+        .unwrap_or_else(|| vec![bounds])
+        .into_iter()
+        .map(|rect| apply_css_motion_to_rect(node, rect))
+        .collect()
+}
+
 fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     let live = dom::bounding_rect(node);
     if !dom::is_document_dirty() {
+        if let Some(rect) = published_fragment_bounds(node) {
+            return apply_css_motion_to_rect(node, rect);
+        }
         if let Some(rect) =
             block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
         {
             return apply_css_motion_to_rect(node, rect);
+        }
+        if inline_with_only_out_of_flow_children(node) {
+            return w3cos_dom::DOMRect::default();
         }
         if live.width != 0.0 || live.height != 0.0 || live.x != 0.0 || live.y != 0.0 {
             return apply_css_motion_to_rect(node, live);
@@ -9834,10 +9903,16 @@ fn forced_bounding_rect(node: u32) -> w3cos_dom::DOMRect {
         return live;
     }
     let stored = dom::bounding_rect(node);
+    if let Some(rect) = published_fragment_bounds(node) {
+        return apply_css_motion_to_rect(node, rect);
+    }
     if let Some(rect) =
         block_in_inline_fragment_bounds(node, |child| Some(dom::bounding_rect(child)))
     {
         return apply_css_motion_to_rect(node, rect);
+    }
+    if inline_with_only_out_of_flow_children(node) {
+        return w3cos_dom::DOMRect::default();
     }
     let rect = if stored.width != 0.0 || stored.height != 0.0 || stored.x != 0.0 || stored.y != 0.0
     {
@@ -11327,7 +11402,12 @@ fn element_computed_get(node: u32, key: &str) -> Value {
         // ── Layout (zeros until the layout engine runs) ──
         "getBoundingClientRect" => func(move |_, _| rect_value(forced_bounding_rect(node))),
         "getClientRects" => func(move |_, _| {
-            crate::geometry_web::rect_list(vec![rect_value(forced_bounding_rect(node))])
+            crate::geometry_web::rect_list(
+                forced_client_rects(node)
+                    .into_iter()
+                    .map(rect_value)
+                    .collect(),
+            )
         }),
         "offsetWidth" | "clientWidth" => Value::Number(forced_bounding_rect(node).width as f64),
         "offsetHeight" | "clientHeight" => Value::Number(forced_bounding_rect(node).height as f64),
@@ -32801,6 +32881,837 @@ try {
 
         let rect = target.call_method("getBoundingClientRect", vec![]);
         assert_eq!(rect.get_property("width").to_number(), 200.0);
+    }
+
+    #[test]
+    fn block_in_inline_cssom_keeps_ordered_physical_fragments() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        host.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("before")])],
+        );
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block.clone()]);
+        host.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("after")])],
+        );
+
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        let before = rects.get_property("0");
+        let middle = rects.get_property("1");
+        let after = rects.get_property("2");
+        assert!(before.get_property("width").to_number() > 0.0);
+        assert!(before.get_property("width").to_number() < 400.0);
+        assert_eq!(middle.get_property("width").to_number(), 400.0);
+        assert_eq!(middle.get_property("height").to_number(), 10.0);
+        assert!(after.get_property("width").to_number() > 0.0);
+        assert!(after.get_property("width").to_number() < 400.0);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert!(bounds.get_property("height").to_number() > 10.0);
+
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("300px"));
+        let narrower = host.call_method("getClientRects", vec![]);
+        assert_eq!(narrower.get_property("length").to_u32(), 3);
+        assert_eq!(
+            narrower.get_property("1").get_property("width").to_number(),
+            300.0
+        );
+        assert_eq!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "retained"
+        );
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let restored = host.call_method("getClientRects", vec![]);
+        assert_eq!(restored.get_property("length").to_u32(), 3);
+        assert_eq!(
+            restored.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        assert_eq!(crate::incremental_layout::last_flush_stats().kind, "memo");
+
+        host.call_method("removeChild", vec![block.clone()]);
+        assert_eq!(
+            host.call_method("getClientRects", vec![])
+                .get_property("length")
+                .to_u32(),
+            1
+        );
+        host.call_method("appendChild", vec![block]);
+        let reappended = host.call_method("getClientRects", vec![]);
+        assert_eq!(reappended.get_property("length").to_u32(), 3);
+        assert_eq!(
+            reappended
+                .get_property("2")
+                .get_property("width")
+                .to_number(),
+            0.0,
+            "a block appended after the trailing text retains Chrome's trailing split edge"
+        );
+        let old_host = node_id_of(&host).unwrap();
+        setup();
+        assert!(
+            crate::incremental_layout::client_rects(old_host).is_none(),
+            "document reset must clear sparse fragment geometry before NodeId reuse"
+        );
+    }
+
+    #[test]
+    fn block_in_inline_block_flex_grid_and_positioned_matrix() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let document = document_value();
+        for (display, width, height) in [
+            ("block", 20.0, 10.0),
+            ("flex", 30.0, 11.0),
+            ("grid", 40.0, 12.0),
+        ] {
+            let outer = create_in_body("div");
+            outer
+                .get_property("style")
+                .set_property("width", Value::string("400px"));
+            let host = document.call_method("createElement", vec![Value::string("span")]);
+            outer.call_method("appendChild", vec![host.clone()]);
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            style.set_property("display", Value::string(display));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+            host.call_method("appendChild", vec![child]);
+
+            let rects = host.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_u32(), 3, "{display}");
+            for edge in ["0", "2"] {
+                let rect = rects.get_property(edge);
+                assert_eq!(rect.get_property("width").to_number(), 0.0, "{display}");
+                assert_eq!(rect.get_property("height").to_number(), 0.0, "{display}");
+            }
+            let middle = rects.get_property("1");
+            assert_eq!(middle.get_property("width").to_number(), 400.0, "{display}");
+            assert_eq!(
+                middle.get_property("height").to_number(),
+                height,
+                "{display}"
+            );
+        }
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        for (width, height) in [(20.0, 10.0), (30.0, 11.0)] {
+            let child = document.call_method("createElement", vec![Value::string("div")]);
+            let style = child.get_property("style");
+            style.set_property("display", Value::string("block"));
+            style.set_property("width", Value::string(&format!("{width}px")));
+            style.set_property("height", Value::string(&format!("{height}px")));
+            host.call_method("appendChild", vec![child]);
+        }
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        assert_eq!(
+            rects.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        assert_eq!(
+            rects.get_property("1").get_property("height").to_number(),
+            21.0
+        );
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        let nested = document.call_method("createElement", vec![Value::string("span")]);
+        nested.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("nested")])],
+        );
+        block.call_method("appendChild", vec![nested]);
+        host.call_method("appendChild", vec![block]);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert_eq!(bounds.get_property("height").to_number(), 10.0);
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        let host_style = host.get_property("style");
+        host_style.set_property("padding", Value::string("2px"));
+        host_style.set_property("border", Value::string("1px solid black"));
+        outer.call_method("appendChild", vec![host.clone()]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let style = block.get_property("style");
+        style.set_property("display", Value::string("block"));
+        style.set_property("width", Value::string("20px"));
+        style.set_property("height", Value::string("10px"));
+        host.call_method("appendChild", vec![block]);
+        let rects = host.call_method("getClientRects", vec![]);
+        assert_eq!(rects.get_property("length").to_u32(), 3);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 400.0);
+        assert!(bounds.get_property("height").to_number() >= 10.0);
+
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let positioned = document.call_method("createElement", vec![Value::string("div")]);
+        let style = positioned.get_property("style");
+        style.set_property("position", Value::string("absolute"));
+        style.set_property("width", Value::string("50px"));
+        style.set_property("height", Value::string("13px"));
+        host.call_method("appendChild", vec![positioned]);
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 0.0);
+        assert_eq!(bounds.get_property("height").to_number(), 0.0);
+    }
+
+    #[test]
+    fn block_in_inline_retained_child_geometry_keeps_fragment_owner() {
+        setup();
+        set_viewport(800.0, 600.0);
+        w3cos_dom::stylesheet::register_rule(
+            ".cold",
+            &[("display", "block"), ("width", "20px"), ("height", "10px")],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".hot",
+            &[("display", "block"), ("width", "24px"), ("height", "12px")],
+        );
+        let document = document_value();
+        let outer = create_in_body("div");
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("400px"));
+        let host = document.call_method("createElement", vec![Value::string("span")]);
+        outer.call_method("appendChild", vec![host.clone()]);
+        let internal_owner = w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER;
+        let computed_owner = || {
+            window_value()
+                .call_method("getComputedStyle", vec![host.clone()])
+                .call_method("getPropertyValue", vec![Value::string(internal_owner)])
+                .to_js_string()
+        };
+        assert_eq!(computed_owner(), "");
+        host.get_property("style").call_method(
+            "setProperty",
+            vec![Value::string(internal_owner), Value::string("user-token")],
+        );
+        let inline_owner = || {
+            host.get_property("style")
+                .call_method("getPropertyValue", vec![Value::string(internal_owner)])
+                .to_js_string()
+        };
+        assert_eq!(inline_owner(), "user-token");
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        block.set_property("className", Value::string("cold"));
+        host.call_method("appendChild", vec![block.clone()]);
+        let initial = host.call_method("getClientRects", vec![]);
+        assert_eq!(
+            initial.get_property("1").get_property("width").to_number(),
+            400.0
+        );
+        // The engine does not yet expose computed custom properties, but the
+        // internal numeric owner must not leak through that existing surface.
+        assert_eq!(computed_owner(), "");
+        assert_eq!(inline_owner(), "user-token");
+
+        block.set_property("className", Value::string("hot"));
+        outer
+            .get_property("style")
+            .set_property("width", Value::string("420px"));
+        let changed = host.call_method("getClientRects", vec![]);
+        assert_eq!(changed.get_property("length").to_u32(), 3);
+        assert_eq!(
+            changed.get_property("1").get_property("width").to_number(),
+            420.0
+        );
+        assert_eq!(
+            changed.get_property("1").get_property("height").to_number(),
+            12.0
+        );
+        let bounds = host.call_method("getBoundingClientRect", vec![]);
+        assert_eq!(bounds.get_property("width").to_number(), 420.0);
+        assert_eq!(bounds.get_property("height").to_number(), 12.0);
+        assert_eq!(computed_owner(), "");
+        assert_eq!(inline_owner(), "user-token");
+    }
+
+    #[test]
+    fn nested_block_in_inline_owners_survive_restyle_and_inner_removal() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let family = "W3cosOwnerTinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register a deterministic face for owner geometry");
+        w3cos_dom::stylesheet::register_rule(
+            ".cold",
+            &[("display", "block"), ("width", "20px"), ("height", "10px")],
+        );
+        w3cos_dom::stylesheet::register_rule(
+            ".hot",
+            &[("display", "block"), ("width", "24px"), ("height", "12px")],
+        );
+        let document = document_value();
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("400px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
+        let outer = document.call_method("createElement", vec![Value::string("span")]);
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        let inner_block = document.call_method("createElement", vec![Value::string("div")]);
+        inner_block.set_property("className", Value::string("cold"));
+        let outer_block = document.call_method("createElement", vec![Value::string("div")]);
+        let outer_block_style = outer_block.get_property("style");
+        outer_block_style.set_property("display", Value::string("block"));
+        outer_block_style.set_property("width", Value::string("30px"));
+        outer_block_style.set_property("height", Value::string("11px"));
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("inner-before")])],
+        );
+        inner.call_method("appendChild", vec![inner_block.clone()]);
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("inner-after")])],
+        );
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("outer-before")])],
+        );
+        outer.call_method("appendChild", vec![inner.clone()]);
+        outer.call_method("appendChild", vec![outer_block]);
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("outer-after")])],
+        );
+        root.call_method("appendChild", vec![outer.clone()]);
+
+        let assert_split = |element: &Value, expected_len: u32, width: f64| {
+            let rects = element.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_u32(), expected_len);
+            assert_eq!(
+                element
+                    .call_method("getBoundingClientRect", vec![])
+                    .get_property("width")
+                    .to_number(),
+                width
+            );
+        };
+        let outer_id = node_id_of(&outer).unwrap();
+        let inner_id = node_id_of(&inner).unwrap();
+        let (outer_owners, inner_owners, inner_ranges, inner_boxes) = dom::with_document(|tree| {
+            fn collect(
+                component: &w3cos_std::Component,
+                outer_id: u32,
+                inner_id: u32,
+                counts: &mut (usize, usize),
+                ranges: &mut Vec<(String, usize, usize)>,
+                boxes: &mut usize,
+            ) {
+                if let Some(owner) =
+                    component
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .and_then(|properties| {
+                            properties.get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)
+                        })
+                {
+                    for owner in owner
+                        .split(',')
+                        .filter_map(|owner| owner.parse::<u32>().ok())
+                    {
+                        counts.0 += usize::from(owner == outer_id);
+                        counts.1 += usize::from(owner == inner_id);
+                    }
+                }
+                if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                    for (owner, start, end) in
+                        w3cos_std::inline_text::cssom_owner_ranges(content, &component.style)
+                    {
+                        counts.0 += usize::from(owner == outer_id);
+                        counts.1 += usize::from(owner == inner_id);
+                        if owner == inner_id {
+                            ranges.push((content.clone(), start, end));
+                        }
+                    }
+                }
+                for owner in w3cos_std::inline_text::cssom_box_owners(&component.style) {
+                    counts.0 += usize::from(owner == outer_id);
+                    counts.1 += usize::from(owner == inner_id);
+                    *boxes += usize::from(owner == inner_id);
+                }
+                for child in &component.children {
+                    collect(child, outer_id, inner_id, counts, ranges, boxes);
+                }
+            }
+            let mut counts = (0, 0);
+            let mut ranges = Vec::new();
+            let mut boxes = 0;
+            collect(
+                &tree.to_component_tree(),
+                outer_id,
+                inner_id,
+                &mut counts,
+                &mut ranges,
+                &mut boxes,
+            );
+            (counts.0, counts.1, ranges, boxes)
+        });
+        assert!(
+            inner_ranges
+                .iter()
+                .any(|(text, start, end)| text == "outer-beforeinner-before"
+                    && (*start, *end) == (12, 24)),
+            "the inner-before UTF-8 source range must survive outer coalescing"
+        );
+        assert!(
+            inner_ranges
+                .iter()
+                .any(|(text, start, end)| text == "inner-after" && (*start, *end) == (0, 11)),
+            "the inner-after source range must survive outer coalescing"
+        );
+        assert!(
+            inner_boxes > 0,
+            "the inner anonymous block must retain its owner"
+        );
+        assert_split(&outer, 5, 400.0);
+        assert_split(&inner, 3, 400.0);
+        let rect_tuples = |element: &Value| {
+            let rects = element.call_method("getClientRects", vec![]);
+            (0..rects.get_property("length").to_u32())
+                .map(|index| {
+                    let rect = rects.get_property(&index.to_string());
+                    (
+                        rect.get_property("x").to_number(),
+                        rect.get_property("y").to_number(),
+                        rect.get_property("width").to_number(),
+                        rect.get_property("height").to_number(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let outer_rects = rect_tuples(&outer);
+        let inner_rects = rect_tuples(&inner);
+        assert_eq!(inner_rects[0].1, outer_rects[0].1);
+        assert_eq!(inner_rects[0].3, outer_rects[0].3);
+        assert_eq!(inner_rects[1], outer_rects[1]);
+        assert_eq!(inner_rects[2].1, outer_rects[2].1);
+        assert_eq!(inner_rects[2].3, outer_rects[2].3);
+        assert!(
+            (inner_rects[0].2 - 78.7421875).abs() < 0.001,
+            "unexpected leading inner fragment: {inner_rects:?}"
+        );
+        assert!(
+            (inner_rects[2].2 - 67.1875).abs() < 0.001,
+            "unexpected trailing inner fragment: {inner_rects:?}"
+        );
+        assert!(outer_owners > 0, "outer split owner must survive lowering");
+        assert!(inner_owners > 0, "inner split owner must survive lowering");
+
+        inner_block.set_property("className", Value::string("hot"));
+        root.get_property("style")
+            .set_property("width", Value::string("420px"));
+        assert_split(&outer, 5, 420.0);
+        assert_split(&inner, 3, 420.0);
+        assert_eq!(
+            inner_block
+                .call_method("getBoundingClientRect", vec![])
+                .get_property("height")
+                .to_number(),
+            12.0
+        );
+
+        inner.call_method("removeChild", vec![inner_block]);
+        assert_split(&outer, 3, 420.0);
+        let inner_rects = inner.call_method("getClientRects", vec![]);
+        assert_eq!(inner_rects.get_property("length").to_u32(), 1);
+        assert!(
+            inner
+                .call_method("getBoundingClientRect", vec![])
+                .get_property("width")
+                .to_number()
+                < 420.0
+        );
+    }
+
+    #[test]
+    fn nested_block_in_inline_owner_ranges_follow_physical_line_wrapping() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let family = "W3cosNestedTinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register the same deterministic face used by the Chrome control");
+        w3cos_dom::stylesheet::register_rule(".cold", &[("display", "block"), ("height", "12px")]);
+        w3cos_dom::stylesheet::register_rule(".hot", &[("display", "block"), ("height", "14px")]);
+        let document = document_value();
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("130px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
+        let outer = document.call_method("createElement", vec![Value::string("span")]);
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        block.set_property("className", Value::string("cold"));
+        let outer_block = document.call_method("createElement", vec![Value::string("div")]);
+        let outer_block_style = outer_block.get_property("style");
+        outer_block_style.set_property("display", Value::string("block"));
+        outer_block_style.set_property("height", Value::string("11px"));
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("inner words that wrap across lines ")],
+            )],
+        );
+        inner.call_method("appendChild", vec![block.clone()]);
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("inner tail words")])],
+        );
+        outer.call_method(
+            "appendChild",
+            vec![
+                document.call_method("createTextNode", vec![Value::string("outer words before ")]),
+            ],
+        );
+        outer.call_method("appendChild", vec![inner.clone()]);
+        outer.call_method("appendChild", vec![outer_block]);
+        root.call_method("appendChild", vec![outer.clone()]);
+
+        let rects = inner.call_method("getClientRects", vec![]);
+        let rects = (0..rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rects.len() > 3,
+            "inner text must span multiple physical lines: {rects:?}"
+        );
+        assert!(
+            rects
+                .iter()
+                .any(|(_, _, width, height)| (*width - 130.0).abs() < 0.001
+                    && (*height - 12.0).abs() < 0.001),
+            "the anonymous block fragment must remain owned by the inner inline"
+        );
+        assert!(
+            rects.iter().all(|(_, _, width, _)| *width <= 130.001),
+            "an inner physical fragment must not exceed its containing line"
+        );
+        let assert_inline_geometry = |actual: &[(f64, f64, f64, f64)], expected: &[(f64, f64)]| {
+            assert_eq!(actual.len(), expected.len(), "rects={actual:?}");
+            for ((x, _, width, _), (expected_x, expected_width)) in actual.iter().zip(expected) {
+                assert!(
+                    (x - expected_x).abs() < 0.001,
+                    "x={x}, expected={expected_x}"
+                );
+                assert!(
+                    (width - expected_width).abs() < 0.001,
+                    "width={width}, expected={expected_width}, rects={actual:?}"
+                );
+            }
+        };
+        assert_inline_geometry(
+            &rects,
+            &[
+                (8.0, 103.984375),
+                (8.0, 110.1875),
+                (8.0, 130.0),
+                (8.0, 100.421875),
+            ],
+        );
+        let outer_rects = outer.call_method("getClientRects", vec![]);
+        let outer_rects = (0..outer_rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = outer_rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_inline_geometry(
+            &outer_rects,
+            &[
+                (8.0, 120.84375),
+                (8.0, 103.984375),
+                (8.0, 110.1875),
+                (8.0, 130.0),
+                (8.0, 100.421875),
+                (8.0, 130.0),
+                (8.0, 0.0),
+            ],
+        );
+        let assert_full_geometry =
+            |actual: &[(f64, f64, f64, f64)], expected: &[(f64, f64, f64, f64)]| {
+                assert_eq!(actual.len(), expected.len(), "rects={actual:?}");
+                for (actual_rect, expected_rect) in actual.iter().zip(expected) {
+                    for (actual_value, expected_value) in
+                        [actual_rect.0, actual_rect.1, actual_rect.2, actual_rect.3]
+                            .into_iter()
+                            .zip([
+                                expected_rect.0,
+                                expected_rect.1,
+                                expected_rect.2,
+                                expected_rect.3,
+                            ])
+                    {
+                        assert!(
+                            (actual_value - expected_value).abs() < 0.001,
+                            "actual={actual_value}, expected={expected_value}, rects={actual:?}"
+                        );
+                    }
+                }
+            };
+        assert_full_geometry(
+            &outer_rects,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 12.0),
+                (8.0, 78.609375, 100.421875, 17.0),
+                (8.0, 96.8125, 130.0, 11.0),
+                (8.0, 107.8125, 0.0, 0.0),
+            ],
+        );
+        assert_full_geometry(
+            &rects,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 12.0),
+                (8.0, 78.609375, 100.421875, 17.0),
+            ],
+        );
+
+        block.set_property("className", Value::string("hot"));
+        let restyled = inner.call_method("getClientRects", vec![]);
+        let restyled = (0..restyled.get_property("length").to_u32())
+            .map(|index| {
+                let rect = restyled.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let restyled_outer = outer.call_method("getClientRects", vec![]);
+        let restyled_outer = (0..restyled_outer.get_property("length").to_u32())
+            .map(|index| {
+                let rect = restyled_outer.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_full_geometry(
+            &restyled,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 14.0),
+                (8.0, 80.609375, 100.421875, 17.0),
+            ],
+        );
+        assert_full_geometry(
+            &restyled_outer,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 65.609375, 130.0, 14.0),
+                (8.0, 80.609375, 100.421875, 17.0),
+                (8.0, 98.8125, 130.0, 11.0),
+                (8.0, 109.8125, 0.0, 0.0),
+            ],
+        );
+
+        inner.call_method("removeChild", vec![block]);
+        let removed = inner.call_method("getClientRects", vec![]);
+        let removed = (0..removed.get_property("length").to_u32())
+            .map(|index| {
+                let rect = removed.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let removed_outer = outer.call_method("getClientRects", vec![]);
+        let removed_outer = (0..removed_outer.get_property("length").to_u32())
+            .map(|index| {
+                let rect = removed_outer.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("y").to_number(),
+                    rect.get_property("width").to_number(),
+                    rect.get_property("height").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_full_geometry(
+            &removed,
+            &[
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 66.609375, 100.421875, 17.0),
+            ],
+        );
+        assert_full_geometry(
+            &removed_outer,
+            &[
+                (8.0, 9.0, 120.84375, 17.0),
+                (8.0, 28.203125, 103.984375, 17.0),
+                (8.0, 47.40625, 110.1875, 17.0),
+                (8.0, 66.609375, 100.421875, 17.0),
+                (8.0, 84.8125, 130.0, 11.0),
+                (8.0, 95.8125, 0.0, 0.0),
+            ],
+        );
+    }
+
+    #[test]
+    fn nested_owner_ranges_preserve_utf8_and_collapsed_whitespace() {
+        setup();
+        set_viewport(800.0, 600.0);
+        let family = "W3cosUtf8Tinos";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register a deterministic face for UTF-8 owner geometry");
+        let document = document_value();
+        let root = create_in_body("div");
+        let root_style = root.get_property("style");
+        root_style.set_property("width", Value::string("105px"));
+        root_style.set_property("fontFamily", Value::string(family));
+        root_style.set_property("fontSize", Value::string("16px"));
+        root_style.set_property("lineHeight", Value::string("19.2px"));
+        let outer = document.call_method("createElement", vec![Value::string("span")]);
+        let inner = document.call_method("createElement", vec![Value::string("span")]);
+        let block = document.call_method("createElement", vec![Value::string("div")]);
+        let block_style = block.get_property("style");
+        block_style.set_property("display", Value::string("block"));
+        block_style.set_property("height", Value::string("9px"));
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method(
+                "createTextNode",
+                vec![Value::string("  café 世界   words wrap  ")],
+            )],
+        );
+        inner.call_method("appendChild", vec![block]);
+        inner.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string(" tail")])],
+        );
+        outer.call_method(
+            "appendChild",
+            vec![document.call_method("createTextNode", vec![Value::string("prefix  ")])],
+        );
+        outer.call_method("appendChild", vec![inner.clone()]);
+        root.call_method("appendChild", vec![outer]);
+
+        let rects = inner.call_method("getClientRects", vec![]);
+        let rects = (0..rects.get_property("length").to_u32())
+            .map(|index| {
+                let rect = rects.get_property(&index.to_string());
+                (
+                    rect.get_property("x").to_number(),
+                    rect.get_property("width").to_number(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            (50.203125, 62.640625),
+            (8.0, 75.09375),
+            (8.0, 105.0),
+            (8.0, 20.4375),
+        ];
+        assert_eq!(rects.len(), expected.len(), "rects={rects:?}");
+        for ((x, width), (expected_x, expected_width)) in rects.iter().zip(expected) {
+            assert!(
+                (x - expected_x).abs() < 0.5,
+                "x={x}, expected={expected_x}, rects={rects:?}"
+            );
+            assert!(
+                (width - expected_width).abs() < 0.001,
+                "width={width}, expected={expected_width}, rects={rects:?}"
+            );
+        }
     }
 
     #[test]
