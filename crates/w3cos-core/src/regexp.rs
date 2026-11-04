@@ -718,13 +718,14 @@ fn js_pattern(source: &str, flags: &str) -> String {
 /// so construction-time SyntaxErrors match the eager behaviour exactly.
 fn pattern_parses(source: &str, flags: &str) -> bool {
     let pattern = js_pattern(source, flags);
-    if fancy_regex::Expr::parse_tree(&pattern).is_err() {
-        return false;
-    }
-    regex_syntax::ast::parse::Parser::new()
-        .parse(&pattern)
-        .is_ok()
-        || build_regex(source, flags).is_some()
+    // Fast accept only: a pattern both parsers take is valid. Every other
+    // verdict (e.g. fancy-regex's parse_tree rejects the literal brace in
+    // `{(\d+)}` that the full builder accepts) comes from a real compile.
+    let fast_ok = fancy_regex::Expr::parse_tree(&pattern).is_ok()
+        && regex_syntax::ast::parse::Parser::new()
+            .parse(&pattern)
+            .is_ok();
+    fast_ok || build_regex(source, flags).is_some()
 }
 
 fn build_regex_uncached(source: &str, flags: &str) -> Option<Regex> {
@@ -874,6 +875,34 @@ mod tests {
         assert!(pattern_parses(r"(?<=a)b(c)\1?", ""));
         assert!(pattern_parses(r"[\p{L}--[a-z]]", "v"));
         assert!(pattern_parses("(?<x>a)|(?<x>b)", ""));
+        // Accepted by the full builder even though parse_tree rejects it.
+        assert!(pattern_parses(r"{(\d+)}", "g"));
+        assert!(build_regex(r"{(\d+)}", "g").is_some());
+    }
+
+    /// Every unique regex literal in the Code-OSS `out/` bundle (one JSON
+    /// `[source, flags]` pair per line): the lazy construction-time verdict
+    /// must equal eager full compilation for each one.
+    #[test]
+    fn code_oss_regex_literals_lazy_verdict_matches_eager_compile() {
+        let corpus = include_str!("../tests/fixtures/code_oss_regex_literals.txt");
+        let mut mismatches = Vec::new();
+        let mut total = 0;
+        for line in corpus.lines().filter(|line| !line.is_empty()) {
+            let (source, flags): (String, String) = serde_json::from_str(line).unwrap();
+            total += 1;
+            let eager = build_regex_uncached(&source, &flags).is_some();
+            if pattern_parses(&source, &flags) != eager {
+                mismatches.push(format!("/{source}/{flags} eager={eager}"));
+            }
+        }
+        assert!(total > 4000, "corpus truncated: {total}");
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 
     #[test]
