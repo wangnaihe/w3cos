@@ -14448,7 +14448,44 @@ fn inline_computed_style_fallback(node: u32, property: &str) -> String {
     }
 }
 
+thread_local! {
+    /// `getComputedStyle(el)` declarations, reused per element and realm.
+    /// The declaration is live (every read resolves the current style), so
+    /// layout helpers that call `getComputedStyle` once per measured edge
+    /// (VS Code's `getContentHeight` reads four) stop building a proxy, a
+    /// method table and two closures per read.
+    static COMPUTED_STYLE_DECLS: RefCell<HashMap<u32, (u64, Value)>> =
+        RefCell::new(HashMap::new());
+}
+
+const COMPUTED_STYLE_DECL_CACHE_LIMIT: usize = 4096;
+
 fn computed_style_value(node: u32, pseudo: Option<String>) -> Value {
+    if pseudo.is_some() {
+        return build_computed_style_value(node, pseudo);
+    }
+    let generation = realm_generation() as u64;
+    if let Some(value) = COMPUTED_STYLE_DECLS.with(|cache| {
+        cache
+            .borrow()
+            .get(&node)
+            .filter(|(cached_generation, _)| *cached_generation == generation)
+            .map(|(_, value)| value.clone())
+    }) {
+        return value;
+    }
+    let value = build_computed_style_value(node, None);
+    COMPUTED_STYLE_DECLS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= COMPUTED_STYLE_DECL_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(node, (generation, value.clone()));
+    });
+    value
+}
+
+fn build_computed_style_value(node: u32, pseudo: Option<String>) -> Value {
     let generation = realm_generation();
     let getter_pseudo = pseudo.clone();
     let handler = ProxyBuilder::new()
@@ -33440,6 +33477,32 @@ try {
             serialize_computed_style_property("color", "rgba(255, 0, 0, 0.5)"),
             "rgba(255, 0, 0, 0.502)"
         );
+    }
+
+    #[test]
+    fn get_computed_style_reuses_a_live_declaration_per_element() {
+        setup();
+        let win = window_value();
+        let div = create_in_body("div");
+        div.get_property("style")
+            .set_property("paddingTop", Value::string("3px"));
+        let first = win.call_method("getComputedStyle", vec![div.clone()]);
+        let second = win.call_method("getComputedStyle", vec![div.clone()]);
+        assert!(first.strict_eq(&second));
+        assert_eq!(
+            first
+                .call_method("getPropertyValue", vec![Value::string("padding-top")])
+                .to_js_string(),
+            "3px"
+        );
+        div.get_property("style")
+            .set_property("paddingTop", Value::string("7px"));
+        assert_eq!(second.get_property("paddingTop").to_js_string(), "7px");
+        let other = create_in_body("div");
+        let third = win.call_method("getComputedStyle", vec![other]);
+        assert!(!third.strict_eq(&first));
+        let before = win.call_method("getComputedStyle", vec![div, Value::string("::before")]);
+        assert!(!before.strict_eq(&first));
     }
 
     #[test]
