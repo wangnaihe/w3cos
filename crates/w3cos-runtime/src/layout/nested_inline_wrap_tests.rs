@@ -430,19 +430,41 @@ fn parsed_table_inline_padding_preserves_browser_font_box_origin() {
 
 #[test]
 fn full_width_empty_atomic_margin_and_alignment_boundaries() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
     use crate::html_parser_host::InertParserScriptHost;
     use crate::html_parser_state::StreamingDocumentParser;
     use std::rc::Rc;
+    const OWNER: u64 = 202611040002;
+    const FAMILY: &str = "W3cos atomic boundary Tinos";
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: FAMILY.into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let mut actual = Vec::new();
     let mut expected = Vec::new();
     for (top, bottom, align, atomic_y, line_y) in [
-        (0, 0, "baseline", 32.0, 37.0),
-        (20, 0, "baseline", 35.0, 40.0),
-        (0, 20, "baseline", 15.0, 40.0),
-        (-5, 0, "baseline", 32.0, 37.0),
-        (0, 0, "top", 15.0, 37.0),
-        (0, 0, "bottom", 37.0, 37.0),
-        (0, 0, "middle", 27.703125, 37.0),
+        (0, 0, "baseline", 29.0, 33.0),
+        (20, 0, "baseline", 35.0, 39.0),
+        (0, 20, "baseline", 15.0, 39.0),
+        (-5, 0, "baseline", 29.0, 33.0),
+        (0, 0, "top", 15.0, 33.0),
+        (0, 0, "bottom", 33.0, 33.0),
+        (0, 0, "middle", 25.328125, 33.0),
     ] {
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
@@ -451,7 +473,7 @@ fn full_width_empty_atomic_margin_and_alignment_boundaries() {
             "https://example.test/atomic-boundary.html",
         )
         .unwrap();
-        parser.write(&format!("<!doctype html><div style='border:5px solid black;font:16px serif;margin:10px;width:550px'>\
+        parser.write(&format!("<!doctype html><div style='border:5px solid black;font:16px \"{FAMILY}\";margin:10px;width:550px'>\
             <span><span style='display:inline-block;width:550px;margin-top:{top}px;margin-bottom:{bottom}px;vertical-align:{align}'></span>Filler Text Filler Text</span>\
             <img src='blue.png' style='height:48px;width:96px'>\
             <span style='background:orange;float:left;height:48px;width:96px'></span></div>")).unwrap();
@@ -495,7 +517,7 @@ fn full_width_empty_atomic_margin_and_alignment_boundaries() {
                 height: 0.0,
             },
             LayoutRect {
-                x: 277.528,
+                x: 256.15625,
                 y: line_y,
                 width: 96.0,
                 height: 48.0,
@@ -510,7 +532,7 @@ fn full_width_empty_atomic_margin_and_alignment_boundaries() {
                 x: 18.0,
                 y: 10.0,
                 width: 560.0,
-                height: line_y + 48.0,
+                height: line_y + 47.0,
             },
         ));
     }
