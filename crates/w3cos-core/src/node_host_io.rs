@@ -131,6 +131,9 @@ struct Proc {
     stdout: Option<Arc<Mutex<Pipe>>>,
     stderr: Option<Arc<Mutex<Pipe>>>,
     status: Option<(Option<i32>, Option<i32>)>,
+    /// The pty master of a `ptySpawn` process (window size ioctls).
+    #[cfg(unix)]
+    master: Option<std::fs::File>,
 }
 
 thread_local! {
@@ -254,6 +257,127 @@ fn drain(pipe: &Option<Arc<Mutex<Pipe>>>) -> (Value, bool) {
     }
 }
 
+/// Pseudo-terminals for `ptySpawn`: a master/slave pair from `posix_openpt`,
+/// the program as a session leader with the slave as its controlling tty.
+#[cfg(unix)]
+mod pty {
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    #[repr(C)]
+    struct WinSize {
+        rows: u16,
+        cols: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+
+    #[cfg(target_os = "linux")]
+    const TIOCSWINSZ: u64 = 0x5414;
+    #[cfg(target_os = "linux")]
+    const TIOCSCTTY: u64 = 0x540E;
+    #[cfg(not(target_os = "linux"))]
+    const TIOCSWINSZ: u64 = 0x8008_7467;
+    #[cfg(not(target_os = "linux"))]
+    const TIOCSCTTY: u64 = 0x2000_7461;
+
+    unsafe extern "C" {
+        fn posix_openpt(flags: i32) -> i32;
+        fn grantpt(fd: i32) -> i32;
+        fn unlockpt(fd: i32) -> i32;
+        fn ptsname_r(fd: i32, buf: *mut std::ffi::c_char, len: usize) -> i32;
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+        fn setsid() -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+
+    const O_RDWR: i32 = 2;
+    #[cfg(target_os = "linux")]
+    const O_NOCTTY: i32 = 0o400;
+    #[cfg(not(target_os = "linux"))]
+    const O_NOCTTY: i32 = 0x20000;
+
+    pub(super) fn set_size(master: &File, cols: u16, rows: u16) -> bool {
+        let size = WinSize {
+            rows,
+            cols,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &size as *const WinSize) == 0 }
+    }
+
+    pub(super) fn spawn(
+        file: &str,
+        args: &[String],
+        cwd: Option<String>,
+        env: Vec<String>,
+        cols: u16,
+        rows: u16,
+    ) -> io::Result<(Child, File)> {
+        let fd = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // posix_openpt does not set close-on-exec; the program must not
+        // inherit its own master.
+        unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) };
+        let master = unsafe { File::from_raw_fd(fd) };
+        if unsafe { grantpt(fd) } != 0 || unsafe { unlockpt(fd) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut name = [0 as std::ffi::c_char; 256];
+        if unsafe { ptsname_r(fd, name.as_mut_ptr(), name.len()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOCTTY)
+            .open(path)?;
+        set_size(&master, cols, rows);
+        let mut command = Command::new(file);
+        command.args(args);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        command.env_clear();
+        for pair in env {
+            if let Some((key, value)) = pair.split_once('=') {
+                command.env(key, value);
+            }
+        }
+        command
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                // A session of its own, with the slave (stdin) as its tty.
+                if setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if ioctl(0, TIOCSCTTY, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn()?;
+        Ok((child, master))
+    }
+}
+
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> bool {
     unsafe extern "C" {
@@ -309,6 +433,8 @@ pub(crate) fn install(host: &Value) {
             stderr: child.stderr.take().map(reader),
             child,
             status: None,
+            #[cfg(unix)]
+            master: None,
         };
         let id = next_id();
         PROCS.with(|procs| procs.borrow_mut().insert(id, proc));
@@ -316,6 +442,69 @@ pub(crate) fn install(host: &Value) {
             ("id", Value::Number(id as f64)),
             ("pid", Value::Number(f64::from(pid))),
         ])
+    });
+
+    // ptySpawn(file, args, cwd, envPairs, cols, rows) -> { id, pid }: the
+    // program on a new pseudo-terminal (`node-pty`'s `spawn`). The id works
+    // with cpPoll (output arrives as `stdout`, the master's byte stream),
+    // cpWrite (keystrokes), cpKill and cpRelease; `ptyResize` sets the size.
+    #[cfg(unix)]
+    define(host, "ptySpawn", |args| {
+        let file = arg(&args, 0).to_js_string();
+        let argv = string_list(&arg(&args, 1));
+        require_permission("child", &file);
+        let cols = arg(&args, 4).to_number();
+        let rows = arg(&args, 5).to_number();
+        let spawned = pty::spawn(
+            &file,
+            &argv,
+            optional_string(&arg(&args, 2)),
+            string_list(&arg(&args, 3)),
+            if cols.is_finite() && cols > 0.0 { cols as u16 } else { 80 },
+            if rows.is_finite() && rows > 0.0 { rows as u16 } else { 24 },
+        );
+        let (child, master) = match spawned {
+            Ok(pair) => pair,
+            Err(error) => crate::throw_value(spawn_error(&error, &file, &argv)),
+        };
+        let pid = child.id();
+        let output = match master.try_clone() {
+            Ok(output) => output,
+            Err(error) => crate::throw_value(spawn_error(&error, &file, &argv)),
+        };
+        let input = match master.try_clone() {
+            Ok(input) => input,
+            Err(error) => crate::throw_value(spawn_error(&error, &file, &argv)),
+        };
+        let proc = Proc {
+            stdin: Some(writer(input)),
+            stdout: Some(reader(output)),
+            stderr: None,
+            child,
+            status: None,
+            master: Some(master),
+        };
+        let id = next_id();
+        PROCS.with(|procs| procs.borrow_mut().insert(id, proc));
+        object(vec![
+            ("id", Value::Number(id as f64)),
+            ("pid", Value::Number(f64::from(pid))),
+        ])
+    });
+
+    #[cfg(unix)]
+    define(host, "ptyResize", |args| {
+        let id = arg(&args, 0).to_number() as i64;
+        let cols = arg(&args, 1).to_number().clamp(1.0, 65535.0) as u16;
+        let rows = arg(&args, 2).to_number().clamp(1.0, 65535.0) as u16;
+        let resized = PROCS.with(|procs| {
+            procs
+                .borrow()
+                .get(&id)
+                .and_then(|proc| proc.master.as_ref())
+                .is_some_and(|master| pty::set_size(master, cols, rows))
+        });
+        Value::Bool(resized)
     });
 
     // cpPoll(id) -> { stdout, stderr, stdoutDone, stderrDone, exited, code, signal }
