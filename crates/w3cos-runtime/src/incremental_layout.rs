@@ -42,6 +42,8 @@ struct Cache {
     /// of them while it stays hidden cannot change any used box, so the patch
     /// path skips it instead of rebuilding. Valid only until the next rebuild.
     hidden: HashSet<u32>,
+    /// Document inputs behind `component`, for patching it on the next rebuild.
+    baseline: w3cos_dom::document::ComponentBaseline,
 }
 
 thread_local! {
@@ -123,7 +125,8 @@ fn rebuild(
     viewport_w: f32,
     viewport_h: f32,
 ) -> bool {
-    let component = crate::dom::to_component_tree();
+    let component = lower_component_tree(slot, viewport_w, viewport_h);
+    let baseline = crate::dom::component_baseline();
     let flat = pre_flatten(&component);
     let node_ids = flat
         .iter()
@@ -150,8 +153,69 @@ fn rebuild(
         viewport_w_bits: viewport_w.to_bits(),
         viewport_h_bits: viewport_h.to_bits(),
         hidden: HashSet::new(),
+        baseline,
     });
     true
+}
+
+/// The component tree for the current DOM. Reuses the previous cache's tree
+/// when only a few nodes changed since it was lowered, re-lowering just the
+/// frontiers under them; anything it cannot prove independent lowers in full.
+fn lower_component_tree(slot: &mut Option<Cache>, viewport_w: f32, viewport_h: f32) -> Component {
+    if let Some(mut cache) = slot.take()
+        && component_patching_enabled()
+        && cache.viewport_w_bits == viewport_w.to_bits()
+        && cache.viewport_h_bits == viewport_h.to_bits()
+        && !document_has_grafts()
+        && let w3cos_dom::document::ComponentPatch::Patched { .. } =
+            crate::dom::patch_component_tree(&mut cache.component, &cache.baseline)
+    {
+        #[cfg(test)]
+        PATCHED_LOWERINGS.with(|count| count.set(count.get() + 1));
+        if verify_component_patching() {
+            let fresh = crate::dom::to_component_tree();
+            assert!(
+                same_component(&cache.component, &fresh),
+                "patched component tree diverged from a fresh lowering"
+            );
+        }
+        return cache.component;
+    }
+    crate::dom::to_component_tree()
+}
+
+fn component_patching_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("W3COS_NO_COMPONENT_PATCH").is_none())
+}
+
+fn verify_component_patching() -> bool {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFY.get_or_init(|| cfg!(test) || std::env::var_os("W3COS_VERIFY_COMPONENT_PATCH").is_some())
+}
+
+/// Shadow roots and frames graft content lowered from nodes outside the light
+/// tree, which the patch's change tracking does not follow.
+fn document_has_grafts() -> bool {
+    #[cfg(feature = "dynamic-js")]
+    if crate::jsdom::has_shadow_roots() {
+        return true;
+    }
+    crate::dom::with_document(|document| {
+        !document.get_elements_by_tag_name("iframe").is_empty()
+            || !document.get_elements_by_tag_name("object").is_empty()
+    })
+}
+
+fn same_component(a: &Component, b: &Component) -> bool {
+    a.kind == b.kind
+        && a.style == b.style
+        && format!("{:?}", a.on_click) == format!("{:?}", b.on_click)
+        && a.children.len() == b.children.len()
+        && a.children
+            .iter()
+            .zip(&b.children)
+            .all(|(x, y)| same_component(x, y))
 }
 
 fn collect_host_ids(component: &Component, ids: &mut HashSet<u32>) {
@@ -586,6 +650,7 @@ fn note_paint_reuse(kind: PaintReuse) {
 #[cfg(test)]
 thread_local! {
     static FLUSH_REBUILDS: Cell<u32> = const { Cell::new(0) };
+    static PATCHED_LOWERINGS: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1372,6 +1437,83 @@ mod paint_layout_tests {
                 .as_ref()
                 .is_some_and(|cache| cache.hidden.contains(&id))
         })
+    }
+
+    fn patched_lowerings() -> u32 {
+        PATCHED_LOWERINGS.with(Cell::get)
+    }
+
+    /// body > shell > [head, list > rows, foot]; the rows are the editor-line
+    /// or palette-entry shape that structural edits hit.
+    fn list_document(rows: usize) -> (u32, Vec<u32>, u32) {
+        crate::dom::reset_document();
+        let shell = crate::dom::create_element("div");
+        let head = crate::dom::create_element("div");
+        crate::dom::set_style_property(head, "height", "20px");
+        let list = crate::dom::create_element("div");
+        let foot = crate::dom::create_element("div");
+        crate::dom::set_style_property(foot, "height", "20px");
+        crate::dom::append_child(crate::dom::body_id(), shell);
+        for node in [head, list, foot] {
+            crate::dom::append_child(shell, node);
+        }
+        let mut built = Vec::new();
+        for index in 0..rows {
+            let row = crate::dom::create_element("div");
+            crate::dom::set_style_property(row, "height", "18px");
+            let text = crate::dom::create_text_node(&format!("row {index}"));
+            crate::dom::append_child(row, text);
+            crate::dom::append_child(list, row);
+            built.push(row);
+        }
+        (list, built, foot)
+    }
+
+    #[test]
+    fn a_structural_edit_re_lowers_only_its_frontier() {
+        let (list, rows, foot) = list_document(30);
+        assert_stored_matches_fresh(foot);
+
+        // Append a row: the layout generation changes, so the geometry is
+        // rebuilt, but the component tree is patched under the list.
+        let rebuilds = flush_rebuilds();
+        let patched = patched_lowerings();
+        let row = crate::dom::create_element("div");
+        crate::dom::set_style_property(row, "height", "18px");
+        let text = crate::dom::create_text_node("appended");
+        crate::dom::append_child(row, text);
+        crate::dom::append_child(list, row);
+        let before = crate::dom::bounding_rect(foot);
+        assert_stored_matches_fresh(foot);
+        assert_eq!(flush_rebuilds() - rebuilds, 1);
+        assert_eq!(patched_lowerings() - patched, 1, "append is patched");
+        let after = crate::dom::bounding_rect(foot);
+        assert!(after.y > before.y + 17.0, "{} -> {}", before.y, after.y);
+
+        // Remove one and reorder: still equal to a full lowering.
+        crate::dom::remove_child(list, rows[7]);
+        assert_stored_matches_fresh(foot);
+        crate::dom::set_text_content(rows[2], "changed text");
+        crate::dom::set_style_property(rows[3], "height", "40px");
+        assert_stored_matches_fresh(foot);
+        assert!(patched_lowerings() - patched >= 2, "later edits patch too");
+    }
+
+    #[test]
+    fn frames_are_never_patched() {
+        let (list, rows, foot) = list_document(10);
+        let frame = crate::dom::create_element("iframe");
+        crate::dom::append_child(list, frame);
+        assert_stored_matches_fresh(foot);
+        let patched = patched_lowerings();
+        crate::dom::set_text_content(rows[1], "edited");
+        crate::dom::set_style_property(rows[2], "height", "30px");
+        assert_stored_matches_fresh(foot);
+        assert_eq!(
+            patched_lowerings(),
+            patched,
+            "a document with a frame rebuilds fully"
+        );
     }
 
     #[test]

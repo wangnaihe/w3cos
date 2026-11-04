@@ -976,8 +976,9 @@ pub fn bounding_rect(node: u32) -> w3cos_dom::DOMRect {
     })
 }
 
-/// Build Component tree from the current DOM state (for rendering).
-pub fn to_component_tree() -> w3cos_std::Component {
+/// Install the font metrics `Document::to_component_tree` reads. A no-op when
+/// the font revision did not change.
+fn install_lowering_providers() {
     crate::layout::install_font_unit_provider();
     fn normal_line_height(style: &w3cos_std::style::Style) -> Option<f32> {
         #[cfg(feature = "skia")]
@@ -992,30 +993,59 @@ pub fn to_component_tree() -> w3cos_std::Component {
             crate::font_face::FontRegistry::global().revision(),
         );
     });
-    let mut tree = with_document(|doc| doc.to_component_tree());
-    #[cfg(feature = "dynamic-js")]
-    crate::jsdom::graft_shadow_component_subtrees(&mut tree);
-    crate::jsdom::graft_frame_component_subtrees(&mut tree);
-    fn resolve_text_leading(component: &mut w3cos_std::Component) {
-        if let w3cos_std::ComponentKind::Text { content } = &component.kind
-            && component.style.line_height_is_normal
+}
+
+fn resolve_text_leading(component: &mut w3cos_std::Component) {
+    if let w3cos_std::ComponentKind::Text { content } = &component.kind
+        && component.style.line_height_is_normal
+    {
+        let registry = crate::font_face::FontRegistry::global();
+        if let Some(primary) = registry.resolve_style(&component.style)
+            && content
+                .chars()
+                .any(|ch| !ch.is_whitespace() && !primary.supports_character(ch))
         {
-            let registry = crate::font_face::FontRegistry::global();
-            if let Some(primary) = registry.resolve_style(&component.style)
-                && content
-                    .chars()
-                    .any(|ch| !ch.is_whitespace() && !primary.supports_character(ch))
-            {
-                component.style.line_height =
-                    registry.normal_line_height_for_text(&component.style, content);
-            }
-        }
-        for child in &mut component.children {
-            resolve_text_leading(child);
+            component.style.line_height =
+                registry.normal_line_height_for_text(&component.style, content);
         }
     }
-    resolve_text_leading(&mut tree);
+    for child in &mut component.children {
+        resolve_text_leading(child);
+    }
+}
+
+/// Host-side passes applied to every lowered tree or subtree.
+fn finish_lowered_subtree(tree: &mut w3cos_std::Component) {
+    #[cfg(feature = "dynamic-js")]
+    crate::jsdom::graft_shadow_component_subtrees(tree);
+    crate::jsdom::graft_frame_component_subtrees(tree);
+    resolve_text_leading(tree);
+}
+
+/// Build Component tree from the current DOM state (for rendering).
+pub fn to_component_tree() -> w3cos_std::Component {
+    install_lowering_providers();
+    let mut tree = with_document(|doc| doc.to_component_tree());
+    finish_lowered_subtree(&mut tree);
     tree
+}
+
+/// Snapshot of the document inputs behind a tree from [`to_component_tree`].
+pub(crate) fn component_baseline() -> w3cos_dom::document::ComponentBaseline {
+    with_document(|doc| doc.component_baseline())
+}
+
+/// Bring `tree` (built when `baseline` was taken) up to date by re-lowering
+/// only the frontiers under changed nodes, applying the same host passes as
+/// [`to_component_tree`] to each. `NeedsRebuild` leaves `tree` unspecified.
+pub(crate) fn patch_component_tree(
+    tree: &mut w3cos_std::Component,
+    baseline: &w3cos_dom::document::ComponentBaseline,
+) -> w3cos_dom::document::ComponentPatch {
+    install_lowering_providers();
+    with_document(|doc| {
+        doc.patch_component_tree_with(tree, baseline, &mut |fresh| finish_lowered_subtree(fresh))
+    })
 }
 
 #[cfg(test)]

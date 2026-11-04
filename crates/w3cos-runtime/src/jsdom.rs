@@ -1056,6 +1056,13 @@ fn shadow_host_for_root(root: u32) -> Option<u32> {
     })
 }
 
+/// Whether any element has a shadow root. Grafted shadow content is lowered
+/// from nodes that are not reachable from the document root, so a patch of the
+/// light tree cannot see their edits.
+pub(crate) fn has_shadow_roots() -> bool {
+    SHADOW_ROOTS.with(|roots| !roots.borrow().is_empty())
+}
+
 pub(crate) fn shadow_root_id_for_host(host: u32) -> Option<u32> {
     SHADOW_ROOTS.with(|roots| roots.borrow().get(&host).map(|info| info.root))
 }
