@@ -4,6 +4,7 @@
 //! Tree shape, text metrics, and inherited cascades rebuild once.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
@@ -22,6 +23,7 @@ struct WidthMemo {
     viewport_w_bits: u32,
     viewport_h_bits: u32,
     rects: Vec<(u32, f32, f32, f32, f32)>,
+    client_rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>,
 }
 
 struct Cache {
@@ -60,6 +62,20 @@ thread_local! {
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
     static LAST_FLUSH: std::cell::Cell<(&'static str, u32, u32)> =
         const { std::cell::Cell::new(("none", 0, 0)) };
+    static CLIENT_RECTS: RefCell<HashMap<u32, Vec<w3cos_dom::DOMRect>>> =
+        RefCell::new(HashMap::new());
+}
+
+pub(crate) fn client_rects(node: u32) -> Option<Vec<w3cos_dom::DOMRect>> {
+    CLIENT_RECTS.with(|rects| rects.borrow().get(&node).cloned())
+}
+
+fn client_rect_snapshot() -> HashMap<u32, Vec<w3cos_dom::DOMRect>> {
+    CLIENT_RECTS.with(|rects| rects.borrow().clone())
+}
+
+fn restore_client_rects(rects: HashMap<u32, Vec<w3cos_dom::DOMRect>>) {
+    CLIENT_RECTS.with(|current| *current.borrow_mut() = rects);
 }
 
 /// What the most recent [`flush`] solved. `solved_nodes` is the subtree that
@@ -91,6 +107,7 @@ fn phase_log_enabled() -> bool {
 pub fn invalidate() {
     CACHE.with(|cache| *cache.borrow_mut() = None);
     PAINT.with(|cache| *cache.borrow_mut() = None);
+    CLIENT_RECTS.with(|rects| rects.borrow_mut().clear());
     PAINT_REUSE.with(|kind| kind.set(PaintReuse::None));
     #[cfg(any(feature = "skia", feature = "cpu-render"))]
     crate::headless::invalidate_retained_frame();
@@ -345,7 +362,7 @@ fn patch_and_compute(
                     && memo.viewport_w_bits == viewport_w_bits
                     && memo.viewport_h_bits == viewport_h_bits
             })
-            .map(|memo| memo.rects.clone())
+            .map(|memo| (memo.rects.clone(), memo.client_rects.clone()))
     });
     for (id, style) in &styles {
         if !assign_layout_style(&mut cache.component, *id, style) {
@@ -359,8 +376,9 @@ fn patch_and_compute(
         note_flush("paint", 0, 0);
         return true;
     }
-    if let Some(rects) = memo_hit {
+    if let Some((rects, client_rects)) = memo_hit {
         restore_rects(&rects);
+        restore_client_rects(client_rects);
         cache.viewport_w_bits = viewport_w.to_bits();
         cache.viewport_h_bits = viewport_h.to_bits();
         note_flush("memo", 0, 0);
@@ -454,6 +472,7 @@ fn write_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
 ) -> Vec<(u32, f32, f32, f32, f32)> {
+    publish_client_rects(flat, layouts);
     let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
@@ -474,6 +493,334 @@ fn write_rects(
         }
     });
     snaps
+}
+
+fn split_inline_owner(info: &crate::layout::FlatNodeInfo<'_>) -> Option<u32> {
+    info.style
+        .custom_properties
+        .as_ref()?
+        .get(w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER)?
+        .parse()
+        .ok()
+}
+
+/// Physical advances for one shaped line at every authored owner boundary.
+/// This is produced during layout writeback and consumed by the retained
+/// CSSOM rectangle map; later `getClientRects()` calls only read that map.
+struct PhysicalTextLine {
+    boundaries: Vec<usize>,
+    positions: Vec<f32>,
+}
+
+impl PhysicalTextLine {
+    fn advance(&self, start: usize, end: usize) -> Option<(f32, f32)> {
+        let start_index = self.boundaries.binary_search(&start).ok()?;
+        let end_index = self.boundaries.binary_search(&end).ok()?;
+        let start_position = *self.positions.get(start_index)?;
+        let end_position = *self.positions.get(end_index)?;
+        Some((start_position, (end_position - start_position).max(0.0)))
+    }
+
+    fn total(&self) -> Option<f32> {
+        self.positions.last().copied()
+    }
+}
+
+fn physical_text_line(
+    line: &str,
+    style: &w3cos_std::Style,
+    owner_ranges: &[(u32, usize, usize)],
+) -> Option<PhysicalTextLine> {
+    let mut boundaries = Vec::with_capacity(owner_ranges.len() * 2 + 2);
+    boundaries.extend([0, line.len()]);
+    for &(_, start, end) in owner_ranges {
+        if start <= end
+            && end <= line.len()
+            && line.is_char_boundary(start)
+            && line.is_char_boundary(end)
+        {
+            boundaries.extend([start, end]);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let fragments = boundaries
+        .windows(2)
+        .map(|range| line.get(range[0]..range[1]))
+        .collect::<Option<Vec<_>>>()?;
+    let advances = crate::layout::physical_text_fragment_advances(&fragments, style)?;
+    let mut positions = Vec::with_capacity(advances.len() + 1);
+    positions.push(0.0);
+    for advance in advances {
+        positions.push(positions.last().copied().unwrap_or(0.0) + advance);
+    }
+    (positions.len() == boundaries.len()).then_some(PhysicalTextLine {
+        boundaries,
+        positions,
+    })
+}
+
+fn publish_client_rects(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layouts: &[(crate::layout::LayoutRect, usize)],
+) {
+    let mut by_index = vec![None; flat.len()];
+    for (rect, index) in layouts {
+        if let Some(slot) = by_index.get_mut(*index) {
+            *slot = Some(*rect);
+        }
+    }
+    let mut published: HashMap<u32, Vec<w3cos_dom::DOMRect>> = HashMap::new();
+    let mut owners_with_inline_fragments = HashSet::new();
+    let mut first_fragment_is_block = HashMap::new();
+    let mut last_fragment_is_block = HashMap::new();
+    let synthetic_inline = |info: &crate::layout::FlatNodeInfo<'_>| {
+        info.style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|properties| {
+                properties.contains_key("--w3cos-internal-split-inline-edge")
+                    || properties.contains_key("--w3cos-internal-split-inline-fragment")
+            })
+    };
+    let mut inherited_text_owners = vec![Vec::new(); flat.len()];
+    let mut text_line_owners = HashSet::new();
+    for (index, info) in flat.iter().enumerate() {
+        if !info.component.is_some_and(|component| {
+            matches!(component.kind, w3cos_std::ComponentKind::Text { .. })
+        }) {
+            continue;
+        }
+        let mut parent = info.parent;
+        while let Some(parent_index) = parent {
+            let Some(ancestor) = flat.get(parent_index) else {
+                break;
+            };
+            if synthetic_inline(ancestor)
+                && let Some(owner) = split_inline_owner(ancestor)
+                && !inherited_text_owners[index].contains(&owner)
+            {
+                inherited_text_owners[index].push(owner);
+                text_line_owners.insert(owner);
+            }
+            parent = ancestor.parent;
+        }
+    }
+    for (index, info) in flat.iter().enumerate() {
+        let synthetic_inline = synthetic_inline(info);
+        let Some(mut rect) = by_index.get(index).copied().flatten() else {
+            continue;
+        };
+        if synthetic_inline {
+            // Taffy lays an anonymous inline carrier out at the containing
+            // block's available width. CSSOM exposes the physical inline
+            // fragment instead, whose inline extent is its max-content width.
+            if let Some(component) = info.component {
+                let width = crate::layout::component_max_content_width(component)
+                    .min(rect.width)
+                    .max(0.0);
+                rect.width = width;
+                if width == 0.0 && component.children.is_empty() {
+                    rect.height = 0.0;
+                }
+            }
+        } else if matches!(
+            info.style.display,
+            Display::Block | Display::Flex | Display::Grid | Display::Table | Display::ListItem
+        ) && let Some(parent) = info.parent
+            && let Some(containing) = by_index.get(parent).copied().flatten()
+        {
+            // CSS 2.1 block-in-inline creates an anonymous block around the
+            // in-flow block. Its inline extent is the actual containing block,
+            // while its block extent follows the authored child.
+            rect.x = containing.x;
+            rect.width = containing.width;
+        }
+        let physical = w3cos_dom::DOMRect::new(rect.x, rect.y, rect.width, rect.height);
+        if let Some(owner) = split_inline_owner(info) {
+            if synthetic_inline {
+                owners_with_inline_fragments.insert(owner);
+            }
+            let text_range_will_publish = info.component.is_some_and(|component| {
+                let w3cos_std::ComponentKind::Text { content } = &component.kind else {
+                    return false;
+                };
+                w3cos_std::inline_text::cssom_owner_ranges(content, info.style)
+                    .iter()
+                    .any(|(range_owner, _, _)| *range_owner == owner)
+            });
+            // Once physical text lines have been published for a split inline,
+            // suppress only its positive-size anonymous inline carrier.  Real
+            // block fragments and the zero-size split edge remain observable
+            // CSSOM fragments and must keep their original ordering entries.
+            let replaced_by_text_lines = synthetic_inline
+                && text_line_owners.contains(&owner)
+                && physical.width > 0.0
+                && physical.height > 0.0;
+            if !text_range_will_publish && !replaced_by_text_lines {
+                published.entry(owner).or_default().push(physical);
+                let is_block = !synthetic_inline;
+                first_fragment_is_block.entry(owner).or_insert(is_block);
+                last_fragment_is_block.insert(owner, is_block);
+            }
+        }
+        for owner in w3cos_std::inline_text::cssom_box_owners(info.style) {
+            published.entry(owner).or_default().push(physical);
+            first_fragment_is_block.entry(owner).or_insert(true);
+            last_fragment_is_block.insert(owner, true);
+        }
+        let Some(component) = info.component else {
+            continue;
+        };
+        let w3cos_std::ComponentKind::Text { content } = &component.kind else {
+            continue;
+        };
+        let line_box = info
+            .parent
+            .and_then(|parent| by_index.get(parent).copied().flatten())
+            .unwrap_or(rect);
+        let measure = |text: &str, style: &w3cos_std::Style| {
+            crate::layout::component_max_content_width(&w3cos_std::Component::text_shared(
+                text.to_string(),
+                style.clone().into(),
+            ))
+        };
+        let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
+        let lines = crate::text_layout::wrap_text_with_run_width(
+            content,
+            line_box.width.max(1.0),
+            info.style.white_space,
+            |text| measure(text, info.style),
+        );
+        let line_styles = crate::text_layout::authored_line_styles(content, info.style, &lines);
+        for (line_index, line) in lines.iter().enumerate() {
+            let line_style = line_styles
+                .as_ref()
+                .and_then(|styles| styles.get(line_index))
+                .unwrap_or(info.style);
+            let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(line, line_style);
+            let physical_line = physical_text_line(line, line_style, &owner_ranges);
+            let explicit_owners = owner_ranges
+                .iter()
+                .map(|(owner, _, _)| *owner)
+                .collect::<HashSet<_>>();
+            for (owner, start, end) in owner_ranges {
+                // Resolve every owner boundary together during layout
+                // writeback. Contextual backends shape one physical run and
+                // assign a crossing cluster to its start owner; the current
+                // Vello/fontdue backend preserves its authored-fragment
+                // LayoutUnit endpoints without later CSSOM remeasurement.
+                let (prefix_width, width) = physical_line
+                    .as_ref()
+                    .and_then(|physical| physical.advance(start, end))
+                    .unwrap_or_else(|| {
+                        (
+                            measure(&line[..start], line_style),
+                            measure(&line[start..end], line_style),
+                        )
+                    });
+                let x = match line_style.direction {
+                    w3cos_std::style::TextDirection::Ltr => line_box.x + prefix_width,
+                    w3cos_std::style::TextDirection::Rtl => {
+                        line_box.x + line_box.width - prefix_width - width
+                    }
+                };
+                let line_height = crate::layout::inline_style_line_height(line_style);
+                let font_box = crate::font_face::font_box_metrics_for_text(
+                    line_style,
+                    line.get(start..end).unwrap_or(line),
+                );
+                let font_height = font_box.map_or(line_height, |metrics| metrics.height());
+                let font_top = crate::layout::inline_upper_leading(line_height, font_height);
+                owners_with_inline_fragments.insert(owner);
+                published
+                    .entry(owner)
+                    .or_default()
+                    .push(w3cos_dom::DOMRect::new(
+                        x,
+                        line_box.y + line_index as f32 * line_height + font_top,
+                        width,
+                        font_height,
+                    ));
+                first_fragment_is_block.entry(owner).or_insert(false);
+                last_fragment_is_block.insert(owner, false);
+            }
+            for owner in inherited_text_owners[index]
+                .iter()
+                .copied()
+                .filter(|owner| !explicit_owners.contains(owner))
+            {
+                let width = physical_line
+                    .as_ref()
+                    .and_then(PhysicalTextLine::total)
+                    .unwrap_or_else(|| physical_advance(line, line_style));
+                let x = match line_style.direction {
+                    w3cos_std::style::TextDirection::Ltr => line_box.x,
+                    w3cos_std::style::TextDirection::Rtl => line_box.x + line_box.width - width,
+                };
+                let line_height = crate::layout::inline_style_line_height(line_style);
+                let font_box = crate::font_face::font_box_metrics_for_text(line_style, line);
+                let font_height = font_box.map_or(line_height, |metrics| metrics.height());
+                let font_top = crate::layout::inline_upper_leading(line_height, font_height);
+                owners_with_inline_fragments.insert(owner);
+                published
+                    .entry(owner)
+                    .or_default()
+                    .push(w3cos_dom::DOMRect::new(
+                        x,
+                        line_box.y + line_index as f32 * line_height + font_top,
+                        width,
+                        font_height,
+                    ));
+                first_fragment_is_block.entry(owner).or_insert(false);
+                last_fragment_is_block.insert(owner, false);
+            }
+        }
+    }
+    for owner in owners_with_inline_fragments.iter().copied() {
+        let Some(rects) = published.get_mut(&owner) else {
+            continue;
+        };
+        if rects.is_empty() {
+            continue;
+        }
+        let left = rects
+            .iter()
+            .map(|rect| rect.x)
+            .fold(f32::INFINITY, f32::min);
+        let top = rects
+            .iter()
+            .map(|rect| rect.y)
+            .fold(f32::INFINITY, f32::min);
+        let bottom = rects
+            .iter()
+            .map(|rect| rect.y + rect.height)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if first_fragment_is_block.get(&owner) == Some(&true) {
+            rects.insert(0, w3cos_dom::DOMRect::new(left, top, 0.0, 0.0));
+        }
+        if last_fragment_is_block.get(&owner) == Some(&true) {
+            rects.push(w3cos_dom::DOMRect::new(left, bottom, 0.0, 0.0));
+        }
+    }
+    for (owner, rects) in &mut published {
+        if owners_with_inline_fragments.contains(owner) || rects.is_empty() {
+            continue;
+        }
+        let mut union = rects[0];
+        for rect in &rects[1..] {
+            let left = union.x.min(rect.x);
+            let top = union.y.min(rect.y);
+            let right = (union.x + union.width).max(rect.x + rect.width);
+            let bottom = (union.y + union.height).max(rect.y + rect.height);
+            union = w3cos_dom::DOMRect::new(left, top, right - left, bottom - top);
+        }
+        let zero_before = w3cos_dom::DOMRect::new(union.x, union.y, 0.0, 0.0);
+        let middle = w3cos_dom::DOMRect::new(union.x, union.y, union.width, union.height);
+        let zero_after = w3cos_dom::DOMRect::new(union.x, union.y + union.height, 0.0, 0.0);
+        *rects = vec![zero_before, middle, zero_after];
+    }
+    CLIENT_RECTS.with(|rects| *rects.borrow_mut() = published);
 }
 
 fn restore_rects(rects: &[(u32, f32, f32, f32, f32)]) {
@@ -526,6 +873,7 @@ fn remember_width(
         viewport_w_bits,
         viewport_h_bits,
         rects,
+        client_rects: client_rect_snapshot(),
     });
 }
 
@@ -550,6 +898,7 @@ fn memos_for_tree(
             viewport_w_bits,
             viewport_h_bits,
             rects: rects.clone(),
+            client_rects: client_rect_snapshot(),
         })
         .collect()
 }
@@ -611,7 +960,31 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
+        let private_metadata = component
+            .style
+            .custom_properties
+            .as_ref()
+            .map(|properties| {
+                [
+                    w3cos_dom::document::SPLIT_INLINE_FRAGMENT_OWNER,
+                    w3cos_std::inline_text::CSSOM_OWNER_RANGES,
+                    w3cos_std::inline_text::CSSOM_BOX_OWNERS,
+                ]
+                .into_iter()
+                .filter_map(|key| properties.get(key).cloned().map(|value| (key, value)))
+                .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         component.style = style.clone().into();
+        if !private_metadata.is_empty() {
+            let properties = component
+                .style
+                .custom_properties
+                .get_or_insert_with(Default::default);
+            for (key, value) in private_metadata {
+                properties.insert(key.into(), value);
+            }
+        }
         return true;
     }
     component
@@ -1000,6 +1373,8 @@ fn try_shift_absolute_insets(
         }
     }
     write_host_rects(&cache.node_ids, &cache.results.layout_cache);
+    let flat = pre_flatten(&cache.component);
+    publish_client_rects(&flat, &cache.results.layout_cache);
     cache.cascade = cascade;
     note_paint_patch();
     note_paint_shift();

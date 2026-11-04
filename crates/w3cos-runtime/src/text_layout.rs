@@ -33,11 +33,22 @@ pub(crate) fn authored_line_styles(
     style: &Style,
     lines: &[String],
 ) -> Option<Vec<Style>> {
-    let ends = w3cos_std::inline_text::fragment_ends(text, style)?;
+    let ends =
+        w3cos_std::inline_text::fragment_ends(text, style).unwrap_or_else(|| vec![text.len()]);
     let normalized = prepare_text_for_white_space(text, style.white_space);
     let ends = ends
         .into_iter()
         .map(|end| prepare_text_for_white_space(&text[..end], style.white_space).len())
+        .collect::<Vec<_>>();
+    let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(text, style)
+        .into_iter()
+        .map(|(owner, start, end)| {
+            (
+                owner,
+                prepare_text_for_white_space(&text[..start], style.white_space).len(),
+                prepare_text_for_white_space(&text[..end], style.white_space).len(),
+            )
+        })
         .collect::<Vec<_>>();
     let mut cursor = 0;
     let mut result = Vec::with_capacity(lines.len());
@@ -53,6 +64,19 @@ pub(crate) fn authored_line_styles(
             .collect::<Vec<_>>();
         let mut line_style = style.clone();
         w3cos_std::inline_text::set_fragment_ends(&mut line_style, line, &local_ends);
+        let local_owner_ranges = owner_ranges
+            .iter()
+            .filter_map(|(owner, owner_start, owner_end)| {
+                let local_start = (*owner_start).max(start);
+                let local_end = (*owner_end).min(end);
+                (local_start < local_end).then_some((
+                    *owner,
+                    local_start - start,
+                    local_end - start,
+                ))
+            })
+            .collect::<Vec<_>>();
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut line_style, line, &local_owner_ranges);
         result.push(line_style);
         cursor = end;
     }
@@ -2045,6 +2069,18 @@ mod tests {
         assert_eq!(
             w3cos_std::inline_text::fragment_ends(&lines[0], &styles[0]),
             Some(vec![8, 13, lines[0].len()])
+        );
+        let owner_start = text.find("the words").unwrap();
+        let owner_end = owner_start + "the words".len();
+        w3cos_std::inline_text::set_cssom_owner_ranges(
+            &mut style,
+            text,
+            &[(17, owner_start, owner_end)],
+        );
+        let styles = authored_line_styles(text, &style, &lines).unwrap();
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges(&lines[0], &styles[0]),
+            vec![(17, 4, 13)]
         );
         let repeated = "one two one two";
         w3cos_std::inline_text::set_fragment_ends(&mut style, repeated, &[3, 7, 11, 15]);
