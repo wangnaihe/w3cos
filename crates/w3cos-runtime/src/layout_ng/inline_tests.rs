@@ -2588,3 +2588,60 @@ fn text_items_break_inside_at_uax14_opportunities() {
         ]
     );
 }
+
+/// `word-break: break-all` (LineBreakType::kBreakAll): opportunities
+/// between any two letters, also in an ASCII-only item.  Rects from Chrome
+/// (Ahem 20px, 120px container).
+#[test]
+fn break_all_breaks_between_letters() {
+    let _ahem = AhemGuard::new();
+    let container = || {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(120.0),
+            ..Style::default()
+        };
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(inline::IFC_MARKER.into(), "1".into());
+        style
+    };
+    let text = |content: &str, break_all: bool| {
+        let mut style = Style {
+            display: Display::Inline,
+            ..Style::default()
+        };
+        if break_all {
+            style.word_break = w3cos_std::style::WordBreak::BreakAll;
+        }
+        font(&mut style, 20.0, LineHeight::Number(1.0));
+        Component::text(content, style)
+    };
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![
+            Component::boxed(container(), vec![text("XXX ", false), text("YYYYYY", true)]),
+            Component::boxed(container(), vec![text("YYYYYYYYYYYY", true)]),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    // (index, [x, y, w, h]) from Chrome: containers, and the union of each
+    // break-all item's line pieces (Chrome client rects 80,0,40,20 +
+    // 0,20,80,20; two full lines).
+    let expected: [(usize, [f32; 4]); 3] = [
+        (1, [0.0, 0.0, 120.0, 40.0]),
+        (3, [0.0, 0.0, 120.0, 40.0]),
+        (5, [0.0, 40.0, 120.0, 40.0]),
+    ];
+    for (index, want) in expected {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
+    }
+}
