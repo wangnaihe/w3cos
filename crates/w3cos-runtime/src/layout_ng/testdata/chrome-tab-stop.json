@@ -1,0 +1,53 @@
+{
+ "browser": "Google Chrome 156.0.8078.80",
+ "cases": [
+  {
+   "name": "after-10",
+   "html": "<div style='white-space:pre;tab-size:40px;margin:0'><span style='display:inline-block;width:10px;height:10px'></span>&#9;<span id=s style='display:inline-block;width:5px;height:10px'></span></div>",
+   "rects": {
+    "s": [
+     40,
+     7,
+     5,
+     10
+    ]
+   }
+  },
+  {
+   "name": "after-18",
+   "html": "<div style='white-space:pre;tab-size:40px;margin:0'><span style='display:inline-block;width:18px;height:10px'></span>&#9;<span id=s style='display:inline-block;width:5px;height:10px'></span></div>",
+   "rects": {
+    "s": [
+     40,
+     7,
+     5,
+     10
+    ]
+   }
+  },
+  {
+   "name": "after-23.3",
+   "html": "<div style='white-space:pre;tab-size:40px;margin:0'><span style='display:inline-block;width:23.3px;height:10px'></span>&#9;<span id=s style='display:inline-block;width:5px;height:10px'></span></div>",
+   "rects": {
+    "s": [
+     40,
+     7,
+     5,
+     10
+    ]
+   }
+  },
+  {
+   "name": "after-39",
+   "html": "<div style='white-space:pre;tab-size:40px;margin:0'><span style='display:inline-block;width:39px;height:10px'></span>&#9;<span id=s style='display:inline-block;width:5px;height:10px'></span></div>",
+   "rects": {
+    "s": [
+     80,
+     7,
+     5,
+     10
+    ]
+   }
+  }
+ ]
+}

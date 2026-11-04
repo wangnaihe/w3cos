@@ -6930,3 +6930,58 @@ fn tab_size_length_matches_chrome() {
         }
     }
 }
+
+/// A preserved tab after other content on a `white-space: pre` line runs
+/// to the next tab stop from its inline offset, skipping a stop closer than
+/// half a space (Blink Font::TabWidth), with the offset in LayoutUnits.
+#[test]
+fn tab_after_content_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/chrome-tab-stop.json")).unwrap();
+    let marker = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-tab-size".to_string(),
+        "l40".to_string(),
+    )]));
+    for case in golden["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let width: f32 = name.trim_start_matches("after-").parse().unwrap();
+        let leaf = Style {
+            display: Display::Inline,
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            custom_properties: marker.clone(),
+            ..Style::default()
+        };
+        let container = Style {
+            white_space: w3cos_std::style::WhiteSpace::Pre,
+            custom_properties: marker.clone(),
+            ..block()
+        };
+        let span = |w: f32| {
+            node(
+                Style {
+                    display: Display::InlineBlock,
+                    width: Dimension::Px(w),
+                    height: Dimension::Px(10.0),
+                    ..Style::default()
+                },
+                vec![],
+            )
+        };
+        let root = node(
+            block(),
+            vec![node(
+                container,
+                vec![span(width), Component::text("\t", leaf), span(5.0)],
+            )],
+        );
+        let out = ng_rects(&root);
+        // 0 root, 1 container, 2 first span, 3 tab leaf, 4 measured span.
+        let actual = rect(&out, 4);
+        let want = case["rects"]["s"][0].as_f64().unwrap() as f32;
+        assert!(
+            (actual.0 - want).abs() < 0.05,
+            "{name}: {actual:?} vs {want}"
+        );
+    }
+}
