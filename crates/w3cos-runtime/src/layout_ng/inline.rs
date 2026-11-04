@@ -1935,12 +1935,9 @@ fn max_content_width(content: &str, style: &Style) -> f32 {
 }
 
 /// `break-word` is modelled only where its extra emergency breaks are never
-/// needed (line building bails otherwise) and the item's intrinsic width
-/// cannot depend on trailing preserved spaces: not for plain `pre-wrap`, whose
-/// shrink-to-fit width still comes from the legacy leaf measure.
+/// needed (line building bails otherwise).
 fn break_word_supported(style: &Style) -> bool {
     style.word_break == WordBreak::BreakWord
-        && (style.white_space != WhiteSpace::PreWrap || style.break_spaces)
 }
 
 /// A forced line break inside a leaf: a coalesced `<br>` or a preserved
@@ -2876,7 +2873,18 @@ fn layout_lines(
         {
             return super::bail("internal-break-earlier");
         }
-        max_line_width = max_line_width.max(content_width);
+        // Max-content (an indefinite available size): preserved spaces
+        // before a forced break or at the end of the block hang only
+        // conditionally, which does not keep them out of the intrinsic
+        // size (CSS Text 3 4.1.3; white-space-intrinsic-size-004).
+        let counts_hanging = hang_preserved
+            && available >= super::block::INDEFINITE_INLINE * 0.5
+            && (line_index + 1 == line_count || forced);
+        max_line_width = max_line_width.max(if counts_hanging {
+            content_width.max(slice_start)
+        } else {
+            content_width
+        });
         // CSS Text 3 4.1.3: before a forced break or the end of the block,
         // preserved spaces hang only conditionally: the part that fits
         // still counts for alignment.
@@ -3253,16 +3261,12 @@ mod tab_tests {
             ..Style::default()
         };
         assert_eq!(text_style_reason("abc", &break_word), None);
-        // Plain pre-wrap + break-word keeps the legacy shrink-to-fit width.
         let pre_wrap_break_word = Style {
             white_space: WhiteSpace::PreWrap,
             word_break: WordBreak::BreakWord,
             ..Style::default()
         };
-        assert_eq!(
-            text_style_reason("abc", &pre_wrap_break_word),
-            Some("text:word-break")
-        );
+        assert_eq!(text_style_reason("abc", &pre_wrap_break_word), None);
         let break_spaces_break_word = Style {
             break_spaces: true,
             ..pre_wrap_break_word

@@ -6478,6 +6478,42 @@ fn inline_min_max_ignores_text_and_inline_box_widths() {
     assert_eq!(rects(&percent), rects(&auto));
 }
 
+/// CSS Text 3 4.1.3: preserved spaces at the end of an unwrapped line hang
+/// only conditionally, so they still count toward a shrink-to-fit float's
+/// max-content size (white-space-intrinsic-size-004).
+#[test]
+fn pre_wrap_float_shrink_to_fit_counts_trailing_preserved_spaces() {
+    use w3cos_std::style::{Float, WhiteSpace};
+    let float_width = |white_space: WhiteSpace, content: &str| {
+        let text = Component::text(
+            content,
+            Style {
+                display: Display::Inline,
+                white_space,
+                ..Style::default()
+            },
+        );
+        let float = node(
+            Style {
+                float: Float::Left,
+                white_space,
+                ..block()
+            },
+            vec![text],
+        );
+        let root = node(block(), vec![float]);
+        let flat = pre_flatten(&root);
+        let out = layout_tree(&root, &flat, 800.0, 600.0).expect("pre-wrap float");
+        rect(&out, 1).2
+    };
+    let bare = float_width(WhiteSpace::PreWrap, "X");
+    let spaced = float_width(WhiteSpace::PreWrap, "X  ");
+    assert!(spaced > bare);
+    assert_eq!(spaced, float_width(WhiteSpace::Pre, "X  "));
+    // The preserved newline ends the line: the spaces before it count too.
+    assert_eq!(float_width(WhiteSpace::PreWrap, "X  \nY"), spaced);
+}
+
 #[test]
 fn relative_inline_moves_its_fragments_only() {
     use w3cos_std::style::Position;
