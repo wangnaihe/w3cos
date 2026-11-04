@@ -1,0 +1,101 @@
+{
+ "browser": "Google Chrome 156.0.8078.80",
+ "cases": [
+  {
+   "name": "one-tab",
+   "html": "<pre id=p style='position:absolute;margin:0;left:0;top:0;tab-size:40px'>&#9;</pre>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     40,
+     15
+    ]
+   }
+  },
+  {
+   "name": "two-tabs",
+   "html": "<pre id=p style='position:absolute;margin:0;left:0;top:0;tab-size:40px'>&#9;&#9;</pre>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     80,
+     15
+    ]
+   }
+  },
+  {
+   "name": "narrow-tab",
+   "html": "<pre id=p style='position:absolute;margin:0;left:0;top:0;tab-size:1px'>&#9;</pre>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     2,
+     15
+    ]
+   }
+  },
+  {
+   "name": "zero",
+   "html": "<pre id=p style='position:absolute;margin:0;left:0;top:0;tab-size:0'>&#9;</pre>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     0,
+     15
+    ]
+   }
+  },
+  {
+   "name": "then-inline-block",
+   "html": "<div id=d style='white-space:pre;tab-size:30px;margin:0'>&#9;<span id=s style='display:inline-block;width:20px;height:20px'></span></div>",
+   "rects": {
+    "d": [
+     0,
+     0,
+     800,
+     25
+    ],
+    "s": [
+     30,
+     0,
+     20,
+     20
+    ]
+   }
+  },
+  {
+   "name": "inherited-length",
+   "html": "<div style='tab-size:25px'><div id=d style='white-space:pre;margin:0'>&#9;<span id=s style='display:inline-block;width:20px;height:20px'></span></div></div>",
+   "rects": {
+    "d": [
+     0,
+     0,
+     800,
+     25
+    ],
+    "s": [
+     25,
+     0,
+     20,
+     20
+    ]
+   }
+  },
+  {
+   "name": "invalid-keeps-previous",
+   "html": "<pre id=p style='position:absolute;margin:0;left:0;top:0;tab-size:40px;tab-size:-4'>&#9;</pre>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     40,
+     15
+    ]
+   }
+  }
+ ]
+}

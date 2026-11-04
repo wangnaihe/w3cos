@@ -6,6 +6,9 @@ use w3cos_std::style::{
     TextDirection, UnicodeBidi, WillChange, parse_css_integer_clamped,
 };
 
+/// Computed `tab-size`: `n<number>` (multiples of the space advance) or
+/// `l<px>`. Inherited; absent is the initial `8`.
+pub const TAB_SIZE_PROPERTY: &str = "--w3cos-internal-tab-size";
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
 /// `contain` with a real `size` (or `strict`) token: size containment
@@ -1301,6 +1304,45 @@ impl CSSStyleDeclaration {
                         "--w3cos-internal-text-align-last".to_string(),
                         value.trim().to_ascii_lowercase(),
                     );
+            }
+            "tab-size" | "tabSize" | "-moz-tab-size" => {
+                // CSS Text 3 tab-size: <number [0,)> | <length [0,)>. A number
+                // multiplies the space advance (`n<number>`); a length is
+                // absolute (`l<px>`, em resolved against this element's
+                // font-size, which inherits as an absolute length). Anything
+                // else (negative, percentage) is invalid and ignored.
+                let value = value.trim().to_ascii_lowercase();
+                let marker = if matches!(value.as_str(), "initial" | "revert" | "revert-layer") {
+                    if let Some(properties) = self.inner.custom_properties.as_mut() {
+                        properties.remove(TAB_SIZE_PROPERTY);
+                    }
+                    None
+                } else if value == "inherit" || value == "unset" {
+                    None
+                } else if let Ok(number) = value.parse::<f32>() {
+                    (number.is_finite() && number >= 0.0).then(|| format!("n{number}"))
+                } else {
+                    let length = if let Some(number) = value.strip_suffix("rem") {
+                        number.trim().parse::<f32>().ok().map(|n| n * 16.0)
+                    } else if let Some(number) = value.strip_suffix("em") {
+                        number
+                            .trim()
+                            .parse::<f32>()
+                            .ok()
+                            .map(|n| n * self.inner.font_size)
+                    } else {
+                        parse_px(&value)
+                    };
+                    length
+                        .filter(|length| length.is_finite() && *length >= 0.0)
+                        .map(|length| format!("l{length}"))
+                };
+                if let Some(marker) = marker {
+                    self.inner
+                        .custom_properties
+                        .get_or_insert_with(Default::default)
+                        .insert(TAB_SIZE_PROPERTY.to_string(), marker);
+                }
             }
             "white-space" | "whiteSpace" => {
                 if value.trim().eq_ignore_ascii_case("break-spaces") {

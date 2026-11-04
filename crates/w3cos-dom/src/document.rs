@@ -3456,6 +3456,7 @@ impl Document {
         custom_properties.retain(|property, _| {
             !property.starts_with("--w3cos-internal-")
                 || property == "--w3cos-internal-text-align-last"
+                || property == crate::css_style::TAB_SIZE_PROPERTY
                 || property == user_agent::HTML_STANDARD_FONT_PROPERTY
         });
 
