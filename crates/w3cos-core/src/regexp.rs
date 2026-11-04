@@ -32,7 +32,10 @@ fn validate(source: &str, flags: &str) {
             "The 'u' and 'v' regular expression flags cannot be used together",
         ));
     }
-    if build_regex(source, flags).is_none() {
+    // Only parse here: compiling the delegate automata is deferred to the
+    // first exec/test/replace (as V8 does), so module-level regex literals
+    // that startup never runs cost no compile time.
+    if !pattern_parses(source, flags) {
         crate::throw_value(syntax_error(&format!(
             "Invalid or unsupported regular expression: /{source}/{flags}"
         )));
@@ -662,6 +665,11 @@ fn translate_javascript_escapes(source: &str) -> String {
     output
 }
 
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<(String, String), Option<Rc<Regex>>>> =
+        RefCell::new(HashMap::new());
+}
+
 /// Compiled-regex cache entries kept per thread before the cache is reset.
 const REGEX_CACHE_LIMIT: usize = 4096;
 
@@ -672,11 +680,6 @@ const REGEX_CACHE_LIMIT: usize = 4096;
 /// recompiling per call turned regex-heavy startup code into a multi-minute
 /// stall. `Regex` is immutable, so sharing it is safe; failures are cached too.
 fn build_regex(source: &str, flags: &str) -> Option<Rc<Regex>> {
-    thread_local! {
-        static REGEX_CACHE: RefCell<HashMap<(String, String), Option<Rc<Regex>>>> =
-            RefCell::new(HashMap::new());
-    }
-
     let key = (source.to_string(), flags.to_string());
     if let Some(hit) = REGEX_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
         return hit;
@@ -692,18 +695,51 @@ fn build_regex(source: &str, flags: &str) -> Option<Rc<Regex>> {
     built
 }
 
-fn build_regex_uncached(source: &str, flags: &str) -> Option<Regex> {
+/// Translate a JavaScript `source`/`flags` pair into fancy-regex syntax.
+fn js_pattern(source: &str, flags: &str) -> String {
     let source = translate_javascript_escapes(source);
     let source = translate_unicode_sets(&source, flags.contains('v'));
     let modifiers = ['i', 'm', 's']
         .into_iter()
         .filter(|flag| flags.contains(*flag))
         .collect::<String>();
-    let pattern = if modifiers.is_empty() {
+    if modifiers.is_empty() {
         source
     } else {
         format!("(?{modifiers}:{source})")
-    };
+    }
+}
+
+/// Cheap syntax check used at construction time; no automaton is built.
+///
+/// fancy-regex checks its own constructs; the AST pass then catches errors
+/// it leaves to the delegate (e.g. `a{2,1}`). The AST parser rejects
+/// lookaround and backreferences, so only its non-"unsupported" errors count.
+fn pattern_parses(source: &str, flags: &str) -> bool {
+    use regex_syntax::ast::ErrorKind;
+    let pattern = js_pattern(source, flags);
+    if fancy_regex::Expr::parse_tree(&pattern).is_err() {
+        return false;
+    }
+    match regex_syntax::ast::parse::Parser::new().parse(&pattern) {
+        Ok(_) => true,
+        Err(error) => {
+            matches!(
+                error.kind(),
+                ErrorKind::UnsupportedLookAround
+                    | ErrorKind::UnsupportedBackreference
+                    | ErrorKind::GroupNameInvalid
+                    | ErrorKind::FlagUnrecognized
+                    | ErrorKind::EscapeUnrecognized
+                    | ErrorKind::GroupUnclosed
+                    | ErrorKind::GroupUnopened
+            ) && build_regex(source, flags).is_some()
+        }
+    }
+}
+
+fn build_regex_uncached(source: &str, flags: &str) -> Option<Regex> {
+    let pattern = js_pattern(source, flags);
     // Real-world patterns (e.g. semver's composed grammar regexes) exceed
     // the regex crate's 10 MiB default NFA budget; V8 has no such limit.
     fancy_regex::RegexBuilder::new(&pattern)
@@ -821,6 +857,33 @@ mod tests {
             "pattern no longer exercises the limit"
         );
         assert!(build_regex(source, "").is_some());
+    }
+
+    fn compiled(source: &str, flags: &str) -> bool {
+        REGEX_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .contains_key(&(source.to_string(), flags.to_string()))
+        })
+    }
+
+    #[test]
+    fn construction_parses_without_compiling() {
+        let source = r"lazy-compile-probe-(\d+)-[a-z]+";
+        let value = create(source, "i");
+        assert!(!compiled(source, "i"), "literal compiled before first use");
+        let input = Value::from("LAZY-compile-probe-42-ab");
+        let matched = value.get_property("exec").call(value.clone(), vec![input]);
+        assert!(!matched.is_null());
+        assert!(compiled(source, "i"));
+    }
+
+    #[test]
+    fn construction_still_rejects_bad_syntax() {
+        assert!(!pattern_parses("(", ""));
+        assert!(!pattern_parses("a{2,1}", ""));
+        assert!(pattern_parses(r"(?<=a)b(c)\1?", ""));
+        assert!(pattern_parses(r"[\p{L}--[a-z]]", "v"));
     }
 
     #[test]
