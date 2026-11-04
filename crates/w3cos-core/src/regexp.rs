@@ -897,7 +897,12 @@ mod tests {
             }
         }
         assert!(total > 4000, "corpus truncated: {total}");
-        assert!(mismatches.is_empty(), "{} mismatches:\n{}", mismatches.len(), mismatches.join("\n"));
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
     }
 
     #[test]
@@ -927,11 +932,9 @@ mod tests {
                 .to_js_string(),
             "abcdef"
         );
-        assert!(
-            pattern
-                .call_method("test", vec![Value::from("ffffff")])
-                .to_bool()
-        );
+        assert!(pattern
+            .call_method("test", vec![Value::from("ffffff")])
+            .to_bool());
         assert_eq!(
             string_replace("a.b.c", &create(r"\.", "g"), &Value::from(" "))
                 .unwrap()
@@ -951,35 +954,27 @@ mod tests {
             r"^(?:[A-Za-z][^\0\t\n\f\r\u0020/>]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9-.:_\u0080-\u{10FFFF}]*)$",
             "u",
         );
-        assert!(
-            pattern
-                .call_method("test", vec![Value::from("div")])
-                .to_bool()
-        );
-        assert!(
-            pattern
-                .call_method("test", vec![Value::from("smallEmoji🆖")])
-                .to_bool()
-        );
+        assert!(pattern
+            .call_method("test", vec![Value::from("div")])
+            .to_bool());
+        assert!(pattern
+            .call_method("test", vec![Value::from("smallEmoji🆖")])
+            .to_bool());
     }
 
     #[test]
     fn javascript_character_class_and_surrogate_escapes_translate_to_rust_regex() {
         let punctuation = create(r"[-\/\\^$*+?.()|[\]{}]", "g");
-        assert!(
-            punctuation
-                .call_method("test", vec![Value::from("$")])
-                .to_bool()
-        );
+        assert!(punctuation
+            .call_method("test", vec![Value::from("$")])
+            .to_bool());
         let surrogate = create(
             r"([\ud800-\udbff]+)(?![\udc00-\udfff])|(^|[^\ud800-\udbff])([\udc00-\udfff]+)",
             "g",
         );
-        assert!(
-            surrogate
-                .call_method("test", vec![Value::from("�")])
-                .to_bool()
-        );
+        assert!(surrogate
+            .call_method("test", vec![Value::from("�")])
+            .to_bool());
     }
 
     #[test]
@@ -993,11 +988,9 @@ mod tests {
         assert_eq!(second.get_property("index").to_number(), 2.0);
         assert_eq!(pattern.get_property("lastIndex").to_number(), 3.0);
 
-        assert!(
-            pattern
-                .call_method("exec", vec![Value::from("baab")])
-                .is_null()
-        );
+        assert!(pattern
+            .call_method("exec", vec![Value::from("baab")])
+            .is_null());
         assert_eq!(pattern.get_property("lastIndex").to_number(), 0.0);
     }
 
@@ -1173,11 +1166,9 @@ mod tests {
             "string pattern match"
         );
         assert_eq!(matched.get_property("0").to_js_string(), "typeParameter");
-        assert!(
-            Value::from("a b")
-                .call_method("match", vec![Value::from("^\\w+$")])
-                .is_null()
-        );
+        assert!(Value::from("a b")
+            .call_method("match", vec![Value::from("^\\w+$")])
+            .is_null());
         assert_eq!(
             Value::from("abc")
                 .call_method("search", vec![Value::from("c|b")])
@@ -1226,16 +1217,12 @@ mod tests {
                 .to_js_string(),
             "42"
         );
-        assert!(
-            create(r"^(?<word>\w+)\s+\k<word>$", "")
-                .call_method("test", vec![Value::from("same same")])
-                .to_bool()
-        );
-        assert!(
-            create(r"^(\w+)\s+\1$", "")
-                .call_method("test", vec![Value::from("same other")])
-                .strict_eq(&Value::Bool(false))
-        );
+        assert!(create(r"^(?<word>\w+)\s+\k<word>$", "")
+            .call_method("test", vec![Value::from("same same")])
+            .to_bool());
+        assert!(create(r"^(\w+)\s+\1$", "")
+            .call_method("test", vec![Value::from("same other")])
+            .strict_eq(&Value::Bool(false)));
     }
 
     #[test]
@@ -1250,11 +1237,9 @@ mod tests {
                 .to_js_string(),
             "abc"
         );
-        assert!(
-            create(r"[\q{ab|cd}]", "v")
-                .call_method("test", vec![Value::from("cd")])
-                .to_bool()
-        );
+        assert!(create(r"[\q{ab|cd}]", "v")
+            .call_method("test", vec![Value::from("cd")])
+            .to_bool());
     }
 
     #[test]
