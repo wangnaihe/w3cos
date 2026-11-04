@@ -887,3 +887,70 @@ fn electron_parent_port_queues_messages_until_a_listener_is_added() {
     );
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Code-OSS's ptyHost: main transfers `port2` of a `MessageChannelMain` to a
+/// utility process, both sides speak binary (`Uint8Array`) IPC over it, and
+/// the child pushes unsolicited timer-driven messages (the heartbeat) that the
+/// main side must receive on `port1`.
+const UTILITY_PORT_PUSH: &[(&str, &str)] = &[
+    (
+        "package.json",
+        r#"{ "name": "w3cos-electron-utility-port-push", "version": "0.1.0", "main": "main.js" }"#,
+    ),
+    (
+        "main.js",
+        r#"const { app, utilityProcess, MessageChannelMain } = require('electron')
+const path = require('node:path')
+app.whenReady().then(() => {
+  const child = utilityProcess.fork(path.join(__dirname, 'child.js'))
+  const { port1, port2 } = new MessageChannelMain()
+  child.postMessage('vscode:createMessageChannel', [port2])
+  let beats = 0
+  port1.on('message', (e) => {
+    const d = e.data
+    const kind = d instanceof Uint8Array ? 'u8' : typeof d
+    if (kind === 'u8' && d[0] === 1) console.log('main got reply ' + kind + ' ' + Array.from(d).join(','))
+    if (kind === 'u8' && d[0] === 2) {
+      beats++
+      if (beats === 3) { console.log('main got 3 beats ' + kind); child.kill() }
+    }
+    if (kind !== 'u8') console.log('main got non-binary ' + kind)
+  })
+  port1.start()
+  port1.postMessage(new Uint8Array([9, 8, 7]))
+  child.on('exit', () => app.quit())
+})
+"#,
+    ),
+    (
+        "child.js",
+        r#"process.parentPort.on('message', (event) => {
+  const port = event.ports.at(0)
+  if (!port) return
+  port.on('message', (e) => {
+    const d = e.data
+    port.postMessage(new Uint8Array([1, d instanceof Uint8Array ? d.length : 0]))
+  })
+  port.start()
+  setInterval(() => port.postMessage(new Uint8Array([2])), 20)
+})
+"#,
+    ),
+];
+
+#[test]
+fn electron_utility_process_pushes_binary_messages_on_a_transferred_port() {
+    let root = write_fixture("w3cos_electron_utility_port_push", UTILITY_PORT_PUSH);
+    let lines = compile_and_run_with_env(
+        &root,
+        &root.join("main.js"),
+        "w3cos_electron_utility_port_push",
+        &[],
+    );
+    assert_eq!(
+        lines,
+        ["main got reply u8 1,3", "main got 3 beats u8"],
+        "{lines:#?}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
