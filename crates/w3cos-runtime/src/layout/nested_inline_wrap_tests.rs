@@ -191,6 +191,87 @@ fn parsed_anonymous_table_rows_resolve_authored_cell_height_floors() {
 }
 
 #[test]
+fn parsed_table_cell_inline_vertical_padding_keeps_the_text_on_the_content_line() {
+    use crate::font_face::{FontFace, FontRegistry, FontSource};
+    use crate::html_parser_host::InertParserScriptHost;
+    use crate::html_parser_state::StreamingDocumentParser;
+    use std::rc::Rc;
+    const OWNER: u64 = 202611040003;
+    const FAMILY: &str = "W3cos table cell Tinos";
+    struct FontOwner;
+    impl Drop for FontOwner {
+        fn drop(&mut self) {
+            FontRegistry::global().clear_owner(OWNER);
+        }
+    }
+    let _font = FontOwner;
+    FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            FontFace {
+                family: FAMILY.into(),
+                src: FontSource::Bytes(
+                    include_bytes!("../../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    w3cos_dom::stylesheet::clear_rules();
+    crate::dom::reset_document();
+    crate::jsdom::reset_bridge();
+    let mut parser = StreamingDocumentParser::new_with_script_host(
+        Rc::new(InertParserScriptHost),
+        "https://example.test/table-cell-inline-padding.html",
+    )
+    .unwrap();
+    parser.write(&format!("<!doctype html><body style='margin:8px'><div style='display:table-cell;width:200px;font:16px/1.2 \"{FAMILY}\"'><span style='padding-top:160px'>control</span></div></body>")).unwrap();
+    parser.finish().unwrap();
+    let root = crate::dom::to_component_tree();
+    let flat = pre_flatten(&root);
+    let cell = flat
+        .iter()
+        .position(|node| node.style.display == WDisplay::TableCell)
+        .unwrap();
+    let inline = flat
+        .iter()
+        .position(|node| {
+            node.style.display == WDisplay::Inline && node.style.padding_lengths().top == 160.0
+        })
+        .unwrap();
+    for layouts in [
+        compute(&root, 800.0, 600.0).unwrap(),
+        LayoutEngine::new()
+            .compute(&root, &flat, 800.0, 600.0)
+            .unwrap()
+            .layout_cache,
+    ] {
+        let rect = |index| layouts.iter().find(|(_, node)| *node == index).unwrap().0;
+        assert_eq!(
+            rect(cell),
+            LayoutRect {
+                x: 8.0,
+                y: 8.0,
+                width: 200.0,
+                height: 19.1875,
+            },
+            "{layouts:?}"
+        );
+        assert_eq!(
+            (rect(inline).x, rect(inline).y, rect(inline).height),
+            (8.0, -151.0, 177.0),
+            "the inline padding area must extend upward: {layouts:?}"
+        );
+        assert_eq!(
+            rect(inline).y + 160.0,
+            9.0,
+            "the inline content line must remain one pixel below the cell top: {layouts:?}"
+        );
+    }
+    w3cos_dom::stylesheet::clear_rules();
+}
+
+#[test]
 fn parsed_generated_strings_and_attributes_preserve_browser_inline_geometry() {
     use crate::html_parser_host::InertParserScriptHost;
     use crate::html_parser_state::StreamingDocumentParser;
