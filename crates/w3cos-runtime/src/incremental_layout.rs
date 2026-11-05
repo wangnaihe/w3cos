@@ -686,10 +686,22 @@ fn publish_client_rects(
             ))
         };
         let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
-        let lines = crate::text_layout::wrap_text_with_run_width(
+        // With LayoutNG the writeback re-wraps with the same UAX #14 mode as
+        // layout and paint (line-break strictness, word-break, lang), so the
+        // published fragments follow the painted lines.
+        // keep-all leaves fall back to the legacy layout and keep its mode.
+        let break_mode = if crate::layout_ng::mode() == crate::layout_ng::Mode::Off
+            || info.style.word_break == w3cos_std::style::WordBreak::KeepAll
+        {
+            crate::line_break::BreakMode::default()
+        } else {
+            crate::line_break::BreakMode::of(info.style)
+        };
+        let lines = crate::text_layout::wrap_text_with_run_width_in(
             content,
             line_box.width.max(1.0),
             info.style.white_space,
+            break_mode,
             |text| measure(text, info.style),
         );
         let line_styles = crate::text_layout::authored_line_styles(content, info.style, &lines);
