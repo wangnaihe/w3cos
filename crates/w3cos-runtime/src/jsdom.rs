@@ -299,6 +299,55 @@ impl ListenerStore {
         })
     }
 
+    /// Remove the first non-inline listener matching `(node, event_type,
+    /// handler, capture)` without rebuilding the whole index. The last item
+    /// moves into the hole; its index entry is rewritten in place, so every
+    /// `(node, event type)` list keeps registration order.
+    fn remove_one(&mut self, node: u32, event_type: EventType, handler: &Value, capture: bool) {
+        let Some(index) = self.index.as_mut() else {
+            return;
+        };
+        let key = (node, event_type);
+        let Some(idxs) = index.get_mut(&key) else {
+            return;
+        };
+        let Some(pos) = idxs.iter().position(|&idx| {
+            same_listener(
+                &self.items[idx as usize],
+                node,
+                event_type,
+                handler,
+                capture,
+            )
+        }) else {
+            return;
+        };
+        let removed = idxs.remove(pos);
+        if idxs.is_empty() {
+            index.remove(&key);
+        }
+        let last = (self.items.len() - 1) as u32;
+        let gone = self.items.swap_remove(removed as usize);
+        if removed != last {
+            let moved = &self.items[removed as usize];
+            if let Some(slot) = index
+                .get_mut(&(moved.node, moved.event_type))
+                .and_then(|v| v.iter_mut().find(|idx| **idx == last))
+            {
+                *slot = removed;
+            }
+        }
+        if gone.capture {
+            self.capture_count = self.capture_count.saturating_sub(1);
+        }
+        // `Many` always falls back to the index, so it stays correct.
+        if !gone.capture {
+            if let Some(slot) = self.ones.get_mut(node as usize) {
+                *slot = Some(OneListener::Many);
+            }
+        }
+    }
+
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
         self.items.retain(|listener| pred(listener));
         self.reindex();
@@ -14697,9 +14746,7 @@ fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options:
     let et = event_type_for(type_name);
     LISTENERS.with(|l| {
         let mut listeners = l.borrow_mut();
-        if listeners.contains(node, et, &handler, capture) {
-            listeners.retain(|jl| !same_listener(jl, node, et, &handler, capture));
-        }
+        listeners.remove_one(node, et, &handler, capture);
     });
 }
 
@@ -30597,6 +30644,73 @@ try {
             doc.dispatch_event_bubbling(&mut ev);
         });
         drain_microtasks();
+    }
+
+    #[test]
+    fn listener_store_remove_one_keeps_order_and_index_consistent() {
+        let click = event_type_for("click");
+        let keydown = event_type_for("keydown");
+        let mut store = ListenerStore::new();
+        let mk = |node, event_type, n: f64, capture| JsListener {
+            node,
+            event_type,
+            handler: Value::Number(n),
+            capture,
+            inline: false,
+        };
+        store.push(mk(1, click, 1.0, false));
+        store.push(mk(1, click, 2.0, false));
+        store.push(mk(2, keydown, 3.0, true));
+        store.push(mk(1, click, 4.0, false));
+        store.push(mk(3, click, 5.0, false));
+        let nums = |v: Vec<Value>| v.iter().map(|x| x.to_number()).collect::<Vec<_>>();
+        // Removing from the middle moves the last item (node 3) into the hole.
+        store.remove_one(1, click, &Value::Number(2.0), false);
+        assert_eq!(nums(store.handlers(1, click, None)), vec![1.0, 4.0]);
+        assert_eq!(nums(store.handlers(3, click, None)), vec![5.0]);
+        assert_eq!(
+            store
+                .one_handler(3, click)
+                .ok()
+                .flatten()
+                .map(|v| v.to_number()),
+            Some(5.0)
+        );
+        // Wrong capture flag or unknown handler: no-op.
+        store.remove_one(2, keydown, &Value::Number(3.0), false);
+        store.remove_one(1, click, &Value::Number(9.0), false);
+        assert!(store.has_capture());
+        assert_eq!(store.iter().count(), 4);
+        store.remove_one(2, keydown, &Value::Number(3.0), true);
+        assert!(!store.has_capture());
+        assert!(store.handlers(2, keydown, None).is_empty());
+        store.remove_one(1, click, &Value::Number(1.0), false);
+        assert_eq!(nums(store.handlers(1, click, None)), vec![4.0]);
+        assert!(store.one_handler(1, click).is_err());
+        store.remove_one(1, click, &Value::Number(4.0), false);
+        assert!(store.handlers(1, click, None).is_empty());
+        assert_eq!(nums(store.handlers(3, click, None)), vec![5.0]);
+        assert_eq!(store.iter().count(), 1);
+    }
+
+    #[test]
+    fn remove_event_listener_many_listeners_keeps_dispatch() {
+        setup();
+        let btn = create_in_body("button");
+        let btn_id = node_id_of(&btn).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let ls: Vec<Value> = (0..200).map(|_| counting_listener(&count, 1)).collect();
+        for l in &ls {
+            btn.call_method("addEventListener", vec![Value::string("click"), l.clone()]);
+        }
+        for l in ls.iter().step_by(2) {
+            btn.call_method(
+                "removeEventListener",
+                vec![Value::string("click"), l.clone()],
+            );
+        }
+        click(btn_id);
+        assert_eq!(count.get(), 100);
     }
 
     #[test]
