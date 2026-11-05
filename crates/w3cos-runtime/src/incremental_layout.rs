@@ -167,19 +167,24 @@ fn lower_component_tree(slot: &mut Option<Cache>, viewport_w: f32, viewport_h: f
         && cache.viewport_w_bits == viewport_w.to_bits()
         && cache.viewport_h_bits == viewport_h.to_bits()
         && !document_has_grafts()
-        && let w3cos_dom::document::ComponentPatch::Patched { .. } =
-            crate::dom::patch_component_tree(&mut cache.component, &cache.baseline)
     {
-        #[cfg(test)]
-        PATCHED_LOWERINGS.with(|count| count.set(count.get() + 1));
-        if verify_component_patching() {
-            let fresh = crate::dom::to_component_tree();
-            assert!(
-                same_component(&cache.component, &fresh),
-                "patched component tree diverged from a fresh lowering"
-            );
+        let outcome = crate::dom::patch_component_tree(&mut cache.component, &cache.baseline);
+        match outcome {
+            w3cos_dom::document::ComponentPatch::Patched { .. }
+            | w3cos_dom::document::ComponentPatch::Unchanged => {
+                #[cfg(test)]
+                PATCHED_LOWERINGS.with(|count| count.set(count.get() + 1));
+                if verify_component_patching() {
+                    let fresh = crate::dom::to_component_tree();
+                    assert!(
+                        same_component(&cache.component, &fresh),
+                        "patched component tree diverged from a fresh lowering"
+                    );
+                }
+                return cache.component;
+            }
+            w3cos_dom::document::ComponentPatch::NeedsRebuild => {}
         }
-        return cache.component;
     }
     crate::dom::to_component_tree()
 }
