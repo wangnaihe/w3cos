@@ -436,11 +436,15 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
         return Some("text:break-spaces");
     }
     // break-all is a LineBreakType of the UAX #14 iterator the NG breaker
-    // uses (crate::line_break::BreakMode); overflow-wrap emergency breaks and
-    // keep-all on a paragraph leaf are not modelled.
-    if !matches!(style.word_break, WordBreak::Normal | WordBreak::BreakAll)
-        || break_all_jamo(content, style)
-    {
+    // uses (crate::line_break::BreakMode). `keep-all` only glues CJK letter
+    // pairs (CSS Text 3 §5.3); on Latin-1 it matches `normal`. `break-word`
+    // / overflow-wrap emergency breaks are unused under `pre` / `pre-wrap`
+    // (white-space-intrinsic-size-003 / 016).
+    let word_break_ok = matches!(style.word_break, WordBreak::Normal | WordBreak::BreakAll)
+        || (style.word_break == WordBreak::KeepAll && latin1(content))
+        || (style.word_break == WordBreak::BreakWord
+            && matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap));
+    if !word_break_ok || break_all_jamo(content, style) {
         return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
@@ -863,8 +867,10 @@ fn inline_text_reason(
             return Some("vertical-align-keyword");
         }
         // overflow-wrap adds emergency breaks inside an item (break-all is
-        // an iterator break type, below).
-        if style.word_break == w3cos_std::style::WordBreak::BreakWord
+        // an iterator break type, below). `pre` / `pre-wrap` do not take
+        // those opportunities, so break-word is fine there.
+        if (style.word_break == WordBreak::BreakWord
+            && !matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap))
             || break_all_jamo(content, style)
         {
             return Some("text:word-break");
