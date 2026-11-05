@@ -7099,6 +7099,78 @@ fn line_break_anywhere_breaks_every_character() {
     close(rect(&out, 2), (0.0, 30.0, 40.0, 30.0));
 }
 
+/// `word-break: keep-all` on Latin-1 matches `normal` (CSS Text 3 §5.3
+/// only glues CJK pairs). Headless Chrome, Ahem 20px/1, `width: min-content`,
+/// body margin 0: "XXXX" is a 80×20 box (overflow-wrap-min-content-size-006).
+#[test]
+fn keep_all_latin1_min_content_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        word_break: w3cos_std::style::WordBreak::KeepAll,
+        ..block()
+    };
+    let mut box_style = font.clone();
+    box_style.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-width-keyword".to_string(),
+        "min-content".to_string(),
+    )]));
+    let text = Component::text(
+        "XXXX",
+        Style {
+            display: Display::Inline,
+            ..font
+        },
+    );
+    let root = node(block(), vec![node(box_style, vec![text])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 80.0, 20.0));
+}
+
+/// `overflow-wrap: break-word` under `white-space: pre` / `pre-wrap` does
+/// not change min-content (CSS Text 3; white-space-intrinsic-size-003/016).
+/// Headless Chrome, Ahem 50px/1, floated `pre-wrap` "X   ": 50×50 (trailing
+/// spaces dropped for min-content).
+#[test]
+fn break_word_pre_wrap_float_min_content_matches_chrome() {
+    use w3cos_std::style::{Float, WhiteSpace, WordBreak};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 50.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let floated = Style {
+        float: Float::Left,
+        white_space: WhiteSpace::PreWrap,
+        word_break: WordBreak::BreakWord,
+        ..font.clone()
+    };
+    let text = Component::text(
+        "X   ",
+        Style {
+            display: Display::Inline,
+            white_space: WhiteSpace::PreWrap,
+            word_break: WordBreak::BreakWord,
+            ..font
+        },
+    );
+    let root = node(block(), vec![node(floated, vec![text])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("pre-wrap break-word");
+    let r = out.iter().find(|(_, i)| *i == 1).expect("float").0;
+    close((r.x, r.y, r.width, r.height), (0.0, 0.0, 50.0, 50.0));
+}
+
 /// A column subgrid whose parent is a top-level `inline-grid` with
 /// `gap: 25px` (css-grid/subgrid/independent-tracks-from-parent-grid).
 /// Headless Chrome, body margin 0: the parent and subgrid are 100×100 at
