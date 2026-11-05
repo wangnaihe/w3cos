@@ -1140,8 +1140,14 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // box's own font; a box whose text does not inherit its font (a shadow
     // <slot>, display:contents in Chrome, carries a default style) does not
     // own the strut, so its style must not drive line metrics.
+    // Only a direct text child can carry a font the box does not own. An
+    // element child with its own font (an inline box, or a block lowered to
+    // inline) lays out through its own strut.
     if !has_marker(style, IFC_MARKER)
-        && rendered_children(flat, index).any(|child| !same_font(flat[child].style, style))
+        && rendered_children(flat, index).any(|child| {
+            matches!(flat[child].kind, ComponentKind::Text { .. })
+                && !same_text_font(flat[child].style, style)
+        })
     {
         return Some("ifc:unmarked");
     }
@@ -1469,6 +1475,20 @@ fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &In
 /// ShapeResult::SnappedWidth.
 fn snap(advance: f32) -> f32 {
     crate::text_layout::inline_layout_advance(advance)
+}
+
+/// `same_font`, except that two `line-height: normal` styles whose
+/// font-derived ratios differ in the third decimal still share a strut (the
+/// primary font's metrics, rounded once per style).
+fn same_text_font(a: &Style, b: &Style) -> bool {
+    same_font(a, b)
+        || (a.line_height_is_normal
+            && b.line_height_is_normal
+            && (a.line_height - b.line_height).abs() < 0.01
+            && a.font_family == b.font_family
+            && a.font_size == b.font_size
+            && a.font_weight == b.font_weight
+            && a.font_style == b.font_style)
 }
 
 /// Same used font and line-height (text inheriting directly from a box).
