@@ -22696,6 +22696,9 @@ fn js_set_idle_timer(callback: Value, timeout_at: Option<Instant>) -> u32 {
     id
 }
 
+/// Longest an idle callback waits for an idle period before it runs anyway.
+const IDLE_STARVATION: Duration = Duration::from_millis(50);
+
 /// True when the event loop has nothing but idle callbacks to run.
 fn idle_period(now: Instant) -> bool {
     let timers = JS_TIMERS.with(|t| {
@@ -22739,6 +22742,11 @@ pub fn tick_timers() -> usize {
         // to events / IPC between them. An expired `timeout` makes one an
         // ordinary task.
         let allow_idle = !ran_idle && idle_period(now);
+        // A busy loop may never be fully idle (self-rescheduling 0ms timers,
+        // a steady IPC stream), so an idle callback that has waited
+        // IDLE_STARVATION still gets its turn, one per tick, as a browser
+        // guarantees an idle period at least every frame.
+        let allow_starved = !ran_idle;
         let next = JS_TIMERS.with(|t| {
             let mut timers = t.borrow_mut();
             let index = timers
@@ -22746,7 +22754,10 @@ pub fn tick_timers() -> usize {
                 .enumerate()
                 .filter(|(_, timer)| timer.fire_at <= now)
                 .filter(|(_, timer)| {
-                    !timer.idle || allow_idle || timer.idle_timeout_at.is_some_and(|at| at <= now)
+                    !timer.idle
+                        || allow_idle
+                        || (allow_starved && now.duration_since(timer.fire_at) >= IDLE_STARVATION)
+                        || timer.idle_timeout_at.is_some_and(|at| at <= now)
                 })
                 .min_by_key(|(_, timer)| (timer.fire_at, timer.id))
                 .map(|(index, _)| index)?;
@@ -30942,6 +30953,29 @@ try {
         drain_microtasks();
         assert_eq!(tick_timers(), 1);
         assert_eq!(*log.borrow(), vec!["expired", "micro", "idle"]);
+    }
+
+    #[test]
+    fn idle_callback_runs_after_starvation_bound_when_never_idle() {
+        setup();
+        let window = window_value();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let push = |tag: &'static str| {
+            let log = Rc::clone(&log);
+            func(move |_, _| {
+                log.borrow_mut().push(tag);
+                Value::Undefined
+            })
+        };
+        window.call_method("requestIdleCallback", vec![push("idle")]);
+        // Work stays pending, so the loop never reaches an idle period.
+        queue_microtask_value(push("micro"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(tick_timers(), 0);
+        std::thread::sleep(IDLE_STARVATION + Duration::from_millis(5));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["idle"]);
+        drain_microtasks();
     }
 
     #[test]
