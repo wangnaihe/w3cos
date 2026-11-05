@@ -1178,19 +1178,26 @@ fn non_visible_overflow(style: &Style) -> bool {
         || style.resolved_overflow_y() != Overflow::Visible
 }
 
-/// Overflow shapes that still disagree with the legacy engine: a flex or
-/// grid item (automatic minimum), a negative margin, or a float/clear inside
-/// the box. Scrollports (`hidden`, `scroll`, `auto`) are laid out here as BFC
-/// roots without scrollbar space; the scroll containers themselves are
-/// derived from the result by `layout::scroll_containers_from_layout`.
+/// Overflow shapes that still disagree with the legacy engine: a negative
+/// margin, a grid item (automatic minimum / subgrid sizing still partial),
+/// or a float that shares the scrollport with in-flow content / clearance.
+/// Flex items with non-visible overflow stay on NG: §4.5 zeroes their
+/// main-axis automatic minimum. Clear alone inside an overflow BFC is
+/// fine (flexbox_item-clear-ref). Scrollports are laid out here as BFC
+/// roots without scrollbar space; `layout::scroll_containers_from_layout`
+/// derives the scroll containers from the result.
 fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
         return None;
     }
-    if flat[index].parent.is_some_and(|parent| {
-        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-    }) {
+    // Grid items with overflow still need the legacy automatic-minimum
+    // path (grid-item-minimum-size-*, aspect-ratio + overflow). Flex items
+    // are handled in `flex::resolve_main_limits`.
+    if flat[index]
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
         return Some("overflow");
     }
     let negative = |spacing: Spacing| match spacing {
@@ -1211,8 +1218,10 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         return Some("overflow");
     }
     // A float alone inside the box matches legacy (the BFC contains it).
-    // A float together with in-flow content, or a `clear`, still takes the
-    // legacy adjoining-float path.
+    // A float together with in-flow content, or a clear next to a float,
+    // still takes the legacy adjoining-float path. Clear alone is fine:
+    // an overflow BFC has no floats of its own to clear past
+    // (flexbox_item-clear-ref).
     let mut saw_float = false;
     let mut saw_inflow = false;
     let mut saw_clear = false;
@@ -1229,7 +1238,7 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             saw_inflow = true;
         }
     }
-    if saw_clear || (saw_float && saw_inflow) {
+    if (saw_float && saw_inflow) || (saw_float && saw_clear) {
         return Some("overflow");
     }
     None
