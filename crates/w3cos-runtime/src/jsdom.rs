@@ -392,6 +392,11 @@ struct JsTimer {
     args: Vec<Value>,
     fire_at: Instant,
     interval: Option<Duration>,
+    /// `requestIdleCallback` entry: runs only in an idle period (no other
+    /// due timer, event, rAF or microtask), one per tick, unless its
+    /// `timeout` has expired.
+    idle: bool,
+    idle_timeout_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -22428,7 +22433,9 @@ fn build_window_value() -> Value {
                     .is_some_and(|timeout| scheduled.elapsed().as_secs_f64() * 1000.0 >= timeout);
                 cb.call(Value::Undefined, vec![idle_deadline_value(did_timeout)])
             });
-            Value::Number(js_set_timer(callback, 0, vec![], false) as f64)
+            let timeout_at =
+                timeout.map(|ms| scheduled + Duration::from_micros((ms * 1000.0) as u64));
+            Value::Number(js_set_idle_timer(callback, timeout_at) as f64)
         }),
     );
     props.insert(
@@ -22658,9 +22665,49 @@ fn js_set_timer(callback: Value, ms: u64, args: Vec<Value>, repeating: bool) -> 
             args,
             fire_at: Instant::now() + Duration::from_millis(ms),
             interval,
+            idle: false,
+            idle_timeout_at: None,
         })
     });
     id
+}
+
+/// Queue a `requestIdleCallback` callback. It shares the timer store (so
+/// `cancelIdleCallback`, `has_pending_work` and the wake-up deadline work
+/// unchanged) but [`tick_timers`] defers it while other work is ready, as a
+/// browser only runs idle callbacks in an idle period.
+fn js_set_idle_timer(callback: Value, timeout_at: Option<Instant>) -> u32 {
+    let id = NEXT_TIMER_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    JS_TIMERS.with(|t| {
+        t.borrow_mut().push(JsTimer {
+            id,
+            callback,
+            args: Vec::new(),
+            fire_at: Instant::now(),
+            interval: None,
+            idle: true,
+            idle_timeout_at: timeout_at,
+        })
+    });
+    id
+}
+
+/// True when the event loop has nothing but idle callbacks to run.
+fn idle_period(now: Instant) -> bool {
+    let timers = JS_TIMERS.with(|t| {
+        t.borrow()
+            .iter()
+            .any(|timer| !timer.idle && timer.fire_at <= now)
+    });
+    let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
+    let micro =
+        MICROTASKS.with(|m| !m.borrow().is_empty()) || w3cos_core::promise::queue_count() > 0;
+    let events = PENDING_EVENTS.with(|q| !q.borrow().is_empty());
+    !(timers || raf || micro || events)
 }
 
 pub(crate) fn schedule_timeout_value(callback: Value, delay_ms: u64) -> u32 {
@@ -22685,15 +22732,27 @@ fn js_clear_timer(id: u32) {
 pub fn tick_timers() -> usize {
     let now = Instant::now();
     let mut ran = 0;
+    let mut ran_idle = false;
     loop {
+        // Idle callbacks yield to every other ready task: at most one runs
+        // per tick, and only when nothing else is ready, so the loop gets back
+        // to events / IPC between them. An expired `timeout` makes one an
+        // ordinary task.
+        let allow_idle = !ran_idle && idle_period(now);
         let next = JS_TIMERS.with(|t| {
             let mut timers = t.borrow_mut();
             let index = timers
                 .iter()
                 .enumerate()
                 .filter(|(_, timer)| timer.fire_at <= now)
+                .filter(|(_, timer)| {
+                    !timer.idle || allow_idle || timer.idle_timeout_at.is_some_and(|at| at <= now)
+                })
                 .min_by_key(|(_, timer)| (timer.fire_at, timer.id))
                 .map(|(index, _)| index)?;
+            if timers[index].idle && !timers[index].idle_timeout_at.is_some_and(|at| at <= now) {
+                ran_idle = true;
+            }
             let timer = &mut timers[index];
             let due = (timer.callback.clone(), timer.args.clone());
             if let Some(interval) = timer.interval {
@@ -30829,6 +30888,60 @@ try {
         window.call_method("cancelIdleCallback", vec![cancelled]);
         assert_eq!(tick_timers(), 1);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn idle_callbacks_yield_to_ready_tasks_one_per_tick() {
+        setup();
+        let window = window_value();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let push = |tag: &'static str| {
+            let log = Rc::clone(&log);
+            func(move |_, _| {
+                log.borrow_mut().push(tag);
+                Value::Undefined
+            })
+        };
+        window.call_method("requestIdleCallback", vec![push("idle1")]);
+        window.call_method("requestIdleCallback", vec![push("idle2")]);
+        window.call_method("setTimeout", vec![push("task"), Value::Number(0.0)]);
+        std::thread::sleep(Duration::from_millis(2));
+        // The task registered after both idle callbacks runs first, then a
+        // single idle callback; the second waits for the next idle period.
+        assert_eq!(tick_timers(), 2);
+        assert_eq!(*log.borrow(), vec!["task", "idle1"]);
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["task", "idle1", "idle2"]);
+        assert_eq!(tick_timers(), 0);
+    }
+
+    #[test]
+    fn idle_callback_waits_for_pending_microtasks_unless_timed_out() {
+        setup();
+        let window = window_value();
+        let log = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let push = |tag: &'static str| {
+            let log = Rc::clone(&log);
+            func(move |_, _| {
+                log.borrow_mut().push(tag);
+                Value::Undefined
+            })
+        };
+        window.call_method("requestIdleCallback", vec![push("idle")]);
+        window.call_method(
+            "requestIdleCallback",
+            vec![
+                push("expired"),
+                Value::object(HashMap::from([("timeout".to_string(), Value::Number(0.0))])),
+            ],
+        );
+        queue_microtask_value(push("micro"));
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["expired"]);
+        drain_microtasks();
+        assert_eq!(tick_timers(), 1);
+        assert_eq!(*log.borrow(), vec!["expired", "micro", "idle"]);
     }
 
     #[test]
