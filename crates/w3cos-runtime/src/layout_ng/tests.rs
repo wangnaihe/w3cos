@@ -7098,3 +7098,61 @@ fn line_break_anywhere_breaks_every_character() {
     close(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
     close(rect(&out, 2), (0.0, 30.0, 40.0, 30.0));
 }
+
+/// A column subgrid whose parent is a top-level `inline-grid` with
+/// `gap: 25px` (css-grid/subgrid/independent-tracks-from-parent-grid).
+/// Headless Chrome, body margin 0: the parent and subgrid are 100×100 at
+/// the origin and the four 100×25 items stack at y = 0, 25, 50, 75. The
+/// single subgridded column has no gutter, and the subgrid's own rows do
+/// not take the parent's row gap.
+#[test]
+fn subgrid_in_inline_grid_parent_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let parent = Style {
+        display: Display::Flex,
+        gap: 25.0,
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let subgrid = Style {
+        display: Display::Grid,
+        grid_template_columns: Some("subgrid".to_string()),
+        ..Style::default()
+    };
+    let item = || {
+        node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(25.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        block(),
+        vec![node(
+            parent,
+            vec![node(subgrid, vec![item(), item(), item(), item()])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("subgrid");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    assert_eq!(at(1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(at(2), (0.0, 0.0, 100.0, 100.0));
+    for (k, index) in (3..7).enumerate() {
+        assert_eq!(at(index), (0.0, 25.0 * k as f32, 100.0, 25.0));
+    }
+}

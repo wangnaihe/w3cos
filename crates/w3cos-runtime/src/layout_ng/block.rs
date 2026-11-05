@@ -1942,7 +1942,7 @@ fn unrecognized_display(style: &Style) -> Option<&str> {
     marker(style, "--w3cos-internal-unrecognized-display")
 }
 
-fn is_inline_grid(style: &Style) -> bool {
+pub(super) fn is_inline_grid(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "inline-grid")
 }
 
