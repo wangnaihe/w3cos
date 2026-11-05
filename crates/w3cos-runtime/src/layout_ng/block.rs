@@ -153,7 +153,7 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     // An author `display:flex` (no marker) is a flex container (S5).
     let lowered_ifc = matches!(style.display, Display::Flex | Display::InlineFlex)
         && marker(style, inline::IFC_MARKER).is_some();
-    let author_flex = style.display == Display::Flex && !lowered_ifc;
+    let author_flex = matches!(style.display, Display::Flex | Display::InlineFlex) && !lowered_ifc;
     // `display:grid` is a grid container when `grid::container_reason` accepts
     // the template. `inline-grid` keeps `display: flex` for legacy and is a
     // grid here (`is_author_grid`).
@@ -2054,7 +2054,9 @@ fn is_legacy_webkit_box(style: &Style) -> bool {
 }
 
 pub(super) fn is_author_flex(style: &Style) -> bool {
-    style.display == Display::Flex
+    // An `inline-flex` box is an atomic inline (inline::is_atomic_inline)
+    // whose contents are a flex formatting context.
+    matches!(style.display, Display::Flex | Display::InlineFlex)
         && marker(style, inline::IFC_MARKER).is_none()
         && !is_float_group(style)
         && !is_grid_lanes(style)
@@ -2200,6 +2202,20 @@ fn layout_block_in(
     // NGFlexLayoutAlgorithm. Lowered IFC rows and synthetic float groups
     // stay on the paths below.
     if is_author_flex(style) {
+        // CSS2 10.3.9: an auto-width `inline-flex` atomic inline is
+        // shrink-to-fit (NGBlockNode::ComputeMinMaxSizes for the inline
+        // formatting context's atomic box).
+        let sized = match sized {
+            None if style.display == Display::InlineFlex
+                && style.width == Dimension::Auto
+                && inline::is_atomic_inline(flat, index) =>
+            {
+                let metrics = resolve_inline(style, space);
+                let width = shrink_to_fit(flat, index, space, &metrics).why("shrink-to-fit")?;
+                Some((width, None))
+            }
+            other => other,
+        };
         return super::flex::layout(flat, index, space, sized);
     }
     if is_author_grid(style) {
