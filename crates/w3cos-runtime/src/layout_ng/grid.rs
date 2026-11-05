@@ -3232,6 +3232,12 @@ pub(super) fn layout(
             source,
         });
     }
+    // With no column template every column is implicit (CSS Grid 7.6,
+    // GridTrackSizingAlgorithm): once placement adds columns, the first
+    // one is `grid-auto-columns` too, not the lone-column `1fr` stand-in.
+    if columns_spec(style).is_none() && !flow.column && column_specs.len() > 1 {
+        column_specs[0] = implicit_column.clone();
+    }
     if column_specs.len() > MAX_TRACKS || row_specs.len() > MAX_TRACKS {
         return super::bail("grid:tracks");
     }
@@ -5342,6 +5348,36 @@ mod tests {
             &[
                 (0, [0.0, 0.0, 200.0, text_height]),
                 (1, [0.0, 0.0, 200.0, text_height]),
+            ],
+        );
+    }
+
+    #[test]
+    fn untemplated_implicit_columns_stretch_like_chrome() {
+        // Chrome: display:grid; width:200px; gap:10px; items 40x10, 20x30,
+        // 30x15 at grid-column 1 / 2 / 3 -> x = 0, 80, 140 (three implicit
+        // auto columns share the free space).
+        let mut grid = grid_style(200.0, None, None);
+        grid.gap = 10.0;
+        let item = |column: &str, width: f32, height: f32| {
+            let mut style = block_box(Some(width), Some(height));
+            style.grid_column = Some(column.to_string());
+            style
+        };
+        expect(
+            &Component::boxed(
+                grid,
+                vec![
+                    leaf(item("1", 40.0, 10.0)),
+                    leaf(item("2", 20.0, 30.0)),
+                    leaf(item("3", 30.0, 15.0)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 200.0, 30.0]),
+                (1, [0.0, 0.0, 40.0, 10.0]),
+                (2, [80.0, 0.0, 20.0, 30.0]),
+                (3, [140.0, 0.0, 30.0, 15.0]),
             ],
         );
     }
