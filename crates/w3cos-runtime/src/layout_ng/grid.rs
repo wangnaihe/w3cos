@@ -486,7 +486,9 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     // its ordinary-grid reference is not.
     let parent_lanes = has_marker(parent_style, "--w3cos-internal-grid-lanes");
     if has_marker(style, "--w3cos-internal-grid-lanes")
-        || (parent_style.display != Display::Grid && !parent_lanes)
+        || (parent_style.display != Display::Grid
+            && !parent_lanes
+            && !block::is_inline_grid(parent_style))
         || (parent_lanes && !lanes_like_grid(flat, parent))
     {
         return Some("grid:subgrid");
