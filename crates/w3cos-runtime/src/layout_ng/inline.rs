@@ -634,11 +634,10 @@ fn fallback_grows_line(content: &str, style: &Style) -> bool {
     false
 }
 
-/// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
-/// block-axis margins are handled by block layout.
-pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
+/// Padding or borders on a text box whose edges NG does not lay out.
+pub(super) fn text_edges_reason(style: &Style) -> Option<&'static str> {
     let padding = style.padding_lengths();
-    if [padding.top, padding.right, padding.bottom, padding.left]
+    ([padding.top, padding.right, padding.bottom, padding.left]
         .into_iter()
         .any(|v| v != 0.0)
         || style.border_width != 0.0
@@ -650,10 +649,18 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
         ]
         .into_iter()
         .flatten()
-        .any(|v| v != 0.0)
-    {
-        return Some("text:edges");
-    }
+        .any(|v| v != 0.0))
+    .then_some("text:edges")
+}
+
+/// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
+/// block-axis margins are handled by block layout.
+///
+/// Padding and borders of a block-level leaf are its own box edges: block
+/// layout (NGBlockLayoutAlgorithm border/padding) insets the content box
+/// its lines are laid out in. Text that is an anonymous block, flex or grid
+/// item, or inline-level still checks `text_edges_reason`.
+pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
     if content.is_empty()
         || content.contains(['\n', '\r'])
         || (content.contains('\t') && !tab_only(content, style))
@@ -671,6 +678,18 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     // A block text leaf is its own paragraph.
     if !super::block::block_unicode_bidi_ok(style) {
         return Some("unicode-bidi");
+    }
+    // overflow-wrap: break-word / anywhere on a block text leaf: its lines
+    // are measured (wrapped_text_height) and painted by the same breaker
+    // with emergency breaks, so NG only places the box.
+    if style.word_break == WordBreak::BreakWord {
+        return text_style_reason(
+            content,
+            &Style {
+                word_break: WordBreak::Normal,
+                ..style.clone()
+            },
+        );
     }
     text_style_reason(content, style)
 }
@@ -1751,9 +1770,27 @@ fn has_forced_break(content: &str, style: &Style) -> bool {
             ))
 }
 
+/// The style a block text leaf's lines are measured with. The legacy text
+/// measurers inset a text component by its own padding; on NG the leaf's
+/// padding is a block box edge that block layout already applied.
+pub(super) fn block_text_measure_style(style: &Style) -> std::borrow::Cow<'_, Style> {
+    let padding = style.padding_lengths();
+    if [padding.top, padding.right, padding.bottom, padding.left]
+        .into_iter()
+        .all(|v| v == 0.0)
+    {
+        return std::borrow::Cow::Borrowed(style);
+    }
+    std::borrow::Cow::Owned(Style {
+        padding: w3cos_std::style::Edges::ZERO,
+        ..style.clone()
+    })
+}
+
 /// Content height of a block-level text leaf of content width `width`.
 /// Content height and last baseline of a block-level text leaf.
 pub(super) fn block_text_layout(content: &str, width: f32, style: &Style) -> (f32, LastBaseline) {
+    let style = &*block_text_measure_style(style);
     let (height, single, ascent) = paragraph_height(content, width, style, style, false);
     (
         height,

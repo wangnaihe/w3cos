@@ -620,6 +620,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
                 true,
             )
+            .or_else(|| inline::text_edges_reason(info.style))
             .or_else(|| inline::block_text_reason(content, info.style)),
             _ if inline::is_inline_container(flat, index) => unsupported_box_style(
                 info.style,
@@ -723,6 +724,16 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 ],
                 info.style.display == Display::Inline,
             )
+            .or_else(|| {
+                // A block-level leaf lays its own edges out; a flex or grid
+                // text item (or inline text there) stays on legacy.
+                let item = info.style.display == Display::Inline
+                    || info.parent.is_some_and(|parent| {
+                        is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
+                    });
+                item.then(|| inline::text_edges_reason(info.style))
+                    .flatten()
+            })
             .or_else(|| inline::block_text_reason(content, info.style))
         }
         ComponentKind::Text { content } => {
@@ -733,7 +744,8 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             // here would send only this page back to the legacy engine.
             if !inline::in_inline_container(flat, index) {
                 if anonymous_block_text(flat, index) {
-                    inline::block_text_reason(content, info.style)
+                    inline::text_edges_reason(info.style)
+                        .or_else(|| inline::block_text_reason(content, info.style))
                 } else {
                     Some("ifc:mixed")
                 }
@@ -1719,7 +1731,10 @@ pub(super) fn intrinsic_sizes(
         return super::flex::intrinsic_sizes(flat, index, space);
     }
     if let ComponentKind::Text { content } = info.kind {
-        return Some(inline::text_min_max(content, info.style));
+        return Some(inline::text_min_max(
+            content,
+            &inline::block_text_measure_style(info.style),
+        ));
     }
     if let ComponentKind::Image { src } = info.kind {
         let (width, _) = replaced_content_size(src, info.style, space).why("image-intrinsic")?;

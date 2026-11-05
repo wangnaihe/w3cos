@@ -6985,3 +6985,41 @@ fn tab_after_content_matches_chrome() {
         );
     }
 }
+
+/// A block text leaf (`<p>text</p>` lowered to one Text box) with its own
+/// border and padding stays on NG: block layout insets the content box the
+/// lines wrap in. Headless Chrome 155, body margin 0, Ahem 20px/1:
+/// - `border: 5px; width: 200px` "XXXXX XXXXX XX": (0,0,210,50);
+/// - `padding: 3px 7px 4px 9px; width: 100px` "XX XX XX XX": (0,50,116,47).
+#[test]
+fn block_text_leaf_with_border_and_padding() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let bordered = Style {
+        border_width: 5.0,
+        width: Dimension::Px(200.0),
+        ..font.clone()
+    };
+    let padded = Style {
+        padding: margins(3.0, 7.0, 4.0, 9.0),
+        width: Dimension::Px(100.0),
+        ..font
+    };
+    // 0 root, 1 bordered text, 2 padded text.
+    let root = node(
+        block(),
+        vec![
+            Component::text("XXXXX XXXXX XX", bordered),
+            Component::text("XX XX XX XX", padded),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 210.0, 50.0));
+    close(rect(&out, 2), (0.0, 50.0, 116.0, 47.0));
+}
