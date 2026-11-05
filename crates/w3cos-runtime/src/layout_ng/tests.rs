@@ -7070,3 +7070,31 @@ fn inline_flex_column_gap_shrink_to_fit() {
     close(rect(&out, 4), (20.0, 30.0, 30.0, 10.0));
     assert_eq!(rect(&out, 0).3, 40.0);
 }
+
+#[test]
+fn line_break_anywhere_breaks_every_character() {
+    // Chrome: <div style="width:40px;line-break:anywhere"> in 10px/1 Ahem:
+    // "XXXXXXXXXX" -> (0,0,40,30); "XX XXX.XX" -> (0,30,40,30).
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        width: Dimension::Px(40.0),
+        line_break: w3cos_std::style::LineBreak::Anywhere,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            Component::text("XXXXXXXXXX", font.clone()),
+            Component::text("XX XXX.XX", font),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
+    close(rect(&out, 2), (0.0, 30.0, 40.0, 30.0));
+}
