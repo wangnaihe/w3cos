@@ -1441,7 +1441,12 @@ pub(super) fn layout(
     let mut cursor = lead;
     let mut children = Vec::with_capacity(items.len());
     let mut oof = Vec::new();
-    for (item, laid) in items.iter().zip(fragments) {
+    // CSS Flexbox 8.5: an `inline-flex` atomic inline's baseline is its
+    // first item's first baseline (NGFlexLayoutAlgorithm, single line,
+    // no reversal; other cases keep the margin-edge fallback).
+    let mut inline_flex_baseline = LastBaseline::NoLines;
+    let first_item_baseline = style.display == Display::InlineFlex && !reverse && !reverse_cross;
+    for (position, (item, laid)) in items.iter().zip(fragments).enumerate() {
         let border_main = item.content + item.main_edges;
         let main = if reverse {
             cursor - item.margin_main_start - border_main
@@ -1482,6 +1487,11 @@ pub(super) fn layout(
                 .iter()
                 .map(|candidate| candidate.translated(x + dx, y + dy)),
         );
+        if first_item_baseline && position == 0 {
+            if let LastBaseline::At(b) = laid.first_baseline {
+                inline_flex_baseline = LastBaseline::At(y + dy + b);
+            }
+        }
         children.push((x + dx, y + dy, laid.fragment));
         let step = item.outer_main() + gap + between;
         if reverse {
@@ -1559,8 +1569,8 @@ pub(super) fn layout(
             ellipsis: false,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        last_baseline: inline_flex_baseline,
+        first_baseline: inline_flex_baseline,
         start_strut,
         end_strut,
         self_collapsing: false,

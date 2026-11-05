@@ -7023,3 +7023,50 @@ fn block_text_leaf_with_border_and_padding() {
     close(rect(&out, 1), (0.0, 0.0, 210.0, 50.0));
     close(rect(&out, 2), (0.0, 50.0, 116.0, 47.0));
 }
+
+#[test]
+fn inline_flex_column_gap_shrink_to_fit() {
+    // Chrome: <div>XX<section style="display:inline-flex;
+    // flex-direction:column;gap:20px"><div>XXX</div><div>X</div></section>
+    // in 10px/1 Ahem -> section (20,0,30,40), items (20,0,30,10) and
+    // (20,30,30,10), line box height 40.
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let section = Style {
+        display: Display::InlineFlex,
+        flex_direction: FlexDirection::Column,
+        gap: 20.0,
+        ..font.clone()
+    };
+    // 0 root, 1 text, 2 section, 3 / 4 items.
+    let root = node(
+        font.clone(),
+        vec![
+            Component::text(
+                "XX",
+                Style {
+                    display: Display::Inline,
+                    ..font.clone()
+                },
+            ),
+            node(
+                section,
+                vec![
+                    Component::text("XXX", font.clone()),
+                    Component::text("X", font),
+                ],
+            ),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (20.0, 0.0, 30.0, 40.0));
+    close(rect(&out, 3), (20.0, 0.0, 30.0, 10.0));
+    close(rect(&out, 4), (20.0, 30.0, 30.0, 10.0));
+    assert_eq!(rect(&out, 0).3, 40.0);
+}

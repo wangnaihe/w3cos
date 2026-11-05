@@ -914,7 +914,8 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     let inline_block = matches!(
         flat[index].style.display,
         Display::InlineBlock | Display::InlineTable
-    );
+    ) || (flat[index].style.display == Display::InlineFlex
+        && super::block::is_author_flex(flat[index].style));
     if matches!(
         flat[index].kind,
         ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
@@ -2131,6 +2132,13 @@ pub(super) fn layout_inline_beside(
             let k = start;
             let child = children[k];
             let style = flat[child].style;
+            // An `inline-flex` box in a right-to-left line keeps legacy
+            // (flex:rtl; its main axis follows the inherited direction).
+            if style.display == Display::InlineFlex
+                && (space.rtl || container.direction == TextDirection::Rtl)
+            {
+                return super::bail("flex:rtl");
+            }
             let result =
                 super::block::layout_block(flat, child, space, true).why("atomic-layout")?;
             if !result.oof.is_empty() {
