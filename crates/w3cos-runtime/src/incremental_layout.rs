@@ -1505,7 +1505,6 @@ mod paint_layout_tests {
     }
 
     #[test]
-    #[test]
     fn flex_patch_keeps_item_geometry_and_order() {
         crate::dom::reset_document();
         let shell = crate::dom::create_element("div");
@@ -1530,11 +1529,16 @@ mod paint_layout_tests {
             "row flex must place left before right: {before_left:?} {before_right:?}"
         );
         let patched = patched_lowerings();
+        // Structural edit under the flex item forces note_structure_change and
+        // the component-tree patch path (style-only width can stay on the
+        // layout-engine patch and never re-lower).
+        let label = crate::dom::create_text_node("wide");
+        crate::dom::append_child(right, label);
         crate::dom::set_style_property(right, "width", "64px");
         assert_stored_matches_fresh(right);
         assert!(
             patched_lowerings() > patched,
-            "editing a flex item must use the component-tree patch path"
+            "structural edit under a flex item must use the component-tree patch path"
         );
         let after_left = crate::dom::bounding_rect(left);
         let after_right = crate::dom::bounding_rect(right);
@@ -1551,6 +1555,10 @@ mod paint_layout_tests {
         assert!(
             after_right.width > before_right.width + 10.0,
             "edited flex item must widen: before {before_right:?} after {after_right:?}"
+        );
+        assert!(
+            (after_left.y - after_right.y).abs() < 0.05,
+            "row flex items must stay on one line after patch: {after_left:?} {after_right:?}"
         );
     }
 
