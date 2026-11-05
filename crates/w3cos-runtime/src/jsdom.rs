@@ -22699,9 +22699,9 @@ fn js_set_idle_timer(callback: Value, timeout_at: Option<Instant>) -> u32 {
 /// True when the event loop has nothing but idle callbacks to run.
 fn idle_period(now: Instant) -> bool {
     let timers = JS_TIMERS.with(|t| {
-        t.borrow().iter().any(|timer| {
-            !timer.idle && timer.fire_at <= now
-        })
+        t.borrow()
+            .iter()
+            .any(|timer| !timer.idle && timer.fire_at <= now)
     });
     let raf = RAF_QUEUE.with(|q| !q.borrow().is_empty());
     let micro =
@@ -22746,9 +22746,7 @@ pub fn tick_timers() -> usize {
                 .enumerate()
                 .filter(|(_, timer)| timer.fire_at <= now)
                 .filter(|(_, timer)| {
-                    !timer.idle
-                        || allow_idle
-                        || timer.idle_timeout_at.is_some_and(|at| at <= now)
+                    !timer.idle || allow_idle || timer.idle_timeout_at.is_some_and(|at| at <= now)
                 })
                 .min_by_key(|(_, timer)| (timer.fire_at, timer.id))
                 .map(|(index, _)| index)?;
