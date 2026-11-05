@@ -15135,7 +15135,7 @@ fn dispatch_event_value_to_js(ev: &Event, js_ev: Value) -> bool {
     // Phase 1: capture, root → parent (skip target). Ancestors with no
     // capture listeners are not wrapped.
     if has_capture {
-        for &id in chain.iter().rev().skip(1) {
+        for &id in chain.iter().skip(1).rev() {
             if stopped(&js_ev) {
                 break;
             }
@@ -30315,6 +30315,73 @@ try {
             assert_eq!(event.get_property("defaultPrevented"), Value::Bool(false));
             assert_eq!(event.get_property("isTrusted"), Value::Bool(false));
         }
+    }
+
+    #[test]
+    fn keypress_capture_listener_on_target_fires_once() {
+        setup();
+        let parent = create_in_body("div");
+        let doc = document_value();
+        let ta = doc.call_method("createElement", vec![Value::string("textarea")]);
+        parent.call_method("appendChild", vec![ta.clone()]);
+        let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        for (ty, cap) in [("keydown", true), ("keypress", true), ("keyup", true)] {
+            let h = hits.clone();
+            let name = ty.to_string();
+            ta.call_method(
+                "addEventListener",
+                vec![
+                    Value::string(ty),
+                    func(move |_, _| {
+                        h.borrow_mut().push(name.clone());
+                        Value::Undefined
+                    }),
+                    Value::Bool(cap),
+                ],
+            );
+        }
+        for (node, name) in [
+            (doc.clone(), "doc-capture"),
+            (parent.clone(), "parent-capture"),
+        ] {
+            let h = hits.clone();
+            node.call_method(
+                "addEventListener",
+                vec![
+                    Value::string("keypress"),
+                    func(move |_, _| {
+                        h.borrow_mut().push(name.to_string());
+                        Value::Undefined
+                    }),
+                    Value::Bool(true),
+                ],
+            );
+        }
+        let ctor = crate::web_events::event_subclass_class("KeyboardEvent");
+        for ty in ["keydown", "keypress", "keyup"] {
+            let mut init = HashMap::new();
+            init.insert("bubbles".to_string(), Value::Bool(true));
+            init.insert("cancelable".to_string(), Value::Bool(true));
+            init.insert("key".to_string(), Value::string(" "));
+            init.insert("charCode".to_string(), Value::Number(32.0));
+            init.insert("keyCode".to_string(), Value::Number(32.0));
+            let ev = w3cos_core::intrinsics::construct(
+                &ctor,
+                vec![Value::string(ty), Value::object(init)],
+            );
+            ta.call_method("dispatchEvent", vec![ev]);
+        }
+        assert_eq!(
+            hits.borrow().as_slice(),
+            &[
+                "keydown",
+                "doc-capture",
+                "parent-capture",
+                "keypress",
+                "keyup"
+            ]
+            .map(String::from)
+        );
     }
 
     #[test]
