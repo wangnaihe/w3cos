@@ -195,8 +195,27 @@ fn tab_advance(text: &str, style: &Style) -> Option<f32> {
 }
 
 /// A sole line-width leaf: paint wraps and draws its whole text itself.
-fn paragraph_leaf(style: &Style, sole: bool) -> bool {
-    sole && has_marker(style, LINE_WIDTH_MARKER)
+fn paragraph_leaf(style: &Style, sole: bool, container: &Style) -> bool {
+    sole && line_width_leaf(style, container)
+}
+
+/// The DOM marks a block's sole text run `text-line-width` (paint wraps it
+/// inside the block's line width).  A run coalesced from dissolved inlines
+/// (#325: it carries CSSOM owner ranges) is not marked, although it is the
+/// same paragraph: infer the marker from the DOM's conditions so it takes
+/// the same path (and line model) as an equivalent unsplit run.
+fn line_width_leaf(style: &Style, container: &Style) -> bool {
+    has_marker(style, LINE_WIDTH_MARKER)
+        || (has_marker(style, w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+            && matches!(
+                container.white_space,
+                WhiteSpace::Normal | WhiteSpace::PreLine
+            )
+            && !matches!(style.position, Position::Absolute | Position::Fixed)
+            && (!matches!(container.width, Dimension::Auto)
+                || container.text_indent != Dimension::Px(0.0)
+                || container.text_align != TextAlign::Start
+                || has_marker(container, "--w3cos-internal-text-align-last")))
 }
 
 fn has_marker(style: &Style, key: &str) -> bool {
@@ -720,6 +739,9 @@ fn inline_text_reason(
     first: bool,
     container: &Style,
 ) -> Option<&'static str> {
+    // Only a sole leaf is a paragraph; a shared line keeps its own marker.
+    let line_width =
+        has_marker(style, LINE_WIDTH_MARKER) || (sole && line_width_leaf(style, container));
     if style.display != Display::Inline {
         return Some("text:display");
     }
@@ -739,9 +761,7 @@ fn inline_text_reason(
     }
     // The paragraph and preserved-newline paths place the leaf without a
     // baseline shift.
-    if valign_length(style).is_some()
-        && (has_marker(style, LINE_WIDTH_MARKER) || content.contains('\n'))
-    {
+    if valign_length(style).is_some() && (line_width || content.contains('\n')) {
         return Some("vertical-align-length");
     }
     // An embedding or isolate inside the paragraph needs bidi resolution
@@ -759,28 +779,25 @@ fn inline_text_reason(
     // leaf itself; word items get their levels from leaf_bidi_levels and
     // are reordered per line.  Preserved spaces that hang (pre-wrap) would
     // hang at the line's left end (L1): legacy.
-    let paragraph = sole && has_marker(style, LINE_WIDTH_MARKER);
+    let paragraph = sole && line_width;
     if container.direction == TextDirection::Rtl
         && !paragraph
         && style.white_space == WhiteSpace::PreWrap
     {
         return Some("bidi:white-space");
     }
-    if !zero_edges(style)
-        && (has_marker(style, LINE_WIDTH_MARKER) || !inline_edges_supported(content, style))
-    {
+    if !zero_edges(style) && (line_width || !inline_edges_supported(content, style)) {
         return Some("text:edges");
     }
     // Preserved newlines (CSS Text 3 4.1.1) in a sole leaf: paint breaks
     // the lines; a trailing one only through the paragraph wrapper.
     let newline_ok = sole
         && match style.white_space {
-            WhiteSpace::PreLine => has_marker(style, LINE_WIDTH_MARKER),
+            WhiteSpace::PreLine => line_width,
             // (line-height: normal mixes the strut's computed line height
             // with the font's line spacing differently in legacy.)
             WhiteSpace::Pre | WhiteSpace::PreWrap => {
-                has_marker(style, LINE_WIDTH_MARKER)
-                    || (!content.ends_with('\n') && !style.line_height_is_normal)
+                line_width || (!content.ends_with('\n') && !style.line_height_is_normal)
             }
             _ => false,
         };
@@ -792,7 +809,7 @@ fn inline_text_reason(
         || content.contains('\r')
         || (content.contains('\t')
             && !(first && tab_only(content, style))
-            && !(tabs_in_pre_text(content, style) && !paragraph_leaf(style, sole)))
+            && !(tabs_in_pre_text(content, style) && !paragraph_leaf(style, sole, container)))
         || (content.contains('\n') && !newline_ok)
     {
         return Some("text:content");
@@ -808,7 +825,7 @@ fn inline_text_reason(
     if fallback_grows_line(content, style) {
         return Some("text:fallback-metrics");
     }
-    if has_marker(style, LINE_WIDTH_MARKER) {
+    if line_width {
         if !sole {
             return Some("text:line-width-shared");
         }
@@ -1125,7 +1142,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // pixel; keep this document on legacy too.
     if let [InlineEntry::Leaf(c)] = entries[..]
         && !is_atomic_inline(flat, c)
-        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[c].style, style)
         && flat[c].style.font_family != style.font_family
         && style.font_size > 0.0
         && flat[c].style.font_size >= style.font_size * 4.0
@@ -1241,7 +1258,7 @@ fn rtl_paragraph_reason(
     }
     if let [InlineEntry::Leaf(c)] = entries[..]
         && !is_atomic_inline(flat, c)
-        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[c].style, container)
     {
         return None;
     }
@@ -1883,7 +1900,7 @@ pub(super) fn layout_inline_beside(
     if !has_boxes
         && let [child] = children[..]
         && !is_atomic_inline(flat, child)
-        && has_marker(flat[child].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[child].style, container)
     {
         let style = flat[child].style;
         let ComponentKind::Text { content } = flat[child].kind else {
@@ -2830,7 +2847,7 @@ pub(super) fn inline_min_max(
     if let [InlineEntry::Leaf(child)] = entries[..]
         && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
-        && (has_marker(flat[child].style, LINE_WIDTH_MARKER) || content.contains('\n'))
+        && (line_width_leaf(flat[child].style, flat[index].style) || content.contains('\n'))
     {
         return Some(text_min_max(content, flat[child].style));
     }
