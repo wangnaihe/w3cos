@@ -2693,3 +2693,37 @@ fn empty_collapsible_text_is_skipped() {
         assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
     }
 }
+
+/// line-break: anywhere (BreakCharacter) breaks inside an ASCII word that
+/// is its own text item.  Chrome: <div style="width:100px;
+/// line-break:anywhere">X<span>XXXXXXXXXX</span></div> in 25px/1 Ahem is
+/// 100x75 (XXXX / XXXX / XXX).
+#[test]
+fn line_break_anywhere_breaks_inside_an_ascii_item() {
+    let _ahem = AhemGuard::new();
+    let mut style = Style {
+        display: Display::Block,
+        width: Dimension::Px(100.0),
+        line_break: w3cos_std::style::LineBreak::Anywhere,
+        ..Style::default()
+    };
+    font(&mut style, 25.0, LineHeight::Number(1.0));
+    let mut item = Style {
+        display: Display::Inline,
+        line_break: w3cos_std::style::LineBreak::Anywhere,
+        ..Style::default()
+    };
+    font(&mut item, 25.0, LineHeight::Number(1.0));
+    let root = Component::boxed(
+        style,
+        vec![
+            Component::text("X", item.clone()),
+            Component::text("XXXXXXXXXX", item),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let r = ng.iter().find(|(_, i)| *i == 0).expect("rect").0;
+    assert_eq!((r.width, r.height), (100.0, 75.0));
+}

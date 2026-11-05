@@ -424,7 +424,12 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.hanging_punctuation_last && !content.chars().all(|c| c.is_ascii()) {
         return Some("text:hanging-punctuation");
     }
-    if !matches!(style.line_break, LineBreak::Auto | LineBreak::Normal) {
+    // `line-break: anywhere` is the shared breaker's BreakCharacter mode
+    // (ComputedStyle::GetLineBreakType); strict / loose stay on legacy.
+    if !matches!(
+        style.line_break,
+        LineBreak::Auto | LineBreak::Normal | LineBreak::Anywhere
+    ) {
         return Some("text:line-break");
     }
     if style.break_spaces {
@@ -1422,9 +1427,11 @@ fn internal_opportunity(content: &str, style: &Style) -> bool {
     let core = content.trim_matches(' ');
     if core.bytes().all(|b| b.is_ascii_alphanumeric())
         && style.word_break != w3cos_std::style::WordBreak::BreakAll
+        && style.line_break != LineBreak::Anywhere
     {
         // FillAscii: no opportunity between ASCII letters and digits
-        // (break-all adds one between any two, ShouldBreakAfterBreakAll).
+        // (break-all adds one between any two, ShouldBreakAfterBreakAll;
+        // line-break: anywhere is BreakCharacter, every grapheme).
         return false;
     }
     core.chars().any(is_soft_wrap_char)
