@@ -1505,6 +1505,55 @@ mod paint_layout_tests {
     }
 
     #[test]
+    #[test]
+    fn flex_patch_keeps_item_geometry_and_order() {
+        crate::dom::reset_document();
+        let shell = crate::dom::create_element("div");
+        crate::dom::set_style_property(shell, "display", "flex");
+        crate::dom::set_style_property(shell, "flex-direction", "row");
+        crate::dom::append_child(crate::dom::body_id(), shell);
+        let left = crate::dom::create_element("div");
+        crate::dom::set_style_property(left, "width", "40px");
+        crate::dom::set_style_property(left, "height", "20px");
+        let spacer = crate::dom::create_text_node(" between ");
+        let right = crate::dom::create_element("div");
+        crate::dom::set_style_property(right, "width", "40px");
+        crate::dom::set_style_property(right, "height", "20px");
+        crate::dom::append_child(shell, left);
+        crate::dom::append_child(shell, spacer);
+        crate::dom::append_child(shell, right);
+        assert_stored_matches_fresh(right);
+        let before_left = crate::dom::bounding_rect(left);
+        let before_right = crate::dom::bounding_rect(right);
+        assert!(
+            before_left.x < before_right.x,
+            "row flex must place left before right: {before_left:?} {before_right:?}"
+        );
+        let patched = patched_lowerings();
+        crate::dom::set_style_property(right, "width", "64px");
+        assert_stored_matches_fresh(right);
+        assert!(
+            patched_lowerings() > patched,
+            "editing a flex item must use the component-tree patch path"
+        );
+        let after_left = crate::dom::bounding_rect(left);
+        let after_right = crate::dom::bounding_rect(right);
+        assert!(
+            after_left.x < after_right.x,
+            "order must hold after patch: {after_left:?} {after_right:?}"
+        );
+        assert!(
+            (after_left.x - before_left.x).abs() < 0.05
+                && (after_left.y - before_left.y).abs() < 0.05
+                && (after_left.width - before_left.width).abs() < 0.05,
+            "untouched flex item must keep geometry: before {before_left:?} after {after_left:?}"
+        );
+        assert!(
+            after_right.width > before_right.width + 10.0,
+            "edited flex item must widen: before {before_right:?} after {after_right:?}"
+        );
+    }
+
     fn frames_are_never_patched() {
         let (list, rows, foot) = list_document(10);
         let frame = crate::dom::create_element("iframe");
