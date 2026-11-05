@@ -727,19 +727,31 @@ fn resolve_main_limits(
     } else {
         (style.min_height, style.max_height, style.height)
     };
+    // CSS Flexbox §4.5: a scroll container's main-axis automatic minimum
+    // is zero (overflow non-visible on that axis disables content-based
+    // min-width/min-height:auto).
+    let main_scrolls = if row {
+        style.resolved_overflow_x() != w3cos_std::style::Overflow::Visible
+    } else {
+        style.resolved_overflow_y() != w3cos_std::style::Overflow::Visible
+    };
     let min = if matches!(min_dim, Dimension::Auto) {
-        let content_min = if row {
-            let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
-            content.min.unwrap_or(content.max)
-        } else if block::size_contained(style) {
-            block::contain_intrinsic_size(style).1
+        if main_scrolls {
+            0.0
         } else {
-            block_content_min(flat, index, space).why("flex:block-min")?
-        }
-        .max(0.0);
-        match definite(specified, inner, style, space).why("flex:percent")? {
-            Some(size) => content_min.min(to_content(style, edges, size)),
-            None => content_min,
+            let content_min = if row {
+                let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
+                content.min.unwrap_or(content.max)
+            } else if block::size_contained(style) {
+                block::contain_intrinsic_size(style).1
+            } else {
+                block_content_min(flat, index, space).why("flex:block-min")?
+            }
+            .max(0.0);
+            match definite(specified, inner, style, space).why("flex:percent")? {
+                Some(size) => content_min.min(to_content(style, edges, size)),
+                None => content_min,
+            }
         }
     } else {
         match definite(min_dim, inner, style, space).why("flex:percent")? {
