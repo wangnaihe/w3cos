@@ -7156,3 +7156,73 @@ fn subgrid_in_inline_grid_parent_matches_chrome() {
         assert_eq!(at(index), (0.0, 25.0 * k as f32, 100.0, 25.0));
     }
 }
+
+/// A column flex item with a definite used height (min-height wins over a
+/// smaller height) may host a percentage-height descendant. Headless
+/// Chrome, body margin 0: the item and the percent child are both 100×100.
+/// The item itself has no percentage block size, so the container stays on
+/// NG (`flex:column-percent` only fires for the item).
+#[test]
+fn column_flex_percent_descendant_of_definite_item_matches_chrome() {
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        min_height: Dimension::Px(100.0),
+        ..block()
+    };
+    let pct = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(col, vec![node(item, vec![node(pct, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("column percent descendant");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// A percentage height on the column flex item itself still falls back
+/// (`flex:column-percent`): those sizes cycle through the automatic
+/// minimum when the container's block size is indefinite.
+#[test]
+fn column_flex_percent_item_stays_on_legacy() {
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        ..Style::default()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(50.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(col, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert!(
+        !block::supports_tree(&flat),
+        "percent column item must stay on legacy"
+    );
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| *reason == "flex:column-percent"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+}
