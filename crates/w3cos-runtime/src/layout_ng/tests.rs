@@ -7171,6 +7171,137 @@ fn break_word_pre_wrap_float_min_content_matches_chrome() {
     close((r.x, r.y, r.width, r.height), (0.0, 0.0, 50.0, 50.0));
 }
 
+/// `overflow: hidden` with a cleared child and no float inside stays on NG
+/// (flexbox_item-clear-ref). Clear alone does not need the legacy
+/// adjoining-float path.
+#[test]
+fn overflow_clear_alone_stays_on_ng() {
+    use w3cos_std::style::{Clear, Overflow};
+    let scroller = Style {
+        overflow: Overflow::Hidden,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    let cleared = Style {
+        clear: Clear::Both,
+        height: Dimension::Px(40.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(scroller, vec![node(cleared, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("clear alone");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 200.0, 40.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 200.0, 40.0));
+}
+
+/// A grid item with `overflow: auto` stays on NG. Headless Chrome, body
+/// margin 0: a 100×50 item fills its 100×50 area (no automatic-minimum
+/// bail). Negative-margin overflow and float+inflow overflow still fall
+/// back.
+#[test]
+/// A flex item with `overflow: auto` stays on NG; a grid item with the
+/// same still falls back. Negative-margin overflow and float+inflow
+/// overflow still fall back. Headless Chrome, body margin 0: column flex
+/// 100×50 with an overflow:auto item that has an 80px child shrinks the
+/// item to 50 (automatic minimum is zero).
+#[test]
+fn flex_item_overflow_auto_stays_on_ng() {
+    use w3cos_std::style::{Float, Overflow, Spacing};
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    let item = Style {
+        overflow: Overflow::Auto,
+        ..block()
+    };
+    let child = Style {
+        height: Dimension::Px(80.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![node(item, vec![node(child, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("flex item overflow");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
+
+    let grid = Style {
+        display: Display::Grid,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    let g_item = Style {
+        overflow: Overflow::Auto,
+        ..block()
+    };
+    let g_root = node(block(), vec![node(grid, vec![node(g_item, vec![])])]);
+    let g_flat = pre_flatten(&g_root);
+    assert!(
+        block::unsupported_reasons(&g_flat)
+            .iter()
+            .any(|r| *r == "overflow"),
+        "{:?}",
+        block::unsupported_reasons(&g_flat)
+    );
+
+    let mut neg = Style {
+        overflow: Overflow::Hidden,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        ..block()
+    };
+    neg.margin.left = Spacing::Px(-10.0);
+    let neg_root = node(block(), vec![node(neg, vec![])]);
+    let neg_flat = pre_flatten(&neg_root);
+    assert!(
+        block::unsupported_reasons(&neg_flat)
+            .iter()
+            .any(|r| *r == "overflow"),
+        "{:?}",
+        block::unsupported_reasons(&neg_flat)
+    );
+
+    let mixed = Style {
+        overflow: Overflow::Hidden,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    let floated = Style {
+        float: Float::Left,
+        width: Dimension::Px(40.0),
+        height: Dimension::Px(20.0),
+        ..block()
+    };
+    let inflow = Style {
+        height: Dimension::Px(20.0),
+        ..block()
+    };
+    let mix_root = node(
+        block(),
+        vec![node(
+            mixed,
+            vec![node(floated, vec![]), node(inflow, vec![])],
+        )],
+    );
+    let mix_flat = pre_flatten(&mix_root);
+    assert!(
+        block::unsupported_reasons(&mix_flat)
+            .iter()
+            .any(|r| *r == "overflow"),
+        "{:?}",
+        block::unsupported_reasons(&mix_flat)
+    );
+}
+
 /// A column subgrid whose parent is a top-level `inline-grid` with
 /// `gap: 25px` (css-grid/subgrid/independent-tracks-from-parent-grid).
 /// Headless Chrome, body margin 0: the parent and subgrid are 100×100 at
