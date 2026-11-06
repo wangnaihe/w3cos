@@ -1037,7 +1037,6 @@ fn plain_init_entries(init: &Value, members: &HashSet<String>) -> Option<Vec<(St
     (!accessor).then_some(entries)
 }
 
-
 fn derive_mouse_coords_from_client(this: &Value, init: &Value) {
     // Template construction copies page/offset/layer/x/y defaults (0) then
     // overlays only the init members that were supplied. Re-derive the CSSOM
