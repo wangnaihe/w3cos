@@ -1562,6 +1562,7 @@ mod paint_layout_tests {
         );
     }
 
+    #[test]
     fn frames_are_never_patched() {
         let (list, rows, foot) = list_document(10);
         let frame = crate::dom::create_element("iframe");
