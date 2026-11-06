@@ -67,6 +67,29 @@ enum LineHeight {
     Px(f32),
 }
 
+#[test]
+fn registered_ahem_xx_is_two_em() {
+    let _ahem = AhemGuard::new();
+    let mut block = Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    font(&mut block, 20.0, LineHeight::Number(1.0));
+    let mut item = Style {
+        display: Display::Inline,
+        ..Style::default()
+    };
+    font(&mut item, 20.0, LineHeight::Number(1.0));
+    let root = Component::boxed(block, vec![Component::text("XX", item)]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let text = ng.iter().find(|(_, index)| *index == 1).expect("text").0;
+    assert_eq!(
+        text.width, 40.0,
+        "registered Ahem XX at 20px is two em cells, not the host CJK advance"
+    );
+}
+
 fn font(style: &mut Style, size: f32, line_height: LineHeight) {
     style.font_family = Some("Ahem".into());
     style.font_size = size;

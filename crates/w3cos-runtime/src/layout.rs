@@ -283,6 +283,19 @@ pub(crate) fn layout_font() -> &'static fontdue::Font {
     crate::font_face::host_ui_font().font.as_ref()
 }
 
+/// Parsed face for an explicit `font-family`, when one is registered.
+///
+/// The host face is not a substitute: the bundled CJK subset is named
+/// "Noto Sans SC" and wins the host query ahead of Noto Sans, so measuring
+/// a registered Ahem run with it yields the subset's 573/1000 em advance.
+pub(crate) fn registered_style_font(
+    style: &w3cos_std::style::Style,
+) -> Option<std::sync::Arc<fontdue::Font>> {
+    crate::font_face::FontRegistry::global()
+        .resolve_style(style)
+        .and_then(|font| font.parsed())
+}
+
 pub(crate) fn inline_font_height(style: &w3cos_std::style::Style) -> f32 {
     #[cfg(feature = "skia")]
     if let Some(metrics) = crate::render_skia::resolved_font_geometry(style) {

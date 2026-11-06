@@ -1774,19 +1774,22 @@ fn max_content_width(content: &str, style: &Style) -> f32 {
     #[cfg(not(feature = "skia"))]
     {
         let padding = style.padding_lengths();
-        let inner = if style.font_family.is_none() {
-            crate::text_layout::measure_text_width_font(
-                content,
-                style.font_size,
-                crate::layout::layout_font(),
-            )
+        // A named family, including a test's registered Ahem, is measured
+        // with that face. The host face here is often the embedded CJK
+        // subset (`Noto Sans SC`, 573/1000 em), which is not Ahem's em cell.
+        let registered = crate::layout::registered_style_font(style);
+        let host;
+        let font = if let Some(face) = registered.as_ref() {
+            face.as_ref()
         } else {
-            let (width, _) = crate::text_layout::text_intrinsic_size_font(
-                content,
-                style,
-                f32::MAX / 4.0,
-                crate::layout::layout_font(),
-            );
+            host = crate::layout::layout_font();
+            host
+        };
+        let inner = if style.font_family.is_none() {
+            crate::text_layout::measure_text_width_font(content, style.font_size, font)
+        } else {
+            let (width, _) =
+                crate::text_layout::text_intrinsic_size_font(content, style, f32::MAX / 4.0, font);
             width - padding.left - padding.right
         };
         crate::text_layout::inline_layout_advance(inner.max(0.0)) + padding.left + padding.right
