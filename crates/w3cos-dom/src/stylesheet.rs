@@ -504,6 +504,16 @@ pub fn generation() -> u64 {
 pub(crate) fn has_sibling_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 2 != 0)
 }
+/// `+`/`~` combinators: an attribute edit can restyle following siblings.
+pub fn has_sibling_selectors() -> bool {
+    has_sibling_dependencies()
+}
+
+/// `:has()`-style selectors: a mutation can restyle any ancestor.
+pub fn has_relational_selectors() -> bool {
+    has_relational_dependencies()
+}
+
 
 pub(crate) fn has_relational_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 4 != 0)

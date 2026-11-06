@@ -428,6 +428,8 @@ pub const DOCUMENT_ELEMENT_MARKER: &str = "--w3cos-internal-document-element";
 /// Set on a block whose first line is styled by `::first-line`.
 pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
 pub const FIRST_LETTER_STYLE_MARKER: &str = "--w3cos-internal-first-letter-style";
+/// Owner id for a split inline fragment (LayoutNG/main splice).
+pub const SPLIT_INLINE_FRAGMENT_OWNER: &str = "--w3cos-internal-split-inline-fragment-owner";
 
 /// Per-node subtree extent cache (see `Document::extent`).
 #[derive(Default)]
@@ -509,6 +511,8 @@ pub struct Document {
     scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
+    /// Bumps when text paints without invalidating used boxes.
+    repaint_text_generation: u64,
     /// Bumps only when used geometry can change. A definite box can repaint
     /// new text without solving layout again.
     layout_generation: u64,
@@ -706,6 +710,7 @@ impl Document {
             scope_epoch: 1,
             scope_stamp: Vec::new(),
             structure_generation: 0,
+            repaint_text_generation: 0,
             layout_generation: 0,
             geometry_epoch: 1,
             cascade_generation: 0,
@@ -2498,7 +2503,7 @@ impl Document {
 
     /// The next paint must read new text, and the used boxes stay valid.
     pub fn note_repaint_without_layout(&mut self) {
-        self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.repaint_text_generation = self.repaint_text_generation.wrapping_add(1);
     }
 
     /// Inherited or selector-matched styles may have changed below `id`.
@@ -2509,6 +2514,16 @@ impl Document {
 
     pub fn structure_generation(&self) -> u64 {
         self.structure_generation
+    }
+
+    pub fn repaint_text_generation(&self) -> u64 {
+        self.repaint_text_generation
+    }
+
+    /// Changes on every `take_precise_dirty`. A retained layout that saw the
+    /// previous value knows no other consumer drained mutations it missed.
+    pub fn precise_drain_epoch(&self) -> u32 {
+        self.precise_epoch
     }
 
     pub fn layout_generation(&self) -> u64 {
