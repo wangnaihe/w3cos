@@ -29,6 +29,75 @@ pub fn bump_structure_tick() {
     STRUCTURE_TICK.with(|tick| tick.set(tick.get().wrapping_add(1)));
 }
 
+thread_local! {
+    static CHILD_LOG: RefCell<ChildListLog> = RefCell::new(ChildListLog::default());
+    static DOCUMENT_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One child-list edit for CollectionIndexCache-style replay (main).
+#[derive(Clone, Copy, Debug)]
+pub enum ChildListChange {
+    Insert {
+        doc: u64,
+        parent: u32,
+        child: u32,
+        before: u32,
+    },
+    Remove {
+        doc: u64,
+        parent: u32,
+        child: u32,
+    },
+    Reset {
+        doc: u64,
+        node: u32,
+    },
+}
+
+#[derive(Default)]
+struct ChildListLog {
+    start: u64,
+    entries: std::collections::VecDeque<(u64, ChildListChange)>,
+}
+
+const CHILD_LOG_CAP: usize = 256;
+
+fn log_child_change(change: ChildListChange) {
+    let tick = structure_tick();
+    CHILD_LOG.with(|log| {
+        let mut log = log.borrow_mut();
+        if log.entries.len() >= CHILD_LOG_CAP
+            && let Some((dropped, _)) = log.entries.pop_front()
+        {
+            log.start = dropped + 1;
+        }
+        log.entries.push_back((tick, change));
+    });
+    bump_structure_tick();
+}
+
+/// Replays child-list edits made since `tick`.
+pub fn replay_child_changes_since(
+    tick: u64,
+    limit: usize,
+    mut apply: impl FnMut(ChildListChange),
+) -> bool {
+    CHILD_LOG.with(|log| {
+        let log = log.borrow();
+        if tick < log.start {
+            return false;
+        }
+        let first = log.entries.partition_point(|(stamp, _)| *stamp < tick);
+        if log.entries.len() - first > limit {
+            return false;
+        }
+        for (_, change) in log.entries.range(first..) {
+            apply(*change);
+        }
+        true
+    })
+}
+
 #[derive(Clone, Default)]
 struct CounterSnapshot {
     scopes: Vec<HashMap<String, i32>>,
@@ -581,6 +650,11 @@ pub struct Document {
     quirks_mode: bool,
     /// Cached scrollable overflow extents (LayoutNG/main).
     extent: std::cell::RefCell<ExtentCache>,
+    /// Identity in [`ChildListChange`] records (main).
+    serial: u64,
+    /// Interned equal computed styles (MPC sharing proxy for main tests).
+    shared_style_intern: RefCell<Vec<SharedStyle>>,
+    shared_style_intern_inserts: Cell<usize>,
 }
 
 #[path = "document/component_patch.rs"]
@@ -622,7 +696,7 @@ mod replaced_table_tests;
 mod form_control_tests;
 
 /// What happened to the child list of a node, for style invalidation.
-enum ChildListChange {
+enum ChildListDirtyKind {
     /// Insertion or move at an arbitrary position.
     Any,
     /// An element was appended after the last child.
@@ -648,6 +722,41 @@ pub(crate) fn layout_ng_requested() -> bool {
 }
 
 impl Document {
+    /// Identity in [`ChildListChange`] records.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Shared-style walk helper (main). Interns equal styles unless the node
+    /// has namespaced attributes (those opt out of MPC-style sharing).
+    pub fn computed_style_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        let style = self.computed_style_inherited_shared(id, inherited);
+        if !self.get_node(id).attribute_namespaces.is_empty() {
+            return style;
+        }
+        self.intern_shared_style(style)
+    }
+
+    fn intern_shared_style(&self, style: SharedStyle) -> SharedStyle {
+        let mut intern = self.shared_style_intern.borrow_mut();
+        if let Some(existing) = intern.iter().find(|s| s.as_ref() == style.as_ref()) {
+            return existing.clone();
+        }
+        intern.push(style.clone());
+        self.shared_style_intern_inserts
+            .set(self.shared_style_intern_inserts.get() + 1);
+        style
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matched_properties_cache_entries(&self) -> usize {
+        self.shared_style_intern_inserts.get()
+    }
+
     /// Host readability preferences, separate from author-specified sizes.
     /// Zero leaves the corresponding minimum disabled.
     pub fn set_font_size_minimums(&mut self, hard: f32, logical: f32) {
@@ -754,6 +863,13 @@ impl Document {
             html_document: true,
             quirks_mode: false,
             extent: std::cell::RefCell::new(ExtentCache::default()),
+            serial: DOCUMENT_SERIAL.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n
+            }),
+            shared_style_intern: RefCell::new(Vec::new()),
+            shared_style_intern_inserts: Cell::new(0),
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -1109,7 +1225,12 @@ impl Document {
         self.get_node_mut(child).parent = None;
         match removed {
             Some((boundary, tag)) => {
-                self.mark_child_list_dirty(parent, ChildListChange::Removed { boundary, tag })
+                self.mark_child_list_dirty(parent, ChildListDirtyKind::Removed { boundary, tag });
+                log_child_change(ChildListChange::Remove {
+                    doc: self.serial,
+                    parent: parent.as_u32(),
+                    child: child.as_u32(),
+                });
             }
             None => self.mark_dirty(parent),
         }
@@ -1218,13 +1339,26 @@ impl Document {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
 
-        if let Some(old_parent) = old_parent
-            && old_parent != parent
-        {
-            self.mark_dirty(old_parent);
+        if let Some(old_parent) = old_parent {
+            // Moving an existing child: record unlink so cache replay drops the
+            // old index before the insert (same-parent moves included).
+            log_child_change(ChildListChange::Remove {
+                doc: self.serial,
+                parent: old_parent.as_u32(),
+                child: new_child.as_u32(),
+            });
+            if old_parent != parent {
+                self.mark_dirty(old_parent);
+            }
         }
         self.mark_dirty(parent);
         self.invalidate_style_subtree(new_child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: new_child.as_u32(),
+            before: ref_child.as_u32(),
+        });
         self.note_structure_change();
     }
 
@@ -1965,17 +2099,17 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
-        self.mark_child_list_dirty(id, ChildListChange::Any);
+        self.mark_child_list_dirty(id, ChildListDirtyKind::Any);
     }
 
     /// `mark_dirty` for a node appended after the last child of `id`. Earlier
     /// siblings keep their position from the start, so only rules that read
     /// following siblings (`:last-child`, `:only-child`, ...) can change.
     fn mark_dirty_after_tail_append(&mut self, id: NodeId) {
-        self.mark_child_list_dirty(id, ChildListChange::TailAppend);
+        self.mark_child_list_dirty(id, ChildListDirtyKind::TailAppend);
     }
 
-    fn mark_child_list_dirty(&mut self, id: NodeId, change: ChildListChange) {
+    fn mark_child_list_dirty(&mut self, id: NodeId, change: ChildListDirtyKind) {
         if stylesheet::has_sibling_dependencies()
             || stylesheet::has_structural_dependencies()
             || stylesheet::has_relational_dependencies()
@@ -2004,7 +2138,11 @@ impl Document {
     /// ancestors are restyled separately by `invalidate_relational_observers`.
     /// Returns false when the parent is not an element and the caller must
     /// restyle the whole parent subtree.
-    fn invalidate_child_list_observers(&mut self, parent: NodeId, change: ChildListChange) -> bool {
+    fn invalidate_child_list_observers(
+        &mut self,
+        parent: NodeId,
+        change: ChildListDirtyKind,
+    ) -> bool {
         if self
             .nodes
             .get(parent.0 as usize)
@@ -2028,11 +2166,11 @@ impl Document {
         }
         self.touch_style_revision(parent);
         let (removal, boundary) = match change {
-            ChildListChange::TailAppend => {
+            ChildListDirtyKind::TailAppend => {
                 self.invalidate_tail_append_observers(parent, &parent_context);
                 return true;
             }
-            ChildListChange::Removed { boundary, tag } => {
+            ChildListDirtyKind::Removed { boundary, tag } => {
                 // Text nodes are not counted by any positional rule, and
                 // `:empty` on the parent was handled above.
                 let Some(tag) = tag else { return true };
@@ -2045,7 +2183,7 @@ impl Document {
                 }
                 (true, boundary)
             }
-            ChildListChange::Any => (false, None),
+            ChildListDirtyKind::Any => (false, None),
         };
         // Children before the removed one lose position from the end, the
         // ones after it position from the start. Any other change (insert
@@ -13160,7 +13298,7 @@ mod inline_line_extra_ascent_tests {
             kind: w3cos_std::component::ComponentKind::Image {
                 src: "swatch.png".to_string(),
             },
-            style: image_style,
+            style: image_style.into(),
             ..passive_fragment()
         };
         // The image establishes the baseline from its own height, and the runtime
@@ -21835,7 +21973,7 @@ mod image_component_tests {
             runs: &mut Vec<(String, w3cos_std::style::Style)>,
         ) {
             if let ComponentKind::Text { content } = &component.kind {
-                runs.push((content.clone(), component.style.clone()));
+                runs.push((content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 collect(child, runs);
@@ -22238,7 +22376,7 @@ mod image_component_tests {
         let normal = w3cos_std::Component::text("SS", w3cos_std::style::Style::default());
         let mut floating = normal.style.clone();
         floating.float = Float::Left;
-        let floating = w3cos_std::Component::text("PA", floating);
+        let floating = w3cos_std::Component::text("PA", (*floating).clone());
         for children in [
             vec![floating.clone(), normal.clone()],
             vec![normal.clone(), floating.clone()],
@@ -22258,7 +22396,7 @@ mod image_component_tests {
             w3cos_std::Component::text("This test has: ", w3cos_std::style::Style::default());
         let mut bordered_style = plain.style.clone();
         bordered_style.border_top_width = Some(3.0);
-        let bordered = w3cos_std::Component::text("PASSED", bordered_style);
+        let bordered = w3cos_std::Component::text("PASSED", (*bordered_style).clone());
         assert!(
             document
                 .coalesced_generated_text_run(&[plain.clone(), bordered], &plain.style)
@@ -24472,7 +24610,7 @@ mod image_component_tests {
         painted.color = w3cos_std::Color::rgb(1, 2, 3);
         assert!(!equivalent_text_style(&base, &painted));
         let mut custom = base.clone();
-        let mut properties = w3cos_std::custom_properties::CustomProperties::default();
+        let mut properties = w3cos_std::style::CustomProperties::default();
         properties.insert("--tone".to_string(), "dark".to_string());
         custom.custom_properties = Some(properties);
         assert!(!equivalent_text_style(&base, &custom));
@@ -24485,9 +24623,7 @@ mod image_component_tests {
             .collect();
         let styled = |run: &str| {
             let mut style = w3cos_std::style::Style::default();
-            style.custom_properties = Some(w3cos_std::custom_properties::CustomProperties::from(
-                theme.clone(),
-            ));
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from(theme.clone()));
             w3cos_std::inline_text::set_source_run(&mut style, run);
             style
         };
@@ -26554,7 +26690,7 @@ mod image_component_tests {
             style.line_height = 3.0;
             style.padding.left = w3cos_std::style::Spacing::Px(16.0);
             style.padding.right = w3cos_std::style::Spacing::Px(16.0);
-            w3cos_std::Component::row(style, vec![plain(content)])
+            w3cos_std::Component::row((*style).clone(), vec![plain(content)])
         };
         let mut style = plain("").style;
         style.display = Display::Block;
@@ -26562,7 +26698,7 @@ mod image_component_tests {
         style.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
         style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
         let mut line = w3cos_std::Component::row(
-            style,
+            (*style).clone(),
             vec![
                 decorated("pppp pppX ppXp \u{202e} ppXp XXpp XppX "),
                 plain("pppX XXXp pXXp "),
@@ -26987,9 +27123,9 @@ mod image_component_tests {
         let mut line = w3cos_std::Component::row(
             parent,
             vec![
-                w3cos_std::Component::text("א", empty.style.clone()),
+                w3cos_std::Component::text("א", (*empty.style).clone()),
                 empty.clone(),
-                w3cos_std::Component::text("בג", empty.style.clone()),
+                w3cos_std::Component::text("בג", (*empty.style).clone()),
             ],
         );
         reorder_explicit_bidi_inline_rows(&mut line);
@@ -27542,7 +27678,7 @@ mod computed_style_cache_tests {
             runs: &mut Vec<(String, w3cos_std::style::Style)>,
         ) {
             if let w3cos_std::component::ComponentKind::Text { content } = &component.kind {
-                runs.push((content.clone(), component.style.clone()));
+                runs.push((content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 collect(child, runs);

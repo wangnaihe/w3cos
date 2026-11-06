@@ -1130,6 +1130,12 @@ fn build_string_value() -> Value {
                     "String.prototype.{name} called on null or undefined"
                 )));
             }
+            // ECMA-262 ToString(symbol) throws; do not coerce sentinel strings.
+            if this.type_of() == "symbol" {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "Cannot convert a Symbol value to a string"
+                )));
+            }
             let receiver = if this.is_string() {
                 this
             } else if let Some(data) = string_wrapper_data(&this) {
@@ -1163,6 +1169,11 @@ fn build_string_value() -> Value {
                 "String.prototype[Symbol.iterator] called on null or undefined",
             ));
         }
+        if this.type_of() == "symbol" {
+            crate::throw_value(crate::value::type_error(
+                "Cannot convert a Symbol value to a string",
+            ));
+        }
         let text = if this.is_string() {
             this
         } else if let Some(data) = string_wrapper_data(&this) {
@@ -1176,6 +1187,9 @@ fn build_string_value() -> Value {
     define_builtin(&prototype, "__w3cos_symbol_iterator", iterator);
     let constructor = Value::callable(HashMap::new(), |_, arguments| match arguments.first() {
         None => Value::string(""),
+        Some(value) if value.type_of() == "symbol" => crate::throw_value(crate::value::type_error(
+            "Cannot convert a Symbol value to a string",
+        )),
         Some(value) => Value::from(value.to_js_string()),
     });
     for (key, value) in [
@@ -1980,6 +1994,10 @@ pub(crate) fn object_keys(value: &Value) -> Value {
             keys.into_iter()
                 .filter(|key| {
                     let key = key.to_js_string();
+                    // Symbol values are string sentinels; omit from Object.keys/entries.
+                    if key.starts_with("__w3cos_symbol_") {
+                        return false;
+                    }
                     object
                         .borrow()
                         .get_own_property_descriptor(&key)
@@ -2005,7 +2023,12 @@ pub(crate) fn object_keys(value: &Value) -> Value {
 
 fn object_own_property_names(value: &Value) -> Value {
     if let Some(object) = value.as_object() {
-        return object.borrow().own_keys();
+        let keys = object.borrow().own_keys();
+        return Value::array(
+            keys.iter()
+                .filter(|key| !key.to_js_string().starts_with("__w3cos_symbol_"))
+                .collect(),
+        );
     }
     if let Some(values) = value.as_array() {
         let mut keys = values

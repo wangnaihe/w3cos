@@ -16049,6 +16049,20 @@ pub(crate) fn deliver_edit_context_command(input_type: &str) -> bool {
     true
 }
 
+/// Code-OSS / cpu-render harness: synthesize a keydown+keyup on the focused
+/// target (and deliver EditContext commands when the key is not prevented).
+pub fn harness_key_press(key: &str, code: &str, shift: bool) -> bool {
+    let Some(target) = keyboard_event_target(None) else {
+        return false;
+    };
+    let prevented = dispatch_native_key(target, key, code, false, false, false, false, shift, true);
+    if !prevented && let Some(input_type) = edit_context_input_type_for_key(key, shift) {
+        deliver_edit_context_command(input_type);
+    }
+    dispatch_native_key(target, key, code, false, false, false, false, shift, false);
+    true
+}
+
 fn active_edit_context() -> Option<(u32, Value)> {
     let active = active_element_id()?;
     let context = get_expando(active, "editContext").unwrap_or(Value::Null);
