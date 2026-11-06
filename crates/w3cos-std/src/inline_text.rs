@@ -17,14 +17,11 @@ pub fn source_run(style: &Style) -> Option<&str> {
 }
 
 pub fn set_source_run(style: &mut Style, source: impl AsRef<str>) {
-    let source = source.as_ref();
-    style.text_source_run = Some(std::sync::Arc::from(source));
-    // Keep the custom-property mirror so main LayoutNG grafts that still key
-    // off SOURCE_RUN continue to see authored-run identity after the aot field migrate.
-    style
-        .custom_properties
-        .get_or_insert_with(Default::default)
-        .insert(SOURCE_RUN.into(), source.into());
+    // Authored-run identity lives on the dedicated field (not custom
+    // properties) so theme maps stay shareable and equivalent_text_style can
+    // ignore run id without cloning. Layout reads via source_run(), which
+    // also accepts a legacy custom-property SOURCE_RUN from main grafts.
+    style.text_source_run = Some(std::sync::Arc::from(source.as_ref()));
 }
 pub const DECORATION_COLOR: &str = "--w3cos-internal-text-decoration-color";
 pub const CSSOM_OWNER_RANGES: &str = "--w3cos-internal-cssom-owner-ranges";
