@@ -96,15 +96,48 @@ def validate_report(report):
     style = section("style_layout")
     nodes = field(style, "nodes", "style_layout", 5000, integer=True)
     full = positive(style, "median_us", "style_layout")
+    # Absent mode keeps the optimized-subtree checks. Only an explicit
+    # LayoutNG-on report may record the column-flex whole-tree rebuild.
+    # `retained` is a cached full compute, not that fallback.
+    layout_ng = report.get("layout_ng", "off")
+    require(layout_ng in ("off", "on", "verify"), f"layout_ng {layout_ng!r} is unknown")
+    column_flex_rebuild = layout_ng == "on"
     for name in ("width", "background", "text", "class", "insert", "remove"):
         label = f"incremental_{name}"
         edit = section(label)
         elapsed = positive(edit, "median_us", label)
+        # A cap against a runaway sample, not a claim that NG rebuild
+        # matches the off-mode splice.
         require(elapsed < full * 4, f"{label} is not faster than four full passes")
-        if name != "background":
-            require(edit.get("kind") in ("style-subtree", "splice"), f"{label} did not use subtree layout")
+        if name == "background":
+            kind = edit.get("kind")
+            if column_flex_rebuild:
+                require(
+                    kind == "rebuild",
+                    f"{label} paints a column-flex cell and must record the rebuild, not {kind!r}",
+                )
+            else:
+                require(kind == "paint", f"{label} off-mode kind {kind!r} is not paint")
+        else:
             solved = field(edit, "solved_nodes", label, integer=True)
-            require(solved * 4 < nodes, f"{label} solved too much of the tree")
+            kind = edit.get("kind")
+            if column_flex_rebuild:
+                require(
+                    kind == "rebuild",
+                    f"{label} NG column-flex edit must rebuild the tree, not claim {kind!r}",
+                )
+                # Insert counts the new cell. A subtree-sized solved count
+                # is not this fallback.
+                require(
+                    nodes <= solved <= nodes + 1024,
+                    f"{label} rebuild solved {solved}, document has {nodes}",
+                )
+            else:
+                require(
+                    kind in ("style-subtree", "splice"),
+                    f"{label} did not use subtree layout",
+                )
+                require(solved * 4 < nodes, f"{label} solved too much of the tree")
         if name in ("width", "class", "text"):
             dimension = "height" if name == "text" else "width"
             before = field(edit, f"before_{dimension}", label)

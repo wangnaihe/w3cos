@@ -20,7 +20,9 @@ def synthetic_report():
         "paint_scroll": {"rows": 240, "first_us": 10, "checksum": 123},
         "host_calls": {"median_ns_per_call": 1},
         "startup": {"wall_us": 10},
-        "incremental_background": {"median_us": 1, "sibling_moved": False},
+        "incremental_background": {
+            "median_us": 1, "sibling_moved": False, "kind": "paint",
+        },
     }
     for name in ("width", "text", "class", "insert", "remove"):
         edit = {"median_us": 1, "kind": "style-subtree", "solved_nodes": 2}
@@ -80,6 +82,60 @@ class RuntimeBenchTests(unittest.TestCase):
                             gate.validate_report(report)
             report = synthetic_report()
             report["incremental_" + name]["after_" + dimension] = 10
+            with self.assertRaises(gate.InvalidReport):
+                gate.validate_report(report)
+
+    def test_ng_on_column_flex_rebuild_records_the_whole_tree(self):
+        report = synthetic_report()
+        report["layout_ng"] = "on"
+        nodes = report["style_layout"]["nodes"]
+        for name in ("width", "text", "class", "insert", "remove"):
+            report["incremental_" + name].update(kind="rebuild", solved_nodes=nodes)
+        report["incremental_background"]["kind"] = "rebuild"
+        # The rebuild may cost about as much as one full pass. That is the
+        # measured fallback, not a subtree speedup.
+        report["incremental_width"]["median_us"] = 90
+        gate.validate_report(report)
+
+    def test_ng_on_rejects_a_claimed_subtree_or_a_partial_rebuild(self):
+        report = synthetic_report()
+        report["layout_ng"] = "on"
+        nodes = report["style_layout"]["nodes"]
+        for name in ("width", "text", "class", "insert", "remove"):
+            report["incremental_" + name].update(kind="rebuild", solved_nodes=nodes)
+        report["incremental_background"]["kind"] = "rebuild"
+        for kind in ("style-subtree", "splice", "retained", "paint"):
+            broken = json.loads(json.dumps(report))
+            broken["incremental_width"]["kind"] = kind
+            with self.assertRaises(gate.InvalidReport):
+                gate.validate_report(broken)
+        partial = json.loads(json.dumps(report))
+        partial["incremental_width"]["solved_nodes"] = 2
+        with self.assertRaises(gate.InvalidReport):
+            gate.validate_report(partial)
+        partial["incremental_width"]["solved_nodes"] = nodes - 1
+        with self.assertRaises(gate.InvalidReport):
+            gate.validate_report(partial)
+        inserted = json.loads(json.dumps(report))
+        inserted["incremental_insert"]["solved_nodes"] = nodes + 2
+        gate.validate_report(inserted)
+        retained = json.loads(json.dumps(report))
+        retained["incremental_text"].update(kind="retained", solved_nodes=nodes)
+        with self.assertRaises(gate.InvalidReport):
+            gate.validate_report(retained)
+
+    def test_off_and_verify_keep_the_subtree_bound(self):
+        for mode in ("off", "verify"):
+            report = synthetic_report()
+            report["layout_ng"] = mode
+            gate.validate_report(report)
+            report["incremental_width"].update(
+                kind="rebuild", solved_nodes=report["style_layout"]["nodes"])
+            with self.assertRaises(gate.InvalidReport):
+                gate.validate_report(report)
+            report = synthetic_report()
+            report["layout_ng"] = mode
+            report["incremental_background"]["kind"] = "rebuild"
             with self.assertRaises(gate.InvalidReport):
                 gate.validate_report(report)
 

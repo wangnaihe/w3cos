@@ -327,13 +327,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         let px = 160 + index * 17;
         dom::set_style_property(target, "width", &format!("{px}px"));
         let sample = time_flush("width");
-        if subtree_gate() {
-            assert_subtree("width", &sample, nodes);
-            if sample.kind != "style-subtree" {
-                eprintln!("width flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("width", &sample, nodes, "style-subtree");
         width_samples.push(sample);
     }
     let after_width = node_width(target);
@@ -371,13 +365,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         let words = "alpha beta gamma delta epsilon zeta eta theta ".repeat(8 + index * 4);
         dom::set_text_content(text_node, &words);
         let sample = time_flush("text");
-        if subtree_gate() {
-            assert_subtree("text", &sample, nodes);
-            if sample.kind != "splice" {
-                eprintln!("text flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("text", &sample, nodes, "splice");
         text_samples.push(sample);
     }
     let after_text_height = node_height(text_cell);
@@ -400,13 +388,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
             dom::class_list_remove(class_cell, "wide");
         }
         let sample = time_flush("class");
-        if subtree_gate() {
-            assert_subtree("class", &sample, nodes);
-            if sample.kind != "style-subtree" {
-                eprintln!("class flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("class", &sample, nodes, "style-subtree");
         let width = node_width(class_cell);
         if (width - previous_class_width).abs() >= 1.0 {
             class_width_changed = true;
@@ -433,13 +415,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         dom::append_child(cell, text);
         dom::append_child(column, cell);
         let sample = time_flush("insert");
-        if subtree_gate() {
-            assert_subtree("insert", &sample, nodes);
-            if sample.kind != "splice" {
-                eprintln!("insert flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("insert", &sample, nodes, "splice");
         if dom::children(column).len() != before_children + 1 {
             eprintln!("insert did not add a child");
             std::process::exit(1);
@@ -463,13 +439,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         }
         dom::remove_child(column, cell);
         let sample = time_flush("remove");
-        if subtree_gate() {
-            assert_subtree("remove", &sample, nodes);
-            if sample.kind != "splice" {
-                eprintln!("remove flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("remove", &sample, nodes, "splice");
         if dom::children(column).len() != before_children {
             eprintln!("remove did not restore the child count");
             std::process::exit(1);
@@ -549,12 +519,37 @@ fn time_flush(label: &str) -> TimedFlush {
     }
 }
 
-/// A one-node edit that lays out the whole document is the old path.
-fn assert_subtree(label: &str, sample: &TimedFlush, nodes: usize) {
-    if sample.kind == "retained" || sample.kind == "rebuild" || sample.solved as usize * 4 >= nodes
+/// Column sections in the large document. LayoutNG has no subtree solve
+/// that matches a full column-flex layout, so `Mode::On` rebuilds the tree
+/// and the sample is the measured cost of that fallback. `Mode::Off` must
+/// still take `off_kind` and must not walk the whole document. `retained`
+/// is a cached-tree compute, not this fallback, and does not satisfy either
+/// arm. Geometry checks outside this function stay in force for both modes.
+fn assert_column_edit(label: &str, sample: &TimedFlush, nodes: usize, off_kind: &str) {
+    if !subtree_gate() {
+        return;
+    }
+    if w3cos_runtime::layout::layout_ng_mode_name() == "on" {
+        // `nodes` is the document before the edit. Insert counts the new
+        // cell as well, so solved may be a little larger, never a subtree.
+        let solved = sample.solved as usize;
+        let whole_tree = solved >= nodes && solved <= nodes.saturating_add(1024);
+        if sample.kind != "rebuild" || !whole_tree {
+            eprintln!(
+                "{label} NG column-flex fallback: kind {} solved {} shifted {} nodes {nodes} (want rebuild of every node)",
+                sample.kind, sample.solved, sample.shifted
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
+    if sample.kind == "retained"
+        || sample.kind == "rebuild"
+        || sample.kind != off_kind
+        || sample.solved as usize * 4 >= nodes
     {
         eprintln!(
-            "{label} solved the whole tree: kind {} solved {} shifted {} nodes {nodes}",
+            "{label} lost the off-mode subtree: kind {} solved {} shifted {} nodes {nodes} (want {off_kind})",
             sample.kind, sample.solved, sample.shifted
         );
         std::process::exit(1);
