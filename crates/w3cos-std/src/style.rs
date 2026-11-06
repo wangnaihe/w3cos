@@ -2,6 +2,7 @@ use crate::color::Color;
 use serde::{Deserialize, Serialize};
 
 pub use crate::custom_properties::CustomProperties;
+pub type CustomPropertyMap = crate::fxhash::FxHashMap<String, String>;
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
 /// Per-thread renderer adapter for the final font's zero-glyph advance.

@@ -381,6 +381,12 @@ impl std::fmt::Debug for CustomProperties {
     }
 }
 
+impl From<crate::fxhash::FxHashMap<String, String>> for CustomProperties {
+    fn from(map: crate::fxhash::FxHashMap<String, String>) -> Self {
+        Self::from(HashMap::<String, String>::from_iter(map))
+    }
+}
+
 impl From<HashMap<String, String>> for CustomProperties {
     fn from(map: HashMap<String, String>) -> Self {
         Self(Arc::new(Inner::from_map(map)))
@@ -435,7 +441,7 @@ impl Serialize for CustomProperties {
 
 impl<'de> Deserialize<'de> for CustomProperties {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        HashMap::deserialize(deserializer).map(Self::from)
+        HashMap::<String, String>::deserialize(deserializer).map(Self::from)
     }
 }
 
