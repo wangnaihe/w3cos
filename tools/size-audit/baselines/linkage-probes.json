@@ -10,11 +10,11 @@
       "features": [],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 12132480,
-          "text_bytes": 7890712,
-          "data_bytes": 3424585,
-          "readonly_data_bytes": 2784625,
-          "gzip_bytes": 5214358,
+          "total_bytes": 12602400,
+          "text_bytes": 8225176,
+          "data_bytes": 3528689,
+          "readonly_data_bytes": 2862089,
+          "gzip_bytes": 5444184,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -31,7 +31,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "LayoutNG stays in the runtime binary: W3COS_LAYOUT_NG selects it at run time, so release-size LTO keeps the S1-S5 block, inline, float, and nowrap-flex code. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12132480 bytes (+254904, 2.15%) and the dynamic-browser probe is 15618448 bytes (+245816, 1.60%), past the 200 KiB absolute gate and under the 3% gate. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
+          "note": "sync #420 after WOFF-off ordinary AOT probe (b1e90996): CI attribution shows dynamic-js/image-codecs/host-* feature symbols at 0; growth is LayoutNG/runtime code from main (w3cos_runtime 2977846 symbol bytes). On x86_64-unknown-linux-gnu with Rust 1.99.1 stripped AOT probe is 12602400 bytes (+469920, 3.87% vs prior LayoutNG baseline). Still within the 20 MiB aot budget. Browser row left pending CI remeasure. Image codecs, web-bluetooth, host-tray, and host-keyring stay off."
         }
       }
     },
@@ -63,7 +63,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "LayoutNG stays in the runtime binary: W3COS_LAYOUT_NG selects it at run time, so release-size LTO keeps the S1-S5 block, inline, float, and nowrap-flex code. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12132480 bytes (+254904, 2.15%) and the dynamic-browser probe is 15618448 bytes (+245816, 1.60%), past the 200 KiB absolute gate and under the 3% gate. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
+          "note": "sync #420 pending browser remeasure on CI after AOT row update to 12602400 bytes (WOFF kept off ordinary AOT; attribution: no dynamic-js leak). Prior browser row 15618448 bytes from main LayoutNG baseline. Image codecs, web-bluetooth, host-tray, and host-keyring stay off."
         }
       }
     }
