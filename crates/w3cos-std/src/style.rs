@@ -126,6 +126,27 @@ impl CustomProperties {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 
+    pub fn edit_shared(&mut self, _tag: &'static str, _arg: &str, edit: impl FnOnce(&mut Self)) {
+        edit(self);
+    }
+
+    pub fn eq_ignoring(&self, other: &Self, ignored: &[&str]) -> bool {
+        if self.ptr_eq(other) {
+            return true;
+        }
+        let left: std::collections::HashMap<&str, &str> = self
+            .iter()
+            .filter(|(k, _)| !ignored.iter().any(|i| i == k))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let right: std::collections::HashMap<&str, &str> = other
+            .iter()
+            .filter(|(k, _)| !ignored.iter().any(|i| i == k))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        left == right
+    }
+
     /// Copy-on-write aware: a no-op removal never unshares the map (Blink's
     /// DataRef::Access() is likewise only taken when a field really changes).
     pub fn remove<Q>(&mut self, key: &Q) -> Option<String>
@@ -476,7 +497,6 @@ pub struct Style {
 
     // CSS Custom Properties (#34)
     pub custom_properties: Option<CustomProperties>,
-    /// Identity of the authored text run (`text:<node>` / `pseudo:...`).
     #[serde(skip)]
     pub text_source_run: Option<std::sync::Arc<str>>,
 
@@ -1188,6 +1208,12 @@ impl Style {
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
             Dimension::Auto => 0.0,
+            Dimension::Calc(calc) => calc.resolve(
+                containing_width,
+                self.font_size,
+                viewport_width,
+                viewport_height,
+            ),
         }
     }
 }
@@ -1330,8 +1356,141 @@ pub enum FlexWrap {
     WrapReverse,
 }
 
+///
+/// Every term is linear, so `+`, `-`, `* <number>` and `/ <number>` fold the
+/// expression into five coefficients at parse time and resolution needs only
+/// the containing block, font size and viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct CalcLength {
+    pub px: f32,
+    /// Percentage points (`50` means `50%`).
+    pub percent: f32,
+    pub em: f32,
+    pub vw: f32,
+    pub vh: f32,
+}
+
+impl CalcLength {
+    pub fn is_absolute(&self) -> bool {
+        self.percent == 0.0
+    }
+
+    pub fn add(self, other: Self) -> Self {
+        Self {
+            px: self.px + other.px,
+            percent: self.percent + other.percent,
+            em: self.em + other.em,
+            vw: self.vw + other.vw,
+            vh: self.vh + other.vh,
+        }
+    }
+
+    pub fn scale(self, factor: f32) -> Self {
+        Self {
+            px: self.px * factor,
+            percent: self.percent * factor,
+            em: self.em * factor,
+            vw: self.vw * factor,
+            vh: self.vh * factor,
+        }
+    }
+
+    /// Resolve against a percentage basis, font size and viewport.
+    pub fn resolve(&self, basis: f32, font_size: f32, viewport_w: f32, viewport_h: f32) -> f32 {
+        self.px
+            + basis * self.percent / 100.0
+            + font_size * self.em
+            + viewport_w * self.vw / 100.0
+            + viewport_h * self.vh / 100.0
+    }
+}
+
+/// Interned handle to a [`CalcLength`].
+///
+/// `Dimension` appears many times in every `Style` and the layout code recurses
+/// deeply, so `Dimension` must stay 8 bytes. Five `f32` coefficients would
+/// double it, hence calc values are interned once and referenced by index.
+/// The handle dereferences to the `CalcLength` and serializes as its value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CalcId(u32);
+
+struct CalcTable {
+    values: Vec<&'static CalcLength>,
+    index: std::collections::HashMap<[u32; 5], u32>,
+}
+
+fn calc_table() -> &'static std::sync::RwLock<CalcTable> {
+    static TABLE: std::sync::OnceLock<std::sync::RwLock<CalcTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::sync::RwLock::new(CalcTable {
+            values: Vec::new(),
+            index: std::collections::HashMap::new(),
+        })
+    })
+}
+
+impl CalcId {
+    pub fn new(length: CalcLength) -> Self {
+        let key = [
+            length.px.to_bits(),
+            length.percent.to_bits(),
+            length.em.to_bits(),
+            length.vw.to_bits(),
+            length.vh.to_bits(),
+        ];
+        if let Some(id) = calc_table().read().unwrap().index.get(&key) {
+            return Self(*id);
+        }
+        let mut table = calc_table().write().unwrap();
+        if let Some(id) = table.index.get(&key) {
+            return Self(*id);
+        }
+        let id = table.values.len() as u32;
+        table.values.push(Box::leak(Box::new(length)));
+        table.index.insert(key, id);
+        Self(id)
+    }
+
+    pub fn get(self) -> CalcLength {
+        *self
+    }
+}
+
+impl std::ops::Deref for CalcId {
+    type Target = CalcLength;
+
+    fn deref(&self) -> &CalcLength {
+        calc_table().read().unwrap().values[self.0 as usize]
+    }
+}
+
+impl std::fmt::Debug for CalcId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CalcId").field(&**self).finish()
+    }
+}
+
+impl Serialize for CalcId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (**self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CalcId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        CalcLength::deserialize(deserializer).map(Self::new)
+    }
+}
+
+impl Dimension {
+    /// A `calc()` dimension with the given linear terms.
+    pub fn calc(length: CalcLength) -> Self {
+        Dimension::Calc(CalcId::new(length))
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum Dimension {
+    Calc(CalcId),
     #[default]
     Auto,
     Px(f32),
@@ -2271,6 +2430,9 @@ impl Dimension {
             Dimension::Ch(v) => Some(*v * local_font_size * 0.5),
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
+            Dimension::Calc(calc) => {
+                Some(calc.resolve(parent_size, local_font_size, viewport_w, viewport_h))
+            }
         }
     }
 }

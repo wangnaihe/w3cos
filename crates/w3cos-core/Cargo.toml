@@ -35,7 +35,8 @@ sha2 = "0.10"
 hmac = "0.12"
 flate2 = "1"
 
+stacker = "0.1"
+
 [[example]]
 name = "leak_report_demo"
 required-features = ["leak-detector"]
-stacker = "0.1"

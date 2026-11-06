@@ -631,7 +631,7 @@ fn layout_grid(
     {
         return None;
     }
-    if style.grid_template_rows.is_some() || style.grid_template_areas.is_some() {
+    if style.grid_rows().is_some() || style.grid_areas().is_some() {
         return None;
     }
     let columns = style
@@ -663,8 +663,12 @@ fn layout_grid(
                     zero_subtree(document, cid, out);
                 } else {
                     if child_style.grid_column.is_some()
-                        || child_style.grid_row.is_some()
-                        || child_style.grid_area.is_some()
+                        || child_style.grid_row_spec().is_some()
+                        || child_style
+                            .grid_ng
+                            .as_ref()
+                            .and_then(|grid| grid.grid_area.as_ref())
+                            .is_some()
                         || child_style.flex_grow != 0.0
                         || child_style.order != 0
                         || child_style.align_self != AlignSelf::Auto

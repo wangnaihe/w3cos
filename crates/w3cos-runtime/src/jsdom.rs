@@ -13652,8 +13652,8 @@ fn scan_css_animations() {
                 from,
                 to,
                 started_at: Instant::now(),
-                delay: Duration::from_millis(u64::from(animation.delay_ms)),
-                duration: Duration::from_millis(u64::from(animation.duration_ms)),
+                delay: Duration::from_millis(animation.delay_ms.max(0) as u64),
+                duration: Duration::from_millis(animation.duration_ms.max(0) as u64),
                 easing: animation.easing,
                 direction: animation.direction,
                 event_pending: true,
@@ -20336,7 +20336,7 @@ fn storage_value(persistent: bool) -> Value {
     value
 }
 
-fn crypto_key_class() -> Value {
+pub(crate) fn crypto_key_class() -> Value {
     CRYPTO_KEY_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
@@ -34497,4 +34497,14 @@ try {
         );
         assert_eq!(hits.get(), 400);
     }
+}
+
+
+pub(crate) fn canvas_2d_rgba(node: u32) -> Option<(u32, u32, Vec<u8>)> {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        let context = contexts.get(&node)?;
+        let context = context.borrow();
+        Some((context.width, context.height, context.pixels().to_vec()))
+    })
 }

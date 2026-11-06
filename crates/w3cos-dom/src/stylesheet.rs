@@ -29,6 +29,7 @@ mod selector_parse_cache;
 
 use rule_set::RuleSet;
 pub(crate) use rule_set::{FollowingPosition, FollowingScan};
+pub use selector_filter::StyleRecalcScope;
 pub(crate) use selector_filter::AncestorBloom;
 use selector_filter::LazyAncestorBloom;
 
@@ -489,6 +490,11 @@ fn refresh_rule_flags() {
 
 fn bump_generation() {
     STYLE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
+}
+
+/// `@keyframes` changed: computed styles depending on them are stale.
+pub(crate) fn note_animation_rules_changed() {
+    bump_generation();
 }
 
 pub fn generation() -> u64 {

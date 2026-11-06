@@ -2682,3 +2682,8 @@ mod tests {
         assert_eq!(wide, [9.0, 513.0, 0.0, 1.0]);
     }
 }
+
+
+pub(crate) fn is_typed_array_view(value: &Value) -> bool {
+    view_for(value).is_some()
+}

@@ -1,6 +1,8 @@
 //! Source fragment boundaries retained through anonymous text coalescing.
 use crate::Style;
 
+pub const SOURCE_RUN: &str = "--w3cos-internal-text-source-run";
+
 pub const FRAGMENT_ENDS: &str = "--w3cos-internal-text-fragment-ends";
 
 /// The authored text run this style's generated piece belongs to.

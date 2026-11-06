@@ -216,7 +216,8 @@ fn row_cross_is_definite(item: &Style, container: &Style) -> bool {
         | Dimension::Em(_)
         | Dimension::Ch(_)
         | Dimension::Vw(_)
-        | Dimension::Vh(_) => true,
+        | Dimension::Vh(_)
+        | Dimension::Calc(_) => true,
     }
 }
 

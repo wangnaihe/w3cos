@@ -2451,6 +2451,39 @@ pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
+        w3cos_std::style::Dimension::Calc(calc) => {
+            let mut terms = Vec::new();
+            for (value, unit) in [
+                (calc.percent, "%"),
+                (calc.px, "px"),
+                (calc.em, "em"),
+                (calc.vw, "vw"),
+                (calc.vh, "vh"),
+            ] {
+                if value != 0.0 {
+                    terms.push(format!("{value}{unit}"));
+                }
+            }
+            let mut out = String::from("calc(");
+            for (index, term) in terms.iter().enumerate() {
+                match (index, term.strip_prefix('-')) {
+                    (0, _) => out.push_str(term),
+                    (_, Some(negative)) => {
+                        out.push_str(" - ");
+                        out.push_str(negative);
+                    }
+                    _ => {
+                        out.push_str(" + ");
+                        out.push_str(term);
+                    }
+                }
+            }
+            if terms.is_empty() {
+                out.push_str("0px");
+            }
+            out.push(')');
+            out
+        }
     }
 }
 
@@ -3093,6 +3126,9 @@ fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
         | Dimension::Ch(value)
         | Dimension::Vw(value)
         | Dimension::Vh(value) => value >= 0.0,
+        // A negative used size clamps to zero, so a calc that may go
+        // negative is still a valid declaration.
+        Dimension::Calc(_) => true,
     }
 }
 

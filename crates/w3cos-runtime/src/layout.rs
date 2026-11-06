@@ -1931,7 +1931,7 @@ pub(crate) fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
-        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc(_) => None,
     };
     let constraint_border_box = |dimension| {
         intrinsic_constraint(dimension).map(|width| {
@@ -3841,7 +3841,8 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Em(_)
         | WDim::Ch(_)
         | WDim::Vw(_)
-        | WDim::Vh(_) => None,
+        | WDim::Vh(_)
+        | WDim::Calc(_) => None,
     }
 }
 
@@ -4424,6 +4425,7 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
+            WDim::Calc(_) => (8, 0),
         },
         padding_top: padding.top.to_bits(),
         padding_right: padding.right.to_bits(),
@@ -21462,7 +21464,7 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
-        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) => None,
+        WDim::Auto | WDim::Ch(_) | WDim::Vw(_) | WDim::Calc(_) => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
     // Keep their own height automatic, while descendants use the nearest
@@ -21808,7 +21810,7 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
-        WDim::Auto | WDim::Percent(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Calc(_) => None,
     };
     let absorbs_ua_inline_padding =
         uses_ua_table_cell_padding && absolute_dimension(comp.style.width).is_some();
@@ -25457,7 +25459,7 @@ fn collect_layouts_fast(
                         || relative_containing_block_height_definite)
             }
             WDim::Percent(_) => relative_containing_block_height_definite,
-            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Ch(_) | WDim::Vw(_) | WDim::Vh(_) => {
+            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Ch(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc(_) => {
                 true
             }
         });
@@ -26740,6 +26742,7 @@ fn to_taffy_dim(
         WDim::Ch(v) => Dimension::length(v * font_style.ch_advance()),
         WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
         WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
+        WDim::Calc(calc) => Dimension::length(calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h)),
     }
 }
 
@@ -26758,6 +26761,9 @@ fn to_taffy_auto(
         WDim::Ch(v) => LengthPercentageAuto::length(v * font_style.ch_advance()),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
+        WDim::Calc(calc) => LengthPercentageAuto::length(
+            calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h),
+        ),
     }
 }
 
@@ -26784,6 +26790,113 @@ fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
         WOverflow::Scroll => taffy::Overflow::Scroll,
         WOverflow::Auto => taffy::Overflow::Scroll,
     }
+}
+
+
+/// Border-box size of an inline element's own text laid out on its own, wrapped
+/// at `available_width`. Used for inline elements whose text was merged into
+/// the enclosing block's text run and therefore never received a layout rect.
+const UNBOUNDED_TEXT_WRAP_WIDTH: f32 = 1.0e6;
+
+fn text_intrinsic_size_at(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    wrap_width: f32,
+) -> (f32, f32) {
+    if let Some(advance) = crate::list_marker::inside_advance(style) {
+        let padding = style.padding_lengths();
+        return (
+            advance + padding.left + padding.right,
+            inline_style_line_height(&style) + padding.top + padding.bottom,
+        );
+    }
+    let registry = crate::font_face::FontRegistry::global();
+    #[cfg(not(feature = "skia"))]
+    let font_runs = registry.resolve_style_runs(style, content);
+    #[cfg(not(feature = "skia"))]
+    let has_registered_runs = font_runs.iter().any(|run| run.font.is_some());
+    let key = text_measure_key(
+        wrap_width,
+        style,
+        registry.cascade_cache_key(style, content),
+    );
+    if let Some(measured) = TEXT_MEASURE_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .intrinsic
+            .get(content)
+            .and_then(|entries| entries.iter().find(|(cached, _)| *cached == key))
+            .map(|(_, measured)| *measured)
+    }) {
+        return measured;
+    }
+
+    let measured = {
+        #[cfg(feature = "skia")]
+        {
+            // Layout and paint must use the same shaping backend. Splitting
+            // one browser inline run across several generated/span boxes
+            // otherwise accumulates Fontdue-vs-Skia advance differences and
+            // visibly removes whitespace by the end of the line.
+            crate::render_skia::measure_skia_text_intrinsic_size(content, style)
+        }
+        #[cfg(not(feature = "skia"))]
+        {
+            if has_registered_runs {
+                cascade_text_intrinsic_size(content, style, wrap_width)
+            } else {
+                text_layout::text_intrinsic_size_font(content, style, wrap_width, layout_font())
+            }
+        }
+    };
+    // Shaping returns floating-point advances. The CSS layout item consumes
+    // the next 1/64px unit, before adding box edges. Do not quantize individual
+    // glyph origins or change the raw Canvas/shaping measurement backend.
+    let padding = style.padding_lengths();
+    let measured = (
+        text_layout::inline_layout_advance(measured.0 - padding.left - padding.right)
+            + padding.left
+            + padding.right,
+        measured.1,
+    );
+    TEXT_MEASURE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.make_room();
+        cache
+            .intrinsic
+            .entry(content.to_owned())
+            .or_default()
+            .push((key, measured));
+        cache.entries += 1;
+    });
+    measured
+}
+
+pub(crate) fn inline_text_box_size(
+    content: &str,
+    style: &w3cos_std::style::Style,
+    available_width: f32,
+) -> (f32, f32) {
+    let single = text_intrinsic_size_at(content, style, UNBOUNDED_TEXT_WRAP_WIDTH);
+    let width = if available_width.is_finite() && available_width > 0.0 {
+        single.0.min(available_width)
+    } else {
+        single.0
+    };
+    if width >= single.0 {
+        return single;
+    }
+    let height = text_intrinsic_size_at(content, style, width.max(1.0)).1;
+    (width, height)
+}
+
+
+/// `true` when a text-only `<button>` label may wrap onto several lines.
+pub(crate) fn button_label_can_wrap(label: &str, style: &w3cos_std::style::Style) -> bool {
+    matches!(
+        style.white_space,
+        WWhiteSpace::Normal | WWhiteSpace::PreWrap | WWhiteSpace::PreLine
+    ) && label.trim().contains(char::is_whitespace)
 }
 
 #[cfg(test)]

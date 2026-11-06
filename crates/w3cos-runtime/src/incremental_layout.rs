@@ -52,6 +52,27 @@ thread_local! {
     /// hidden.
     static LEARN_HIDDEN: Cell<bool> = const { Cell::new(false) };
     static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
+    static LAST_FLUSH: Cell<(&'static str, u32, u32)> = const { Cell::new(("none", 0, 0)) };
+}
+
+/// What the most recent [`flush`] solved.
+pub struct IncrementalFlushStats {
+    pub kind: &'static str,
+    pub solved_nodes: u32,
+    pub shifted_nodes: u32,
+}
+
+pub fn last_flush_stats() -> IncrementalFlushStats {
+    let (kind, solved_nodes, shifted_nodes) = LAST_FLUSH.with(Cell::get);
+    IncrementalFlushStats {
+        kind,
+        solved_nodes,
+        shifted_nodes,
+    }
+}
+
+fn note_flush(kind: &'static str, solved_nodes: u32, shifted_nodes: u32) {
+    LAST_FLUSH.with(|slot| slot.set((kind, solved_nodes, shifted_nodes)));
 }
 
 pub fn invalidate() {
@@ -68,6 +89,7 @@ pub fn flush() -> bool {
         let _ = crate::dom::with_document_mut(|document| document.take_precise_dirty());
         crate::dom::clear_document_dirty();
         invalidate();
+        note_flush("definite", 0, 0);
         return true;
     }
     let (viewport_w, viewport_h, _) = crate::jsdom::viewport();
@@ -113,6 +135,7 @@ pub fn flush() -> bool {
     });
     if ok {
         crate::dom::clear_document_dirty();
+        note_flush("rebuild", 0, 0);
     }
     ok
 }
@@ -541,7 +564,7 @@ fn assign_layout_style(
     style: &w3cos_std::style::Style,
 ) -> bool {
     if host_id(component) == Some(id) {
-        component.style = style.clone();
+        component.style = style.clone().into();
         return true;
     }
     component

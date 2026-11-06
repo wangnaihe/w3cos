@@ -1528,6 +1528,12 @@ fn resolve_dim(
         Dimension::Ch(v) => Some(v * style.ch_advance()),
         Dimension::Vw(v) => Some(v * space.viewport_w / 100.0),
         Dimension::Vh(v) => Some(v * space.viewport_h / 100.0),
+        Dimension::Calc(calc) => Some(calc.resolve(
+            basis.unwrap_or(0.0),
+            style.font_size,
+            space.viewport_w,
+            space.viewport_h,
+        )),
     }
 }
 

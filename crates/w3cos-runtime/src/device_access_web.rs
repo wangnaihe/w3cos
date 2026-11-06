@@ -1484,7 +1484,19 @@ fn device_id(device: &Value) -> String {
 }
 
 fn arg<'a>(args: &'a [Value], index: usize) -> &'a Value {
-    args.get(index).unwrap_or(&Value::Undefined)
+    if let Some(value) = args.get(index) {
+        return value;
+    }
+    static INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static mut UNDEFINED: *const Value = std::ptr::null();
+    if !INIT.load(std::sync::atomic::Ordering::Acquire) {
+        let leaked: &'static Value = Box::leak(Box::new(Value::Undefined));
+        unsafe {
+            UNDEFINED = leaked;
+        }
+        INIT.store(true, std::sync::atomic::Ordering::Release);
+    }
+    unsafe { &*UNDEFINED }
 }
 
 fn optional_u16(object: &Value, name: &str) -> Option<u16> {

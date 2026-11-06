@@ -310,12 +310,6 @@ pub fn pending_finalizer_count() -> usize {
     PENDING.with(|queue| queue.borrow().len())
 }
 
-fn type_error(message: &str) -> ! {
-    crate::throw_value(crate::error_instance(
-        "TypeError",
-        vec![Value::string(message)],
-    ))
-}
 
 /// Weak identity of an object/array/function. `assign` allocates an id for
 /// a value that has never been watched; lookups pass `false`, since a value
