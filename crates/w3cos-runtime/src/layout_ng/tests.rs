@@ -7708,3 +7708,146 @@ fn empty_text_after_br_does_not_shift_inline_block_baseline() {
         );
     }
 }
+
+/// 20×50 PNG. `image_intrinsic_size` reads the decode cache, not the path.
+fn install_20x50(src: &str) {
+    const HEX: &str = "89504e470d0a1a0a0000000d4948445200000014000000320802000000d31e6c710000002549444154789cedcbb10d000008c0a09eeee9fee0e440c24a4d77b22ccbb22ccbb22cffcc0b3e77f410a1bae3d20000000049454e44ae426082";
+    let bytes = (0..HEX.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&HEX[index..index + 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    crate::image_loader::decode_and_install(src, &bytes).expect("20x50 png");
+}
+
+/// css-sizing/aspect-ratio/grid-aspect-ratio-005 and 006. Headless Chrome
+/// 156, body margin 0, 800×600: `repeat(2, min-content)` does not shrink the
+/// grid box (it stays 800×100). A 20×50 image with `aspect-ratio: auto 1/1`
+/// transfers its intrinsic ratio, so `height: 100px` is 40×100 and
+/// `width: 40px` is 40×100. The 60×100 sibling sits at x=40. Together they
+/// cover a 100px square. Source newlines between the items are not cells.
+#[test]
+fn min_content_replaced_columns_match_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let src = "r37/20x50.png";
+    install_20x50(src);
+    let ratio = CustomProperties::from_iter([(
+        "--w3cos-internal-aspect-ratio".to_string(),
+        "1".to_string(),
+    )]);
+    let image = |width: Dimension, height: Dimension| {
+        Component::image(
+            src,
+            Style {
+                display: Display::Inline,
+                width,
+                height,
+                custom_properties: Some(ratio.clone()),
+                ..Style::default()
+            },
+        )
+    };
+    let sibling = node(
+        Style {
+            width: Dimension::Px(60.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![],
+    );
+    let grid = |columns: &str, image: Component, extra: Vec<Component>| {
+        let mut children = Vec::new();
+        children.push(Component::text(
+            "\n  ",
+            Style {
+                display: Display::Inline,
+                ..block()
+            },
+        ));
+        children.push(image);
+        children.push(Component::text(
+            "\n  ",
+            Style {
+                display: Display::Inline,
+                ..block()
+            },
+        ));
+        children.extend(extra);
+        node(
+            Style {
+                display: Display::Grid,
+                grid_template_columns: Some(columns.to_string()),
+                ..Style::default()
+            },
+            children,
+        )
+    };
+    let lay = |child: Component| {
+        let root = node(block(), vec![child]);
+        ng_rects(&root)
+    };
+    let height = lay(grid(
+        "repeat(2, min-content)",
+        image(Dimension::Auto, Dimension::Px(100.0)),
+        vec![sibling.clone()],
+    ));
+    close(rect(&height, 1), (0.0, 0.0, 800.0, 100.0));
+    close(rect(&height, 3), (0.0, 0.0, 40.0, 100.0));
+    close(rect(&height, 5), (40.0, 0.0, 60.0, 100.0));
+    let width = lay(grid(
+        "repeat(2, min-content)",
+        image(Dimension::Px(40.0), Dimension::Auto),
+        vec![sibling],
+    ));
+    close(rect(&width, 1), (0.0, 0.0, 800.0, 100.0));
+    close(rect(&width, 3), (0.0, 0.0, 40.0, 100.0));
+    close(rect(&width, 5), (40.0, 0.0, 60.0, 100.0));
+
+    let still_legacy = |child: Component, reason: &str| {
+        let root = node(block(), vec![child]);
+        let flat = pre_flatten(&root);
+        assert!(
+            !block::supports_tree(&flat),
+            "{reason} should stay on legacy: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        assert!(
+            block::unsupported_reasons(&flat)
+                .iter()
+                .any(|got| got == reason),
+            "{reason} {:?}",
+            block::unsupported_reasons(&flat)
+        );
+    };
+    still_legacy(
+        grid(
+            "repeat(2, max-content)",
+            image(Dimension::Auto, Dimension::Px(100.0)),
+            vec![node(
+                Style {
+                    width: Dimension::Px(60.0),
+                    height: Dimension::Px(100.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        ),
+        "grid:intrinsic-track",
+    );
+    still_legacy(
+        node(
+            Style {
+                display: Display::Grid,
+                grid_template_columns: Some("min-content".to_string()),
+                ..Style::default()
+            },
+            vec![Component::text(
+                "x x x",
+                Style {
+                    display: Display::Inline,
+                    ..block()
+                },
+            )],
+        ),
+        "grid:intrinsic-track",
+    );
+}
