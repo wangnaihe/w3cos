@@ -2796,7 +2796,7 @@ mod monaco_tests {
         let symbol_x = call(&symbol_ctor, Value::Undefined, vec![Value::string("x")]);
         let symbol_empty = call(&symbol_ctor, Value::Undefined, Vec::new());
         let symbol_for = get_property(&symbol_ctor, &Value::string("for"));
-        let registered_x = call(&symbol_for, symbol_ctor, vec![Value::string("x")]);
+        let registered_x = call(&symbol_for, symbol_ctor.clone(), vec![Value::string("x")]);
         let prototype = get_property(&string_ctor, &Value::string("prototype"));
 
         let cases = [
@@ -2886,6 +2886,15 @@ mod monaco_tests {
         assert_eq!(
             call(&symbol_to_string, symbol_x, Vec::new()).to_js_string(),
             "Symbol(x)"
+        );
+        let symbol_66 = call(&symbol_ctor, Value::Undefined, vec![Value::string("66")]);
+        assert_eq!(
+            symbol_66.call_method("toString", Vec::new()).to_js_string(),
+            "Symbol(66)"
+        );
+        assert_eq!(
+            symbol_66.call_method("valueOf", Vec::new()).type_of(),
+            "symbol"
         );
     }
 
