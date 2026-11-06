@@ -36513,13 +36513,7 @@ mod tests {
             ComponentKind::Text { content } if content == "Before")
             })
             .unwrap();
-        let source = |style: &w3cos_std::Style| {
-            style
-                .custom_properties
-                .as_ref()
-                .and_then(|p| p.get(w3cos_std::inline_text::SOURCE_RUN))
-                .cloned()
-        };
+        let source = |style: &w3cos_std::Style| w3cos_std::inline_text::source_run(style).map(str::to_owned);
         assert_ne!(source(quote.unwrap().style), source(word.style));
         w3cos_dom::stylesheet::clear_rules();
     }

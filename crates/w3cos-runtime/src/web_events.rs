@@ -1037,6 +1037,30 @@ fn plain_init_entries(init: &Value, members: &HashSet<String>) -> Option<Vec<(St
     (!accessor).then_some(entries)
 }
 
+
+fn derive_mouse_coords_from_client(this: &Value, init: &Value) {
+    // Template construction copies page/offset/layer/x/y defaults (0) then
+    // overlays only the init members that were supplied. Re-derive the CSSOM
+    // View aliases from clientX/clientY when the init omitted them, matching
+    // install_mouse_fields (#319) for the template fast path.
+    let client_x = this.get_property("clientX").to_number();
+    let client_y = this.get_property("clientY").to_number();
+    for (name, derived) in [
+        ("pageX", client_x),
+        ("pageY", client_y),
+        ("offsetX", client_x),
+        ("offsetY", client_y),
+        ("layerX", client_x),
+        ("layerY", client_y),
+        ("x", client_x),
+        ("y", client_y),
+    ] {
+        if init.get_property(name).is_undefined() {
+            put_field(this, name, Value::Number(derived));
+        }
+    }
+}
+
 /// Construct a MouseEvent (0) or PointerEvent (1) by copying a per-realm
 /// boilerplate of default members (V8 object boilerplate cloning), then
 /// overlaying only the dictionary members the init actually supplies. The
@@ -1188,6 +1212,8 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
         EventSubclass::Mouse => {
             if !install_from_template(this, &init, 0) {
                 install_mouse_fields(this, &init);
+            } else {
+                derive_mouse_coords_from_client(this, &init);
             }
         }
         EventSubclass::Keyboard => {
@@ -1211,6 +1237,8 @@ fn install_subclass(this: &Value, args: &[Value], kind: EventSubclass) {
             if !install_from_template(this, &init, 1) {
                 install_mouse_fields(this, &init);
                 install_pointer_fields(this, &init);
+            } else {
+                derive_mouse_coords_from_client(this, &init);
             }
         }
         EventSubclass::Wheel => {
