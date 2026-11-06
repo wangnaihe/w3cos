@@ -533,6 +533,19 @@ pub(crate) fn resolved_text_font_geometry(
     }))
 }
 
+/// True when shaping `text` uses a fallback face whose normal line box is
+/// taller than the primary face's (or the geometry is unknown).
+pub(crate) fn text_fallback_grows_normal_line(text: &str, style: &Style) -> bool {
+    let (Some(primary), Some(resolved)) = (
+        resolved_font_geometry(style),
+        resolved_text_font_geometry(text, style),
+    ) else {
+        return true;
+    };
+    let primary = primary.normal_line_box();
+    resolved.ascent > primary.ascent + 1e-3 || resolved.descent > primary.descent + 1e-3
+}
+
 /// CSS middle alignment uses the parent's concrete x-height, not half an em.
 /// Resolve the same primary face and weight as its strut/glyph painter.
 pub(crate) fn resolved_font_x_height(style: &Style) -> Option<f32> {
@@ -4136,12 +4149,13 @@ fn draw_text_in_rect_with_line_painter(
             ink_bounds: vec![measure_ink(text)],
         })
     } else {
-        text_layout::retained_text_paint_layout_with_run_width_and_line_widths(
+        text_layout::retained_text_paint_layout_with_run_width_and_line_widths_in(
             text,
             continuation_content.width,
             &line_widths,
             style.font_size,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             registry.cascade_cache_key(style, text)
                 ^ 0x534b_4941_5445_5801
                 ^ w3cos_std::inline_text::metadata_cache_key(style),
@@ -5566,7 +5580,10 @@ mod ahem_segment_tests {
     /// Ahem covers Latin-1 but stops short of Latin Extended-A, which is the
     /// gap `font-family-013` builds `"Ahem", "Times New Roman"` on.
     fn pinned_ahem() -> Option<crate::font_face::LoadedFont> {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let bytes = std::fs::read(path).ok()?;
         let registry = FontRegistry::new();
         registry
@@ -5975,6 +5992,26 @@ pub(crate) fn measure_skia_inline_fragment_advances(
     fragments: &[&str],
     style: &Style,
 ) -> Option<Vec<f32>> {
+    measure_skia_fragment_advances(fragments, style, false)
+}
+
+/// Partition one physical shaping run for CSSOM inline-owner rectangles.
+/// A cluster that crosses an authored owner boundary belongs to the fragment
+/// containing its logical start. Chrome exposes the same contract for a
+/// ligature split across two otherwise identical inline elements: the first
+/// element owns the cluster advance and the second element has zero width.
+pub(crate) fn measure_skia_cssom_fragment_advances(
+    fragments: &[&str],
+    style: &Style,
+) -> Option<Vec<f32>> {
+    measure_skia_fragment_advances(fragments, style, true)
+}
+
+fn measure_skia_fragment_advances(
+    fragments: &[&str],
+    style: &Style,
+    assign_crossing_cluster_to_start: bool,
+) -> Option<Vec<f32>> {
     if fragments.is_empty() || style_uses_ahem(style) {
         return None;
     }
@@ -6019,7 +6056,8 @@ pub(crate) fn measure_skia_inline_fragment_advances(
                     .partition_point(|boundary| *boundary <= run_offset + start)
                     .checked_sub(1)?;
                 if fragment >= fragments.len()
-                    || run_offset + end > boundaries[fragment + 1]
+                    || (!assign_crossing_cluster_to_start
+                        && run_offset + end > boundaries[fragment + 1])
                     || !advance.is_finite()
                 {
                     return None;
@@ -6170,11 +6208,12 @@ fn measure_skia_wrapped_text_geometry<const BASELINE: bool>(
         } else {
             inner_width
         };
-        let lines = text_layout::wrap_text_with_run_width_and_first_line(
+        let lines = text_layout::wrap_text_with_run_width_and_first_line_in(
             text,
             continuation_width,
             first_line_width,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             |line| measure_skia_text_advance(line, primary, style),
         );
         let used_line_count = text_layout::used_text_line_count(text, style, &lines);
@@ -9274,7 +9313,10 @@ mod tests {
     fn registered_ahem_normal_line_includes_uncovered_font_metrics() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610080112;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9290,8 +9332,34 @@ mod tests {
                 },
             )
             .unwrap();
+        let fallback_faces = [
+            (
+                "W3COS Test Tinos",
+                include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").as_slice(),
+            ),
+            (
+                "W3COS Test Arimo",
+                include_bytes!("../assets/test-fonts/Arimo-Regular.ttf").as_slice(),
+            ),
+            (
+                "W3COS Test Cousine",
+                include_bytes!("../assets/test-fonts/Cousine-Regular.ttf").as_slice(),
+            ),
+        ];
+        for (family, bytes) in fallback_faces {
+            registry
+                .register_for_owner(
+                    OWNER,
+                    FontFace {
+                        family: family.into(),
+                        src: FontSource::Bytes(bytes.to_vec()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
         let mut results = Vec::new();
-        for family in ["Times New Roman", "Arial", "Courier New"] {
+        for family in ["W3COS Test Tinos", "W3COS Test Arimo", "W3COS Test Cousine"] {
             let style = Style {
                 font_family: Some(format!("Ahem, \"{family}\"")),
                 font_size: 64.0,
@@ -9378,7 +9446,10 @@ mod tests {
     fn registered_ahem_inline_glyph_covers_its_integer_em_background() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 2026100802290;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9476,7 +9547,10 @@ mod tests {
     fn registered_ahem_picture_bounds_preserve_shared_edge_pixels() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 2026101003884;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9556,7 +9630,10 @@ mod tests {
     fn registered_ahem_normal_preserves_font_raster_and_fractional_origin() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610040048;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -9630,7 +9707,7 @@ mod tests {
         const OWNER: u64 = 202610100061;
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf"
+            "/src/layout_ng/testdata/Ahem.ttf"
         ))
         .expect("pinned WPT Ahem");
         let registry = FontRegistry::global();
@@ -10060,7 +10137,10 @@ mod tests {
     fn registered_ahem_bold_changes_ink_without_changing_advance() {
         use crate::font_face::{FontFace, FontRegistry, FontSource};
         const OWNER: u64 = 202610040029;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -11319,7 +11399,11 @@ mod tests {
                 letter_spacing: 32.0,
                 ..Style::default()
             };
-            let font = Font::new(&typeface, style.font_size);
+            // The implementation resolves CSS generic families before shaping.
+            // Measure the expectation with that same resolved face; using the
+            // Times fixture for `monospace` compares unrelated glyph metrics.
+            let resolved = generic_serif_typeface(&style).unwrap_or_else(|| typeface.clone());
+            let font = Font::new(&resolved, style.font_size);
             for text in ["a", "ab", "abc"] {
                 let expected = text
                     .chars()
@@ -12652,7 +12736,10 @@ mod tests {
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
         const OWNER: u64 = 202610040049;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -12887,32 +12974,70 @@ mod tests {
             line_height: 1.2,
             ..Style::default()
         };
+        let used_line_height = crate::layout::inline_style_line_height(&style);
         draw_text_in_rect(
             single.canvas(),
             LayoutRect {
                 x: 0.0,
                 y: 0.0,
                 width: 64.0,
-                height: 19.2,
+                height: used_line_height,
             },
             "i",
             &style,
             &typeface,
             &metrics_font,
         );
-        draw_text_in_rect(
+        let mut painted_lines = 0;
+        draw_text_in_rect_with_line_painter(
             multiline.canvas(),
             LayoutRect {
                 x: 0.0,
                 y: 0.0,
                 width: 64.0,
-                height: 38.4,
+                height: 2.0 * used_line_height,
             },
             "i\u{2028}i",
             &style,
             &typeface,
             &metrics_font,
+            None,
+            true,
+            &mut |canvas, x, top, text, advance, style, expansion| {
+                painted_lines += 1;
+                if painted_lines == 1 {
+                    if let Some(expansion) = expansion {
+                        draw_justified_text_line(
+                            canvas,
+                            x,
+                            top,
+                            text,
+                            style.font_size,
+                            style.color,
+                            style.opacity,
+                            &typeface,
+                            style,
+                            expansion,
+                        )
+                    } else {
+                        draw_text_line(
+                            canvas,
+                            x,
+                            top,
+                            text,
+                            style.font_size,
+                            style.color,
+                            style.opacity,
+                            &typeface,
+                            style,
+                        )
+                    }
+                } else {
+                    advance
+                }
+            },
         );
+        assert_eq!(painted_lines, 2, "fixture must exercise the multiline path");
 
         let info = ImageInfo::new((64, 40), ColorType::RGBA8888, AlphaType::Premul, None);
         let mut single_pixels = vec![0_u8; 64 * 40 * 4];
@@ -13193,6 +13318,35 @@ mod tests {
             together < separate - 0.5,
             "font positioning must affect the inline advance: together={together}, separate={separate}"
         );
+    }
+
+    #[test]
+    fn cssom_owner_boundary_assigns_a_crossing_ligature_to_its_start_fragment() {
+        let family = "W3cosCssomLigatureNotoSerif";
+        crate::font_face::FontRegistry::global()
+            .register(crate::font_face::FontFace {
+                family: family.into(),
+                src: crate::font_face::FontSource::Bytes(
+                    include_bytes!("../assets/test-fonts/NotoSerif-Regular.ttf").to_vec(),
+                ),
+                ..Default::default()
+            })
+            .expect("register the ligature-capable Chrome control face");
+        let style = Style {
+            font_family: Some(family.into()),
+            font_size: 64.0,
+            ..Style::default()
+        };
+        let split = measure_skia_cssom_fragment_advances(&["f", "i"], &style)
+            .expect("shape one physical run across the owner boundary");
+        let whole = measure_skia_text_intrinsic_size("fi", &style).0;
+        assert_eq!(split.len(), 2);
+        assert!(
+            (split.iter().sum::<f32>() - whole).abs() < 0.001,
+            "split={split:?}, whole={whole}"
+        );
+        assert!(split[0] > 0.0, "the cluster start owns its advance");
+        assert_eq!(split[1], 0.0, "the continuation owner is zero-width");
     }
 
     #[test]

@@ -1,14 +1,27 @@
 //! Headless demo for the native-gap adapters.
 //!
 //! Exercises permission denial, a real process, window-management displays,
-//! battery (or an honest `NotSupportedError`), an application shortcut, a
-//! refused tray stub, display capture, a TCP echo, and a WebNN add.
+//! battery (or an honest `NotSupportedError`), an accelerometer reading (or an
+//! honest `NotReadableError` when this host has no live sensor), a geolocation
+//! fix (or an honest position error when this host has no location service),
+//! Bluetooth availability (or `NotSupportedError` / `NotFoundError`), a camera
+//! frame (or an honest `NotFoundError` / `NotAllowedError` / `NotReadableError`
+//! when this host has no usable camera), an application shortcut, the
+//! origin-scoped keyring (or `NotSupportedError` when no secret store is
+//! open), a system-tray adapter (or an honest `NotSupportedError` when the
+//! session has no status watcher), display capture, Web Serial (permission
+//! or adapter rejection, then `NotFoundError` for a filter that matches
+//! nothing), a TCP echo, a WebNN add, and Gamepad enumeration through the
+//! desktop adapter (or the host snapshot path).
 //! Rasterizes with the CPU renderer.
 //!
 //! ```sh
 //! DISPLAY=:1 cargo +stable run -p w3cos-runtime --example native_gaps \
-//!   --no-default-features --features cpu-render
+//!   --no-default-features --features cpu-render,web-sensors,web-serial,web-geolocation,web-bluetooth,web-gamepad,web-media-advanced,web-device-access
 //! ```
+//!
+//! The HID and USB probes do not grant `hid` or `usb`, so `requestDevice`
+//! must not succeed. Geolocation is granted only after a denial check.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,6 +31,7 @@ use std::rc::Rc;
 
 use w3cos_core::Value;
 use w3cos_runtime::capability_gate;
+use w3cos_runtime::device_access_web;
 use w3cos_runtime::direct_sockets_web::{self, tcp_socket_class};
 use w3cos_runtime::dom;
 use w3cos_runtime::headless::{self, render_document_rgba_cpu};
@@ -57,6 +71,29 @@ fn await_value(promise: Value) -> Result<Value, String> {
         return Err(error);
     }
     ok.borrow().clone().ok_or_else(|| "unresolved".into())
+}
+
+fn gamepad_probe() -> (String, bool) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w3cos_runtime::gamepad_web::get_gamepads_value().call(Value::Undefined, vec![])
+    }));
+    match result {
+        Ok(list) => {
+            let backend = w3cos_runtime::gamepad_web::platform_backend_name();
+            let length = list.get_property("length").to_u32();
+            let mut connected = 0u32;
+            for index in 0..length {
+                if !list.get_property(&index.to_string()).is_null() {
+                    connected += 1;
+                }
+            }
+            (
+                format!("{backend} connected {connected}"),
+                backend != "gilrs-unavailable",
+            )
+        }
+        Err(_) => ("call failed".into(), false),
+    }
 }
 
 fn row(label: &str, detail: &str, ok: bool) {
@@ -161,6 +198,259 @@ fn webnn_add() -> Result<String, String> {
     Ok(values)
 }
 
+fn device_probe(kind: &str) -> (String, bool) {
+    let manager = if kind == "hid" {
+        device_access_web::hid_value()
+    } else {
+        device_access_web::usb_value()
+    };
+    let summary = if kind == "hid" {
+        device_access_web::hid_backend_summary()
+    } else {
+        device_access_web::usb_backend_summary()
+    };
+    let listed = await_value(manager.call_method("getDevices", vec![]));
+    let requested = await_value(manager.call_method(
+        "requestDevice",
+        vec![Value::object(HashMap::from([(
+            "filters".into(),
+            Value::array(vec![]),
+        )]))],
+    ));
+    let list_len = listed
+        .as_ref()
+        .map(|devices| devices.get_property("length").to_number())
+        .unwrap_or(-1.0);
+    let request_error = match &requested {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    let ok =
+        list_len == 0.0 && matches!(request_error.as_str(), "NotFoundError" | "NotAllowedError");
+    (
+        format!("{summary} devices {list_len} request {request_error}"),
+        ok,
+    )
+}
+
+fn sensor_probe() -> (String, bool) {
+    w3cos_runtime::orientation_web::set_permission_granted(true);
+    capability_gate::grant("accelerometer");
+    let sensor = w3cos_core::class::construct(
+        &w3cos_runtime::sensors_web::accelerometer_class(),
+        vec![Value::object(HashMap::from([(
+            "frequency".into(),
+            Value::Number(10.0),
+        )]))],
+    );
+    let error = Rc::new(RefCell::new(String::new()));
+    let error_slot = Rc::clone(&error);
+    sensor.call_method(
+        "addEventListener",
+        vec![
+            Value::string("error"),
+            Value::function(move |_, args| {
+                *error_slot.borrow_mut() = args
+                    .first()
+                    .map(|event| {
+                        event
+                            .get_property("error")
+                            .get_property("name")
+                            .to_js_string()
+                    })
+                    .unwrap_or_default();
+                Value::Undefined
+            }),
+        ],
+    );
+    sensor.call_method("start", vec![]);
+    for _ in 0..30 {
+        jsdom::drain_microtasks();
+        if sensor.get_property("hasReading").to_bool() || !error.borrow().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    let has_reading = sensor.get_property("hasReading").to_bool();
+    let text = if has_reading {
+        format!(
+            "x {} y {} z {}",
+            sensor.get_property("x").to_number(),
+            sensor.get_property("y").to_number(),
+            sensor.get_property("z").to_number()
+        )
+    } else if error.borrow().is_empty() {
+        "no live sample".to_string()
+    } else {
+        error.borrow().clone()
+    };
+    let ok = has_reading || error.borrow().as_str() == "NotReadableError";
+    sensor.call_method("stop", vec![]);
+    w3cos_runtime::orientation_web::reset();
+    w3cos_runtime::sensors_web::reset();
+    (text, ok)
+}
+
+fn geolocation_probe() -> (String, bool) {
+    let geo = w3cos_runtime::geolocation_web::geolocation_value();
+    let denied = Rc::new(RefCell::new(0.0));
+    let denied_slot = Rc::clone(&denied);
+    geo.call_method(
+        "getCurrentPosition",
+        vec![
+            Value::Undefined,
+            Value::function(move |_, args| {
+                *denied_slot.borrow_mut() = args
+                    .first()
+                    .map(|error| error.get_property("code").to_number())
+                    .unwrap_or(0.0);
+                Value::Undefined
+            }),
+            Value::object(HashMap::from([("timeout".into(), Value::Number(200.0))])),
+        ],
+    );
+    jsdom::drain_microtasks();
+    if *denied.borrow() != 1.0 {
+        return (format!("deny {}", denied.borrow()), false);
+    }
+
+    capability_gate::grant("geolocation");
+    let outcome: Rc<RefCell<Option<Result<(f64, f64, f64), f64>>>> = Rc::new(RefCell::new(None));
+    let success_slot = Rc::clone(&outcome);
+    let error_slot = Rc::clone(&outcome);
+    geo.call_method(
+        "getCurrentPosition",
+        vec![
+            Value::function(move |_, args| {
+                let coords = args
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+                    .get_property("coords");
+                *success_slot.borrow_mut() = Some(Ok((
+                    coords.get_property("latitude").to_number(),
+                    coords.get_property("longitude").to_number(),
+                    coords.get_property("accuracy").to_number(),
+                )));
+                Value::Undefined
+            }),
+            Value::function(move |_, args| {
+                *error_slot.borrow_mut() = Some(Err(args
+                    .first()
+                    .map(|error| error.get_property("code").to_number())
+                    .unwrap_or(0.0)));
+                Value::Undefined
+            }),
+            Value::object(HashMap::from([
+                ("timeout".into(), Value::Number(1_500.0)),
+                ("maximumAge".into(), Value::Number(0.0)),
+                ("enableHighAccuracy".into(), Value::Bool(false)),
+            ])),
+        ],
+    );
+    for _ in 0..40 {
+        jsdom::drain_microtasks();
+        if outcome.borrow().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let report = match outcome.borrow().clone() {
+        Some(Ok((latitude, longitude, accuracy)))
+            if latitude.is_finite()
+                && longitude.is_finite()
+                && accuracy.is_finite()
+                && accuracy >= 0.0 =>
+        {
+            (
+                format!("{latitude:.5},{longitude:.5} ±{accuracy:.0}m"),
+                true,
+            )
+        }
+        Some(Err(code)) if code == 1.0 || code == 2.0 || code == 3.0 => {
+            (format!("code {code}"), true)
+        }
+        Some(Ok(_)) => ("non-finite fix".to_string(), false),
+        Some(Err(code)) => (format!("code {code}"), false),
+        None => ("no response".to_string(), false),
+    };
+    w3cos_runtime::geolocation_web::reset();
+    report
+}
+
+fn bluetooth_probe() -> (String, bool) {
+    let bluetooth = w3cos_runtime::bluetooth_web::bluetooth_value();
+    let request = Value::object(HashMap::from([(
+        "acceptAllDevices".into(),
+        Value::Bool(true),
+    )]));
+    let denied = await_value(bluetooth.call_method("requestDevice", vec![request.clone()]));
+    if matches!(denied.as_ref(), Err(name) if name == "NotSupportedError") {
+        return ("NotSupportedError".to_string(), true);
+    }
+    let denied_ok = matches!(denied.as_ref(), Err(name) if name == "NotAllowedError");
+    capability_gate::grant("bluetooth");
+    let available = await_value(bluetooth.call_method("getAvailability", vec![]));
+    let available_text = match &available {
+        Ok(value) => format!("available {}", value.to_bool()),
+        Err(err) => err.clone(),
+    };
+    let found = await_value(bluetooth.call_method("requestDevice", vec![request]));
+    let detail = match &found {
+        Ok(device) => format!(
+            "{available_text}; {}",
+            device.get_property("id").to_js_string()
+        ),
+        Err(err) => format!("{available_text}; {err}"),
+    };
+    let ok = denied_ok
+        && available
+            .as_ref()
+            .is_ok_and(|value| value.as_bool().is_some())
+        && match &found {
+            Ok(device) => device.get_property("id").to_js_string().starts_with("ble:"),
+            Err(err) => err == "NotFoundError",
+        };
+    (detail, ok)
+}
+
+fn camera_probe() -> (String, bool) {
+    capability_gate::grant("camera");
+    let media = w3cos_runtime::media_devices_web::media_devices_value();
+    let opened = await_value(media.call_method(
+        "getUserMedia",
+        vec![Value::object(HashMap::from([(
+            "video".into(),
+            Value::Bool(true),
+        )]))],
+    ));
+    let result = match opened {
+        Ok(stream) => {
+            let track = stream
+                .call_method("getVideoTracks", vec![])
+                .get_property("0");
+            let settings = track.call_method("getSettings", vec![]);
+            let width = settings.get_property("width").to_number();
+            let height = settings.get_property("height").to_number();
+            let label = track.get_property("label").to_js_string();
+            track.call_method("stop", vec![]);
+            (
+                format!("{label} {width}x{height}"),
+                width > 0.0 && height > 0.0,
+            )
+        }
+        Err(err) => {
+            let honest = matches!(
+                err.as_str(),
+                "NotFoundError" | "NotAllowedError" | "NotReadableError" | "OverconstrainedError"
+            );
+            (err, honest)
+        }
+    };
+    w3cos_runtime::media_devices_web::reset();
+    result
+}
+
 fn main() {
     dom::reset_document();
     jsdom::reset_bridge();
@@ -171,6 +461,10 @@ fn main() {
     w3cos_extensions::reset_realm();
 
     let namespace = namespace_value();
+    let serial_before = await_value(
+        w3cos_runtime::device_access_web::serial_value().call_method("requestPort", vec![]),
+    );
+
     let denied = await_value(namespace.get_property("process").call_method(
         "exec",
         vec![Value::object(HashMap::from([(
@@ -188,6 +482,8 @@ fn main() {
         "display-capture",
         "direct-sockets",
         "webnn",
+        "w3cos-keyring",
+        "serial",
     ] {
         capability_gate::grant(name);
     }
@@ -221,7 +517,47 @@ fn main() {
     if shortcut.is_ok() {
         dispatch_accelerator("Control+Shift+K");
     }
-    let tray = await_value(namespace.get_property("tray").call_method("show", vec![]));
+    let keyring = await_value(namespace.get_property("keyring").call_method(
+        "set",
+        vec![Value::string("native-gaps"), Value::string("probe")],
+    ));
+    let keyring_read = if keyring.is_ok() {
+        let read = await_value(
+            namespace
+                .get_property("keyring")
+                .call_method("get", vec![Value::string("native-gaps")]),
+        );
+        let _ = await_value(
+            namespace
+                .get_property("keyring")
+                .call_method("delete", vec![Value::string("native-gaps")]),
+        );
+        read
+    } else {
+        keyring.clone()
+    };
+    let tray = await_value(namespace.get_property("tray").call_method(
+        "show",
+        vec![Value::object(HashMap::from([(
+            "tooltip".into(),
+            Value::string("w3cos native gaps"),
+        )]))],
+    ));
+    if let Ok(handle) = &tray {
+        let _ = await_value(handle.call_method("remove", vec![]));
+    }
+    let serial_after = await_value(
+        w3cos_runtime::device_access_web::serial_value().call_method(
+            "requestPort",
+            vec![Value::object(HashMap::from([(
+                "filters".into(),
+                Value::array(vec![Value::object(HashMap::from([
+                    ("usbVendorId".into(), Value::Number(65535.0)),
+                    ("usbProductId".into(), Value::Number(65535.0)),
+                ]))]),
+            )]))],
+        ),
+    );
     let capture = await_value(
         namespace
             .get_property("agent")
@@ -229,6 +565,8 @@ fn main() {
     );
     let tcp = tcp_echo();
     let webnn = webnn_add();
+    let hid = device_probe("hid");
+    let usb = device_probe("usb");
 
     dom::set_style_property(dom::body_id(), "margin", "0");
     dom::set_style_property(dom::body_id(), "background", "#101418");
@@ -286,10 +624,28 @@ fn main() {
     let shortcut_text = format!("hits {}", hits.borrow());
     row("shortcut", &shortcut_text, *hits.borrow() == 1);
     let tray_text = match &tray {
-        Ok(_) => "unexpected success".to_string(),
+        Ok(handle) => format!(
+            "id {} {}",
+            handle.get_property("id").to_number(),
+            handle.get_property("tooltip").to_js_string()
+        ),
         Err(err) => err.clone(),
     };
-    row("tray stub", &tray_text, tray_text == "NotSupportedError");
+    let keyring_text = match &keyring_read {
+        Ok(value) if value.to_js_string() == "probe" => "stored".to_string(),
+        Ok(_) => "mismatch".to_string(),
+        Err(err) => err.clone(),
+    };
+    row(
+        "keyring",
+        &keyring_text,
+        keyring_text == "stored" || keyring_text == "NotSupportedError",
+    );
+    let tray_ok = match &tray {
+        Ok(_) => true,
+        Err(err) => err == "NotSupportedError",
+    };
+    row("tray adapter", &tray_text, tray_ok);
     let capture_text = match &capture {
         Ok(image) => format!(
             "{}x{}",
@@ -299,6 +655,22 @@ fn main() {
         Err(err) => err.clone(),
     };
     row("capture", &capture_text, capture.is_ok());
+    let serial_before_text = match &serial_before {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    let serial_after_text = match &serial_after {
+        Ok(_) => "unexpected success".to_string(),
+        Err(err) => err.clone(),
+    };
+    row(
+        "serial",
+        &format!("{serial_before_text} / {serial_after_text}"),
+        matches!(
+            serial_before_text.as_str(),
+            "NotAllowedError" | "NotFoundError"
+        ) && serial_after_text == "NotFoundError",
+    );
     row(
         "tcp echo",
         &tcp.clone().unwrap_or_else(|err| err),
@@ -309,8 +681,20 @@ fn main() {
         &webnn.clone().unwrap_or_else(|err| err),
         webnn.as_deref() == Ok("4,6"),
     );
+    let (gamepad_text, gamepad_ok) = gamepad_probe();
+    row("gamepad", &gamepad_text, gamepad_ok);
+    row("hid", &hid.0, hid.1);
+    row("usb", &usb.0, usb.1);
+    let (sensor_text, sensor_ok) = sensor_probe();
+    row("accelerometer", &sensor_text, sensor_ok);
+    let (geo_text, geo_ok) = geolocation_probe();
+    row("geolocation", &geo_text, geo_ok);
+    let (bluetooth_text, bluetooth_ok) = bluetooth_probe();
+    row("bluetooth", &bluetooth_text, bluetooth_ok);
+    let (camera_text, camera_ok) = camera_probe();
+    row("camera", &camera_text, camera_ok);
 
-    let frame = render_document_rgba_cpu(960, 560).expect("cpu frame");
+    let frame = render_document_rgba_cpu(960, 1260).expect("cpu frame");
     let path = std::path::PathBuf::from("/opt/cursor/artifacts/native-gaps.png");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

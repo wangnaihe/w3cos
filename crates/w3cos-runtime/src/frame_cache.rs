@@ -163,26 +163,34 @@ pub fn encode_png() -> Option<Vec<u8>> {
 /// X11 present format keeps that byte unused). Viewers then treat the whole
 /// image as blank. Screenshot PNGs stay opaque and keep the RGB bytes.
 pub fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
-    use image::ImageEncoder;
-    let expected = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    if rgba.len() != expected {
-        return Err(format!(
-            "png encode failed: expected {expected} bytes, got {}",
-            rgba.len()
-        ));
+    #[cfg(not(feature = "image-png"))]
+    {
+        let _ = (width, height, rgba);
+        return Err("PNG encoding requires the image-png feature".into());
     }
-    let mut opaque = Vec::with_capacity(expected);
-    for pixel in rgba.chunks_exact(4) {
-        opaque.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+    #[cfg(feature = "image-png")]
+    {
+        use image::ImageEncoder;
+        let expected = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if rgba.len() != expected {
+            return Err(format!(
+                "png encode failed: expected {expected} bytes, got {}",
+                rgba.len()
+            ));
+        }
+        let mut opaque = Vec::with_capacity(expected);
+        for pixel in rgba.chunks_exact(4) {
+            opaque.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        }
+        let mut out = Vec::with_capacity(expected / 2);
+        let mut cursor = std::io::Cursor::new(&mut out);
+        image::codecs::png::PngEncoder::new(&mut cursor)
+            .write_image(&opaque, width, height, image::ExtendedColorType::Rgba8)
+            .map_err(|e| format!("png encode failed: {e}"))?;
+        Ok(out)
     }
-    let mut out = Vec::with_capacity(expected / 2);
-    let mut cursor = std::io::Cursor::new(&mut out);
-    image::codecs::png::PngEncoder::new(&mut cursor)
-        .write_image(&opaque, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|e| format!("png encode failed: {e}"))?;
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -236,6 +244,7 @@ mod tests {
         assert_eq!(gen3, gen2);
     }
 
+    #[cfg(feature = "image-png")]
     #[test]
     fn encode_png_returns_signature() {
         let _g = FC_TEST_LOCK.lock().unwrap();
@@ -246,6 +255,7 @@ mod tests {
         assert_eq!(&png[..4], &[0x89, 0x50, 0x4E, 0x47]);
     }
 
+    #[cfg(feature = "image-png")]
     #[test]
     fn encode_png_keeps_rgb_and_writes_opaque_alpha() {
         let _g = FC_TEST_LOCK.lock().unwrap();

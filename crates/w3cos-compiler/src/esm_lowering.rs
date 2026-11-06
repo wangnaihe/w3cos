@@ -4590,6 +4590,8 @@ fn global_value_expr(name: &str) -> Option<String> {
         | "Gamepad" | "GamepadButton" | "GamepadEvent"
         | "DeviceOrientationEvent" | "DeviceMotionEvent"
         | "Sensor" | "SensorErrorEvent" | "Accelerometer" | "Gyroscope" | "Magnetometer"
+        | "GravitySensor" | "LinearAccelerationSensor" | "OrientationSensor"
+        | "AbsoluteOrientationSensor" | "RelativeOrientationSensor" | "AmbientLightSensor"
         | "CookieStore" | "CookieChangeEvent" | "Sanitizer"
         | "TrustedHTML" | "TrustedScript" | "TrustedScriptURL"
         | "TrustedTypePolicy" | "TrustedTypePolicyFactory"

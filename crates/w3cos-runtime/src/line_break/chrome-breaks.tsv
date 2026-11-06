@@ -1,0 +1,1468 @@
+# Chrome 155.0.8059.80 line breaks: mode, lang, text, the lines of a
+# width:0 block (U+001F separated). mode: normal (line-break:auto),
+# strict/lbnormal/loose (line-break), breakall/keepall (word-break),
+# anywhere (line-break:anywhere). Spaces hang, so tests compare trimmed lines.
+anywhere		$100 €20 50%	$100 €20 50%
+anywhere		(中)	(中)
+anywhere		+(b)	+(b)
+anywhere		1,000.5	1,000.5
+anywhere		100%中	100%中
+anywhere		ABCD-1234	ABCD-1234
+anywhere		AB中ー	AB中ー
+anywhere		Hello  world	Hello  world
+anywhere		a b	a b
+anywhere		a"b"c	a"b"c
+anywhere		a'b	a'b
+anywhere		a(b)	a(b)
+anywhere		a/b	a/b
+anywhere		abc中def	abc中def
+anywhere		ab­cd	ab­cd
+anywhere		a b	a b
+anywhere		a·b	a·b
+anywhere		a֊b	a֊b
+anywhere		a b	a b
+anywhere		a b	a b
+anywhere		a​b	a​b
+anywhere		a‐b	a‐b
+anywhere		a—b	a—b
+anywhere		a․b	a․b
+anywhere		a‥b	a‥b
+anywhere		a b	a b
+anywhere		a⁠b	a⁠b
+anywhere		a　b	a　b
+anywhere		a🙂b	a🙂b
+anywhere		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+anywhere		well-known	well-known
+anywhere		x -1	x -1
+anywhere		α β	α β
+anywhere		Ѐѐ	Ѐѐ
+anywhere		עברית טקסט	עברית טקסט
+anywhere		العربية نص	العربية نص
+anywhere		ⅠⅡ	ⅠⅡ
+anywhere		「中」	「中」
+anywhere		あぁいーう	あぁいーう
+anywhere		ァアヽヾ々〻	ァアヽヾ々〻
+anywhere		中!中	中!中
+anywhere		中abc中	中abc中
+anywhere		中 中	中 中
+anywhere		中¥100	中¥100
+anywhere		中‐中	中‐中
+anywhere		中–中	中–中
+anywhere		中—中	中—中
+anywhere		中‥中	中‥中
+anywhere		中……中	中……中
+anywhere		中‼中	中‼中
+anywhere		中№中	中№中
+anywhere		中　中	中　中
+anywhere		中々中	中々中
+anywhere		中《中》中	中《中》中
+anywhere		中〜中	中〜中
+anywhere		中〳中	中〳中
+anywhere		中゛中	中゛中
+anywhere		中゠中	中゠中
+anywhere		中・中	中・中
+anywhere		中ー中	中ー中
+anywhere		中㍿中	中㍿中
+anywhere		中文。文本	中文。文本
+anywhere		中：中	中：中
+anywhere		中？中	中？中
+anywhere		日本語、テスト	日本語、テスト
+anywhere		한국어 텍스트	한국어 텍스트
+anywhere		ｧｨｩ	ｧｨｩ
+anywhere		ｱｲｳ	ｱｲｳ
+anywhere		🙂🙂	🙂🙂
+anywhere	ja	$100 €20 50%	$100 €20 50%
+anywhere	ja	(中)	(中)
+anywhere	ja	+(b)	+(b)
+anywhere	ja	1,000.5	1,000.5
+anywhere	ja	100%中	100%中
+anywhere	ja	ABCD-1234	ABCD-1234
+anywhere	ja	AB中ー	AB中ー
+anywhere	ja	Hello  world	Hello  world
+anywhere	ja	a"b"c	a"b"c
+anywhere	ja	a'b	a'b
+anywhere	ja	a(b)	a(b)
+anywhere	ja	a/b	a/b
+anywhere	ja	abc中def	abc中def
+anywhere	ja	ab­cd	ab­cd
+anywhere	ja	a b	a b
+anywhere	ja	a·b	a·b
+anywhere	ja	a֊b	a֊b
+anywhere	ja	a​b	a​b
+anywhere	ja	a‐b	a‐b
+anywhere	ja	a—b	a—b
+anywhere	ja	a․b	a․b
+anywhere	ja	a‥b	a‥b
+anywhere	ja	a b	a b
+anywhere	ja	a⁠b	a⁠b
+anywhere	ja	a🙂b	a🙂b
+anywhere	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+anywhere	ja	well-known	well-known
+anywhere	ja	x -1	x -1
+anywhere	ja	α β	α β
+anywhere	ja	Ѐѐ	Ѐѐ
+anywhere	ja	עברית טקסט	עברית טקסט
+anywhere	ja	العربية نص	العربية نص
+anywhere	ja	ⅠⅡ	ⅠⅡ
+anywhere	ja	「中」	「中」
+anywhere	ja	あぁいーう	あぁいーう
+anywhere	ja	ァアヽヾ々〻	ァアヽヾ々〻
+anywhere	ja	中!中	中!中
+anywhere	ja	中abc中	中abc中
+anywhere	ja	中¥100	中¥100
+anywhere	ja	中‐中	中‐中
+anywhere	ja	中–中	中–中
+anywhere	ja	中—中	中—中
+anywhere	ja	中‥中	中‥中
+anywhere	ja	中……中	中……中
+anywhere	ja	中‼中	中‼中
+anywhere	ja	中№中	中№中
+anywhere	ja	中　中	中　中
+anywhere	ja	中々中	中々中
+anywhere	ja	中《中》中	中《中》中
+anywhere	ja	中〜中	中〜中
+anywhere	ja	中〳中	中〳中
+anywhere	ja	中゛中	中゛中
+anywhere	ja	中゠中	中゠中
+anywhere	ja	中・中	中・中
+anywhere	ja	中ー中	中ー中
+anywhere	ja	中㍿中	中㍿中
+anywhere	ja	中文。文本	中文。文本
+anywhere	ja	中：中	中：中
+anywhere	ja	中？中	中？中
+anywhere	ja	日本語、テスト	日本語、テスト
+anywhere	ja	한국어 텍스트	한국어 텍스트
+anywhere	ja	ｧｨｩ	ｧｨｩ
+anywhere	ja	ｱｲｳ	ｱｲｳ
+anywhere	ja	🙂🙂	🙂🙂
+breakall		$100 €20 50%	$100 €20 50%
+breakall		(中)	(中)
+breakall		+(b)	+(b)
+breakall		1,000.5	1,000.5
+breakall		100%中	100%中
+breakall		1a1	1a1
+breakall		ABCD-1234	ABCD-1234
+breakall		AB中ー	AB中ー
+breakall		Hello  world	Hello  world
+breakall		a!b	a!b
+breakall		a"b	a"b
+breakall		a"b"c	a"b"c
+breakall		a#b	a#b
+breakall		a$b	a$b
+breakall		a%b	a%b
+breakall		a&b	a&b
+breakall		a'b	a'b
+breakall		a(b	a(b
+breakall		a(b)	a(b)
+breakall		a)b	a)b
+breakall		a*b	a*b
+breakall		a+b	a+b
+breakall		a,b	a,b
+breakall		a-b	a-b
+breakall		a.b	a.b
+breakall		a/b	a/b
+breakall		a1b	a1b
+breakall		a:b	a:b
+breakall		a=b	a=b
+breakall		a?b	a?b
+breakall		a@b	a@b
+breakall		a_b	a_b
+breakall		abc中def	abc中def
+breakall		ab­cd	ab­cd
+breakall		a b	a b
+breakall		a§b	a§b
+breakall		a©b	a©b
+breakall		aªb	aªb
+breakall		a°b	a°b
+breakall		a²b	a²b
+breakall		a¶b	a¶b
+breakall		a·b	a·b
+breakall		aºb	aºb
+breakall		a×b	a×b
+breakall		a÷b	a÷b
+breakall		áb	áb
+breakall		aαβb	aαβb
+breakall		a֊b	a֊b
+breakall		a־b	a־b
+breakall		a٣b	a٣b
+breakall		aกb	aกb
+breakall		a​b	a​b
+breakall		a‐b	a‐b
+breakall		a–b	a–b
+breakall		a—b	a—b
+breakall		a‘b’	a‘b’
+breakall		a․b	a․b
+breakall		a‥b	a‥b
+breakall		a b	a b
+breakall		a⁠b	a⁠b
+breakall		a№b	a№b
+breakall		a、b	a、b
+breakall		aアb	aアb
+breakall		a中b	a中b
+breakall		a🙂b	a🙂b
+breakall		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+breakall		well-known	well-known
+breakall		x -1	x -1
+breakall		«a»	«a»
+breakall		α β	α β
+breakall		Ѐѐ	Ѐѐ
+breakall		עברית טקסט	עברית טקסט
+breakall		العربية نص	العربية نص
+breakall		กข	กข
+breakall		ⅠⅡ	ⅠⅡ
+breakall		ⅠⅡⅢ	ⅠⅡⅢ
+breakall		①②	①②
+breakall		「中」	「中」
+breakall		あぁいーう	あぁいーう
+breakall		ァアヽヾ々〻	ァアヽヾ々〻
+breakall		ヽヾゝゞ	ヽヾゝゞ
+breakall		中!中	中!中
+breakall		中1中	中1中
+breakall		中a	中a
+breakall		中abc中	中abc中
+breakall		中a中	中a中
+breakall		中¥100	中¥100
+breakall		中©中	中©中
+breakall		中‐中	中‐中
+breakall		中–中	中–中
+breakall		中—中	中—中
+breakall		中‥中	中‥中
+breakall		中……中	中……中
+breakall		中‼中	中‼中
+breakall		中℃中	中℃中
+breakall		中№中	中№中
+breakall		中　中	中　中
+breakall		中、中	中、中
+breakall		中。中	中。中
+breakall		中〃中	中〃中
+breakall		中々中	中々中
+breakall		中〆中	中〆中
+breakall		中《中》中	中《中》中
+breakall		中〜中	中〜中
+breakall		中〳中	中〳中
+breakall		中ぁ中	中ぁ中
+breakall		中゛中	中゛中
+breakall		中゠中	中゠中
+breakall		中・中	中・中
+breakall		中ー中	中ー中
+breakall		中㍿中	中㍿中
+breakall		中仝中	中仝中
+breakall		中文。文本	中文。文本
+breakall		中：中	中：中
+breakall		中？中	中？中
+breakall		日本語、テスト	日本語、テスト
+breakall		한국어 텍스트	한국어 텍스트
+breakall		ｧｨｩ	ｧｨｩ
+breakall		ｱｲｳ	ｱｲｳ
+breakall		🙂a	🙂a
+breakall		🙂🙂	🙂🙂
+breakall	ja	$100 €20 50%	$100 €20 50%
+breakall	ja	(中)	(中)
+breakall	ja	+(b)	+(b)
+breakall	ja	1,000.5	1,000.5
+breakall	ja	100%中	100%中
+breakall	ja	1a1	1a1
+breakall	ja	ABCD-1234	ABCD-1234
+breakall	ja	AB中ー	AB中ー
+breakall	ja	Hello  world	Hello  world
+breakall	ja	a!b	a!b
+breakall	ja	a"b	a"b
+breakall	ja	a"b"c	a"b"c
+breakall	ja	a#b	a#b
+breakall	ja	a$b	a$b
+breakall	ja	a%b	a%b
+breakall	ja	a&b	a&b
+breakall	ja	a'b	a'b
+breakall	ja	a(b	a(b
+breakall	ja	a(b)	a(b)
+breakall	ja	a)b	a)b
+breakall	ja	a*b	a*b
+breakall	ja	a+b	a+b
+breakall	ja	a,b	a,b
+breakall	ja	a-b	a-b
+breakall	ja	a.b	a.b
+breakall	ja	a/b	a/b
+breakall	ja	a1b	a1b
+breakall	ja	a:b	a:b
+breakall	ja	a=b	a=b
+breakall	ja	a?b	a?b
+breakall	ja	a@b	a@b
+breakall	ja	a_b	a_b
+breakall	ja	abc中def	abc中def
+breakall	ja	ab­cd	ab­cd
+breakall	ja	a b	a b
+breakall	ja	a§b	a§b
+breakall	ja	a©b	a©b
+breakall	ja	aªb	aªb
+breakall	ja	a°b	a°b
+breakall	ja	a²b	a²b
+breakall	ja	a¶b	a¶b
+breakall	ja	a·b	a·b
+breakall	ja	aºb	aºb
+breakall	ja	a×b	a×b
+breakall	ja	a÷b	a÷b
+breakall	ja	áb	áb
+breakall	ja	aαβb	aαβb
+breakall	ja	a֊b	a֊b
+breakall	ja	a־b	a־b
+breakall	ja	a٣b	a٣b
+breakall	ja	aกb	aกb
+breakall	ja	a​b	a​b
+breakall	ja	a‐b	a‐b
+breakall	ja	a–b	a–b
+breakall	ja	a—b	a—b
+breakall	ja	a‘b’	a‘b’
+breakall	ja	a․b	a․b
+breakall	ja	a‥b	a‥b
+breakall	ja	a b	a b
+breakall	ja	a⁠b	a⁠b
+breakall	ja	a№b	a№b
+breakall	ja	a、b	a、b
+breakall	ja	aアb	aアb
+breakall	ja	a中b	a中b
+breakall	ja	a🙂b	a🙂b
+breakall	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+breakall	ja	well-known	well-known
+breakall	ja	x -1	x -1
+breakall	ja	«a»	«a»
+breakall	ja	α β	α β
+breakall	ja	Ѐѐ	Ѐѐ
+breakall	ja	עברית טקסט	עברית טקסט
+breakall	ja	العربية نص	العربية نص
+breakall	ja	กข	กข
+breakall	ja	ⅠⅡ	ⅠⅡ
+breakall	ja	ⅠⅡⅢ	ⅠⅡⅢ
+breakall	ja	①②	①②
+breakall	ja	「中」	「中」
+breakall	ja	あぁいーう	あぁいーう
+breakall	ja	ァアヽヾ々〻	ァアヽヾ々〻
+breakall	ja	ヽヾゝゞ	ヽヾゝゞ
+breakall	ja	中!中	中!中
+breakall	ja	中1中	中1中
+breakall	ja	中a	中a
+breakall	ja	中abc中	中abc中
+breakall	ja	中a中	中a中
+breakall	ja	中¥100	中¥100
+breakall	ja	中©中	中©中
+breakall	ja	中‐中	中‐中
+breakall	ja	中–中	中–中
+breakall	ja	中—中	中—中
+breakall	ja	中‥中	中‥中
+breakall	ja	中……中	中……中
+breakall	ja	中‼中	中‼中
+breakall	ja	中℃中	中℃中
+breakall	ja	中№中	中№中
+breakall	ja	中　中	中　中
+breakall	ja	中、中	中、中
+breakall	ja	中。中	中。中
+breakall	ja	中〃中	中〃中
+breakall	ja	中々中	中々中
+breakall	ja	中〆中	中〆中
+breakall	ja	中《中》中	中《中》中
+breakall	ja	中〜中	中〜中
+breakall	ja	中〳中	中〳中
+breakall	ja	中ぁ中	中ぁ中
+breakall	ja	中゛中	中゛中
+breakall	ja	中゠中	中゠中
+breakall	ja	中・中	中・中
+breakall	ja	中ー中	中ー中
+breakall	ja	中㍿中	中㍿中
+breakall	ja	中仝中	中仝中
+breakall	ja	中文。文本	中文。文本
+breakall	ja	中：中	中：中
+breakall	ja	中？中	中？中
+breakall	ja	日本語、テスト	日本語、テスト
+breakall	ja	한국어 텍스트	한국어 텍스트
+breakall	ja	ｧｨｩ	ｧｨｩ
+breakall	ja	ｱｲｳ	ｱｲｳ
+breakall	ja	🙂a	🙂a
+breakall	ja	🙂🙂	🙂🙂
+keepall		$100 €20 50%	$100 €20 50%
+keepall		(中)	(中)
+keepall		+(b)	+(b)
+keepall		1,000.5	1,000.5
+keepall		100%中	100%中
+keepall		1a1	1a1
+keepall		ABCD-1234	ABCD-1234
+keepall		AB中ー	AB中ー
+keepall		Hello  world	Hello  world
+keepall		a!b	a!b
+keepall		a"b	a"b
+keepall		a"b"c	a"b"c
+keepall		a#b	a#b
+keepall		a$b	a$b
+keepall		a%b	a%b
+keepall		a&b	a&b
+keepall		a'b	a'b
+keepall		a(b	a(b
+keepall		a(b)	a(b)
+keepall		a)b	a)b
+keepall		a*b	a*b
+keepall		a+b	a+b
+keepall		a,b	a,b
+keepall		a-b	a-b
+keepall		a.b	a.b
+keepall		a/b	a/b
+keepall		a1b	a1b
+keepall		a:b	a:b
+keepall		a=b	a=b
+keepall		a?b	a?b
+keepall		a@b	a@b
+keepall		a_b	a_b
+keepall		abc中def	abc中def
+keepall		ab­cd	ab­cd
+keepall		a b	a b
+keepall		a§b	a§b
+keepall		a©b	a©b
+keepall		aªb	aªb
+keepall		a°b	a°b
+keepall		a²b	a²b
+keepall		a¶b	a¶b
+keepall		a·b	a·b
+keepall		aºb	aºb
+keepall		a×b	a×b
+keepall		a÷b	a÷b
+keepall		áb	áb
+keepall		aαβb	aαβb
+keepall		a֊b	a֊b
+keepall		a־b	a־b
+keepall		a٣b	a٣b
+keepall		aกb	aกb
+keepall		a​b	a​b
+keepall		a‐b	a‐b
+keepall		a–b	a–b
+keepall		a—b	a—b
+keepall		a‘b’	a‘b’
+keepall		a․b	a․b
+keepall		a‥b	a‥b
+keepall		a b	a b
+keepall		a⁠b	a⁠b
+keepall		a№b	a№b
+keepall		a、b	a、b
+keepall		aアb	aアb
+keepall		a中b	a中b
+keepall		a🙂b	a🙂b
+keepall		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+keepall		well-known	well-known
+keepall		x -1	x -1
+keepall		«a»	«a»
+keepall		α β	α β
+keepall		Ѐѐ	Ѐѐ
+keepall		עברית טקסט	עברית טקסט
+keepall		العربية نص	العربية نص
+keepall		กข	กข
+keepall		ⅠⅡ	ⅠⅡ
+keepall		ⅠⅡⅢ	ⅠⅡⅢ
+keepall		①②	①②
+keepall		「中」	「中」
+keepall		あぁいーう	あぁいーう
+keepall		ァアヽヾ々〻	ァアヽヾ々〻
+keepall		ヽヾゝゞ	ヽヾゝゞ
+keepall		中!中	中!中
+keepall		中1中	中1中
+keepall		中a	中a
+keepall		中abc中	中abc中
+keepall		中a中	中a中
+keepall		中¥100	中¥100
+keepall		中©中	中©中
+keepall		中‐中	中‐中
+keepall		中–中	中–中
+keepall		中—中	中—中
+keepall		中‥中	中‥中
+keepall		中……中	中……中
+keepall		中‼中	中‼中
+keepall		中℃中	中℃中
+keepall		中№中	中№中
+keepall		中　中	中　中
+keepall		中、中	中、中
+keepall		中。中	中。中
+keepall		中〃中	中〃中
+keepall		中々中	中々中
+keepall		中〆中	中〆中
+keepall		中《中》中	中《中》中
+keepall		中〜中	中〜中
+keepall		中〳中	中〳中
+keepall		中ぁ中	中ぁ中
+keepall		中゛中	中゛中
+keepall		中゠中	中゠中
+keepall		中・中	中・中
+keepall		中ー中	中ー中
+keepall		中㍿中	中㍿中
+keepall		中仝中	中仝中
+keepall		中文。文本	中文。文本
+keepall		中：中	中：中
+keepall		中？中	中？中
+keepall		日本語、テスト	日本語、テスト
+keepall		한국어 텍스트	한국어 텍스트
+keepall		ｧｨｩ	ｧｨｩ
+keepall		ｱｲｳ	ｱｲｳ
+keepall		🙂a	🙂a
+keepall		🙂🙂	🙂🙂
+keepall	ja	$100 €20 50%	$100 €20 50%
+keepall	ja	(中)	(中)
+keepall	ja	+(b)	+(b)
+keepall	ja	1,000.5	1,000.5
+keepall	ja	100%中	100%中
+keepall	ja	1a1	1a1
+keepall	ja	ABCD-1234	ABCD-1234
+keepall	ja	AB中ー	AB中ー
+keepall	ja	Hello  world	Hello  world
+keepall	ja	a!b	a!b
+keepall	ja	a"b	a"b
+keepall	ja	a"b"c	a"b"c
+keepall	ja	a#b	a#b
+keepall	ja	a$b	a$b
+keepall	ja	a%b	a%b
+keepall	ja	a&b	a&b
+keepall	ja	a'b	a'b
+keepall	ja	a(b	a(b
+keepall	ja	a(b)	a(b)
+keepall	ja	a)b	a)b
+keepall	ja	a*b	a*b
+keepall	ja	a+b	a+b
+keepall	ja	a,b	a,b
+keepall	ja	a-b	a-b
+keepall	ja	a.b	a.b
+keepall	ja	a/b	a/b
+keepall	ja	a1b	a1b
+keepall	ja	a:b	a:b
+keepall	ja	a=b	a=b
+keepall	ja	a?b	a?b
+keepall	ja	a@b	a@b
+keepall	ja	a_b	a_b
+keepall	ja	abc中def	abc中def
+keepall	ja	ab­cd	ab­cd
+keepall	ja	a b	a b
+keepall	ja	a§b	a§b
+keepall	ja	a©b	a©b
+keepall	ja	aªb	aªb
+keepall	ja	a°b	a°b
+keepall	ja	a²b	a²b
+keepall	ja	a¶b	a¶b
+keepall	ja	a·b	a·b
+keepall	ja	aºb	aºb
+keepall	ja	a×b	a×b
+keepall	ja	a÷b	a÷b
+keepall	ja	áb	áb
+keepall	ja	aαβb	aαβb
+keepall	ja	a֊b	a֊b
+keepall	ja	a־b	a־b
+keepall	ja	a٣b	a٣b
+keepall	ja	aกb	aกb
+keepall	ja	a​b	a​b
+keepall	ja	a‐b	a‐b
+keepall	ja	a–b	a–b
+keepall	ja	a—b	a—b
+keepall	ja	a‘b’	a‘b’
+keepall	ja	a․b	a․b
+keepall	ja	a‥b	a‥b
+keepall	ja	a b	a b
+keepall	ja	a⁠b	a⁠b
+keepall	ja	a№b	a№b
+keepall	ja	a、b	a、b
+keepall	ja	aアb	aアb
+keepall	ja	a中b	a中b
+keepall	ja	a🙂b	a🙂b
+keepall	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+keepall	ja	well-known	well-known
+keepall	ja	x -1	x -1
+keepall	ja	«a»	«a»
+keepall	ja	α β	α β
+keepall	ja	Ѐѐ	Ѐѐ
+keepall	ja	עברית טקסט	עברית טקסט
+keepall	ja	العربية نص	العربية نص
+keepall	ja	กข	กข
+keepall	ja	ⅠⅡ	ⅠⅡ
+keepall	ja	ⅠⅡⅢ	ⅠⅡⅢ
+keepall	ja	①②	①②
+keepall	ja	「中」	「中」
+keepall	ja	あぁいーう	あぁいーう
+keepall	ja	ァアヽヾ々〻	ァアヽヾ々〻
+keepall	ja	ヽヾゝゞ	ヽヾゝゞ
+keepall	ja	中!中	中!中
+keepall	ja	中1中	中1中
+keepall	ja	中a	中a
+keepall	ja	中abc中	中abc中
+keepall	ja	中a中	中a中
+keepall	ja	中¥100	中¥100
+keepall	ja	中©中	中©中
+keepall	ja	中‐中	中‐中
+keepall	ja	中–中	中–中
+keepall	ja	中—中	中—中
+keepall	ja	中‥中	中‥中
+keepall	ja	中……中	中……中
+keepall	ja	中‼中	中‼中
+keepall	ja	中℃中	中℃中
+keepall	ja	中№中	中№中
+keepall	ja	中　中	中　中
+keepall	ja	中、中	中、中
+keepall	ja	中。中	中。中
+keepall	ja	中〃中	中〃中
+keepall	ja	中々中	中々中
+keepall	ja	中〆中	中〆中
+keepall	ja	中《中》中	中《中》中
+keepall	ja	中〜中	中〜中
+keepall	ja	中〳中	中〳中
+keepall	ja	中ぁ中	中ぁ中
+keepall	ja	中゛中	中゛中
+keepall	ja	中゠中	中゠中
+keepall	ja	中・中	中・中
+keepall	ja	中ー中	中ー中
+keepall	ja	中㍿中	中㍿中
+keepall	ja	中仝中	中仝中
+keepall	ja	中文。文本	中文。文本
+keepall	ja	中：中	中：中
+keepall	ja	中？中	中？中
+keepall	ja	日本語、テスト	日本語、テスト
+keepall	ja	한국어 텍스트	한국어 텍스트
+keepall	ja	ｧｨｩ	ｧｨｩ
+keepall	ja	ｱｲｳ	ｱｲｳ
+keepall	ja	🙂a	🙂a
+keepall	ja	🙂🙂	🙂🙂
+lbnormal		$100 €20 50%	$100 €20 50%
+lbnormal		(中)	(中)
+lbnormal		+(b)	+(b)
+lbnormal		1%中	1%中
+lbnormal		1,000.5	1,000.5
+lbnormal		100%中	100%中
+lbnormal		ABCD-1234	ABCD-1234
+lbnormal		AB中ー	AB中ー
+lbnormal		Hello  world	Hello  world
+lbnormal		a"b"c	a"b"c
+lbnormal		a'b	a'b
+lbnormal		a(b)	a(b)
+lbnormal		a/b	a/b
+lbnormal		abc中def	abc中def
+lbnormal		ab­cd	ab­cd
+lbnormal		a b	a b
+lbnormal		a·b	a·b
+lbnormal		a֊b	a֊b
+lbnormal		a​b	a​b
+lbnormal		a‐b	a‐b
+lbnormal		a—b	a—b
+lbnormal		a․b	a․b
+lbnormal		a‥b	a‥b
+lbnormal		a b	a b
+lbnormal		a⁠b	a⁠b
+lbnormal		a🙂b	a🙂b
+lbnormal		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+lbnormal		well-known	well-known
+lbnormal		x -1	x -1
+lbnormal		α β	α β
+lbnormal		Ѐѐ	Ѐѐ
+lbnormal		עברית טקסט	עברית טקסט
+lbnormal		العربية نص	العربية نص
+lbnormal		ⅠⅡ	ⅠⅡ
+lbnormal		「中」	「中」
+lbnormal		あぁいーう	あぁいーう
+lbnormal		ァアヽヾ々〻	ァアヽヾ々〻
+lbnormal		中!中	中!中
+lbnormal		中?中	中?中
+lbnormal		中abc中	中abc中
+lbnormal		中¢中	中¢中
+lbnormal		中¥1	中¥1
+lbnormal		中¥100	中¥100
+lbnormal		中°中	中°中
+lbnormal		中‐中	中‐中
+lbnormal		中–中	中–中
+lbnormal		中—中	中—中
+lbnormal		中‥中	中‥中
+lbnormal		中……中	中……中
+lbnormal		中…中	中…中
+lbnormal		中‰中	中‰中
+lbnormal		中′中	中′中
+lbnormal		中‼中	中‼中
+lbnormal		中⁇中	中⁇中
+lbnormal		中€中	中€中
+lbnormal		中℃中	中℃中
+lbnormal		中№中	中№中
+lbnormal		中　中	中　中
+lbnormal		中々中	中々中
+lbnormal		中《中》中	中《中》中
+lbnormal		中〜中	中〜中
+lbnormal		中〳中	中〳中
+lbnormal		中ぁ中	中ぁ中
+lbnormal		中゛中	中゛中
+lbnormal		中゠中	中゠中
+lbnormal		中・中	中・中
+lbnormal		中ー中	中ー中
+lbnormal		中ヽ中	中ヽ中
+lbnormal		中㍿中	中㍿中
+lbnormal		中文。文本	中文。文本
+lbnormal		中：中	中：中
+lbnormal		中；中	中；中
+lbnormal		中？中	中？中
+lbnormal		日本語、テスト	日本語、テスト
+lbnormal		한국어 텍스트	한국어 텍스트
+lbnormal		ｧｨｩ	ｧｨｩ
+lbnormal		ｱｲｳ	ｱｲｳ
+lbnormal		🙂🙂	🙂🙂
+lbnormal	ja	$100 €20 50%	$100 €20 50%
+lbnormal	ja	(中)	(中)
+lbnormal	ja	+(b)	+(b)
+lbnormal	ja	1%中	1%中
+lbnormal	ja	1,000.5	1,000.5
+lbnormal	ja	100%中	100%中
+lbnormal	ja	ABCD-1234	ABCD-1234
+lbnormal	ja	AB中ー	AB中ー
+lbnormal	ja	Hello  world	Hello  world
+lbnormal	ja	a"b"c	a"b"c
+lbnormal	ja	a'b	a'b
+lbnormal	ja	a(b)	a(b)
+lbnormal	ja	a/b	a/b
+lbnormal	ja	abc中def	abc中def
+lbnormal	ja	ab­cd	ab­cd
+lbnormal	ja	a b	a b
+lbnormal	ja	a·b	a·b
+lbnormal	ja	a֊b	a֊b
+lbnormal	ja	a​b	a​b
+lbnormal	ja	a‐b	a‐b
+lbnormal	ja	a—b	a—b
+lbnormal	ja	a․b	a․b
+lbnormal	ja	a‥b	a‥b
+lbnormal	ja	a b	a b
+lbnormal	ja	a⁠b	a⁠b
+lbnormal	ja	a🙂b	a🙂b
+lbnormal	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+lbnormal	ja	well-known	well-known
+lbnormal	ja	x -1	x -1
+lbnormal	ja	α β	α β
+lbnormal	ja	Ѐѐ	Ѐѐ
+lbnormal	ja	עברית טקסט	עברית טקסט
+lbnormal	ja	العربية نص	العربية نص
+lbnormal	ja	ⅠⅡ	ⅠⅡ
+lbnormal	ja	「中」	「中」
+lbnormal	ja	あぁいーう	あぁいーう
+lbnormal	ja	ァアヽヾ々〻	ァアヽヾ々〻
+lbnormal	ja	中!中	中!中
+lbnormal	ja	中?中	中?中
+lbnormal	ja	中abc中	中abc中
+lbnormal	ja	中¢中	中¢中
+lbnormal	ja	中¥1	中¥1
+lbnormal	ja	中¥100	中¥100
+lbnormal	ja	中°中	中°中
+lbnormal	ja	中‐中	中‐中
+lbnormal	ja	中–中	中–中
+lbnormal	ja	中—中	中—中
+lbnormal	ja	中‥中	中‥中
+lbnormal	ja	中……中	中……中
+lbnormal	ja	中…中	中…中
+lbnormal	ja	中‰中	中‰中
+lbnormal	ja	中′中	中′中
+lbnormal	ja	中‼中	中‼中
+lbnormal	ja	中⁇中	中⁇中
+lbnormal	ja	中€中	中€中
+lbnormal	ja	中℃中	中℃中
+lbnormal	ja	中№中	中№中
+lbnormal	ja	中　中	中　中
+lbnormal	ja	中々中	中々中
+lbnormal	ja	中《中》中	中《中》中
+lbnormal	ja	中〜中	中〜中
+lbnormal	ja	中〳中	中〳中
+lbnormal	ja	中ぁ中	中ぁ中
+lbnormal	ja	中゛中	中゛中
+lbnormal	ja	中゠中	中゠中
+lbnormal	ja	中・中	中・中
+lbnormal	ja	中ー中	中ー中
+lbnormal	ja	中ヽ中	中ヽ中
+lbnormal	ja	中㍿中	中㍿中
+lbnormal	ja	中文。文本	中文。文本
+lbnormal	ja	中：中	中：中
+lbnormal	ja	中；中	中；中
+lbnormal	ja	中？中	中？中
+lbnormal	ja	日本語、テスト	日本語、テスト
+lbnormal	ja	한국어 텍스트	한국어 텍스트
+lbnormal	ja	ｧｨｩ	ｧｨｩ
+lbnormal	ja	ｱｲｳ	ｱｲｳ
+lbnormal	ja	🙂🙂	🙂🙂
+lbnormal	zh	1%中	1%中
+lbnormal	zh	中!中	中!中
+lbnormal	zh	中?中	中?中
+lbnormal	zh	中¢中	中¢中
+lbnormal	zh	中¥1	中¥1
+lbnormal	zh	中°中	中°中
+lbnormal	zh	中‐中	中‐中
+lbnormal	zh	中–中	中–中
+lbnormal	zh	中‥中	中‥中
+lbnormal	zh	中…中	中…中
+lbnormal	zh	中‰中	中‰中
+lbnormal	zh	中′中	中′中
+lbnormal	zh	中‼中	中‼中
+lbnormal	zh	中⁇中	中⁇中
+lbnormal	zh	中€中	中€中
+lbnormal	zh	中℃中	中℃中
+lbnormal	zh	中々中	中々中
+lbnormal	zh	中〜中	中〜中
+lbnormal	zh	中〳中	中〳中
+lbnormal	zh	中ぁ中	中ぁ中
+lbnormal	zh	中゛中	中゛中
+lbnormal	zh	中゠中	中゠中
+lbnormal	zh	中・中	中・中
+lbnormal	zh	中ー中	中ー中
+lbnormal	zh	中ヽ中	中ヽ中
+lbnormal	zh	中：中	中：中
+lbnormal	zh	中；中	中；中
+loose		$100 €20 50%	$100 €20 50%
+loose		(中)	(中)
+loose		+(b)	+(b)
+loose		1%中	1%中
+loose		1,000.5	1,000.5
+loose		100%中	100%中
+loose		ABCD-1234	ABCD-1234
+loose		AB中ー	AB中ー
+loose		Hello  world	Hello  world
+loose		a"b"c	a"b"c
+loose		a'b	a'b
+loose		a(b)	a(b)
+loose		a/b	a/b
+loose		abc中def	abc中def
+loose		ab­cd	ab­cd
+loose		a b	a b
+loose		a·b	a·b
+loose		a֊b	a֊b
+loose		a​b	a​b
+loose		a‐b	a‐b
+loose		a—b	a—b
+loose		a․b	a․b
+loose		a‥b	a‥b
+loose		a b	a b
+loose		a⁠b	a⁠b
+loose		a🙂b	a🙂b
+loose		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+loose		well-known	well-known
+loose		x -1	x -1
+loose		α β	α β
+loose		Ѐѐ	Ѐѐ
+loose		עברית טקסט	עברית טקסט
+loose		العربية نص	العربية نص
+loose		ⅠⅡ	ⅠⅡ
+loose		「中」	「中」
+loose		あぁいーう	あぁいーう
+loose		ァアヽヾ々〻	ァアヽヾ々〻
+loose		中!中	中!中
+loose		中?中	中?中
+loose		中abc中	中abc中
+loose		中¢中	中¢中
+loose		中¥1	中¥1
+loose		中¥100	中¥100
+loose		中°中	中°中
+loose		中‐中	中‐中
+loose		中–中	中–中
+loose		中—中	中—中
+loose		中‥中	中‥中
+loose		中……中	中……中
+loose		中…中	中…中
+loose		中‰中	中‰中
+loose		中′中	中′中
+loose		中‼中	中‼中
+loose		中⁇中	中⁇中
+loose		中€中	中€中
+loose		中℃中	中℃中
+loose		中№中	中№中
+loose		中　中	中　中
+loose		中々中	中々中
+loose		中《中》中	中《中》中
+loose		中〜中	中〜中
+loose		中〳中	中〳中
+loose		中ぁ中	中ぁ中
+loose		中゛中	中゛中
+loose		中゠中	中゠中
+loose		中・中	中・中
+loose		中ー中	中ー中
+loose		中ヽ中	中ヽ中
+loose		中㍿中	中㍿中
+loose		中文。文本	中文。文本
+loose		中：中	中：中
+loose		中；中	中；中
+loose		中？中	中？中
+loose		日本語、テスト	日本語、テスト
+loose		한국어 텍스트	한국어 텍스트
+loose		ｧｨｩ	ｧｨｩ
+loose		ｱｲｳ	ｱｲｳ
+loose		🙂🙂	🙂🙂
+loose	ja	$100 €20 50%	$100 €20 50%
+loose	ja	(中)	(中)
+loose	ja	+(b)	+(b)
+loose	ja	1%中	1%中
+loose	ja	1,000.5	1,000.5
+loose	ja	100%中	100%中
+loose	ja	ABCD-1234	ABCD-1234
+loose	ja	AB中ー	AB中ー
+loose	ja	Hello  world	Hello  world
+loose	ja	a"b"c	a"b"c
+loose	ja	a'b	a'b
+loose	ja	a(b)	a(b)
+loose	ja	a/b	a/b
+loose	ja	abc中def	abc中def
+loose	ja	ab­cd	ab­cd
+loose	ja	a b	a b
+loose	ja	a·b	a·b
+loose	ja	a֊b	a֊b
+loose	ja	a​b	a​b
+loose	ja	a‐b	a‐b
+loose	ja	a—b	a—b
+loose	ja	a․b	a․b
+loose	ja	a‥b	a‥b
+loose	ja	a b	a b
+loose	ja	a⁠b	a⁠b
+loose	ja	a🙂b	a🙂b
+loose	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+loose	ja	well-known	well-known
+loose	ja	x -1	x -1
+loose	ja	α β	α β
+loose	ja	Ѐѐ	Ѐѐ
+loose	ja	עברית טקסט	עברית טקסט
+loose	ja	العربية نص	العربية نص
+loose	ja	ⅠⅡ	ⅠⅡ
+loose	ja	「中」	「中」
+loose	ja	あぁいーう	あぁいーう
+loose	ja	ァアヽヾ々〻	ァアヽヾ々〻
+loose	ja	中!中	中!中
+loose	ja	中?中	中?中
+loose	ja	中abc中	中abc中
+loose	ja	中¢中	中¢中
+loose	ja	中¥1	中¥1
+loose	ja	中¥100	中¥100
+loose	ja	中°中	中°中
+loose	ja	中‐中	中‐中
+loose	ja	中–中	中–中
+loose	ja	中—中	中—中
+loose	ja	中‥中	中‥中
+loose	ja	中……中	中……中
+loose	ja	中…中	中…中
+loose	ja	中‰中	中‰中
+loose	ja	中′中	中′中
+loose	ja	中‼中	中‼中
+loose	ja	中⁇中	中⁇中
+loose	ja	中€中	中€中
+loose	ja	中℃中	中℃中
+loose	ja	中№中	中№中
+loose	ja	中　中	中　中
+loose	ja	中々中	中々中
+loose	ja	中《中》中	中《中》中
+loose	ja	中〜中	中〜中
+loose	ja	中〳中	中〳中
+loose	ja	中ぁ中	中ぁ中
+loose	ja	中゛中	中゛中
+loose	ja	中゠中	中゠中
+loose	ja	中・中	中・中
+loose	ja	中ー中	中ー中
+loose	ja	中ヽ中	中ヽ中
+loose	ja	中㍿中	中㍿中
+loose	ja	中文。文本	中文。文本
+loose	ja	中：中	中：中
+loose	ja	中；中	中；中
+loose	ja	中？中	中？中
+loose	ja	日本語、テスト	日本語、テスト
+loose	ja	한국어 텍스트	한국어 텍스트
+loose	ja	ｧｨｩ	ｧｨｩ
+loose	ja	ｱｲｳ	ｱｲｳ
+loose	ja	🙂🙂	🙂🙂
+loose	zh	1%中	1%中
+loose	zh	中!中	中!中
+loose	zh	中?中	中?中
+loose	zh	中¢中	中¢中
+loose	zh	中¥1	中¥1
+loose	zh	中°中	中°中
+loose	zh	中‐中	中‐中
+loose	zh	中–中	中–中
+loose	zh	中‥中	中‥中
+loose	zh	中…中	中…中
+loose	zh	中‰中	中‰中
+loose	zh	中′中	中′中
+loose	zh	中‼中	中‼中
+loose	zh	中⁇中	中⁇中
+loose	zh	中€中	中€中
+loose	zh	中℃中	中℃中
+loose	zh	中々中	中々中
+loose	zh	中〜中	中〜中
+loose	zh	中〳中	中〳中
+loose	zh	中ぁ中	中ぁ中
+loose	zh	中゛中	中゛中
+loose	zh	中゠中	中゠中
+loose	zh	中・中	中・中
+loose	zh	中ー中	中ー中
+loose	zh	中ヽ中	中ヽ中
+loose	zh	中：中	中：中
+loose	zh	中；中	中；中
+normal		$100 €20 50%	$100 €20 50%
+normal		(中)	(中)
+normal		+(b)	+(b)
+normal		1%中	1%中
+normal		1,000.5	1,000.5
+normal		100%中	100%中
+normal		1a1	1a1
+normal		ABCD-1234	ABCD-1234
+normal		AB中ー	AB中ー
+normal		Hello  world	Hello  world
+normal		a b	a b
+normal		a!b	a!b
+normal		a"b	a"b
+normal		a"b"c	a"b"c
+normal		a#b	a#b
+normal		a$b	a$b
+normal		a%b	a%b
+normal		a&b	a&b
+normal		a'b	a'b
+normal		a(b	a(b
+normal		a(b)	a(b)
+normal		a)b	a)b
+normal		a*b	a*b
+normal		a+b	a+b
+normal		a,b	a,b
+normal		a-b	a-b
+normal		a.b	a.b
+normal		a/b	a/b
+normal		a1b	a1b
+normal		a:b	a:b
+normal		a=b	a=b
+normal		a?b	a?b
+normal		a@b	a@b
+normal		a_b	a_b
+normal		abc中def	abc中def
+normal		ab­cd	ab­cd
+normal		a b	a b
+normal		a§b	a§b
+normal		a©b	a©b
+normal		aªb	aªb
+normal		a°b	a°b
+normal		a²b	a²b
+normal		a¶b	a¶b
+normal		a·b	a·b
+normal		aºb	aºb
+normal		a×b	a×b
+normal		a÷b	a÷b
+normal		áb	áb
+normal		aαβb	aαβb
+normal		a֊b	a֊b
+normal		a־b	a־b
+normal		a٣b	a٣b
+normal		aกb	aกb
+normal		a b	a b
+normal		a b	a b
+normal		a​b	a​b
+normal		a‐b	a‐b
+normal		a–b	a–b
+normal		a—b	a—b
+normal		a‘b’	a‘b’
+normal		a․b	a․b
+normal		a‥b	a‥b
+normal		a b	a b
+normal		a⁠b	a⁠b
+normal		a№b	a№b
+normal		a　b	a　b
+normal		a、b	a、b
+normal		aアb	aアb
+normal		a中b	a中b
+normal		a🙂b	a🙂b
+normal		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+normal		well-known	well-known
+normal		x -1	x -1
+normal		«a»	«a»
+normal		α β	α β
+normal		Ѐѐ	Ѐѐ
+normal		עברית טקסט	עברית טקסט
+normal		العربية نص	العربية نص
+normal		กข	กข
+normal		ⅠⅡ	ⅠⅡ
+normal		ⅠⅡⅢ	ⅠⅡⅢ
+normal		①②	①②
+normal		「中」	「中」
+normal		あぁいーう	あぁいーう
+normal		ァアヽヾ々〻	ァアヽヾ々〻
+normal		ヽヾゝゞ	ヽヾゝゞ
+normal		中!中	中!中
+normal		中1中	中1中
+normal		中?中	中?中
+normal		中a	中a
+normal		中abc中	中abc中
+normal		中a中	中a中
+normal		中 中	中 中
+normal		中¢中	中¢中
+normal		中¥1	中¥1
+normal		中¥100	中¥100
+normal		中©中	中©中
+normal		中°中	中°中
+normal		中‐中	中‐中
+normal		中–中	中–中
+normal		中—中	中—中
+normal		中‥中	中‥中
+normal		中……中	中……中
+normal		中…中	中…中
+normal		中‰中	中‰中
+normal		中′中	中′中
+normal		中‼中	中‼中
+normal		中⁇中	中⁇中
+normal		中€中	中€中
+normal		中℃中	中℃中
+normal		中№中	中№中
+normal		中　中	中　中
+normal		中、中	中、中
+normal		中。中	中。中
+normal		中〃中	中〃中
+normal		中々中	中々中
+normal		中〆中	中〆中
+normal		中《中》中	中《中》中
+normal		中〜中	中〜中
+normal		中〳中	中〳中
+normal		中ぁ中	中ぁ中
+normal		中゛中	中゛中
+normal		中゠中	中゠中
+normal		中・中	中・中
+normal		中ー中	中ー中
+normal		中ヽ中	中ヽ中
+normal		中㍿中	中㍿中
+normal		中仝中	中仝中
+normal		中文。文本	中文。文本
+normal		中：中	中：中
+normal		中；中	中；中
+normal		中？中	中？中
+normal		日本語、テスト	日本語、テスト
+normal		한국어 텍스트	한국어 텍스트
+normal		ｧｨｩ	ｧｨｩ
+normal		ｱｲｳ	ｱｲｳ
+normal		🙂a	🙂a
+normal		🙂🙂	🙂🙂
+normal	ja	$100 €20 50%	$100 €20 50%
+normal	ja	(中)	(中)
+normal	ja	+(b)	+(b)
+normal	ja	1%中	1%中
+normal	ja	1,000.5	1,000.5
+normal	ja	100%中	100%中
+normal	ja	1a1	1a1
+normal	ja	ABCD-1234	ABCD-1234
+normal	ja	AB中ー	AB中ー
+normal	ja	Hello  world	Hello  world
+normal	ja	a!b	a!b
+normal	ja	a"b	a"b
+normal	ja	a"b"c	a"b"c
+normal	ja	a#b	a#b
+normal	ja	a$b	a$b
+normal	ja	a%b	a%b
+normal	ja	a&b	a&b
+normal	ja	a'b	a'b
+normal	ja	a(b	a(b
+normal	ja	a(b)	a(b)
+normal	ja	a)b	a)b
+normal	ja	a*b	a*b
+normal	ja	a+b	a+b
+normal	ja	a,b	a,b
+normal	ja	a-b	a-b
+normal	ja	a.b	a.b
+normal	ja	a/b	a/b
+normal	ja	a1b	a1b
+normal	ja	a:b	a:b
+normal	ja	a=b	a=b
+normal	ja	a?b	a?b
+normal	ja	a@b	a@b
+normal	ja	a_b	a_b
+normal	ja	abc中def	abc中def
+normal	ja	ab­cd	ab­cd
+normal	ja	a b	a b
+normal	ja	a§b	a§b
+normal	ja	a©b	a©b
+normal	ja	aªb	aªb
+normal	ja	a°b	a°b
+normal	ja	a²b	a²b
+normal	ja	a¶b	a¶b
+normal	ja	a·b	a·b
+normal	ja	aºb	aºb
+normal	ja	a×b	a×b
+normal	ja	a÷b	a÷b
+normal	ja	áb	áb
+normal	ja	aαβb	aαβb
+normal	ja	a֊b	a֊b
+normal	ja	a־b	a־b
+normal	ja	a٣b	a٣b
+normal	ja	aกb	aกb
+normal	ja	a​b	a​b
+normal	ja	a‐b	a‐b
+normal	ja	a–b	a–b
+normal	ja	a—b	a—b
+normal	ja	a‘b’	a‘b’
+normal	ja	a․b	a․b
+normal	ja	a‥b	a‥b
+normal	ja	a b	a b
+normal	ja	a⁠b	a⁠b
+normal	ja	a№b	a№b
+normal	ja	a、b	a、b
+normal	ja	aアb	aアb
+normal	ja	a中b	a中b
+normal	ja	a🙂b	a🙂b
+normal	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+normal	ja	well-known	well-known
+normal	ja	x -1	x -1
+normal	ja	«a»	«a»
+normal	ja	α β	α β
+normal	ja	Ѐѐ	Ѐѐ
+normal	ja	עברית טקסט	עברית טקסט
+normal	ja	العربية نص	العربية نص
+normal	ja	กข	กข
+normal	ja	ⅠⅡ	ⅠⅡ
+normal	ja	ⅠⅡⅢ	ⅠⅡⅢ
+normal	ja	①②	①②
+normal	ja	「中」	「中」
+normal	ja	あぁいーう	あぁいーう
+normal	ja	ァアヽヾ々〻	ァアヽヾ々〻
+normal	ja	ヽヾゝゞ	ヽヾゝゞ
+normal	ja	中!中	中!中
+normal	ja	中1中	中1中
+normal	ja	中?中	中?中
+normal	ja	中a	中a
+normal	ja	中abc中	中abc中
+normal	ja	中a中	中a中
+normal	ja	中¢中	中¢中
+normal	ja	中¥1	中¥1
+normal	ja	中¥100	中¥100
+normal	ja	中©中	中©中
+normal	ja	中°中	中°中
+normal	ja	中‐中	中‐中
+normal	ja	中–中	中–中
+normal	ja	中—中	中—中
+normal	ja	中‥中	中‥中
+normal	ja	中……中	中……中
+normal	ja	中…中	中…中
+normal	ja	中‰中	中‰中
+normal	ja	中′中	中′中
+normal	ja	中‼中	中‼中
+normal	ja	中⁇中	中⁇中
+normal	ja	中€中	中€中
+normal	ja	中℃中	中℃中
+normal	ja	中№中	中№中
+normal	ja	中　中	中　中
+normal	ja	中、中	中、中
+normal	ja	中。中	中。中
+normal	ja	中〃中	中〃中
+normal	ja	中々中	中々中
+normal	ja	中〆中	中〆中
+normal	ja	中《中》中	中《中》中
+normal	ja	中〜中	中〜中
+normal	ja	中〳中	中〳中
+normal	ja	中ぁ中	中ぁ中
+normal	ja	中゛中	中゛中
+normal	ja	中゠中	中゠中
+normal	ja	中・中	中・中
+normal	ja	中ー中	中ー中
+normal	ja	中ヽ中	中ヽ中
+normal	ja	中㍿中	中㍿中
+normal	ja	中仝中	中仝中
+normal	ja	中文。文本	中文。文本
+normal	ja	中：中	中：中
+normal	ja	中；中	中；中
+normal	ja	中？中	中？中
+normal	ja	日本語、テスト	日本語、テスト
+normal	ja	한국어 텍스트	한국어 텍스트
+normal	ja	ｧｨｩ	ｧｨｩ
+normal	ja	ｱｲｳ	ｱｲｳ
+normal	ja	🙂a	🙂a
+normal	ja	🙂🙂	🙂🙂
+normal	zh	1%中	1%中
+normal	zh	中!中	中!中
+normal	zh	中?中	中?中
+normal	zh	中¢中	中¢中
+normal	zh	中¥1	中¥1
+normal	zh	中°中	中°中
+normal	zh	中‐中	中‐中
+normal	zh	中–中	中–中
+normal	zh	中‥中	中‥中
+normal	zh	中…中	中…中
+normal	zh	中‰中	中‰中
+normal	zh	中′中	中′中
+normal	zh	中‼中	中‼中
+normal	zh	中⁇中	中⁇中
+normal	zh	中€中	中€中
+normal	zh	中℃中	中℃中
+normal	zh	中々中	中々中
+normal	zh	中〜中	中〜中
+normal	zh	中〳中	中〳中
+normal	zh	中ぁ中	中ぁ中
+normal	zh	中゛中	中゛中
+normal	zh	中゠中	中゠中
+normal	zh	中・中	中・中
+normal	zh	中ー中	中ー中
+normal	zh	中ヽ中	中ヽ中
+normal	zh	中：中	中：中
+normal	zh	中；中	中；中
+strict		$100 €20 50%	$100 €20 50%
+strict		(中)	(中)
+strict		+(b)	+(b)
+strict		1%中	1%中
+strict		1,000.5	1,000.5
+strict		100%中	100%中
+strict		ABCD-1234	ABCD-1234
+strict		AB中ー	AB中ー
+strict		Hello  world	Hello  world
+strict		a"b"c	a"b"c
+strict		a'b	a'b
+strict		a(b)	a(b)
+strict		a/b	a/b
+strict		abc中def	abc中def
+strict		ab­cd	ab­cd
+strict		a b	a b
+strict		a·b	a·b
+strict		a֊b	a֊b
+strict		a​b	a​b
+strict		a‐b	a‐b
+strict		a—b	a—b
+strict		a․b	a․b
+strict		a‥b	a‥b
+strict		a b	a b
+strict		a⁠b	a⁠b
+strict		a🙂b	a🙂b
+strict		http://a.b/c?d=e&f	http://a.b/c?d=e&f
+strict		well-known	well-known
+strict		x -1	x -1
+strict		α β	α β
+strict		Ѐѐ	Ѐѐ
+strict		עברית טקסט	עברית טקסט
+strict		العربية نص	العربية نص
+strict		ⅠⅡ	ⅠⅡ
+strict		「中」	「中」
+strict		あぁいーう	あぁいーう
+strict		ァアヽヾ々〻	ァアヽヾ々〻
+strict		中!中	中!中
+strict		中?中	中?中
+strict		中abc中	中abc中
+strict		中¢中	中¢中
+strict		中¥1	中¥1
+strict		中¥100	中¥100
+strict		中°中	中°中
+strict		中‐中	中‐中
+strict		中–中	中–中
+strict		中—中	中—中
+strict		中‥中	中‥中
+strict		中……中	中……中
+strict		中…中	中…中
+strict		中‰中	中‰中
+strict		中′中	中′中
+strict		中‼中	中‼中
+strict		中⁇中	中⁇中
+strict		中€中	中€中
+strict		中℃中	中℃中
+strict		中№中	中№中
+strict		中　中	中　中
+strict		中々中	中々中
+strict		中《中》中	中《中》中
+strict		中〜中	中〜中
+strict		中〳中	中〳中
+strict		中ぁ中	中ぁ中
+strict		中゛中	中゛中
+strict		中゠中	中゠中
+strict		中・中	中・中
+strict		中ー中	中ー中
+strict		中ヽ中	中ヽ中
+strict		中㍿中	中㍿中
+strict		中文。文本	中文。文本
+strict		中：中	中：中
+strict		中；中	中；中
+strict		中？中	中？中
+strict		日本語、テスト	日本語、テスト
+strict		한국어 텍스트	한국어 텍스트
+strict		ｧｨｩ	ｧｨｩ
+strict		ｱｲｳ	ｱｲｳ
+strict		🙂🙂	🙂🙂
+strict	ja	$100 €20 50%	$100 €20 50%
+strict	ja	(中)	(中)
+strict	ja	+(b)	+(b)
+strict	ja	1%中	1%中
+strict	ja	1,000.5	1,000.5
+strict	ja	100%中	100%中
+strict	ja	ABCD-1234	ABCD-1234
+strict	ja	AB中ー	AB中ー
+strict	ja	Hello  world	Hello  world
+strict	ja	a"b"c	a"b"c
+strict	ja	a'b	a'b
+strict	ja	a(b)	a(b)
+strict	ja	a/b	a/b
+strict	ja	abc中def	abc中def
+strict	ja	ab­cd	ab­cd
+strict	ja	a b	a b
+strict	ja	a·b	a·b
+strict	ja	a֊b	a֊b
+strict	ja	a​b	a​b
+strict	ja	a‐b	a‐b
+strict	ja	a—b	a—b
+strict	ja	a․b	a․b
+strict	ja	a‥b	a‥b
+strict	ja	a b	a b
+strict	ja	a⁠b	a⁠b
+strict	ja	a🙂b	a🙂b
+strict	ja	http://a.b/c?d=e&f	http://a.b/c?d=e&f
+strict	ja	well-known	well-known
+strict	ja	x -1	x -1
+strict	ja	α β	α β
+strict	ja	Ѐѐ	Ѐѐ
+strict	ja	עברית טקסט	עברית טקסט
+strict	ja	العربية نص	العربية نص
+strict	ja	ⅠⅡ	ⅠⅡ
+strict	ja	「中」	「中」
+strict	ja	あぁいーう	あぁいーう
+strict	ja	ァアヽヾ々〻	ァアヽヾ々〻
+strict	ja	中!中	中!中
+strict	ja	中?中	中?中
+strict	ja	中abc中	中abc中
+strict	ja	中¢中	中¢中
+strict	ja	中¥1	中¥1
+strict	ja	中¥100	中¥100
+strict	ja	中°中	中°中
+strict	ja	中‐中	中‐中
+strict	ja	中–中	中–中
+strict	ja	中—中	中—中
+strict	ja	中‥中	中‥中
+strict	ja	中……中	中……中
+strict	ja	中…中	中…中
+strict	ja	中‰中	中‰中
+strict	ja	中′中	中′中
+strict	ja	中‼中	中‼中
+strict	ja	中⁇中	中⁇中
+strict	ja	中€中	中€中
+strict	ja	中℃中	中℃中
+strict	ja	中№中	中№中
+strict	ja	中　中	中　中
+strict	ja	中々中	中々中
+strict	ja	中《中》中	中《中》中
+strict	ja	中〜中	中〜中
+strict	ja	中〳中	中〳中
+strict	ja	中ぁ中	中ぁ中
+strict	ja	中゛中	中゛中
+strict	ja	中゠中	中゠中
+strict	ja	中・中	中・中
+strict	ja	中ー中	中ー中
+strict	ja	中ヽ中	中ヽ中
+strict	ja	中㍿中	中㍿中
+strict	ja	中文。文本	中文。文本
+strict	ja	中：中	中：中
+strict	ja	中；中	中；中
+strict	ja	中？中	中？中
+strict	ja	日本語、テスト	日本語、テスト
+strict	ja	한국어 텍스트	한국어 텍스트
+strict	ja	ｧｨｩ	ｧｨｩ
+strict	ja	ｱｲｳ	ｱｲｳ
+strict	ja	🙂🙂	🙂🙂
+strict	zh	1%中	1%中
+strict	zh	中!中	中!中
+strict	zh	中?中	中?中
+strict	zh	中¢中	中¢中
+strict	zh	中¥1	中¥1
+strict	zh	中°中	中°中
+strict	zh	中‐中	中‐中
+strict	zh	中–中	中–中
+strict	zh	中‥中	中‥中
+strict	zh	中…中	中…中
+strict	zh	中‰中	中‰中
+strict	zh	中′中	中′中
+strict	zh	中‼中	中‼中
+strict	zh	中⁇中	中⁇中
+strict	zh	中€中	中€中
+strict	zh	中℃中	中℃中
+strict	zh	中々中	中々中
+strict	zh	中〜中	中〜中
+strict	zh	中〳中	中〳中
+strict	zh	中ぁ中	中ぁ中
+strict	zh	中゛中	中゛中
+strict	zh	中゠中	中゠中
+strict	zh	中・中	中・中
+strict	zh	中ー中	中ー中
+strict	zh	中ヽ中	中ヽ中
+strict	zh	中：中	中：中
+strict	zh	中；中	中；中

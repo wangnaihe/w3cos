@@ -145,9 +145,21 @@ fn finish_headless_frame(
     root: &w3cos_std::Component,
     layout_results: &layout::LayoutResults,
 ) -> Result<HeadlessFrame> {
+    if crate::webgl_draw::has_live_contexts() {
+        let flat = layout::pre_flatten(root);
+        crate::webgl_draw::publish_drawing_buffers(flat.iter().enumerate().filter_map(
+            |(index, node)| match &node.on_click {
+                w3cos_std::EventAction::NativeHost { id, .. } => {
+                    u32::try_from(*id).ok().map(|id| (index, id))
+                }
+                _ => None,
+            },
+        ));
+    }
     let structure = crate::dom::with_document(|document| document.structure_generation());
     let reuse = crate::incremental_layout::take_paint_reuse();
     if reuse != crate::incremental_layout::PaintReuse::None
+        && layout_results.text_fragments.is_empty()
         && let Some(frame) = reuse_retained_paint(
             structure,
             reuse,
@@ -219,6 +231,7 @@ fn finish_headless_frame(
         body_index,
         Some((width as f32, height as f32)),
     );
+    artifact.set_text_fragments(&layout_results.text_fragments);
     artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
     let faded = artifact.ancestor_faded_styles();
     let mut nodes = artifact
@@ -294,13 +307,14 @@ fn finish_headless_frame(
     let scroll_offsets = layout_results
         .scrollable_nodes
         .iter()
-        .filter_map(|(index, _, _)| {
+        .filter_map(|(index, _, extent)| {
             let w3cos_std::EventAction::NativeHost { id, .. } = flat[*index].on_click else {
                 return None;
             };
-            u32::try_from(*id)
-                .ok()
-                .map(|node| (*index, crate::dom::get_scroll_offset(node)))
+            u32::try_from(*id).ok().map(|node| {
+                let (x, y) = crate::dom::get_scroll_offset(node);
+                (*index, clamp_scroll_offset_ng(x, y, extent))
+            })
         })
         .collect::<HashMap<_, _>>();
     let scroll_info = crate::window::build_headless_scroll_info(
@@ -344,7 +358,7 @@ fn reuse_retained_paint(
         let Some(retained) = slot.as_mut() else {
             return Ok(None);
         };
-        if retained.structure != structure {
+        if retained.structure != structure || !retained.artifact.text_fragments.is_empty() {
             return Ok(None);
         }
         retained.artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
@@ -492,13 +506,14 @@ fn paint_retained_artifact(
     let scroll_offsets = layout_results
         .scrollable_nodes
         .iter()
-        .filter_map(|(index, _, _)| {
+        .filter_map(|(index, _, extent)| {
             let w3cos_std::EventAction::NativeHost { id, .. } = flat[*index].on_click else {
                 return None;
             };
-            u32::try_from(*id)
-                .ok()
-                .map(|node| (*index, crate::dom::get_scroll_offset(node)))
+            u32::try_from(*id).ok().map(|node| {
+                let (x, y) = crate::dom::get_scroll_offset(node);
+                (*index, clamp_scroll_offset_ng(x, y, extent))
+            })
         })
         .collect::<HashMap<_, _>>();
     let scroll_info = crate::window::build_headless_scroll_info(
@@ -934,4 +949,18 @@ mod tests {
             &after.rgba[pixel..pixel + 4]
         );
     }
+}
+
+/// A scroll offset cannot exceed the scrollable overflow. LayoutNG computes
+/// that extent itself, so an offset script set past it (`scrollLeft = 100` on
+/// a box with no overflow) is clamped as a browser does. The legacy path keeps
+/// applying offsets unclamped, as it always has.
+fn clamp_scroll_offset_ng(x: f32, y: f32, extent: &crate::layout::ScrollExtent) -> (f32, f32) {
+    if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
+        return (x, y);
+    }
+    (
+        x.clamp(0.0, extent.max_x.max(0.0)),
+        y.clamp(0.0, extent.max_y.max(0.0)),
+    )
 }

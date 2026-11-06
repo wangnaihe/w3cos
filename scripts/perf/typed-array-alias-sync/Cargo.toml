@@ -1,0 +1,19 @@
+[package]
+name = "alias-sync-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+w3cos-core = { path = "../../../crates/w3cos-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "alias-sync-bench"
+path = "main.rs"

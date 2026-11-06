@@ -1,0 +1,347 @@
+{
+ "browser": "Google Chrome 156.0.8078.80",
+ "cases": [
+  {
+   "name": "left",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:left'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     0,
+     50,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "right",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:right'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     100,
+     50,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "center",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:center'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     50,
+     50,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "float-left",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:left'><div id=f style='float:left;width:50px;height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     0,
+     0,
+     50,
+     50
+    ],
+    "a": [
+     50,
+     0,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "float-left-right-align",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:right'><div id=f style='float:left;width:50px;height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     0,
+     0,
+     50,
+     50
+    ],
+    "a": [
+     100,
+     0,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "float-right",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:left'><div id=f style='float:right;width:50px;height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     50,
+     0,
+     50,
+     50
+    ],
+    "a": [
+     0,
+     0,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "float-right-right-align",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:right'><div id=f style='float:right;width:50px;height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     50,
+     0,
+     50,
+     50
+    ],
+    "a": [
+     50,
+     0,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "float-left-center",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:center'><div id=f style='float:left;width:50px;height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     0,
+     0,
+     50,
+     50
+    ],
+    "a": [
+     75,
+     0,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "rtl",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;direction:rtl'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     50,
+     50,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "rtl-text-left",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;direction:rtl;text-align:left'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     -50,
+     50,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "rtl-float-right",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;direction:rtl'><div id=f style='float:right;width:50px;height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     50,
+     0,
+     50,
+     50
+    ],
+    "a": [
+     0,
+     0,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "float-then-flow",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:left'><div id=f style='float:left;width:50px;height:50px'></div><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "f": [
+     0,
+     0,
+     50,
+     50
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     0,
+     50,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "inset-top",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:right'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px;top:10px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     0,
+     0,
+     100,
+     50
+    ],
+    "a": [
+     100,
+     10,
+     50,
+     50
+    ]
+   }
+  },
+  {
+   "name": "padding",
+   "html": "<div id=c style='width:100px;height:100px;position:relative;text-align:center;padding:0 10px;box-sizing:content-box;width:80px'><div id=i style='height:50px'></div><div id=a style='display:inline;position:absolute;width:50px;height:50px'></div></div>",
+   "rects": {
+    "c": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "i": [
+     10,
+     0,
+     80,
+     50
+    ],
+    "a": [
+     50,
+     50,
+     50,
+     50
+    ]
+   }
+  }
+ ]
+}

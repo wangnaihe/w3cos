@@ -488,6 +488,7 @@ impl AttrList {
     }
 }
 
+#[derive(Clone)]
 pub struct AttrIter<'a> {
     list: &'a AttrList,
     index: usize,
@@ -724,6 +725,10 @@ impl AttributeNamespaceList {
         self.values
             .get_or_insert_with(|| Box::new(Vec::new()))
             .push(attribute);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_none()
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&AttributeNamespace) -> bool) {

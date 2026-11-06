@@ -1,6 +1,5 @@
 //! Baselines exported by the first row of an atomic inline table.
 use crate::layout::{LayoutRect, count_nodes, inline_font_content_ascent};
-use std::collections::HashMap;
 use w3cos_std::style::{Display, Float, Position};
 use w3cos_std::{Component, ComponentKind};
 
@@ -8,7 +7,7 @@ pub(crate) fn first_row(
     component: &Component,
     index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &crate::layout::LayoutPositions,
 ) -> Option<f32> {
     fn in_flow(component: &Component) -> bool {
         component.style.display != Display::None
@@ -22,7 +21,7 @@ pub(crate) fn first_row(
         component: &Component,
         index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<f32> {
         if !in_flow(component) {
             return None;
@@ -88,7 +87,7 @@ pub(crate) fn first_row(
         component: &Component,
         index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<f32> {
         // DOM lowering can retain a text-only row as one leaf instead of
         // materializing its anonymous cell/inline wrappers. That leaf still
@@ -116,7 +115,7 @@ pub(crate) fn first_row(
         component: &Component,
         index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &crate::layout::LayoutPositions,
     ) -> Option<f32> {
         let mut child_index = index + 1;
         for child in &component.children {

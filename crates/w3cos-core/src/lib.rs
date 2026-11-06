@@ -1,10 +1,12 @@
 pub mod aot_frame;
+pub mod aot_slots;
 pub mod bigint;
 pub mod binary;
 mod builtins;
 pub mod class;
 pub mod collections;
 pub mod fast_hash;
+pub mod fxhash;
 pub mod heap;
 pub mod host;
 pub mod host_modules;
@@ -37,6 +39,7 @@ mod value;
 pub mod weak;
 pub mod web;
 
+pub use aot_slots::SparseSlots;
 pub use builtins::{
     Array, Error, ErrorValue, Map, Math, Object, RangeError, ResizeObserver, Set, array_value,
     boolean_value, console, dispatch_resize_observers, dispatch_resize_observers_bounded, document,

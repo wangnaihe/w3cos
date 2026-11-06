@@ -105,13 +105,82 @@ The ordinary probe reaches the real DOM/jsdom runtime without `dynamic-js`. The
 browser probe incrementally parses an environment-overridable HTML document,
 executes its script-driven DOM mutation through SWC → W3IR → W3VM, and keeps
 the network script loader, WOFF/WOFF2 decoder, and configurable persistent-cache path
-runtime-reachable through opt-in environment inputs. CI runs both binaries,
-audits them against
-the `aot` and `browser` budgets, and uploads separate JSON reports. The Browser
-report also uses the AOT executable from the same runner as its baseline and
-fails if the dynamic linkage increment exceeds 50%. This architecture-local
-comparison makes accidental compiler/VM/fetch-cache dependency growth visible
-while measuring the actual stripped executable instead of the audit tool itself.
+runtime-reachable through opt-in environment inputs. CI builds both with
+`CARGO_PROFILE_RELEASE_SIZE_STRIP=none`, keeps those binaries for symbol
+attribution, and measures a `strip --strip-all` copy. `scripts/audit-linkage-sizes.sh`
+writes JSON and markdown reports. The Browser report also uses the AOT
+executable from the same runner as its baseline and fails if the dynamic
+linkage increment exceeds 50%. This architecture-local comparison makes
+accidental compiler/VM/fetch-cache dependency growth visible while measuring
+the actual stripped executable instead of the audit tool itself.
+
+Each report records executable text, file-backed data, read-only data, bss,
+gzip level 9 of the stripped bytes (the download-size proxy), and embedded
+font/image containers plus any asset files from `crates/w3cos-runtime/assets`
+whose bytes occur in the binary. On the `x86_64-unknown-linux-gnu` probes
+below, that embedded scan is 0 bytes: the packaged faces are not in ordinary
+AOT or dynamic-browser linkage. Pass `--compressed` when a real package
+archive exists; that size is recorded separately from the gzip proxy.
+
+Symbol attribution reads the unstripped symbol table (the same class of
+measurement as `cargo bloat`). It reports crate totals, the largest symbols,
+and feature buckets. Feature buckets are symbol-table bytes, can overlap, and
+are not a second link. A zero means those crates were absent. `tiny-skia`
+bytes are left on the crate row because resvg also links that crate; the
+`cpu-render` bucket counts `softbuffer` only.
+
+CI fails a probe when its stripped size grows by more than 3% or more than
+200 KiB versus the checked-in row for the same rustc host triple in
+`tools/size-audit/baselines/linkage-probes.json`. A missing triple is not a
+failure on a local run and is a failure in CI (`--require-baseline`), so an
+arm64 measurement is never compared with an x86_64 runner. To accept a new
+size, rerun on that same triple and review the diff:
+
+```sh
+scripts/audit-linkage-sizes.sh --update-baseline --baseline-note "why the size changed"
+```
+
+The historical full-runtime Monaco artifact (about 172 MB unstripped / 120 MB
+stripped on arm64 macOS) is not a CI gate. It mixed application modules with
+every default feature. The reproducible replacements are the per-closure rows
+in the baseline file, with per-feature symbol bytes beside them. Render, font,
+and image-codec product slices are not given a new absolute baseline here.
+
+On `x86_64-unknown-linux-gnu` with Rust 1.99.1, after `strip --strip-all`, the
+checked-in rows are:
+
+| Probe | Stripped bytes | text | data | gzip -9 | Embedded |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ordinary AOT | 11,877,576 | 7,726,552 | 3,338,845 | 5,095,951 | 0 |
+| dynamic browser | 15,372,632 | 9,963,144 | 4,399,109 | 6,693,042 | 0 |
+
+Data includes read-only data (2,703,813 bytes AOT, 3,586,561 bytes browser).
+The same-runner dynamic increment is 3,495,056 bytes (29.43% of the AOT
+probe). Symbol attribution assigns 686,785 of the browser symbol bytes to
+`dynamic-js` crates and 192,080 to image-codec crates. Ordinary AOT's
+image-codec bucket is 0. Those codec bytes are reported only; codec
+selection is a separate change. `web-bluetooth` is off in both probes, and
+its `btleplug` symbol bucket is 0.
+
+Moving `navigator.w3cos.tray` and `navigator.w3cos.keyring` behind `host-tray`
+and `host-keyring` removed them from both probes. The runtime `default`
+feature set and `w3cos-shell` still enable both, and the shell also enables
+`web-geolocation` and `web-bluetooth`. A generated app uses `default-features = false`, so it
+enables them with `W3COS_RUNTIME_FEATURES=host-tray,host-keyring` or by
+listing those Cargo features. Without the feature the call rejects
+`NotSupportedError`. Measured on this same toolchain and strip, before that
+bluetooth code was in the tree, ordinary AOT fell from 12,814,744 to
+11,884,064 bytes (930,680 bytes, 7.26%) and its gzip proxy from 5,497,725 to
+5,100,001. The browser probe fell from 16,621,992 to 15,694,896 bytes
+(927,096 bytes, 5.58%). Calls without the feature reject `NotSupportedError`
+and do not install an icon or store a secret. Desktop `web-bluetooth` landing
+with the feature still off, and with no `btleplug` symbols, then added 21,376
+bytes to ordinary AOT and 23,808 bytes to the browser probe. Desktop
+`web-geolocation` landing the same way, still off, added another 26,792 bytes
+to ordinary AOT and 32,040 bytes to the browser probe. Merging explicit image
+codecs and the SVG GPU path, with the codecs still off in these two probes,
+then moved the checked-in rows from 11,932,232 / 15,750,744 to 11,877,576 /
+15,372,632 (−54,656 and −378,112). Those last sizes are the rows above.
 
 On the current arm64 macOS measurement, the stripped probes are 6,083,264 bytes
 for ordinary AOT and 7,148,896 bytes for dynamic Browser linkage: a 1,065,632-byte
@@ -120,6 +189,50 @@ for ordinary AOT and 7,148,896 bytes for dynamic Browser linkage: a 1,065,632-by
 compiler, W3IR, W3VM, dynamic loader, and WOFF/WOFF2 decoder. These are host
 linkage lower bounds, not mobile product-package baselines: neither includes a renderer, packaged fonts,
 application assets, ABI packaging overhead, or platform native libraries.
+
+### Linux host probes for the standalone mobile closure (2026-10-21)
+
+Same machine, `x86_64-unknown-linux-gnu`, rustc 1.99.1
+(`58cf8f9c3 2026-10-13`), `--profile release-size`, symbols stripped. Each
+probe touches DOM/jsdom through `document.body.setAttribute` /
+`getAttribute`. Byte counts are `stat` of the ELF, not a compressed package
+and not an Android ABI split or iOS device slice. Shared libraries reported
+by `ldd` are outside the executable.
+
+| Probe | Features beyond the DOM touch | Bytes | `size` text / data / bss |
+| --- | --- | ---: | --- |
+| Ordinary AOT at `ff70045` | none (workspace `image` features were still unconditional; the probe never calls a decoder) | 12,839,200 | not re-sectioned |
+| Ordinary AOT after explicit codecs | none (`image` is `default-features = false`; no renderer) | 12,796,192 | 12,138,773 / 651,176 / 22,920 |
+| `mobile-skia` | `skia`, `image-png`, `image-jpeg`, `image-webp`, plus `distribution_linkage_anchor` | 16,057,800 | 15,284,451 / 769,080 / 28,189 |
+| `mobile-legacy` (diagnostic, not a generated mobile manifest and not a CI build) | `mobile-skia` plus `cpu-render`, `image-gif`, `image-bmp`, `image-ico` | 16,114,328 | 15,337,927 / 772,208 / 29,141 |
+
+The ordinary AOT executable shrank by 43,008 bytes. Fat LTO had already
+discarded unreferenced decoder code at `ff70045`, so this delta is the
+feature-gated residue, not a claim that PNG/JPEG/WebP previously occupied
+megabytes of the AOT probe. Adding Skia and those three decoders, and calling
+them from the anchor, costs 3,261,608 bytes over the after-AOT probe (text
++3,145,678, data +117,904).
+
+The Skia probe's dynamic dependencies add `libstdc++`, `libfontconfig`,
+`libfreetype`, and `libpng16` on top of the AOT probe's `libsqlite3`,
+`libX11`, and `libXss`. Its strings include Skia `.cpp` paths and the PNG,
+JPEG, and WebP decoders. They do not include `vello`, `wgpu`, `softbuffer`,
+`tiny-skia`, `ravif`, `rav1e`, or `CJK-Subset`. `assets/CJK-Subset.ttf` on
+disk is 10,028,840 bytes and is not linked unless `embed-cjk-font` is on.
+16,057,800 bytes is under the 60 MiB `runtime` budget for this host probe.
+That does not close the per-ABI product gate.
+
+`mobile-legacy` is 56,528 bytes larger than `mobile-skia` (text +53,476, data
++3,128). Strings that appear only in that binary include `gif` 0.14.2 and
+`image` `codecs/bmp/decoder.rs`, plus the anchor label `cpu:`. `softbuffer`
+and `tiny-skia` path strings are absent: the probe constructs an 8x8 pixmap
+and the extra decoders, and fat LTO drops the unused software presenter.
+56,528 bytes is that residue, not the cost of a second full renderer. Generated
+mobile manifests do not enable this combination.
+
+CI builds `w3cos-mobile-skia-size-probe` with `--features mobile-skia` and
+`--profile release-size`, requires stdout `mobile-skia`, and audits it with
+`w3cos-size-audit --profile runtime`.
 
 Mobile release gates must audit an Android App Bundle device/ABI split and an iOS
 App Store device slice. Universal simulator builds are diagnostic only and must

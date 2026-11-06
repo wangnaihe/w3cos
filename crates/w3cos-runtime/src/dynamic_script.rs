@@ -165,6 +165,47 @@ pub struct ScriptLoader {
     inner: Rc<ScriptLoaderInner>,
 }
 
+/// A JS exception that escaped a classic script.  The thrown value is not
+/// `Send`, so it is parked in a thread-local until the HTML script-execution
+/// step takes it to "report the exception" on the global.
+#[derive(Debug)]
+struct UncaughtScriptException(String);
+
+impl std::fmt::Display for UncaughtScriptException {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UncaughtScriptException {}
+
+thread_local! {
+    static UNCAUGHT_SCRIPT_EXCEPTION: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+fn script_error_from_vm(error: w3cos_vm::VmError) -> anyhow::Error {
+    let message = error.to_string();
+    if let w3cos_vm::VmError::Thrown(value) = error {
+        UNCAUGHT_SCRIPT_EXCEPTION.with(|slot| *slot.borrow_mut() = Some(value));
+        return anyhow::Error::new(UncaughtScriptException(message));
+    }
+    anyhow!(message)
+}
+
+/// HTML "run a classic script" step 8: an uncaught exception is reported on
+/// the global and script processing continues.  Returns false for errors that
+/// are not script exceptions.
+fn report_uncaught_script_exception(error: &anyhow::Error, filename: &str) -> bool {
+    if error.downcast_ref::<UncaughtScriptException>().is_none() {
+        return false;
+    }
+    let value = UNCAUGHT_SCRIPT_EXCEPTION
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(|| Value::string(&error.to_string()));
+    crate::reporting_web::report_exception(value, filename);
+    true
+}
+
 impl ParserScriptHost for ScriptLoader {
     fn begin_document_parse(&self, document_url: &str) -> Result<()> {
         ScriptLoader::begin_document_parse(self, document_url)
@@ -1799,7 +1840,7 @@ impl ScriptLoader {
         Vm::new(module, self.inner.policy.limits)
             .map_err(|error| anyhow!(error.to_string()))?
             .run_with_cells(bindings)
-            .map_err(|error| anyhow!(error.to_string()))
+            .map_err(script_error_from_vm)
     }
 
     fn classic_lexical_declaration_binding(&self, name: &str) -> BindingCell {
@@ -6490,6 +6531,9 @@ impl ScriptLoader {
                 Ok(None) => {
                     executed += 1;
                 }
+                Err(error) if report_uncaught_script_exception(&error, document_url) => {
+                    executed += 1;
+                }
                 Err(error) => {
                     let onerror = element.get_property("onerror");
                     if !onerror.is_null() && !onerror.is_undefined() {
@@ -8435,6 +8479,9 @@ impl ScriptLoader {
             .map_err(|error| anyhow!(error))
             .and_then(|source| self.execute_source(&source, url));
         match execution {
+            Err(error) if report_uncaught_script_exception(&error, url) => {
+                crate::jsdom::drain_microtasks();
+            }
             Ok(_) => {
                 let onload = element.get_property("onload");
                 if !onload.is_null() && !onload.is_undefined() {
@@ -9927,23 +9974,22 @@ fn parse_source_size_length(
 }
 
 fn is_decodable_picture_type(content_type: &str) -> bool {
-    matches!(
-        content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "image/png"
-            | "image/jpeg"
-            | "image/gif"
-            | "image/webp"
-            | "image/apng"
-            | "image/bmp"
-            | "image/x-icon"
-            | "image/vnd.microsoft.icon"
-    )
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" | "image/apng" => cfg!(feature = "image-png"),
+        "image/jpeg" => cfg!(feature = "image-jpeg"),
+        "image/gif" => cfg!(feature = "image-gif"),
+        "image/webp" => cfg!(feature = "image-webp"),
+        "image/bmp" => cfg!(feature = "image-bmp"),
+        "image/x-icon" | "image/vnd.microsoft.icon" => cfg!(feature = "image-ico"),
+        _ => false,
+    }
 }
 
 /// Native lazy-loading policy. Images with established layout boxes are
@@ -10629,6 +10675,39 @@ mod tests {
         assert!(
             !text.contains("page loading"),
             "parser kept the pre-script text: {text}"
+        );
+    }
+
+    #[test]
+    fn uncaught_classic_script_exception_is_reported_and_parsing_continues() {
+        // HTML "run a classic script": an uncaught exception is reported on
+        // the global (ErrorEvent at window) and later scripts and markup
+        // still run; the document load does not fail.
+        let html = r#"<!doctype html><html><body>
+            <script>
+              window.reported = [];
+              window.addEventListener("error", function (event) {
+                window.reported.push(event.message + "|" + (event.error instanceof Error));
+              });
+            </script>
+            <script>notDefinedAnywhere();</script>
+            <script>throw new Error("boom");</script>
+            <p id="after">tail</p>
+            <script>document.getElementById("after").textContent = "ran " + window.reported.length;</script>
+        </body></html>"#;
+        load_html_on_shared_vm(html, "https://shared.w3cos.local/throws.html").unwrap();
+        let text = crate::dom::get_descendant_text_content(crate::dom::body_id());
+        assert!(
+            text.contains("ran 2"),
+            "later script did not run after exceptions: {text}"
+        );
+        let reported = crate::jsdom::window_value()
+            .get_property("reported")
+            .call_method("join", vec![Value::string(",")])
+            .to_js_string();
+        assert!(
+            reported.contains("boom|true"),
+            "throw not reported: {reported}"
         );
     }
 
@@ -15679,11 +15758,11 @@ window.__dynamicInlineHandler = dynamicInlineResult;
         for _ in 0..5000 {
             loader.poll();
             poll_script_fetches();
-            // The image can arrive one poll before the loader observes the
-            // load event; wait for both so a slow runner cannot race the
-            // `Complete` assertion below.
+            // Image bytes can land in the fetch poll that follows `loader.poll`.
+            // That poll queues the document `load` microtask; the next
+            // `loader.poll` is what marks the navigation complete.
             if crate::image_loader::dimensions(&source) == Some((3, 2))
-                && loader.progress() == &DocumentLoadProgress::Complete
+                && matches!(loader.progress(), DocumentLoadProgress::Complete)
             {
                 break;
             }
@@ -16200,17 +16279,22 @@ window.__dynamicInlineHandler = dynamicInlineResult;
 
     #[test]
     fn browser_picture_mime_contract_matches_linked_decoders() {
-        for content_type in [
-            "image/png",
-            "image/jpeg",
-            "image/gif",
-            "image/webp",
-            "image/apng",
-            "image/bmp",
-            "image/x-icon",
-            "image/vnd.microsoft.icon",
-        ] {
-            assert!(is_decodable_picture_type(content_type), "{content_type}");
+        let cases = [
+            ("image/png", cfg!(feature = "image-png")),
+            ("image/jpeg", cfg!(feature = "image-jpeg")),
+            ("image/gif", cfg!(feature = "image-gif")),
+            ("image/webp", cfg!(feature = "image-webp")),
+            ("image/apng", cfg!(feature = "image-png")),
+            ("image/bmp", cfg!(feature = "image-bmp")),
+            ("image/x-icon", cfg!(feature = "image-ico")),
+            ("image/vnd.microsoft.icon", cfg!(feature = "image-ico")),
+        ];
+        for (content_type, enabled) in cases {
+            assert_eq!(
+                is_decodable_picture_type(content_type),
+                enabled,
+                "{content_type}"
+            );
         }
         assert!(!is_decodable_picture_type("image/avif"));
     }

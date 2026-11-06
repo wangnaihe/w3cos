@@ -43,7 +43,7 @@ if [ "$(uname)" = "Darwin" ]; then
     echo "Or build on a Linux machine / in Docker."
     echo ""
     echo "Attempting Docker-based build..."
-    docker run --rm -v "$PROJECT_DIR":/w3cos -w /w3cos rust:1.94-bookworm \
+    docker run --rm -v "$PROJECT_DIR":/w3cos -w /w3cos rust:1.99.1-bookworm \
         cargo build --release -p w3cos-cli
     SHELL_BIN="${PROJECT_DIR}/target/release/w3cos"
 else

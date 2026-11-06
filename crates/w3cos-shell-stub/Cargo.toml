@@ -2,6 +2,7 @@
 name = "w3cos-shell-stub"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Desktop process that loads the one system libw3cos_runtime.so"
 

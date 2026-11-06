@@ -2,6 +2,7 @@
 name = "w3cos-runtime-host"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Thin loader that runs AOT app plugins and web pages on the system runtime"
 

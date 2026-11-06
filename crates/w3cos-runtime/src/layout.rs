@@ -1,6 +1,70 @@
 use anyhow::Result;
 use std::cell::RefCell;
-use std::collections::HashMap;
+/// Layout-pass side tables (address/position keyed) are private to the
+/// layout thread: hash them with Fx + fmix64 instead of SipHash, as Blink's
+/// LayoutNG uses WTF::HashMap with integer hashing for its per-pass maps.
+pub(crate) type HashMap<K, V> = w3cos_std::fxhash::FxHashMap<K, V>;
+
+/// Dense layout-position table: preorder component index -> position of its
+/// fragment in the `layouts` vector. LayoutNG walks fragments through
+/// box-tree links instead of hashing; the projection passes here index a
+/// flat vector built once per pass instead of a HashMap<usize, usize>.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct LayoutPositions(Vec<usize>);
+
+impl LayoutPositions {
+    const NONE: usize = usize::MAX;
+
+    pub(crate) fn of(layouts: &[(LayoutRect, usize)]) -> Self {
+        layouts
+            .iter()
+            .enumerate()
+            .map(|(position, (_, index))| (*index, position))
+            .collect()
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, index: &usize) -> Option<&usize> {
+        self.0
+            .get(*index)
+            .filter(|position| **position != Self::NONE)
+    }
+
+    #[inline]
+    pub(crate) fn contains_key(&self, index: &usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0
+            .iter()
+            .filter(|position| **position != Self::NONE)
+            .count()
+    }
+}
+
+impl FromIterator<(usize, usize)> for LayoutPositions {
+    fn from_iter<I: IntoIterator<Item = (usize, usize)>>(iter: I) -> Self {
+        let mut positions = Vec::new();
+        for (index, position) in iter {
+            if index >= positions.len() {
+                positions.resize(index + 1, Self::NONE);
+            }
+            // Same as HashMap::insert during collect: the last entry wins.
+            positions[index] = position;
+        }
+        Self(positions)
+    }
+}
+
+impl std::ops::Index<&usize> for LayoutPositions {
+    type Output = usize;
+    #[inline]
+    fn index(&self, index: &usize) -> &usize {
+        self.get(index)
+            .expect("layout position for component index")
+    }
+}
 use taffy::prelude::*;
 use taffy::util::ResolveOrZero;
 use w3cos_std::component::EventAction;
@@ -8,8 +72,9 @@ use w3cos_std::style::{
     AlignContent as WAlignContent, AlignItems as WAlign, AlignSelf as WAlignSelf,
     BoxSizing as WBoxSizing, Clear as WClear, Dimension as WDim, Display as WDisplay, EdgeLengths,
     FlexDirection as WDir, FlexWrap as WWrap, Float as WFloat, JustifyContent as WJustify,
-    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, Visibility as WVisibility,
-    WhiteSpace as WWhiteSpace, WordBreak as WWordBreak,
+    Overflow as WOverflow, Position as WPos, Spacing as WSpacing, TextDirection as WTextDirection,
+    UnicodeBidi as WUnicodeBidi, Visibility as WVisibility, WhiteSpace as WWhiteSpace,
+    WordBreak as WWordBreak,
 };
 use w3cos_std::{Component, ComponentKind};
 
@@ -39,6 +104,9 @@ struct TextMeasureKey {
     min_width: Option<u32>,
     white_space: u8,
     word_break: u8,
+    line_break: u8,
+    break_spaces: bool,
+    hanging_punctuation_last: bool,
 }
 
 struct WrappedTextMeasure {
@@ -50,8 +118,8 @@ struct WrappedTextMeasure {
 
 #[derive(Default)]
 struct TextMeasureCache {
-    intrinsic: HashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
-    wrapped_height: HashMap<String, Vec<WrappedTextMeasure>>,
+    intrinsic: w3cos_std::fxhash::FxHashMap<String, Vec<(TextMeasureKey, (f32, f32))>>,
+    wrapped_height: w3cos_std::fxhash::FxHashMap<String, Vec<WrappedTextMeasure>>,
     entries: usize,
 }
 
@@ -66,21 +134,147 @@ impl TextMeasureCache {
 }
 
 thread_local! {
-    /// Grid tracks are unknown while the Taffy tree is built, so a relative
-    /// `calc()` inside a grid item would resolve against the grid container.
-    /// The first solve records each grid item's used width; a second build
-    /// uses it as the item's containing width.
-    static GRID_ITEM_IDS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    static GRID_ITEM_HINTS: RefCell<Option<HashMap<usize, f32>>> = const { RefCell::new(None) };
-    static GRID_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static GRID_CALC_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-thread_local! {
     /// Blink keeps font metrics and shaped text runs across layout passes. This
     /// bounded per-UI-thread cache provides the same retained-measure behavior
     /// without coupling the layout engine to a particular application tree.
     static TEXT_MEASURE_CACHE: RefCell<TextMeasureCache> = RefCell::new(TextMeasureCache::default());
+}
+
+fn layout_phases_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_LAYOUT_PHASES").is_some())
+}
+
+#[derive(Default, Clone, Copy)]
+struct TextMeasureStats {
+    intrinsic_hit_n: u32,
+    intrinsic_hit_us: u128,
+    intrinsic_miss_n: u32,
+    intrinsic_miss_us: u128,
+    wrapped_hit_n: u32,
+    wrapped_hit_us: u128,
+    wrapped_miss_n: u32,
+    wrapped_miss_us: u128,
+}
+
+thread_local! {
+    static TEXT_MEASURE_STATS: RefCell<TextMeasureStats> = const { RefCell::new(TextMeasureStats {
+        intrinsic_hit_n: 0,
+        intrinsic_hit_us: 0,
+        intrinsic_miss_n: 0,
+        intrinsic_miss_us: 0,
+        wrapped_hit_n: 0,
+        wrapped_hit_us: 0,
+        wrapped_miss_n: 0,
+        wrapped_miss_us: 0,
+    }) };
+}
+
+const TEXT_MEASURE_INTRINSIC: u8 = 0;
+const TEXT_MEASURE_WRAPPED: u8 = 1;
+
+struct TextMeasureSpan {
+    start: Option<std::time::Instant>,
+    kind: u8,
+    miss: bool,
+}
+
+impl TextMeasureSpan {
+    fn begin(kind: u8) -> Self {
+        Self {
+            start: layout_phases_enabled().then(std::time::Instant::now),
+            kind,
+            miss: false,
+        }
+    }
+
+    fn miss(&mut self) {
+        self.miss = true;
+    }
+}
+
+impl Drop for TextMeasureSpan {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed().as_micros();
+        TEXT_MEASURE_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            match (self.kind, self.miss) {
+                (TEXT_MEASURE_INTRINSIC, false) => {
+                    stats.intrinsic_hit_n += 1;
+                    stats.intrinsic_hit_us += elapsed;
+                }
+                (TEXT_MEASURE_INTRINSIC, true) => {
+                    stats.intrinsic_miss_n += 1;
+                    stats.intrinsic_miss_us += elapsed;
+                }
+                (_, false) => {
+                    stats.wrapped_hit_n += 1;
+                    stats.wrapped_hit_us += elapsed;
+                }
+                (_, true) => {
+                    stats.wrapped_miss_n += 1;
+                    stats.wrapped_miss_us += elapsed;
+                }
+            }
+        });
+    }
+}
+
+struct PhaseLog {
+    on: bool,
+    last: Option<std::time::Instant>,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl PhaseLog {
+    fn new() -> Self {
+        let on = layout_phases_enabled();
+        if on {
+            TEXT_MEASURE_STATS.with(|stats| *stats.borrow_mut() = TextMeasureStats::default());
+        }
+        Self {
+            on,
+            last: on.then(std::time::Instant::now),
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        let Some(last) = self.last else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        self.phases
+            .push((name, now.duration_since(last).as_micros()));
+        self.last = Some(now);
+    }
+
+    fn finish(self, nodes: usize, second_pass: bool) {
+        if !self.on {
+            return;
+        }
+        let text = TEXT_MEASURE_STATS.with(|stats| *stats.borrow());
+        let body = self
+            .phases
+            .iter()
+            .map(|(name, us)| format!("{name}={us}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "W3COS_LAYOUT_PHASE nodes={nodes} second={second_pass} {body} intrinsic_hit={}/{} intrinsic_miss={}/{} wrapped_hit={}/{} wrapped_miss={}/{}",
+            text.intrinsic_hit_n,
+            text.intrinsic_hit_us,
+            text.intrinsic_miss_n,
+            text.intrinsic_miss_us,
+            text.wrapped_hit_n,
+            text.wrapped_hit_us,
+            text.wrapped_miss_n,
+            text.wrapped_miss_us,
+        );
+    }
 }
 
 pub(crate) fn layout_font() -> &'static fontdue::Font {
@@ -547,11 +741,12 @@ pub(crate) fn resolve_float_text_layouts(
             continue;
         }
         let widths: Vec<_> = bands.iter().map(|band| band.width).collect();
-        let lines = text_layout::wrap_text_with_run_width_and_line_widths(
+        let lines = text_layout::wrap_text_with_run_width_and_line_widths_in(
             text,
             content.width,
             &widths,
             style.white_space,
+            crate::line_break::BreakMode::of(style),
             |run| text_intrinsic_size(run, style).0,
         );
         let bottom_edge = spacing(parent_style.padding.bottom, &parent_style)
@@ -989,6 +1184,7 @@ pub struct ScrollExtent {
 // ---------------------------------------------------------------------------
 
 pub struct FlatNodeInfo<'a> {
+    pub component: Option<&'a Component>,
     /// Stable identity for this compiled tree slot across reactive rebuilds.
     /// The compiler keeps conditional branches mounted and only toggles
     /// display, so a structural path is stable even when visibility changes.
@@ -998,6 +1194,10 @@ pub struct FlatNodeInfo<'a> {
     pub on_click: &'a EventAction,
     pub sticky_counter_signal: Option<usize>,
     pub parent: Option<usize>,
+    /// One past the last preorder descendant (LayoutNG walks children via
+    /// box-tree links; here a node's subtree is the contiguous range
+    /// `index + 1..subtree_end`, so child scans need not reach `flat.len()`).
+    pub subtree_end: usize,
 }
 
 pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
@@ -1009,11 +1209,97 @@ pub fn pre_flatten(root: &Component) -> Vec<FlatNodeInfo<'_>> {
 }
 
 pub(crate) fn count_nodes(comp: &Component) -> usize {
+    if comp.children.is_empty() {
+        return 1;
+    }
+    if let Some(size) = SUBTREE_SIZES.with(|sizes| {
+        let sizes = sizes.borrow();
+        if sizes.is_empty() {
+            None
+        } else {
+            sizes.get(&(comp as *const Component as usize)).copied()
+        }
+    }) {
+        return size;
+    }
     1 + comp.children.iter().map(count_nodes).sum::<usize>()
 }
 
+/// Pointer-identity hasher for the subtree-size memo (keys are addresses).
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl std::hash::Hasher for AddressHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn write_usize(&mut self, value: usize) {
+        let mixed = (value as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = mixed ^ (mixed >> 29);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type SubtreeSizeMap =
+    std::collections::HashMap<usize, usize, std::hash::BuildHasherDefault<AddressHasher>>;
+
+thread_local! {
+    /// Descendant counts of the component tree a layout pass is reading,
+    /// keyed by node address. LayoutNG walks children through box-tree links
+    /// and never re-counts a subtree; the projection passes here address the
+    /// preorder array by `index + count_nodes(child)`, which made every pass
+    /// O(nodes x depth). Populated by `SubtreeSizeScope` only for a tree that
+    /// stays immutably borrowed for the whole scope, so addresses cannot be
+    /// reused while an entry is visible.
+    static SUBTREE_SIZES: std::cell::RefCell<SubtreeSizeMap> =
+        std::cell::RefCell::new(SubtreeSizeMap::default());
+}
+
+/// Memoizes `count_nodes` for `root` until dropped; restores the enclosing
+/// scope's memo (nested layouts of temporary trees never see stale keys).
+struct SubtreeSizeScope<'a> {
+    previous: Option<SubtreeSizeMap>,
+    _root: std::marker::PhantomData<&'a Component>,
+}
+
+impl<'a> SubtreeSizeScope<'a> {
+    fn new(root: &'a Component) -> Self {
+        fn fill(component: &Component, sizes: &mut SubtreeSizeMap) -> usize {
+            if component.children.is_empty() {
+                return 1;
+            }
+            let size = 1 + component
+                .children
+                .iter()
+                .map(|child| fill(child, sizes))
+                .sum::<usize>();
+            sizes.insert(component as *const Component as usize, size);
+            size
+        }
+        let mut sizes = SubtreeSizeMap::default();
+        fill(root, &mut sizes);
+        let previous = SUBTREE_SIZES.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), sizes));
+        Self {
+            previous: Some(previous),
+            _root: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for SubtreeSizeScope<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            SUBTREE_SIZES.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+}
+
 /// Leaf intrinsic size used by Taffy (must stay in sync with `build_taffy_tree`).
-fn image_intrinsic_ratio(src: &str) -> Option<f32> {
+pub(crate) fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     use crate::image_loader::SvgIntrinsicLength;
 
     if let Some(size) = crate::image_loader::svg_intrinsic_size(src) {
@@ -1035,7 +1321,7 @@ fn image_intrinsic_ratio(src: &str) -> Option<f32> {
     })
 }
 
-fn image_intrinsic_size(
+pub(crate) fn image_intrinsic_size(
     src: &str,
     style: &w3cos_std::style::Style,
     containing_width: Option<f32>,
@@ -1345,7 +1631,7 @@ fn atomic_inline_intrinsic_width(component: &Component, minimum: bool) -> Option
     Some(widest.max(advance).max(0.0))
 }
 
-fn component_max_content_width(component: &Component) -> f32 {
+pub(crate) fn component_max_content_width(component: &Component) -> f32 {
     #[cfg(feature = "skia")]
     let contextual_widths =
         if component.children.len() >= 3 || component.style.white_space == WWhiteSpace::Pre {
@@ -1486,14 +1772,7 @@ fn component_max_content_width(component: &Component) -> f32 {
     let intrinsic_width = if let Some(width) = atomic_inline_intrinsic_width(component, false) {
         width
     } else if component.children.is_empty() {
-        let width = match &component.kind {
-            // The shared intrinsic measure wraps at a fixed probe width, which
-            // would cap the preferred width of any longer run at ~360px.
-            ComponentKind::Text { content } => {
-                text_intrinsic_size_at(content, &component.style, UNBOUNDED_TEXT_WRAP_WIDTH).0
-            }
-            _ => leaf_intrinsic_size(&component.kind, &component.style).0,
-        };
+        let width = leaf_intrinsic_size(&component.kind, &component.style).0;
         if matches!(component.kind, ComponentKind::Text { .. }) {
             // Text measurement already includes padding; the border box adds it below.
             let padding = component.style.padding_lengths();
@@ -1652,7 +1931,7 @@ fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
-        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc(_) => None,
+        WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) => None,
     };
     let constraint_border_box = |dimension| {
         intrinsic_constraint(dimension).map(|width| {
@@ -3200,7 +3479,13 @@ fn component_min_content_width_with_preferred_width(
                     let advance = advances.get(index).copied().flatten();
                     let eligible = child.children.is_empty()
                         && is_plain_inline_word_fragment(&child.kind, &child.style)
-                        && child.style.text_source_run.is_some();
+                        && child
+                            .style
+                            .custom_properties
+                            .as_ref()
+                            .is_some_and(|properties| {
+                                properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
+                            });
                     if !eligible || advance.is_none() {
                         previous_style = None;
                         cursor = 0.0;
@@ -3296,6 +3581,45 @@ fn component_min_content_width_with_preferred_width(
         + margin.right
 }
 
+/// `inline_line_filled_by_previous_items` for every prefix of `items` in one
+/// pass; asking it per child was quadratic in a long paragraph's inline
+/// children.
+fn inline_line_prefix_filled(
+    prefix: &std::cell::OnceCell<Vec<f32>>,
+    items: &[Component],
+    count: usize,
+    available_width: f32,
+) -> bool {
+    let widths = prefix.get_or_init(|| {
+        let mut widths = Vec::with_capacity(items.len() + 1);
+        widths.push(0.0_f32);
+        let mut line_width = 0.0_f32;
+        for item in items {
+            line_width = inline_line_fold_step(line_width, item, available_width);
+            widths.push(line_width);
+        }
+        widths
+    });
+    (widths[count] - available_width).abs() < 0.01
+}
+
+fn inline_line_fold_step(line_width: f32, item: &Component, available_width: f32) -> f32 {
+    if (line_width - available_width).abs() < 0.01
+        && matches!(&item.kind, ComponentKind::Text { content }
+            if !content.is_empty() && content.chars().all(|ch|
+                matches!(ch, ' ' | '\t' | '\n' | '\r' | '\u{000c}')))
+    {
+        return line_width;
+    }
+    let width = component_max_content_width(item);
+    if line_width + width > available_width + 0.01 {
+        width
+    } else {
+        line_width + width
+    }
+}
+
+#[allow(dead_code)]
 fn inline_line_filled_by_previous_items(items: &[Component], available_width: f32) -> bool {
     let line_width = items.iter().fold(0.0_f32, |line_width, item| {
         if (line_width - available_width).abs() < 0.01
@@ -3517,8 +3841,7 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Em(_)
         | WDim::Ch(_)
         | WDim::Vw(_)
-        | WDim::Vh(_)
-        | WDim::Calc(_) => None,
+        | WDim::Vh(_) => None,
     }
 }
 
@@ -3537,7 +3860,7 @@ struct FontUnitKey {
 }
 
 thread_local! {
-    static CH_ADVANCE_CACHE: RefCell<HashMap<FontUnitKey, f32>> = RefCell::new(HashMap::new());
+    static CH_ADVANCE_CACHE: RefCell<HashMap<FontUnitKey, f32>> = RefCell::new(HashMap::default());
     #[cfg(test)]
     static CH_ADVANCE_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -3576,7 +3899,7 @@ pub(crate) fn install_font_unit_provider() {
         // Standard-face and language metadata still select the actual font;
         // strip fragment metadata without replacing HTML's face by the host
         // embedding font. These contexts also belong to the cache identity.
-        let mut font_context = HashMap::new();
+        let mut font_context = HashMap::default();
         if standard {
             font_context.insert(
                 w3cos_dom::user_agent::HTML_STANDARD_FONT_PROPERTY.into(),
@@ -3655,18 +3978,7 @@ pub(crate) fn resolve_spacing_for_layout(
 }
 
 pub(crate) fn text_intrinsic_size(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
-    text_intrinsic_size_at(content, style, DEFAULT_TEXT_WRAP_WIDTH)
-}
-
-/// Wrap probe wide enough that no realistic line breaks: the text's
-/// max-content (single line per hard break) size.
-const UNBOUNDED_TEXT_WRAP_WIDTH: f32 = 1.0e6;
-
-fn text_intrinsic_size_at(
-    content: &str,
-    style: &w3cos_std::style::Style,
-    wrap_width: f32,
-) -> (f32, f32) {
+    let mut text_span = TextMeasureSpan::begin(TEXT_MEASURE_INTRINSIC);
     if let Some(advance) = crate::list_marker::inside_advance(style) {
         let padding = style.padding_lengths();
         return (
@@ -3674,13 +3986,29 @@ fn text_intrinsic_size_at(
             crate::layout::inline_style_line_height(&style) + padding.top + padding.bottom,
         );
     }
+    // A single unwrapped line does not need the measure-key hash, the cascade
+    // string, or the text cache. Registered families and the skia shaper stay
+    // on the existing path so paint and layout keep one metric space.
+    #[cfg(not(feature = "skia"))]
+    if style.font_family.is_none()
+        && let Some(measured) = text_layout::fast_text_intrinsic_size(
+            content,
+            style,
+            DEFAULT_TEXT_WRAP_WIDTH,
+            layout_font(),
+        )
+    {
+        let padding = style.padding_lengths();
+        return (
+            text_layout::inline_layout_advance(measured.0 - padding.left - padding.right)
+                + padding.left
+                + padding.right,
+            measured.1,
+        );
+    }
     let registry = crate::font_face::FontRegistry::global();
-    #[cfg(not(feature = "skia"))]
-    let font_runs = registry.resolve_style_runs(style, content);
-    #[cfg(not(feature = "skia"))]
-    let has_registered_runs = font_runs.iter().any(|run| run.font.is_some());
     let key = text_measure_key(
-        wrap_width,
+        DEFAULT_TEXT_WRAP_WIDTH,
         style,
         registry.cascade_cache_key(style, content),
     );
@@ -3695,6 +4023,7 @@ fn text_intrinsic_size_at(
         return measured;
     }
 
+    text_span.miss();
     let measured = {
         #[cfg(feature = "skia")]
         {
@@ -3706,10 +4035,20 @@ fn text_intrinsic_size_at(
         }
         #[cfg(not(feature = "skia"))]
         {
+            // Only a cache miss needs the font runs again.
+            let has_registered_runs = registry
+                .resolve_style_runs(style, content)
+                .iter()
+                .any(|run| run.font.is_some());
             if has_registered_runs {
-                cascade_text_intrinsic_size(content, style, wrap_width)
+                cascade_text_intrinsic_size(content, style, DEFAULT_TEXT_WRAP_WIDTH)
             } else {
-                text_layout::text_intrinsic_size_font(content, style, wrap_width, layout_font())
+                text_layout::text_intrinsic_size_font(
+                    content,
+                    style,
+                    DEFAULT_TEXT_WRAP_WIDTH,
+                    layout_font(),
+                )
             }
         }
     };
@@ -3734,55 +4073,6 @@ fn text_intrinsic_size_at(
         cache.entries += 1;
     });
     measured
-}
-
-/// Height of `content` wrapped at the given taffy (content-box when
-/// `box-sizing: content-box`) width.
-fn text_height_at_content_width_for_taffy(
-    content: &str,
-    style: &w3cos_std::style::Style,
-    content_width: f32,
-) -> f32 {
-    let padding = style.padding_lengths();
-    let (wrap_width, vertical) = if style.box_sizing == WBoxSizing::BorderBox {
-        (content_width, 0.0)
-    } else {
-        (
-            content_width + padding.left + padding.right,
-            padding.top + padding.bottom,
-        )
-    };
-    (text_intrinsic_size_at(content, style, wrap_width).1 - vertical).max(0.0)
-}
-
-/// Border-box size of an inline element's own text laid out on its own, wrapped
-/// at `available_width`. Used for inline elements whose text was merged into
-/// the enclosing block's text run and therefore never received a layout rect.
-pub(crate) fn inline_text_box_size(
-    content: &str,
-    style: &w3cos_std::style::Style,
-    available_width: f32,
-) -> (f32, f32) {
-    let single = text_intrinsic_size_at(content, style, UNBOUNDED_TEXT_WRAP_WIDTH);
-    let width = if available_width.is_finite() && available_width > 0.0 {
-        single.0.min(available_width)
-    } else {
-        single.0
-    };
-    if width >= single.0 {
-        return single;
-    }
-    let height = text_intrinsic_size_at(content, style, width.max(1.0)).1;
-    (width, height)
-}
-
-fn text_max_content_width_for_taffy(content: &str, style: &w3cos_std::style::Style) -> f32 {
-    let width = text_intrinsic_size_at(content, style, UNBOUNDED_TEXT_WRAP_WIDTH).0;
-    if style.box_sizing == WBoxSizing::BorderBox {
-        return width;
-    }
-    let padding = style.padding_lengths();
-    (width - padding.left - padding.right).max(0.0)
 }
 
 fn text_intrinsic_size_for_taffy(content: &str, style: &w3cos_std::style::Style) -> (f32, f32) {
@@ -3811,6 +4101,40 @@ fn cascade_measure_width(text: &str, style: &w3cos_std::style::Style) -> f32 {
     text.chars()
         .map(|character| cascade_char_advance(character, style))
         .sum()
+}
+
+/// Physical advances for adjacent fragments that share one layout text run.
+/// The GPU/Skia path shapes the concatenated run and partitions its clusters;
+/// the Vello-only path mirrors its current fontdue layout contract, whose
+/// advances are per character and whose authored fragments are consumed at
+/// separate LayoutUnit endpoints.
+pub(crate) fn physical_text_fragment_advances(
+    fragments: &[&str],
+    style: &w3cos_std::style::Style,
+) -> Option<Vec<f32>> {
+    if fragments.is_empty() {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    let mut advances = crate::render_skia::measure_skia_cssom_fragment_advances(fragments, style)?;
+    #[cfg(not(feature = "skia"))]
+    let advances = fragments
+        .iter()
+        .map(|fragment| text_layout::inline_layout_advance(cascade_measure_width(fragment, style)))
+        .collect::<Vec<_>>();
+
+    #[cfg(feature = "skia")]
+    {
+        let total = advances.iter().sum::<f32>();
+        let snapped = text_layout::inline_layout_advance(total);
+        if let Some(last) = advances.last_mut() {
+            *last += snapped - total;
+        }
+    }
+    advances
+        .iter()
+        .all(|advance| advance.is_finite() && *advance >= 0.0)
+        .then_some(advances)
 }
 
 fn cascade_line_height(text: &str, style: &w3cos_std::style::Style) -> f32 {
@@ -3975,6 +4299,14 @@ pub(crate) fn wrapped_text_height(
     width: f32,
     style: &w3cos_std::style::Style,
 ) -> f32 {
+    let mut text_span = TextMeasureSpan::begin(TEXT_MEASURE_WRAPPED);
+    #[cfg(not(feature = "skia"))]
+    if style.font_family.is_none()
+        && let Some(height) =
+            text_layout::fast_wrapped_block_height(content, width, style, layout_font())
+    {
+        return height;
+    }
     let registry = crate::font_face::FontRegistry::global();
     let revision = registry.revision();
     let probe = text_measure_key(width, style, 0);
@@ -4012,6 +4344,7 @@ pub(crate) fn wrapped_text_height(
         return measured;
     }
 
+    text_span.miss();
     let key = text_measure_key(width, style, cascade);
     let measured = {
         #[cfg(feature = "skia")]
@@ -4047,7 +4380,7 @@ pub(crate) fn wrapped_text_height(
 
 fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> TextMeasureKey {
     use std::hash::{Hash, Hasher};
-    let mut typography = std::collections::hash_map::DefaultHasher::new();
+    let mut typography = w3cos_std::fxhash::FxHasher::default();
     // Resolved cascade identities alone do not distinguish platform fallback
     // faces. Preserve all typography that can change shaping/measurement,
     // while excluding paint-only properties from cache invalidation.
@@ -4091,14 +4424,6 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
-            WDim::Calc(calc) => (
-                8,
-                [calc.px, calc.percent, calc.em, calc.vw, calc.vh]
-                    .iter()
-                    .fold(0_u32, |hash, part| {
-                        hash.rotate_left(5) ^ part.to_bits().wrapping_mul(0x9E37_79B1)
-                    }),
-            ),
         },
         padding_top: padding.top.to_bits(),
         padding_right: padding.right.to_bits(),
@@ -4121,6 +4446,9 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WWordBreak::BreakWord => 2,
             WWordBreak::KeepAll => 3,
         },
+        line_break: style.line_break as u8,
+        break_spaces: style.break_spaces,
+        hanging_punctuation_last: style.hanging_punctuation_last,
     }
 }
 
@@ -4365,12 +4693,14 @@ fn pre_flatten_recursive<'a>(
 ) {
     let my_idx = out.len();
     out.push(FlatNodeInfo {
+        component: Some(comp),
         stable_id,
         kind: &comp.kind,
         style: &comp.style,
         on_click: &comp.on_click,
         sticky_counter_signal: comp.sticky_counter_signal,
         parent,
+        subtree_end: my_idx + 1,
     });
     for (child_index, child) in comp.children.iter().enumerate() {
         // FNV-1a over the child ordinal gives each persistent tree slot an
@@ -4382,75 +4712,12 @@ fn pre_flatten_recursive<'a>(
         }
         pre_flatten_recursive(child, Some(my_idx), child_id, out);
     }
+    out[my_idx].subtree_end = out.len();
 }
 
 // ---------------------------------------------------------------------------
 // LayoutEngine — persistent TaffyTree for incremental layout
 // ---------------------------------------------------------------------------
-
-fn begin_grid_calc_probe() {
-    GRID_ITEM_IDS.with(|ids| ids.borrow_mut().clear());
-    GRID_ITEM_HINTS.with(|hints| *hints.borrow_mut() = None);
-    GRID_DEPTH.with(|depth| depth.set(0));
-    GRID_CALC_SEEN.with(|seen| seen.set(false));
-}
-
-/// Rebuild and re-solve when a relative `calc()` was resolved inside a grid
-/// item against the grid container instead of the item's track. Returns the
-/// new root node, or `None` when no second pass was needed.
-fn rebuild_for_grid_item_calc(
-    tree: &mut TaffyTree<usize>,
-    root_node: taffy::NodeId,
-    layout_root: &Component,
-    viewport_w: f32,
-    viewport_h: f32,
-    space: Size<AvailableSpace>,
-) -> Result<Option<taffy::NodeId>, taffy::TaffyError> {
-    if !GRID_CALC_SEEN.with(|seen| seen.replace(false)) {
-        return Ok(None);
-    }
-    let nodes = index_taffy_nodes(tree, root_node);
-    let ids = GRID_ITEM_IDS.with(|ids| std::mem::take(&mut *ids.borrow_mut()));
-    let mut hints = HashMap::new();
-    for idx in ids {
-        if let Some(node) = nodes.get(idx)
-            && let Ok(layout) = tree.layout(*node)
-            && layout.size.width.is_finite()
-        {
-            hints.insert(idx, layout.size.width);
-        }
-    }
-    GRID_ITEM_HINTS.with(|slot| *slot.borrow_mut() = Some(hints));
-    tree.clear();
-    let mut idx = 0;
-    let rebuilt = build_taffy_tree(
-        tree,
-        layout_root,
-        &mut idx,
-        None,
-        None,
-        None,
-        None,
-        viewport_w,
-        viewport_h,
-        viewport_w,
-        viewport_w,
-        Some(viewport_h),
-        Some(viewport_h),
-        None,
-        false,
-        None,
-        None,
-        false,
-        None,
-        false,
-    );
-    GRID_ITEM_HINTS.with(|slot| *slot.borrow_mut() = None);
-    GRID_CALC_SEEN.with(|seen| seen.set(false));
-    let rebuilt = rebuilt?;
-    tree.compute_layout(rebuilt, space)?;
-    Ok(Some(rebuilt))
-}
 
 fn index_taffy_nodes(tree: &TaffyTree<usize>, root: taffy::NodeId) -> Vec<taffy::NodeId> {
     let mut indexed: Vec<Option<taffy::NodeId>> = Vec::new();
@@ -4497,6 +4764,10 @@ pub struct LayoutResults {
     pub scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     pub clip_only_nodes: Vec<(usize, LayoutRect)>,
     pub scroll_ancestor: Vec<Option<usize>>,
+    /// LayoutNG text nodes broken inside their content: one piece per line
+    /// (NGPhysicalTextFragment), in fragment order. `layout_cache` holds the
+    /// union rect for such a node; paint draws the pieces instead.
+    pub text_fragments: Vec<crate::layout_ng::TextFragment>,
 }
 
 impl LayoutResults {
@@ -4506,6 +4777,7 @@ impl LayoutResults {
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_ancestor: Vec::new(),
+            text_fragments: Vec::new(),
         }
     }
 }
@@ -4579,6 +4851,51 @@ impl LayoutEngine {
         viewport_w: f32,
         viewport_h: f32,
     ) -> Result<LayoutResults> {
+        match crate::layout_ng::mode() {
+            crate::layout_ng::Mode::Off => self.compute_legacy(root, flat, viewport_w, viewport_h),
+            crate::layout_ng::Mode::On => {
+                match crate::layout_ng::layout_tree_with_text(root, flat, viewport_w, viewport_h) {
+                    Some((layout_cache, text_fragments)) => {
+                        // The legacy Taffy tree no longer matches this output.
+                        self.tree_valid = false;
+                        let (scrollable_nodes, clip_only_nodes, scroll_ancestor) =
+                            scroll_containers_from_layout(&layout_cache, flat);
+                        Ok(LayoutResults {
+                            layout_cache,
+                            scrollable_nodes,
+                            clip_only_nodes,
+                            scroll_ancestor,
+                            text_fragments,
+                        })
+                    }
+                    None => self.compute_legacy(root, flat, viewport_w, viewport_h),
+                }
+            }
+            crate::layout_ng::Mode::Verify => {
+                let legacy = self.compute_legacy(root, flat, viewport_w, viewport_h)?;
+                if let Some((ng, _)) =
+                    crate::layout_ng::layout_tree_with_text(root, flat, viewport_w, viewport_h)
+                {
+                    crate::layout_ng::verify(flat, &legacy.layout_cache, &ng);
+                }
+                Ok(legacy)
+            }
+        }
+    }
+
+    fn compute_legacy(
+        &mut self,
+        root: &Component,
+        flat: &[FlatNodeInfo],
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Result<LayoutResults> {
+        let _subtree_sizes = SubtreeSizeScope::new(root);
+        // Table-prepared tree (collapsed borders resolved + grid annotated),
+        // built at most once per compute: the Taffy build and the fixed
+        // table cell projection read the same used table geometry (LayoutNG
+        // computes NGTableBorders once per table and shares it).
+        let mut table_prepared = None::<Component>;
         if self.viewport != Some((viewport_w, viewport_h)) {
             self.tree_valid = false;
             self.viewport = Some((viewport_w, viewport_h));
@@ -4586,14 +4903,11 @@ impl LayoutEngine {
         if !self.tree_valid {
             self.tree.clear();
             let mut idx = 0;
-            let prepared = component_needs_table_prep(root).then(|| {
-                let mut layout_root = root.clone();
-                resolve_collapsed_table_layout_borders(&mut layout_root);
-                crate::table_grid::annotate(&mut layout_root);
-                layout_root
-            });
-            let layout_root = prepared.as_ref().unwrap_or(root);
-            begin_grid_calc_probe();
+            let layout_root = if component_needs_table_prep(root) {
+                &*prepared_table_tree(&mut table_prepared, root)
+            } else {
+                root
+            };
             self.root_node = Some(build_taffy_tree(
                 &mut self.tree,
                 layout_root,
@@ -4614,7 +4928,6 @@ impl LayoutEngine {
                 None,
                 false,
                 None,
-                false,
             )?);
             self.tree_valid = true;
             if let Some(root_node) = self.root_node {
@@ -4622,7 +4935,7 @@ impl LayoutEngine {
             }
         }
 
-        let mut root_node = self.root_node.unwrap();
+        let root_node = self.root_node.unwrap();
         let root_margins = root_used_margins(
             flat.first().map(|entry| entry.style),
             viewport_w,
@@ -4644,27 +4957,6 @@ impl LayoutEngine {
             )?;
         }
         self.tree.compute_layout(root_node, space)?;
-        if GRID_CALC_SEEN.with(|seen| seen.get()) {
-            let prepared = component_needs_table_prep(root).then(|| {
-                let mut layout_root = root.clone();
-                resolve_collapsed_table_layout_borders(&mut layout_root);
-                crate::table_grid::annotate(&mut layout_root);
-                layout_root
-            });
-            let layout_root = prepared.as_ref().unwrap_or(root);
-            if let Some(rebuilt) = rebuild_for_grid_item_calc(
-                &mut self.tree,
-                root_node,
-                layout_root,
-                viewport_w,
-                viewport_h,
-                space,
-            )? {
-                root_node = rebuilt;
-                self.root_node = Some(root_node);
-                self.node_index = index_taffy_nodes(&self.tree, root_node);
-            }
-        }
         self.last_compute_layout_passes = 1;
         // Definite flex/grid/block trees already have border boxes. Measuring
         // text leaves and solving again dominates repeated offsetHeight.
@@ -4719,12 +5011,12 @@ impl LayoutEngine {
 
         if self.skip_projections {
             results.extend(fixed_results);
-            project_percent_translate(&mut results, root);
             return Ok(LayoutResults {
                 layout_cache: results,
                 scrollable_nodes: scrollable,
                 clip_only_nodes: clip_only,
                 scroll_ancestor,
+                text_fragments: Vec::new(),
             });
         }
 
@@ -4746,6 +5038,24 @@ impl LayoutEngine {
         project_empty_painted_inline_boxes(&mut results, flat);
         project_mixed_inline_block_definite_widths(&mut results, flat, viewport_w, viewport_h);
         project_inline_background_widths(&mut results, root);
+        // Blink only runs a layout algorithm for boxes whose formatting
+        // context needs it (NeedsLayout bits + LayoutNG algorithm dispatch).
+        // Summarize the tree's features once and skip projection passes
+        // that are no-ops without them. Kill switch:
+        // W3COS_PROJECTION_GATES=0. W3COS_PROJECTION_VERIFY=1 runs the
+        // skipped pass anyway and panics if it would have moved any box.
+        let features = LayoutFeatures::of(flat);
+        macro_rules! gated_projection {
+            ($need:expr, $call:expr) => {
+                if features.has($need) || !projection_gates_enabled() {
+                    $call;
+                } else if projection_verify_enabled() {
+                    let before = results.clone();
+                    $call;
+                    assert_layouts_unchanged(&before, &results, stringify!($call));
+                }
+            };
+        }
         let projection_root = flat
             .iter()
             .any(|node| {
@@ -4765,22 +5075,30 @@ impl LayoutEngine {
                             edge.width > 0.0 || edge.hidden
                         }))
             })
-            .then(|| {
-                let mut resolved = root.clone();
-                resolve_collapsed_table_layout_borders(&mut resolved);
-                crate::table_grid::annotate(&mut resolved);
-                resolved
-            });
+            .then(|| &*prepared_table_tree(&mut table_prepared, root));
         project_fixed_table_cell_rects(
             &mut results,
-            projection_root.as_ref().unwrap_or(root),
+            projection_root.unwrap_or(root),
             viewport_w,
             viewport_h,
         );
         project_inline_block_atomic_line_descent(&mut results, root);
         project_single_baseline_replaced_image(&mut results, root);
         project_forced_break_inline_block_alignment(&mut results, root);
-        project_forced_break_lines_with_constraints(&mut results, root, &inline_height_constraints);
+        // With collapsed tables and no row spans the prepared tree is the
+        // border-resolved tree the forced-break pass needs; it edits it in
+        // place and restores it instead of cloning the whole document.
+        let forced_break_tree = (has_collapsed_table_root(flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1))
+        .then(|| prepared_table_tree(&mut table_prepared, root));
+        project_forced_break_lines_with_shared_tree(
+            &mut results,
+            root,
+            forced_break_tree,
+            &inline_height_constraints,
+        );
         project_inline_continuation_after_wrapped_row(&mut results, root);
         crate::inline_whitespace::project(&mut results, root);
         project_forced_break_inline_block_alignment(&mut results, root);
@@ -4796,26 +5114,98 @@ impl LayoutEngine {
             viewport_w,
             viewport_h,
         );
-        project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h);
-        project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
-        project_table_into_float_band(&mut results, flat);
-        project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h);
-        project_adjoining_clearance_auto_heights(&mut results, flat, viewport_w, viewport_h);
-        project_empty_clear_margin_past_float(&mut results, flat);
-        project_shared_bfc_float_collisions(&mut results, flat, viewport_w, viewport_h);
-        project_nonadjoining_bfc_margin_separation(&mut results, flat, viewport_w, viewport_h);
-        project_float_text_layouts(&mut results, flat, viewport_w, viewport_h);
-        project_anonymous_float_group_following_image(&mut results, flat, viewport_w, viewport_h);
-        project_bottom_aligned_float_inline_rows(&mut results, flat, viewport_w, viewport_h);
-        project_staggered_float_inline_bands(&mut results, flat, viewport_w, viewport_h);
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_table_into_float_band(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nested_bfc_clearance(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_adjoining_clearance_auto_heights(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_empty_clear_margin_past_float(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_shared_bfc_float_collisions(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nonadjoining_bfc_margin_separation(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_float_text_layouts(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_anonymous_float_group_following_image(
+                &mut results,
+                flat,
+                viewport_w,
+                viewport_h
+            )
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_bottom_aligned_float_inline_rows(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_staggered_float_inline_bands(&mut results, flat, viewport_w, viewport_h)
+        );
         project_inline_block_atomic_line_descent(&mut results, root);
-        project_indented_inline_after_leading_float(&mut results, flat, viewport_w, viewport_h);
-        project_block_after_floated_inline_line(&mut results, flat);
-        project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h);
-        project_float_followed_by_clearing_block_height(&mut results, flat, viewport_w, viewport_h);
-        project_nested_margin_inline_float_band(&mut results, flat, viewport_w, viewport_h);
-        project_clearance_empty_margin_collapse(&mut results, flat, viewport_w, viewport_h);
-        project_self_collapsing_clear_following_block(&mut results, flat, viewport_w, viewport_h);
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_indented_inline_after_leading_float(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_block_after_floated_inline_line(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_auto_height_bfc_float_heights(&mut results, root, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_float_followed_by_clearing_block_height(
+                &mut results,
+                flat,
+                viewport_w,
+                viewport_h
+            )
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_nested_margin_inline_float_band(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_clearance_empty_margin_collapse(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_self_collapsing_clear_following_block(
+                &mut results,
+                flat,
+                viewport_w,
+                viewport_h
+            )
+        );
         project_table_column_background_rects(&mut results, flat);
         project_collapsed_table_row_rects(&mut results, flat);
         table_replaced_baseline::project(&mut results, root, flat, viewport_w, viewport_h);
@@ -4828,10 +5218,24 @@ impl LayoutEngine {
         );
         project_auto_table_child_heights(&mut results, root, flat, viewport_w, viewport_h);
         crate::table_grid::project_rowspan_extents(&mut results, flat);
+        // Without row spans the grid annotation is a no-op, so the prepared
+        // table tree is exactly the border-resolved tree alignment needs.
+        let prepared_flat;
+        let shared_resolved = if has_collapsed_table_root(flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1)
+        {
+            prepared_flat = pre_flatten(prepared_table_tree(&mut table_prepared, root));
+            Some(prepared_flat.as_slice())
+        } else {
+            None
+        };
         align_table_cell_baselines_with_resolved_borders(
             &mut results,
             root,
             flat,
+            shared_resolved,
             viewport_w,
             viewport_h,
         );
@@ -4839,10 +5243,22 @@ impl LayoutEngine {
         align_inline_table_first_row_baselines(&mut results, flat);
         align_empty_inline_table_baselines(&mut results, flat);
         project_top_table_captions_outside_border(&mut results, root, flat);
-        project_zero_width_float_bfc_clearance(&mut results, flat, viewport_w, viewport_h);
-        project_right_float_text_containment(&mut results, flat, viewport_w, viewport_h);
-        project_cleared_descendant_bfc_heights(&mut results, flat);
-        project_negative_clearance_after_bottom_margin(&mut results, flat);
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_zero_width_float_bfc_clearance(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_right_float_text_containment(&mut results, flat, viewport_w, viewport_h)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_cleared_descendant_bfc_heights(&mut results, flat)
+        );
+        gated_projection!(
+            LayoutFeatures::FLOAT_OR_CLEAR,
+            project_negative_clearance_after_bottom_margin(&mut results, flat)
+        );
         project_absolute_insets_from_final_containing_blocks(
             &mut results,
             flat,
@@ -4867,13 +5283,13 @@ impl LayoutEngine {
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
 
         results.extend(fixed_results);
-        project_percent_translate(&mut results, root);
 
         Ok(LayoutResults {
             layout_cache: results,
             scrollable_nodes: scrollable,
             clip_only_nodes: clip_only,
             scroll_ancestor,
+            text_fragments: Vec::new(),
         })
     }
 }
@@ -4881,6 +5297,23 @@ impl LayoutEngine {
 // ---------------------------------------------------------------------------
 // Public API (backward compatible — used by tests and simple callers)
 // ---------------------------------------------------------------------------
+
+/// One legacy layout of `root`, ignoring `W3COS_LAYOUT_NG`. LayoutNG uses
+/// this for a table subtree: the table formatting context stays the legacy
+/// one (the same projections), and the fragment tree is the resulting
+/// border boxes.
+pub(crate) fn legacy_layout_rects(
+    root: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<Vec<(LayoutRect, usize)>> {
+    let flat = pre_flatten(root);
+    let mut engine = LayoutEngine::new();
+    engine
+        .compute_legacy(root, &flat, viewport_w, viewport_h)
+        .ok()
+        .map(|results| results.layout_cache)
+}
 
 pub fn compute(
     root: &Component,
@@ -4907,6 +5340,153 @@ pub fn compute_with_scroll(
         result.scrollable_nodes,
         result.clip_only_nodes,
     ))
+}
+
+struct ColdLayoutPlan {
+    float_or_clear: bool,
+    table: bool,
+    complex_inline: bool,
+}
+
+fn is_table_display(display: WDisplay) -> bool {
+    matches!(
+        display,
+        WDisplay::Table
+            | WDisplay::InlineTable
+            | WDisplay::TableRow
+            | WDisplay::TableRowGroup
+            | WDisplay::TableHeaderGroup
+            | WDisplay::TableFooterGroup
+            | WDisplay::TableColumn
+            | WDisplay::TableColumnGroup
+            | WDisplay::TableCell
+            | WDisplay::TableCaption
+    )
+}
+
+fn node_needs_complex_inline(node: &FlatNodeInfo<'_>) -> bool {
+    let style = node.style;
+    if matches!(
+        style.display,
+        WDisplay::InlineBlock | WDisplay::InlineFlex | WDisplay::InlineTable
+    ) || style.direction != WTextDirection::Ltr
+        || style.column_count.is_some()
+        || style.unicode_bidi != WUnicodeBidi::Normal
+        || !matches!(style.white_space, WWhiteSpace::Normal | WWhiteSpace::NoWrap)
+        || !matches!(
+            style.align_self,
+            WAlignSelf::Auto | WAlignSelf::Baseline | WAlignSelf::Stretch
+        )
+    {
+        return true;
+    }
+    if matches!(
+        node.kind,
+        ComponentKind::Image { .. }
+            | ComponentKind::Canvas { .. }
+            | ComponentKind::SvgPath { .. }
+            | ComponentKind::SvgDocument { .. }
+            | ComponentKind::Button { .. }
+            | ComponentKind::TextInput { .. }
+    ) {
+        return true;
+    }
+    if let ComponentKind::Text { content } = node.kind {
+        if content.ends_with([' ', '\t', '\u{200b}'])
+            || content.contains(['\n', '\r', '\u{000c}', '\t', '\u{2028}', '\u{2029}'])
+        {
+            return true;
+        }
+    }
+    style.custom_properties.as_ref().is_some_and(|properties| {
+        properties.contains_key("--w3cos-internal-inline-formatting-context")
+            || properties.contains_key("--w3cos-internal-vertical-align-keyword")
+            || properties.contains_key("--w3cos-internal-vertical-align-length")
+            || properties.contains_key("--w3cos-internal-line-extra-ascent")
+            || properties.contains_key("--w3cos-internal-unbroken-inline-word")
+            || properties.contains_key("--w3cos-internal-full-width-atomic-line-break")
+            || properties.contains_key("--w3cos-internal-text-line-width")
+            || properties.contains_key("--w3cos-internal-reserved-line-lift")
+            || properties.contains_key("--w3cos-internal-anonymous-float-group")
+    })
+}
+
+/// Features that make a post-Taffy projection more than a walk. Float and
+/// table bits match the passes `LayoutEngine` already skips; complex inline
+/// covers forced breaks, atomics, and replaced boxes whose passes also
+/// propagate height deltas.
+fn cold_layout_plan(flat: &[FlatNodeInfo<'_>]) -> ColdLayoutPlan {
+    let mut plan = ColdLayoutPlan {
+        float_or_clear: false,
+        table: false,
+        complex_inline: false,
+    };
+    for (index, node) in flat.iter().enumerate() {
+        let style = node.style;
+        if style.float != WFloat::None || style.clear != WClear::None {
+            plan.float_or_clear = true;
+        }
+        if is_table_display(style.display) || crate::table_grid::row_span(style) != 1 {
+            plan.table = true;
+        }
+        if !plan.complex_inline && node_needs_complex_inline(node) {
+            plan.complex_inline = true;
+        }
+        if !plan.complex_inline && flex_baseline_texts_need_line_alignment(flat, index) {
+            plan.complex_inline = true;
+        }
+    }
+    plan
+}
+
+/// Flex `align-items: baseline` plus equal-font inline texts whose struts
+/// differ. `align_inline_block_last_line_baselines` is what puts those runs
+/// on one baseline; Taffy's leaf-bottom baseline leaves the shorter strut
+/// low. Ordinary flex rows (the bench tree) do not use baseline alignment.
+fn flex_baseline_texts_need_line_alignment(flat: &[FlatNodeInfo<'_>], index: usize) -> bool {
+    let parent = &flat[index];
+    if parent.style.display != WDisplay::Flex || parent.style.align_items != WAlign::Baseline {
+        return false;
+    }
+    let mut child = index + 1;
+    let mut saw = false;
+    let mut min_lh = f32::INFINITY;
+    let mut max_lh = inline_style_line_height(parent.style);
+    while child < parent.subtree_end && child < flat.len() {
+        let info = &flat[child];
+        let in_flow = info.style.display != WDisplay::None
+            && info.style.float == WFloat::None
+            && !matches!(info.style.position, WPos::Absolute | WPos::Fixed);
+        if in_flow {
+            let same_face = info.style.display == WDisplay::Inline
+                && matches!(info.kind, ComponentKind::Text { .. })
+                && info.style.font_size == parent.style.font_size
+                && info.style.font_family == parent.style.font_family
+                && info.style.font_weight == parent.style.font_weight
+                && info.style.font_style == parent.style.font_style
+                && info.style.font_variant == parent.style.font_variant
+                && matches!(
+                    info.style.align_self,
+                    WAlignSelf::Auto | WAlignSelf::Baseline
+                )
+                && info
+                    .style
+                    .custom_properties
+                    .as_ref()
+                    .is_none_or(|properties| {
+                        !properties.contains_key("--w3cos-internal-vertical-align-length")
+                    });
+            if !same_face {
+                return false;
+            }
+            let line_height = inline_style_line_height(info.style);
+            min_lh = min_lh.min(line_height);
+            max_lh = max_lh.max(line_height);
+            saw = true;
+        }
+        child = info.subtree_end;
+    }
+    saw && max_lh - min_lh > 0.01
 }
 
 pub fn compute_with_scroll_details(
@@ -4943,24 +5523,46 @@ pub fn compute_with_scroll_details(
                     .all(|style| style.is_some_and(|style| !style.is_visible())))
             || component.children.iter().any(needs_used_borders)
     }
+    let mut phase = PhaseLog::new();
     let used_root = needs_used_borders(root).then(|| {
         let mut used = root.clone();
         resolve_used_borders(&mut used);
         used
     });
+    phase.mark("borders");
     let root = used_root.as_ref().unwrap_or(root);
+    let _subtree_sizes = SubtreeSizeScope::new(root);
     let flat = pre_flatten(root);
-    let mut layout_root = root.clone();
-    resolve_collapsed_table_layout_borders(&mut layout_root);
-    crate::table_grid::annotate(&mut layout_root);
+    phase.mark("flatten");
+    let plan = cold_layout_plan(&flat);
+    phase.mark("plan");
+    let gates_on = projection_gates_enabled();
+    let run_table = plan.table || !gates_on;
+    let run_float = plan.float_or_clear || !gates_on;
+    let run_complex = plan.complex_inline || !gates_on;
+    // Collapsed borders and rowspan annotation mutate a copy. A tree with
+    // neither can build Taffy from the border-resolved component tree.
+    let mut prepared_table = if run_table {
+        let mut cloned = root.clone();
+        phase.mark("clone");
+        resolve_collapsed_table_layout_borders(&mut cloned);
+        phase.mark("collapsed_borders");
+        crate::table_grid::annotate(&mut cloned);
+        phase.mark("annotate");
+        Some(cloned)
+    } else {
+        phase.mark("clone");
+        phase.mark("collapsed_borders");
+        phase.mark("annotate");
+        None
+    };
     let mut tree: TaffyTree<usize> = TaffyTree::new();
     tree.disable_rounding();
     let mut node_index: usize = 0;
 
-    begin_grid_calc_probe();
-    let mut root_node = build_taffy_tree(
+    let root_node = build_taffy_tree(
         &mut tree,
-        &layout_root,
+        prepared_table.as_ref().unwrap_or(root),
         &mut node_index,
         None,
         None,
@@ -4978,8 +5580,8 @@ pub fn compute_with_scroll_details(
         None,
         false,
         None,
-        false,
     )?;
+    phase.mark("taffy_build");
     let root_margins = root_used_margins(
         flat.first().map(|entry| entry.style),
         viewport_w,
@@ -4990,18 +5592,12 @@ pub fn compute_with_scroll_details(
         height: AvailableSpace::Definite(viewport_h),
     };
     tree.compute_layout(root_node, space)?;
-    if let Some(rebuilt) = rebuild_for_grid_item_calc(
-        &mut tree,
-        root_node,
-        &layout_root,
-        viewport_w,
-        viewport_h,
-        space,
-    )? {
-        root_node = rebuilt;
-    }
-    if update_text_leaf_heights(&mut tree, root_node, &flat, None)? {
+    phase.mark("taffy_1");
+    let second_pass = update_text_leaf_heights(&mut tree, root_node, &flat, None)?;
+    phase.mark("text_heights");
+    if second_pass {
         tree.compute_layout(root_node, space)?;
+        phase.mark("taffy_2");
     }
 
     let mut results = Vec::new();
@@ -5046,86 +5642,353 @@ pub fn compute_with_scroll_details(
         &mut clip_only,
         &mut scroll_ancestor,
     );
+    phase.mark("collect");
 
-    let inline_original_rects = flat
-        .iter()
-        .any(|node| {
-            matches!(
-                node.style.display,
-                WDisplay::TableCell | WDisplay::TableCaption
-            )
-        })
-        .then(|| results.clone())
-        .unwrap_or_default();
-    let inline_height_constraints =
-        used_inline_height_constraints(&tree, root_node, &flat, &results)?;
-    apply_inline_line_extra_ascent(&mut results, root);
-    apply_inline_vertical_align_length(&mut results, root);
-    project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h);
+    // W3COS_PROJECTION_GATES=0 runs every pass. W3COS_PROJECTION_VERIFY=1
+    // runs a skipped pass and panics if any box moved.
+    macro_rules! gate {
+        ($run:expr, $name:literal, $call:expr) => {{
+            if $run {
+                $call;
+            } else if projection_verify_enabled() {
+                let before = results.clone();
+                $call;
+                assert_layouts_unchanged(&before, &results, $name);
+            }
+            phase.mark($name);
+        }};
+    }
+    let inline_original_rects = if run_table || projection_verify_enabled() {
+        flat.iter()
+            .any(|node| {
+                matches!(
+                    node.style.display,
+                    WDisplay::TableCell | WDisplay::TableCaption
+                )
+            })
+            .then(|| results.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    phase.mark("inline_setup");
+    let inline_height_constraints = if run_complex || projection_verify_enabled() {
+        used_inline_height_constraints(&tree, root_node, &flat, &results)?
+    } else {
+        HashMap::default()
+    };
+    phase.mark("inline_constraints");
+    gate!(
+        run_complex,
+        "inline_ascent",
+        apply_inline_line_extra_ascent(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_valign",
+        apply_inline_vertical_align_length(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_rtl",
+        project_rtl_fixed_block_alignment(&mut results, &flat, viewport_w, viewport_h)
+    );
     project_empty_painted_inline_boxes(&mut results, &flat);
+    phase.mark("inline_empty");
     project_mixed_inline_block_definite_widths(&mut results, &flat, viewport_w, viewport_h);
+    phase.mark("inline_mixed");
     project_inline_background_widths(&mut results, root);
-    project_fixed_table_cell_rects(&mut results, &layout_root, viewport_w, viewport_h);
-    project_inline_block_atomic_line_descent(&mut results, root);
-    project_single_baseline_replaced_image(&mut results, root);
-    project_forced_break_inline_block_alignment(&mut results, root);
-    project_forced_break_lines_with_constraints(&mut results, root, &inline_height_constraints);
-    project_inline_continuation_after_wrapped_row(&mut results, root);
-    crate::inline_whitespace::project(&mut results, root);
-    project_forced_break_inline_block_alignment(&mut results, root);
-    align_inline_block_last_line_baselines(&mut results, root);
-    project_inline_block_vertical_align_keywords(&mut results, root, viewport_w, viewport_h);
-    project_table_block_inline_height_changes(&mut results, root, &inline_original_rects);
+    phase.mark("inline_bg");
+    gate!(run_table, "inline_table_cells", {
+        project_fixed_table_cell_rects(
+            &mut results,
+            prepared_table.as_ref().unwrap_or(root),
+            viewport_w,
+            viewport_h,
+        );
+    });
+    gate!(
+        run_complex,
+        "inline_descent",
+        project_inline_block_atomic_line_descent(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_image",
+        project_single_baseline_replaced_image(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_forced_align",
+        project_forced_break_inline_block_alignment(&mut results, root)
+    );
+    // Soft-line placement runs for ordinary blocks that contain inline text.
+    // That is not an atomic/forced-break feature, so the complex-inline bit
+    // must not skip it.
+    gate!(true, "inline_forced_lines", {
+        let forced_break_tree = if has_collapsed_table_root(&flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1)
+        {
+            prepared_table.as_mut()
+        } else {
+            None
+        };
+        project_forced_break_lines_with_shared_tree(
+            &mut results,
+            root,
+            forced_break_tree,
+            &inline_height_constraints,
+        );
+    });
+    gate!(
+        run_complex,
+        "inline_continuation",
+        project_inline_continuation_after_wrapped_row(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_whitespace",
+        crate::inline_whitespace::project(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_forced_align2",
+        project_forced_break_inline_block_alignment(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_baselines",
+        align_inline_block_last_line_baselines(&mut results, root)
+    );
+    gate!(
+        run_complex,
+        "inline_keywords",
+        project_inline_block_vertical_align_keywords(&mut results, root, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "inline_table_heights",
+        project_table_block_inline_height_changes(&mut results, root, &inline_original_rects)
+    );
     project_collapsible_line_end_whitespace(&mut results, &flat);
+    phase.mark("inline_eol_space");
     project_leading_descendant_margin_groups(&mut results, root, viewport_w, viewport_h);
+    phase.mark("inline_margins");
     project_inline_after_leading_empty_blocks(&mut results, root);
+    phase.mark("inline_empty_blocks");
     project_constrained_height_trailing_margin_containment(
         &mut results,
         root,
         viewport_w,
         viewport_h,
     );
-    project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h);
-    project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h);
-    project_table_into_float_band(&mut results, &flat);
-    project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h);
-    project_adjoining_clearance_auto_heights(&mut results, &flat, viewport_w, viewport_h);
-    project_empty_clear_margin_past_float(&mut results, &flat);
-    project_shared_bfc_float_collisions(&mut results, &flat, viewport_w, viewport_h);
-    project_nonadjoining_bfc_margin_separation(&mut results, &flat, viewport_w, viewport_h);
-    project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h);
-    project_anonymous_float_group_following_image(&mut results, &flat, viewport_w, viewport_h);
-    project_bottom_aligned_float_inline_rows(&mut results, &flat, viewport_w, viewport_h);
-    project_staggered_float_inline_bands(&mut results, &flat, viewport_w, viewport_h);
-    project_inline_block_atomic_line_descent(&mut results, root);
-    project_indented_inline_after_leading_float(&mut results, &flat, viewport_w, viewport_h);
-    project_block_after_floated_inline_line(&mut results, &flat);
-    project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h);
-    project_float_followed_by_clearing_block_height(&mut results, &flat, viewport_w, viewport_h);
-    project_nested_margin_inline_float_band(&mut results, &flat, viewport_w, viewport_h);
-    project_clearance_empty_margin_collapse(&mut results, &flat, viewport_w, viewport_h);
-    project_self_collapsing_clear_following_block(&mut results, &flat, viewport_w, viewport_h);
-    project_table_column_background_rects(&mut results, &flat);
-    project_collapsed_table_row_rects(&mut results, &flat);
-    table_replaced_baseline::project(&mut results, root, &flat, viewport_w, viewport_h);
-    project_table_rows_after_content_settlement(&mut results, root, &flat, viewport_w, viewport_h);
-    project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h);
-    crate::table_grid::project_rowspan_extents(&mut results, &flat);
-    align_table_cell_baselines_with_resolved_borders(
-        &mut results,
-        root,
-        &flat,
-        viewport_w,
-        viewport_h,
+    phase.mark("inline_trailing_margin");
+    gate!(
+        run_float,
+        "float_clearance",
+        project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h)
     );
-    project_table_cell_inline_vertical_padding(&mut results, &flat);
-    align_inline_table_first_row_baselines(&mut results, &flat);
-    align_empty_inline_table_baselines(&mut results, &flat);
-    project_top_table_captions_outside_border(&mut results, root, &flat);
-    project_zero_width_float_bfc_clearance(&mut results, &flat, viewport_w, viewport_h);
-    project_right_float_text_containment(&mut results, &flat, viewport_w, viewport_h);
-    project_cleared_descendant_bfc_heights(&mut results, &flat);
-    project_negative_clearance_after_bottom_margin(&mut results, &flat);
+    gate!(
+        run_float,
+        "float_simple",
+        project_simple_float_margin_boxes(&mut results, root, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_table_band",
+        project_table_into_float_band(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_clearance2",
+        project_nested_bfc_clearance(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_adjoining",
+        project_adjoining_clearance_auto_heights(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_empty_clear",
+        project_empty_clear_margin_past_float(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_shared",
+        project_shared_bfc_float_collisions(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_nonadj",
+        project_nonadjoining_bfc_margin_separation(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_text",
+        project_float_text_layouts(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_anon",
+        project_anonymous_float_group_following_image(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_bottom",
+        project_bottom_aligned_float_inline_rows(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_staggered",
+        project_staggered_float_inline_bands(&mut results, &flat, viewport_w, viewport_h)
+    );
+    // This second descent pass propagates inline-block line growth. It is not
+    // a float projection, so the float bit must not skip it.
+    gate!(
+        run_complex,
+        "float_descent",
+        project_inline_block_atomic_line_descent(&mut results, root)
+    );
+    gate!(
+        run_float,
+        "float_indent",
+        project_indented_inline_after_leading_float(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_after_line",
+        project_block_after_floated_inline_line(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_bfc_height",
+        project_auto_height_bfc_float_heights(&mut results, root, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_clear_block",
+        project_float_followed_by_clearing_block_height(
+            &mut results,
+            &flat,
+            viewport_w,
+            viewport_h
+        )
+    );
+    gate!(
+        run_float,
+        "float_nested_margin",
+        project_nested_margin_inline_float_band(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_clear_collapse",
+        project_clearance_empty_margin_collapse(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_self_collapse",
+        project_self_collapsing_clear_following_block(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "table_col_bg",
+        project_table_column_background_rects(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_rows",
+        project_collapsed_table_row_rects(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_baseline",
+        table_replaced_baseline::project(&mut results, root, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "table_settle",
+        project_table_rows_after_content_settlement(
+            &mut results,
+            root,
+            &flat,
+            viewport_w,
+            viewport_h
+        )
+    );
+    gate!(
+        run_table,
+        "table_auto_h",
+        project_auto_table_child_heights(&mut results, root, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_table,
+        "table_rowspan",
+        crate::table_grid::project_rowspan_extents(&mut results, &flat)
+    );
+    gate!(run_table, "table_align", {
+        let prepared_flat;
+        let shared_resolved = if has_collapsed_table_root(&flat)
+            && !flat
+                .iter()
+                .any(|node| crate::table_grid::row_span(node.style) != 1)
+        {
+            prepared_flat = pre_flatten(prepared_table.as_ref().expect("collapsed table tree"));
+            Some(prepared_flat.as_slice())
+        } else {
+            None
+        };
+        align_table_cell_baselines_with_resolved_borders(
+            &mut results,
+            root,
+            &flat,
+            shared_resolved,
+            viewport_w,
+            viewport_h,
+        );
+    });
+    gate!(
+        run_table,
+        "table_pad",
+        project_table_cell_inline_vertical_padding(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_inline_base",
+        align_inline_table_first_row_baselines(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_empty_base",
+        align_empty_inline_table_baselines(&mut results, &flat)
+    );
+    gate!(
+        run_table,
+        "table_caption",
+        project_top_table_captions_outside_border(&mut results, root, &flat)
+    );
+    gate!(
+        run_float,
+        "float_zero",
+        project_zero_width_float_bfc_clearance(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_right",
+        project_right_float_text_containment(&mut results, &flat, viewport_w, viewport_h)
+    );
+    gate!(
+        run_float,
+        "float_cleared",
+        project_cleared_descendant_bfc_heights(&mut results, &flat)
+    );
+    gate!(
+        run_float,
+        "float_negative",
+        project_negative_clearance_after_bottom_margin(&mut results, &flat)
+    );
     project_absolute_insets_from_final_containing_blocks(
         &mut results,
         &flat,
@@ -5148,68 +6011,17 @@ pub fn compute_with_scroll_details(
     }
     refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
+    phase.mark("proj_rest");
 
     results.extend(fixed_results);
-    project_percent_translate(&mut results, root);
+    phase.finish(flat.len(), second_pass);
     Ok(LayoutResults {
         layout_cache: results,
         scrollable_nodes: scrollable,
         clip_only_nodes: clip_only,
         scroll_ancestor,
+        text_fragments: Vec::new(),
     })
-}
-
-/// Resolve `transform: translate*(<percentage>)` against each element's own
-/// border box. The DOM layer parks the percentages in
-/// `--w3cos-internal-translate-pct` (`"x,y"`); here the box and its whole
-/// subtree move by the resolved offset, which is what `top: 50%` +
-/// `translateY(-50%)` centering relies on.
-fn project_percent_translate(layouts: &mut [(LayoutRect, usize)], root: &Component) {
-    fn percent(style: &w3cos_std::style::Style) -> Option<(f32, f32)> {
-        let value = style
-            .custom_properties
-            .as_ref()?
-            .get("--w3cos-internal-translate-pct")?;
-        let (x, y) = value.split_once(',')?;
-        Some((x.parse().ok()?, y.parse().ok()?))
-    }
-    fn any(component: &Component) -> bool {
-        percent(&component.style).is_some() || component.children.iter().any(any)
-    }
-    if !any(root) {
-        return;
-    }
-    let layout_position = layouts
-        .iter()
-        .enumerate()
-        .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
-    fn visit(
-        component: &Component,
-        index: usize,
-        layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
-    ) {
-        if let Some((pct_x, pct_y)) = percent(&component.style)
-            && let Some(position) = layout_position.get(&index).copied()
-        {
-            let rect = layouts[position].0;
-            let dx = rect.width * pct_x / 100.0;
-            let dy = rect.height * pct_y / 100.0;
-            for node in index..index + count_nodes(component) {
-                if let Some(position) = layout_position.get(&node).copied() {
-                    layouts[position].0.x += dx;
-                    layouts[position].0.y += dy;
-                }
-            }
-        }
-        let mut child_index = index + 1;
-        for child in &component.children {
-            visit(child, child_index, layouts, layout_position);
-            child_index += count_nodes(child);
-        }
-    }
-    visit(root, 0, layouts, &layout_position);
 }
 
 /// Resolve terminal preformatted tab runs against the actual block content
@@ -5226,7 +6038,7 @@ fn project_terminal_preserved_tabs(layouts: &mut [(LayoutRect, usize)], flat: &[
         }) {
             return;
         }
-        let positions: HashMap<_, _> = layouts
+        let positions: LayoutPositions = layouts
             .iter()
             .enumerate()
             .map(|(position, (_, index))| (*index, position))
@@ -5351,7 +6163,7 @@ fn project_empty_painted_inline_boxes(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for index in 0..flat.len() {
         let node = &flat[index];
         if node.style.display != WDisplay::Inline {
@@ -5417,13 +6229,19 @@ fn project_mixed_inline_block_definite_widths(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut parent_has_float = vec![false; flat.len()];
-    for node in flat {
-        if node.style.float != WFloat::None
-            && let Some(parent) = node.parent
-        {
-            parent_has_float[parent] = true;
+    // Previous sibling of each preorder entry, in one pass (was a backward
+    // scan per node that ran to the start of the list for first children).
+    let mut previous_sibling = vec![None; flat.len()];
+    let mut last_child: Vec<Option<usize>> = vec![None; flat.len()];
+    for (index, node) in flat.iter().enumerate() {
+        if let Some(parent) = node.parent {
+            if node.style.float != WFloat::None {
+                parent_has_float[parent] = true;
+            }
+            previous_sibling[index] = last_child[parent];
+            last_child[parent] = Some(index);
         }
     }
     for (index, node) in flat.iter().enumerate() {
@@ -5447,9 +6265,7 @@ fn project_mixed_inline_block_definite_widths(
         if parent.style.display != WDisplay::Block || !matches!(parent.kind, ComponentKind::Row) {
             continue;
         }
-        let previous_index = (0..index)
-            .rev()
-            .find(|candidate| flat[*candidate].parent == Some(parent_index));
+        let previous_index = previous_sibling[index];
         let after_inline_fragment = previous_index.is_some_and(|previous_index| {
             let previous = &flat[previous_index];
             let previous_has_children = flat
@@ -5517,13 +6333,13 @@ fn project_inline_background_widths(layouts: &mut [(LayoutRect, usize)], root: &
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn visit(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = index + 1;
         for child in &component.children {
@@ -5565,7 +6381,7 @@ fn project_block_after_floated_inline_line(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut children = vec![Vec::new(); flat.len()];
     let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
     for (index, node) in flat.iter().enumerate() {
@@ -5686,7 +6502,7 @@ fn project_top_table_captions_outside_border(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
     for index in (0..flat.len()).rev() {
         if let Some(parent) = flat[index].parent {
@@ -5741,7 +6557,7 @@ fn project_rtl_fixed_block_alignment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     // Preorder flattening makes each subtree contiguous. Compute its end in
     // one reverse pass rather than walking ancestry for every shifted node.
     let mut subtree_ends = (1..=flat.len()).collect::<Vec<_>>();
@@ -5847,7 +6663,7 @@ fn project_collapsible_line_end_whitespace(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for (index, node) in flat.iter().enumerate() {
         let ComponentKind::Text { content } = node.kind else {
             continue;
@@ -5943,7 +6759,7 @@ fn project_table_cell_inline_vertical_padding(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for (index, node) in flat.iter().enumerate() {
         let Some(parent_index) = node.parent else {
             continue;
@@ -5991,17 +6807,95 @@ fn project_table_cell_inline_vertical_padding(
     }
 }
 
+/// Tree-wide layout feature bits (OR of every box's bits), computed once per
+/// compute from the flat tree.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LayoutFeatures(u32);
+
+impl LayoutFeatures {
+    pub(crate) const FLOAT: u32 = 1 << 0;
+    pub(crate) const CLEAR: u32 = 1 << 1;
+    pub(crate) const FLOAT_OR_CLEAR: u32 = Self::FLOAT | Self::CLEAR;
+
+    pub(crate) fn node_bits(style: &w3cos_std::style::Style) -> u32 {
+        let mut bits = 0;
+        if style.float != WFloat::None {
+            bits |= Self::FLOAT;
+        }
+        if style.clear != WClear::None {
+            bits |= Self::CLEAR;
+        }
+        bits
+    }
+
+    pub(crate) fn of(flat: &[FlatNodeInfo<'_>]) -> Self {
+        Self(
+            flat.iter()
+                .fold(0, |bits, node| bits | Self::node_bits(node.style)),
+        )
+    }
+
+    pub(crate) fn has(self, bits: u32) -> bool {
+        self.0 & bits != 0
+    }
+}
+
+fn projection_gates_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("W3COS_PROJECTION_GATES").map_or(true, |value| value != "0"))
+}
+
+fn projection_verify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("W3COS_PROJECTION_VERIFY").is_some())
+}
+
+fn assert_layouts_unchanged(
+    before: &[(LayoutRect, usize)],
+    after: &[(LayoutRect, usize)],
+    pass: &str,
+) {
+    let same = before.len() == after.len()
+        && before.iter().zip(after).all(|((a, ai), (b, bi))| {
+            ai == bi
+                && a.x.to_bits() == b.x.to_bits()
+                && a.y.to_bits() == b.y.to_bits()
+                && a.width.to_bits() == b.width.to_bits()
+                && a.height.to_bits() == b.height.to_bits()
+        });
+    assert!(same, "gated projection pass changed layout: {pass}");
+}
+
+/// The table-prepared tree (collapsed borders resolved + grid annotated),
+/// built at most once per compute and shared by every table-aware pass, as
+/// LayoutNG computes NGTableBorders once per table.
+fn prepared_table_tree<'a>(slot: &'a mut Option<Component>, root: &Component) -> &'a mut Component {
+    slot.get_or_insert_with(|| {
+        let mut layout_root = root.clone();
+        resolve_collapsed_table_layout_borders(&mut layout_root);
+        crate::table_grid::annotate(&mut layout_root);
+        layout_root
+    })
+}
+
+fn has_collapsed_table_root(flat: &[FlatNodeInfo<'_>]) -> bool {
+    flat.iter().any(|node| {
+        node.style.border_collapse
+            && matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
+    })
+}
+
 fn align_table_cell_baselines_with_resolved_borders(
     layouts: &mut [(LayoutRect, usize)],
     root: &Component,
     flat: &[FlatNodeInfo<'_>],
+    shared_resolved: Option<&[FlatNodeInfo<'_>]>,
     viewport_w: f32,
     viewport_h: f32,
 ) {
-    if flat.iter().any(|node| {
-        node.style.border_collapse
-            && matches!(node.style.display, WDisplay::Table | WDisplay::InlineTable)
-    }) {
+    if let Some(resolved) = shared_resolved {
+        align_table_cell_baselines(layouts, resolved, viewport_w, viewport_h);
+    } else if has_collapsed_table_root(flat) {
         // The grid sizes already include the winning shared half-borders.
         // Alignment must use those same edges, not the authored cell border:
         // an outer table/column edge can make the available area asymmetric.
@@ -6010,6 +6904,40 @@ fn align_table_cell_baselines_with_resolved_borders(
         align_table_cell_baselines(layouts, &pre_flatten(&resolved), viewport_w, viewport_h);
     } else {
         align_table_cell_baselines(layouts, flat, viewport_w, viewport_h);
+    }
+}
+
+/// Exclusive end of each node's pre-order subtree in `flat`.
+pub(crate) fn subtree_ends(flat: &[FlatNodeInfo<'_>]) -> Vec<usize> {
+    let mut sizes = vec![1usize; flat.len()];
+    for index in (0..flat.len()).rev() {
+        if let Some(parent) = flat[index].parent {
+            sizes[parent] += sizes[index];
+        }
+    }
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(index, size)| index + size)
+        .collect()
+}
+
+/// Move the in-flow descendants of `root` (the range `root + 1..end`) by `delta`.
+fn shift_subtree(
+    layouts: &mut [(LayoutRect, usize)],
+    positions: &LayoutPositions,
+    flat: &[FlatNodeInfo<'_>],
+    root: usize,
+    end: usize,
+    delta: f32,
+) {
+    for index in root + 1..end {
+        if matches!(flat[index].style.position, WPos::Absolute | WPos::Fixed) {
+            continue;
+        }
+        if let Some(position) = positions.get(&index) {
+            layouts[*position].0.y += delta;
+        }
     }
 }
 
@@ -6058,21 +6986,15 @@ fn align_table_cell_baselines(
         false
     }
 
-    fn descendant_of(flat: &[FlatNodeInfo<'_>], mut index: usize, ancestor: usize) -> bool {
-        while let Some(parent) = flat[index].parent {
-            if parent == ancestor {
-                return true;
-            }
-            index = parent;
-        }
-        false
-    }
-
     let positions = layouts
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
+    // `flat` is pre-order, so a subtree is the contiguous range
+    // `index + 1..ends[index]`. Scanning only that range keeps each cell
+    // linear in its own subtree instead of in the whole document.
+    let ends = subtree_ends(flat);
     for (cell, node) in flat
         .iter()
         .enumerate()
@@ -6086,7 +7008,7 @@ fn align_table_cell_baselines(
             continue;
         };
         let cell_rect = layouts[cell_position].0;
-        let inline_cell = flat
+        let inline_cell = flat[cell + 1..ends[cell]]
             .iter()
             .filter(|child| {
                 child.parent == Some(cell)
@@ -6103,9 +7025,10 @@ fn align_table_cell_baselines(
                         | WDisplay::InlineTable
                 )
             });
-        let content_bounds = flat
+        let content_bounds = flat[cell + 1..ends[cell]]
             .iter()
             .enumerate()
+            .map(|(offset, child)| (cell + 1 + offset, child))
             .filter(|(index, child)| {
                 cell_content_box(flat, *index, cell)
                     && !matches!(child.style.position, WPos::Fixed)
@@ -6253,22 +7176,17 @@ fn align_table_cell_baselines(
         if delta.abs() <= f32::EPSILON {
             continue;
         }
-        for (rect, index) in layouts.iter_mut() {
-            if descendant_of(flat, *index, cell)
-                && !matches!(flat[*index].style.position, WPos::Absolute | WPos::Fixed)
-            {
-                rect.y += delta;
-            }
-        }
+        shift_subtree(layouts, &positions, flat, cell, ends[cell], delta);
     }
     for (row, _) in flat
         .iter()
         .enumerate()
         .filter(|(_, node)| node.style.display == WDisplay::TableRow)
     {
-        let cells = flat
+        let cells = flat[row + 1..ends[row]]
             .iter()
             .enumerate()
+            .map(|(offset, node)| (row + 1 + offset, node))
             .filter(|(_, node)| {
                 node.parent == Some(row)
                     && node.style.display == WDisplay::TableCell
@@ -6285,9 +7203,11 @@ fn align_table_cell_baselines(
         let baselines = cells
             .iter()
             .filter_map(|cell| {
-                let text = flat.iter().enumerate().find(|(index, node)| {
-                    descendant_of(flat, *index, *cell)
-                        && !matches!(node.style.position, WPos::Absolute | WPos::Fixed)
+                let text = flat[*cell + 1..ends[*cell]]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, node)| (*cell + 1 + offset, node))
+                    .find(|(_, node)| { !matches!(node.style.position, WPos::Absolute | WPos::Fixed)
                         && matches!(node.kind, ComponentKind::Text { content } if content.chars().any(|character| !character.is_whitespace()))
                 })?;
                 let rect = layouts[*positions.get(&text.0)?].0;
@@ -6318,13 +7238,7 @@ fn align_table_cell_baselines(
             if delta <= 0.0 {
                 continue;
             }
-            for (rect, index) in layouts.iter_mut() {
-                if descendant_of(flat, *index, cell)
-                    && !matches!(flat[*index].style.position, WPos::Absolute | WPos::Fixed)
-                {
-                    rect.y += delta;
-                }
-            }
+            shift_subtree(layouts, &positions, flat, cell, ends[cell], delta);
         }
     }
 }
@@ -6347,7 +7261,7 @@ fn align_empty_inline_table_baselines(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for table in 0..flat.len() {
         if flat[table].style.display != WDisplay::InlineTable
             || flat.iter().enumerate().any(|(index, node)| {
@@ -6410,8 +7324,8 @@ fn align_inline_table_first_row_baselines(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
-    let mut line_baselines = HashMap::<usize, Vec<(LayoutRect, f32)>>::new();
+        .collect::<LayoutPositions>();
+    let mut line_baselines = HashMap::<usize, Vec<(LayoutRect, f32)>>::default();
     for (table, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::InlineTable
             || matches!(node.style.position, WPos::Absolute | WPos::Fixed)
@@ -6578,6 +7492,12 @@ fn project_collapsed_table_row_rects(
         }
         false
     };
+    // Every container below only acts when one of its rows collapses.
+    if !flat.iter().any(|node| {
+        node.style.display == WDisplay::TableRow && node.style.visibility == WVisibility::Collapse
+    }) {
+        return;
+    }
     for container in 0..flat.len() {
         if !matches!(
             flat[container].style.display,
@@ -6592,6 +7512,8 @@ fn project_collapsed_table_row_rects(
         let rows = flat
             .iter()
             .enumerate()
+            .take(flat[container].subtree_end)
+            .skip(container + 1)
             .filter(|(index, node)| {
                 node.style.display == WDisplay::TableRow && is_descendant_of(*index, container)
             })
@@ -6639,7 +7561,7 @@ fn project_table_rows_after_content_settlement(
     for (position, &(_, index)) in layouts.iter().enumerate() {
         positions[index] = Some(position);
     }
-    let line_positions: HashMap<_, _> = positions
+    let line_positions: LayoutPositions = positions
         .iter()
         .enumerate()
         .filter_map(|(index, position)| position.map(|position| (index, position)))
@@ -6649,7 +7571,7 @@ fn project_table_rows_after_content_settlement(
         component: &Component,
         index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         heights: &mut [Option<f32>],
     ) {
         if component.style.display == WDisplay::TableCell {
@@ -6932,7 +7854,7 @@ fn project_auto_table_child_heights(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let mut children = vec![Vec::<usize>::new(); flat.len()];
     let mut bfc_owners = vec![None; flat.len()];
     let mut owned_floats = vec![Vec::<usize>::new(); flat.len()];
@@ -7302,11 +8224,11 @@ fn project_fixed_table_cell_rects(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn shift_subtree_x(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta: f32,
@@ -7331,7 +8253,7 @@ fn project_fixed_table_cell_rects(
         viewport_w: f32,
         viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         if component.style.display == WDisplay::TableRow {
             let Some(row_position) = layout_position.get(&component_index).copied() else {
@@ -7500,7 +8422,7 @@ fn project_fixed_table_cell_rects(
         component: &Component,
         component_index: usize,
         layouts: &[(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) -> Option<LayoutRect> {
         let mut result = if component.style.display == WDisplay::TableRow {
             layout_position
@@ -7539,7 +8461,7 @@ fn project_fixed_table_cell_rects(
         grid_rect: Option<LayoutRect>,
         column: &mut usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         let start_column = *column;
         let mut child_index = component_index + 1;
@@ -7599,7 +8521,7 @@ fn project_fixed_table_cell_rects(
         viewport_w: f32,
         viewport_h: f32,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         if matches!(
             component.style.display,
@@ -7635,7 +8557,7 @@ fn project_fixed_table_cell_rects(
                 component: &Component,
                 component_index: usize,
                 layouts: &[(LayoutRect, usize)],
-                layout_position: &HashMap<usize, usize>,
+                layout_position: &LayoutPositions,
                 row_count: &mut usize,
                 current_row_height: &mut f32,
             ) {
@@ -7780,7 +8702,7 @@ fn project_leading_descendant_margin_groups(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     let collapse = |margins: &[f32]| {
         let positive = margins.iter().copied().fold(0.0_f32, f32::max);
@@ -7795,7 +8717,7 @@ fn project_leading_descendant_margin_groups(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         viewport_w: f32,
         viewport_h: f32,
         collapse: &impl Fn(&[f32]) -> f32,
@@ -7942,13 +8864,13 @@ fn project_inline_after_leading_empty_blocks(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn visit(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
     ) {
         let Some(parent_position) = layout_position.get(&component_index).copied() else {
             return;
@@ -8040,7 +8962,7 @@ fn project_constrained_height_trailing_margin_containment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn collapse(margins: impl IntoIterator<Item = f32>) -> f32 {
         let mut positive = 0.0_f32;
@@ -8054,7 +8976,7 @@ fn project_constrained_height_trailing_margin_containment(
 
     fn shift_range(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         end: usize,
         delta_y: f32,
@@ -8070,7 +8992,7 @@ fn project_constrained_height_trailing_margin_containment(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         viewport_w: f32,
         viewport_h: f32,
     ) {
@@ -8365,11 +9287,11 @@ fn project_simple_float_margin_boxes(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta_y: f32,
@@ -8383,7 +9305,7 @@ fn project_simple_float_margin_boxes(
 
     fn shift_subtree_x(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta_x: f32,
@@ -8399,7 +9321,7 @@ fn project_simple_float_margin_boxes(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         viewport_w: f32,
         viewport_h: f32,
     ) {
@@ -8662,7 +9584,7 @@ fn project_simple_float_margin_boxes(
                     component_index: usize,
                     containing_width: f32,
                     layouts: &[(LayoutRect, usize)],
-                    layout_position: &HashMap<usize, usize>,
+                    layout_position: &LayoutPositions,
                     viewport_w: f32,
                     viewport_h: f32,
                     margins: &mut Vec<f32>,
@@ -9490,13 +10412,16 @@ fn project_simple_float_margin_boxes(
                                 viewport_h,
                             )
                         };
-                        for padding in [
-                            &mut constrained.style.padding.left,
-                            &mut constrained.style.padding.right,
-                            &mut constrained.style.padding.top,
-                            &mut constrained.style.padding.bottom,
-                        ] {
-                            *padding = w3cos_std::style::Spacing::Px(spacing(*padding));
+                        {
+                            let style = &mut *constrained.style;
+                            for padding in [
+                                &mut style.padding.left,
+                                &mut style.padding.right,
+                                &mut style.padding.top,
+                                &mut style.padding.bottom,
+                            ] {
+                                *padding = w3cos_std::style::Spacing::Px(spacing(*padding));
+                            }
                         }
                         let horizontal_inner = spacing(child.style.padding.left)
                             + spacing(child.style.padding.right)
@@ -9515,20 +10440,20 @@ fn project_simple_float_margin_boxes(
                         } else {
                             (available - horizontal_inner).max(0.0)
                         });
-                        for dimension in [
-                            &mut constrained.style.min_width,
-                            &mut constrained.style.max_width,
-                        ] {
-                            if matches!(*dimension, WDim::Percent(_)) {
-                                *dimension = dimension
-                                    .resolve(
-                                        containing.width,
-                                        ROOT_FONT_SIZE,
-                                        child.style.font_size,
-                                        viewport_w,
-                                        viewport_h,
-                                    )
-                                    .map_or(WDim::Auto, WDim::Px);
+                        {
+                            let style = &mut *constrained.style;
+                            for dimension in [&mut style.min_width, &mut style.max_width] {
+                                if matches!(*dimension, WDim::Percent(_)) {
+                                    *dimension = dimension
+                                        .resolve(
+                                            containing.width,
+                                            ROOT_FONT_SIZE,
+                                            child.style.font_size,
+                                            viewport_w,
+                                            viewport_h,
+                                        )
+                                        .map_or(WDim::Auto, WDim::Px);
+                                }
                             }
                         }
                         if matches!(child.style.height, WDim::Percent(_)) {
@@ -10702,10 +11627,14 @@ fn project_simple_float_margin_boxes(
 }
 
 fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
-    let anonymous = style.custom_properties.as_ref().is_some_and(|properties| {
-        properties.contains_key("--w3cos-internal-inline-formatting-context")
-            || properties.contains_key("--w3cos-internal-anonymous-float-group")
-    });
+    // Only consulted for flex/grid boxes; probing the custom property map
+    // for every box in every float pass dominated this predicate.
+    let anonymous = || {
+        style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                || properties.contains_key("--w3cos-internal-anonymous-float-group")
+        })
+    };
     root || establishes_column_context(style)
         || style.float != WFloat::None
         || matches!(style.position, WPos::Absolute | WPos::Fixed)
@@ -10718,11 +11647,10 @@ fn establishes_float_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
                 | WDisplay::InlineTable
                 | WDisplay::TableCell
         )
-        || (!anonymous
-            && matches!(
-                style.display,
-                WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
-            ))
+        || (matches!(
+            style.display,
+            WDisplay::Flex | WDisplay::InlineFlex | WDisplay::Grid
+        ) && !anonymous())
 }
 
 fn genuine_float_track_container(style: &w3cos_std::style::Style) -> bool {
@@ -12167,7 +13095,7 @@ fn project_float_followed_by_clearing_block_height(
             let last_rect = layouts[last_position].0;
             layouts[parent_position].0.height = (last_rect.y - parent_rect.y).max(0.0);
             if let Some(parent_of_parent) = flat[index].parent {
-                let outer_children = (parent_of_parent + 1..flat.len())
+                let outer_children = (parent_of_parent + 1..flat[parent_of_parent].subtree_end)
                     .filter(|child| flat[*child].parent == Some(parent_of_parent))
                     .collect::<Vec<_>>();
                 if let Some(slot) = outer_children.iter().position(|child| *child == index) {
@@ -12235,7 +13163,7 @@ fn project_float_followed_by_clearing_block_height(
         {
             continue;
         }
-        let direct = (parent + 1..flat.len())
+        let direct = (parent + 1..flat[parent].subtree_end)
             .filter(|child| flat[*child].parent == Some(parent))
             .collect::<Vec<_>>();
         let Some(clear_slot) = direct.iter().position(|child| {
@@ -12281,7 +13209,7 @@ fn project_float_followed_by_clearing_block_height(
         let target_height = (target_bottom - parent_rect.y + 1.0).max(0.0);
         layouts[parent_position].0.height = target_height;
         if let Some(parent_of_parent) = flat[parent].parent {
-            let outer_children = (parent_of_parent + 1..flat.len())
+            let outer_children = (parent_of_parent + 1..flat[parent_of_parent].subtree_end)
                 .filter(|child| flat[*child].parent == Some(parent_of_parent))
                 .collect::<Vec<_>>();
             if let Some(slot) = outer_children.iter().position(|child| *child == parent) {
@@ -12831,8 +13759,8 @@ fn project_shared_bfc_float_collisions(
         }
         stack.push(index);
     }
-    let mut groups = HashMap::<usize, Vec<(FloatExclusion, Option<usize>)>>::new();
-    let mut clear_break_floors = HashMap::<usize, f32>::new();
+    let mut groups = HashMap::<usize, Vec<(FloatExclusion, Option<usize>)>>::default();
+    let mut clear_break_floors = HashMap::<usize, f32>::default();
     for index in 0..flat.len() {
         let node = &flat[index];
         if !visible[index] || matches!(node.style.position, WPos::Absolute | WPos::Fixed) {
@@ -13468,7 +14396,7 @@ fn project_right_float_text_containment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     for (index, node) in flat.iter().enumerate() {
         let Some(parent) = node.parent else {
             continue;
@@ -13890,7 +14818,7 @@ fn project_bottom_aligned_float_inline_rows(
             continue;
         };
         let rect = layouts[container_position].0;
-        let children = (container + 1..flat.len())
+        let children = (container + 1..flat[container].subtree_end)
             .filter(|child| flat[*child].parent == Some(container))
             .collect::<Vec<_>>();
         let floats = children
@@ -14051,7 +14979,7 @@ fn project_staggered_float_inline_bands(
         let Some(container_position) = positions[container] else {
             continue;
         };
-        let children = (container + 1..flat.len())
+        let children = (container + 1..flat[container].subtree_end)
             .filter(|child| flat[*child].parent == Some(container))
             .collect::<Vec<_>>();
         let floats = children
@@ -14184,7 +15112,7 @@ fn project_auto_height_bfc_float_heights(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn establishes_bfc(style: &w3cos_std::style::Style, root: bool) -> bool {
         establishes_float_bfc(style, root)
@@ -14194,7 +15122,7 @@ fn project_auto_height_bfc_float_heights(
         index: usize,
         height: f32,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         flat: &[FlatNodeInfo<'_>],
         vw: f32,
         vh: f32,
@@ -14238,7 +15166,7 @@ fn project_auto_height_bfc_float_heights(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         flat: &[FlatNodeInfo<'_>],
         viewport_w: f32,
         viewport_h: f32,
@@ -14458,11 +15386,20 @@ fn project_cleared_descendant_bfc_heights(
     layouts: &mut [(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
 ) {
+    // Only in-flow cleared boxes can extend a BFC here; most trees have none.
+    if !flat
+        .iter()
+        .any(|node| node.style.clear != WClear::None && node.style.float == WFloat::None)
+    {
+        return;
+    }
     let positions = layouts
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
+    // Pre-order: the descendants of `ancestor` are `ancestor + 1..ends[ancestor]`.
+    let ends = subtree_ends(flat);
     for ancestor in 0..flat.len() {
         let style = flat[ancestor].style;
         if !matches!(style.height, WDim::Auto)
@@ -14474,7 +15411,7 @@ fn project_cleared_descendant_bfc_heights(
             continue;
         };
         let ancestor_rect = layouts[ancestor_position].0;
-        let Some(bottom) = (ancestor + 1..flat.len())
+        let Some(bottom) = (ancestor + 1..ends[ancestor])
             .filter(|candidate| {
                 positions.contains_key(candidate)
                     && flat[*candidate].style.clear != WClear::None
@@ -14484,16 +15421,6 @@ fn project_cleared_descendant_bfc_heights(
                         flat[*candidate].style.position,
                         WPos::Absolute | WPos::Fixed
                     )
-            })
-            .filter(|candidate| {
-                let mut parent = flat[*candidate].parent;
-                while let Some(index) = parent {
-                    if index == ancestor {
-                        return true;
-                    }
-                    parent = flat[index].parent;
-                }
-                false
             })
             .filter_map(|candidate| {
                 let rect = layouts[*positions.get(&candidate)?].0;
@@ -14581,12 +15508,12 @@ fn project_single_baseline_replaced_image(layouts: &mut [(LayoutRect, usize)], r
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     fn visit(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = index + 1;
         for child in &component.children {
@@ -14651,7 +15578,7 @@ fn project_table_block_inline_height_changes(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let original = original
         .iter()
         .map(|(rect, index)| (*index, *rect))
@@ -14660,7 +15587,7 @@ fn project_table_block_inline_height_changes(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         original: &HashMap<usize, LayoutRect>,
     ) {
         let mut child_index = index + 1;
@@ -14769,13 +15696,13 @@ fn project_inline_block_atomic_line_descent(layouts: &mut [(LayoutRect, usize)],
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn visit(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -15030,7 +15957,7 @@ fn project_forced_break_inline_block_alignment(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn keyword(component: &Component) -> &str {
         component
@@ -15051,7 +15978,7 @@ fn project_forced_break_inline_block_alignment(
         component: &Component,
         component_index: usize,
         layouts: &[(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) -> Option<f32> {
         let own = positions.get(&component_index).and_then(|position| {
             let rect = layouts[*position].0;
@@ -15083,7 +16010,7 @@ fn project_forced_break_inline_block_alignment(
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         index: usize,
         component: &Component,
         delta_y: f32,
@@ -15102,7 +16029,7 @@ fn project_forced_break_inline_block_alignment(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -15268,7 +16195,7 @@ fn project_inline_continuation_after_wrapped_row(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn whitespace_only(component: &Component) -> bool {
         match &component.kind {
@@ -15300,7 +16227,7 @@ fn project_inline_continuation_after_wrapped_row(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = index + 1;
         let children = component
@@ -15812,7 +16739,7 @@ fn image_text_line_packets<'a>(
     component: &'a Component,
     component_index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> Option<Vec<Vec<(&'a Component, usize)>>> {
     // Lowered inline contexts can retain their principal Block or Inline
     // display. The marker, not the Flex representation,
@@ -16055,7 +16982,7 @@ fn image_text_packets_have_shared_baselines(
     component: &Component,
     component_index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> bool {
     if crate::inline_line_metrics::is_projected(component, component_index, layouts, positions) {
         return true;
@@ -16119,7 +17046,7 @@ fn used_inline_height_constraints(
         .iter()
         .map(|(rect, index)| (*index, *rect))
         .collect::<HashMap<_, _>>();
-    let mut output = HashMap::new();
+    let mut output = HashMap::default();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         pending.extend(tree.children(node)?);
@@ -16190,7 +17117,7 @@ fn project_image_text_lines(
     component: &Component,
     component_index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> bool {
     project_image_text_lines_with_constraints(component, component_index, layouts, positions, None)
 }
@@ -16199,7 +17126,7 @@ fn project_image_text_lines_with_constraints(
     component: &Component,
     component_index: usize,
     layouts: &mut [(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
     used: Option<crate::inline_line_metrics::UsedHeightConstraints>,
 ) -> bool {
     if crate::inline_line_metrics::project_with_constraints(
@@ -16255,7 +17182,7 @@ fn project_image_text_lines_with_constraints(
         let mut descent = strut_height - strut_ascent;
         let mut top_height = 0.0_f32;
         let mut bottom_height = 0.0_f32;
-        let mut item_tops = HashMap::new();
+        let mut item_tops = HashMap::default();
         for (child, index) in &line {
             let rect = layouts[positions[index]].0;
             let margin = child.style.margin_lengths();
@@ -16329,7 +17256,7 @@ fn project_image_text_lines_with_constraints(
 }
 
 fn project_forced_break_lines(layouts: &mut [(LayoutRect, usize)], root: &Component) {
-    project_forced_break_lines_with_constraints(layouts, root, &HashMap::new());
+    project_forced_break_lines_with_constraints(layouts, root, &HashMap::default());
 }
 
 fn project_forced_break_lines_with_constraints(
@@ -16389,7 +17316,96 @@ fn project_forced_break_lines_with_constraints(
             use_resolved_padding(&mut resolved, &mut 0, constraints);
             resolved
         });
-    let root = resolved.as_ref().unwrap_or(root);
+    project_forced_break_lines_on_used_tree(
+        layouts,
+        resolved.as_ref().unwrap_or(root),
+        constraints,
+    );
+}
+
+/// `project_forced_break_lines_with_constraints` on a caller-owned tree whose
+/// collapsed table borders are already resolved (the table-prepared tree).
+/// The half-border and used-padding edits are applied in place and undone
+/// afterwards, so the shared tree is unchanged for later passes.
+fn project_forced_break_lines_with_shared_tree(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    shared: Option<&mut Component>,
+    constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
+) {
+    let Some(tree) = shared else {
+        project_forced_break_lines_with_constraints(layouts, root, constraints);
+        return;
+    };
+    fn apply(
+        component: &mut Component,
+        index: &mut usize,
+        constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
+        saved: &mut Vec<(usize, w3cos_std::component::ComponentStyle)>,
+    ) {
+        let own_index = *index;
+        *index += 1;
+        let half =
+            component.style.display == WDisplay::TableCell && component.style.border_collapse;
+        let padding = constraints.get(&own_index).and_then(|used| used.padding);
+        if half || padding.is_some() {
+            saved.push((own_index, component.style.clone()));
+        }
+        if half {
+            for side in 0..4 {
+                let width = collapsed_layout_edge_width(&component.style, side) * 0.5;
+                set_collapsed_layout_edge_width(&mut component.style, side, width);
+            }
+        }
+        if let Some(padding) = padding {
+            component.style.padding = w3cos_std::style::Edges {
+                top: WSpacing::Px(padding.top),
+                right: WSpacing::Px(padding.right),
+                bottom: WSpacing::Px(padding.bottom),
+                left: WSpacing::Px(padding.left),
+            };
+        }
+        for child in &mut component.children {
+            apply(child, index, constraints, saved);
+        }
+    }
+    fn restore(
+        component: &mut Component,
+        index: &mut usize,
+        saved: &mut std::iter::Peekable<
+            std::vec::IntoIter<(usize, w3cos_std::component::ComponentStyle)>,
+        >,
+    ) {
+        if saved.peek().is_none() {
+            return;
+        }
+        if saved.peek().is_some_and(|(at, _)| *at == *index) {
+            component.style = saved.next().unwrap().1;
+        }
+        *index += 1;
+        for child in &mut component.children {
+            restore(child, index, saved);
+        }
+    }
+    let expected = projection_verify_enabled().then(|| {
+        let mut expected = layouts.to_vec();
+        project_forced_break_lines_with_constraints(&mut expected, root, constraints);
+        expected
+    });
+    let mut saved = Vec::new();
+    apply(tree, &mut 0, constraints, &mut saved);
+    project_forced_break_lines_on_used_tree(layouts, tree, constraints);
+    restore(tree, &mut 0, &mut saved.into_iter().peekable());
+    if let Some(expected) = expected {
+        assert_layouts_unchanged(&expected, layouts, "shared-tree forced-break projection");
+    }
+}
+
+fn project_forced_break_lines_on_used_tree(
+    layouts: &mut [(LayoutRect, usize)],
+    root: &Component,
+    constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
+) {
     /// The content box a forced break continues into.
     ///
     /// A forced break opens a new line box of the inline formatting context
@@ -16501,7 +17517,7 @@ fn project_forced_break_lines_with_constraints(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let original_rects = layouts
         .iter()
         .map(|(rect, index)| (*index, *rect))
@@ -16509,7 +17525,7 @@ fn project_forced_break_lines_with_constraints(
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         start: usize,
         count: usize,
         delta_x: f32,
@@ -16527,7 +17543,7 @@ fn project_forced_break_lines_with_constraints(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        layout_position: &HashMap<usize, usize>,
+        layout_position: &LayoutPositions,
         original_rects: &HashMap<usize, LayoutRect>,
         inherited_line_origin: Option<LineOrigin>,
         constraints: &HashMap<usize, crate::inline_line_metrics::UsedHeightConstraints>,
@@ -17210,7 +18226,7 @@ fn project_inline_block_vertical_align_keywords(
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     let original_rects = layouts
         .iter()
         .map(|(rect, index)| (*index, *rect))
@@ -17230,7 +18246,7 @@ fn project_inline_block_vertical_align_keywords(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         original_rects: &HashMap<usize, LayoutRect>,
         viewport_w: f32,
         viewport_h: f32,
@@ -17738,7 +18754,7 @@ fn project_inline_block_vertical_align_keywords(
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         original_rects: &HashMap<usize, LayoutRect>,
     ) {
         let mut child_index = component_index + 1;
@@ -17790,7 +18806,7 @@ fn last_text_baseline(
     component: &Component,
     component_index: usize,
     layouts: &[(LayoutRect, usize)],
-    positions: &HashMap<usize, usize>,
+    positions: &LayoutPositions,
 ) -> Option<f32> {
     // Out-of-flow descendants do not export an in-flow line baseline.
     if matches!(component.style.position, WPos::Absolute | WPos::Fixed)
@@ -17942,18 +18958,18 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         component_index: usize,
         component: &Component,
         delta_y: f32,
     ) {
         fn shift(
             layouts: &mut [(LayoutRect, usize)],
-            positions: &HashMap<usize, usize>,
+            positions: &LayoutPositions,
             component: &Component,
             index: usize,
             delta_y: f32,
@@ -18006,7 +19022,7 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -18081,37 +19097,12 @@ fn align_inline_block_last_line_baselines(layouts: &mut [(LayoutRect, usize)], r
                 delta += layouts[*position].0.height - original.height;
             }
             if component.style.height == WDim::Auto
+                && component.style.min_height == WDim::Auto
+                && component.style.max_height == WDim::Auto
                 && delta.abs() > 0.01
                 && let Some(position) = positions.get(&component_index)
             {
-                let absolute = |dimension: WDim| match dimension {
-                    WDim::Auto => Some(None),
-                    WDim::Px(value) => Some(Some(value)),
-                    WDim::Em(value) => Some(Some(value * component.style.font_size)),
-                    WDim::Rem(value) => Some(Some(value * ROOT_FONT_SIZE)),
-                    _ => None,
-                };
-                // A min/max-height only constrains the grown size when the
-                // box was content-sized before the baseline settlement; a box
-                // already pinned at its limit keeps that limit.
-                if let (Some(minimum), Some(maximum)) = (
-                    absolute(component.style.min_height),
-                    absolute(component.style.max_height),
-                ) {
-                    let height = layouts[*position].0.height;
-                    let pinned = minimum.is_some_and(|min| height <= min + 0.01)
-                        || maximum.is_some_and(|max| height >= max - 0.01);
-                    if !pinned {
-                        let mut grown = height + delta;
-                        if let Some(max) = maximum {
-                            grown = grown.min(max);
-                        }
-                        if let Some(min) = minimum {
-                            grown = grown.max(min);
-                        }
-                        layouts[*position].0.height = grown;
-                    }
-                }
+                layouts[*position].0.height += delta;
             }
         }
 
@@ -19198,7 +20189,7 @@ fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Co
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
 
     fn custom_length(component: &Component, property: &str) -> Option<f32> {
         component
@@ -19212,7 +20203,7 @@ fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Co
 
     fn shift_subtree(
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         component_index: usize,
         component: &Component,
         delta_y: f32,
@@ -19228,7 +20219,7 @@ fn apply_inline_line_extra_ascent(layouts: &mut [(LayoutRect, usize)], root: &Co
         component: &Component,
         component_index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
     ) {
         let mut child_index = component_index + 1;
         let children = component
@@ -19297,12 +20288,12 @@ fn apply_inline_vertical_align_length(layouts: &mut [(LayoutRect, usize)], root:
         .iter()
         .enumerate()
         .map(|(position, (_, index))| (*index, position))
-        .collect::<HashMap<_, _>>();
+        .collect::<LayoutPositions>();
     fn visit(
         component: &Component,
         index: usize,
         layouts: &mut [(LayoutRect, usize)],
-        positions: &HashMap<usize, usize>,
+        positions: &LayoutPositions,
         inside_unbroken_word: bool,
     ) {
         let inside_unbroken_word = inside_unbroken_word
@@ -19391,8 +20382,8 @@ fn project_table_column_background_rects(
             height: max_y - y,
         }
     };
-    let mut table_columns = HashMap::<usize, Vec<LayoutRect>>::new();
-    let mut projected_rows = HashMap::<usize, LayoutRect>::new();
+    let mut table_columns = HashMap::<usize, Vec<LayoutRect>>::default();
+    let mut projected_rows = HashMap::<usize, LayoutRect>::default();
     for (table, table_node) in flat
         .iter()
         .enumerate()
@@ -19404,6 +20395,8 @@ fn project_table_column_background_rects(
         let mut rows = flat
             .iter()
             .enumerate()
+            .take(table_node.subtree_end)
+            .skip(table + 1)
             .filter(|(index, node)| {
                 node.style.display == WDisplay::TableRow
                     && node.style.visibility != WVisibility::Collapse
@@ -19414,6 +20407,8 @@ fn project_table_column_background_rects(
                 let cells = flat
                     .iter()
                     .enumerate()
+                    .take(flat[index].subtree_end)
+                    .skip(index + 1)
                     .filter(|(_, node)| {
                         node.parent == Some(index) && node.style.display == WDisplay::TableCell
                     })
@@ -19469,8 +20464,8 @@ fn project_table_column_background_rects(
         table_columns.insert(table, bounds.into_iter().flatten().collect());
     }
 
-    let mut projected = HashMap::<usize, LayoutRect>::new();
-    let mut next_column = HashMap::<usize, usize>::new();
+    let mut projected = HashMap::<usize, LayoutRect>::default();
+    let mut next_column = HashMap::<usize, usize>::default();
     for (index, node) in flat.iter().enumerate() {
         if node.style.display != WDisplay::TableColumn {
             continue;
@@ -19579,6 +20574,149 @@ fn refresh_scroll_container_rects(
             *rect = *final_rect;
         }
     }
+}
+
+/// Scroll containers of a LayoutNG result. Every box whose `overflow`
+/// clips (CSS Overflow 3: hidden, scroll, auto on a box that establishes an
+/// overflow clip) is a scrollport; its scrollable extent is the farthest
+/// descendant border-box edge past its own border box, as in the legacy
+/// collector. Scrollbars take no space (the legacy engine reserves none).
+pub(crate) fn scroll_containers_from_layout(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+) -> (
+    Vec<(usize, LayoutRect, ScrollExtent)>,
+    Vec<(usize, LayoutRect)>,
+    Vec<Option<usize>>,
+) {
+    let rects = layouts
+        .iter()
+        .map(|(rect, index)| (*index, *rect))
+        .collect::<HashMap<_, _>>();
+    // `inherited[i]`: the scroll container that clips `i`'s children.
+    let mut inherited: Vec<Option<usize>> = vec![None; flat.len()];
+    let mut scroll_ancestor: Vec<Option<usize>> = vec![None; flat.len()];
+    let mut scrollable = Vec::new();
+    let mut hidden_clip = vec![false; flat.len()];
+    // Translation accumulated from the transforms of the boxes between a box
+    // and its scroll container (the container's own transform moves the
+    // container, not its contents). Scrollable overflow is measured on the
+    // transformed boxes (CSS Overflow 3), so a descendant that a transform
+    // moves back into the scrollport adds no overflow.
+    let mut content_shift: Vec<(f32, f32)> = vec![(0.0, 0.0); flat.len()];
+    let mut shifted_layouts = layouts.to_vec();
+    let layout_slot = layouts
+        .iter()
+        .enumerate()
+        .map(|(slot, (_, index))| (*index, slot))
+        .collect::<HashMap<_, _>>();
+    let body_host = crate::dom::body_id();
+    let root_overflow_visible = flat.first().is_some_and(|root| {
+        root.style.resolved_overflow_x() == WOverflow::Visible
+            && root.style.resolved_overflow_y() == WOverflow::Visible
+    });
+    for index in 0..flat.len() {
+        let info = &flat[index];
+        let current = info.parent.and_then(|parent| inherited[parent]);
+        let mut effective = current;
+        if matches!(info.style.position, WPos::Absolute) {
+            // An absolutely positioned box escapes the scroll containers
+            // between it and its containing block.
+            let mut ancestor = info.parent;
+            let mut positioned = None;
+            while let Some(parent) = ancestor {
+                if !matches!(flat[parent].style.position, WPos::Static) {
+                    positioned = Some(parent);
+                    break;
+                }
+                ancestor = flat[parent].parent;
+            }
+            while let Some(clip) = effective {
+                let mut candidate = positioned;
+                let mut inside = false;
+                while let Some(at) = candidate {
+                    if at == clip {
+                        inside = true;
+                        break;
+                    }
+                    candidate = flat[at].parent;
+                }
+                if inside {
+                    break;
+                }
+                effective = scroll_ancestor[clip];
+            }
+        }
+        scroll_ancestor[index] = effective;
+        inherited[index] = effective;
+        let parent_shift = info
+            .parent
+            .map_or((0.0, 0.0), |parent| content_shift[parent]);
+        let own_shift = (
+            parent_shift.0 + info.style.transform.translate_x,
+            parent_shift.1 + info.style.transform.translate_y,
+        );
+        content_shift[index] = own_shift;
+        if (own_shift.0 != 0.0 || own_shift.1 != 0.0)
+            && let Some(slot) = layout_slot.get(&index)
+        {
+            shifted_layouts[*slot].0.x += own_shift.0;
+            shifted_layouts[*slot].0.y += own_shift.1;
+        }
+        let overflow_x = info.style.resolved_overflow_x();
+        let overflow_y = info.style.resolved_overflow_y();
+        let clips = |o: WOverflow| matches!(o, WOverflow::Hidden);
+        let scrolls = |o: WOverflow| matches!(o, WOverflow::Scroll | WOverflow::Auto);
+        // The root and a body whose overflow propagates to the viewport do
+        // not clip at their own boxes; the viewport does, so a hidden/clip
+        // value there is no scroll container. Scrolling values stay (the
+        // painter treats those hosts as the viewport).
+        let viewport_host = index == 0
+            || (root_overflow_visible
+                && matches!(
+                    info.on_click,
+                    EventAction::NativeHost { id, .. } if *id == u64::from(body_host)
+                ));
+        if viewport_host && !(scrolls(overflow_x) || scrolls(overflow_y)) {
+            continue;
+        }
+        if info.style.display.establishes_overflow_clip()
+            && (clips(overflow_x)
+                || clips(overflow_y)
+                || scrolls(overflow_x)
+                || scrolls(overflow_y))
+        {
+            inherited[index] = Some(index);
+            content_shift[index] = (0.0, 0.0);
+            if let Some(rect) = rects.get(&index) {
+                scrollable.push((
+                    index,
+                    *rect,
+                    ScrollExtent {
+                        max_x: 0.0,
+                        max_y: 0.0,
+                    },
+                ));
+                hidden_clip[index] = clips(overflow_x) || clips(overflow_y);
+            }
+        }
+    }
+    extend_scroll_extents_from_descendants(
+        &shifted_layouts,
+        flat,
+        &scroll_ancestor,
+        &mut scrollable,
+    );
+    let mut clip_only = Vec::new();
+    scrollable.retain(|(index, rect, extent)| {
+        if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden_clip[*index] {
+            true
+        } else {
+            clip_only.push((*index, *rect));
+            false
+        }
+    });
+    (scrollable, clip_only, scroll_ancestor)
 }
 
 fn extend_scroll_extents_from_descendants(
@@ -19936,7 +21074,7 @@ fn quote_word_fragment_advances(
         }
         ranges.push((start..flattened.len(), is_word));
     }
-    let virtual_line = Component::row(component.style.clone(), flattened);
+    let virtual_line = Component::row_shared(component.style.clone(), flattened);
     let mut advances = inline_fragment_shaped_advances_for_width(&virtual_line, available_width);
     // A generated source ends at a LayoutUnit boundary even when its last
     // word shares a no-break wrapper with a different quote source. Retain
@@ -19944,7 +21082,11 @@ fn quote_word_fragment_advances(
     let mut start = 0;
     while start < virtual_line.children.len() {
         let first = &virtual_line.children[start];
-        let source = w3cos_std::inline_text::source_run(&first.style);
+        let source = first
+            .style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN));
         let mut end = start + 1;
         while source.is_some()
             && end < virtual_line.children.len()
@@ -20036,7 +21178,9 @@ fn inline_fragment_shaped_advances_for_width(
         .iter()
         .map(|child| {
             let mut style = child.style.clone();
-            if style.text_source_run.is_some() {
+            if style.custom_properties.as_ref().is_some_and(|properties| {
+                properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
+            }) {
                 // Generated pieces retain one authored text run. Inline box
                 // decoration is laid out separately, not a per-word font boundary.
                 style.padding = w3cos_std::style::Edges::ZERO;
@@ -20103,13 +21247,16 @@ fn inline_fragment_shaped_advances_for_width(
             // run. Its used width occupies LayoutUnits, while glyph positions
             // inside the run retain their original fractional precision.
             if !interior_endpoints && ((end == component.children.len()
-                && first_style.text_source_run.is_some())
+                && first_style.custom_properties.as_ref().is_some_and(|properties|
+                    properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)))
                 || component.children.get(end).is_some_and(|next|
                 next.children.is_empty() && next.style.display == WDisplay::Inline
                     && next.style.position == WPos::Static && next.style.float == WFloat::None
                     && matches!(&next.kind, ComponentKind::Text { content } if !content.is_empty())
-                    && (w3cos_std::inline_text::source_run(first_style)
-                            .is_some_and(|source| w3cos_std::inline_text::source_run(&next.style)
+                    && (first_style.custom_properties.as_ref()
+                            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
+                            .is_some_and(|source| next.style.custom_properties.as_ref()
+                                .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
                                 != Some(source))
                         || next.style.font_family != first_style.font_family
                         || next.style.font_size != first_style.font_size
@@ -20223,7 +21370,6 @@ fn build_taffy_tree(
     table_column: Option<usize>,
     parent_table_height_definite: bool,
     inherited_border_spacing: Option<(f32, f32)>,
-    parent_lowered_block_inline: bool,
 ) -> Result<NodeId, taffy::TaffyError> {
     let my_idx = *idx;
     *idx += 1;
@@ -20235,21 +21381,6 @@ fn build_taffy_tree(
     };
 
     let mut style = to_taffy_style(&comp.style, viewport_w, viewport_h);
-    apply_calc_percent_overrides(
-        &mut style,
-        &comp.style,
-        containing_width,
-        definite_height_basis,
-        viewport_w,
-        viewport_h,
-    );
-    if GRID_DEPTH.with(|depth| depth.get()) > 0
-        && [comp.style.width, comp.style.min_width, comp.style.max_width]
-            .iter()
-            .any(|value| matches!(value, WDim::Calc(calc) if !calc.is_absolute()))
-    {
-        GRID_CALC_SEEN.with(|seen| seen.set(true));
-    }
     if comp.style.float != WFloat::None && style.display == Display::Block {
         // CSS floats establish a BFC, even with authored overflow:visible.
         // Taffy's block interface has no float/BFC flag; its non-scrolling
@@ -20331,11 +21462,6 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
-        WDim::Calc(calc) if calc.is_absolute() => {
-            Some(calc.resolve(0.0, comp.style.font_size, viewport_w, viewport_h))
-        }
-        WDim::Calc(calc) => definite_height_basis
-            .map(|basis| calc.resolve(basis, comp.style.font_size, viewport_w, viewport_h)),
         WDim::Auto | WDim::Ch(_) | WDim::Vw(_) => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
@@ -20682,10 +21808,7 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
-        WDim::Calc(calc) if calc.is_absolute() => {
-            Some(calc.resolve(0.0, comp.style.font_size, viewport_w, viewport_h))
-        }
-        WDim::Auto | WDim::Percent(_) | WDim::Calc(_) => None,
+        WDim::Auto | WDim::Percent(_) => None,
     };
     let absorbs_ua_inline_padding =
         uses_ua_table_cell_padding && absolute_dimension(comp.style.width).is_some();
@@ -21736,7 +22859,6 @@ fn build_taffy_tree(
                 comp.style.display,
                 WDisplay::InlineBlock | WDisplay::InlineFlex
             ) && !matches!(parent_display, Some(WDisplay::Flex | WDisplay::Grid));
-        let mut wide_text_width: Option<f32> = None;
         let (min_w, size_w) = if passive_inline_edges
             && !matches!(comp.kind, ComponentKind::Text { .. })
         {
@@ -21783,7 +22905,13 @@ fn build_taffy_tree(
                     if passive_inline_edges
                         && parent_display == Some(WDisplay::Inline)
                         && !nowrap
-                        && comp.style.text_source_run.is_none()
+                        && comp
+                            .style
+                            .custom_properties
+                            .as_ref()
+                            .is_none_or(|properties| {
+                                !properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
+                            })
                     {
                         // A raw nested inline can retain one unsplit text
                         // leaf. Its normal text fits the containing line,
@@ -21826,39 +22954,6 @@ fn build_taffy_tree(
                             ))
                     {
                         let mut w = text_intrinsic_size_for_taffy(content, &comp.style).0;
-                        if inline_text_in_block
-                            && !nowrap
-                            && !absolute_auto_shrink_to_fit
-                            && comp.style.float == WFloat::None
-                            && containing_width.is_finite()
-                            && containing_width > 0.0
-                        {
-                            // The intrinsic measure above wraps at a fixed 360px
-                            // probe width, so text wider than that would be
-                            // locked to a narrow, many-line box inside a wide
-                            // block. CSS shrink-to-fit: the preferred (max-content)
-                            // width bounded by the containing block, never below
-                            // the longest unbreakable run.
-                            let padding = comp.style.padding_lengths();
-                            let edges = padding.left
-                                + padding.right
-                                + comp
-                                    .style
-                                    .border_left_width
-                                    .unwrap_or(comp.style.border_width)
-                                + comp
-                                    .style
-                                    .border_right_width
-                                    .unwrap_or(comp.style.border_width);
-                            let used =
-                                shrink_to_fit_used_width_with_available(comp, containing_width);
-                            w = if comp.style.box_sizing == WBoxSizing::ContentBox {
-                                (used - edges).max(0.0)
-                            } else {
-                                used
-                            };
-                            wide_text_width = Some(w);
-                        }
                         if comp.style.display == WDisplay::InlineBlock {
                             w += comp
                                 .style
@@ -21960,21 +23055,6 @@ fn build_taffy_tree(
                             );
                         let mut w = if pre_wrap_flex_text {
                             component_min_content_width(comp)
-                        } else if (inline_text_in_block
-                            || (parent_lowered_block_inline
-                                && comp.style.display == WDisplay::Inline))
-                            && comp.style.white_space != WWhiteSpace::NoWrap
-                            && containing_width.is_finite()
-                            && containing_width > 0.0
-                        {
-                            // Preferred (single-line) width bounded by the
-                            // containing block. The fixed 360px wrap probe
-                            // would otherwise lock wide text into a narrow
-                            // many-line box.
-                            let wide = text_max_content_width_for_taffy(content, &comp.style)
-                                .min(containing_width);
-                            wide_text_width = Some(wide);
-                            wide
                         } else {
                             text_intrinsic_size_for_taffy(content, &comp.style).0
                         };
@@ -22083,19 +23163,7 @@ fn build_taffy_tree(
         {
             min_w
         } else {
-            let authored = to_taffy_dim(comp.style.min_width, &comp.style, viewport_w, viewport_h);
-            // A text-only flex item (e.g. `h3.title { min-width: 3ch }`) keeps
-            // its content width as the lower bound: an authored `min-width`
-            // only raises it. Replacing it lets the leaf collapse to the
-            // authored width and wrap one glyph per line.
-            let text_flex_item = matches!(comp.kind, ComponentKind::Text { .. })
-                && matches!(parent_display, Some(WDisplay::Flex | WDisplay::InlineFlex))
-                && !matches!(parent_direction, Some(WDir::Column | WDir::ColumnReverse))
-                && comp.style.white_space != WWhiteSpace::PreWrap;
-            match (text_flex_item, min_w.into_option(), authored.into_option()) {
-                (true, Some(content), Some(authored_px)) if content > authored_px => min_w,
-                _ => authored,
-            }
+            to_taffy_dim(comp.style.min_width, &comp.style, viewport_w, viewport_h)
         };
         let intrinsic_min_h = if matches!(comp.style.height, WDim::Auto)
             && matches!(comp.style.max_height, WDim::Auto)
@@ -22125,19 +23193,10 @@ fn build_taffy_tree(
         let table_cell_track_width = (comp.style.display == WDisplay::TableCell
             && inherited_cell_tracks.is_some())
         .then_some(style.size.width);
-        // The shared leaf height wraps at the fixed 360px probe; a text leaf
-        // given its true single-line/wide width needs the matching height.
-        let (leaf_height, min_h) = match (&comp.kind, wide_text_width) {
-            (ComponentKind::Text { content }, Some(width)) if min_h.into_option().is_some() => {
-                let height = text_height_at_content_width_for_taffy(content, &comp.style, width);
-                (Dimension::length(height), Dimension::length(height))
-            }
-            _ => (size.height, min_h),
-        };
         let mut leaf_style = Style {
             size: Size {
                 width: size_w,
-                height: leaf_height,
+                height: size.height,
             },
             min_size: Size {
                 width: min_w,
@@ -22362,6 +23421,9 @@ fn build_taffy_tree(
             viewport_h,
         );
         let mut separator_breaks = Vec::new();
+        let line_prefix = std::cell::OnceCell::new();
+        // Per inline formatting context, not per child (was quadratic).
+        let simple_packet = std::cell::OnceCell::new();
         let mut child_nodes: Vec<(i32, usize, NodeId)> = comp
             .children
             .iter()
@@ -22378,27 +23440,6 @@ fn build_taffy_tree(
                 } else {
                     child_containing_width
                 };
-                let is_grid_item = comp.style.display == WDisplay::Grid;
-                let child_available_width = if is_grid_item {
-                    GRID_ITEM_IDS.with(|ids| ids.borrow_mut().push(*idx));
-                    GRID_ITEM_HINTS
-                        .with(|hints| {
-                            hints
-                                .borrow()
-                                .as_ref()
-                                .and_then(|map| map.get(&*idx).copied())
-                        })
-                        .filter(|_| {
-                            matches!(c.style.width, WDim::Auto)
-                                && matches!(c.style.position, WPos::Static | WPos::Relative)
-                        })
-                        .unwrap_or(child_available_width)
-                } else {
-                    child_available_width
-                };
-                if is_grid_item {
-                    GRID_DEPTH.with(|depth| depth.set(depth.get() + 1));
-                }
                 let node = build_taffy_tree(
                     tree,
                     c,
@@ -22448,12 +23489,7 @@ fn build_taffy_tree(
                                     | WDisplay::TableFooterGroup
                             )),
                     active_border_spacing,
-                    lowered_block_inline,
-                );
-                if is_grid_item {
-                    GRID_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-                }
-                let node = node?;
+                )?;
                 if anonymous_block_line
                     && !matches!(c.style.position, WPos::Absolute | WPos::Fixed)
                     && (c.style.display != WDisplay::Inline
@@ -22928,8 +23964,10 @@ fn build_taffy_tree(
                     && c.style.margin == w3cos_std::style::Edges::ZERO
                     && c.style.border_width == 0.0
                     && c.style.background.a == 0
-                    && inline_line_filled_by_previous_items(
-                        &comp.children[..source_index],
+                    && inline_line_prefix_filled(
+                        &line_prefix,
+                        &comp.children,
+                        source_index,
                         child_containing_width,
                     )
                     && let ComponentKind::Text { content } = &c.kind
@@ -23009,8 +24047,10 @@ fn build_taffy_tree(
                                 >= child_containing_width
                         || matches!(&comp.children[source_index - 1].kind,
                                 ComponentKind::Text { content } if content.ends_with('\u{a0}'))
-                            && inline_line_filled_by_previous_items(
-                                &comp.children[..source_index],
+                            && inline_line_prefix_filled(
+                                &line_prefix,
+                                &comp.children,
+                                source_index,
                                 child_containing_width,
                             )
                         || flex_backed_inline_formatting_context
@@ -23036,8 +24076,10 @@ fn build_taffy_tree(
                                             },
                                         )
                             })
-                            && inline_line_filled_by_previous_items(
-                                &comp.children[..source_index],
+                            && inline_line_prefix_filled(
+                                &line_prefix,
+                                &comp.children,
+                                source_index,
                                 child_containing_width,
                             ))
                 {
@@ -23080,13 +24122,17 @@ fn build_taffy_tree(
                         separator_breaks.push((c.style.order, source_index, line_break));
                     }
                 }
-                if is_simple_wrapping_text_packet(comp, child_containing_width)
-                    && source_index > 0
+                if source_index > 0
                     && matches!(&c.kind, ComponentKind::Text { content } if content == " ")
                     && c.style.margin.left == WSpacing::Px(0.0)
                     && c.style.margin.right == WSpacing::Px(0.0)
-                    && inline_line_filled_by_previous_items(
-                        &comp.children[..source_index],
+                    && *simple_packet.get_or_init(|| {
+                        is_simple_wrapping_text_packet(comp, child_containing_width)
+                    })
+                    && inline_line_prefix_filled(
+                        &line_prefix,
+                        &comp.children,
+                        source_index,
                         child_containing_width,
                     )
                 {
@@ -23825,70 +24871,23 @@ fn apply_measured_text_height(
         let padding = style.padding_lengths();
         h = (h - padding.top - padding.bottom).max(0.0);
     }
-    let mut taffy_style = tree.style(node)?.clone();
     let measured_height = Dimension::length(h);
-    let measured_min_height =
-        if matches!(style.min_height, WDim::Auto) && matches!(style.max_height, WDim::Auto) {
-            measured_height
-        } else {
-            taffy_style.min_size.height
-        };
-    if taffy_style.min_size.height != measured_min_height
-        || taffy_style.size.height != measured_height
-    {
-        taffy_style.min_size.height = measured_min_height;
-        taffy_style.size.height = measured_height;
-        tree.set_style(node, taffy_style)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-/// `true` when a text-only `<button>` label may wrap onto several lines.
-pub(crate) fn button_label_can_wrap(label: &str, style: &w3cos_std::style::Style) -> bool {
-    matches!(
-        style.white_space,
-        WWhiteSpace::Normal | WWhiteSpace::PreWrap | WWhiteSpace::PreLine
-    ) && label.trim().contains(char::is_whitespace)
-}
-
-/// A text-only `<button>` wraps its label at its own width like any block of
-/// text; its auto height follows the wrapped line count. Single-line labels
-/// are left untouched.
-fn apply_button_wrapped_height(
-    tree: &mut TaffyTree<usize>,
-    node: NodeId,
-    label: &str,
-    style: &w3cos_std::style::Style,
-    node_width: f32,
-) -> Result<bool, taffy::TaffyError> {
-    let padding = style.padding_lengths();
-    let border_w = style.border_left_width.unwrap_or(style.border_width)
-        + style.border_right_width.unwrap_or(style.border_width);
-    let border_h = style.border_top_width.unwrap_or(style.border_width)
-        + style.border_bottom_width.unwrap_or(style.border_width);
-    let wrapped = wrapped_text_height(label, (node_width - border_w).max(1.0), style);
-    let single = text_intrinsic_size(label, style).1;
-    if wrapped <= single + 0.5 {
-        return Ok(false);
-    }
-    let mut h = wrapped;
-    if style.box_sizing == WBoxSizing::BorderBox {
-        h += border_h;
-    } else {
-        h = (h - padding.top - padding.bottom).max(0.0);
-    }
-    let mut taffy_style = tree.style(node)?.clone();
-    let measured_height = Dimension::length(h);
-    let measured_min_height =
-        if matches!(style.min_height, WDim::Auto) && matches!(style.max_height, WDim::Auto) {
-            measured_height
-        } else {
-            taffy_style.min_size.height
-        };
-    if taffy_style.min_size.height != measured_min_height
-        || taffy_style.size.height != measured_height
-    {
+    let (changed, measured_min_height) = {
+        let current = tree.style(node)?;
+        let measured_min_height =
+            if matches!(style.min_height, WDim::Auto) && matches!(style.max_height, WDim::Auto) {
+                measured_height
+            } else {
+                current.min_size.height
+            };
+        (
+            current.min_size.height != measured_min_height
+                || current.size.height != measured_height,
+            measured_min_height,
+        )
+    };
+    if changed {
+        let mut taffy_style = tree.style(node)?.clone();
         taffy_style.min_size.height = measured_min_height;
         taffy_style.size.height = measured_height;
         tree.set_style(node, taffy_style)?;
@@ -23923,11 +24922,6 @@ fn update_text_leaf_heights(
                         wrap_width,
                         parent_display,
                     )?;
-                }
-            } else if let ComponentKind::Button { label } = flat[idx].kind {
-                let style = flat[idx].style;
-                if matches!(style.height, WDim::Auto) && button_label_can_wrap(label, style) {
-                    dirty |= apply_button_wrapped_height(tree, node, label, style, node_width)?;
                 }
             }
         }
@@ -24463,14 +25457,9 @@ fn collect_layouts_fast(
                         || relative_containing_block_height_definite)
             }
             WDim::Percent(_) => relative_containing_block_height_definite,
-            WDim::Calc(calc) if !calc.is_absolute() => relative_containing_block_height_definite,
-            WDim::Calc(_)
-            | WDim::Px(_)
-            | WDim::Rem(_)
-            | WDim::Em(_)
-            | WDim::Ch(_)
-            | WDim::Vw(_)
-            | WDim::Vh(_) => true,
+            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Ch(_) | WDim::Vw(_) | WDim::Vh(_) => {
+                true
+            }
         });
 
     for &child in tree.children(node).unwrap().iter() {
@@ -25511,18 +26500,11 @@ fn to_taffy_style(s: &w3cos_std::style::Style, viewport_w: f32, viewport_h: f32)
         } else {
             Vec::new()
         },
-        grid_template_rows: s
-            .grid_template_rows
+        grid_column: s
+            .grid_column
             .as_deref()
-            .map(parse_grid_template_columns)
+            .map(parse_grid_column)
             .unwrap_or_default(),
-        grid_template_areas: s
-            .grid_template_areas
-            .as_deref()
-            .map(parse_grid_template_areas)
-            .unwrap_or_default(),
-        grid_column: resolve_grid_placement(s.grid_area.as_deref(), s.grid_column.as_deref(), true),
-        grid_row: resolve_grid_placement(s.grid_area.as_deref(), s.grid_row.as_deref(), false),
         ..Style::DEFAULT
     };
     if let WDim::Ch(value) = s.width {
@@ -25581,18 +26563,6 @@ fn parse_grid_template_columns(value: &str) -> Vec<GridTemplateComponent<String>
 
 fn parse_grid_track(value: &str) -> Option<GridTemplateComponent<String>> {
     let value = value.trim();
-    if value == "min-content" {
-        return Some(taffy::style_helpers::minmax(
-            MinTrackSizingFunction::MIN_CONTENT,
-            MaxTrackSizingFunction::MIN_CONTENT,
-        ));
-    }
-    if value == "max-content" {
-        return Some(taffy::style_helpers::minmax(
-            MinTrackSizingFunction::MAX_CONTENT,
-            MaxTrackSizingFunction::MAX_CONTENT,
-        ));
-    }
     if let Some(number) = value.strip_suffix("fr")
         && let Ok(number) = number.trim().parse::<f32>()
     {
@@ -25619,12 +26589,6 @@ fn parse_grid_track(value: &str) -> Option<GridTemplateComponent<String>> {
 }
 
 fn parse_grid_min_track(value: &str) -> Option<MinTrackSizingFunction> {
-    if value == "min-content" {
-        return Some(MinTrackSizingFunction::MIN_CONTENT);
-    }
-    if value == "max-content" {
-        return Some(MinTrackSizingFunction::MAX_CONTENT);
-    }
     if value == "auto" {
         return Some(taffy::style_helpers::auto());
     }
@@ -25640,12 +26604,6 @@ fn parse_grid_min_track(value: &str) -> Option<MinTrackSizingFunction> {
 }
 
 fn parse_grid_max_track(value: &str) -> Option<MaxTrackSizingFunction> {
-    if value == "min-content" {
-        return Some(MaxTrackSizingFunction::MIN_CONTENT);
-    }
-    if value == "max-content" {
-        return Some(MaxTrackSizingFunction::MAX_CONTENT);
-    }
     if let Some(number) = value.strip_suffix("fr")
         && let Ok(number) = number.trim().parse::<f32>()
     {
@@ -25711,162 +26669,31 @@ fn split_css_top_level_once(value: &str, separator: char) -> Option<(&str, &str)
     None
 }
 
-/// Parse one `grid-row-start`-style token: `auto`, an integer line, `span N`
-/// or a custom ident naming a line or a `grid-template-areas` area edge.
-fn parse_grid_placement_token(token: &str) -> GridPlacement<String> {
-    let token = token.trim();
-    if token.is_empty() || token == "auto" {
-        return GridPlacement::Auto;
-    }
-    if let Ok(line) = token.parse::<i16>() {
-        return taffy::style_helpers::line(line);
-    }
-    if let Some(span) = token.strip_prefix("span") {
-        let span = span.trim();
-        if let Ok(count) = span.parse::<u16>() {
-            return taffy::style_helpers::span(count);
-        }
-        if !span.is_empty()
-            && span
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            return GridPlacement::NamedSpan(span.to_string(), 1);
-        }
-        return GridPlacement::Auto;
-    }
-    if token
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return GridPlacement::NamedLine(token.to_string(), 1);
-    }
-    GridPlacement::Auto
-}
-
-/// A placement is a custom ident when it is a bare name (not `auto`, a number or `span`).
-fn is_grid_ident(token: &str) -> bool {
-    matches!(
-        parse_grid_placement_token(token),
-        GridPlacement::NamedLine(..)
-    )
-}
-
 fn parse_grid_column(value: &str) -> Line<GridPlacement<String>> {
     let value = value.trim();
-    match value.split_once('/') {
-        Some((start, end)) => Line {
-            start: parse_grid_placement_token(start),
-            end: parse_grid_placement_token(end),
-        },
-        None => {
-            let start = parse_grid_placement_token(value);
-            // `grid-row: header` names both edges; other single values leave
-            // the end line auto.
-            let end = if matches!(start, GridPlacement::NamedLine(..)) {
-                start.clone()
-            } else {
-                GridPlacement::Auto
-            };
-            Line { start, end }
-        }
+    if let Ok(start) = value.parse::<i16>() {
+        return Line {
+            start: taffy::style_helpers::line(start),
+            end: GridPlacement::Auto,
+        };
     }
-}
-
-/// Resolve `grid-area` plus the longhand-ish `grid-row`/`grid-column` into one
-/// axis placement. `grid-row`/`grid-column` win over the `grid-area` shorthand.
-fn resolve_grid_placement(
-    area: Option<&str>,
-    axis: Option<&str>,
-    column: bool,
-) -> Line<GridPlacement<String>> {
-    if let Some(axis) = axis {
-        return parse_grid_column(axis);
+    if let Some(span) = value.strip_prefix("span ")
+        && let Ok(span) = span.trim().parse::<u16>()
+    {
+        return Line {
+            start: taffy::style_helpers::span(span),
+            end: GridPlacement::Auto,
+        };
     }
-    let Some(area) = area else {
-        return Line::default();
-    };
-    // grid-area: <row-start> / <column-start> / <row-end> / <column-end>
-    let parts: Vec<&str> = area.split('/').map(str::trim).collect();
-    let row_start = parts.first().copied().unwrap_or("auto");
-    let column_start = parts
-        .get(1)
-        .copied()
-        .unwrap_or(if is_grid_ident(row_start) {
-            row_start
-        } else {
-            "auto"
-        });
-    let row_end = parts
-        .get(2)
-        .copied()
-        .unwrap_or(if is_grid_ident(row_start) {
-            row_start
-        } else {
-            "auto"
-        });
-    let column_end = parts
-        .get(3)
-        .copied()
-        .unwrap_or(if is_grid_ident(column_start) {
-            column_start
-        } else {
-            "auto"
-        });
-    if column {
-        Line {
-            start: parse_grid_placement_token(column_start),
-            end: parse_grid_placement_token(column_end),
-        }
-    } else {
-        Line {
-            start: parse_grid_placement_token(row_start),
-            end: parse_grid_placement_token(row_end),
-        }
+    if let Some((start, end)) = value.split_once('/')
+        && let (Ok(start), Ok(end)) = (start.trim().parse::<i16>(), end.trim().parse::<i16>())
+    {
+        return Line {
+            start: taffy::style_helpers::line(start),
+            end: taffy::style_helpers::line(end),
+        };
     }
-}
-
-/// Parse `grid-template-areas` strings (`". header header ." ". left . right"`)
-/// into Taffy areas. Each named area spans the bounding box of its cells.
-fn parse_grid_template_areas(value: &str) -> Vec<taffy::GridTemplateArea<String>> {
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '"' || ch == '\'' {
-            let quote = ch;
-            let mut row = String::new();
-            for inner in chars.by_ref() {
-                if inner == quote {
-                    break;
-                }
-                row.push(inner);
-            }
-            rows.push(row.split_whitespace().map(str::to_string).collect());
-        }
-    }
-    let mut areas: Vec<taffy::GridTemplateArea<String>> = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        for (column_index, name) in row.iter().enumerate() {
-            if name.chars().all(|c| c == '.') {
-                continue;
-            }
-            let (row_start, column_start) = (row_index as u16 + 1, column_index as u16 + 1);
-            if let Some(area) = areas.iter_mut().find(|area| &area.name == name) {
-                area.row_end = area.row_end.max(row_start + 1);
-                area.column_start = area.column_start.min(column_start);
-                area.column_end = area.column_end.max(column_start + 1);
-            } else {
-                areas.push(taffy::GridTemplateArea {
-                    name: name.clone(),
-                    row_start,
-                    row_end: row_start + 1,
-                    column_start,
-                    column_end: column_start + 1,
-                });
-            }
-        }
-    }
-    areas
+    Line::default()
 }
 
 fn to_taffy_spacing(
@@ -25913,12 +26740,6 @@ fn to_taffy_dim(
         WDim::Ch(v) => Dimension::length(v * font_style.ch_advance()),
         WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
         WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
-        // Percentage terms need the containing block, which
-        // `apply_calc_percent_overrides` supplies while the tree is built.
-        WDim::Calc(calc) if calc.is_absolute() => {
-            Dimension::length(calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h))
-        }
-        WDim::Calc(_) => Dimension::auto(),
     }
 }
 
@@ -25937,13 +26758,6 @@ fn to_taffy_auto(
         WDim::Ch(v) => LengthPercentageAuto::length(v * font_style.ch_advance()),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
-        WDim::Calc(calc) if calc.is_absolute() => LengthPercentageAuto::length(calc.resolve(
-            0.0,
-            font_style.font_size,
-            viewport_w,
-            viewport_h,
-        )),
-        WDim::Calc(_) => LengthPercentageAuto::auto(),
     }
 }
 
@@ -25963,64 +26777,6 @@ fn to_taffy_inset(
     }
 }
 
-/// Resolve percentage-bearing `calc()` sizes and insets against the
-/// containing block known while the tree is built. Taffy's tree has no calc
-/// resolver, so these were left automatic by `to_taffy_dim`/`to_taffy_auto`.
-fn apply_calc_percent_overrides(
-    style: &mut taffy::Style,
-    authored: &w3cos_std::style::Style,
-    width_basis: f32,
-    height_basis: Option<f32>,
-    viewport_w: f32,
-    viewport_h: f32,
-) {
-    let font_size = authored.font_size;
-    let horizontal = |dimension: WDim| match dimension {
-        WDim::Calc(calc) if !calc.is_absolute() => {
-            Some(calc.resolve(width_basis, font_size, viewport_w, viewport_h))
-        }
-        _ => None,
-    };
-    let vertical = |dimension: WDim| match dimension {
-        WDim::Calc(calc) if !calc.is_absolute() => {
-            height_basis.map(|basis| calc.resolve(basis, font_size, viewport_w, viewport_h))
-        }
-        _ => None,
-    };
-    if let Some(value) = horizontal(authored.width) {
-        style.size.width = Dimension::length(value.max(0.0));
-    }
-    if let Some(value) = horizontal(authored.min_width) {
-        style.min_size.width = Dimension::length(value.max(0.0));
-    }
-    if let Some(value) = horizontal(authored.max_width) {
-        style.max_size.width = Dimension::length(value.max(0.0));
-    }
-    if let Some(value) = vertical(authored.height) {
-        style.size.height = Dimension::length(value.max(0.0));
-    }
-    if let Some(value) = vertical(authored.min_height) {
-        style.min_size.height = Dimension::length(value.max(0.0));
-    }
-    if let Some(value) = vertical(authored.max_height) {
-        style.max_size.height = Dimension::length(value.max(0.0));
-    }
-    if !matches!(authored.position, WPos::Static) {
-        if let Some(value) = horizontal(authored.left) {
-            style.inset.left = LengthPercentageAuto::length(value);
-        }
-        if let Some(value) = horizontal(authored.right) {
-            style.inset.right = LengthPercentageAuto::length(value);
-        }
-        if let Some(value) = vertical(authored.top) {
-            style.inset.top = LengthPercentageAuto::length(value);
-        }
-        if let Some(value) = vertical(authored.bottom) {
-            style.inset.bottom = LengthPercentageAuto::length(value);
-        }
-    }
-}
-
 fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
     match o {
         WOverflow::Visible => taffy::Overflow::Visible,
@@ -26032,6 +26788,41 @@ fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subtree_ends_cover_exactly_each_pre_order_subtree() {
+        use w3cos_std::style::Style;
+        let leaf = |text: &str| Component::text(text, Style::default());
+        let tree = Component::boxed(
+            Style::default(),
+            vec![
+                Component::boxed(Style::default(), vec![leaf("a"), leaf("b")]),
+                leaf("c"),
+                Component::boxed(
+                    Style::default(),
+                    vec![Component::boxed(Style::default(), vec![leaf("d")])],
+                ),
+            ],
+        );
+        let flat = pre_flatten(&tree);
+        let ends = subtree_ends(&flat);
+        assert_eq!(ends, vec![8, 4, 3, 4, 5, 8, 8, 8]);
+        // Range membership equals the ancestor walk for every pair.
+        for ancestor in 0..flat.len() {
+            for node in 0..flat.len() {
+                let mut walk = flat[node].parent;
+                let mut is_descendant = false;
+                while let Some(parent) = walk {
+                    if parent == ancestor {
+                        is_descendant = true;
+                        break;
+                    }
+                    walk = flat[parent].parent;
+                }
+                assert_eq!(is_descendant, ancestor < node && node < ends[ancestor]);
+            }
+        }
+    }
+
     use std::io::Cursor;
 
     use super::*;
@@ -26043,6 +26834,29 @@ mod tests {
 
     fn s() -> Style {
         Style::default()
+    }
+
+    #[test]
+    fn subtree_size_scope_matches_recount_and_restores() {
+        let leaf = |text: &str| Component::text(text, Style::default());
+        let inner = Component::column(Style::default(), vec![leaf("a"), leaf("b")]);
+        let root = Component::column(Style::default(), vec![inner, leaf("c")]);
+        let other = Component::column(Style::default(), vec![leaf("x")]);
+        assert_eq!(count_nodes(&root), 5);
+        {
+            let _scope = SubtreeSizeScope::new(&root);
+            assert_eq!(count_nodes(&root), 5);
+            assert_eq!(count_nodes(&root.children[0]), 3);
+            // A tree outside the scope is still counted directly.
+            assert_eq!(count_nodes(&other), 2);
+            {
+                let _nested = SubtreeSizeScope::new(&other);
+                assert_eq!(count_nodes(&other), 2);
+                assert_eq!(count_nodes(&root), 5);
+            }
+            assert_eq!(count_nodes(&root.children[0]), 3);
+        }
+        SUBTREE_SIZES.with(|sizes| assert!(sizes.borrow().is_empty()));
     }
 
     #[test]
@@ -26819,7 +27633,7 @@ mod tests {
         let _font = FontOwner;
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../wpt/fonts/Ahem.ttf"
+            "/src/layout_ng/testdata/Ahem.ttf"
         ))
         .unwrap();
         FontRegistry::global()
@@ -27057,7 +27871,10 @@ mod tests {
         assert!(style.ch_advance() > first);
         assert_eq!(CH_ADVANCE_MEASUREMENTS.with(std::cell::Cell::get), 2);
 
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -27075,7 +27892,7 @@ mod tests {
                     family: style.font_family.clone().unwrap(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -27887,7 +28704,13 @@ mod tests {
             font_family: Some("PingFang SC".into()),
             ..Style::default()
         };
-        w3cos_std::inline_text::set_source_run(&mut plain, "text:before-font-change");
+        plain
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_std::inline_text::SOURCE_RUN.into(),
+                "text:before-font-change".into(),
+            );
         let texts = [
             "Test", " ", "passes", " ", "if", " ", "the", " ", "filled", " ", "blue", " ",
             "square", " ", "is", " ", "in", " ", "the", " ",
@@ -27902,7 +28725,10 @@ mod tests {
         let expected = 336.015625;
         let mut bold = plain.clone();
         bold.font_weight = 700;
-        w3cos_std::inline_text::set_source_run(&mut bold, "text:after-font-change");
+        bold.custom_properties.as_mut().unwrap().insert(
+            w3cos_std::inline_text::SOURCE_RUN.into(),
+            "text:after-font-change".into(),
+        );
         let mut children = texts
             .into_iter()
             .map(|text| Component::text(text, plain.clone()))
@@ -27986,9 +28812,17 @@ mod tests {
             font_weight: 700,
             ..Style::default()
         };
-        w3cos_std::inline_text::set_source_run(&mut plain, "text:fixture");
-        let expected =
+        plain
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_std::inline_text::SOURCE_RUN.into(),
+                "text:fixture".into(),
+            );
+        let mut expected =
             crate::render_skia::measure_skia_inline_fragment_advances(&texts, &plain).unwrap();
+        let total: f32 = expected.iter().sum();
+        *expected.last_mut().unwrap() += text_layout::inline_layout_advance(total) - total;
         let children = texts
             .into_iter()
             .enumerate()
@@ -28023,7 +28857,7 @@ mod tests {
         assert_eq!(
             widths.into_iter().flatten().collect::<Vec<_>>(),
             expected,
-            "content-box advances must exclude padding and retain unsnapped glyph precision"
+            "content-box advances must exclude padding, retain contextual glyph precision, and snap the completed source once"
         );
     }
 
@@ -30144,101 +30978,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_template_areas_and_grid_area_place_items() {
-        fn cell(area: &str) -> Component {
-            Component::boxed(
-                Style {
-                    grid_area: Some(area.to_string()),
-                    ..Style::default()
-                },
-                Vec::new(),
-            )
-        }
-        // Mirrors Code-OSS's Welcome page grid.
-        let grid = Component::column(
-            Style {
-                display: WDisp::Grid,
-                width: WDim::Px(1400.0),
-                height: WDim::Px(400.0),
-                grid_template_rows: Some("25% minmax(min-content, auto) min-content".to_string()),
-                grid_template_columns: Some("1fr 6fr 1fr 6fr 1fr".to_string()),
-                grid_template_areas: Some(
-                    "\". header header header .\"\n\t\". left-column . right-column .\"\n\t\". footer footer footer .\""
-                        .to_string(),
-                ),
-                ..Style::default()
-            },
-            vec![
-                cell("header"),
-                cell("left-column"),
-                cell("right-column"),
-                cell("footer"),
-            ],
-        );
-        let layout = compute(&grid, 1400.0, 400.0).unwrap();
-        // 15 fr units over 1400px.
-        let fr = 1400.0 / 15.0;
-        let header = layout[1].0;
-        let left = layout[2].0;
-        let right = layout[3].0;
-        let footer = layout[4].0;
-        let close = |a: f32, b: f32| (a - b).abs() < 0.05;
-        assert!(
-            close(header.x, fr) && close(header.width, 13.0 * fr),
-            "{header:?}"
-        );
-        assert!(close(left.x, fr) && close(left.width, 6.0 * fr), "{left:?}");
-        assert!(
-            close(right.x, 8.0 * fr) && close(right.width, 6.0 * fr),
-            "{right:?}"
-        );
-        assert!(
-            close(footer.x, fr) && close(footer.width, 13.0 * fr),
-            "{footer:?}"
-        );
-        assert_eq!(header.y, 0.0);
-        assert!(
-            close(left.y, 100.0),
-            "left row starts below the 25% header row: {left:?}"
-        );
-        assert!(footer.y >= left.y);
-        assert!(close(left.y, right.y));
-    }
-
-    #[test]
-    fn grid_area_parsing_covers_names_and_numeric_forms() {
-        let areas = parse_grid_template_areas("\". a a\" \"b b .\"");
-        assert_eq!(areas.len(), 2);
-        assert_eq!(
-            (areas[0].name.as_str(), areas[0].row_start, areas[0].row_end),
-            ("a", 1, 2)
-        );
-        assert_eq!((areas[0].column_start, areas[0].column_end), (2, 4));
-        assert_eq!(
-            (areas[1].name.as_str(), areas[1].row_start, areas[1].row_end),
-            ("b", 2, 3)
-        );
-        assert_eq!((areas[1].column_start, areas[1].column_end), (1, 3));
-        let row = resolve_grid_placement(Some("2 / 3 / 4 / 5"), None, false);
-        assert_eq!(row.start, taffy::style_helpers::line(2));
-        assert_eq!(row.end, taffy::style_helpers::line(4));
-        let column = resolve_grid_placement(Some("2 / 3 / 4 / 5"), None, true);
-        assert_eq!(column.start, taffy::style_helpers::line(3));
-        assert_eq!(column.end, taffy::style_helpers::line(5));
-        let named = resolve_grid_placement(Some("main"), None, true);
-        assert_eq!(named.start, GridPlacement::NamedLine("main".to_string(), 1));
-        assert_eq!(named.end, GridPlacement::NamedLine("main".to_string(), 1));
-        assert_eq!(
-            resolve_grid_placement(Some("main"), Some("2"), true).start,
-            taffy::style_helpers::line(2)
-        );
-        assert_eq!(
-            parse_grid_template_columns("min-content max-content minmax(min-content, auto)").len(),
-            3
-        );
-    }
-
-    #[test]
     fn display_table_preserves_authored_content_box_sizing() {
         let table = Component::boxed(
             Style {
@@ -31955,7 +32694,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -32954,56 +33693,6 @@ mod tests {
     }
 
     #[test]
-    fn percentage_height_resolves_against_absolute_block_with_vertical_insets() {
-        use w3cos_dom::{Document, stylesheet};
-
-        stylesheet::clear_rules();
-        stylesheet::register_rule(
-            "#tab",
-            &[
-                ("position", "relative"),
-                ("width", "100px"),
-                ("height", "24px"),
-                ("border-block", "4px solid transparent"),
-            ],
-        );
-        stylesheet::register_rule(
-            "#actions",
-            &[
-                ("position", "absolute"),
-                ("top", "0"),
-                ("bottom", "0"),
-                ("right", "0"),
-                ("width", "24px"),
-                ("box-sizing", "border-box"),
-                ("border-block", "1px solid transparent"),
-            ],
-        );
-        stylesheet::register_rule("#bar", &[("height", "100%")]);
-
-        let mut document = Document::new();
-        let tab = document.create_element("div");
-        tab.set_attribute(&mut document, "id", "tab");
-        let actions = document.create_element("div");
-        actions.set_attribute(&mut document, "id", "actions");
-        let bar = document.create_element("div");
-        bar.set_attribute(&mut document, "id", "bar");
-        actions.append_child(&mut document, bar);
-        tab.append_child(&mut document, actions);
-        document.body().append_child(&mut document, tab);
-
-        let component = document.to_component_tree();
-        let layout = compute(&component, 800.0, 600.0).unwrap();
-        let rect = |index| layout.iter().find(|(_, item)| *item == index).unwrap().0;
-        // `border-block` must reach layout: 24px content + 2 * 4px borders.
-        assert_eq!(rect(1).height, 32.0, "layout={layout:#?}");
-        // Absolute box fills the 24px padding box; its content box is 22px.
-        assert_eq!(rect(2).height, 24.0, "layout={layout:#?}");
-        assert_eq!(rect(3).height, 22.0, "layout={layout:#?}");
-        stylesheet::clear_rules();
-    }
-
-    #[test]
     fn bottom_inline_with_top_child_keeps_anonymous_text_on_segment_top() {
         let text = |size, alignment| {
             Component::text(
@@ -33199,7 +33888,10 @@ mod tests {
 
     #[test]
     fn bottom_aligned_inline_places_anonymous_text_on_the_large_child_line() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -33219,7 +33911,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf",
+                        "/src/layout_ng/testdata/Ahem.ttf",
                     ))),
                     ..Default::default()
                 },
@@ -33372,7 +34064,10 @@ mod tests {
 
     #[test]
     fn anonymous_block_text_wraps_before_and_after_a_larger_font_block() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -33392,7 +34087,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -33456,7 +34151,10 @@ mod tests {
 
     #[test]
     fn mixed_font_top_text_keeps_replaced_baseline_strut_descent() {
-        let ahem_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let ahem_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         if std::fs::read(ahem_path).is_err() {
             eprintln!("skipped: no pinned WPT checkout at {ahem_path}");
             return;
@@ -33476,7 +34174,7 @@ mod tests {
                     family: FAMILY.into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -33865,7 +34563,7 @@ mod tests {
                 2,
             ),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2)]);
+        let positions = crate::layout::LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2)]);
         assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
         // Chrome's Arial 15px/15px inline has a 17px font box whose top is
         // 1px above the line top; the 15px baseline image is at the line top.
@@ -34478,7 +35176,7 @@ mod tests {
             let own = *index;
             *index += 1;
             if let ComponentKind::Text { content } = &component.kind {
-                out.push((own, content.clone(), component.style.clone()));
+                out.push((own, content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 text_nodes(child, index, out);
@@ -35695,7 +36393,13 @@ mod tests {
             ComponentKind::Text { content } if content == "Before")
             })
             .unwrap();
-        let source = |style: &w3cos_std::Style| style.text_source_run.clone();
+        let source = |style: &w3cos_std::Style| {
+            style
+                .custom_properties
+                .as_ref()
+                .and_then(|p| p.get(w3cos_std::inline_text::SOURCE_RUN))
+                .cloned()
+        };
         assert_ne!(source(quote.unwrap().style), source(word.style));
         w3cos_dom::stylesheet::clear_rules();
     }
@@ -35777,9 +36481,18 @@ mod tests {
             font_family: Some("PingFang SC".into()),
             ..Style::default()
         };
-        w3cos_std::inline_text::set_source_run(&mut plain, "pseudo:before:text");
+        plain
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_std::inline_text::SOURCE_RUN.into(),
+                "pseudo:before:text".into(),
+            );
         let mut quote = plain.clone();
-        w3cos_std::inline_text::set_source_run(&mut quote, "pseudo:before:quote");
+        quote.custom_properties.as_mut().unwrap().insert(
+            w3cos_std::inline_text::SOURCE_RUN.into(),
+            "pseudo:before:quote".into(),
+        );
         quote
             .custom_properties
             .as_mut()
@@ -35979,9 +36692,18 @@ mod tests {
             font_family: Some("PingFang SC".into()),
             ..Style::default()
         };
-        w3cos_std::inline_text::set_source_run(&mut plain, "text:float-after-image");
+        plain
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(
+                w3cos_std::inline_text::SOURCE_RUN.into(),
+                "text:float-after-image".into(),
+            );
         let mut counter = plain.clone();
-        w3cos_std::inline_text::set_source_run(&mut counter, "text:float-before-image");
+        counter.custom_properties.as_mut().unwrap().insert(
+            w3cos_std::inline_text::SOURCE_RUN.into(),
+            "text:float-before-image".into(),
+        );
         let counter_width = component_max_content_width(&Component::text("1", counter.clone()));
         let words = ["\"Before", " ", "beforeright", " ", "afterleft"];
         let raw =
@@ -37826,82 +38548,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_width_button_label_wraps_and_grows_taller() {
-        let label = "A long button label that should wrap onto several lines";
-        let button = |width: f32, label: &str, white_space: WWhiteSpace| {
-            Component::button(
-                label,
-                Style {
-                    width: WDim::Px(width),
-                    white_space,
-                    ..Style::default()
-                },
-            )
-        };
-        let height = |component: Component| {
-            let layout = compute(&component, 800.0, 600.0).unwrap();
-            let rect = layout.iter().find(|(_, index)| *index == 0).unwrap().0;
-            rect.height
-        };
-        let wide = height(button(120.0, label, WWhiteSpace::NoWrap));
-        let narrow = height(button(120.0, label, WWhiteSpace::Normal));
-        let nowrap = height(button(120.0, label, WWhiteSpace::NoWrap));
-        let single_word = height(button(40.0, "Applications", WWhiteSpace::Normal));
-        assert!(narrow > wide * 1.8, "narrow={narrow} wide={wide}");
-        assert!((nowrap - wide).abs() < 0.5, "nowrap={nowrap} wide={wide}");
-        assert!(wide < 30.0, "single line height expected: {wide}");
-        assert!(
-            (single_word - wide).abs() < 0.5,
-            "single word must not wrap"
-        );
-    }
-
-    #[test]
-    fn relative_calc_width_in_grid_item_resolves_against_its_track() {
-        // Welcome page cards use `width: calc(100% - 16px)` inside a grid
-        // column. The percentage base is the track, not the grid container.
-        let calc = WDim::Calc(w3cos_std::style::CalcId::new(
-            w3cos_std::style::CalcLength {
-                px: -16.0,
-                percent: 100.0,
-                ..Default::default()
-            },
-        ));
-        let card = Component::column(
-            Style {
-                width: calc,
-                ..Style::default()
-            },
-            vec![],
-        );
-        let column = Component::column(Style::default(), vec![card]);
-        let layout = compute(
-            &Component::column(
-                Style {
-                    display: WDisp::Grid,
-                    width: WDim::Px(1000.0),
-                    grid_template_columns: Some("100px 400px".to_string()),
-                    ..Style::default()
-                },
-                vec![Component::column(Style::default(), vec![]), column],
-            ),
-            1200.0,
-            800.0,
-        )
-        .unwrap();
-        let card = layout
-            .iter()
-            .find(|(_, index)| *index == 3)
-            .map(|(rect, _)| rect)
-            .expect("card layout");
-        assert!(
-            (card.width - 384.0).abs() < 0.5,
-            "card should be its 400px track minus 16px, got {}",
-            card.width
-        );
-    }
-
-    #[test]
     fn grid_text_wraps_to_the_available_track_width() {
         let layout = compute(
             &Component::column(
@@ -38571,106 +39217,6 @@ mod tests {
         let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
         assert_eq!(parent.width, 144.0);
         assert_eq!(child.x, 96.0);
-    }
-
-    #[test]
-    fn calc_lengths_resolve_percentages_against_the_containing_block() {
-        use w3cos_std::style::CalcLength;
-        let calc = |percent: f32, px: f32| {
-            WDim::calc(CalcLength {
-                percent,
-                px,
-                ..CalcLength::default()
-            })
-        };
-        let layout = compute(
-            &Component::boxed(
-                Style {
-                    display: WDisp::Block,
-                    width: WDim::Px(400.0),
-                    height: WDim::Px(200.0),
-                    ..Style::default()
-                },
-                vec![
-                    Component::boxed(
-                        Style {
-                            display: WDisp::Block,
-                            width: calc(100.0, -60.0),
-                            height: WDim::Px(20.0),
-                            ..Style::default()
-                        },
-                        Vec::new(),
-                    ),
-                    Component::boxed(
-                        Style {
-                            display: WDisp::Block,
-                            width: WDim::calc(CalcLength {
-                                px: 120.0,
-                                ..CalcLength::default()
-                            }),
-                            height: calc(50.0, -10.0),
-                            ..Style::default()
-                        },
-                        Vec::new(),
-                    ),
-                    Component::boxed(
-                        Style {
-                            display: WDisp::Block,
-                            width: WDim::Px(10.0),
-                            height: WDim::Px(10.0),
-                            max_width: calc(50.0, 0.0),
-                            ..Style::default()
-                        },
-                        Vec::new(),
-                    ),
-                ],
-            ),
-            800.0,
-            600.0,
-        )
-        .unwrap();
-
-        let find = |index: usize| layout.iter().find(|(_, i)| *i == index).unwrap().0;
-        assert_eq!(find(1).width, 340.0);
-        assert_eq!(find(2).width, 120.0);
-        assert_eq!(find(2).height, 90.0);
-        assert_eq!(find(3).width, 10.0);
-    }
-
-    #[test]
-    fn calc_insets_position_absolute_boxes_from_the_containing_block() {
-        use w3cos_std::style::CalcLength;
-        let layout = compute(
-            &Component::boxed(
-                Style {
-                    display: WDisp::Block,
-                    position: WPos::Relative,
-                    width: WDim::Px(400.0),
-                    height: WDim::Px(100.0),
-                    ..Style::default()
-                },
-                vec![Component::boxed(
-                    Style {
-                        position: WPos::Absolute,
-                        left: WDim::calc(CalcLength {
-                            percent: 50.0,
-                            px: 10.0,
-                            ..CalcLength::default()
-                        }),
-                        top: WDim::Px(0.0),
-                        width: WDim::Px(20.0),
-                        height: WDim::Px(20.0),
-                        ..Style::default()
-                    },
-                    Vec::new(),
-                )],
-            ),
-            800.0,
-            600.0,
-        )
-        .unwrap();
-        let child = layout.iter().find(|(_, index)| *index == 1).unwrap().0;
-        assert_eq!(child.x, 210.0);
     }
 
     #[test]
@@ -43844,62 +44390,6 @@ mod tests {
             wrapper.width > 150.0,
             "wrapper lost its text width: {wrapper:?}"
         );
-    }
-
-    #[test]
-    fn inline_text_wider_than_the_wrap_probe_keeps_its_single_line_width_in_a_block() {
-        // Text longer than the fixed 360px intrinsic wrap probe must size to
-        // its real max-content width (bounded by the containing block), not to
-        // the probe-wrapped width.
-        let text = "n ".repeat(48);
-        let style = Style {
-            display: WDisplay::Inline,
-            font_size: 12.0,
-            ..Style::default()
-        };
-        let single_line = text_intrinsic_size_at(&text, &style, UNBOUNDED_TEXT_WRAP_WIDTH);
-        assert!(single_line.0 > 400.0, "fixture must exceed the probe width");
-        let layout = compute(
-            &Component::column(
-                Style {
-                    display: WDisplay::Block,
-                    font_size: 12.0,
-                    ..Style::default()
-                },
-                vec![Component::text(text.clone(), style.clone())],
-            ),
-            1264.0,
-            800.0,
-        )
-        .unwrap();
-        let (rect, _) = layout
-            .iter()
-            .find(|(_, index)| *index == 1)
-            .expect("text leaf");
-        assert!(
-            (rect.width - single_line.0).abs() < 0.5,
-            "width {} should be the single-line width {}",
-            rect.width,
-            single_line.0
-        );
-        assert!(
-            rect.height < single_line.1 * 1.5,
-            "height {} should be a single line, not wrapped at the probe width",
-            rect.height
-        );
-    }
-
-    #[test]
-    fn max_content_width_of_a_text_leaf_is_not_capped_by_the_wrap_probe() {
-        let text = "n".repeat(256);
-        let style = Style {
-            font_size: 12.0,
-            ..Style::default()
-        };
-        let component = Component::text(text.clone(), style.clone());
-        let expected = text_intrinsic_size_at(&text, &style, UNBOUNDED_TEXT_WRAP_WIDTH).0;
-        assert!(expected > 1000.0);
-        assert!((component_max_content_width(&component) - expected).abs() < 0.5);
     }
 
     #[test]
@@ -51971,7 +52461,7 @@ mod tests {
             (40.0, Some(20.0), 57.0),
             (-40.0, Some(-40.0), 127.0),
         ] {
-            let mut properties = HashMap::from([(
+            let mut properties = HashMap::from_iter([(
                 "--w3cos-internal-vertical-align-length".into(),
                 format!("{offset} 40"),
             )]);
@@ -53317,7 +53807,7 @@ mod tests {
             (rect(30.0, 15.0, 15.0, 18.0), 3),
             (rect(45.0, 15.0, 15.0, 18.0), 4),
         ];
-        let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
+        let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]);
         assert!(project_image_text_lines(&root, 0, &mut layouts, &positions));
         assert_eq!(layouts[0].0.height, 30.0 + descent);
         assert_eq!(layouts[3].0.y, leading);
@@ -53415,7 +53905,7 @@ mod tests {
                     3,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+            let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
             assert!(
                 project_image_text_lines(&root, 0, &mut layouts, &positions),
                 "offset={offset}"
@@ -53507,7 +53997,7 @@ mod tests {
                     3,
                 ),
             ];
-            let positions = HashMap::from([(0, 0), (1, 1), (2, 2), (3, 3)]);
+            let positions = LayoutPositions::from_iter([(0, 0), (1, 1), (2, 2), (3, 3)]);
             assert!(
                 project_image_text_lines(&root, 0, &mut layouts, &positions),
                 "{display:?}"
@@ -53635,6 +54125,29 @@ mod tests {
             assert_eq!(actual, baseline);
             assert_eq!(line_height - actual, descent);
         }
+    }
+
+    #[test]
+    fn physical_text_fragments_match_the_layout_backend_endpoints() {
+        let style = Style {
+            display: WDisp::Inline,
+            font_size: 16.0,
+            ..Style::default()
+        };
+        let fragments = ["outer ", "inner", " tail"];
+        let advances = physical_text_fragment_advances(&fragments, &style).unwrap();
+        assert_eq!(advances.len(), fragments.len());
+        assert!(advances.iter().all(|advance| *advance >= 0.0));
+        #[cfg(not(feature = "skia"))]
+        for (fragment, advance) in fragments.into_iter().zip(advances) {
+            assert_eq!(advance, text_intrinsic_size(fragment, &style).0);
+        }
+        #[cfg(feature = "skia")]
+        assert_eq!(
+            advances.iter().sum::<f32>(),
+            text_intrinsic_size(&fragments.concat(), &style).0,
+            "Skia partitions a single contextually shaped run, so its fragment endpoints must sum to the combined run rather than independent substring widths"
+        );
     }
 
     #[test]
@@ -54013,6 +54526,26 @@ mod tests {
         use crate::html_parser_host::InertParserScriptHost;
         use crate::html_parser_state::StreamingDocumentParser;
         use std::rc::Rc;
+        const OWNER: u64 = 202611010001;
+        struct FontFixture;
+        impl Drop for FontFixture {
+            fn drop(&mut self) {
+                crate::font_face::FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        crate::font_face::FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                crate::font_face::FontFace {
+                    family: "W3cosHiddenTinos".into(),
+                    src: crate::font_face::FontSource::Bytes(
+                        include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register deterministic hidden-source font");
+        let _font = FontFixture;
         crate::dom::reset_document();
         crate::jsdom::reset_bridge();
         let mut parser = StreamingDocumentParser::new_with_script_host(
@@ -54023,7 +54556,7 @@ mod tests {
         parser
             .write(
                 "<!doctype html><body style='margin:8px'>\
-            <div style='line-height:1.25'>Filler Text1\
+            <div style='font-family:W3cosHiddenTinos;font-size:16px;line-height:20px'>Filler Text1\
             <span style='visibility:hidden'>Filler Text2</span>Filler Text3</div></body>",
             )
             .unwrap();
@@ -54039,11 +54572,12 @@ mod tests {
                     .then(|| layouts.iter().find(|(_, item)| *item == index).unwrap().0.x)
             })
             .collect::<Vec<_>>();
-        // Chrome155 original XHTML Text Ranges, V3395: authored source
-        // advances are 79.921875 and 83.109375, not the sum of rounded words.
+        // Isolated Chrome 155 with the exact same Tinos bytes (SHA-256
+        // cf264a22...) starts each 74.578125px source at these positions.
+        // Visibility changes paint, not inline advance or shaping continuity.
         assert_eq!(
             starts,
-            vec![8.0, 87.921875, 171.03125],
+            vec![8.0, 82.578125, 157.15625],
             "synthetic no-break wrappers must not add a LayoutUnit at each source boundary"
         );
     }
@@ -54068,7 +54602,7 @@ mod tests {
                     family: "Ahem".into(),
                     src: crate::font_face::FontSource::Path(std::path::PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../../wpt/fonts/Ahem.ttf"
+                        "/src/layout_ng/testdata/Ahem.ttf"
                     ))),
                     ..Default::default()
                 },
@@ -59764,11 +60298,40 @@ mod tests {
     #[cfg(feature = "skia")]
     #[test]
     fn wrapped_text_height_accounts_for_first_line_percent_indent() {
-        let text = "X The first X in this sentence should be indented to the center of this block.";
+        use crate::font_face::{FontFace, FontRegistry, FontSource};
+
+        const OWNER: u64 = 0x494e_4445_4e54;
+        const FAMILY: &str = "W3cos Percent Indent Tinos";
+        struct FontOwner;
+        impl Drop for FontOwner {
+            fn drop(&mut self) {
+                FontRegistry::global().clear_owner(OWNER);
+            }
+        }
+        let _font = FontOwner;
+        FontRegistry::global()
+            .register_for_owner(
+                OWNER,
+                FontFace {
+                    family: FAMILY.into(),
+                    src: FontSource::Bytes(
+                        include_bytes!("../assets/test-fonts/Tinos-Regular.ttf").to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .expect("register deterministic percent-indent font");
+
+        // Isolated Chrome155 with the same Tinos bytes and a 220px block:
+        // the unindented text occupies one 19.2px line, while a 50% first-line
+        // indent wraps `four` onto a second line.  The longer historical text
+        // occupied three lines in both cases and therefore did not test the
+        // indent despite its host-font-dependent height assertion.
+        let text = "one two three four";
         let base = Style {
             font_size: 16.0,
             line_height: 1.2,
-            font_family: Some("serif".into()),
+            font_family: Some(FAMILY.into()),
             ..Style::default()
         };
         let indented = Style {
@@ -60863,57 +61426,5 @@ mod tests {
         // Two CI runs of this tree measured 8086µs and 8089µs. 9ms still
         // rejects a real regression and covers that host plus the 8197µs flake.
         assert!(best_us < 9_000, "layout avg {best_us}µs exceeds 9ms budget");
-    }
-
-    #[test]
-    fn percent_translate_centers_absolute_box_and_moves_its_subtree() {
-        let mut props = w3cos_std::style::CustomProperties::default();
-        props.insert(
-            "--w3cos-internal-translate-pct".to_string(),
-            "0,-50".to_string(),
-        );
-        let child = Component::boxed(
-            Style {
-                width: WDim::Px(10.0),
-                height: WDim::Px(10.0),
-                ..Style::default()
-            },
-            vec![],
-        );
-        let chip = Component::boxed(
-            Style {
-                position: WPos::Absolute,
-                top: WDim::Percent(50.0),
-                left: WDim::Px(2.0),
-                width: WDim::Px(40.0),
-                height: WDim::Px(24.0),
-                custom_properties: Some(props),
-                ..Style::default()
-            },
-            vec![child],
-        );
-        let tree = Component::boxed(
-            Style {
-                position: WPos::Relative,
-                width: WDim::Px(100.0),
-                height: WDim::Px(32.0),
-                ..Style::default()
-            },
-            vec![chip],
-        );
-        let flat = pre_flatten(&tree);
-        let mut engine = LayoutEngine::new();
-        let results = engine.compute(&tree, &flat, 400.0, 300.0).unwrap();
-        let rect = |index: usize| {
-            results
-                .layout_cache
-                .iter()
-                .find(|(_, i)| *i == index)
-                .unwrap()
-                .0
-        };
-        // top:50% of 32 = 16, then translateY(-50%) of its own 24px = -12.
-        assert_eq!(rect(1).y - rect(0).y, 4.0);
-        assert_eq!(rect(2).y - rect(1).y, 0.0, "descendants move with the box");
     }
 }

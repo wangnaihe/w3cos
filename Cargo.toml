@@ -32,6 +32,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# Oldest Rust that CI verifies; keep in step with rust-toolchain.toml.
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/wangnaihe/w3cos"
 
@@ -51,16 +53,9 @@ w3cos-rn-compat = { path = "crates/w3cos-rn-compat" }
 w3cos-mobile = { path = "crates/w3cos-mobile" }
 w3cos-abi = { path = "crates/w3cos-abi" }
 png = "0.17"
-# Chromium-facing raster formats. Avoid linking scientific/authoring codecs
-# (DDS/EXR/HDR/PNM/QOI/TGA/TIFF) into every standalone application.
-image = { version = "0.25", default-features = false, features = [
-    "bmp",
-    "gif",
-    "ico",
-    "jpeg",
-    "png",
-    "webp",
-] }
+# No raster formats here. w3cos-runtime enables PNG/JPEG/WebP and the
+# optional GIF/BMP/ICO/AVIF features explicitly.
+image = { version = "0.25", default-features = false }
 flate2 = "1.1"
 wuff = "0.2.8"
 encoding_rs = "0.8"
@@ -70,6 +65,9 @@ taffy = { version = "0.9", features = ["std", "flexbox", "grid", "block_layout",
 
 # Text layout: Parley — line-breaking, shaping, bidi, inline boxes
 parley = "0.7"
+icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_locale_core = { version = "2.3", default-features = false }
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 unicode-bidi = "0.3.18"
 unicode-bidi-mirroring = "0.4.0"
 fontdue = { path = "third_party/fontdue" }
@@ -139,6 +137,15 @@ panic = "unwind"
 inherits = "release"
 opt-level = "z"
 lto = "fat"
+
+# Wall-clock harness profile. opt-level 3 without fat/thin LTO so the
+# report-only CI job stays within a GitHub runner and repeated local runs
+# share one codegen setting. Absolute times are not a merge gate.
+[profile.runtime-bench]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = "none"
 
 # libp2p-quic 0.14 disables QUIC connection migration. The patched copy enables it.
 [patch.crates-io]

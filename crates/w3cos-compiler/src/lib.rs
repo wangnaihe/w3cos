@@ -821,14 +821,8 @@ edition = "2024"
         if options.devtools && !runtime_features.iter().any(|feature| feature == "devtools") {
             runtime_features.push("devtools".to_string());
         }
-        let features = format!(
-            "[{}]",
-            runtime_features
-                .iter()
-                .map(|feature| format!("{feature:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        codegen::append_desktop_codecs(&mut runtime_features, options);
+        let features = codegen::format_features(&runtime_features);
         workspace_root
             .as_ref()
             .map(|root| {
@@ -1206,7 +1200,7 @@ console.log("Done!");
             },
         );
         assert!(
-            toml.contains(r#"default-features = false, features = ["gpu", "devtools"]"#),
+            toml.contains(r#"default-features = false, features = ["gpu", "devtools", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]"#),
             "ESM applications must link one renderer: {toml}"
         );
         assert!(toml.contains("opt-level = \"z\""), "{toml}");
@@ -1255,7 +1249,7 @@ console.log("Done!");
         let toml = generate_standalone_cargo_toml(&flags, &CompileOptions::default());
         assert!(
             toml.contains(
-                r#"default-features = false, features = ["gpu", "web-graphics-advanced"]"#
+                r#"default-features = false, features = ["gpu", "web-graphics-advanced", "image-png", "image-jpeg", "image-webp", "image-gif", "image-bmp", "image-ico"]"#
             ),
             "advanced graphics must be restored when referenced: {toml}"
         );
@@ -2190,7 +2184,8 @@ createRoot(document.getElementById("root")!).render(App());"#,
             bundle_rs.contains("__init_w3ir_0(")
                 && bundle_rs.contains("createRoot_value()")
                 && (bundle_rs.contains("w3cos_core::intrinsics::call(")
-                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion("))
+                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion(")
+                    || bundle_rs.contains("w3cos_core::intrinsics::call_completion_slice("))
                 && bundle_rs.contains("m0__init();"),
             "top-level Web bootstrap must execute through native W3IR module init: {bundle_rs}"
         );

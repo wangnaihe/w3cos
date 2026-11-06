@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "evidence/typed-array-registry/bin/memory-baseline",
+    "sha256": "7a854065cc65a48f749c8e1d3831611cc33d2f4fec2b36ea2c964db1385abeea"
+  },
+  "candidate": {
+    "path": "evidence/typed-array-registry/bin/memory-fastpath-candidate",
+    "sha256": "d642a94a147b9f321e9394b58cd354f505e72bf8df5877d46e233f46029365b4"
+  }
+}

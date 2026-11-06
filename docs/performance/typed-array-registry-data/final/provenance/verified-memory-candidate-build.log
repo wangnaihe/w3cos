@@ -1,0 +1,15 @@
+   Compiling w3cos-core v0.1.0 (w3cos-next/crates/w3cos-core)
+warning: method `is_compact` is never used
+   --> w3cos-next/crates/w3cos-core/src/property_map.rs:111:19
+    |
+ 60 | impl PropertyMap {
+    | ---------------- method in this implementation
+...
+111 |     pub(crate) fn is_compact(&self) -> bool {
+    |                   ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `w3cos-core` (lib) generated 1 warning
+   Compiling typed-array-registry-bench v0.1.0 (w3cos-next/scripts/perf/typed-array-registry)
+    Finished `release` profile [optimized] target(s) in 21.78s

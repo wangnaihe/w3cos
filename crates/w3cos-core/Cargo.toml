@@ -2,6 +2,7 @@
 name = "w3cos-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "W3C OS core — JS value types, Proxy, and reactive primitives"
 
@@ -37,3 +38,4 @@ flate2 = "1"
 [[example]]
 name = "leak_report_demo"
 required-features = ["leak-detector"]
+stacker = "0.1"

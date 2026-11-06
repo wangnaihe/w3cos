@@ -222,6 +222,12 @@ thread_local! {
 }
 
 const WATCH_ID_LIMIT: u64 = 1 << 48;
+fn type_error(message: &str) -> ! {
+    crate::throw_value(crate::error_instance(
+        "TypeError",
+        vec![Value::string(message)],
+    ))
+}
 
 /// Allocate the next weak-identity id (see [`crate::heap::HeapAllocation`]).
 pub(crate) fn next_watch_id() -> u64 {

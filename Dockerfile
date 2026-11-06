@@ -5,7 +5,7 @@
 # ============================================================
 # Stage 1: Builder
 # ============================================================
-FROM rust:1.94-bookworm AS builder
+FROM rust:1.99.1-bookworm AS builder
 
 WORKDIR /w3cos
 COPY . .
