@@ -9788,6 +9788,12 @@ pub(crate) fn invalidate_scroll_size_cache() {
 }
 
 fn forced_scroll_size(node: u32) -> (f64, f64) {
+    // scrollWidth/scrollHeight flush pending style and layout like every
+    // other geometry getter. Without this an appended child was invisible to
+    // scrollHeight (and to the scrollTop clamp) until something else flushed.
+    if dom::is_document_dirty() {
+        let _ = crate::incremental_layout::flush();
+    }
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
