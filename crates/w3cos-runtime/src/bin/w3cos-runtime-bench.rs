@@ -30,6 +30,10 @@ const VIEW_H: f32 = 720.0;
 const LARGE_SECTIONS: usize = 200;
 const CELLS_PER_SECTION: usize = 20;
 const SCROLL_ROWS: usize = 240;
+/// Historical `paint_scroll.checksum` is the first frame plus this many
+/// 24px scrolls. It does not grow with `--samples`. The recorded legacy
+/// constant `1786374846` is that sum, from the `W3COS_LAYOUT_NG=0` engine.
+const SCROLL_CHECKSUM_FRAMES: usize = 3;
 const HOST_ITERS: usize = 800;
 
 fn main() {
@@ -686,16 +690,24 @@ fn measure_scroll_paint(samples: usize) -> String {
         eprintln!("scroll list raster is empty");
         std::process::exit(1);
     }
+    // Timing uses every requested sample. The checksum stops after the
+    // historical three scrolls (offsets 24, 48, 72). A 15-sample timing run
+    // must not fold the later frames into `1786374846`.
+    let frames = samples.max(SCROLL_CHECKSUM_FRAMES);
     let mut scroll_samples = Vec::with_capacity(samples);
-    for index in 0..samples {
+    for index in 0..frames {
         dom::set_scroll_offset(list, None, Some(24.0 * (index as f32 + 1.0)));
         let started = Instant::now();
         let frame = headless::render_document_rgba(800, 600).expect("scrolled frame");
-        scroll_samples.push(started.elapsed().as_micros());
-        checksum = checksum.wrapping_add(pixel_checksum(&frame.rgba));
+        if index < samples {
+            scroll_samples.push(started.elapsed().as_micros());
+        }
+        if index < SCROLL_CHECKSUM_FRAMES {
+            checksum = checksum.wrapping_add(pixel_checksum(&frame.rgba));
+        }
     }
     format!(
-        "{{\"rows\": {SCROLL_ROWS}, \"first_us\": {first_us}, \"scroll_median_us\": {}, \"scroll_samples_us\": {}, \"checksum\": {checksum}}}",
+        "{{\"rows\": {SCROLL_ROWS}, \"first_us\": {first_us}, \"scroll_median_us\": {}, \"scroll_samples_us\": {}, \"checksum_frames\": {SCROLL_CHECKSUM_FRAMES}, \"checksum\": {checksum}}}",
         median(&scroll_samples),
         json_us(&scroll_samples),
     )

@@ -45,6 +45,8 @@ def number(value, label, minimum=0, integer=False):
 # box. Do not replace these with NG-on numbers when the default engine
 # changes. Order is large-layout rects, startup layout rects, startup
 # paint pixels, scroll paint pixels.
+# The scroll value is the first list frame plus exactly three 24px scrolls.
+# It is not the sum of every `--samples` timing frame.
 LEGACY_LAYOUT_NG_OFF_CHECKSUMS = (
     (("style_layout", "layout_checksum"), 18294915160932),
     (("startup", "child", "layout_checksum"), 31627714668),
@@ -66,6 +68,8 @@ def nested(report, path):
 def expect_legacy_checksums(report):
     """The NG-off lane must still produce the historical checksum tuple."""
     require(report.get("layout_ng") == "off", "legacy checksum lane requires layout_ng=off")
+    frames, frames_label = nested(report, ("paint_scroll", "checksum_frames"))
+    require(frames == 3, f"{frames_label} must be the historical 3-scroll protocol")
     for path, expected in LEGACY_LAYOUT_NG_OFF_CHECKSUMS:
         value, label = nested(report, path)
         require(type(value) is int, f"{label} must be an integer")

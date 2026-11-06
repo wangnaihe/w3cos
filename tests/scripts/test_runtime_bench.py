@@ -149,6 +149,7 @@ class RuntimeBenchTests(unittest.TestCase):
             "child": {"layout_checksum": 31627714668, "checksum": 150112521},
         }
         report["paint_scroll"]["checksum"] = 1786374846
+        report["paint_scroll"]["checksum_frames"] = 3
         with self.assertRaises(gate.InvalidReport):
             gate.expect_legacy_checksums(report)
         report["layout_ng"] = "off"

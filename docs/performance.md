@@ -19,7 +19,8 @@ LayoutNG is on unless `W3COS_LAYOUT_NG=0`. The default report is the NG
 lane and is not required to match the legacy checksums. The `=0` lane
 keeps those constants: large-layout rects `18294915160932`, startup
 layout rects `31627714668`, startup paint `150112521`, scroll paint
-`1786374846`.
+`1786374846`. The scroll constant is the first list frame plus three
+24px scrolls. Later `--samples` frames are timed and are not added in.
 
 The `runtime-bench` profile matches release optimization (`opt-level` 3)
 with LTO off, 16 codegen units, and symbols kept. CPU raster (`cpu-render`,
