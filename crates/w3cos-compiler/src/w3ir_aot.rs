@@ -3170,6 +3170,7 @@ fn generate_sync_function_with_factories(
     module_specifier: Option<&str>,
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let shared = shared_numeric_ids(function);
     SHARED_NUMBERS.with(|numbers| *numbers.borrow_mut() = shared.clone());
@@ -3293,6 +3294,7 @@ fn generate_async_function_with_factories(
         bail!("ordinary async W3IR AOT emission requires an async non-generator function");
     }
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
     let back_edges = analyze_and_warn(function, module_specifier);
@@ -3550,6 +3552,7 @@ fn generate_generator_with_factories(
         );
     }
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
     let back_edges = analyze_and_warn(function, module_specifier);
@@ -3825,6 +3828,7 @@ fn generate_async_generator_with_factories(
     module_specifier: Option<&str>,
 ) -> Result<String> {
     let rust_name = sanitize_identifier(rust_name);
+    let _factory_guard = CurrentAotFactoryGuard::new(&rust_name);
     let type_name = format!("{}Frame", upper_camel(&rust_name));
     let plan = analyze_function(function);
     let back_edges = analyze_and_warn(function, module_specifier);
@@ -7550,6 +7554,22 @@ thread_local! {
         const { std::cell::RefCell::new(String::new()) };
 }
 
+struct CurrentAotFactoryGuard(String);
+
+impl CurrentAotFactoryGuard {
+    fn new(factory: &str) -> Self {
+        Self(CURRENT_AOT_FACTORY.with(|current| current.replace(factory.to_owned())))
+    }
+}
+
+impl Drop for CurrentAotFactoryGuard {
+    fn drop(&mut self) {
+        CURRENT_AOT_FACTORY.with(|current| {
+            current.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+
 fn emit_instruction(
     instruction: &Instruction,
     exception_target: Option<(w3cos_ir::Register, w3cos_ir::BlockId)>,
@@ -8848,6 +8868,102 @@ mod tests {
     use std::process::Command;
     use w3cos_core::Value;
     use w3cos_vm::{Limits, Vm};
+
+    #[test]
+    fn generated_new_target_uses_its_factory_and_runs_construct_semantics() {
+        let function = Function {
+            id: FunctionId(0),
+            name: Some("constructor".into()),
+            parameters: Vec::new(),
+            rest_parameter: None,
+            arguments_binding: None,
+            bindings: Vec::new(),
+            captures: Vec::new(),
+            this_binding: None,
+            registers: 1,
+            entry: BlockId(0),
+            blocks: vec![w3cos_ir::Block {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::NewTarget { dst: Register(0) },
+                    Instruction::Return { value: Register(0) },
+                ],
+                source_span: None,
+            }],
+            exception_regions: Vec::new(),
+            suspension_points: Vec::new(),
+            generator_suspension_points: Vec::new(),
+            is_async: false,
+            is_generator: false,
+            source_span: None,
+            types: Default::default(),
+            own_name_length: None,
+        };
+        let generated = generate_sync_function_with_factories(
+            &function,
+            "new_target_aot",
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            generated.contains("take_new_target(new_target_aot as usize)"),
+            "new.target must compare against the emitted factory: {generated}"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fixture.path().join("src")).unwrap();
+        let core_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../w3cos-core")
+            .canonicalize()
+            .unwrap();
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"w3ir_aot_new_target_fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nw3cos-core = {{ path = {:?} }}\n",
+                core_path
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("src/main.rs"),
+            format!(
+                r#"
+{generated}
+fn main() {{
+    let constructor = w3cos_core::Value::aot_function(
+        new_target_aot,
+        w3cos_core::AotCaptureMap::new(),
+    );
+    let direct = new_target_aot(
+        w3cos_core::Value::Undefined,
+        &[],
+        &w3cos_core::AotCaptureMap::new(),
+    );
+    let constructed = w3cos_core::class::construct(&constructor, Vec::new());
+    println!("{{}}:{{}}", direct.is_undefined(), constructed == constructor);
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--offline",
+                "--manifest-path",
+                fixture.path().join("Cargo.toml").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated new.target fixture failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "true:true");
+    }
 
     /// The pre-linearization `dead_string_loads`: rescans the proven-key
     /// prefix for every later instruction.
