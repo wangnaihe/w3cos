@@ -942,16 +942,52 @@ fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Co
         })
 }
 
-/// Whether the opt-in LayoutNG engine is requested (`W3COS_LAYOUT_NG`, or
-/// its verify mode). Mirrors `layout_ng::mode()`; the DOM crate cannot see
-/// the runtime crate.
+/// Whether LayoutNG should shape the DOM tree. Mirrors
+/// `layout_ng::mode_from_env`: unset and `W3COS_LAYOUT_NG=1` request NG,
+/// `W3COS_LAYOUT_NG=0` does not, and `W3COS_LAYOUT_NG_VERIFY` other than `0`
+/// does even when NG is `0`. The DOM crate cannot see the runtime crate, so
+/// the two functions must stay in agreement.
+pub(crate) fn layout_ng_requested_from_env(
+    ng: Option<&std::ffi::OsStr>,
+    verify: Option<&std::ffi::OsStr>,
+) -> bool {
+    let enabled = |value: &std::ffi::OsStr| value != "0";
+    if verify.is_some_and(enabled) {
+        return true;
+    }
+    ng.is_none_or(enabled)
+}
+
+/// Process-latched view of [`layout_ng_requested_from_env`].
 pub(crate) fn layout_ng_requested() -> bool {
     static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQUESTED.get_or_init(|| {
-        ["W3COS_LAYOUT_NG", "W3COS_LAYOUT_NG_VERIFY"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|value| value != "0"))
+        let ng = std::env::var_os("W3COS_LAYOUT_NG");
+        let verify = std::env::var_os("W3COS_LAYOUT_NG_VERIFY");
+        layout_ng_requested_from_env(ng.as_deref(), verify.as_deref())
     })
+}
+
+#[cfg(test)]
+#[test]
+fn layout_ng_requested_defaults_on_and_matches_the_runtime_rule() {
+    let check = |ng: Option<&str>, verify: Option<&str>, want: bool| {
+        let ng = ng.map(std::ffi::OsString::from);
+        let verify = verify.map(std::ffi::OsString::from);
+        assert_eq!(
+            layout_ng_requested_from_env(ng.as_deref(), verify.as_deref()),
+            want,
+            "ng={ng:?} verify={verify:?}"
+        );
+    };
+    check(None, None, true);
+    check(Some("1"), None, true);
+    check(Some(""), None, true);
+    check(Some("0"), None, false);
+    check(Some("0"), Some("0"), false);
+    check(Some("0"), Some("1"), true);
+    check(None, Some("1"), true);
+    check(Some("1"), Some("0"), true);
 }
 
 impl Document {
@@ -9330,11 +9366,12 @@ impl Document {
                             w3cos_std::style::Display::Inline | w3cos_std::style::Display::None
                         ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
                     })
-                    // LayoutNG (opt-in, `W3COS_LAYOUT_NG`) also lays out a
-                    // host whose children are all text runs (a styled
-                    // `inline-block` span folds into one) as real flex
-                    // items. The legacy engine keeps the wrapping row
-                    // lowering its results depend on, so this is NG-only.
+                    // LayoutNG (the default; `W3COS_LAYOUT_NG=0` keeps the
+                    // legacy lowering) also lays out a host whose children
+                    // are all text runs (a styled `inline-block` span folds
+                    // into one) as real flex items. The legacy engine keeps
+                    // the wrapping row lowering its results depend on, so
+                    // this is NG-only.
                     || (layout_ng_requested() && is_flex_host_of_text_runs(&style, &children));
                 if !authored_flex_of_plain_inlines
                     && (children.len() >= 2

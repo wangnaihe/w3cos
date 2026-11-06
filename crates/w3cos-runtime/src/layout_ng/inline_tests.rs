@@ -271,7 +271,7 @@ fn generated_inline_trees_are_supported() {
         );
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         if dump.is_some() {
-            let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+            let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
             lines.push_str(&format!(
                 "{{\"case\":{case},\"fonts\":[\"Ahem\"],\"html\":{:?},\"legacy\":{{{}}},\"ng\":{{{}}}}}\n",
                 case_html(&flat),
@@ -352,7 +352,7 @@ fn ext_trees_are_supported(level: u8, seed: u64, dump_env: &str, min_handled: us
         };
         handled += 1;
         if dump.is_some() {
-            let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+            let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
             lines.push_str(&format!(
                 "{{\"case\":{case},\"fonts\":[\"Ahem\"],\"html\":{:?},\"legacy\":{{{}}},\"ng\":{{{}}}}}\n",
                 case_html(&flat),

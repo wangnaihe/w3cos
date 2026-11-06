@@ -5315,6 +5315,12 @@ pub(crate) fn legacy_layout_rects(
         .map(|results| results.layout_cache)
 }
 
+/// `off`, `on`, or `verify`. Unset `W3COS_LAYOUT_NG` is `on`; `0` is `off`.
+/// The value is latched on the first layout in this process.
+pub fn layout_ng_mode_name() -> &'static str {
+    crate::layout_ng::mode_name()
+}
+
 pub fn compute(
     root: &Component,
     viewport_w: f32,
@@ -36336,10 +36342,13 @@ mod tests {
             .unwrap();
         let parent = flat[prefix].parent.unwrap();
         let mut engine = LayoutEngine::new();
+        // Both arms are the legacy caption fit. `LayoutEngine::compute`
+        // follows the default, which is LayoutNG and sizes this caption
+        // differently; that difference is not this test.
         for layout in [
             compute(&root, 800.0, 600.0).unwrap(),
             engine
-                .compute(&root, &flat, 800.0, 600.0)
+                .compute_legacy(&root, &flat, 800.0, 600.0)
                 .unwrap()
                 .layout_cache,
         ] {
@@ -60165,13 +60174,15 @@ mod tests {
         );
         let flat = pre_flatten(&tree);
         let mut engine = LayoutEngine::new();
-        let first = engine.compute(&tree, &flat, 80.0, 600.0).unwrap();
+        // This counts Taffy passes. The default engine is LayoutNG, which
+        // does not use that counter; the legacy escape hatch still does.
+        let first = engine.compute_legacy(&tree, &flat, 80.0, 600.0).unwrap();
         assert_eq!(first.layout_cache.len(), 2);
         assert_eq!(
             engine.last_compute_layout_passes, 2,
             "first pass must still reflow wrapped Auto-height text"
         );
-        let second = engine.compute(&tree, &flat, 80.0, 600.0).unwrap();
+        let second = engine.compute_legacy(&tree, &flat, 80.0, 600.0).unwrap();
         assert_eq!(second.layout_cache, first.layout_cache);
         assert_eq!(
             engine.last_compute_layout_passes, 1,

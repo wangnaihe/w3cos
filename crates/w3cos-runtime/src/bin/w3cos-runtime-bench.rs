@@ -81,8 +81,9 @@ fn main() {
     let style = measure_style_and_incremental(samples);
     let paint = measure_scroll_paint(samples);
     let host = measure_host_calls(samples);
+    let layout_ng = w3cos_runtime::layout::layout_ng_mode_name();
     let report = format!(
-        "{{\n  \"harness\": \"w3cos-runtime-bench\",\n  \"profile\": \"runtime-bench\",\n  \"viewport\": [{VIEW_W}, {VIEW_H}],\n  \"startup\": {startup},\n  \"style_layout\": {},\n  \"incremental_width\": {},\n  \"incremental_background\": {},\n  \"incremental_text\": {},\n  \"incremental_class\": {},\n  \"incremental_insert\": {},\n  \"incremental_remove\": {},\n  \"paint_scroll\": {paint},\n  \"host_calls\": {host}\n}}\n",
+        "{{\n  \"harness\": \"w3cos-runtime-bench\",\n  \"profile\": \"runtime-bench\",\n  \"layout_ng\": \"{layout_ng}\",\n  \"viewport\": [{VIEW_W}, {VIEW_H}],\n  \"startup\": {startup},\n  \"style_layout\": {},\n  \"incremental_width\": {},\n  \"incremental_background\": {},\n  \"incremental_text\": {},\n  \"incremental_class\": {},\n  \"incremental_insert\": {},\n  \"incremental_remove\": {},\n  \"paint_scroll\": {paint},\n  \"host_calls\": {host}\n}}\n",
         style.style,
         style.width,
         style.background,
@@ -138,7 +139,7 @@ fn run_startup_child() {
     let built_us = started.elapsed().as_micros();
     let style_started = Instant::now();
     let tree = dom::to_component_tree();
-    let laid_out = layout::compute(&tree, VIEW_W, VIEW_H).expect("example layout");
+    let laid_out = layout_rects(&tree, VIEW_W, VIEW_H);
     let style_layout_us = style_started.elapsed().as_micros();
     let paint_started = Instant::now();
     let frame = headless::render_document_rgba(VIEW_W as u32, VIEW_H as u32).expect("first frame");
@@ -285,7 +286,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         let tree = dom::to_component_tree();
         let style_us = style_started.elapsed().as_micros();
         let layout_started = Instant::now();
-        let laid_out = layout::compute(&tree, VIEW_W, VIEW_H).expect("large layout");
+        let laid_out = layout_rects(&tree, VIEW_W, VIEW_H);
         let layout_us = layout_started.elapsed().as_micros();
         layout_checksum = rect_checksum(&laid_out);
         if laid_out.len() < 1000 {
@@ -761,7 +762,8 @@ fn warm_font() {
     let text = dom::create_text_node("Warm");
     dom::append_child(dom::body_id(), text);
     let tree = dom::to_component_tree();
-    let _ = layout::compute(&tree, 64.0, 64.0);
+    let flat = layout::pre_flatten(&tree);
+    let _ = layout::LayoutEngine::new().compute(&tree, &flat, 64.0, 64.0);
 }
 
 fn node_width(id: u32) -> f32 {
@@ -783,6 +785,16 @@ fn rects_differ(left: LayoutRect, right: LayoutRect) -> bool {
         || (left.y - right.y).abs() > 0.5
         || (left.width - right.width).abs() > 0.5
         || (left.height - right.height).abs() > 0.5
+}
+
+/// Layout through `LayoutEngine`, so an unset flag and `W3COS_LAYOUT_NG=1`
+/// measure NG, and `=0` measures the legacy engine.
+fn layout_rects(tree: &w3cos_std::Component, w: f32, h: f32) -> Vec<(LayoutRect, usize)> {
+    let flat = layout::pre_flatten(tree);
+    layout::LayoutEngine::new()
+        .compute(tree, &flat, w, h)
+        .expect("layout")
+        .layout_cache
 }
 
 fn rect_checksum(layout: &[(LayoutRect, usize)]) -> u64 {

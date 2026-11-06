@@ -138,6 +138,26 @@ class RuntimeBenchTests(unittest.TestCase):
         with self.assertRaises(gate.InvalidReport):
             gate.validate_report(gate.load_report(text))
 
+    def test_legacy_checksum_lane_keeps_the_historical_constants(self):
+        report = synthetic_report()
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+        report["layout_ng"] = "on"
+        report["style_layout"]["layout_checksum"] = 18294915160932
+        report["startup"] = {
+            "wall_us": 10,
+            "child": {"layout_checksum": 31627714668, "checksum": 150112521},
+        }
+        report["paint_scroll"]["checksum"] = 1786374846
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+        report["layout_ng"] = "off"
+        gate.validate_report(report)
+        gate.expect_legacy_checksums(report)
+        report["style_layout"]["layout_checksum"] = 1
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+
     def test_cli_normal_and_optimized_python_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.json"

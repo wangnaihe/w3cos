@@ -41,6 +41,37 @@ def number(value, label, minimum=0, integer=False):
     return value
 
 
+# Legacy engine (`W3COS_LAYOUT_NG=0`) checksums recorded on the full-gate
+# box. Do not replace these with NG-on numbers when the default engine
+# changes. Order is large-layout rects, startup layout rects, startup
+# paint pixels, scroll paint pixels.
+LEGACY_LAYOUT_NG_OFF_CHECKSUMS = (
+    (("style_layout", "layout_checksum"), 18294915160932),
+    (("startup", "child", "layout_checksum"), 31627714668),
+    (("startup", "child", "checksum"), 150112521),
+    (("paint_scroll", "checksum"), 1786374846),
+)
+
+
+def nested(report, path):
+    value = report
+    label = []
+    for key in path:
+        label.append(key)
+        require(isinstance(value, dict), f"{'.'.join(label)} is missing")
+        value = value.get(key)
+    return value, ".".join(label)
+
+
+def expect_legacy_checksums(report):
+    """The NG-off lane must still produce the historical checksum tuple."""
+    require(report.get("layout_ng") == "off", "legacy checksum lane requires layout_ng=off")
+    for path, expected in LEGACY_LAYOUT_NG_OFF_CHECKSUMS:
+        value, label = nested(report, path)
+        require(type(value) is int, f"{label} must be an integer")
+        require(value == expected, f"{label} is {value}, legacy constant is {expected}")
+
+
 def validate_report(report):
     """Apply the CI gate with explicit types and finite, nonnegative evidence."""
     require(isinstance(report, dict), "report must be an object")
@@ -94,9 +125,17 @@ def validate_report(report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
+    parser.add_argument(
+        "--expect-legacy-checksums",
+        action="store_true",
+        help="require the historical W3COS_LAYOUT_NG=0 checksum tuple",
+    )
     args = parser.parse_args(argv)
     try:
-        validate_report(load_report(args.report.read_text()))
+        report = load_report(args.report.read_text())
+        validate_report(report)
+        if args.expect_legacy_checksums:
+            expect_legacy_checksums(report)
     except (OSError, ValueError) as error:
         print(f"runtime bench sanity failed: {error}", file=sys.stderr)
         return 1

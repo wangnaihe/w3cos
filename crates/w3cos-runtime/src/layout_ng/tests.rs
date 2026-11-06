@@ -40,7 +40,7 @@ fn sized(h: f32) -> Style {
 fn parity(root: &Component) -> Vec<(LayoutRect, usize)> {
     let flat = pre_flatten(root);
     assert!(block::supports_tree(&flat), "tree outside S1");
-    let legacy = crate::layout::compute(root, 800.0, 600.0).expect("legacy layout");
+    let legacy = crate::layout::legacy_layout_rects(root, 800.0, 600.0).expect("legacy layout");
     let ng = layout_tree(root, &flat, 800.0, 600.0).expect("ng layout");
     let diffs = verify(&flat, &legacy, &ng);
     assert_eq!(diffs, 0, "legacy {legacy:#?}\nng {ng:#?}");
@@ -419,7 +419,7 @@ fn generated_block_trees_cover_the_legacy_box_set() {
     for case in 0..400 {
         let root = node(block(), vec![random_tree(&mut rng, 3)]);
         let flat = pre_flatten(&root);
-        let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+        let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         let mut legacy_ids: Vec<usize> = legacy.iter().map(|(_, i)| *i).collect();
         let mut ng_ids: Vec<usize> = ng.iter().map(|(_, i)| *i).collect();
@@ -506,7 +506,7 @@ fn probe_html() {
     let root = crate::browser_page_domain::load_html_snapshot(&html, "file:///probe.html")
         .expect("snapshot");
     let flat = pre_flatten(&root);
-    let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy layout");
+    let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy layout");
     let reasons = block::unsupported_reasons(&flat);
     println!("reasons: {reasons:?}");
     let ng = if reasons.is_empty() {
@@ -7550,4 +7550,98 @@ fn max_content_subgrid_under_min_content_grid_matches_chrome() {
     };
     assert_eq!(at(1).2, 100.0, "min-content grid width {:?}", at(1));
     assert_eq!(at(2).2, 100.0, "max-content subgrid width {:?}", at(2));
+}
+
+fn os(value: &str) -> &std::ffi::OsStr {
+    std::ffi::OsStr::new(value)
+}
+
+/// Unset selects NG, the same as `W3COS_LAYOUT_NG=1`. Only `0` is legacy,
+/// and a non-zero verify value wins over `0`.
+#[test]
+fn layout_ng_mode_from_env_defaults_on() {
+    use super::Mode;
+    let cases = [
+        (None, None, Mode::On),
+        (Some("1"), None, Mode::On),
+        (Some(""), None, Mode::On),
+        (Some("on"), None, Mode::On),
+        (Some("0"), None, Mode::Off),
+        (Some("0"), Some("0"), Mode::Off),
+        (Some("0"), Some("1"), Mode::Verify),
+        (Some("0"), Some("all"), Mode::Verify),
+        (None, Some("1"), Mode::Verify),
+        (Some("1"), Some("0"), Mode::On),
+        (Some("1"), Some("1"), Mode::Verify),
+    ];
+    for (ng, verify, want) in cases {
+        let got = super::mode_from_env(ng.map(os), verify.map(os));
+        assert_eq!(got, want, "ng={ng:?} verify={verify:?}");
+    }
+}
+
+/// The latched mode matches the process environment on the first read, and
+/// a second read returns the same value. Fresh processes are probed below.
+#[test]
+fn layout_ng_mode_latches_the_process_environment() {
+    let ng = std::env::var_os("W3COS_LAYOUT_NG");
+    let verify = std::env::var_os("W3COS_LAYOUT_NG_VERIFY");
+    let want = super::mode_from_env(ng.as_deref(), verify.as_deref());
+    assert_eq!(super::mode(), want);
+    assert_eq!(super::mode(), super::mode());
+}
+
+/// Child of the test harness. Prints the mode latched from the process
+/// environment and checks a second read. The parent test starts one process
+/// per flag value; this returns immediately in the normal suite run.
+#[test]
+fn layout_ng_mode_probe() {
+    if std::env::var_os("W3COS_LAYOUT_NG_MODE_PROBE").is_none() {
+        return;
+    }
+    let first = super::mode();
+    let second = super::mode();
+    assert_eq!(first, second, "mode is latched for the process");
+    eprintln!("LAYOUT_NG_MODE={first:?}");
+}
+
+#[test]
+fn layout_ng_fresh_processes_agree_on_unset_and_explicit_on() {
+    let probe = |ng: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.args([
+            "--exact",
+            "layout_ng::tests::layout_ng_mode_probe",
+            "--nocapture",
+        ]);
+        cmd.env("W3COS_LAYOUT_NG_MODE_PROBE", "1");
+        cmd.env_remove("W3COS_LAYOUT_NG_VERIFY");
+        match ng {
+            Some(value) => {
+                cmd.env("W3COS_LAYOUT_NG", value);
+            }
+            None => {
+                cmd.env_remove("W3COS_LAYOUT_NG");
+            }
+        }
+        let output = cmd.output().expect("spawn mode probe");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "ng={ng:?} status {:?} {stderr}",
+            output.status
+        );
+        stderr
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("LAYOUT_NG_MODE="))
+            .unwrap_or_else(|| panic!("ng={ng:?} produced no mode line:\n{stderr}"))
+            .to_string()
+    };
+    let unset = probe(None);
+    let on = probe(Some("1"));
+    let off = probe(Some("0"));
+    assert_eq!(unset, "On");
+    assert_eq!(on, "On");
+    assert_eq!(off, "Off");
+    assert_eq!(unset, on);
 }

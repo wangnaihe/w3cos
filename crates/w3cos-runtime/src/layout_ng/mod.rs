@@ -10,10 +10,13 @@
 //! `(LayoutRect, flat index)` output, so paint, hit-testing and the CSSOM
 //! geometry getters are unchanged.
 //!
-//! Rollout (see notes / PR): `W3COS_LAYOUT_NG=1` uses this engine for trees
-//! it fully supports and falls back to the legacy Taffy + projection engine
-//! otherwise; `W3COS_LAYOUT_NG_VERIFY=1` runs both on supported trees,
-//! keeps the legacy output and reports every rect that differs.
+//! Rollout: LayoutNG is the default. An unset `W3COS_LAYOUT_NG` uses this
+//! engine for trees it fully supports and falls back to the legacy Taffy +
+//! projection engine otherwise. `W3COS_LAYOUT_NG=1` is the same mode.
+//! `W3COS_LAYOUT_NG=0` is the legacy escape hatch. `W3COS_LAYOUT_NG_VERIFY=1`
+//! (any value other than `0`) runs both on supported trees, keeps the legacy
+//! output, and reports every rect that differs. The choice is read once per
+//! process and then latched.
 //!
 //! Stage S1: block flow without floats -- block-level boxes in normal flow,
 //! margin collapsing (siblings, parent/first-child, parent/last-child,
@@ -42,17 +45,43 @@ pub(crate) enum Mode {
     Verify,
 }
 
+/// Resolve the layout engine from the two environment values.
+///
+/// `verify` other than `0` wins (including when `ng` is `0`). An unset `ng`
+/// selects NG, the same as `1` or any value other than `0`. Only `ng=0`
+/// with verify unset or `0` stays on the legacy engine. This is the single
+/// decision `mode` latches; `w3cos_dom::document::layout_ng_requested_from_env`
+/// must accept the same inputs.
+pub(crate) fn mode_from_env(
+    ng: Option<&std::ffi::OsStr>,
+    verify: Option<&std::ffi::OsStr>,
+) -> Mode {
+    let enabled = |value: &std::ffi::OsStr| value != "0";
+    if verify.is_some_and(enabled) {
+        Mode::Verify
+    } else if ng.is_none_or(enabled) {
+        Mode::On
+    } else {
+        Mode::Off
+    }
+}
+
 pub(crate) fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        if std::env::var_os("W3COS_LAYOUT_NG_VERIFY").is_some_and(|v| v != "0") {
-            Mode::Verify
-        } else if std::env::var_os("W3COS_LAYOUT_NG").is_some_and(|v| v != "0") {
-            Mode::On
-        } else {
-            Mode::Off
-        }
+        let ng = std::env::var_os("W3COS_LAYOUT_NG");
+        let verify = std::env::var_os("W3COS_LAYOUT_NG_VERIFY");
+        mode_from_env(ng.as_deref(), verify.as_deref())
     })
+}
+
+/// Stable name for harness reports: `off`, `on`, or `verify`.
+pub(crate) fn mode_name() -> &'static str {
+    match mode() {
+        Mode::Off => "off",
+        Mode::On => "on",
+        Mode::Verify => "verify",
+    }
 }
 
 /// `W3COS_LAYOUT_NG_TRACE=1`: log whether each compute used NG or fell back

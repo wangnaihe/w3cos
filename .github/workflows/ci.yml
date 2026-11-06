@@ -127,15 +127,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build runtime bench
         run: cargo build --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --no-default-features --features cpu-render
-      - name: Run runtime bench
+      - name: Run runtime bench (LayoutNG default)
         run: target/runtime-bench/w3cos-runtime-bench --output runtime-bench.json --samples 3
+      - name: Run runtime bench (legacy checksum lane)
+        env:
+          W3COS_LAYOUT_NG: "0"
+        run: target/runtime-bench/w3cos-runtime-bench --output runtime-bench-legacy.json --samples 3
       - name: Check harness sanity
         run: |
           python3 -m unittest discover -s tests/scripts -p 'test_runtime_bench.py' -v
           python3 scripts/check-runtime-bench.py runtime-bench.json
+          python3 scripts/check-runtime-bench.py --expect-legacy-checksums runtime-bench-legacy.json
       - name: Upload runtime bench report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: runtime-bench
-          path: runtime-bench.json
+          path: |
+            runtime-bench.json
+            runtime-bench-legacy.json
