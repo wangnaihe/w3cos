@@ -190,6 +190,39 @@ fn component_path(root: &Component, chain: &[u32]) -> Option<Vec<usize>> {
     Some(path)
 }
 
+/// LayoutNG lays a column flex item out inside the column. An isolated
+/// block or single-item wrapper does not reproduce that used width, so a
+/// later sibling keeps a short y. `Mode::On` rebuilds the whole tree
+/// instead of publishing that subtree. `Mode::Off` keeps the fast path.
+fn path_has_column_flex(root: &Component, path: &[usize]) -> bool {
+    if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
+        return false;
+    }
+    (0..=path.len()).any(|end| {
+        let style = &at_path(root, &path[..end]).style;
+        matches!(style.display, Display::Flex | Display::InlineFlex)
+            && style.flex_direction == FlexDirection::Column
+    })
+}
+
+pub(super) fn ng_column_flex_requires_rebuild(cache: &Cache, id: u32) -> bool {
+    if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
+        return false;
+    }
+    let Some(root_id) = host_id(&cache.component) else {
+        return false;
+    };
+    let Some(chain) = crate::dom::with_document(|document| {
+        element_chain(document, NodeId::from_u32(id), root_id)
+    }) else {
+        return false;
+    };
+    let Some(path) = component_path(&cache.component, &chain) else {
+        return false;
+    };
+    path_has_column_flex(&cache.component, &path)
+}
+
 fn at_path<'a>(root: &'a Component, path: &[usize]) -> &'a Component {
     path.iter().fold(root, |node, &index| &node.children[index])
 }
@@ -837,6 +870,9 @@ pub(super) fn try_splice(
         Ok(None) => return true,
         Err(()) => return bail("no safe subtree root"),
     };
+    if path_has_column_flex(&cache.component, &plan.path) {
+        return bail("ng column flex");
+    }
     let Some(levels) = ancestor_levels(&cache.component, &plan.path) else {
         return bail("ancestors");
     };
@@ -1170,6 +1206,9 @@ pub(super) fn try_style_subtree(
     if path.is_empty() || host_id(at_path(&cache.component, &path)) != Some(id) {
         return bail("style host");
     }
+    if path_has_column_flex(&cache.component, &path) {
+        return bail("ng column flex");
+    }
     let parent = at_path(&cache.component, &path[..path.len() - 1]);
     let node_alone = stacking_parent(parent)
         && cross_axis_start_stable(&parent.style, new)
@@ -1323,6 +1362,29 @@ fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Column flex under LayoutNG rebuilds the whole tree. The fast path
+    /// remains the expectation when LayoutNG is off. Geometry stays exact
+    /// either way.
+    fn expect_column_flex_edit(label: &str, fast_kind: &str, fast_node_limit: Option<u32>) {
+        let stats = crate::incremental_layout::last_flush_stats();
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert_eq!(
+                stats.kind, "rebuild",
+                "{label}: column flex under LayoutNG rebuilt ({})",
+                stats.kind
+            );
+        } else {
+            assert_eq!(stats.kind, fast_kind, "{label} {}", stats.kind);
+            if let Some(limit) = fast_node_limit {
+                assert!(
+                    stats.solved_nodes < limit,
+                    "{label} solved {} nodes",
+                    stats.solved_nodes
+                );
+            }
+        }
+    }
 
     fn style(node: u32, decls: &[(&str, &str)]) {
         for (name, value) in decls {
@@ -1602,17 +1664,7 @@ mod tests {
         let (column, items) = flex_column();
         crate::dom::set_style_property(items[1], "width", "36px");
         assert!(crate::incremental_layout::flush());
-        let stats = crate::incremental_layout::last_flush_stats();
-        assert_eq!(
-            stats.kind, "style-subtree",
-            "width edit solved {}",
-            stats.kind
-        );
-        assert!(
-            stats.solved_nodes < 30,
-            "width edit solved {} nodes",
-            stats.solved_nodes
-        );
+        expect_column_flex_edit("width edit", "style-subtree", Some(30));
         assert_matches_full("flex width");
 
         let text = crate::dom::with_document(|document| {
@@ -1627,11 +1679,7 @@ mod tests {
             "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
         );
         assert!(crate::incremental_layout::flush());
-        assert_eq!(
-            crate::incremental_layout::last_flush_stats().kind,
-            "splice",
-            "text edit"
-        );
+        expect_column_flex_edit("text edit", "splice", None);
         assert_matches_full("flex text");
 
         let extra = crate::dom::create_element("div");
@@ -1639,20 +1687,12 @@ mod tests {
         crate::dom::append_child(extra, crate::dom::create_text_node("appended row"));
         crate::dom::append_child(column, extra);
         assert!(crate::incremental_layout::flush());
-        assert_eq!(
-            crate::incremental_layout::last_flush_stats().kind,
-            "splice",
-            "append"
-        );
+        expect_column_flex_edit("append", "splice", None);
         assert_matches_full("flex append");
 
         crate::dom::remove_child(column, extra);
         assert!(crate::incremental_layout::flush());
-        assert_eq!(
-            crate::incremental_layout::last_flush_stats().kind,
-            "splice",
-            "remove"
-        );
+        expect_column_flex_edit("remove", "splice", None);
         assert_matches_full("flex remove");
     }
 
@@ -1714,8 +1754,7 @@ mod tests {
         let (_column, items) = flex_column();
         crate::dom::class_list_add(items[0], "wide");
         assert!(crate::incremental_layout::flush());
-        let stats = crate::incremental_layout::last_flush_stats();
-        assert_eq!(stats.kind, "style-subtree", "class toggle {}", stats.kind);
+        expect_column_flex_edit("class toggle", "style-subtree", None);
         assert_matches_full("class on");
         crate::dom::class_list_remove(items[0], "wide");
         assert!(crate::incremental_layout::flush());
