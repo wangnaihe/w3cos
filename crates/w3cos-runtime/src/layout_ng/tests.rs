@@ -7429,3 +7429,125 @@ fn column_flex_percent_item_stays_on_legacy() {
         block::unsupported_reasons(&flat)
     );
 }
+
+/// A grid with `width: min-content` whose only item is a column subgrid
+/// (css-grid/subgrid/dynamic-min-content-001 end state). Headless Chrome,
+/// body margin 0: the outer grid is a 100×100 border box; the subgrid and
+/// its 100px-wide item share that inline size. Previously NG bailed with
+/// `grid:width-keyword` whenever a width-keyword grid had a subgrid child.
+#[test]
+fn min_content_grid_with_column_subgrid_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let parent = Style {
+        display: Display::Grid,
+        height: Dimension::Px(100.0),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-width-keyword".to_string(),
+            "min-content".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let subgrid = Style {
+        display: Display::Grid,
+        grid_template_columns: Some("subgrid".to_string()),
+        ..Style::default()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(parent, vec![node(subgrid, vec![node(item, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    assert!(
+        !block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| *reason == "grid:width-keyword"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng layout");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    assert_eq!(at(1), (0.0, 0.0, 100.0, 100.0), "min-content grid");
+    assert_eq!(at(2), (0.0, 0.0, 100.0, 100.0), "column subgrid");
+    assert_eq!(at(3), (0.0, 0.0, 100.0, 100.0), "item");
+}
+
+/// Outer `width: min-content` grid hosting a row-subgrid with
+/// `width: max-content; max-width: 100px` (standalone-axis-size-006 shape).
+/// Headless Chrome / WPT: the outer grid's used width is 100px. The
+/// subgrid is a grid item, so `intrinsic_keyword_applies` is false — NG
+/// keeps its width keyword via the subgrid exceptions on
+/// `grid:width-keyword` / `grid:item-width-keyword`.
+#[test]
+fn max_content_subgrid_under_min_content_grid_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let kw = |word: &str| {
+        CustomProperties::from_iter([(
+            "--w3cos-internal-width-keyword".to_string(),
+            word.to_string(),
+        )])
+    };
+    let parent = Style {
+        display: Display::Grid,
+        custom_properties: Some(kw("min-content")),
+        ..Style::default()
+    };
+    let mut subgrid = Style {
+        display: Display::Grid,
+        max_width: Dimension::Px(100.0),
+        custom_properties: Some(kw("max-content")),
+        ..Style::default()
+    };
+    subgrid.grid_ng_mut().grid_template_rows = Some("subgrid".to_string());
+    let item = || {
+        node(
+            Style {
+                display: Display::InlineBlock,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(50.0),
+                font_size: 0.0,
+                ..Style::default()
+            },
+            vec![],
+        )
+    };
+    let wrap = Style {
+        display: Display::Block,
+        font_size: 0.0,
+        line_height: 0.0,
+        line_height_is_normal: false,
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            parent,
+            vec![node(subgrid, vec![node(wrap, vec![item(), item()])])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng layout");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    assert_eq!(at(1).2, 100.0, "min-content grid width {:?}", at(1));
+    assert_eq!(at(2).2, 100.0, "max-content subgrid width {:?}", at(2));
+}

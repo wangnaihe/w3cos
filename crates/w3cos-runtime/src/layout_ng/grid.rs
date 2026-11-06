@@ -277,13 +277,26 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("grid:contain");
     }
-    // A subgrid item's tracks come from this grid's own sizing, which the
-    // keyword resolves against; that cycle stays on the legacy engine.
-    if has_marker(style, "--w3cos-internal-width-keyword")
-        && (!block::intrinsic_keyword_applies(flat, index)
-            || rendered_children(flat, index).any(|child| subgrid_style(flat[child].style)))
-    {
-        return Some("grid:width-keyword");
+    // Intrinsic width keywords on an in-flow grid are resolved from the
+    // grid's own track min/max contributions in `layout`. Subgrid children
+    // feed those tracks (see `intrinsic_tracks_without_subgrid`) when their
+    // standalone axis is implicit (dynamic-min-content-001/002,
+    // standalone-axis-size-006). Explicit fr/repeat tracks on that axis
+    // (standalone-axis-size-010+) still disagree with legacy, so keep the
+    // keyword bail there. A subgrid item may also carry a width keyword;
+    // its parent is a grid so `intrinsic_keyword_applies` is false — keep
+    // it when the box itself is a subgrid.
+    if has_marker(style, "--w3cos-internal-width-keyword") {
+        let self_ok = block::intrinsic_keyword_applies(flat, index) || subgrid_style(style);
+        if !self_ok {
+            return Some("grid:width-keyword");
+        }
+        if rendered_children(flat, index).any(|child| {
+            let child_style = flat[child].style;
+            subgrid_style(child_style) && !subgrid_standalone_axis_is_implicit(child_style)
+        }) {
+            return Some("grid:width-keyword");
+        }
     }
     if style.grid_areas().is_some() {
         return Some("grid:areas");
@@ -384,7 +397,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.position == Position::Relative && inset_set(child_style) {
             return Some("grid:inset");
         }
-        if has_marker(child_style, "--w3cos-internal-width-keyword") {
+        // A subgrid item may carry `width: min/max/fit-content`; those
+        // sizes contribute through the parent's track sizing
+        // (standalone-axis-size-006). Non-subgrid items still disagree.
+        if has_marker(child_style, "--w3cos-internal-width-keyword") && !subgrid_style(child_style)
+        {
             return Some("grid:item-width-keyword");
         }
     }
@@ -1012,6 +1029,19 @@ fn axis_line(spec: Option<&str>, rows: bool) -> bool {
 fn subgrid_style(style: &Style) -> bool {
     columns_spec(style).is_some_and(is_subgrid_axis)
         || style.grid_rows().is_some_and(is_subgrid_axis)
+}
+
+/// Column-only / row-only subgrid whose other axis has no author track
+/// list. Explicit `repeat()` / `fr` tracks on that axis under a
+/// `width: min-content` parent still need the legacy engine.
+fn subgrid_standalone_axis_is_implicit(style: &Style) -> bool {
+    let col_sub = columns_spec(style).is_some_and(is_subgrid_axis);
+    let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
+    match (col_sub, row_sub) {
+        (true, false) => style.grid_rows().is_none(),
+        (false, true) => columns_spec(style).is_none(),
+        _ => false,
+    }
 }
 
 fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
