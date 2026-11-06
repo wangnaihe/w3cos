@@ -2060,6 +2060,11 @@ mod tests {
         assert!(manifest_features.contains(r#""cpu-render""#));
         assert!(manifest_features.contains(r#""woff""#));
         assert!(!manifest_features.contains(r#""dynamic-js""#));
+        append_desktop_codecs(&mut features, &CompileOptions::default());
+        assert_eq!(
+            features.iter().filter(|feature| *feature == "woff").count(),
+            1
+        );
 
         let mut ordinary_aot_features = Vec::new();
         append_desktop_codecs(&mut ordinary_aot_features, &CompileOptions::default());
