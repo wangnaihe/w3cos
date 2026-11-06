@@ -1130,6 +1130,11 @@ fn build_string_value() -> Value {
                     "String.prototype.{name} called on null or undefined"
                 )));
             }
+            if this.type_of() == "symbol" {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "String.prototype.{name} cannot convert a Symbol value to a string"
+                )));
+            }
             let receiver = if this.is_string() {
                 this
             } else if let Some(data) = string_wrapper_data(&this) {
@@ -1144,7 +1149,7 @@ fn build_string_value() -> Value {
     }
     for name in ["toString", "valueOf"] {
         let method = native_function(name, 0, move |this, _| {
-            if this.is_string() {
+            if this.type_of() == "string" {
                 this
             } else if let Some(data) = string_wrapper_data(&this) {
                 data
@@ -1979,6 +1984,9 @@ pub(crate) fn object_keys(value: &Value) -> Value {
         return Value::array(
             keys.into_iter()
                 .filter(|key| {
+                    if key.type_of() == "symbol" {
+                        return false;
+                    }
                     let key = key.to_js_string();
                     object
                         .borrow()
@@ -2761,6 +2769,53 @@ mod monaco_tests {
         assert!(
             ok.as_ref().ok().map(|v| v.to_bool()) == Some(true),
             "includes(symbol): {ok:?}"
+        );
+    }
+
+    #[test]
+    fn string_prototype_methods_reject_symbol_receivers() {
+        use crate::intrinsics::{call, call_completion, get_property};
+
+        let symbol = call(
+            &symbol_value(),
+            Value::Undefined,
+            vec![Value::string("receiver")],
+        );
+        let prototype = get_property(&string_value(), &Value::string("prototype"));
+        for name in [
+            "endsWith",
+            "includes",
+            "padStart",
+            "repeat",
+            "replace",
+            "slice",
+            "startsWith",
+            "substring",
+            "toLowerCase",
+            "toString",
+            "valueOf",
+        ] {
+            let method = get_property(&prototype, &Value::string(name));
+            let result = call_completion(&method, symbol.clone(), vec![Value::string("x")]);
+            let error = result.expect_err(&format!("String.prototype.{name} accepted a Symbol"));
+            assert_eq!(error.get_property("name"), Value::string("TypeError"));
+        }
+    }
+
+    #[test]
+    fn object_entries_omits_symbol_keys() {
+        use crate::intrinsics::call;
+
+        let symbol = call(&symbol_value(), Value::Undefined, Vec::new());
+        let object = Value::object(HashMap::new());
+        object.set_property("visible", Value::Number(1.0));
+        object.set_property(&symbol.to_js_string(), Value::Number(2.0));
+
+        let entries = object_value().call_method("entries", vec![object]);
+        assert_eq!(entries.get_property("length"), Value::Number(1.0));
+        assert_eq!(
+            entries.get_property("0").get_property("0"),
+            Value::string("visible")
         );
     }
 

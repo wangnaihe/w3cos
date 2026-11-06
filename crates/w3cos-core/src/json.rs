@@ -108,8 +108,11 @@ pub fn stringify(args: Vec<Value>) -> Value {
     let gap_value = args.get(2).cloned().unwrap_or(Value::Undefined);
     let gap = if let Some(n) = gap_value.as_number() {
         " ".repeat((n.max(0.0) as usize).min(10))
-    } else if let Some(s) = gap_value.as_js_string() {
-        s.chars().take(10).collect()
+    } else if gap_value.type_of() != "symbol" {
+        gap_value
+            .as_js_string()
+            .map(|s| s.chars().take(10).collect())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -455,6 +458,20 @@ mod tests {
         let value = parse(vec![Value::string(r#"{"x":1}"#)]);
         let text = stringify(vec![value, Value::Undefined, Value::string("\t")]).to_js_string();
         assert!(text.contains("\n\t\"x\": 1"));
+    }
+
+    #[test]
+    fn stringify_ignores_symbol_space_argument() {
+        let symbol = crate::intrinsics::call(
+            &crate::builtins::symbol_value(),
+            Value::Undefined,
+            vec![Value::string("space")],
+        );
+        let value = parse(vec![Value::string(r#"{"x":1}"#)]);
+        assert_eq!(
+            stringify(vec![value, Value::Undefined, symbol]).to_js_string(),
+            r#"{"x":1}"#
+        );
     }
 
     #[test]
