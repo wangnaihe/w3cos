@@ -71,6 +71,8 @@ pub(crate) struct BreakMode {
     pub cj: bool,
     /// The content language is Japanese.
     pub ja: bool,
+    /// The text has an element language (possibly empty); see lb_strictness.
+    pub has_lang: bool,
     /// `overflow-wrap: anywhere / break-word` or `word-break: break-word`:
     /// an otherwise unbreakable run may break at any grapheme boundary when
     /// it would overflow (NGLineBreaker's break_anywhere_if_overflow).
@@ -92,6 +94,7 @@ impl Default for BreakMode {
             break_space: BreakSpace::AfterSpaceRun,
             cj: false,
             ja: false,
+            has_lang: false,
             break_anywhere_if_overflow: false,
             disable_soft_hyphen: false,
             hang_last_punctuation: false,
@@ -111,6 +114,12 @@ impl BreakMode {
             .unwrap_or_default();
         let is = |l: &str| lang == l || lang.starts_with(&format!("{l}-"));
         let (ja, cj) = (is("ja"), is("ja") || is("zh"));
+        // An element language (even an empty, unknown one) makes Blink add
+        // the `@lb` keyword; without any language `line-break` has no effect.
+        let has_lang = style
+            .custom_properties
+            .as_ref()
+            .is_some_and(|p| p.contains_key("--w3cos-internal-text-language"));
         // ComputedStyle::GetLineBreakType: line-break: anywhere wins over
         // word-break.
         let kind = match (style.line_break, style.word_break) {
@@ -130,6 +139,7 @@ impl BreakMode {
             strictness,
             cj,
             ja,
+            has_lang,
             break_anywhere_if_overflow: style.word_break == WordBreak::BreakWord,
             break_space: if style.break_spaces {
                 BreakSpace::AfterEverySpace
@@ -141,21 +151,26 @@ impl BreakMode {
         }
     }
 
+    /// The `line-break` strictness in effect: LayoutLocale::
+    /// LocaleWithBreakKeyword sets `@lb` only when the text has a language.
+    pub(crate) fn lb_strictness(&self) -> Strictness {
+        if self.cj || self.has_lang {
+            self.strictness
+        } else {
+            Strictness::Default
+        }
+    }
+
     fn segmenter_options(&self) -> LineBreakOptions<'static> {
         static JA: icu_locale_core::LanguageIdentifier = icu_locale_core::langid!("ja");
         let mut options = LineBreakOptions::default();
-        options.strictness = Some(if !self.cj {
-            // LayoutLocale::LocaleWithBreakKeyword: without a content
-            // language no `@lb` keyword is set, so `line-break` has no
-            // effect and the root rules (CJ as ID) apply.
-            LineBreakStrictness::Normal
-        } else {
-            match self.strictness {
-                // ICU's ja / zh locales default to the normal tailoring.
-                Strictness::Default | Strictness::Normal => LineBreakStrictness::Normal,
-                Strictness::Strict => LineBreakStrictness::Strict,
-                Strictness::Loose => LineBreakStrictness::Loose,
-            }
+        // LayoutLocale::LocaleWithBreakKeyword: Blink appends the `@lb`
+        // keyword to the content language (or the default locale when the
+        // language is unknown), so `line-break` applies to every language.
+        options.strictness = Some(match self.lb_strictness() {
+            Strictness::Default | Strictness::Normal => LineBreakStrictness::Normal,
+            Strictness::Strict => LineBreakStrictness::Strict,
+            Strictness::Loose => LineBreakStrictness::Loose,
         });
         options.word_option = Some(match self.kind {
             LineBreakType::BreakAll => LineBreakWordOption::BreakAll,
@@ -391,7 +406,10 @@ pub(crate) fn break_opportunities(text: &str, mode: BreakMode) -> Vec<usize> {
             }
             if is_cj_dash(c) || is_cj_dash(prev) {
                 if !mode.cj {
-                    break 'decide true;
+                    // With an explicit `line-break` the `@lb` keyword selects
+                    // ICU's non-CJ tailoring, which keeps U+301C / U+30A0
+                    // (NS) off the line start.
+                    break 'decide !(mode.lb_strictness() != Strictness::Default && is_cj_dash(c));
                 }
                 if mode.cj_dash_no_break_before() && is_cj_dash(c) {
                     break 'decide false;

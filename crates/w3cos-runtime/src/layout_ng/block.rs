@@ -140,6 +140,11 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             | "background-inherit"
             | "text-source-run"
             | "text-fragment-ends"
+            // CSSOM client-rect ownership of dissolved inlines (#325): read
+            // only by getClientRects, not by layout or paint.
+            | "cssom-owner-ranges"
+            | "cssom-box-owners"
+            | "split-inline-owner"
             | "quirks-mode"
             | "rendered-legend"
             | "document-element"

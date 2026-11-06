@@ -273,7 +273,7 @@ fn rebuild(
     let Ok(results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
         return false;
     };
-    let snaps = write_rects(&flat, &results.layout_cache);
+    let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
     let skip_projections = can_skip_projections(&component);
@@ -432,7 +432,7 @@ fn patch_and_compute(
     };
     let compute_us = compute_started.elapsed().as_micros();
     let write_started = std::time::Instant::now();
-    let snaps = write_rects(&flat, &results.layout_cache);
+    let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let write_us = write_started.elapsed().as_micros();
     if phase {
         eprintln!(
@@ -464,15 +464,16 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
     else {
         return false;
     };
-    write_rects(&flat, &results.layout_cache);
+    write_rects(&flat, &results.layout_cache, &results.text_fragments);
     true
 }
 
 fn write_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
+    text_fragments: &[crate::layout_ng::TextFragment],
 ) -> Vec<(u32, f32, f32, f32, f32)> {
-    publish_client_rects(flat, layouts);
+    publish_client_rects(flat, layouts, text_fragments);
     let mut snaps = Vec::with_capacity(layouts.len());
     crate::dom::with_document_mut(|document| {
         for (rect, index) in layouts {
@@ -563,6 +564,7 @@ fn physical_text_line(
 fn publish_client_rects(
     flat: &[crate::layout::FlatNodeInfo<'_>],
     layouts: &[(crate::layout::LayoutRect, usize)],
+    ng_text: &[crate::layout_ng::TextFragment],
 ) {
     let mut by_index = vec![None; flat.len()];
     for (rect, index) in layouts {
@@ -686,10 +688,83 @@ fn publish_client_rects(
             ))
         };
         let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
-        let lines = crate::text_layout::wrap_text_with_run_width(
+        // LayoutNG laid this text out: its line fragments (byte ranges of
+        // `content` with their physical rects) are where the owner ranges
+        // sit, so CSSOM reads them instead of re-wrapping the run.
+        let ng_lines = ng_text
+            .iter()
+            .filter(|fragment| fragment.index == index && !fragment.vertical)
+            .collect::<Vec<_>>();
+        if !ng_lines.is_empty() {
+            let owner_ranges = w3cos_std::inline_text::cssom_owner_ranges(content, info.style);
+            let explicit_owners = owner_ranges
+                .iter()
+                .map(|(owner, _, _)| *owner)
+                .collect::<HashSet<_>>();
+            for fragment in &ng_lines {
+                let (line_start, line_end) = (fragment.start, fragment.end.min(content.len()));
+                if line_start > line_end
+                    || !content.is_char_boundary(line_start)
+                    || !content.is_char_boundary(line_end)
+                {
+                    continue;
+                }
+                let line_rect = fragment.rect;
+                let mut push = |owner: u32, x: f32, width: f32, text: &str| {
+                    let font_box = crate::font_face::font_box_metrics_for_text(info.style, text);
+                    let font_height = font_box.map_or(line_rect.height, |metrics| metrics.height());
+                    let font_top =
+                        crate::layout::inline_upper_leading(line_rect.height, font_height);
+                    owners_with_inline_fragments.insert(owner);
+                    published
+                        .entry(owner)
+                        .or_default()
+                        .push(w3cos_dom::DOMRect::new(
+                            x,
+                            line_rect.y + font_top,
+                            width,
+                            font_height,
+                        ));
+                    first_fragment_is_block.entry(owner).or_insert(false);
+                    last_fragment_is_block.insert(owner, false);
+                };
+                for &(owner, start, end) in &owner_ranges {
+                    let (a, b) = (start.max(line_start), end.min(line_end));
+                    if a >= b {
+                        continue;
+                    }
+                    let prefix = measure(&content[line_start..a], info.style);
+                    let width = measure(&content[a..b], info.style);
+                    let x = match info.style.direction {
+                        w3cos_std::style::TextDirection::Ltr => line_rect.x + prefix,
+                        w3cos_std::style::TextDirection::Rtl => {
+                            line_rect.x + line_rect.width - prefix - width
+                        }
+                    };
+                    push(owner, x, width, &content[a..b]);
+                }
+                for owner in inherited_text_owners[index]
+                    .iter()
+                    .copied()
+                    .filter(|owner| !explicit_owners.contains(owner))
+                {
+                    push(
+                        owner,
+                        line_rect.x,
+                        line_rect.width,
+                        &content[line_start..line_end],
+                    );
+                }
+            }
+            continue;
+        }
+        // The CSSOM lines break where layout does: the run's own
+        // line-break / word-break / lang (NGLineBreaker's break iterator).
+        let lines = crate::text_layout::wrap_text_with_run_width_in(
             content,
             line_box.width.max(1.0),
             info.style.white_space,
+            crate::line_break::BreakMode::of(info.style),
             |text| measure(text, info.style),
         );
         let line_styles = crate::text_layout::authored_line_styles(content, info.style, &lines);
@@ -1199,7 +1274,7 @@ fn rebuild_paint_cache(
     engine.set_skip_projections(can_skip_projections(&component));
     engine.set_measure_text(true);
     let results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
-    write_rects(&flat, &results.layout_cache);
+    write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let children = child_lists(&flat);
     let shift_ok = absolute_shift_ok(&flat);
     *slot = Some(PaintCache {
@@ -1300,7 +1375,7 @@ fn sync_paint_cache(
         return false;
     };
     cache.engine.set_measure_text(true);
-    write_rects(&flat, &results.layout_cache);
+    write_rects(&flat, &results.layout_cache, &results.text_fragments);
     cache.results = results;
     cache.cascade = cascade;
     note_paint_patch();
@@ -1376,7 +1451,7 @@ fn try_shift_absolute_insets(
     }
     write_host_rects(&cache.node_ids, &cache.results.layout_cache);
     let flat = pre_flatten(&cache.component);
-    publish_client_rects(&flat, &cache.results.layout_cache);
+    publish_client_rects(&flat, &cache.results.layout_cache, &[]);
     cache.cascade = cascade;
     note_paint_patch();
     note_paint_shift();
