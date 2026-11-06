@@ -482,6 +482,16 @@ pub fn set_style_property(node: u32, prop: &str, value: &str) {
     }
 }
 
+pub fn set_empty_custom_property_declaration(node: u32, prop: &str) {
+    with_document_mut(|doc| {
+        let id = NodeId::from_u32(node);
+        doc.get_style_mut_for_property(id, prop)
+            .set_parsed_empty_custom_property(prop);
+        doc.mark_inline_style_dirty(id);
+    });
+    mark_dom_dirty();
+}
+
 /// Known non-inherited properties. Everything else, including custom
 /// properties and `font`/`color`, still restyles the descendant subtree.
 fn inline_style_change_is_local(prop: &str) -> bool {
