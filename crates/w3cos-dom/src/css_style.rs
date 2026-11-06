@@ -2377,6 +2377,16 @@ fn parse_spacing(value: &str) -> Option<Spacing> {
             return Some(constructor(number));
         }
     }
+    if let Some(calc) = crate::css_calc::parse_calc_length(value) {
+        return match crate::css_calc::calc_to_dimension(calc) {
+            Dimension::Px(v) => Some(Spacing::Px(v)),
+            Dimension::Percent(v) => Some(Spacing::Percent(v)),
+            Dimension::Em(v) => Some(Spacing::Em(v)),
+            Dimension::Vw(v) => Some(Spacing::Vw(v)),
+            Dimension::Vh(v) => Some(Spacing::Vh(v)),
+            _ => None,
+        };
+    }
     parse_px(value).map(Spacing::Px)
 }
 
@@ -3112,6 +3122,9 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
     }
     if let Some(px) = parse_px(v) {
         return Some(Dimension::Px(px));
+    }
+    if let Some(calc) = crate::css_calc::parse_calc_length(v) {
+        return Some(crate::css_calc::calc_to_dimension(calc));
     }
     None
 }
