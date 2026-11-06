@@ -7543,7 +7543,6 @@ fn emit_capture_pair_store(capture_id: u32, weaken: bool, inherited: bool) -> St
     )
 }
 
-
 thread_local! {
     /// Rust name of the sync factory being emitted; `new.target` compares it
     /// with the code entry [[Construct]] recorded.
@@ -9756,8 +9755,8 @@ fn main() {{
             is_generator: false,
             source_span: None,
             types: Default::default(),
-        own_name_length: None,
-    };
+            own_name_length: None,
+        };
 
         let blocks = coalesce_sync_blocks(&function);
 

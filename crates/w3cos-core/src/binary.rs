@@ -2683,7 +2683,6 @@ mod tests {
     }
 }
 
-
 pub(crate) fn is_typed_array_view(value: &Value) -> bool {
     view_for(value).is_some()
 }

@@ -25459,9 +25459,13 @@ fn collect_layouts_fast(
                         || relative_containing_block_height_definite)
             }
             WDim::Percent(_) => relative_containing_block_height_definite,
-            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Ch(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc(_) => {
-                true
-            }
+            WDim::Px(_)
+            | WDim::Rem(_)
+            | WDim::Em(_)
+            | WDim::Ch(_)
+            | WDim::Vw(_)
+            | WDim::Vh(_)
+            | WDim::Calc(_) => true,
         });
 
     for &child in tree.children(node).unwrap().iter() {
@@ -26742,7 +26746,9 @@ fn to_taffy_dim(
         WDim::Ch(v) => Dimension::length(v * font_style.ch_advance()),
         WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
         WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
-        WDim::Calc(calc) => Dimension::length(calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h)),
+        WDim::Calc(calc) => {
+            Dimension::length(calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h))
+        }
     }
 }
 
@@ -26761,9 +26767,12 @@ fn to_taffy_auto(
         WDim::Ch(v) => LengthPercentageAuto::length(v * font_style.ch_advance()),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
-        WDim::Calc(calc) => LengthPercentageAuto::length(
-            calc.resolve(0.0, font_style.font_size, viewport_w, viewport_h),
-        ),
+        WDim::Calc(calc) => LengthPercentageAuto::length(calc.resolve(
+            0.0,
+            font_style.font_size,
+            viewport_w,
+            viewport_h,
+        )),
     }
 }
 
@@ -26791,7 +26800,6 @@ fn to_taffy_overflow(o: WOverflow) -> taffy::Overflow {
         WOverflow::Auto => taffy::Overflow::Scroll,
     }
 }
-
 
 /// Border-box size of an inline element's own text laid out on its own, wrapped
 /// at `available_width`. Used for inline elements whose text was merged into
@@ -26889,7 +26897,6 @@ pub(crate) fn inline_text_box_size(
     let height = text_intrinsic_size_at(content, style, width.max(1.0)).1;
     (width, height)
 }
-
 
 /// `true` when a text-only `<button>` label may wrap onto several lines.
 pub(crate) fn button_label_can_wrap(label: &str, style: &w3cos_std::style::Style) -> bool {

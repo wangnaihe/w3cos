@@ -34499,7 +34499,6 @@ try {
     }
 }
 
-
 pub(crate) fn canvas_2d_rgba(node: u32) -> Option<(u32, u32, Vec<u8>)> {
     CANVAS_CONTEXTS.with(|contexts| {
         let contexts = contexts.borrow();

@@ -29,9 +29,9 @@ mod selector_parse_cache;
 
 use rule_set::RuleSet;
 pub(crate) use rule_set::{FollowingPosition, FollowingScan};
-pub use selector_filter::StyleRecalcScope;
 pub(crate) use selector_filter::AncestorBloom;
 use selector_filter::LazyAncestorBloom;
+pub use selector_filter::StyleRecalcScope;
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
 #[derive(Debug, Clone, Default)]
@@ -513,7 +513,6 @@ pub fn has_sibling_selectors() -> bool {
 pub fn has_relational_selectors() -> bool {
     has_relational_dependencies()
 }
-
 
 pub(crate) fn has_relational_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 4 != 0)

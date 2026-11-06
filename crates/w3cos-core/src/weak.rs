@@ -310,7 +310,6 @@ pub fn pending_finalizer_count() -> usize {
     PENDING.with(|queue| queue.borrow().len())
 }
 
-
 /// Weak identity of an object/array/function. `assign` allocates an id for
 /// a value that has never been watched; lookups pass `false`, since a value
 /// without an id cannot be in any weak table.

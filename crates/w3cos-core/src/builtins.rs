@@ -448,10 +448,7 @@ pub fn symbol_value() -> Value {
                 ("prototype".to_string(), prototype.clone()),
             ]),
             |_, arguments| {
-                let desc = arguments
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Undefined);
+                let desc = arguments.first().cloned().unwrap_or(Value::Undefined);
                 let desc = if desc.is_undefined() {
                     String::new()
                 } else {
@@ -2731,12 +2728,14 @@ pub fn dispatch_resize_observers_bounded(
 mod monaco_tests {
     use super::*;
 
-
     #[test]
     fn symbol_facade_is_callable_and_mints_unique_values() {
         use crate::intrinsics::{call, call_completion, get_property};
         let symbol = symbol_value();
-        assert!(symbol.is_callable(), "Symbol must be callable after ensure_callable");
+        assert!(
+            symbol.is_callable(),
+            "Symbol must be callable after ensure_callable"
+        );
         let a = call(&symbol, Value::Undefined, vec![Value::string("s")]);
         let b = call(&symbol, Value::Undefined, vec![Value::string("s")]);
         assert_eq!(a.type_of(), "symbol");
@@ -2759,7 +2758,10 @@ mod monaco_tests {
         );
         let sample = Value::array(vec![Value::Number(42.0), a.clone()]);
         let ok = call_completion(&includes, sample, vec![a.clone()]);
-        assert!(ok.as_ref().ok().map(|v| v.to_bool()) == Some(true), "includes(symbol): {ok:?}");
+        assert!(
+            ok.as_ref().ok().map(|v| v.to_bool()) == Some(true),
+            "includes(symbol): {ok:?}"
+        );
     }
 
     #[test]

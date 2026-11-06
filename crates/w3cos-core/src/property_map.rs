@@ -384,7 +384,6 @@ impl PropertyMap {
         })
     }
 
-
     pub(crate) fn insert(&mut self, key: JsString, value: Value) -> Option<Value> {
         if let Some(slot) = self.get_mut(key.as_str()) {
             return Some(std::mem::replace(slot, value));

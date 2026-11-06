@@ -5103,8 +5103,8 @@ impl Builder {
             is_generator: false,
             source_span: None,
             types: Default::default(),
-        own_name_length: None,
-    };
+            own_name_length: None,
+        };
         self.functions.extend(child.functions);
         self.functions.push(function);
         Ok(())
@@ -5185,8 +5185,8 @@ impl Builder {
             is_generator: false,
             source_span: None,
             types: Default::default(),
-        own_name_length: None,
-    };
+            own_name_length: None,
+        };
         self.functions.extend(child.functions);
         self.functions.push(function);
         let dst = self.register();
@@ -5342,8 +5342,8 @@ impl Builder {
                 parameters: parameter_hints,
                 returns: return_hint,
             },
-        own_name_length: None,
-    };
+            own_name_length: None,
+        };
         self.functions.extend(child.functions);
         self.functions.push(function);
         let dst = self.register();

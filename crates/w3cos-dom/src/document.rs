@@ -635,7 +635,6 @@ enum ChildListChange {
     },
 }
 
-
 /// Whether the opt-in LayoutNG engine is requested (`W3COS_LAYOUT_NG`, or
 /// its verify mode). Mirrors `layout_ng::mode()`; the DOM crate cannot see
 /// the runtime crate.
@@ -754,7 +753,7 @@ impl Document {
             selection: Selection::new(),
             html_document: true,
             quirks_mode: false,
-        extent: std::cell::RefCell::new(ExtentCache::default()),
+            extent: std::cell::RefCell::new(ExtentCache::default()),
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -785,7 +784,6 @@ impl Document {
     // W3C Document API
     // -----------------------------------------------------------------------
 
-
     fn mark_extent_dirty(&mut self, id: NodeId) {
         let mut current = Some(id);
         while let Some(node) = current {
@@ -799,7 +797,6 @@ impl Document {
                 .and_then(|node| node.parent);
         }
     }
-
 
     /// Max (right, bottom) layout edge over the descendants of `id`, or None
     /// without descendants. Clean subtrees answer from the cache.
@@ -840,7 +837,6 @@ impl Document {
         out
     }
 
-
     fn subtree_extent(&self, id: NodeId, cache: &mut ExtentCache) -> (f32, f32) {
         let idx = id.0 as usize;
         if let Some(hit) = cache.clean(idx) {
@@ -867,7 +863,6 @@ impl Document {
         cache.store(idx, (right, bottom));
         (right, bottom)
     }
-
 
     /// css-overflow-3 scrollable overflow: a `position: fixed` box whose
     /// containing block is the viewport (no transformed/filtered ancestor,
@@ -13499,7 +13494,8 @@ fn apply_first_line_style_inner(
             if !content.is_empty() {
                 let advance = first_line_text_advance(content, &components[index].style);
                 components[index].style =
-                    first_line_text_style(&components[index].style, declarations, fragment_height).into();
+                    first_line_text_style(&components[index].style, declarations, fragment_height)
+                        .into();
                 changed = true;
                 *used_width += advance;
                 if available_width.is_some_and(|width| *used_width >= width) {

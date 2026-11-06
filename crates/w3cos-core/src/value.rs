@@ -416,7 +416,6 @@ impl PartialEq for Immediate {
     }
 }
 
-
 pub(crate) fn accessor_key<'a>(
     buf: &'a mut [u8; 96],
     prefix: &str,
