@@ -7756,6 +7756,19 @@ impl Document {
                 }
                 return true;
             }
+            if matches!(
+                component.style.display,
+                w3cos_std::style::Display::InlineBlock
+                    | w3cos_std::style::Display::InlineFlex
+                    | w3cos_std::style::Display::InlineTable
+            ) && !component.children.is_empty()
+            {
+                // An atomic inline is a single box on the parent line. A
+                // `<br>` inside it must not become a parent-line break
+                // (`x<br>x` coalesced to "x\u{2028}x" drops the following
+                // span by one em). Empty generated wrappers still merge.
+                return false;
+            }
             if component.children.is_empty() {
                 // State-only generated quote boxes can leave an empty,
                 // transparent inline wrapper. It contributes no glyph or box

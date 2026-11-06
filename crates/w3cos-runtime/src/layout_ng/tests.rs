@@ -7645,3 +7645,66 @@ fn layout_ng_fresh_processes_agree_on_unset_and_explicit_on() {
     assert_eq!(off, "Off");
     assert_eq!(unset, on);
 }
+
+/// WPT css/css-display/empty-text-baseline-001.html. A `<br>` plus an empty
+/// text node inside an inline-block must not move the following span.
+/// Coalescing that break into the parent line ("x\u{2028}x") drops the span
+/// by one Ahem em (offsetTop 16).
+#[test]
+fn empty_text_after_br_does_not_shift_inline_block_baseline() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    crate::dom::reset_document();
+    crate::incremental_layout::invalidate();
+    crate::jsdom::set_viewport(800.0, 600.0);
+    let document = crate::jsdom::document_value();
+    document
+        .get_property("body")
+        .get_property("style")
+        .set_property("margin", w3cos_core::Value::string("0"));
+    let container = document.call_method("createElement", vec![w3cos_core::Value::string("div")]);
+    container
+        .get_property("style")
+        .set_property("fontFamily", w3cos_core::Value::string("Ahem"));
+    document
+        .get_property("body")
+        .call_method("appendChild", vec![container.clone()]);
+    let inner = document.call_method("createElement", vec![w3cos_core::Value::string("div")]);
+    inner
+        .get_property("style")
+        .set_property("display", w3cos_core::Value::string("inline-block"));
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("x")])],
+    );
+    container.call_method("appendChild", vec![inner.clone()]);
+    let span = document.call_method("createElement", vec![w3cos_core::Value::string("span")]);
+    span.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("x")])],
+    );
+    container.call_method("appendChild", vec![span.clone()]);
+    let before = span.get_property("offsetTop").to_number();
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createElement", vec![w3cos_core::Value::string("br")])],
+    );
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("")])],
+    );
+    let after = span.get_property("offsetTop").to_number();
+    assert_eq!(
+        after, before,
+        "empty text after br shifted the span by one em"
+    );
+    for white_space in ["pre-line", "pre"] {
+        inner
+            .get_property("style")
+            .set_property("whiteSpace", w3cos_core::Value::string(white_space));
+        assert_eq!(
+            span.get_property("offsetTop").to_number(),
+            before,
+            "white-space: {white_space} shifted the span"
+        );
+    }
+}
