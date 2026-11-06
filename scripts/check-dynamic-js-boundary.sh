@@ -24,12 +24,16 @@ if ! grep -q 'wuff' <<<"$woff_tree"; then
     echo "standalone WOFF runtime is missing wuff" >&2
     exit 1
 fi
-for forbidden in w3cos-compiler w3cos-vm w3cos-ir base64; do
+for forbidden in w3cos-compiler w3cos-vm w3cos-ir; do
     if grep -q "$forbidden" <<<"$woff_tree"; then
         echo "standalone WOFF runtime unexpectedly contains $forbidden" >&2
         exit 1
     fi
 done
+# `w3cos-core` always depends on `base64`, so package presence cannot distinguish
+# standalone WOFF from `dynamic-js`. The compiler/VM/IR checks above enforce the
+# execution boundary; the test below compiles and exercises WOFF with only that
+# feature enabled.
 cargo test \
     -p w3cos-runtime \
     --no-default-features \
