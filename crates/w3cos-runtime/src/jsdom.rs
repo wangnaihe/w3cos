@@ -13944,6 +13944,12 @@ fn sampled_discrete_css_animation(node: u32, property: &str) -> Option<String> {
 }
 
 fn normalize_inline_style_property(property: &str, value: &str) -> Option<String> {
+    // Custom-property values are token streams. Preserve whitespace so an
+    // all-whitespace stream remains distinct from CSSOM's exact empty-string
+    // removal operation.
+    if property.starts_with("--") {
+        return Some(value.to_string());
+    }
     let value = value.trim();
     if property != "color" && !property.ends_with("-color") || value.is_empty() {
         return Some(value.to_string());
@@ -14214,7 +14220,12 @@ fn parse_css_text(node: u32, css: &str) {
                 }
                 _ => (value, false),
             };
-            style_apply(node, &prop, value);
+            if prop.starts_with("--") && value.is_empty() {
+                dom::set_empty_custom_property_declaration(node, &prop);
+                STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, &prop, String::new()));
+            } else {
+                style_apply(node, &prop, value);
+            }
             set_inline_important(node, &prop, important);
         }
     }
@@ -27094,6 +27105,72 @@ mod tests {
                 .get_property("display")
         });
         assert_eq!(typed, "flex");
+    }
+
+    #[test]
+    fn custom_property_empty_cssom_and_declaration_text_have_distinct_semantics() {
+        setup();
+        let parent = create_in_body("div");
+        let child = document_value().call_method("createElement", vec![Value::string("div")]);
+        parent.call_method("appendChild", vec![child.clone()]);
+
+        let parent_style = parent.get_property("style");
+        let child_style = child.get_property("style");
+        parent_style.call_method(
+            "setProperty",
+            vec![Value::string("--alpha"), Value::string("0.5")],
+        );
+        child_style.call_method(
+            "setProperty",
+            vec![
+                Value::string("opacity"),
+                Value::string("var(--alpha, 0.25)"),
+            ],
+        );
+
+        let computed = || {
+            window_value()
+                .call_method("getComputedStyle", vec![child.clone()])
+                .get_property("opacity")
+                .to_js_string()
+        };
+        assert_eq!(computed(), "0.5");
+
+        // CSSOM setProperty with an empty string removes the declaration, so
+        // the parent value is inherited again.
+        child_style.call_method(
+            "setProperty",
+            vec![Value::string("--alpha"), Value::string("")],
+        );
+        assert_eq!(
+            child_style
+                .call_method("getPropertyValue", vec![Value::string("--alpha")])
+                .to_js_string(),
+            ""
+        );
+        assert_eq!(computed(), "0.5");
+
+        // Whitespace is a valid empty custom-property token stream, not the
+        // CSSOM empty-string removal operation. It shadows the inherited value
+        // and makes the color declaration invalid instead of using fallback.
+        child_style.call_method(
+            "setProperty",
+            vec![Value::string("--alpha"), Value::string("   ")],
+        );
+        assert_eq!(computed(), "1");
+
+        // An empty declaration parsed from declaration text has the same valid
+        // empty-token-stream semantics and must survive cssText parsing.
+        child_style.set_property(
+            "cssText",
+            Value::string("--alpha:; opacity: var(--alpha, 0.25)"),
+        );
+        assert_eq!(computed(), "1");
+
+        child_style.call_method("removeProperty", vec![Value::string("--alpha")]);
+        assert_eq!(computed(), "0.5");
+        parent_style.call_method("removeProperty", vec![Value::string("--alpha")]);
+        assert_eq!(computed(), "0.25");
     }
 
     #[test]

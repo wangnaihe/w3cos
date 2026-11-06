@@ -341,7 +341,7 @@ impl CSSStyleDeclaration {
         }
         // An empty custom property write is CSSOM removal: drop the inline
         // declaration so the inherited / author value shows through again.
-        if name.starts_with("--") && value.trim().is_empty() {
+        if name.starts_with("--") && value.is_empty() {
             self.inline_declarations
                 .retain(|(existing, _)| existing != name);
             if let Some(properties) = self.inner.custom_properties.as_mut() {
@@ -1746,6 +1746,21 @@ impl CSSStyleDeclaration {
 
             _ => {}
         }
+    }
+
+    /// Store a parsed custom-property declaration. Unlike CSSOM
+    /// `setProperty(name, "")`, an empty value in declaration text is a valid
+    /// empty token stream and must not remove the declaration.
+    pub fn set_parsed_empty_custom_property(&mut self, name: &str) {
+        debug_assert!(name.starts_with("--"));
+        self.inline_declarations
+            .retain(|(existing, _)| existing != name);
+        self.inline_declarations
+            .push((name.to_string(), String::new()));
+        self.inner
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(name.to_string(), String::new());
     }
 
     /// Move a shorthand to the end of the declaration list and drop the
