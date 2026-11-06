@@ -23447,6 +23447,13 @@ pub fn drain_microtasks() -> usize {
         ran += crate::eventsource::poll_js_events();
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
+        ran += crate::audio_web::poll_live_outputs();
+        ran += crate::gamepad_web::poll();
+        ran += crate::serial_web::poll_serial_io();
+        ran += crate::device_access_web::poll_device_events();
+        ran += crate::sensors_web::poll_platform_samples();
+        ran += crate::geolocation_web::poll_platform_events();
+        ran += crate::bluetooth_web::poll_platform_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
