@@ -10,11 +10,11 @@
       "features": [],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 12859168,
-          "text_bytes": 8310744,
-          "data_bytes": 3692941,
-          "readonly_data_bytes": 3018477,
-          "gzip_bytes": 5566092,
+          "total_bytes": 12132480,
+          "text_bytes": 7890712,
+          "data_bytes": 3424585,
+          "readonly_data_bytes": 2784625,
+          "gzip_bytes": 5214358,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
@@ -31,7 +31,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "sync origin/main into aot-port: LayoutNG remains linked (W3COS_LAYOUT_NG runtime select) and aot-port runtime grafts land in the ordinary AOT probe. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12859168 bytes (+726688, 5.99% vs prior 12132480). Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
+          "note": "LayoutNG stays in the runtime binary: W3COS_LAYOUT_NG selects it at run time, so release-size LTO keeps the S1-S5 block, inline, float, and nowrap-flex code. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12132480 bytes (+254904, 2.15%) and the dynamic-browser probe is 15618448 bytes (+245816, 1.60%), past the 200 KiB absolute gate and under the 3% gate. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
         }
       }
     },
@@ -63,7 +63,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "sync origin/main into aot-port pending browser remeasure on CI after AOT row update. AOT row now 12859168 bytes. Prior browser row 15618448 bytes from main LayoutNG baseline. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
+          "note": "LayoutNG stays in the runtime binary: W3COS_LAYOUT_NG selects it at run time, so release-size LTO keeps the S1-S5 block, inline, float, and nowrap-flex code. On x86_64-unknown-linux-gnu with Rust 1.99.1 the stripped AOT probe is 12132480 bytes (+254904, 2.15%) and the dynamic-browser probe is 15618448 bytes (+245816, 1.60%), past the 200 KiB absolute gate and under the 3% gate. Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
         }
       }
     }
