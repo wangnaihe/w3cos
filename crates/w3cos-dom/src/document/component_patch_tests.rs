@@ -322,3 +322,127 @@ fn random_edits_never_diverge_from_a_fresh_lowering() {
     }
     assert!(patched > 60, "patched {patched}, rebuilt {rebuilt}");
 }
+
+#[test]
+fn flex_item_under_mixed_flex_parent_is_patched() {
+    // A flex container with a text node between two items is still safe to
+    // patch: flex items do not share anonymous block wrappers.
+    crate::stylesheet::clear_rules();
+    crate::stylesheet::register_rule(
+        ".shell",
+        &[("display", "flex"), ("flex-direction", "column")],
+    );
+    crate::stylesheet::register_rule(".row", &[("display", "block"), ("height", "20px")]);
+    let mut document = Document::new();
+    let shell = document.create_element("div");
+    shell.set_attribute(&mut document, "class", "shell");
+    document.body().append_child(&mut document, shell);
+    let first = document.create_element("div");
+    first.set_attribute(&mut document, "class", "row");
+    let spacer = document.create_text_node(" ");
+    let second = document.create_element("div");
+    second.set_attribute(&mut document, "class", "row");
+    let label = document.create_element("span");
+    let label_text = document.create_text_node("item");
+    label.append_child(&mut document, label_text);
+    second.append_child(&mut document, label);
+    shell.append_child(&mut document, first);
+    shell.append_child(&mut document, spacer);
+    shell.append_child(&mut document, second);
+
+    let mut tree = document.to_component_tree();
+    let base = document.component_baseline();
+    second.set_attribute(&mut document, "style", "height: 28px");
+    let outcome = patch_matches_fresh(&document, &mut tree, &base);
+    assert!(
+        matches!(outcome, ComponentPatch::Patched { frontiers: 1 }),
+        "expected a one-frontier flex patch, got {outcome:?}"
+    );
+}
+
+#[test]
+fn grid_item_under_mixed_grid_parent_is_patched() {
+    crate::stylesheet::clear_rules();
+    crate::stylesheet::register_rule(".shell", &[("display", "grid")]);
+    crate::stylesheet::register_rule(".row", &[("display", "block"), ("height", "20px")]);
+    let mut document = Document::new();
+    let shell = document.create_element("div");
+    shell.set_attribute(&mut document, "class", "shell");
+    document.body().append_child(&mut document, shell);
+    let first = document.create_element("div");
+    first.set_attribute(&mut document, "class", "row");
+    let spacer = document.create_text_node("\n");
+    let second = document.create_element("div");
+    second.set_attribute(&mut document, "class", "row");
+    shell.append_child(&mut document, first);
+    shell.append_child(&mut document, spacer);
+    shell.append_child(&mut document, second);
+
+    let mut tree = document.to_component_tree();
+    let base = document.component_baseline();
+    first.set_attribute(&mut document, "style", "height: 40px");
+    let outcome = patch_matches_fresh(&document, &mut tree, &base);
+    assert!(
+        matches!(outcome, ComponentPatch::Patched { .. }),
+        "expected a grid patch, got {outcome:?}"
+    );
+}
+
+#[test]
+fn flex_patch_keeps_item_order_and_geometry_tokens() {
+    // Semantic guard: after patching one flex item, the lowered tree must keep
+    // the same host order as a fresh lowering (text spacer stays between items;
+    // edited item keeps its place). Geometry equality is covered by `same`.
+    crate::stylesheet::clear_rules();
+    crate::stylesheet::register_rule(".shell", &[("display", "flex"), ("flex-direction", "row")]);
+    crate::stylesheet::register_rule(
+        ".row",
+        &[("display", "block"), ("width", "40px"), ("height", "20px")],
+    );
+    let mut document = Document::new();
+    let shell = document.create_element("div");
+    shell.set_attribute(&mut document, "class", "shell");
+    document.body().append_child(&mut document, shell);
+    let left = document.create_element("div");
+    left.set_attribute(&mut document, "class", "row");
+    left.set_attribute(&mut document, "id", "left");
+    let spacer = document.create_text_node(" between ");
+    let right = document.create_element("div");
+    right.set_attribute(&mut document, "class", "row");
+    right.set_attribute(&mut document, "id", "right");
+    shell.append_child(&mut document, left);
+    shell.append_child(&mut document, spacer);
+    shell.append_child(&mut document, right);
+
+    let mut tree = document.to_component_tree();
+    let base = document.component_baseline();
+    right.set_attribute(&mut document, "style", "width: 64px; height: 20px");
+    assert!(matches!(
+        patch_matches_fresh(&document, &mut tree, &base),
+        ComponentPatch::Patched { .. }
+    ));
+
+    fn host_ids(component: &Component, out: &mut Vec<Option<u32>>) {
+        out.push(match component.on_click {
+            w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(id).ok(),
+            _ => None,
+        });
+        for child in &component.children {
+            host_ids(child, out);
+        }
+    }
+    let mut patched_ids = Vec::new();
+    host_ids(&tree, &mut patched_ids);
+    let mut fresh_ids = Vec::new();
+    host_ids(&document.to_component_tree(), &mut fresh_ids);
+    assert_eq!(
+        patched_ids, fresh_ids,
+        "flex patch must preserve host order"
+    );
+    let left_pos = patched_ids.iter().position(|h| *h == Some(left.id.0));
+    let right_pos = patched_ids.iter().position(|h| *h == Some(right.id.0));
+    assert!(
+        left_pos.is_some() && right_pos.is_some() && left_pos < right_pos,
+        "left item must still precede right after patch: {patched_ids:?}"
+    );
+}

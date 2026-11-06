@@ -282,16 +282,20 @@ impl PatchCx<'_> {
 
     fn parent_ctx(&self, component: &Component) -> ParentCtx {
         let host = host_id(component);
+        // Flex and grid items are independent of each other: whitespace and
+        // anonymous wrappers do not couple one item to the next the way they
+        // do in ordinary block flow. A mixed flex/grid parent is therefore
+        // safe to patch under. Block and flow-root parents still require
+        // every child to be block-level so inline runs stay intact.
         let isolated_children = host.is_some()
-            && block_level(component.style.display)
-            && matches!(
-                component.style.display,
-                Display::Block | Display::Flex | Display::Grid
-            )
-            && component.children.iter().all(|child| {
-                !matches!(child.kind, ComponentKind::Text { .. })
-                    && block_level(child.style.display)
-            });
+            && match component.style.display {
+                Display::Flex | Display::Grid => true,
+                Display::Block | Display::FlowRoot => component.children.iter().all(|child| {
+                    !matches!(child.kind, ComponentKind::Text { .. })
+                        && block_level(child.style.display)
+                }),
+                _ => false,
+            };
         let style_is_computed =
             host.is_some_and(|host| self.doc.computed_style_for(NodeId(host)) == component.style);
         ParentCtx {
