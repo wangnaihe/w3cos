@@ -965,7 +965,7 @@ fn empty_decorated_inline_exports_its_font_box_baseline() {
             1,
         ),
     ];
-    let positions = HashMap::from([(0, 0), (1, 1)]);
+    let positions = LayoutPositions::from_iter([(0, 0), (1, 1)]);
     assert_eq!(
         last_text_baseline(&root, 0, &layouts, &positions),
         Some(54.0 + inline_font_content_ascent(&inline)),
@@ -988,7 +988,7 @@ fn empty_decorated_inline_exports_its_font_box_baseline() {
         0,
     )];
     assert_eq!(
-        last_text_baseline(&empty, 0, &zero, &HashMap::from([(0, 0)])),
+        last_text_baseline(&empty, 0, &zero, &LayoutPositions::from_iter([(0, 0)]),),
         None
     );
 }
