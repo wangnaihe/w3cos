@@ -600,7 +600,14 @@ fn try_container(
 
 fn wrapper_for(parent: &Component, width: f32, children: Vec<Component>) -> Component {
     let mut style = parent.style.clone();
-    style.display = Display::Block;
+    // Flex and grid items do not share a block's used width or margin
+    // collapse. LayoutNG's line breaks follow that used width, so a block
+    // wrapper can come back shorter than the same item in the real column
+    // and the followers keep the old y. The legacy engine's block and flex
+    // heights agree on these splices, and that path stays a block wrapper.
+    if crate::layout_ng::mode() == crate::layout_ng::Mode::Off || !is_flex_or_grid(&parent.style) {
+        style.display = Display::Block;
+    }
     style.position = Position::Static;
     style.float = Float::None;
     style.width = Dimension::Px(width);
@@ -642,6 +649,15 @@ fn solve(
     crate::layout::LayoutRect,
 )> {
     let flat = pre_flatten(wrapper);
+    // `LayoutEngine::compute` publishes legacy rects when LayoutNG bails.
+    // A subtree that bails would then store a legacy line count beside a
+    // full NG layout, and followers keep the short y. Under Mode::On, refuse
+    // that result so the flush rebuilds with the same engine as `full_rects`.
+    if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+        let (layout_cache, _) =
+            crate::layout_ng::layout_tree_with_text(wrapper, &flat, viewport_w, viewport_h)?;
+        return host_rects(&flat, &layout_cache);
+    }
     let mut engine = LayoutEngine::new();
     // Projections repair floats, tables, inline-block and RTL boxes. A
     // subtree with none of them gets nothing from them even when the rest
@@ -651,9 +667,19 @@ fn solve(
     let results = engine
         .compute(wrapper, &flat, viewport_w, viewport_h)
         .ok()?;
-    let mut rects = Vec::with_capacity(results.layout_cache.len());
+    host_rects(&flat, &results.layout_cache)
+}
+
+fn host_rects(
+    flat: &[crate::layout::FlatNodeInfo],
+    layout_cache: &[(crate::layout::LayoutRect, usize)],
+) -> Option<(
+    Vec<(u32, crate::layout::LayoutRect)>,
+    crate::layout::LayoutRect,
+)> {
+    let mut rects = Vec::with_capacity(layout_cache.len());
     let mut own = None;
-    for (rect, index) in &results.layout_cache {
+    for (rect, index) in layout_cache {
         if *index == 0 {
             own = Some(*rect);
         }
