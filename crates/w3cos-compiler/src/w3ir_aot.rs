@@ -11515,6 +11515,7 @@ fn main() {{
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         }
     }
 

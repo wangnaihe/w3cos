@@ -531,6 +531,7 @@ mod tests {
             is_generator: false,
             source_span: None,
             types,
+            own_name_length: None,
         }
     }
 
