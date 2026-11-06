@@ -150,6 +150,15 @@ impl StyleCache {
         self.values().insert((node, id), value);
     }
 
+    fn remove_value(&mut self, node: u32, property: &str) {
+        let Some(id) = self.ids.as_ref().and_then(|ids| ids.get(property).copied()) else {
+            return;
+        };
+        if let Some(values) = self.values.as_mut() {
+            values.remove(&(node, id));
+        }
+    }
+
     fn get_value(&self, node: u32, property: &str) -> Option<String> {
         let id = self.ids.as_ref()?.get(property).copied()?;
         self.values.as_ref()?.get(&(node, id)).cloned()
@@ -170,7 +179,10 @@ impl StyleCache {
             .map(|values| {
                 values
                     .iter()
-                    .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+                    .filter(|((candidate, id), value)| {
+                        *candidate == node
+                            && (!value.is_empty() || self.names[*id as usize].starts_with("--"))
+                    })
                     .count()
             })
             .unwrap_or(0)
@@ -183,7 +195,10 @@ impl StyleCache {
         };
         let mut pairs = values
             .iter()
-            .filter(|((candidate, _), value)| *candidate == node && !value.is_empty())
+            .filter(|((candidate, id), value)| {
+                *candidate == node
+                    && (!value.is_empty() || self.names[*id as usize].starts_with("--"))
+            })
             .map(|((_, id), value)| (self.names[*id as usize].clone(), value.clone()))
             .collect::<Vec<_>>();
         pairs.sort_by(|left, right| left.0.cmp(&right.0));
@@ -13763,14 +13778,29 @@ fn style_apply(node: u32, kebab: &str, value: &str) {
     // cache is published first in that case. The common path moves the string
     // in after the typed write and does not clone it.
     let observers = !crate::observers_web::mutation_observers_empty();
+    let removes_custom_property = kebab.starts_with("--") && value.is_empty();
     if observers {
-        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value.clone()));
+        STYLE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if removes_custom_property {
+                cache.remove_value(node, kebab);
+            } else {
+                cache.insert_value(node, kebab, value.clone());
+            }
+        });
     }
     // Forward to the typed style (known properties drive layout; unknown ones
     // are dropped there but stay in the bridge cache).
     dom::set_style_property(node, kebab, &value);
     if !observers {
-        STYLE_CACHE.with(|c| c.borrow_mut().insert_value(node, kebab, value));
+        STYLE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if removes_custom_property {
+                cache.remove_value(node, kebab);
+            } else {
+                cache.insert_value(node, kebab, value);
+            }
+        });
     }
     if let Some(before) = discrete_before {
         start_discrete_css_transition(
@@ -27166,9 +27196,22 @@ mod tests {
             Value::string("--alpha:; opacity: var(--alpha, 0.25)"),
         );
         assert_eq!(computed(), "1");
+        assert_eq!(child_style.get_property("length").to_number(), 2.0);
+        assert!(
+            child_style
+                .get_property("cssText")
+                .to_js_string()
+                .contains("--alpha:")
+        );
 
         child_style.call_method("removeProperty", vec![Value::string("--alpha")]);
         assert_eq!(computed(), "0.5");
+        assert!(
+            !child_style
+                .get_property("cssText")
+                .to_js_string()
+                .contains("--alpha:")
+        );
         parent_style.call_method("removeProperty", vec![Value::string("--alpha")]);
         assert_eq!(computed(), "0.25");
     }
