@@ -82,6 +82,11 @@ pub(super) fn tree_is_spliceable(root: &Component) -> bool {
     let mut stack = vec![root];
     while let Some(component) = stack.pop() {
         let style = &component.style;
+        if host_id(component).is_some_and(|id| {
+            matches!(crate::dom::tag_name(id).as_str(), "iframe" | "object")
+        }) {
+            return false;
+        }
         // The sparse CSSOM fragment map is rebuilt from a complete flattened
         // tree. Keep split-inline trees on that path until splice publishes
         // equivalent ordered fragment ownership itself.
@@ -1546,6 +1551,48 @@ mod tests {
         assert_matches_full("hidden shown");
         let shown = crate::dom::bounding_rect(last);
         assert!(shown.y > before.y + 25.0, "{before:?} -> {shown:?}");
+    }
+
+    #[test]
+    fn iframe_document_does_not_use_structural_splice() {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        let list = crate::dom::create_element("div");
+        let foot = crate::dom::create_element("div");
+        style(foot, &[("height", "20px")]);
+        crate::dom::append_child(crate::dom::body_id(), list);
+        crate::dom::append_child(crate::dom::body_id(), foot);
+        let mut rows = Vec::new();
+        for index in 0..10 {
+            let row = crate::dom::create_element("div");
+            style(row, &[("height", "18px")]);
+            let text = crate::dom::create_text_node(&format!("row {index}"));
+            crate::dom::append_child(row, text);
+            crate::dom::append_child(list, row);
+            rows.push((row, text));
+        }
+        let frame = crate::dom::create_element("iframe");
+        crate::dom::append_child(list, frame);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("iframe initial");
+
+        crate::dom::set_text_content(rows[1].1, "edited");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("iframe text edit");
+        assert_ne!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "splice",
+            "a document with an iframe must stay off the structural splice path"
+        );
+
+        style(rows[2].0, &[("height", "30px")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("iframe style edit");
+        assert_ne!(
+            crate::incremental_layout::last_flush_stats().kind,
+            "splice",
+            "a document with an iframe must stay off the structural splice path"
+        );
     }
 
     #[test]
