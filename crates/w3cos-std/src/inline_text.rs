@@ -7,11 +7,35 @@ pub const FRAGMENT_ENDS: &str = "--w3cos-internal-text-fragment-ends";
 
 /// The authored text run this style's generated piece belongs to.
 pub fn source_run(style: &Style) -> Option<&str> {
-    style.text_source_run.as_deref()
+    style.text_source_run.as_deref().or_else(|| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(SOURCE_RUN))
+            .map(String::as_str)
+    })
 }
 
 pub fn set_source_run(style: &mut Style, source: impl AsRef<str>) {
     style.text_source_run = Some(std::sync::Arc::from(source.as_ref()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedicated_source_run_precedes_legacy_fixture_metadata() {
+        let mut style = Style::default();
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(SOURCE_RUN.into(), "legacy".into());
+        assert_eq!(source_run(&style), Some("legacy"));
+
+        set_source_run(&mut style, "dedicated");
+        assert_eq!(source_run(&style), Some("dedicated"));
+    }
 }
 pub const DECORATION_COLOR: &str = "--w3cos-internal-text-decoration-color";
 pub const CSSOM_OWNER_RANGES: &str = "--w3cos-internal-cssom-owner-ranges";
