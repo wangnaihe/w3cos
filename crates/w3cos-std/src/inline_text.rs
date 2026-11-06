@@ -7,11 +7,24 @@ pub const FRAGMENT_ENDS: &str = "--w3cos-internal-text-fragment-ends";
 
 /// The authored text run this style's generated piece belongs to.
 pub fn source_run(style: &Style) -> Option<&str> {
-    style.text_source_run.as_deref()
+    style.text_source_run.as_deref().or_else(|| {
+        style
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(SOURCE_RUN))
+            .map(String::as_str)
+    })
 }
 
 pub fn set_source_run(style: &mut Style, source: impl AsRef<str>) {
-    style.text_source_run = Some(std::sync::Arc::from(source.as_ref()));
+    let source = source.as_ref();
+    style.text_source_run = Some(std::sync::Arc::from(source));
+    // Keep the custom-property mirror so main LayoutNG grafts that still key
+    // off SOURCE_RUN continue to see authored-run identity after the aot field migrate.
+    style
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(SOURCE_RUN.into(), source.into());
 }
 pub const DECORATION_COLOR: &str = "--w3cos-internal-text-decoration-color";
 pub const CSSOM_OWNER_RANGES: &str = "--w3cos-internal-cssom-owner-ranges";
@@ -340,7 +353,7 @@ pub fn append_source_fragment_ends(
     if text.is_empty() {
         return;
     }
-    let source = style.text_source_run.as_deref().map(str::to_owned);
+    let source = source_run(style).map(str::to_owned);
     if source.is_some() && source == *previous_source && output.last().copied() == Some(offset) {
         output.pop();
     }

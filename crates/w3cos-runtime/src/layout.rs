@@ -3479,13 +3479,7 @@ fn component_min_content_width_with_preferred_width(
                     let advance = advances.get(index).copied().flatten();
                     let eligible = child.children.is_empty()
                         && is_plain_inline_word_fragment(&child.kind, &child.style)
-                        && child
-                            .style
-                            .custom_properties
-                            .as_ref()
-                            .is_some_and(|properties| {
-                                properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-                            });
+                        && w3cos_std::inline_text::source_run(&child.style).is_some();
                     if !eligible || advance.is_none() {
                         previous_style = None;
                         cursor = 0.0;
@@ -21084,11 +21078,7 @@ fn quote_word_fragment_advances(
     let mut start = 0;
     while start < virtual_line.children.len() {
         let first = &virtual_line.children[start];
-        let source = first
-            .style
-            .custom_properties
-            .as_ref()
-            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN));
+        let source = w3cos_std::inline_text::source_run(&first.style).map(str::to_owned);
         let mut end = start + 1;
         while source.is_some()
             && end < virtual_line.children.len()
@@ -21180,9 +21170,7 @@ fn inline_fragment_shaped_advances_for_width(
         .iter()
         .map(|child| {
             let mut style = child.style.clone();
-            if style.custom_properties.as_ref().is_some_and(|properties| {
-                properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-            }) {
+            if w3cos_std::inline_text::source_run(&style).is_some() {
                 // Generated pieces retain one authored text run. Inline box
                 // decoration is laid out separately, not a per-word font boundary.
                 style.padding = w3cos_std::style::Edges::ZERO;
@@ -21249,17 +21237,13 @@ fn inline_fragment_shaped_advances_for_width(
             // run. Its used width occupies LayoutUnits, while glyph positions
             // inside the run retain their original fractional precision.
             if !interior_endpoints && ((end == component.children.len()
-                && first_style.custom_properties.as_ref().is_some_and(|properties|
-                    properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)))
+                && w3cos_std::inline_text::source_run(first_style).is_some())
                 || component.children.get(end).is_some_and(|next|
                 next.children.is_empty() && next.style.display == WDisplay::Inline
                     && next.style.position == WPos::Static && next.style.float == WFloat::None
                     && matches!(&next.kind, ComponentKind::Text { content } if !content.is_empty())
-                    && (first_style.custom_properties.as_ref()
-                            .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
-                            .is_some_and(|source| next.style.custom_properties.as_ref()
-                                .and_then(|properties| properties.get(w3cos_std::inline_text::SOURCE_RUN))
-                                != Some(source))
+                    && (w3cos_std::inline_text::source_run(first_style)
+                            .is_some_and(|source| w3cos_std::inline_text::source_run(&next.style) != Some(source))
                         || next.style.font_family != first_style.font_family
                         || next.style.font_size != first_style.font_size
                         || next.style.font_weight != first_style.font_weight
@@ -22907,13 +22891,7 @@ fn build_taffy_tree(
                     if passive_inline_edges
                         && parent_display == Some(WDisplay::Inline)
                         && !nowrap
-                        && comp
-                            .style
-                            .custom_properties
-                            .as_ref()
-                            .is_none_or(|properties| {
-                                !properties.contains_key(w3cos_std::inline_text::SOURCE_RUN)
-                            })
+                        && w3cos_std::inline_text::source_run(&comp.style).is_none()
                     {
                         // A raw nested inline can retain one unsplit text
                         // leaf. Its normal text fits the containing line,
