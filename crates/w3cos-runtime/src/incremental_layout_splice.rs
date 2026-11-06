@@ -1515,6 +1515,40 @@ mod tests {
     }
 
     #[test]
+    fn hidden_restyle_and_show_match_full_layout() {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        let first = crate::dom::create_element("div");
+        style(first, &[("height", "20px")]);
+        let hidden = crate::dom::create_element("div");
+        style(hidden, &[("display", "none"), ("height", "30px")]);
+        let inner = crate::dom::create_element("div");
+        style(inner, &[("height", "10px")]);
+        crate::dom::append_child(hidden, inner);
+        let last = crate::dom::create_element("div");
+        style(last, &[("height", "20px")]);
+        for node in [first, hidden, last] {
+            crate::dom::append_child(crate::dom::body_id(), node);
+        }
+
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("hidden initial");
+        let before = crate::dom::bounding_rect(last);
+        for color in ["red", "blue", "green"] {
+            style(hidden, &[("color", color)]);
+            assert!(crate::incremental_layout::flush());
+            assert_matches_full("hidden restyle");
+            assert_eq!(crate::dom::bounding_rect(last), before);
+        }
+
+        style(hidden, &[("display", "block")]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("hidden shown");
+        let shown = crate::dom::bounding_rect(last);
+        assert!(shown.y > before.y + 25.0, "{before:?} -> {shown:?}");
+    }
+
+    #[test]
     fn message_appended_to_definite_scroller_splices() {
         let (chat, _reply) = chat_page();
         let before = splice_counts();
