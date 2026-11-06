@@ -13,6 +13,30 @@ for forbidden in w3cos-compiler w3cos-vm w3cos-ir swc_ wuff brotli; do
     fi
 done
 
+woff_tree="$(
+    cargo tree \
+        -p w3cos-runtime \
+        --no-default-features \
+        --features woff \
+        -e normal
+)"
+if ! grep -q 'wuff' <<<"$woff_tree"; then
+    echo "standalone WOFF runtime is missing wuff" >&2
+    exit 1
+fi
+for forbidden in w3cos-compiler w3cos-vm w3cos-ir base64; do
+    if grep -q "$forbidden" <<<"$woff_tree"; then
+        echo "standalone WOFF runtime unexpectedly contains $forbidden" >&2
+        exit 1
+    fi
+done
+cargo test \
+    -p w3cos-runtime \
+    --no-default-features \
+    --features woff \
+    woff_decoding_does_not_depend_on_dynamic_js \
+    --lib
+
 dynamic_tree="$(
     cargo tree \
         -p w3cos-runtime \
