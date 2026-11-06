@@ -48,6 +48,7 @@ jobs:
           cargo test -p w3cos-runtime --lib --tests
       - name: Test optional dynamic JavaScript path
         run: |
+          cargo test -p w3cos-runtime --no-default-features --features woff woff_decoding_does_not_depend_on_dynamic_js --lib
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico dynamic_script::tests --lib
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --lib worker_realm::
           cargo test -p w3cos-runtime --no-default-features --features dynamic-js,image-png,image-jpeg,image-webp,image-gif,image-bmp,image-ico --lib worker_web::tests
