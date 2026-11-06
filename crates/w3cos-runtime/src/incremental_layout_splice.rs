@@ -190,10 +190,10 @@ fn component_path(root: &Component, chain: &[u32]) -> Option<Vec<usize>> {
     Some(path)
 }
 
-/// LayoutNG lays a column flex item out inside the column. An isolated
-/// block or single-item wrapper does not reproduce that used width, so a
-/// later sibling keeps a short y. `Mode::On` rebuilds the whole tree
-/// instead of publishing that subtree. `Mode::Off` keeps the fast path.
+/// LayoutNG column flex on this path. A width edit changes whether the
+/// item's sole text is a `text-line-width` paragraph, which only a fresh
+/// lower records. The caller re-lowers that item instead of rebuilding
+/// the document. `Mode::Off` never takes the branch.
 fn path_has_column_flex(root: &Component, path: &[usize]) -> bool {
     if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
         return false;
@@ -203,24 +203,6 @@ fn path_has_column_flex(root: &Component, path: &[usize]) -> bool {
         matches!(style.display, Display::Flex | Display::InlineFlex)
             && style.flex_direction == FlexDirection::Column
     })
-}
-
-pub(super) fn ng_column_flex_requires_rebuild(cache: &Cache, id: u32) -> bool {
-    if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
-        return false;
-    }
-    let Some(root_id) = host_id(&cache.component) else {
-        return false;
-    };
-    let Some(chain) = crate::dom::with_document(|document| {
-        element_chain(document, NodeId::from_u32(id), root_id)
-    }) else {
-        return false;
-    };
-    let Some(path) = component_path(&cache.component, &chain) else {
-        return false;
-    };
-    path_has_column_flex(&cache.component, &path)
 }
 
 fn at_path<'a>(root: &'a Component, path: &[usize]) -> &'a Component {
@@ -870,9 +852,6 @@ pub(super) fn try_splice(
         Ok(None) => return true,
         Err(()) => return bail("no safe subtree root"),
     };
-    if path_has_column_flex(&cache.component, &plan.path) {
-        return bail("ng column flex");
-    }
     let Some(levels) = ancestor_levels(&cache.component, &plan.path) else {
         return bail("ancestors");
     };
@@ -1206,9 +1185,11 @@ pub(super) fn try_style_subtree(
     if path.is_empty() || host_id(at_path(&cache.component, &path)) != Some(id) {
         return bail("style host");
     }
-    if path_has_column_flex(&cache.component, &path) {
-        return bail("ng column flex");
-    }
+    // A column-flex item whose width just became definite (or auto again)
+    // is re-lowered below. The cached text still has the previous
+    // `text-line-width` mark, and the paragraph line count would not match
+    // a full lower of the same border box.
+    let column_flex = path_has_column_flex(&cache.component, &path);
     let parent = at_path(&cache.component, &path[..path.len() - 1]);
     let node_alone = stacking_parent(parent)
         && cross_axis_start_stable(&parent.style, new)
@@ -1253,7 +1234,18 @@ pub(super) fn try_style_subtree(
     if !wrapper_width.is_finite() || wrapper_width <= 0.0 {
         return bail("style width");
     }
-    let fresh = target.clone();
+    let fresh = if column_flex {
+        let lowered = crate::dom::with_document(|document| {
+            document.to_component_subtree(NodeId::from_u32(host))
+        });
+        if host_id(&lowered) != Some(host) {
+            return bail("style relower");
+        }
+        lowered
+    } else {
+        target.clone()
+    };
+    let relowered = column_flex.then(|| fresh.clone());
     let solved_nodes = crate::layout::count_nodes(&fresh) as u32;
     let wrapper = wrapper_for(parent_of_target, wrapper_width, vec![fresh]);
     let Some((rects, _)) = solve(
@@ -1302,6 +1294,12 @@ pub(super) fn try_style_subtree(
             document.set_layout_rect(id, rect);
         }
     });
+    if let Some(relowered) = relowered {
+        // The text run's line-width mark lives on the children. The element's
+        // own style stays the computed style already assigned, so a later
+        // background edit is still paint-only.
+        at_path_mut(&mut cache.component, &solve_path).children = relowered.children;
+    }
     cache.engine.invalidate();
     cache.width_memos.clear();
     super::note_flush("style-subtree", solved_nodes, shifted_nodes);
@@ -1363,26 +1361,17 @@ fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
 mod tests {
     use super::*;
 
-    /// Column flex under LayoutNG rebuilds the whole tree. The fast path
-    /// remains the expectation when LayoutNG is off. Geometry stays exact
-    /// either way.
+    /// Column flex uses the same subtree kind in every mode. Geometry stays
+    /// exact; a full-document rebuild is not the supported path.
     fn expect_column_flex_edit(label: &str, fast_kind: &str, fast_node_limit: Option<u32>) {
         let stats = crate::incremental_layout::last_flush_stats();
-        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
-            assert_eq!(
-                stats.kind, "rebuild",
-                "{label}: column flex under LayoutNG rebuilt ({})",
-                stats.kind
+        assert_eq!(stats.kind, fast_kind, "{label} {}", stats.kind);
+        if let Some(limit) = fast_node_limit {
+            assert!(
+                stats.solved_nodes < limit,
+                "{label} solved {} nodes",
+                stats.solved_nodes
             );
-        } else {
-            assert_eq!(stats.kind, fast_kind, "{label} {}", stats.kind);
-            if let Some(limit) = fast_node_limit {
-                assert!(
-                    stats.solved_nodes < limit,
-                    "{label} solved {} nodes",
-                    stats.solved_nodes
-                );
-            }
         }
     }
 
@@ -1694,6 +1683,96 @@ mod tests {
         assert!(crate::incremental_layout::flush());
         expect_column_flex_edit("remove", "splice", None);
         assert_matches_full("flex remove");
+    }
+
+    /// The runtime bench's sections are `width:100%` columns, not a fixed
+    /// 420px. The same edits have to match a full LayoutNG pass there too,
+    /// including a background change that must not move the next item.
+    #[test]
+    fn percent_column_edits_match_full_layout() {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("font-size", "14px")]);
+        let column = crate::dom::create_element("div");
+        style(
+            column,
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("width", "100%"),
+            ],
+        );
+        crate::dom::append_child(crate::dom::body_id(), column);
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let item = crate::dom::create_element("div");
+            style(item, &[("margin", "2px"), ("padding", "4px")]);
+            crate::dom::append_child(
+                item,
+                crate::dom::create_text_node(&format!(
+                    "Item {index} alpha beta gamma delta epsilon zeta"
+                )),
+            );
+            crate::dom::append_child(column, item);
+            items.push(item);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("percent initial");
+
+        crate::dom::set_style_property(items[0], "width", "160px");
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent width", "style-subtree", Some(30));
+        assert_matches_full("percent width");
+
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(items[1]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(
+            text,
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+        );
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent text", "splice", None);
+        assert_matches_full("percent text");
+
+        let sibling_before = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[1]))
+                .y
+        });
+        crate::dom::set_style_property(items[0], "background", "#204060");
+        assert!(crate::incremental_layout::flush());
+        let stats = crate::incremental_layout::last_flush_stats();
+        assert_eq!(stats.kind, "paint", "percent background {}", stats.kind);
+        let sibling_after = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[1]))
+                .y
+        });
+        assert_eq!(
+            sibling_before, sibling_after,
+            "background moved the next item"
+        );
+        assert_matches_full("percent background");
+
+        let extra = crate::dom::create_element("div");
+        style(extra, &[("margin", "2px"), ("padding", "4px")]);
+        crate::dom::append_child(extra, crate::dom::create_text_node("Inserted row"));
+        crate::dom::append_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent append", "splice", None);
+        assert_matches_full("percent append");
+        crate::dom::remove_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent remove", "splice", None);
+        assert_matches_full("percent remove");
+        crate::stylesheet::clear_rules();
     }
 
     #[test]

@@ -344,6 +344,17 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
     }
     let sibling_after = node_rect(sibling);
     let sibling_moved = rects_differ(sibling_before, sibling_after);
+    if sibling_moved {
+        eprintln!("background edit moved a sibling");
+        std::process::exit(1);
+    }
+    if subtree_gate() {
+        let kind = background_samples.last().expect("background").kind;
+        if kind != "paint" {
+            eprintln!("background flush kind {kind}");
+            std::process::exit(1);
+        }
+    }
     let background = dom::with_document(|document| {
         document
             .computed_style_for(NodeId::from_u32(target))
@@ -519,28 +530,13 @@ fn time_flush(label: &str) -> TimedFlush {
     }
 }
 
-/// Column sections in the large document. LayoutNG has no subtree solve
-/// that matches a full column-flex layout, so `Mode::On` rebuilds the tree
-/// and the sample is the measured cost of that fallback. `Mode::Off` must
-/// still take `off_kind` and must not walk the whole document. `retained`
-/// is a cached-tree compute, not this fallback, and does not satisfy either
-/// arm. Geometry checks outside this function stay in force for both modes.
+/// Column sections in the large document. A width or class edit re-lowers
+/// that one item, and a text or child-list edit splices its column. Both
+/// modes must take `off_kind` and must not walk the document. `retained`
+/// and `rebuild` do not satisfy the check. Geometry checks outside this
+/// function stay in force.
 fn assert_column_edit(label: &str, sample: &TimedFlush, nodes: usize, off_kind: &str) {
     if !subtree_gate() {
-        return;
-    }
-    if w3cos_runtime::layout::layout_ng_mode_name() == "on" {
-        // `nodes` is the document before the edit. Insert counts the new
-        // cell as well, so solved may be a little larger, never a subtree.
-        let solved = sample.solved as usize;
-        let whole_tree = solved >= nodes && solved <= nodes.saturating_add(1024);
-        if sample.kind != "rebuild" || !whole_tree {
-            eprintln!(
-                "{label} NG column-flex fallback: kind {} solved {} shifted {} nodes {nodes} (want rebuild of every node)",
-                sample.kind, sample.solved, sample.shifted
-            );
-            std::process::exit(1);
-        }
         return;
     }
     if sample.kind == "retained"
@@ -549,7 +545,7 @@ fn assert_column_edit(label: &str, sample: &TimedFlush, nodes: usize, off_kind: 
         || sample.solved as usize * 4 >= nodes
     {
         eprintln!(
-            "{label} lost the off-mode subtree: kind {} solved {} shifted {} nodes {nodes} (want {off_kind})",
+            "{label} lost the subtree: kind {} solved {} shifted {} nodes {nodes} (want {off_kind})",
             sample.kind, sample.solved, sample.shifted
         );
         std::process::exit(1);

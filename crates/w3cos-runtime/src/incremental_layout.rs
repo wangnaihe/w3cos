@@ -324,15 +324,6 @@ fn patch_and_compute(
         }
         return ok;
     }
-    // Column-flex text wraps inside the column. A subtree solve, and a
-    // retained engine that is not the DOM oracle, can store a shorter
-    // follower y. Under LayoutNG, flush rebuilds from `to_component_tree`.
-    if dirty
-        .iter()
-        .any(|id| splice::ng_column_flex_requires_rebuild(cache, id.as_u32()))
-    {
-        return false;
-    }
     let mut styles = Vec::with_capacity(dirty.len());
     let mut paint_only = true;
     let previous = (dirty.len() == 1)
