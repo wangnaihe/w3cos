@@ -377,6 +377,7 @@ pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
     if ends.len() > 1 {
         style.text_source_run = None;
         let properties = style.custom_properties.get_or_insert_with(Default::default);
+        properties.remove(SOURCE_RUN);
         let offsets = ends
             .iter()
             .map(usize::to_string)
@@ -392,6 +393,18 @@ pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_boundaries_clear_single_source_identity() {
+        let mut style = Style::default();
+        set_source_run(&mut style, "run");
+        assert_eq!(source_run(&style), Some("run"));
+
+        set_fragment_ends(&mut style, "ab", &[1, 2]);
+
+        assert_eq!(source_run(&style), None);
+        assert!(fragment_ends("ab", &style).is_some());
+    }
 
     #[test]
     fn explicit_decoration_color_survives_used_text_and_owner_snapshots() {
