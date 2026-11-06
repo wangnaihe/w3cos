@@ -344,6 +344,27 @@ pub fn boolean_value() -> Value {
     })
 }
 
+fn symbol_description(raw: &str) -> Option<&str> {
+    if let Some(description) = raw.strip_prefix("__w3cos_symbol_for:") {
+        return Some(description);
+    }
+    let suffix = raw.strip_prefix("__w3cos_symbol_")?;
+    match suffix.split_once(':') {
+        Some((id, description)) if id.bytes().all(|byte| byte.is_ascii_digit()) => {
+            Some(description)
+        }
+        _ => Some(suffix),
+    }
+}
+
+fn symbol_descriptive_string(value: &Value) -> Option<String> {
+    if value.type_of() != "symbol" {
+        return None;
+    }
+    let raw = value.to_js_string();
+    symbol_description(&raw).map(|description| format!("Symbol({description})"))
+}
+
 /// The global `Symbol` facade, one per thread. Symbols are collision-resistant
 /// string sentinels (`__w3cos_symbol_…`); `Symbol.for(key)` is stable for the
 /// global registry. `Symbol.prototype` exists so uncurried method captures
@@ -378,11 +399,7 @@ pub fn symbol_value() -> Value {
                 "toString".to_string(),
                 Value::function(|this, _| {
                     let raw = this_symbol(&this, "toString");
-                    let description = raw
-                        .strip_prefix("__w3cos_symbol_for:")
-                        .or_else(|| raw.strip_prefix("__w3cos_symbol_"))
-                        .unwrap_or(&raw)
-                        .to_string();
+                    let description = symbol_description(&raw).unwrap_or(&raw);
                     Value::from(format!("Symbol({description})"))
                 }),
             ),
@@ -1041,6 +1058,14 @@ pub(crate) fn is_string_constructor(value: &Value) -> bool {
 /// `new String(value)`: an object inheriting `String.prototype` with
 /// enumerable index properties and a non-enumerable `length`.
 pub(crate) fn string_wrapper(arguments: &[Value]) -> Value {
+    if arguments
+        .first()
+        .is_some_and(|value| value.type_of() == "symbol")
+    {
+        crate::throw_value(crate::value::type_error(
+            "Cannot convert a Symbol value to a string",
+        ));
+    }
     let data = arguments
         .first()
         .map(Value::to_js_string)
@@ -1150,7 +1175,7 @@ fn build_string_value() -> Value {
     }
     for name in ["toString", "valueOf"] {
         let method = native_function(name, 0, move |this, _| {
-            if this.is_string() {
+            if this.type_of() == "string" {
                 this
             } else if let Some(data) = string_wrapper_data(&this) {
                 data
@@ -1187,9 +1212,9 @@ fn build_string_value() -> Value {
     define_builtin(&prototype, "__w3cos_symbol_iterator", iterator);
     let constructor = Value::callable(HashMap::new(), |_, arguments| match arguments.first() {
         None => Value::string(""),
-        Some(value) if value.type_of() == "symbol" => crate::throw_value(crate::value::type_error(
-            "Cannot convert a Symbol value to a string",
-        )),
+        Some(value) if value.type_of() == "symbol" => symbol_descriptive_string(value)
+            .map(Value::from)
+            .unwrap_or_else(|| Value::from(value.to_js_string())),
         Some(value) => Value::from(value.to_js_string()),
     });
     for (key, value) in [
@@ -2750,6 +2775,119 @@ pub fn dispatch_resize_observers_bounded(
 #[cfg(test)]
 mod monaco_tests {
     use super::*;
+
+    #[test]
+    fn string_and_symbol_conversion_follow_ecmascript_contract() {
+        use crate::intrinsics::{call, call_completion, get_property};
+
+        fn observed(result: crate::Completion) -> String {
+            match result {
+                Ok(value) => format!("ok:{}:{}", value.type_of(), value.to_js_string()),
+                Err(error) => format!(
+                    "err:{}:{}",
+                    error.get_property("name").to_js_string(),
+                    error.to_js_string()
+                ),
+            }
+        }
+
+        let symbol_ctor = symbol_value();
+        let string_ctor = string_value();
+        let symbol_x = call(&symbol_ctor, Value::Undefined, vec![Value::string("x")]);
+        let symbol_empty = call(&symbol_ctor, Value::Undefined, Vec::new());
+        let symbol_for = get_property(&symbol_ctor, &Value::string("for"));
+        let registered_x = call(&symbol_for, symbol_ctor, vec![Value::string("x")]);
+        let prototype = get_property(&string_ctor, &Value::string("prototype"));
+
+        let cases = [
+            (
+                "String(Symbol('x'))",
+                observed(call_completion(
+                    &string_ctor,
+                    Value::Undefined,
+                    vec![symbol_x.clone()],
+                )),
+                "ok:string:Symbol(x)",
+            ),
+            (
+                "String(Symbol())",
+                observed(call_completion(
+                    &string_ctor,
+                    Value::Undefined,
+                    vec![symbol_empty.clone()],
+                )),
+                "ok:string:Symbol()",
+            ),
+            (
+                "String(Symbol.for('x'))",
+                observed(call_completion(
+                    &string_ctor,
+                    Value::Undefined,
+                    vec![registered_x],
+                )),
+                "ok:string:Symbol(x)",
+            ),
+            (
+                "new String(Symbol())",
+                observed(crate::catch_js(|| {
+                    crate::class::construct(&string_ctor, vec![symbol_empty.clone()])
+                })),
+                "err:TypeError:TypeError: Cannot convert a Symbol value to a string",
+            ),
+            (
+                "String.prototype.toString.call(Symbol())",
+                observed(call_completion(
+                    &get_property(&prototype, &Value::string("toString")),
+                    symbol_empty.clone(),
+                    Vec::new(),
+                )),
+                "err:TypeError:TypeError: String.prototype.toString requires that 'this' be a String",
+            ),
+            (
+                "String.prototype.valueOf.call(Symbol())",
+                observed(call_completion(
+                    &get_property(&prototype, &Value::string("valueOf")),
+                    symbol_empty.clone(),
+                    Vec::new(),
+                )),
+                "err:TypeError:TypeError: String.prototype.valueOf requires that 'this' be a String",
+            ),
+            (
+                "String.prototype[Symbol.iterator].call(Symbol())",
+                observed(call_completion(
+                    &get_property(&prototype, &Value::string("__w3cos_symbol_iterator")),
+                    symbol_empty.clone(),
+                    Vec::new(),
+                )),
+                "err:TypeError:TypeError: Cannot convert a Symbol value to a string",
+            ),
+            (
+                "String.prototype.includes.call(Symbol())",
+                observed(call_completion(
+                    &get_property(&prototype, &Value::string("includes")),
+                    symbol_empty,
+                    vec![Value::string("x")],
+                )),
+                "err:TypeError:TypeError: Cannot convert a Symbol value to a string",
+            ),
+        ];
+
+        let mismatches = cases
+            .into_iter()
+            .filter_map(|(name, actual, expected)| {
+                (actual != expected).then(|| format!("{name}: {actual} (expected {expected})"))
+            })
+            .collect::<Vec<_>>();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+
+        let symbol_to_string = symbol_value()
+            .get_property("prototype")
+            .get_property("toString");
+        assert_eq!(
+            call(&symbol_to_string, symbol_x, Vec::new()).to_js_string(),
+            "Symbol(x)"
+        );
+    }
 
     #[test]
     fn symbol_facade_is_callable_and_mints_unique_values() {
