@@ -1503,12 +1503,7 @@ fn same_font(a: &Style, b: &Style) -> bool {
 /// Shaping identity of a word piece: pieces of one authored text node with
 /// the same font are shaped as one run.
 fn same_run(a: &Style, b: &Style) -> bool {
-    let source = |s: &Style| {
-        s.custom_properties
-            .as_ref()
-            .and_then(|p| p.get(w3cos_std::inline_text::SOURCE_RUN))
-            .cloned()
-    };
+    let source = |s: &Style| w3cos_std::inline_text::source_run(s).map(str::to_owned);
     // An inline box edge ends the shaping run (its item starts or ends a
     // box fragment).
     source(a).is_some()
