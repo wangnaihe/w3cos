@@ -76,11 +76,16 @@ devtools = []
 ai-bridge = ["dep:w3cos-ai-bridge"]
 # Compile the desktop into this cdylib so /usr/bin/w3cos-shell can dlopen one runtime.
 desktop = ["ai-bridge", "w3cos-ai-bridge/l1"]
+# WOFF/WOFF2 decode (wuff + brotli). Ordinary AOT leaves this off; Code-OSS
+# cpu-render apps that load seti.woff enable `woff` without pulling dynamic-js.
+# The dynamic browser probe enables it via dynamic-js.
+woff = ["dep:wuff"]
 dynamic-js = [
     "dep:w3cos-compiler",
     "dep:w3cos-ir",
     "dep:w3cos-vm",
     "dep:base64",
+    "woff",
 ]
 # Type-check the OHOS renderer on a non-OHOS host without pretending that the
 # host libc has target_env="ohos". Production builds do not enable this.
@@ -116,7 +121,7 @@ anyhow = { workspace = true }
 image = { workspace = true, default-features = false }
 flate2 = { workspace = true }
 encoding_rs = { workspace = true }
-wuff = { workspace = true }
+wuff = { workspace = true, optional = true }
 resvg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
