@@ -1953,6 +1953,48 @@ fn width_limit_keywords_and_fit_content_function() {
     }
 }
 
+/// Flex and grid containers ignore Multicol `column-*` (css-flexbox /
+/// css-grid). A block with the same properties still falls back to
+/// `columns` until NGColumnLayoutAlgorithm lands.
+#[test]
+fn flex_and_grid_ignore_column_properties() {
+    let flex = Style {
+        display: Display::Flex,
+        column_count: Some(2),
+        column_width: Dimension::Px(50.0),
+        width: Dimension::Px(100.0),
+        ..sized(20.0)
+    };
+    let grid = Style {
+        display: Display::Grid,
+        column_count: Some(2),
+        column_width: Dimension::Px(50.0),
+        grid_template_columns: Some("100px".to_string()),
+        width: Dimension::Px(100.0),
+        ..sized(20.0)
+    };
+    let block_multicol = Style {
+        column_count: Some(2),
+        width: Dimension::Px(100.0),
+        ..sized(20.0)
+    };
+    let root_flex = node(block(), vec![node(flex, vec![])]);
+    let root_grid = node(block(), vec![node(grid, vec![])]);
+    let root_block = node(block(), vec![node(block_multicol, vec![])]);
+    let flat_flex = pre_flatten(&root_flex);
+    let flat_grid = pre_flatten(&root_grid);
+    let flat_block = pre_flatten(&root_block);
+    assert_eq!(block::unsupported_reasons(&flat_flex), Vec::<String>::new());
+    assert_eq!(block::unsupported_reasons(&flat_grid), Vec::<String>::new());
+    assert!(
+        block::unsupported_reasons(&flat_block)
+            .iter()
+            .any(|r| r.contains("columns")),
+        "{:?}",
+        block::unsupported_reasons(&flat_block)
+    );
+}
+
 /// The automatic minimum width of a flex item is clamped by its definite
 /// max-width, and a child's min-width keyword raises the item's
 /// min-content size (flexbox-min-width-auto-001,

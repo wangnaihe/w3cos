@@ -232,6 +232,21 @@ fn unsupported_style(style: &Style, allowed: &[&str]) -> Option<&'static str> {
 }
 
 /// `atomic`: an inline-block in an IFC (its display is the IFC's concern).
+
+/// CSS Multicol: column properties create a multicol container only on
+/// block containers (and table cells/captions). Flex/grid ignore them.
+fn establishes_column_context(style: &Style) -> bool {
+    matches!(
+        style.display,
+        Display::Block
+            | Display::FlowRoot
+            | Display::InlineBlock
+            | Display::ListItem
+            | Display::TableCell
+            | Display::TableCaption
+    ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
+}
+
 fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Option<&'static str> {
     if let Some(reason) = unsupported_marker(style, allowed) {
         return Some(reason);
@@ -294,7 +309,10 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if non_visible_overflow(style) && !style.display.establishes_overflow_clip() {
         return Some("overflow:inline");
     }
-    if style.column_count.is_some() || style.column_width != Dimension::Auto {
+    // Multicol only applies to block containers (CSS Multicol / Blink).
+    // Flex and grid containers ignore `column-*`; bailing here sent those
+    // pages to legacy while their refs stayed on NG.
+    if establishes_column_context(style) {
         return Some("columns");
     }
     // direction: rtl places block children from the right (resolve_inline).
