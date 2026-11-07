@@ -17,7 +17,7 @@ spec.loader.exec_module(gate)
 def synthetic_report():
     report = {
         "style_layout": {"nodes": 8201, "median_us": 100},
-        "paint_scroll": {"rows": 240, "first_us": 10, "checksum": 123},
+        "paint_scroll": {"rows": 240, "first_us": 10, "checksum": 123, "checksum_frames": 3},
         "host_calls": {"median_ns_per_call": 1},
         "startup": {"wall_us": 10},
         "incremental_background": {

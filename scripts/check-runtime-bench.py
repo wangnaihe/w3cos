@@ -135,6 +135,11 @@ def validate_report(report):
     field(paint, "rows", "paint_scroll", 200, integer=True)
     positive(paint, "first_us", "paint_scroll")
     field(paint, "checksum", "paint_scroll", 1, integer=True)
+    # Three scroll frames, on every lane. The pixel tuple checked by
+    # --expect-legacy-checksums is the box font environment; this runner
+    # check is the protocol, and it does not replace those constants.
+    frames = field(paint, "checksum_frames", "paint_scroll", 1, integer=True)
+    require(frames == 3, f"paint_scroll.checksum_frames is {frames}, want 3")
     positive(section("host_calls"), "median_ns_per_call", "host_calls")
     positive(section("startup"), "wall_us", "startup")
 

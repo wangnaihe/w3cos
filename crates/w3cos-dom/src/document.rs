@@ -929,6 +929,7 @@ mod form_control_tests;
 
 /// An authored `display: flex` host whose children are all text runs (a
 /// styled `inline-block` span folds into one).
+#[cfg(test)]
 fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Component]) -> bool {
     style.display == w3cos_std::style::Display::Flex
         && children.iter().all(|child| {
@@ -9367,10 +9368,14 @@ impl Document {
                 // its nested runs must not become max-content atomic rows.
                 // An authored `display: flex` host whose children are all
                 // plain inline text keeps its own direction, wrap and
-                // alignment (LayoutNG lays its text runs out as flex
-                // items). One with atomic inline children (inline-block,
-                // controls, images) keeps the wrapping row lowering the
-                // legacy engine's result depends on.
+                // alignment (LayoutNG lays those text runs out as flex
+                // items). A host whose children are atomic inlines
+                // (inline-block, controls, images), including one whose
+                // inline-block spans have folded into text runs, still
+                // takes the wrapping baseline row. That row is what the
+                // legacy engine's result depends on, and it stays in force
+                // when LayoutNG is the default. Skipping it left
+                // `flex-wrap: nowrap` on the atomic host.
                 let authored_flex_of_plain_inlines = style.display
                     == w3cos_std::style::Display::Flex
                     && children.iter().all(|child| {
@@ -9378,14 +9383,7 @@ impl Document {
                             child.style.display,
                             w3cos_std::style::Display::Inline | w3cos_std::style::Display::None
                         ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
-                    })
-                    // LayoutNG (the default; `W3COS_LAYOUT_NG=0` keeps the
-                    // legacy lowering) also lays out a host whose children
-                    // are all text runs (a styled `inline-block` span folds
-                    // into one) as real flex items. The legacy engine keeps
-                    // the wrapping row lowering its results depend on, so
-                    // this is NG-only.
-                    || (layout_ng_requested() && is_flex_host_of_text_runs(&style, &children));
+                    });
                 if !authored_flex_of_plain_inlines
                     && (children.len() >= 2
                         || children.iter().any(|child| {
