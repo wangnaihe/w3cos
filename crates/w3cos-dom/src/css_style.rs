@@ -339,6 +339,16 @@ impl CSSStyleDeclaration {
         if invalid_cssom_declaration(name, value) {
             return;
         }
+        // An empty custom property write is CSSOM removal: drop the inline
+        // declaration so the inherited / author value shows through again.
+        if name.starts_with("--") && value.trim().is_empty() {
+            self.inline_declarations
+                .retain(|(existing, _)| existing != name);
+            if let Some(properties) = self.inner.custom_properties.as_mut() {
+                properties.remove(name);
+            }
+            return;
+        }
         // CSSOM setProperty replaces an existing declaration of the same name.
         // Appending every write makes animated properties grow without bound
         // and forces later cascade scans to walk the discarded values.
