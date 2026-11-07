@@ -32,13 +32,13 @@ for forbidden in w3cos-compiler w3cos-vm w3cos-ir; do
 done
 # `w3cos-core` always depends on `base64`, so package presence cannot distinguish
 # standalone WOFF from `dynamic-js`. The compiler/VM/IR checks above enforce the
-# execution boundary; the test below compiles and exercises WOFF with only that
-# feature enabled.
+# execution boundary; the tests below exercise both the decoder error path and
+# real WOFF/WOFF2 success paths with only that feature enabled.
 cargo test \
     -p w3cos-runtime \
     --no-default-features \
     --features woff \
-    woff_decoding_does_not_depend_on_dynamic_js \
+    woff \
     --lib
 
 dynamic_tree="$(

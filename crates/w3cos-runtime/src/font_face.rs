@@ -1950,10 +1950,10 @@ mod tests {
         assert!(error.contains("decode failed"), "{error}");
     }
 
-    // This fixture is base64-encoded and base64 is a dynamic-js dependency.
-    // The woff-only decoder path is covered above without pulling that larger
-    // product feature into Code-OSS CPU-render builds.
-    #[cfg(feature = "dynamic-js")]
+    /// Decode real browser font containers with only the `woff` product
+    /// feature enabled. `base64` is a test-only dependency here, so this
+    /// success-path fixture does not pull dynamic JS into Code-OSS builds.
+    #[cfg(feature = "woff")]
     #[test]
     fn normalizes_woff_and_woff2_to_shared_sfnt_bytes() {
         use base64::Engine as _;
