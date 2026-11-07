@@ -5,11 +5,11 @@
 //! full content width; paint projects fragments into columns. Balancing
 //! for `height: auto` uses a simple equal split of the continuous flow
 //! height across the column count. Inc 3 admits auto/percent/ch sizes;
-//! floats, abspos, nested multicol, and auto-height text-align-last
-//! stay on later slices.
+//! Inc 4 admits floats and nested multicol in the continuous column
+//! flow; abspos and auto-height text-align-last stay on later slices.
 
 use crate::layout::FlatNodeInfo;
-use w3cos_std::style::{ColumnFill, Dimension, Display, Float, Position, Style, WritingMode};
+use w3cos_std::style::{ColumnFill, Dimension, Display, Position, Style, WritingMode};
 
 /// Block containers that establish a multicol formatting context.
 pub(super) fn establishes(style: &Style) -> bool {
@@ -24,9 +24,9 @@ pub(super) fn establishes(style: &Style) -> bool {
     ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
 }
 
-/// Inc 3: horizontal-tb block multicol may have auto/percent/ch width or
-/// height (used sizes come from the constraint space / balancing). Still
-/// no floats, abspos, or nested multicol — those need later slices.
+/// Inc 4: horizontal-tb block multicol may have auto/percent/ch width or
+/// height, in-flow floats, and nested multicol (each nest runs eligible
+/// on its own). Still no abspos — that needs a later slice.
 /// Auto×auto under a flex/grid parent stays legacy (gap-002: `gap:inherit`
 /// of `normal` from grid-lanes pairs only on legacy today).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -47,7 +47,9 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
             }
         }
     }
-    // Nested multicol / floats / abspos stay on legacy for this slice.
+    // Abspos stays on legacy for this slice (fragmented inline CBs need
+    // a later slice). Floats and nested multicol use the continuous-flow
+    // BFC; each nested multicol re-checks eligible() on its own layout.
     // Auto-height + text-align-last needs column-aware last-line alignment
     // (text-align-last-015); keep those on legacy until that lands.
     let auto_height = matches!(style.height, Dimension::Auto);
@@ -56,13 +58,7 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
         if node.style.display == Display::None {
             continue;
         }
-        if node.style.float != Float::None {
-            return false;
-        }
         if matches!(node.style.position, Position::Absolute | Position::Fixed) {
-            return false;
-        }
-        if establishes(node.style) {
             return false;
         }
         if auto_height

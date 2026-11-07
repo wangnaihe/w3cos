@@ -2078,6 +2078,79 @@ fn multicol_auto_size_uses_column_count_under_definite_cb() {
     );
 }
 
+/// Floats inside an eligible multicol stay on NG (Inc 4): the continuous
+/// column flow is a BFC, so left/right floats lay out at the column width.
+#[test]
+fn multicol_with_float_child_stays_on_ng() {
+    use w3cos_std::style::Float;
+    let root = node(
+        Style {
+            column_count: Some(2),
+            column_gap: Some(0.0),
+            width: Dimension::Px(200.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                float: Float::Left,
+                width: Dimension::Px(40.0),
+                height: Dimension::Px(40.0),
+                ..block()
+            },
+            vec![],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 0).2, 200.0, "principal {:?}", rect(&ng, 0));
+    assert_eq!(rect(&ng, 1).2, 40.0, "float {:?}", rect(&ng, 1));
+}
+
+/// Nested multicol (outer+inner column-count) stays on NG when otherwise
+/// eligible (Inc 4).
+#[test]
+fn nested_multicol_stays_on_ng() {
+    let root = node(
+        Style {
+            column_count: Some(2),
+            column_gap: Some(0.0),
+            width: Dimension::Px(200.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                column_count: Some(2),
+                column_gap: Some(0.0),
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(80.0),
+                ..block()
+            },
+            vec![node(
+                Style {
+                    width: Dimension::Percent(100.0),
+                    height: Dimension::Px(40.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 0).2, 200.0);
+    assert_eq!(rect(&ng, 1).2, 100.0);
+    assert_eq!(
+        rect(&ng, 2).2,
+        50.0,
+        "inner column width {:?}",
+        rect(&ng, 2)
+    );
+}
+
 /// The automatic minimum width of a flex item is clamped by its definite
 /// max-width, and a child's min-width keyword raises the item's
 /// min-content size (flexbox-min-width-auto-001,
