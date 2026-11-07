@@ -1,10 +1,12 @@
 //! Multicolumn layout (CSS Multicol / Blink NGColumnLayoutAlgorithm).
 //!
-//! First slice: keep one logical flow laid out against the used column
-//! width (legacy `layout.rs` + paint `column_fragments`). The principal
-//! box keeps the full content width; paint projects fragments into
-//! columns. Balancing for `height: auto` uses a simple equal split of the
-//! continuous flow height across the column count.
+//! Keep one logical flow laid out against the used column width (legacy
+//! `layout.rs` + paint `column_fragments`). The principal box keeps the
+//! full content width; paint projects fragments into columns. Balancing
+//! for `height: auto` uses a simple equal split of the continuous flow
+//! height across the column count. Inc 3 admits auto/percent/ch sizes;
+//! floats, abspos, nested multicol, and auto-height text-align-last
+//! stay on later slices.
 
 use crate::layout::FlatNodeInfo;
 use w3cos_std::style::{ColumnFill, Dimension, Display, Float, Position, Style, WritingMode};
@@ -22,9 +24,11 @@ pub(super) fn establishes(style: &Style) -> bool {
     ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
 }
 
-/// Narrow first slice: horizontal-tb, no floats / abspos in the subtree,
-/// and either a definite height (column-fill auto or balance) or
-/// balance/balance-all with auto height.
+/// Inc 3: horizontal-tb block multicol may have auto/percent/ch width or
+/// height (used sizes come from the constraint space / balancing). Still
+/// no floats, abspos, or nested multicol — those need later slices.
+/// Auto×auto under a flex/grid parent stays legacy (gap-002: `gap:inherit`
+/// of `normal` from grid-lanes pairs only on legacy today).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
     let style = flat[index].style;
     if !establishes(style) {
@@ -33,14 +37,20 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
     if style.writing_mode != WritingMode::HorizontalTb {
         return false;
     }
-    // First slice needs a definite border box so paint's fragmentainer
-    // height matches the principal box (aspect-ratio-052+, sticky
-    // multicol). Indefinite multicol inside grid-lanes (gap-002) stays
-    // legacy to preserve paired passes.
-    if !matches!(style.width, Dimension::Px(_)) || !matches!(style.height, Dimension::Px(_)) {
-        return false;
+    if matches!(style.width, Dimension::Auto) && matches!(style.height, Dimension::Auto) {
+        if let Some(parent) = flat[index].parent {
+            let parent_style = flat[parent].style;
+            if super::block::is_author_flex(parent_style)
+                || super::block::is_author_grid(parent_style)
+            {
+                return false;
+            }
+        }
     }
-    // Nested multicol stays on legacy for this slice.
+    // Nested multicol / floats / abspos stay on legacy for this slice.
+    // Auto-height + text-align-last needs column-aware last-line alignment
+    // (text-align-last-015); keep those on legacy until that lands.
+    let auto_height = matches!(style.height, Dimension::Auto);
     let end = flat[index].subtree_end;
     for node in &flat[index + 1..end] {
         if node.style.display == Display::None {
@@ -53,6 +63,15 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
             return false;
         }
         if establishes(node.style) {
+            return false;
+        }
+        if auto_height
+            && node
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|p| p.contains_key("--w3cos-internal-text-align-last"))
+        {
             return false;
         }
     }

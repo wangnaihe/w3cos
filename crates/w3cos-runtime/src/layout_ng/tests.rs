@@ -2038,6 +2038,46 @@ fn multicol_children_use_column_width_continuous_flow() {
     );
 }
 
+/// Auto width/height multicol under a definite containing block stays on
+/// NG (aspect-ratio-055 / columns:N shape): column-count alone, used
+/// width from the CB; child percent width resolves against column width.
+#[test]
+fn multicol_auto_size_uses_column_count_under_definite_cb() {
+    let root = node(
+        Style {
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                column_count: Some(4),
+                column_gap: Some(0.0),
+                column_fill: w3cos_std::style::ColumnFill::Auto,
+                ..block()
+            },
+            vec![node(
+                Style {
+                    width: Dimension::Percent(100.0),
+                    height: Dimension::Px(40.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 1).2, 100.0, "multicol width {:?}", rect(&ng, 1));
+    assert_eq!(
+        rect(&ng, 2).2,
+        25.0,
+        "flow child uses column width {:?}",
+        rect(&ng, 2)
+    );
+}
+
 /// The automatic minimum width of a flex item is clamped by its definite
 /// max-width, and a child's min-width keyword raises the item's
 /// min-content size (flexbox-min-width-auto-001,
