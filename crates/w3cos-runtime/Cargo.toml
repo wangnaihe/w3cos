@@ -241,6 +241,7 @@ hidapi = { version = "2.6.7", optional = true, default-features = false, feature
 
 [dev-dependencies]
 w3cos-core = { workspace = true }
+base64 = "0.22"
 
 [[bin]]
 name = "w3cos-runtime-bench"
