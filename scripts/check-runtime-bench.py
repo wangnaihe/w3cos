@@ -54,6 +54,18 @@ LEGACY_LAYOUT_NG_OFF_CHECKSUMS = (
     (("paint_scroll", "checksum"), 1786374846),
 )
 
+# Same four fields, measured on GitHub ubuntu-latest rather than the box.
+# Green main run 42155314497 job 127687955856 (7f1c12dc, flag unset, so the
+# legacy engine) recorded them. This branch's explicit W3COS_LAYOUT_NG=0
+# lane on run 42338677739 job 128301295869 (52c2a199) recorded the same
+# four. They are not a substitute for the box tuple above.
+RUNNER_LEGACY_BASELINE_CHECKSUMS = (
+    (("style_layout", "layout_checksum"), 18291149073252),
+    (("startup", "child", "layout_checksum"), 31625672812),
+    (("startup", "child", "checksum"), 147785895),
+    (("paint_scroll", "checksum"), 1797980318),
+)
+
 
 def nested(report, path):
     value = report
@@ -65,15 +77,27 @@ def nested(report, path):
     return value, ".".join(label)
 
 
-def expect_legacy_checksums(report):
-    """The NG-off lane must still produce the historical checksum tuple."""
+def expect_checksum_tuple(report, pairs, constant_name):
+    """NG-off lane, 3 scroll frames, and one exact four-value checksum tuple."""
     require(report.get("layout_ng") == "off", "legacy checksum lane requires layout_ng=off")
     frames, frames_label = nested(report, ("paint_scroll", "checksum_frames"))
     require(frames == 3, f"{frames_label} must be the historical 3-scroll protocol")
-    for path, expected in LEGACY_LAYOUT_NG_OFF_CHECKSUMS:
+    for path, expected in pairs:
         value, label = nested(report, path)
         require(type(value) is int, f"{label} must be an integer")
-        require(value == expected, f"{label} is {value}, legacy constant is {expected}")
+        require(value == expected, f"{label} is {value}, {constant_name} is {expected}")
+
+
+def expect_legacy_checksums(report):
+    """The box font environment must still produce the historical tuple."""
+    expect_checksum_tuple(report, LEGACY_LAYOUT_NG_OFF_CHECKSUMS, "legacy constant")
+
+
+def expect_runner_legacy_baseline(report):
+    """ubuntu-latest must still produce the legacy tuple green main recorded."""
+    expect_checksum_tuple(
+        report, RUNNER_LEGACY_BASELINE_CHECKSUMS, "ubuntu-latest main baseline"
+    )
 
 
 def validate_report(report):
@@ -148,16 +172,33 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
     parser.add_argument(
+        "--expect-layout-ng",
+        choices=("on", "off", "verify"),
+        help="require report.layout_ng to be this mode",
+    )
+    parser.add_argument(
         "--expect-legacy-checksums",
         action="store_true",
-        help="require the historical W3COS_LAYOUT_NG=0 checksum tuple",
+        help="require the historical box W3COS_LAYOUT_NG=0 checksum tuple",
+    )
+    parser.add_argument(
+        "--expect-runner-legacy-baseline",
+        action="store_true",
+        help="require the ubuntu-latest legacy tuple recorded on green main",
     )
     args = parser.parse_args(argv)
     try:
         report = load_report(args.report.read_text())
         validate_report(report)
+        if args.expect_layout_ng is not None:
+            require(
+                report.get("layout_ng") == args.expect_layout_ng,
+                f"layout_ng is {report.get('layout_ng')!r}, want {args.expect_layout_ng}",
+            )
         if args.expect_legacy_checksums:
             expect_legacy_checksums(report)
+        if args.expect_runner_legacy_baseline:
+            expect_runner_legacy_baseline(report)
     except (OSError, ValueError) as error:
         print(f"runtime bench sanity failed: {error}", file=sys.stderr)
         return 1

@@ -199,6 +199,68 @@ class RuntimeBenchTests(unittest.TestCase):
         with self.assertRaises(gate.InvalidReport):
             gate.expect_legacy_checksums(report)
 
+    def test_historical_box_tuple_is_unchanged(self):
+        self.assertEqual(
+            gate.LEGACY_LAYOUT_NG_OFF_CHECKSUMS,
+            (
+                (("style_layout", "layout_checksum"), 18294915160932),
+                (("startup", "child", "layout_checksum"), 31627714668),
+                (("startup", "child", "checksum"), 150112521),
+                (("paint_scroll", "checksum"), 1786374846),
+            ),
+        )
+
+    def test_runner_baseline_matches_green_main_and_rejects_drift(self):
+        # ubuntu-latest main 7f1c12dc, run 42155314497 job 127687955856.
+        # Branch W3COS_LAYOUT_NG=0, run 42338677739 job 128301295869, matched.
+        self.assertEqual(
+            gate.RUNNER_LEGACY_BASELINE_CHECKSUMS,
+            (
+                (("style_layout", "layout_checksum"), 18291149073252),
+                (("startup", "child", "layout_checksum"), 31625672812),
+                (("startup", "child", "checksum"), 147785895),
+                (("paint_scroll", "checksum"), 1797980318),
+            ),
+        )
+        self.assertNotEqual(
+            gate.LEGACY_LAYOUT_NG_OFF_CHECKSUMS,
+            gate.RUNNER_LEGACY_BASELINE_CHECKSUMS,
+        )
+        report = synthetic_report()
+        report["layout_ng"] = "off"
+        report["style_layout"]["layout_checksum"] = 18291149073252
+        report["startup"] = {
+            "wall_us": 10,
+            "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+        }
+        report["paint_scroll"]["checksum"] = 1797980318
+        report["paint_scroll"]["checksum_frames"] = 3
+        gate.validate_report(report)
+        gate.expect_runner_legacy_baseline(report)
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+        box = json.loads(json.dumps(report))
+        box["style_layout"]["layout_checksum"] = 18294915160932
+        box["startup"]["child"]["layout_checksum"] = 31627714668
+        box["startup"]["child"]["checksum"] = 150112521
+        box["paint_scroll"]["checksum"] = 1786374846
+        gate.expect_legacy_checksums(box)
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_runner_legacy_baseline(box)
+        for path, replacement in (
+            (("style_layout", "layout_checksum"), 18291149073253),
+            (("startup", "child", "layout_checksum"), 31625672813),
+            (("startup", "child", "checksum"), 147785896),
+            (("paint_scroll", "checksum"), 1797980319),
+        ):
+            drifted = json.loads(json.dumps(report))
+            cursor = drifted
+            for key in path[:-1]:
+                cursor = cursor[key]
+            cursor[path[-1]] = replacement
+            with self.assertRaises(gate.InvalidReport):
+                gate.expect_runner_legacy_baseline(drifted)
+
     def test_cli_normal_and_optimized_python_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.json"
@@ -210,6 +272,22 @@ class RuntimeBenchTests(unittest.TestCase):
                                             capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
+            drifted = synthetic_report()
+            drifted["layout_ng"] = "off"
+            drifted["style_layout"]["layout_checksum"] = 1
+            drifted["startup"] = {
+                "wall_us": 10,
+                "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+            }
+            drifted["paint_scroll"]["checksum"] = 1797980318
+            drifted["paint_scroll"]["checksum_frames"] = 3
+            path.write_text(json.dumps(drifted))
+            missing = subprocess.run(
+                [sys.executable, str(SCRIPT), "--expect-runner-legacy-baseline", str(path)],
+                capture_output=True, text=True)
+            self.assertEqual(missing.returncode, 1, missing.stderr)
+            self.assertIn("ubuntu-latest main baseline", missing.stderr)
+            self.assertNotIn("Traceback", missing.stderr)
 
 
 if __name__ == "__main__":

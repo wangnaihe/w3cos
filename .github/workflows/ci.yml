@@ -136,16 +136,11 @@ jobs:
       - name: Check harness sanity
         run: |
           python3 -m unittest discover -s tests/scripts -p 'test_runtime_bench.py' -v
-          python3 scripts/check-runtime-bench.py runtime-bench.json
-          python3 scripts/check-runtime-bench.py runtime-bench-legacy.json
-          # The historical box tuple stays in check-runtime-bench.py
-          # (--expect-legacy-checksums). This ubuntu-latest runner does not
-          # produce it: green main run 42155314497 job 127687955856 recorded
-          # style_layout.layout_checksum 18291149073252, startup layout
-          # 31625672812, startup paint 147785895, scroll 1797980318. The
-          # W3COS_LAYOUT_NG=0 lane on this PR produced those same four
-          # numbers. Comparing it to the box tuple failed a lane that
-          # matches main on this runner. The box still uses the flag.
+          # Default lane: LayoutNG geometry and the no-rebuild subtree checks.
+          python3 scripts/check-runtime-bench.py --expect-layout-ng on runtime-bench.json
+          # Legacy lane: same-runner checksums green main produced. The box
+          # tuple stays --expect-legacy-checksums and is not used here.
+          python3 scripts/check-runtime-bench.py --expect-runner-legacy-baseline runtime-bench-legacy.json
       - name: Upload runtime bench report
         if: always()
         uses: actions/upload-artifact@v4
