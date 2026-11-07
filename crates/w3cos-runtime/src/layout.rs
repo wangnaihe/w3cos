@@ -21078,7 +21078,7 @@ fn quote_word_fragment_advances(
     let mut start = 0;
     while start < virtual_line.children.len() {
         let first = &virtual_line.children[start];
-        let source = w3cos_std::inline_text::source_run(&first.style);
+        let source = w3cos_std::inline_text::source_run(&first.style).map(str::to_owned);
         let mut end = start + 1;
         while source.is_some()
             && end < virtual_line.children.len()
@@ -21242,8 +21242,8 @@ fn inline_fragment_shaped_advances_for_width(
                 next.children.is_empty() && next.style.display == WDisplay::Inline
                     && next.style.position == WPos::Static && next.style.float == WFloat::None
                     && matches!(&next.kind, ComponentKind::Text { content } if !content.is_empty())
-                    && (w3cos_std::inline_text::source_run(first_style).is_some_and(|source|
-                            w3cos_std::inline_text::source_run(&next.style) != Some(source))
+                    && (w3cos_std::inline_text::source_run(first_style)
+                            .is_some_and(|source| w3cos_std::inline_text::source_run(&next.style) != Some(source))
                         || next.style.font_family != first_style.font_family
                         || next.style.font_size != first_style.font_size
                         || next.style.font_weight != first_style.font_weight

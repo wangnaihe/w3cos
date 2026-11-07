@@ -17,6 +17,10 @@ pub fn source_run(style: &Style) -> Option<&str> {
 }
 
 pub fn set_source_run(style: &mut Style, source: impl AsRef<str>) {
+    // Authored-run identity lives on the dedicated field (not custom
+    // properties) so theme maps stay shareable and equivalent_text_style can
+    // ignore run id without cloning. Layout reads via source_run(), which
+    // also accepts a legacy custom-property SOURCE_RUN from main grafts.
     style.text_source_run = Some(std::sync::Arc::from(source.as_ref()));
 }
 
@@ -347,7 +351,7 @@ pub fn append_source_fragment_ends(
     if text.is_empty() {
         return;
     }
-    let source = style.text_source_run.as_deref().map(str::to_owned);
+    let source = source_run(style).map(str::to_owned);
     if source.is_some() && source == *previous_source && output.last().copied() == Some(offset) {
         output.pop();
     }
