@@ -929,7 +929,6 @@ mod form_control_tests;
 
 /// An authored `display: flex` host whose children are all text runs (a
 /// styled `inline-block` span folds into one).
-#[cfg(test)]
 fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Component]) -> bool {
     style.display == w3cos_std::style::Display::Flex
         && children.iter().all(|child| {
@@ -9368,14 +9367,12 @@ impl Document {
                 // its nested runs must not become max-content atomic rows.
                 // An authored `display: flex` host whose children are all
                 // plain inline text keeps its own direction, wrap and
-                // alignment (LayoutNG lays those text runs out as flex
-                // items). A host whose children are atomic inlines
-                // (inline-block, controls, images), including one whose
-                // inline-block spans have folded into text runs, still
-                // takes the wrapping baseline row. That row is what the
-                // legacy engine's result depends on, and it stays in force
-                // when LayoutNG is the default. Skipping it left
-                // `flex-wrap: nowrap` on the atomic host.
+                // alignment. LayoutNG also keeps a host whose children are
+                // text runs, including a styled `inline-block` span that
+                // folded into one: rewriting that host into a wrapping
+                // baseline row replaces `flex-direction` and `align-content`
+                // (the 127 flex reftest regressions on 34e589e8). The legacy
+                // engine still depends on that row, so the skip is NG-only.
                 let authored_flex_of_plain_inlines = style.display
                     == w3cos_std::style::Display::Flex
                     && children.iter().all(|child| {
@@ -9383,7 +9380,8 @@ impl Document {
                             child.style.display,
                             w3cos_std::style::Display::Inline | w3cos_std::style::Display::None
                         ) && !matches!(child.kind, w3cos_std::ComponentKind::Image { .. })
-                    });
+                    })
+                    || (layout_ng_requested() && is_flex_host_of_text_runs(&style, &children));
                 if !authored_flex_of_plain_inlines
                     && (children.len() >= 2
                         || children.iter().any(|child| {
@@ -21565,14 +21563,90 @@ mod image_component_tests {
         assert_ne!(flex.style.align_items, AlignItems::Baseline);
         assert_eq!(flex.children.len(), 2, "two flex items, not one text run");
         let atomic = build("flex", "inline-block");
-        assert_eq!(atomic.style.flex_wrap, FlexWrap::Wrap);
-        assert_eq!(atomic.style.align_items, AlignItems::Baseline);
+        if layout_ng_requested() {
+            // Same markup as css/css-flexbox/flex-direction-column.html.
+            // The authored column must survive; the wrapping row is legacy.
+            assert_eq!(atomic.style.display, Display::Flex);
+            assert_eq!(atomic.style.flex_direction, FlexDirection::Column);
+            assert_ne!(atomic.style.flex_wrap, FlexWrap::Wrap);
+            assert_ne!(atomic.style.align_items, AlignItems::Baseline);
+        } else {
+            assert_eq!(atomic.style.flex_wrap, FlexWrap::Wrap);
+            assert_eq!(atomic.style.align_items, AlignItems::Baseline);
+        }
         // LayoutNG's NG-only widening: the lowered text runs are text kind.
         assert!(is_flex_host_of_text_runs(&atomic.style, &atomic.children));
         let block = build("block", "inline");
         assert_eq!(block.style.flex_wrap, FlexWrap::Wrap);
         assert_eq!(block.style.align_items, AlignItems::Baseline);
         assert!(!is_flex_host_of_text_runs(&block.style, &block.children));
+        crate::stylesheet::clear_rules();
+    }
+
+    /// `css/css-flexbox/flex-direction-column.html` and
+    /// `flex-align-content-center.html`: the items are `display:inline-block`
+    /// spans. LayoutNG must keep the authored flex container. The legacy
+    /// engine still rewrites it to a wrapping baseline row.
+    #[test]
+    fn inline_block_flex_items_keep_authored_alignment_under_layout_ng() {
+        use w3cos_std::style::{AlignContent, Display, FlexDirection, FlexWrap};
+        crate::stylesheet::clear_rules();
+        let mut document = Document::new();
+        let mut column = document.create_element("div");
+        column
+            .style_mut(&mut document)
+            .set_property("display", "flex");
+        column
+            .style_mut(&mut document)
+            .set_property("flex-direction", "column");
+        let mut centered = document.create_element("div");
+        centered
+            .style_mut(&mut document)
+            .set_property("display", "flex");
+        centered
+            .style_mut(&mut document)
+            .set_property("flex-wrap", "wrap");
+        centered
+            .style_mut(&mut document)
+            .set_property("align-content", "center");
+        centered
+            .style_mut(&mut document)
+            .set_property("height", "6em");
+        centered
+            .style_mut(&mut document)
+            .set_property("width", "20em");
+        let column_id = column.id;
+        let centered_id = centered.id;
+        for host in [&mut column, &mut centered] {
+            for word in ["first", "second", "third", "fourth"] {
+                let span = document.create_element("span");
+                span.style_mut(&mut document)
+                    .set_property("display", "inline-block");
+                span.style_mut(&mut document).set_property("width", "8em");
+                span.style_mut(&mut document).set_property("margin", "1em");
+                span.style_mut(&mut document)
+                    .set_property("background-color", "green");
+                let text = document.create_text_node(word);
+                span.append_child(&mut document, text);
+                host.append_child(&mut document, span);
+            }
+        }
+        let body = document.body();
+        body.append_child(&mut document, column);
+        body.append_child(&mut document, centered);
+        let column_tree = document.to_component_subtree(column_id);
+        let centered_tree = document.to_component_subtree(centered_id);
+        if layout_ng_requested() {
+            assert_eq!(column_tree.style.display, Display::Flex);
+            assert_eq!(column_tree.style.flex_direction, FlexDirection::Column);
+            assert_ne!(column_tree.style.flex_wrap, FlexWrap::Wrap);
+            assert_eq!(centered_tree.style.display, Display::Flex);
+            assert_eq!(centered_tree.style.flex_wrap, FlexWrap::Wrap);
+            assert_eq!(centered_tree.style.align_content, AlignContent::Center);
+        } else {
+            assert_eq!(column_tree.style.flex_wrap, FlexWrap::Wrap);
+            assert_eq!(centered_tree.style.align_content, AlignContent::FlexStart);
+        }
         crate::stylesheet::clear_rules();
     }
 
