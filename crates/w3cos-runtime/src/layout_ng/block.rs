@@ -1871,8 +1871,10 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         return Some("overflow:negative-margin");
     }
     // A float alone inside the box matches legacy (the BFC contains it).
-    // A float together with in-flow content, or a `clear`, still takes the
-    // legacy adjoining-float path.
+    // A float together with in-flow content, or a clear next to a float,
+    // still takes the legacy adjoining-float path. Clear alone is fine:
+    // an overflow BFC has no floats of its own to clear past
+    // (flexbox_item-clear-ref; main #415).
     let mut saw_float = false;
     let mut saw_inflow = false;
     let mut saw_clear = false;
@@ -1894,7 +1896,7 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             saw_inflow = true;
         }
     }
-    if saw_clear || (saw_float && saw_inflow) {
+    if (saw_float && saw_inflow) || (saw_float && saw_clear) {
         return Some("overflow:float");
     }
     None
@@ -3306,9 +3308,9 @@ pub(super) fn intrinsic_sizes_at(
             contributing_percent_inline(flat, index)
         }
     };
-    if (is_author_flex(info.style) || is_author_grid(info.style)) && percent_below() {
-        return super::bail("intrinsic-percent:flex-grid");
-    }
+    // Percentage descendants under flex/grid: size through the container's
+    // own min/max path (main removed this bail). Cyclic cases still bail
+    // deeper in flex/grid algorithms.
     if is_author_flex(info.style) {
         return super::flex::container_min_max_at(flat, index, space, block);
     }

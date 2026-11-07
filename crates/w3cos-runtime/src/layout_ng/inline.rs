@@ -311,16 +311,11 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     // hanging-punctuation: last hangs the paragraph's final closing
     // bracket or quote (`mark_hanging_last`; a paragraph leaf through
     // crate::text_layout's BreakMode::hang_last_punctuation).
-    // line-break: loose / strict reach the breaker through
-    // crate::line_break::BreakMode (Blink LazyLineBreakIterator strictness,
-    // LayoutLocale::LocaleWithBreakKeyword). `anywhere` is BreakCharacter
-    // (ComputedStyle::GetLineBreakType) and stays on NG.
-    if !matches!(
-        style.line_break,
-        LineBreak::Auto | LineBreak::Normal | LineBreak::Anywhere
-    ) {
-        return Some("text:line-break");
-    }
+    // line-break: loose / strict / anywhere all reach the breaker through
+    // crate::line_break::BreakMode (Blink LazyLineBreakIterator strictness /
+    // BreakCharacter for anywhere). Branch already lays loose/strict on NG;
+    // allowing anywhere matches main #404 without forcing loose/strict onto
+    // legacy (paired losses on line-break-loose/strict-011..018).
     // break-spaces: the sole-leaf wrap runs through crate::line_break
     // (BreakSpace::AfterEverySpace); multi-item lines stay on legacy.
     // break-all / keep-all only change the opportunities

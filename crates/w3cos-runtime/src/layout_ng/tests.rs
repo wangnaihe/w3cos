@@ -7677,53 +7677,55 @@ fn flex_container_with_logical_size_and_calc_items_stays_on_legacy() {
     assert!(layout_tree(&root, &flat, 800.0, 600.0).is_none());
 }
 
+/// A column flex item with a definite used height may host a percentage-
+/// height descendant (main #412). The item itself has no percentage block
+/// size, so the container stays on NG.
 #[test]
-fn column_percent_descendant_keeps_the_container_on_legacy() {
+fn column_flex_percent_descendant_of_definite_item_stays_on_ng() {
     use w3cos_std::style::{Display, FlexDirection};
-    let column = |inner_percent: bool, height: Dimension| {
-        let item1 = Style {
-            flex_basis: Dimension::Percent(100.0),
-            flex_shrink: 1.0,
-            ..block()
-        };
-        let item2 = Style {
-            flex_grow: 1.0,
-            flex_basis: Dimension::Px(30.0),
-            ..block()
-        };
-        let inner = Style {
-            height: if inner_percent {
-                Dimension::Percent(100.0)
-            } else {
-                Dimension::Auto
-            },
-            min_height: Dimension::Px(100.0),
-            ..block()
-        };
-        let col = Style {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            width: Dimension::Px(100.0),
-            height,
-            ..block()
-        };
-        let root = node(
-            block(),
-            vec![node(
-                col,
-                vec![node(item1, vec![]), node(item2, vec![node(inner, vec![])])],
-            )],
-        );
-        let flat = pre_flatten(&root);
-        flex::container_reason(&flat, 1)
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        ..block()
     };
-    // The item's own percentage resolves against a length height.
-    assert_eq!(column(false, Dimension::Px(100.0)), None);
-    // Without a definite height it cycles through the automatic minimum.
-    assert_eq!(column(false, Dimension::Auto), Some("flex:column-percent"));
-    // A percentage further down resolves against the flexed size.
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        min_height: Dimension::Px(100.0),
+        ..block()
+    };
+    let pct = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(col, vec![node(item, vec![node(pct, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(flex::container_reason(&flat, 1), None);
+}
+
+/// A percentage height on the column flex item itself still falls back.
+#[test]
+fn column_flex_percent_item_stays_on_legacy() {
+    use w3cos_std::style::{Display, FlexDirection};
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        ..block()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(50.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(col, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
     assert_eq!(
-        column(true, Dimension::Px(100.0)),
+        flex::container_reason(&flat, 1),
         Some("flex:column-percent")
     );
 }

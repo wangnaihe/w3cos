@@ -171,32 +171,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if subtree_has_float(flat, child) {
             return Some("flex:float-descendant");
         }
-        // Percentage main sizes and percentage block descendants cycle
-        // through the automatic minimum. Leave those columns on legacy.
-        // A container with a definite (length) height is a basis for the
-        // item's own percentages; only a percentage further down, which
-        // resolves against the item's flexed size, still cycles.
+        // Percentage main sizes on the column item itself cycle through
+        // the automatic minimum. Leave those on legacy. A percentage on a
+        // descendant alone is fine: tables resolve cell percentages in
+        // their own algorithm, and a definite item height (including from
+        // min-height) is a percentage basis for nested blocks (main #412).
         if !row && column_percent_size(flat, child) {
-            let definite = matches!(style.height, Dimension::Px(_));
-            let blocked = if definite {
-                column_percent_descendant(flat, child)
-            } else {
-                // An indefinite container: the item's flexed size is not a
-                // percentage basis (`fixed_block_indefinite`), so descendant
-                // percentages are auto. The item's own percentages and its
-                // automatic minimum stay on legacy.
-                percent_block_size(child_style)
-                    || child_style.min_height == Dimension::Auto
-                    || super::block::is_author_flex(child_style)
-                    || super::block::is_author_grid(child_style)
-                    || matches!(
-                        child_style.display,
-                        w3cos_std::style::Display::Table | w3cos_std::style::Display::InlineTable
-                    )
-            };
-            if blocked {
-                return Some("flex:column-percent");
-            }
+            return Some("flex:column-percent");
         }
     }
     None
@@ -328,40 +309,12 @@ fn subtree_has_float(flat: &[FlatNodeInfo], index: usize) -> bool {
     false
 }
 
-/// A percentage block size on this column item or a descendant. The
-/// flex base, the used height, and min/max height all count.
+/// A percentage block size on this column flex item. The flex base, the
+/// used height, and min/max height all count. Descendants are not scanned:
+/// a table item keeps cell percentages inside table layout, and a
+/// definite item height is a percentage basis for nested blocks.
 fn column_percent_size(flat: &[FlatNodeInfo], index: usize) -> bool {
-    let end = flat[index].subtree_end.max(index + 1);
-    let mut child = index;
-    while child < end {
-        if flat[child].style.display == w3cos_std::style::Display::None {
-            child = flat[child].subtree_end.max(child + 1);
-            continue;
-        }
-        if percent_block_size(flat[child].style) {
-            return true;
-        }
-        child += 1;
-    }
-    false
-}
-
-/// A percentage block size on a descendant of this column item (not the
-/// item itself).
-fn column_percent_descendant(flat: &[FlatNodeInfo], index: usize) -> bool {
-    let end = flat[index].subtree_end.max(index + 1);
-    let mut child = index + 1;
-    while child < end {
-        if flat[child].style.display == w3cos_std::style::Display::None {
-            child = flat[child].subtree_end.max(child + 1);
-            continue;
-        }
-        if percent_block_size(flat[child].style) {
-            return true;
-        }
-        child += 1;
-    }
-    false
+    percent_block_size(flat[index].style)
 }
 
 fn percent_block_size(style: &Style) -> bool {
