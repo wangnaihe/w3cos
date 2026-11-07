@@ -4653,15 +4653,36 @@ fn layout_impl(
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_sub = columns_spec(style).is_some_and(is_subgrid_axis);
     let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
-    // Intrinsic sizing of a subgrid reuses parent tracks (main #418).
-    // Width-keyword parents of subgrids with explicit standalone tracks
-    // stay on legacy via container_reason. While the parent is still
-    // measuring, SUBGRID_PUBLISHED is empty — a single-axis subgrid can
-    // still size its standalone axis (standalone-axis-size-006/007).
+    // `keyword` is cleared whenever measure is set (see above), so a
+    // width-keyword parent is detected via its marker. Allow a single-axis
+    // subgrid to size without published parent tracks only under that
+    // parent (main #418 / standalone-axis-size-006/007,
+    // dynamic-min-content). Bare measure under a non-keyword parent
+    // (flex baseline on a plain grid) must still bail — otherwise
+    // grid-lanes baseline refs diverge
+    // (row-grid-lanes-container-baseline-subgrid-001).
+    let width_keyword_on = |s: &Style| {
+        has_marker(s, WIDTH_KEYWORD)
+            || has_marker(s, block::MIN_WIDTH_KEYWORD)
+            || has_marker(s, block::MAX_WIDTH_KEYWORD)
+    };
+    // Parent width keyword (006/dynamic-min-content) or the subgrid's own
+    // min-width:min-content (007).
+    let parent_width_keyword = flat[index]
+        .parent
+        .is_some_and(|p| width_keyword_on(flat[p].style));
+    let self_width_keyword = width_keyword_on(style);
+    let measure_without_publish = measure
+        && (parent_width_keyword || self_width_keyword)
+        && (column_sub || row_sub)
+        && !(column_sub && row_sub);
+    if (measure || keyword.is_some()) && (column_sub || row_sub) && !measure_without_publish {
+        return super::bail("grid:intrinsic-subgrid");
+    }
     let inherited = if column_sub || row_sub {
         match lookup_inherited(flat, index, space, column_sub, row_sub) {
             Some(tracks) => Some(tracks),
-            None if measure && !(column_sub && row_sub) => None,
+            None if measure_without_publish => None,
             None => return super::bail("grid:subgrid-rt-lookup"),
         }
     } else {
@@ -4699,8 +4720,8 @@ fn layout_impl(
                 fixed_template(&inherited.columns, names)
             }
             None => {
-                // Measure without parent publish: size the standalone
-                // (non-subgridded) axis from local tracks / items.
+                // Keyword measure without parent publish: size the
+                // standalone (non-subgridded) axis from local tracks.
                 parse_template("", true).why("grid:template")?
             }
         }
@@ -4715,9 +4736,9 @@ fn layout_impl(
     let mut rows_template = if row_sub {
         match inherited.as_ref() {
             None => {
-                // Measure without parent publish. Honor `grid-row: span N`
-                // so column-flow items pack into the right track count
-                // (standalone-axis-size-007).
+                // Keyword measure without parent publish. Honor
+                // `grid-row: span N` so column-flow items pack into the
+                // right track count (standalone-axis-size-007).
                 let span = resolve_axis(placement(style, true), &[], 0)
                     .map(|axis| axis.span.max(1))
                     .unwrap_or(1);
@@ -5058,8 +5079,16 @@ fn layout_impl(
         let child_style = flat[item.index].style;
         if columns_spec(child_style).is_some_and(is_subgrid_axis) {
             // A column subgrid's items contribute through the parent's
-            // tracks (standalone-axis intrinsic containers stay on NG when
-            // container_reason allows; main #418).
+            // tracks. Under a width-keyword container the measure may
+            // proceed (standalone-axis pages); bare measure (flex
+            // baseline) must bail so grid-lanes baseline refs stay paired.
+            if measure
+                && !(has_marker(style, WIDTH_KEYWORD)
+                    || has_marker(style, block::MIN_WIDTH_KEYWORD)
+                    || has_marker(style, block::MAX_WIDTH_KEYWORD))
+            {
+                return super::bail("grid:intrinsic-subgrid");
+            }
             contribute_subgrid_columns(
                 flat,
                 item.index,

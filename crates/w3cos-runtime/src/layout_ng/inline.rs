@@ -1171,24 +1171,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // inline) lays out through its own strut.
     // (main 7f1c12d / flexbox-baseline-multi-item-horiz-001 ref: unmarked
     // inline-block with a bigFont inline child must stay on NG.)
-    // A cascaded box whose only child is one inline text leaf (a folded
-    // span) owns the strut even when the leaf keeps its own font.
-    let sole_text_leaf = || {
-        let mut children = rendered_children(flat, index);
-        style.font_family.is_some()
-            && matches!(
-                (children.next(), children.next()),
-                (Some(child), None)
-                    if matches!(flat[child].kind, ComponentKind::Text { .. })
-                        && flat[child].style.display == Display::Inline
-            )
-    };
     if !has_marker(style, IFC_MARKER)
         && rendered_children(flat, index).any(|child| {
             matches!(flat[child].kind, ComponentKind::Text { .. })
                 && !same_text_font(flat[child].style, style)
         })
-        && !sole_text_leaf()
     {
         return Some("ifc:unmarked");
     }

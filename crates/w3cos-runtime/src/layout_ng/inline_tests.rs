@@ -2851,7 +2851,9 @@ fn a_cascaded_box_with_one_folded_text_leaf_is_an_ifc_root() {
     };
     let reason = |root: &Component| inline::container_reason(&pre_flatten(root), 1);
     let one = || vec![Component::text("hello there", leaf.clone())];
-    assert_eq!(reason(&tree(Some("serif"), one())), None);
+    // main 7f1c12d: a differently-fonted direct text leaf is unmarked
+    // (sole or not). Element children do not trip this gate.
+    assert_eq!(reason(&tree(Some("serif"), one())), Some("ifc:unmarked"));
     assert_eq!(reason(&tree(None, one())), Some("ifc:unmarked"));
     let two = vec![
         Component::text("hello", leaf.clone()),
