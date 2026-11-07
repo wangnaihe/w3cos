@@ -17,10 +17,12 @@ spec.loader.exec_module(gate)
 def synthetic_report():
     report = {
         "style_layout": {"nodes": 8201, "median_us": 100},
-        "paint_scroll": {"rows": 240, "first_us": 10, "checksum": 123},
+        "paint_scroll": {"rows": 240, "first_us": 10, "checksum": 123, "checksum_frames": 3},
         "host_calls": {"median_ns_per_call": 1},
         "startup": {"wall_us": 10},
-        "incremental_background": {"median_us": 1, "sibling_moved": False},
+        "incremental_background": {
+            "median_us": 1, "sibling_moved": False, "kind": "paint",
+        },
     }
     for name in ("width", "text", "class", "insert", "remove"):
         edit = {"median_us": 1, "kind": "style-subtree", "solved_nodes": 2}
@@ -83,6 +85,44 @@ class RuntimeBenchTests(unittest.TestCase):
             with self.assertRaises(gate.InvalidReport):
                 gate.validate_report(report)
 
+    def test_ng_on_column_flex_keeps_the_subtree(self):
+        report = synthetic_report()
+        report["layout_ng"] = "on"
+        gate.validate_report(report)
+
+    def test_ng_on_rejects_a_whole_tree_rebuild(self):
+        report = synthetic_report()
+        report["layout_ng"] = "on"
+        nodes = report["style_layout"]["nodes"]
+        report["incremental_width"].update(kind="rebuild", solved_nodes=nodes)
+        with self.assertRaises(gate.InvalidReport):
+            gate.validate_report(report)
+        report = synthetic_report()
+        report["layout_ng"] = "on"
+        report["incremental_background"]["kind"] = "rebuild"
+        with self.assertRaises(gate.InvalidReport):
+            gate.validate_report(report)
+        report = synthetic_report()
+        report["layout_ng"] = "on"
+        report["incremental_text"].update(kind="retained", solved_nodes=nodes)
+        with self.assertRaises(gate.InvalidReport):
+            gate.validate_report(report)
+
+    def test_off_and_verify_keep_the_subtree_bound(self):
+        for mode in ("off", "verify"):
+            report = synthetic_report()
+            report["layout_ng"] = mode
+            gate.validate_report(report)
+            report["incremental_width"].update(
+                kind="rebuild", solved_nodes=report["style_layout"]["nodes"])
+            with self.assertRaises(gate.InvalidReport):
+                gate.validate_report(report)
+            report = synthetic_report()
+            report["layout_ng"] = mode
+            report["incremental_background"]["kind"] = "rebuild"
+            with self.assertRaises(gate.InvalidReport):
+                gate.validate_report(report)
+
     def test_relative_timing_and_subtree_boundaries(self):
         for field, value in (("median_us", 400), ("solved_nodes", 2051), ("kind", "rebuild")):
             report = synthetic_report()
@@ -138,6 +178,89 @@ class RuntimeBenchTests(unittest.TestCase):
         with self.assertRaises(gate.InvalidReport):
             gate.validate_report(gate.load_report(text))
 
+    def test_legacy_checksum_lane_keeps_the_historical_constants(self):
+        report = synthetic_report()
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+        report["layout_ng"] = "on"
+        report["style_layout"]["layout_checksum"] = 18294915160932
+        report["startup"] = {
+            "wall_us": 10,
+            "child": {"layout_checksum": 31627714668, "checksum": 150112521},
+        }
+        report["paint_scroll"]["checksum"] = 1786374846
+        report["paint_scroll"]["checksum_frames"] = 3
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+        report["layout_ng"] = "off"
+        gate.validate_report(report)
+        gate.expect_legacy_checksums(report)
+        report["style_layout"]["layout_checksum"] = 1
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+
+    def test_historical_box_tuple_is_unchanged(self):
+        self.assertEqual(
+            gate.LEGACY_LAYOUT_NG_OFF_CHECKSUMS,
+            (
+                (("style_layout", "layout_checksum"), 18294915160932),
+                (("startup", "child", "layout_checksum"), 31627714668),
+                (("startup", "child", "checksum"), 150112521),
+                (("paint_scroll", "checksum"), 1786374846),
+            ),
+        )
+
+    def test_runner_baseline_matches_green_main_and_rejects_drift(self):
+        # ubuntu-latest main 7f1c12dc, run 42155314497 job 127687955856.
+        # Branch W3COS_LAYOUT_NG=0, run 42338677739 job 128301295869, matched.
+        self.assertEqual(
+            gate.RUNNER_LEGACY_BASELINE_CHECKSUMS,
+            (
+                (("style_layout", "layout_checksum"), 18291149073252),
+                (("startup", "child", "layout_checksum"), 31625672812),
+                (("startup", "child", "checksum"), 147785895),
+                (("paint_scroll", "checksum"), 1797980318),
+            ),
+        )
+        self.assertNotEqual(
+            gate.LEGACY_LAYOUT_NG_OFF_CHECKSUMS,
+            gate.RUNNER_LEGACY_BASELINE_CHECKSUMS,
+        )
+        report = synthetic_report()
+        report["layout_ng"] = "off"
+        report["style_layout"]["layout_checksum"] = 18291149073252
+        report["startup"] = {
+            "wall_us": 10,
+            "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+        }
+        report["paint_scroll"]["checksum"] = 1797980318
+        report["paint_scroll"]["checksum_frames"] = 3
+        gate.validate_report(report)
+        gate.expect_runner_legacy_baseline(report)
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_legacy_checksums(report)
+        box = json.loads(json.dumps(report))
+        box["style_layout"]["layout_checksum"] = 18294915160932
+        box["startup"]["child"]["layout_checksum"] = 31627714668
+        box["startup"]["child"]["checksum"] = 150112521
+        box["paint_scroll"]["checksum"] = 1786374846
+        gate.expect_legacy_checksums(box)
+        with self.assertRaises(gate.InvalidReport):
+            gate.expect_runner_legacy_baseline(box)
+        for path, replacement in (
+            (("style_layout", "layout_checksum"), 18291149073253),
+            (("startup", "child", "layout_checksum"), 31625672813),
+            (("startup", "child", "checksum"), 147785896),
+            (("paint_scroll", "checksum"), 1797980319),
+        ):
+            drifted = json.loads(json.dumps(report))
+            cursor = drifted
+            for key in path[:-1]:
+                cursor = cursor[key]
+            cursor[path[-1]] = replacement
+            with self.assertRaises(gate.InvalidReport):
+                gate.expect_runner_legacy_baseline(drifted)
+
     def test_cli_normal_and_optimized_python_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.json"
@@ -149,6 +272,22 @@ class RuntimeBenchTests(unittest.TestCase):
                                             capture_output=True, text=True)
                     self.assertEqual(result.returncode, expected, result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
+            drifted = synthetic_report()
+            drifted["layout_ng"] = "off"
+            drifted["style_layout"]["layout_checksum"] = 1
+            drifted["startup"] = {
+                "wall_us": 10,
+                "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+            }
+            drifted["paint_scroll"]["checksum"] = 1797980318
+            drifted["paint_scroll"]["checksum_frames"] = 3
+            path.write_text(json.dumps(drifted))
+            missing = subprocess.run(
+                [sys.executable, str(SCRIPT), "--expect-runner-legacy-baseline", str(path)],
+                capture_output=True, text=True)
+            self.assertEqual(missing.returncode, 1, missing.stderr)
+            self.assertIn("ubuntu-latest main baseline", missing.stderr)
+            self.assertNotIn("Traceback", missing.stderr)
 
 
 if __name__ == "__main__":

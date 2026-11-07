@@ -4,7 +4,9 @@
 Runs each case's test document once through the runner's isolated worker
 mode with W3COS_LAYOUT_NG=1 W3COS_LAYOUT_NG_TRACE=1 and classifies the page
 by the per-compute trace lines: all-ng / mixed / fallback / no-layout.
-Set W3COS_LAYOUT_NG_VERIFY=1 to also count legacy-vs-NG rect diffs.
+Unset W3COS_LAYOUT_NG already selects NG; this script still forces =1 so a
+surrounding =0 does not measure the legacy lane. Set
+W3COS_LAYOUT_NG_VERIFY=1 to also count legacy-vs-NG rect diffs.
 
 Usage: layout-ng-coverage.py BIN WPT_ROOT REPO_ROOT OUT.tsv [STEP]
 
@@ -16,8 +18,7 @@ import collections, concurrent.futures as cf, json, os, shutil, signal, subproce
 BIN, WPT, GATE, OUT = sys.argv[1:5]
 STEP = int(sys.argv[5]) if len(sys.argv) > 5 else 1
 PARTS = (("css2", ["--user-stylesheet", f"{GATE}/tests/wpt/profiles/css2-userstyle.css"]), ("css3", []))
-env = dict(os.environ, W3COS_LAYOUT_NG_TRACE="1")
-env.setdefault("W3COS_LAYOUT_NG", "1")
+env = dict(os.environ, W3COS_LAYOUT_NG_TRACE="1", W3COS_LAYOUT_NG="1")
 tmp = tempfile.mkdtemp(prefix="w3cos-ng-coverage-")
 
 

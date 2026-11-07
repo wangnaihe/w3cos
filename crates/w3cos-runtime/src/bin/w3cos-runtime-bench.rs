@@ -30,6 +30,10 @@ const VIEW_H: f32 = 720.0;
 const LARGE_SECTIONS: usize = 200;
 const CELLS_PER_SECTION: usize = 20;
 const SCROLL_ROWS: usize = 240;
+/// Historical `paint_scroll.checksum` is the first frame plus this many
+/// 24px scrolls. It does not grow with `--samples`. The recorded legacy
+/// constant `1786374846` is that sum, from the `W3COS_LAYOUT_NG=0` engine.
+const SCROLL_CHECKSUM_FRAMES: usize = 3;
 const HOST_ITERS: usize = 800;
 
 fn main() {
@@ -81,8 +85,9 @@ fn main() {
     let style = measure_style_and_incremental(samples);
     let paint = measure_scroll_paint(samples);
     let host = measure_host_calls(samples);
+    let layout_ng = w3cos_runtime::layout::layout_ng_mode_name();
     let report = format!(
-        "{{\n  \"harness\": \"w3cos-runtime-bench\",\n  \"profile\": \"runtime-bench\",\n  \"viewport\": [{VIEW_W}, {VIEW_H}],\n  \"startup\": {startup},\n  \"style_layout\": {},\n  \"incremental_width\": {},\n  \"incremental_background\": {},\n  \"incremental_text\": {},\n  \"incremental_class\": {},\n  \"incremental_insert\": {},\n  \"incremental_remove\": {},\n  \"paint_scroll\": {paint},\n  \"host_calls\": {host}\n}}\n",
+        "{{\n  \"harness\": \"w3cos-runtime-bench\",\n  \"profile\": \"runtime-bench\",\n  \"layout_ng\": \"{layout_ng}\",\n  \"viewport\": [{VIEW_W}, {VIEW_H}],\n  \"startup\": {startup},\n  \"style_layout\": {},\n  \"incremental_width\": {},\n  \"incremental_background\": {},\n  \"incremental_text\": {},\n  \"incremental_class\": {},\n  \"incremental_insert\": {},\n  \"incremental_remove\": {},\n  \"paint_scroll\": {paint},\n  \"host_calls\": {host}\n}}\n",
         style.style,
         style.width,
         style.background,
@@ -138,7 +143,7 @@ fn run_startup_child() {
     let built_us = started.elapsed().as_micros();
     let style_started = Instant::now();
     let tree = dom::to_component_tree();
-    let laid_out = layout::compute(&tree, VIEW_W, VIEW_H).expect("example layout");
+    let laid_out = layout_rects(&tree, VIEW_W, VIEW_H);
     let style_layout_us = style_started.elapsed().as_micros();
     let paint_started = Instant::now();
     let frame = headless::render_document_rgba(VIEW_W as u32, VIEW_H as u32).expect("first frame");
@@ -285,7 +290,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         let tree = dom::to_component_tree();
         let style_us = style_started.elapsed().as_micros();
         let layout_started = Instant::now();
-        let laid_out = layout::compute(&tree, VIEW_W, VIEW_H).expect("large layout");
+        let laid_out = layout_rects(&tree, VIEW_W, VIEW_H);
         let layout_us = layout_started.elapsed().as_micros();
         layout_checksum = rect_checksum(&laid_out);
         if laid_out.len() < 1000 {
@@ -322,13 +327,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         let px = 160 + index * 17;
         dom::set_style_property(target, "width", &format!("{px}px"));
         let sample = time_flush("width");
-        if subtree_gate() {
-            assert_subtree("width", &sample, nodes);
-            if sample.kind != "style-subtree" {
-                eprintln!("width flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("width", &sample, nodes, "style-subtree");
         width_samples.push(sample);
     }
     let after_width = node_width(target);
@@ -345,6 +344,17 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
     }
     let sibling_after = node_rect(sibling);
     let sibling_moved = rects_differ(sibling_before, sibling_after);
+    if sibling_moved {
+        eprintln!("background edit moved a sibling");
+        std::process::exit(1);
+    }
+    if subtree_gate() {
+        let kind = background_samples.last().expect("background").kind;
+        if kind != "paint" {
+            eprintln!("background flush kind {kind}");
+            std::process::exit(1);
+        }
+    }
     let background = dom::with_document(|document| {
         document
             .computed_style_for(NodeId::from_u32(target))
@@ -366,13 +376,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         let words = "alpha beta gamma delta epsilon zeta eta theta ".repeat(8 + index * 4);
         dom::set_text_content(text_node, &words);
         let sample = time_flush("text");
-        if subtree_gate() {
-            assert_subtree("text", &sample, nodes);
-            if sample.kind != "splice" {
-                eprintln!("text flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("text", &sample, nodes, "splice");
         text_samples.push(sample);
     }
     let after_text_height = node_height(text_cell);
@@ -395,13 +399,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
             dom::class_list_remove(class_cell, "wide");
         }
         let sample = time_flush("class");
-        if subtree_gate() {
-            assert_subtree("class", &sample, nodes);
-            if sample.kind != "style-subtree" {
-                eprintln!("class flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("class", &sample, nodes, "style-subtree");
         let width = node_width(class_cell);
         if (width - previous_class_width).abs() >= 1.0 {
             class_width_changed = true;
@@ -428,13 +426,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         dom::append_child(cell, text);
         dom::append_child(column, cell);
         let sample = time_flush("insert");
-        if subtree_gate() {
-            assert_subtree("insert", &sample, nodes);
-            if sample.kind != "splice" {
-                eprintln!("insert flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("insert", &sample, nodes, "splice");
         if dom::children(column).len() != before_children + 1 {
             eprintln!("insert did not add a child");
             std::process::exit(1);
@@ -458,13 +450,7 @@ fn measure_style_and_incremental(samples: usize) -> StyleIncremental {
         }
         dom::remove_child(column, cell);
         let sample = time_flush("remove");
-        if subtree_gate() {
-            assert_subtree("remove", &sample, nodes);
-            if sample.kind != "splice" {
-                eprintln!("remove flush kind {}", sample.kind);
-                std::process::exit(1);
-            }
-        }
+        assert_column_edit("remove", &sample, nodes, "splice");
         if dom::children(column).len() != before_children {
             eprintln!("remove did not restore the child count");
             std::process::exit(1);
@@ -544,12 +530,22 @@ fn time_flush(label: &str) -> TimedFlush {
     }
 }
 
-/// A one-node edit that lays out the whole document is the old path.
-fn assert_subtree(label: &str, sample: &TimedFlush, nodes: usize) {
-    if sample.kind == "retained" || sample.kind == "rebuild" || sample.solved as usize * 4 >= nodes
+/// Column sections in the large document. A width or class edit re-lowers
+/// that one item, and a text or child-list edit splices its column. Both
+/// modes must take `off_kind` and must not walk the document. `retained`
+/// and `rebuild` do not satisfy the check. Geometry checks outside this
+/// function stay in force.
+fn assert_column_edit(label: &str, sample: &TimedFlush, nodes: usize, off_kind: &str) {
+    if !subtree_gate() {
+        return;
+    }
+    if sample.kind == "retained"
+        || sample.kind == "rebuild"
+        || sample.kind != off_kind
+        || sample.solved as usize * 4 >= nodes
     {
         eprintln!(
-            "{label} solved the whole tree: kind {} solved {} shifted {} nodes {nodes}",
+            "{label} lost the subtree: kind {} solved {} shifted {} nodes {nodes} (want {off_kind})",
             sample.kind, sample.solved, sample.shifted
         );
         std::process::exit(1);
@@ -685,16 +681,24 @@ fn measure_scroll_paint(samples: usize) -> String {
         eprintln!("scroll list raster is empty");
         std::process::exit(1);
     }
+    // Timing uses every requested sample. The checksum stops after the
+    // historical three scrolls (offsets 24, 48, 72). A 15-sample timing run
+    // must not fold the later frames into `1786374846`.
+    let frames = samples.max(SCROLL_CHECKSUM_FRAMES);
     let mut scroll_samples = Vec::with_capacity(samples);
-    for index in 0..samples {
+    for index in 0..frames {
         dom::set_scroll_offset(list, None, Some(24.0 * (index as f32 + 1.0)));
         let started = Instant::now();
         let frame = headless::render_document_rgba(800, 600).expect("scrolled frame");
-        scroll_samples.push(started.elapsed().as_micros());
-        checksum = checksum.wrapping_add(pixel_checksum(&frame.rgba));
+        if index < samples {
+            scroll_samples.push(started.elapsed().as_micros());
+        }
+        if index < SCROLL_CHECKSUM_FRAMES {
+            checksum = checksum.wrapping_add(pixel_checksum(&frame.rgba));
+        }
     }
     format!(
-        "{{\"rows\": {SCROLL_ROWS}, \"first_us\": {first_us}, \"scroll_median_us\": {}, \"scroll_samples_us\": {}, \"checksum\": {checksum}}}",
+        "{{\"rows\": {SCROLL_ROWS}, \"first_us\": {first_us}, \"scroll_median_us\": {}, \"scroll_samples_us\": {}, \"checksum_frames\": {SCROLL_CHECKSUM_FRAMES}, \"checksum\": {checksum}}}",
         median(&scroll_samples),
         json_us(&scroll_samples),
     )
@@ -761,7 +765,8 @@ fn warm_font() {
     let text = dom::create_text_node("Warm");
     dom::append_child(dom::body_id(), text);
     let tree = dom::to_component_tree();
-    let _ = layout::compute(&tree, 64.0, 64.0);
+    let flat = layout::pre_flatten(&tree);
+    let _ = layout::LayoutEngine::new().compute(&tree, &flat, 64.0, 64.0);
 }
 
 fn node_width(id: u32) -> f32 {
@@ -783,6 +788,16 @@ fn rects_differ(left: LayoutRect, right: LayoutRect) -> bool {
         || (left.y - right.y).abs() > 0.5
         || (left.width - right.width).abs() > 0.5
         || (left.height - right.height).abs() > 0.5
+}
+
+/// Layout through `LayoutEngine`, so an unset flag and `W3COS_LAYOUT_NG=1`
+/// measure NG, and `=0` measures the legacy engine.
+fn layout_rects(tree: &w3cos_std::Component, w: f32, h: f32) -> Vec<(LayoutRect, usize)> {
+    let flat = layout::pre_flatten(tree);
+    layout::LayoutEngine::new()
+        .compute(tree, &flat, w, h)
+        .expect("layout")
+        .layout_cache
 }
 
 fn rect_checksum(layout: &[(LayoutRect, usize)]) -> u64 {

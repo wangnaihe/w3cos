@@ -7,8 +7,20 @@ one machine. Numbers below are from that harness. They are not a budget.
 
 ```sh
 cargo build --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --no-default-features --features cpu-render
+# Unset W3COS_LAYOUT_NG: LayoutNG is the default, same as =1.
 target/runtime-bench/w3cos-runtime-bench --output runtime-bench.json --samples 3
+# Legacy escape hatch. Its checksums stay the historical constants below.
+W3COS_LAYOUT_NG=0 target/runtime-bench/w3cos-runtime-bench --output runtime-bench-legacy.json --samples 3
+python3 scripts/check-runtime-bench.py runtime-bench.json
+python3 scripts/check-runtime-bench.py --expect-legacy-checksums runtime-bench-legacy.json
 ```
+
+LayoutNG is on unless `W3COS_LAYOUT_NG=0`. The default report is the NG
+lane and is not required to match the legacy checksums. The `=0` lane
+keeps those constants: large-layout rects `18294915160932`, startup
+layout rects `31627714668`, startup paint `150112521`, scroll paint
+`1786374846`. The scroll constant is the first list frame plus three
+24px scrolls. Later `--samples` frames are timed and are not added in.
 
 The `runtime-bench` profile matches release optimization (`opt-level` 3)
 with LTO off, 16 codegen units, and symbols kept. CPU raster (`cpu-render`,
@@ -31,13 +43,16 @@ not change the DOM or layout it claims to measure.
 
 ## CI
 
-`.github/workflows/ci.yml` job `runtime-bench` builds the same binary, runs
-`--samples 3`, checks that the tree has at least 5000 nodes, that medians
+`.github/workflows/ci.yml` job `runtime-bench` builds the same binary and
+runs `--samples 3` twice: once with LayoutNG left at its default, and once
+with `W3COS_LAYOUT_NG=0` so the legacy checksum tuple still has a lane. It
+checks that the tree has at least 5000 nodes, that medians
 are positive, that each edit changes the box it claims to change, that a
 one-node edit is faster than four times the same run's full style-plus-layout
 median, and that the width, text, class, insert, and remove edits lay out a
 subtree (`solved_nodes * 4 < nodes`) rather than the whole tree.
-The job uploads `runtime-bench.json` as the `runtime-bench` artifact. Absolute
+The job uploads `runtime-bench.json` and `runtime-bench-legacy.json` as the
+`runtime-bench` artifact. Absolute
 microseconds are not a gate.
 
 The same sanity gate can be run locally with
