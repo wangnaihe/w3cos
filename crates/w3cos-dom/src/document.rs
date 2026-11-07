@@ -4421,6 +4421,54 @@ impl Document {
                     crate::css_style::inherit_box_alignment(&mut style, parent, longhand);
                 }
             }
+            // `gap` / `row-gap` / `column-gap`: `inherit` copies the parent's
+            // computed gaps (including `normal` as None). A later longhand
+            // beats an earlier shorthand when deciding which axis inherits.
+            let gap_inherit = |value: &str| value.trim().eq_ignore_ascii_case("inherit");
+            let last_affecting = |names: &[&str]| {
+                author_declarations
+                    .iter()
+                    .filter(|(name, value, _)| {
+                        names.iter().any(|property| css_property_eq(name, property))
+                            && declaration_value_is_valid(name, value)
+                    })
+                    .map(|(_, value, _)| value.as_str())
+                    .last()
+            };
+            let gap_names = ["gap", "grid-gap", "gridGap"];
+            let row_names = [
+                "gap",
+                "grid-gap",
+                "gridGap",
+                "row-gap",
+                "rowGap",
+                "grid-row-gap",
+                "gridRowGap",
+            ];
+            let column_names = [
+                "gap",
+                "grid-gap",
+                "gridGap",
+                "column-gap",
+                "columnGap",
+                "grid-column-gap",
+                "gridColumnGap",
+            ];
+            let row_wins_inherit = last_affecting(&row_names).is_some_and(gap_inherit);
+            let column_wins_inherit = last_affecting(&column_names).is_some_and(gap_inherit);
+            if last_affecting(&gap_names).is_some_and(gap_inherit)
+                && row_wins_inherit
+                && column_wins_inherit
+            {
+                crate::css_style::inherit_gap(&mut style, parent, "gap");
+            } else {
+                if row_wins_inherit {
+                    crate::css_style::inherit_gap(&mut style, parent, "row-gap");
+                }
+                if column_wins_inherit {
+                    crate::css_style::inherit_gap(&mut style, parent, "column-gap");
+                }
+            }
         }
         if let Some(value) = declared_value(&["z-index", "zIndex"]) {
             match value.trim().to_ascii_lowercase().as_str() {

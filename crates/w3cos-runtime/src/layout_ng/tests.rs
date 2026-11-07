@@ -2212,6 +2212,53 @@ fn multicol_auto_height_text_align_last_stays_on_ng() {
 /// max-width, and a child's min-width keyword raises the item's
 /// min-content size (flexbox-min-width-auto-001,
 /// flex-item-content-is-min-width-max-content).
+/// Inc 7: auto×auto multicol under ordinary flex stays on NG; under
+/// grid / grid-lanes it stays legacy (gap-002 test+ref same-engine).
+#[test]
+fn multicol_auto_auto_under_flex_stays_on_ng_but_not_grid() {
+    use w3cos_std::style::CustomProperties;
+    let multicol = Style {
+        column_count: Some(3),
+        column_gap: None, // normal → 1em at used-value time
+        width: Dimension::Auto,
+        height: Dimension::Auto,
+        ..block()
+    };
+    let flex_parent = Style {
+        display: Display::Flex,
+        width: Dimension::Px(300.0),
+        height: Dimension::Px(200.0),
+        ..block()
+    };
+    let root = node(flex_parent, vec![node(multicol.clone(), vec![])]);
+    let flat = pre_flatten(&root);
+    assert!(super::columns::eligible(&flat, 1));
+
+    let grid_parent = Style {
+        display: Display::Grid,
+        width: Dimension::Px(300.0),
+        height: Dimension::Px(200.0),
+        ..block()
+    };
+    let root = node(grid_parent, vec![node(multicol.clone(), vec![])]);
+    let flat = pre_flatten(&root);
+    assert!(!super::columns::eligible(&flat, 1));
+
+    let mut lanes = Style {
+        display: Display::Flex,
+        width: Dimension::Px(300.0),
+        height: Dimension::Px(200.0),
+        ..block()
+    };
+    lanes.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-grid-lanes".into(),
+        "1".into(),
+    )]));
+    let root = node(lanes, vec![node(multicol, vec![])]);
+    let flat = pre_flatten(&root);
+    assert!(!super::columns::eligible(&flat, 1));
+}
+
 #[test]
 fn flex_auto_min_width_respects_max_width_and_child_keywords() {
     use w3cos_std::style::FlexDirection;

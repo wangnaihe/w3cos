@@ -363,6 +363,51 @@ pub fn inherit_box_alignment(style: &mut Style, parent: &Style, longhand: &str) 
     }
 }
 
+/// `inherit` for `gap` / `row-gap` / `column-gap` (CSS Box Alignment): copy
+/// the parent's used gaps and percentage-gap markers. `normal` is stored as
+/// `None` (multicol resolves it to 1em; flex/grid/lanes to 0).
+pub fn inherit_gap(style: &mut Style, parent: &Style, longhand: &str) {
+    let copy_marker = |style: &mut Style, key: &str| {
+        let value = parent
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(key))
+            .map(|value| value.to_string());
+        set_marker(style, key, value);
+    };
+    match longhand {
+        "gap" => {
+            style.gap = parent.gap;
+            style.row_gap = parent.row_gap;
+            style.column_gap = parent.column_gap;
+            copy_marker(style, PERCENT_GAP_PROPERTY);
+            copy_marker(style, ROW_GAP_PERCENT_PROPERTY);
+            copy_marker(style, COLUMN_GAP_PERCENT_PROPERTY);
+        }
+        "row-gap" => {
+            style.row_gap = parent.row_gap;
+            copy_marker(style, ROW_GAP_PERCENT_PROPERTY);
+            let parent_has_row = parent
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(PERCENT_GAP_PROPERTY))
+                .is_some_and(|value| value == "row" || value == "both");
+            update_percent_gap(style, Some(parent_has_row), None);
+        }
+        "column-gap" => {
+            style.column_gap = parent.column_gap;
+            copy_marker(style, COLUMN_GAP_PERCENT_PROPERTY);
+            let parent_has_column = parent
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(PERCENT_GAP_PROPERTY))
+                .is_some_and(|value| value == "column" || value == "both");
+            update_percent_gap(style, None, Some(parent_has_column));
+        }
+        _ => {}
+    }
+}
+
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
     // A later size declaration of the same property replaces `stretch`.
     if let Some(token) = stretch_token_of(key) {
@@ -966,34 +1011,72 @@ impl CSSStyleDeclaration {
 
             // `grid-gap`, `grid-row-gap`, and `grid-column-gap` are the legacy
             // aliases (CSS Box Alignment) that Chrome still parses.
+            // `normal` / `initial` / `unset` clear to the initial `normal`
+            // (stored as `None`). `inherit` is resolved against the parent in
+            // document.rs (`inherit_gap`).
             "gap" | "grid-gap" | "gridGap" => {
-                let parts = split_css_whitespace(value);
-                let row_pct = parts.first().is_some_and(|part| part.contains('%'));
-                let column_pct = parts
-                    .get(1)
-                    .map(|part| part.contains('%'))
-                    .unwrap_or(row_pct);
-                update_percent_gap(&mut self.inner, Some(row_pct), Some(column_pct));
-                if let Some(row) = parts.first() {
-                    let column = parts.get(1).unwrap_or(row);
-                    update_percent_gap_values(&mut self.inner, Some(row), Some(column));
-                }
-                if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
-                    self.inner.row_gap = Some(v);
-                    self.inner.column_gap =
-                        Some(parts.get(1).and_then(|part| parse_px(part)).unwrap_or(v));
-                    self.inner.gap = v;
+                let lower = value.trim().to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "normal" | "initial" | "unset" | "revert" | "revert-layer"
+                ) {
+                    self.inner.row_gap = None;
+                    self.inner.column_gap = None;
+                    self.inner.gap = 0.0;
+                    update_percent_gap(&mut self.inner, Some(false), Some(false));
+                    set_marker(&mut self.inner, ROW_GAP_PERCENT_PROPERTY, None);
+                    set_marker(&mut self.inner, COLUMN_GAP_PERCENT_PROPERTY, None);
+                } else if lower == "inherit" {
+                    // Parent copy happens in `inherit_gap`.
+                } else {
+                    let parts = split_css_whitespace(value);
+                    let row_pct = parts.first().is_some_and(|part| part.contains('%'));
+                    let column_pct = parts
+                        .get(1)
+                        .map(|part| part.contains('%'))
+                        .unwrap_or(row_pct);
+                    update_percent_gap(&mut self.inner, Some(row_pct), Some(column_pct));
+                    if let Some(row) = parts.first() {
+                        let column = parts.get(1).unwrap_or(row);
+                        update_percent_gap_values(&mut self.inner, Some(row), Some(column));
+                    }
+                    if let Some(v) = parts.first().and_then(|part| parse_px(part)) {
+                        self.inner.row_gap = Some(v);
+                        self.inner.column_gap =
+                            Some(parts.get(1).and_then(|part| parse_px(part)).unwrap_or(v));
+                        self.inner.gap = v;
+                    }
                 }
             }
             "row-gap" | "rowGap" | "grid-row-gap" | "gridRowGap" => {
-                update_percent_gap(&mut self.inner, Some(value.contains('%')), None);
-                update_percent_gap_values(&mut self.inner, Some(value), None);
-                self.inner.row_gap = parse_px(value);
+                let lower = value.trim().to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "normal" | "initial" | "unset" | "revert" | "revert-layer"
+                ) {
+                    self.inner.row_gap = None;
+                    update_percent_gap(&mut self.inner, Some(false), None);
+                    set_marker(&mut self.inner, ROW_GAP_PERCENT_PROPERTY, None);
+                } else if lower != "inherit" {
+                    update_percent_gap(&mut self.inner, Some(value.contains('%')), None);
+                    update_percent_gap_values(&mut self.inner, Some(value), None);
+                    self.inner.row_gap = parse_px(value);
+                }
             }
             "column-gap" | "columnGap" | "grid-column-gap" | "gridColumnGap" => {
-                update_percent_gap(&mut self.inner, None, Some(value.contains('%')));
-                update_percent_gap_values(&mut self.inner, None, Some(value));
-                self.inner.column_gap = parse_px(value);
+                let lower = value.trim().to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "normal" | "initial" | "unset" | "revert" | "revert-layer"
+                ) {
+                    self.inner.column_gap = None;
+                    update_percent_gap(&mut self.inner, None, Some(false));
+                    set_marker(&mut self.inner, COLUMN_GAP_PERCENT_PROPERTY, None);
+                } else if lower != "inherit" {
+                    update_percent_gap(&mut self.inner, None, Some(value.contains('%')));
+                    update_percent_gap_values(&mut self.inner, None, Some(value));
+                    self.inner.column_gap = parse_px(value);
+                }
             }
             "column-width" | "columnWidth" => {
                 if let Some(width) = parse_column_width(value) {
@@ -8807,6 +8890,35 @@ fn grid_lanes_stays_flex_and_percent_gaps_are_marked() {
             .as_ref()
             .is_none_or(|props| !props.contains_key(PERCENT_GAP_PROPERTY))
     );
+}
+
+#[test]
+fn gap_normal_clears_prior_pixel_gaps() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("gap", "10px");
+    assert_eq!(declaration.inner.row_gap, Some(10.0));
+    assert_eq!(declaration.inner.column_gap, Some(10.0));
+    declaration.set_property("gap", "normal");
+    assert_eq!(declaration.inner.row_gap, None);
+    assert_eq!(declaration.inner.column_gap, None);
+    assert_eq!(declaration.inner.gap, 0.0);
+}
+
+#[test]
+fn inherit_gap_copies_normal_and_pixel_gaps() {
+    let mut parent = CSSStyleDeclaration::new();
+    parent.set_property("gap", "normal");
+    let mut child = CSSStyleDeclaration::new();
+    child.set_property("gap", "20px");
+    inherit_gap(&mut child.inner, &parent.inner, "gap");
+    assert_eq!(child.inner.row_gap, None);
+    assert_eq!(child.inner.column_gap, None);
+
+    parent.set_property("gap", "12px 4px");
+    inherit_gap(&mut child.inner, &parent.inner, "gap");
+    assert_eq!(child.inner.row_gap, Some(12.0));
+    assert_eq!(child.inner.column_gap, Some(4.0));
+    assert_eq!(child.inner.gap, 12.0);
 }
 
 #[test]

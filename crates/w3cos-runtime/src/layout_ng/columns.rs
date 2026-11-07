@@ -8,6 +8,7 @@
 //! Inc 4 admits floats and nested multicol in the continuous column
 //! flow. Inc 5 admits abspos in the continuous-flow BFC. Inc 6 admits
 //! auto-height text-align-last (NG text pieces skip paint-time re-align).
+//! Inc 7 admits auto×auto under ordinary flex; grid/lanes/inline-grid parents stay legacy.
 
 use crate::layout::FlatNodeInfo;
 use w3cos_std::style::{ColumnFill, Dimension, Display, Style, WritingMode};
@@ -25,10 +26,13 @@ pub(super) fn establishes(style: &Style) -> bool {
     ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
 }
 
-/// Inc 6: horizontal-tb block multicol may have auto/percent/ch width or
-/// height, in-flow floats, nested multicol, abspos children, and
+/// Inc 7: horizontal-tb block multicol may have auto/percent/ch width or
+/// height, in-flow floats, nested multicol, abspos children,
 /// auto-height text-align-last (layout-applied; paint pieces do not
-/// re-align). Auto×auto under a flex/grid parent stays legacy (gap-002).
+/// re-align), and auto×auto under ordinary flex parents. Auto×auto under
+/// a grid / grid-lanes / inline-grid parent stays legacy (gap-002: the
+/// test's lanes item and the ref's inline-grid item must share an engine;
+/// multicol-as-grid-item sizing is still wrong).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
     let style = flat[index].style;
     if !establishes(style) {
@@ -39,10 +43,9 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
     }
     if matches!(style.width, Dimension::Auto) && matches!(style.height, Dimension::Auto) {
         if let Some(parent) = flat[index].parent {
-            let parent_style = flat[parent].style;
-            if super::block::is_author_flex(parent_style)
-                || super::block::is_author_grid(parent_style)
-            {
+            // Keep grid (incl. lanes / inline-grid) on legacy so gap-002's
+            // test+ref stay same-engine. Ordinary flex parents are OK.
+            if super::block::is_author_grid(flat[parent].style) {
                 return false;
             }
         }

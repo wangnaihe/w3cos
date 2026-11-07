@@ -4005,10 +4005,8 @@ pub(super) fn shrink_to_fit(
     Some(clamp_inline_in(style, space, edges, width.max(0.0), cb))
 }
 
-/// Author `display:flex`. Synthetic boxes stay on their own algorithms:
-/// an IFC-marker row is an inline formatting context, and a float-group
-/// row is transparent in its parent's BFC.
-fn is_grid_lanes(style: &Style) -> bool {
+/// Internal marker set by `display: grid-lanes` / `inline grid-lanes`.
+pub(super) fn is_grid_lanes(style: &Style) -> bool {
     marker(style, "--w3cos-internal-grid-lanes").is_some()
 }
 
