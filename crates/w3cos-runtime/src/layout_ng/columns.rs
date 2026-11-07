@@ -6,10 +6,11 @@
 //! for `height: auto` uses a simple equal split of the continuous flow
 //! height across the column count. Inc 3 admits auto/percent/ch sizes;
 //! Inc 4 admits floats and nested multicol in the continuous column
-//! flow; abspos and auto-height text-align-last stay on later slices.
+//! flow. Inc 5 admits abspos in the continuous-flow BFC. Auto-height
+//! text-align-last stays on a later slice (column-aware last-line).
 
 use crate::layout::FlatNodeInfo;
-use w3cos_std::style::{ColumnFill, Dimension, Display, Position, Style, WritingMode};
+use w3cos_std::style::{ColumnFill, Dimension, Display, Style, WritingMode};
 
 /// Block containers that establish a multicol formatting context.
 pub(super) fn establishes(style: &Style) -> bool {
@@ -24,9 +25,9 @@ pub(super) fn establishes(style: &Style) -> bool {
     ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
 }
 
-/// Inc 4: horizontal-tb block multicol may have auto/percent/ch width or
-/// height, in-flow floats, and nested multicol (each nest runs eligible
-/// on its own). Still no abspos — that needs a later slice.
+/// Inc 5: horizontal-tb block multicol may have auto/percent/ch width or
+/// height, in-flow floats, nested multicol, and abspos children. Still
+/// bails auto-height text-align-last (needs column-aware last-line).
 /// Auto×auto under a flex/grid parent stays legacy (gap-002: `gap:inherit`
 /// of `normal` from grid-lanes pairs only on legacy today).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -47,19 +48,14 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
             }
         }
     }
-    // Abspos stays on legacy for this slice (fragmented inline CBs need
-    // a later slice). Floats and nested multicol use the continuous-flow
-    // BFC; each nested multicol re-checks eligible() on its own layout.
-    // Auto-height + text-align-last needs column-aware last-line alignment
-    // (text-align-last-015); keep those on legacy until that lands.
+    // Floats, nested multicol, and abspos use the continuous-flow BFC
+    // (each nest re-checks eligible()). Auto-height + text-align-last
+    // needs column-aware last-line alignment (text-align-last-015).
     let auto_height = matches!(style.height, Dimension::Auto);
     let end = flat[index].subtree_end;
     for node in &flat[index + 1..end] {
         if node.style.display == Display::None {
             continue;
-        }
-        if matches!(node.style.position, Position::Absolute | Position::Fixed) {
-            return false;
         }
         if auto_height
             && node
