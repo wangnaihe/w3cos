@@ -313,8 +313,12 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     // crate::text_layout's BreakMode::hang_last_punctuation).
     // line-break: loose / strict reach the breaker through
     // crate::line_break::BreakMode (Blink LazyLineBreakIterator strictness,
-    // LayoutLocale::LocaleWithBreakKeyword). `anywhere` is not applied yet.
-    if style.line_break == LineBreak::Anywhere {
+    // LayoutLocale::LocaleWithBreakKeyword). `anywhere` is BreakCharacter
+    // (ComputedStyle::GetLineBreakType) and stays on NG.
+    if !matches!(
+        style.line_break,
+        LineBreak::Auto | LineBreak::Normal | LineBreak::Anywhere
+    ) {
         return Some("text:line-break");
     }
     // break-spaces: the sole-leaf wrap runs through crate::line_break
@@ -1467,8 +1471,13 @@ pub(super) fn internal_opportunity(content: &str, style: &Style) -> bool {
     } else {
         core
     };
-    if style.word_break != WordBreak::BreakAll && core.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        // FillAscii: no opportunity between ASCII letters and digits.
+    if style.word_break != WordBreak::BreakAll
+        && style.line_break != LineBreak::Anywhere
+        && core.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        // FillAscii: no opportunity between ASCII letters and digits
+        // (break-all adds one between any two; line-break: anywhere is
+        // BreakCharacter, every grapheme).
         return false;
     }
     // keep-all / auto-phrase remove the CJK opportunities of the legacy
