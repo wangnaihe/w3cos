@@ -65,14 +65,31 @@ pub(crate) fn normalize_font_bytes_with_limit(
             ));
         }
     }
-    let decoded =
-        match bytes.get(..4) {
-            Some(b"wOFF") => wuff::decompress_woff1(bytes)
-                .map_err(|error| format!("WOFF decode failed: {error:?}")),
-            Some(b"wOF2") => wuff::decompress_woff2(bytes)
-                .map_err(|error| format!("WOFF2 decode failed: {error:?}")),
-            _ => Ok(bytes.to_vec()),
-        }?;
+    let decoded = match bytes.get(..4) {
+        Some(b"wOFF") => {
+            #[cfg(feature = "woff")]
+            {
+                wuff::decompress_woff1(bytes)
+                    .map_err(|error| format!("WOFF decode failed: {error:?}"))
+            }
+            #[cfg(not(feature = "woff"))]
+            {
+                Err("WOFF decoding requires the woff feature".to_string())
+            }
+        }
+        Some(b"wOF2") => {
+            #[cfg(feature = "woff")]
+            {
+                wuff::decompress_woff2(bytes)
+                    .map_err(|error| format!("WOFF2 decode failed: {error:?}"))
+            }
+            #[cfg(not(feature = "woff"))]
+            {
+                Err("WOFF2 decoding requires the woff feature".to_string())
+            }
+        }
+        _ => Ok(bytes.to_vec()),
+    }?;
     if decoded.len() > max_decoded_bytes {
         return Err(format!(
             "decoded font exceeds source limit ({} > {max_decoded_bytes} bytes)",
@@ -1902,9 +1919,25 @@ mod tests {
         assert!(resolved.unwrap().is_monospace);
     }
 
-    /// The CPU-only AOT build (no `dynamic-js`) must still decode WOFF: Code-OSS
-    /// ships its seti file icons as `seti.woff`. A bad payload fails in the
-    /// decoder rather than at a missing-feature stub.
+    /// Ordinary AOT (no `woff`) refuses compressed fonts at a feature stub so
+    /// the size probe does not link wuff/brotli. Product builds that need
+    /// Code-OSS `seti.woff` enable the `woff` feature without `dynamic-js`.
+    #[cfg(not(feature = "woff"))]
+    #[test]
+    fn woff_decoding_requires_woff_feature() {
+        let mut bogus = b"wOFF".to_vec();
+        bogus.resize(64, 0);
+        let error = normalize_font_bytes_with_limit(&bogus, 1 << 20).unwrap_err();
+        assert!(error.contains("woff feature"), "{error}");
+        let mut bogus2 = b"wOF2".to_vec();
+        bogus2.resize(64, 0);
+        let error = normalize_font_bytes_with_limit(&bogus2, 1 << 20).unwrap_err();
+        assert!(error.contains("woff feature"), "{error}");
+    }
+
+    /// With `woff` enabled (Code-OSS cpu-render or dynamic-js), a bad payload
+    /// fails in the decoder rather than at a missing-feature stub.
+    #[cfg(feature = "woff")]
     #[test]
     fn woff_decoding_does_not_depend_on_dynamic_js() {
         let mut bogus = b"wOFF".to_vec();
@@ -1917,7 +1950,7 @@ mod tests {
         assert!(error.contains("decode failed"), "{error}");
     }
 
-    #[cfg(feature = "dynamic-js")]
+    #[cfg(feature = "woff")]
     #[test]
     fn normalizes_woff_and_woff2_to_shared_sfnt_bytes() {
         use base64::Engine as _;
