@@ -392,10 +392,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fragment_boundaries_clear_single_source_identity() {
+    fn fragment_boundaries_clear_preexisting_legacy_source_identity() {
         let mut style = Style::default();
-        set_source_run(&mut style, "run");
-        assert_eq!(source_run(&style), Some("run"));
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(SOURCE_RUN.into(), "legacy-run".into());
+        assert_eq!(style.text_source_run, None);
+        assert_eq!(source_run(&style), Some("legacy-run"));
 
         set_fragment_ends(&mut style, "ab", &[1, 2]);
 
