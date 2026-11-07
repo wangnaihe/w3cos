@@ -23,6 +23,7 @@ pub fn set_source_run(style: &mut Style, source: impl AsRef<str>) {
     // also accepts a legacy custom-property SOURCE_RUN from main grafts.
     style.text_source_run = Some(std::sync::Arc::from(source.as_ref()));
 }
+
 pub const DECORATION_COLOR: &str = "--w3cos-internal-text-decoration-color";
 pub const CSSOM_OWNER_RANGES: &str = "--w3cos-internal-cssom-owner-ranges";
 pub const CSSOM_BOX_OWNERS: &str = "--w3cos-internal-cssom-box-owners";
@@ -389,6 +390,19 @@ pub fn set_fragment_ends(style: &mut Style, text: &str, ends: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_source_run_precedes_legacy_fixture_metadata() {
+        let mut style = Style::default();
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert(SOURCE_RUN.into(), "legacy".into());
+        assert_eq!(source_run(&style), Some("legacy"));
+
+        set_source_run(&mut style, "dedicated");
+        assert_eq!(source_run(&style), Some("dedicated"));
+    }
 
     #[test]
     fn explicit_decoration_color_survives_used_text_and_owner_snapshots() {
