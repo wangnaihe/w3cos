@@ -117,6 +117,12 @@ pub(crate) fn push_feature(features: &mut Vec<String>, feature: &str) {
 }
 
 pub(crate) fn append_desktop_codecs(features: &mut Vec<String>, options: &CompileOptions) {
+    // Code-OSS's CPU-rendered desktop loads its file-icon face from
+    // seti.woff. Keep the capability on the generated product manifest, while
+    // the renderer-free ordinary-AOT linkage probe remains WOFF-free.
+    if features.iter().any(|feature| feature == "cpu-render") {
+        push_feature(features, "woff");
+    }
     for feature in DESKTOP_IMAGE_FEATURES {
         push_feature(features, feature);
     }
@@ -2044,6 +2050,25 @@ mod tests {
                 "{engine} must be speed-optimized inside the size profile: {toml}"
             );
         }
+    }
+
+    #[test]
+    fn code_oss_cpu_render_manifest_features_include_woff_without_dynamic_js() {
+        let mut features = vec!["cpu-render".to_string()];
+        append_desktop_codecs(&mut features, &CompileOptions::default());
+        let manifest_features = format_features(&features);
+        assert!(manifest_features.contains(r#""cpu-render""#));
+        assert!(manifest_features.contains(r#""woff""#));
+        assert!(!manifest_features.contains(r#""dynamic-js""#));
+        append_desktop_codecs(&mut features, &CompileOptions::default());
+        assert_eq!(
+            features.iter().filter(|feature| *feature == "woff").count(),
+            1
+        );
+
+        let mut ordinary_aot_features = Vec::new();
+        append_desktop_codecs(&mut ordinary_aot_features, &CompileOptions::default());
+        assert!(!format_features(&ordinary_aot_features).contains(r#""woff""#));
     }
 
     #[test]
