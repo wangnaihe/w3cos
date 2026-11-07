@@ -24,6 +24,7 @@
 //! `unsupported_tree` report a reason and the legacy engine runs.
 
 mod block;
+mod columns;
 mod exclusion;
 mod flex;
 mod grid;

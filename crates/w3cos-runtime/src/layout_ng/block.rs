@@ -233,20 +233,6 @@ fn unsupported_style(style: &Style, allowed: &[&str]) -> Option<&'static str> {
 
 /// `atomic`: an inline-block in an IFC (its display is the IFC's concern).
 
-/// CSS Multicol: column properties create a multicol container only on
-/// block containers (and table cells/captions). Flex/grid ignore them.
-fn establishes_column_context(style: &Style) -> bool {
-    matches!(
-        style.display,
-        Display::Block
-            | Display::FlowRoot
-            | Display::InlineBlock
-            | Display::ListItem
-            | Display::TableCell
-            | Display::TableCaption
-    ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
-}
-
 fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Option<&'static str> {
     if let Some(reason) = unsupported_marker(style, allowed) {
         return Some(reason);
@@ -309,12 +295,10 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     if non_visible_overflow(style) && !style.display.establishes_overflow_clip() {
         return Some("overflow:inline");
     }
-    // Multicol only applies to block containers (CSS Multicol / Blink).
-    // Flex and grid containers ignore `column-*`; bailing here sent those
-    // pages to legacy while their refs stayed on NG.
-    if establishes_column_context(style) {
-        return Some("columns");
-    }
+    // Flex/grid ignore Multicol `column-*`. Block multicol is accepted
+    // here; `layout_block_in` runs `columns::eligible` and bails the
+    // unsupported remainder at runtime (fragmentainer / floats / nested).
+
     // direction: rtl places block children from the right (resolve_inline).
     if !block_unicode_bidi_ok(style) {
         return Some("unicode-bidi");
@@ -4194,12 +4178,14 @@ pub(super) fn is_author_grid(style: &Style) -> bool {
 
 fn is_bfc_root(style: &Style) -> bool {
     // A flex or grid container establishes an independent formatting
-    // context (CSS Flexbox §3, CSS Grid §1). Non-visible overflow does
-    // too, on the boxes CSS 2.1 11.1.1 clips (CSS2 9.4.1).
+    // context (CSS Flexbox §3, CSS Grid §1). Multicol containers do too
+    // (CSS Multicol §2). Non-visible overflow does on the boxes CSS 2.1
+    // 11.1.1 clips (CSS2 9.4.1).
     style.display == Display::FlowRoot
         || style.display == Display::Table
         || is_author_flex(style)
         || is_author_grid(style)
+        || super::columns::establishes(style)
         || (non_visible_overflow(style) && style.display.establishes_overflow_clip())
 }
 
@@ -4450,6 +4436,10 @@ pub(super) fn layout_block_in(
 ) -> Option<LayoutResult> {
     let info = &flat[index];
     let style = info.style;
+    // Multicol first slice: eligible boxes stay on NG; others fall back.
+    if super::columns::establishes(style) && !super::columns::eligible(flat, index) {
+        return super::bail("columns");
+    }
     // An orthogonal (vertical) root inside a horizontal block container.
     if let Some(flow) = super::orthogonal::root_flow(flat, index) {
         return super::orthogonal::layout(flat, index, flow, space, sized, exclusions);
@@ -4723,9 +4713,22 @@ pub(super) fn layout_block_in(
         .custom_properties
         .as_ref()
         .is_some_and(|props| props.contains_key(inline::ANONYMOUS_BLOCK_MARKER));
+    // Multicol: children size against the used column width; the principal
+    // box keeps the full content width (paint projects fragments).
+    let column_width = super::columns::establishes(style)
+        .then(|| {
+            super::columns::used_width(
+                style,
+                metrics.content_width,
+                space.viewport_w,
+                space.viewport_h,
+            )
+        })
+        .flatten();
+    let flow_inline = column_width.unwrap_or(metrics.content_width);
     // A definite height, after min/max, is the children's percentage basis.
     let child_space = ConstraintSpace {
-        available_inline: metrics.content_width,
+        available_inline: flow_inline,
         // Anonymous blocks are skipped when finding the percentage
         // containing block (CSS 2.1 10.5).
         percentage_block: if anonymous_block {
@@ -5657,7 +5660,15 @@ pub(super) fn layout_block_in(
             };
             clamp_h(height.max(floor))
         }
-        (None, None) => clamp_h(auto_content),
+        (None, None) => {
+            let h = if let Some(col_w) = column_width {
+                let n = super::columns::count(style, metrics.content_width, col_w);
+                super::columns::content_block_size(style, None, auto_content, n)
+            } else {
+                auto_content
+            };
+            clamp_h(h)
+        }
     };
     // css-sizing-3: in a block container's block axis min-content,
     // max-content and fit-content all mean its content (auto) height, so

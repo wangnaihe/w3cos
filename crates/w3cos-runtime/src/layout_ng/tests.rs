@@ -1986,12 +1986,55 @@ fn flex_and_grid_ignore_column_properties() {
     let flat_block = pre_flatten(&root_block);
     assert_eq!(block::unsupported_reasons(&flat_flex), Vec::<String>::new());
     assert_eq!(block::unsupported_reasons(&flat_grid), Vec::<String>::new());
-    assert!(
-        block::unsupported_reasons(&flat_block)
-            .iter()
-            .any(|r| r.contains("columns")),
-        "{:?}",
-        block::unsupported_reasons(&flat_block)
+    // Eligible simple block multicol stays on NG (first columns slice).
+    assert_eq!(
+        block::unsupported_reasons(&flat_block),
+        Vec::<String>::new()
+    );
+    let ng = layout_tree(&root_block, &flat_block, 800.0, 600.0).expect("multicol ng");
+    assert_eq!(
+        rect(&ng, 1),
+        (0.0, 0.0, 100.0, 20.0),
+        "principal keeps full width"
+    );
+}
+
+/// Legacy `multicol_children_use_column_width_without_replacing_principal_box`
+/// on NG: principal keeps 300×100; the child is the column-width flow.
+#[test]
+fn multicol_children_use_column_width_continuous_flow() {
+    let root = node(
+        Style {
+            column_width: Dimension::Px(100.0),
+            column_gap: Some(0.0),
+            column_count: Some(3),
+            width: Dimension::Px(300.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                width: Dimension::Percent(100.0),
+                height: Dimension::Px(250.0),
+                ..block()
+            },
+            vec![],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(
+        rect(&ng, 0),
+        (0.0, 0.0, 300.0, 100.0),
+        "principal {:?}",
+        rect(&ng, 0)
+    );
+    assert_eq!(
+        rect(&ng, 1),
+        (0.0, 0.0, 100.0, 250.0),
+        "flow child {:?}",
+        rect(&ng, 1)
     );
 }
 
