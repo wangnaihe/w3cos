@@ -2737,6 +2737,12 @@ fn layout_lines(
             && can_wrap
             && flat[item.index].style.word_break == WordBreak::BreakWord
             && !item.whitespace_only
+            // pre / pre-wrap never take overflow-wrap emergency breaks
+            // (main #413; white-space-intrinsic-size-003 / 016).
+            && !matches!(
+                flat[item.index].style.white_space,
+                WhiteSpace::Pre | WhiteSpace::PreWrap
+            )
         {
             // An unbreakable word wider than the line takes an emergency
             // break (overflow-wrap: break-word), which S2 does not model.
@@ -3358,22 +3364,32 @@ pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
         && !content.chars().any(|c| {
             c != ' ' && is_soft_wrap_char(c) && !(c == '\u{ad}' && suppresses_hyphenation(style))
         })
-        && style.white_space != WhiteSpace::PreWrap
     {
-        Some(content.split(' ').map(width).fold(0.0f32, f32::max))
-    } else if !forced && style.white_space != WhiteSpace::PreWrap {
+        // Pre-wrap: trailing preserved spaces hang and do not affect
+        // min-content (CSS Text 3; white-space-intrinsic-size-003).
+        let body = if style.white_space == WhiteSpace::PreWrap {
+            content.trim_end_matches(' ')
+        } else {
+            content
+        };
+        Some(body.split(' ').map(width).fold(0.0f32, f32::max))
+    } else if !forced {
         // NGLineBreaker at available 0: every UAX #14 opportunity of the
-        // run's BreakMode (word-break / line-break / lang) is taken, so
-        // min-content is the widest unbreakable segment, trailing spaces
-        // hanging.
+        // run's BreakMode is taken; trailing hanging spaces (pre-wrap)
+        // do not contribute to min-content.
+        let body = if style.white_space == WhiteSpace::PreWrap {
+            content.trim_end_matches(' ')
+        } else {
+            content
+        };
         let mode = break_mode(style);
-        let mut cuts = crate::line_break::break_opportunities(content, mode);
-        cuts.retain(|&o| o > 0 && o < content.len());
-        cuts.push(content.len());
+        let mut cuts = crate::line_break::break_opportunities(body, mode);
+        cuts.retain(|&o| o > 0 && o < body.len());
+        cuts.push(body.len());
         let mut start = 0;
         let mut widest = 0.0f32;
         for cut in cuts {
-            let segment = content[start..cut].trim_end_matches(' ');
+            let segment = body[start..cut].trim_end_matches(' ');
             if !segment.is_empty() {
                 widest = widest.max(width(segment));
             }
@@ -3400,7 +3416,9 @@ pub(super) fn inline_min_max(
     if let [InlineEntry::Leaf(child)] = entries[..]
         && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
-        && (has_marker(flat[child].style, LINE_WIDTH_MARKER) || content.contains('\n'))
+        && (has_marker(flat[child].style, LINE_WIDTH_MARKER)
+            || content.contains('\n')
+            || flat[child].style.white_space == WhiteSpace::PreWrap)
     {
         return Some(text_min_max(content, flat[child].style));
     }
