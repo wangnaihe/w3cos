@@ -31,7 +31,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "sync #420 after WOFF-off ordinary AOT probe (b1e90996): CI attribution shows dynamic-js/image-codecs/host-* feature symbols at 0; growth is LayoutNG/runtime code from main (w3cos_runtime 2977846 symbol bytes). On x86_64-unknown-linux-gnu with Rust 1.99.1 stripped AOT probe is 12602400 bytes (+469920, 3.87% vs prior LayoutNG baseline). Still within the 20 MiB aot budget. Browser row left pending CI remeasure. Image codecs, web-bluetooth, host-tray, and host-keyring stay off."
+          "note": "Owner-accepted aot-port residual (wang naihe, 2026-11-07, PR #420): main->aot-port sync measured by CI run 42227585907 on b1e90996, x86_64-unknown-linux-gnu, Rust 1.99.1, release-size. Stripped AOT probe 12602400 bytes (+469920, 3.87% vs 12132480). WOFF/WOFF2 (wuff+brotli, 256768 bytes) stays off ordinary AOT behind the woff feature; dynamic-js feature symbols are 0. Residual vs main is aot-port runtime surface: w3cos_core +79296, core +25236, chrono clock (local Date getters) +18333, std +18108, w3cos_dom +12109, hashbrown +10737, unicode_bidi +7482 symbol bytes. LayoutNG stays in the binary, selected at run time (default off). Image codecs, web-bluetooth, web-geolocation, host-tray, and host-keyring stay off."
         }
       }
     },
@@ -42,19 +42,19 @@
       ],
       "targets": {
         "x86_64-unknown-linux-gnu": {
-          "total_bytes": 15618448,
-          "text_bytes": 10116616,
-          "data_bytes": 4483261,
-          "readonly_data_bytes": 3664897,
-          "gzip_bytes": 6802713,
+          "total_bytes": 16125368,
+          "text_bytes": 10477768,
+          "data_bytes": 4602897,
+          "readonly_data_bytes": 3758781,
+          "gzip_bytes": 7046427,
           "embedded_bytes": 0,
           "feature_symbol_bytes": {
             "cpu-render": 0,
-            "dynamic-js": 687346,
+            "dynamic-js": 730702,
             "gpu": 0,
             "host-keyring": 0,
             "host-tray": 0,
-            "image-codecs": 192080,
+            "image-codecs": 192083,
             "skia": 0,
             "web-bluetooth": 0,
             "web-device-access": 0,
@@ -63,7 +63,7 @@
             "web-media-advanced": 0,
             "web-serial": 0
           },
-          "note": "sync #420 pending browser remeasure on CI after AOT row update to 12602400 bytes (WOFF kept off ordinary AOT; attribution: no dynamic-js leak). Prior browser row 15618448 bytes from main LayoutNG baseline. Image codecs, web-bluetooth, host-tray, and host-keyring stay off."
+          "note": "Owner-accepted aot-port residual (wang naihe, 2026-11-07, PR #420): measured by CI run 42315155032 on 4b972823, x86_64-unknown-linux-gnu, Rust 1.99.1, release-size. Stripped dynamic-browser probe 16125368 bytes (+506920, 3.25% vs 15618448). Same attributed residual as the AOT row (w3cos_core +76022, std +18901, chrono clock +18481, core +11649, w3cos_dom +9862 symbol bytes vs main); dynamic-js feature symbols 730702 (+32577 vs main: brotli/W3IR/compiler). WOFF/WOFF2 is linked here through dynamic-js. Image codecs 192083. LayoutNG selected at run time (default off)."
         }
       }
     }
