@@ -8,7 +8,10 @@ use crate::retained_layers::{CompositorOverrides, LayerPaintAction, RetainedLaye
 use crate::text_layout;
 use crate::tile_manager::{TileManager, TileRequest};
 
-#[cfg(feature = "cpu-render")]
+#[cfg(any(
+    feature = "cpu-render",
+    all(feature = "skia", any(target_os = "ios", target_os = "android"))
+))]
 use std::rc::Rc;
 
 #[cfg(feature = "gpu")]
@@ -1554,19 +1557,27 @@ impl w3cos_ai_bridge::server::ScreenshotProvider for FrameCacheScreenshot {
 // CPU presenter — softbuffer context/surface must be created once, not per frame
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cpu-render")]
+#[cfg(any(
+    feature = "cpu-render",
+    all(feature = "skia", any(target_os = "ios", target_os = "android"))
+))]
 struct CpuPresenter {
     window: Rc<Window>,
+    #[cfg(feature = "cpu-render")]
     _context: Option<softbuffer::Context<winit::event_loop::OwnedDisplayHandle>>,
+    #[cfg(feature = "cpu-render")]
     surface: Option<softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, Rc<Window>>>,
+    #[cfg(feature = "cpu-render")]
     framebuffer: Option<Pixmap>,
-    #[cfg(feature = "skia")]
+    #[cfg(all(feature = "skia", feature = "cpu-render"))]
     skia: Option<crate::render_skia::SkiaRasterizer>,
     #[cfg(all(feature = "skia", target_os = "ios"))]
     skia_metal: Option<crate::render_skia::SkiaMetalPresenter>,
     #[cfg(all(feature = "skia", target_os = "android"))]
     skia_vulkan: Option<crate::render_skia_vulkan::SkiaVulkanPresenter>,
+    #[cfg(feature = "cpu-render")]
     clip_masks: render_cpu::ClipMaskCache,
+    #[cfg(feature = "cpu-render")]
     buffer_size: (u32, u32),
 }
 
@@ -1616,6 +1627,8 @@ struct App {
     hit_nodes: Vec<HitNode>,
     focusable_indices: Vec<usize>,
     layout_cache: Vec<(LayoutRect, usize)>,
+    /// LayoutNG text pieces of the current layout (LayoutResults).
+    layout_text_fragments: Vec<crate::layout_ng::TextFragment>,
     scrollable_nodes: Vec<(usize, LayoutRect, ScrollExtent)>,
     clip_only_nodes: Vec<(usize, LayoutRect)>,
     scroll_offsets: HashMap<usize, (f32, f32)>,
@@ -1720,8 +1733,11 @@ struct App {
     #[cfg(feature = "gpu")]
     gpu_output_texture_pool: crate::gpu_filter::GpuOutputTexturePool,
 
-    // CPU presenter — softbuffer path; also used as GPU fallback.
-    #[cfg(feature = "cpu-render")]
+    // CPU presenter — softbuffer path; also the iOS/Android Skia window owner.
+    #[cfg(any(
+        feature = "cpu-render",
+        all(feature = "skia", any(target_os = "ios", target_os = "android"))
+    ))]
     cpu: Option<CpuPresenter>,
 }
 
@@ -1777,6 +1793,7 @@ impl App {
             hit_nodes: Vec::new(),
             focusable_indices: Vec::new(),
             layout_cache: Vec::new(),
+            layout_text_fragments: Vec::new(),
             scrollable_nodes: Vec::new(),
             clip_only_nodes: Vec::new(),
             scroll_offsets: HashMap::new(),
@@ -1871,7 +1888,10 @@ impl App {
             #[cfg(feature = "gpu")]
             gpu_output_texture_pool: crate::gpu_filter::GpuOutputTexturePool::new(),
 
-            #[cfg(feature = "cpu-render")]
+            #[cfg(any(
+                feature = "cpu-render",
+                all(feature = "skia", any(target_os = "ios", target_os = "android"))
+            ))]
             cpu: None,
         }
     }
@@ -1890,6 +1910,13 @@ impl App {
         #[cfg(all(feature = "gpu", not(feature = "cpu-render")))]
         self.paint_gpu();
         #[cfg(all(feature = "cpu-render", not(feature = "gpu")))]
+        self.paint_cpu();
+        #[cfg(all(
+            not(feature = "gpu"),
+            not(feature = "cpu-render"),
+            feature = "skia",
+            any(target_os = "ios", target_os = "android")
+        ))]
         self.paint_cpu();
         #[cfg(not(all(feature = "gpu", feature = "cpu-render")))]
         crate::uitest::write_snapshot();
@@ -2248,13 +2275,28 @@ impl App {
         {
             return self.cpu.as_ref().map(|cpu| cpu.window.as_ref());
         }
-        #[cfg(not(any(feature = "gpu", feature = "cpu-render")))]
+        #[cfg(all(
+            not(feature = "gpu"),
+            not(feature = "cpu-render"),
+            feature = "skia",
+            any(target_os = "ios", target_os = "android")
+        ))]
+        {
+            return self.cpu.as_ref().map(|cpu| cpu.window.as_ref());
+        }
+        #[cfg(all(
+            not(any(feature = "gpu", feature = "cpu-render")),
+            not(all(feature = "skia", any(target_os = "ios", target_os = "android")))
+        ))]
         {
             None
         }
     }
 
-    #[cfg(feature = "cpu-render")]
+    #[cfg(any(
+        feature = "cpu-render",
+        all(feature = "skia", any(target_os = "ios", target_os = "android"))
+    ))]
     fn ensure_cpu_presenter(&mut self, event_loop: &ActiveEventLoop) {
         if self.cpu.is_some() {
             return;
@@ -2272,7 +2314,18 @@ impl App {
             .flatten();
         #[cfg(all(feature = "skia", target_os = "android"))]
         if skia_backend_requested() && skia_vulkan.is_none() {
+            #[cfg(feature = "cpu-render")]
             eprintln!("[W3C OS] Skia Vulkan unavailable; falling back to Skia raster");
+            #[cfg(not(feature = "cpu-render"))]
+            eprintln!(
+                "[W3C OS] Skia Vulkan presenter unavailable; this mobile artifact does not include a software renderer"
+            );
+        }
+        #[cfg(all(feature = "skia", target_os = "ios", not(feature = "cpu-render")))]
+        if skia_backend_requested() && skia_metal.is_none() {
+            eprintln!(
+                "[W3C OS] Skia Metal presenter unavailable; this mobile artifact does not include a software renderer"
+            );
         }
         #[cfg(all(feature = "skia", target_os = "ios"))]
         let direct_skia = skia_metal.is_some();
@@ -2280,9 +2333,12 @@ impl App {
         let direct_skia = skia_vulkan.is_some();
         #[cfg(not(all(feature = "skia", any(target_os = "ios", target_os = "android"))))]
         let direct_skia = false;
+        #[cfg(not(feature = "cpu-render"))]
+        let _ = direct_skia;
         // Chromium keeps software and accelerated raster modes mutually
         // exclusive. A direct Skia presenter owns the native window, so do
         // not also create softbuffer's backing store and a CPU raster surface.
+        #[cfg(feature = "cpu-render")]
         let (context, surface) = if direct_skia {
             (None, None)
         } else {
@@ -2294,10 +2350,13 @@ impl App {
         };
         self.cpu = Some(CpuPresenter {
             window,
+            #[cfg(feature = "cpu-render")]
             _context: context,
+            #[cfg(feature = "cpu-render")]
             surface,
+            #[cfg(feature = "cpu-render")]
             framebuffer: None,
-            #[cfg(feature = "skia")]
+            #[cfg(all(feature = "skia", feature = "cpu-render"))]
             skia: (!direct_skia)
                 .then(crate::render_skia::SkiaRasterizer::new_host)
                 .flatten(),
@@ -2305,7 +2364,9 @@ impl App {
             skia_metal,
             #[cfg(all(feature = "skia", target_os = "android"))]
             skia_vulkan,
+            #[cfg(feature = "cpu-render")]
             clip_masks: render_cpu::ClipMaskCache::default(),
+            #[cfg(feature = "cpu-render")]
             buffer_size: (0, 0),
         });
         self.needs_layout = true;
@@ -2842,6 +2903,19 @@ impl App {
         self.ensure_layout_pass(0);
     }
 
+    fn publish_webgl_canvases(&self) {
+        if !crate::webgl_draw::has_live_contexts() {
+            return;
+        }
+        let flat = layout::pre_flatten(&self.root);
+        crate::webgl_draw::publish_drawing_buffers(flat.iter().enumerate().filter_map(
+            |(index, node)| match &node.on_click {
+                EventAction::NativeHost { id, .. } => u32::try_from(*id).ok().map(|id| (index, id)),
+                _ => None,
+            },
+        ));
+    }
+
     fn ensure_layout_pass(&mut self, measurement_pass: u8) {
         let window = match self.get_window() {
             Some(w) => w,
@@ -2946,6 +3020,7 @@ impl App {
             .unwrap_or_else(|_| layout::LayoutResults::empty());
 
         self.layout_cache = results.layout_cache;
+        self.layout_text_fragments = results.text_fragments;
         self.scrollable_nodes = results.scrollable_nodes;
         for (idx, _, extent) in &self.scrollable_nodes {
             if let Some((x, y)) = self.scroll_offsets.get_mut(idx) {
@@ -3257,6 +3332,8 @@ impl App {
             canvas_body_index,
             Some((w, layout_h)),
         );
+        self.paint_artifact
+            .set_text_fragments(&self.layout_text_fragments);
         if had_column_fragments
             || self
                 .paint_artifact
@@ -3681,6 +3758,7 @@ impl App {
         self.sync_gpu_surface_to_window();
         let layout_started = Instant::now();
         self.ensure_layout();
+        self.publish_webgl_canvases();
         crate::perf::record_layout(layout_started.elapsed());
         let paint_started = Instant::now();
 
@@ -4091,10 +4169,15 @@ impl App {
         crate::frame_cache::encode_rgba_png(pixmap.width(), pixmap.height(), &rgba)
     }
 
-    #[cfg(feature = "cpu-render")]
+    #[cfg(any(
+        feature = "cpu-render",
+        all(feature = "skia", any(target_os = "ios", target_os = "android"))
+    ))]
+    #[cfg_attr(not(feature = "cpu-render"), allow(unused))]
     fn paint_cpu(&mut self) {
         let layout_started = Instant::now();
         self.ensure_layout();
+        self.publish_webgl_canvases();
         self.paint_artifact.viewport_scroll = crate::jsdom::window_scroll_offset();
         crate::perf::record_layout(layout_started.elapsed());
         let paint_started = Instant::now();
@@ -4129,6 +4212,7 @@ impl App {
         // Direct Metal/Vulkan frames never consume the CPU framebuffer. Keep a
         // one-pixel scratch value for the shared control flow instead of
         // retaining a full RGBA screen beside the swapchain.
+        #[cfg(feature = "cpu-render")]
         let mut pixmap = match self.cpu.as_mut().unwrap().framebuffer.take() {
             Some(existing)
                 if !direct_skia_present && existing.width() == w && existing.height() == h =>
@@ -4395,7 +4479,7 @@ impl App {
         #[cfg(not(all(feature = "skia", target_os = "android")))]
         let painted_with_skia_vulkan = false;
 
-        #[cfg(feature = "skia")]
+        #[cfg(all(feature = "skia", feature = "cpu-render"))]
         let painted_with_skia_raster = !painted_with_skia_metal
             && !painted_with_skia_vulkan
             && skia_backend_requested()
@@ -4422,14 +4506,16 @@ impl App {
                     pixmap.data_mut().copy_from_slice(rgba);
                     true
                 });
-        #[cfg(not(feature = "skia"))]
+        #[cfg(not(all(feature = "skia", feature = "cpu-render")))]
         let painted_with_skia_raster = false;
         let painted_with_skia =
             painted_with_skia_metal || painted_with_skia_vulkan || painted_with_skia_raster;
 
         // Default to a full softbuffer blit. Retained paint paths below narrow
         // this to scrollports / node rects when the pixmap only changed there.
+        #[cfg(feature = "cpu-render")]
         let mut softbuffer_damage = SoftbufferDamage::Full;
+        #[cfg(feature = "cpu-render")]
         if painted_with_skia {
             crate::perf::record_paint_path("skia-full");
         } else {
@@ -4595,6 +4681,7 @@ impl App {
                 RepaintMode::Clean => unreachable!("clean frames return before raster preparation"),
             }
         }
+        #[cfg(feature = "cpu-render")]
         if let Some(hover_idx) = self.hovered_index {
             if let Some(hit) = self
                 .hit_nodes
@@ -4605,6 +4692,7 @@ impl App {
                 softbuffer_damage.union_layout_rect(hit.rect, w, h);
             }
         }
+        #[cfg(feature = "cpu-render")]
         if !direct_skia_present && let Some(focus_idx) = self.focused_index {
             if self.hovered_index != Some(focus_idx) {
                 if let Some(node) = flat.get(focus_idx) {
@@ -4631,14 +4719,19 @@ impl App {
 
         let needs_anim_repaint = !self.animations.is_empty();
 
-        #[cfg(any(feature = "devtools", feature = "ai-bridge"))]
+        #[cfg(all(
+            feature = "cpu-render",
+            any(feature = "devtools", feature = "ai-bridge")
+        ))]
         {
             if !direct_skia_present && crate::frame_cache::take_screenshot_request() {
                 crate::frame_cache::store_from_slice(w, h, pixmap.data());
             }
         }
 
+        #[cfg(feature = "cpu-render")]
         let dump_exit = Self::maybe_dump_cpu_frame(&pixmap);
+        #[cfg(feature = "cpu-render")]
         if let Some(cpu) = self.cpu.as_mut() {
             if !painted_with_skia_metal && !painted_with_skia_vulkan {
                 cpu.present(&pixmap, w, h, softbuffer_damage);
@@ -4649,9 +4742,23 @@ impl App {
                 eprintln!("[W3C OS] first frame presented");
             }
         }
+        #[cfg(feature = "cpu-render")]
         if dump_exit {
             std::thread::sleep(Duration::from_millis(200));
             std::process::exit(0);
+        }
+        #[cfg(not(feature = "cpu-render"))]
+        {
+            if painted_with_skia_metal || painted_with_skia_vulkan {
+                if !self.first_frame_presented {
+                    self.first_frame_presented = true;
+                    eprintln!("[W3C OS] first frame presented");
+                }
+            } else {
+                eprintln!(
+                    "[W3C OS] Skia Metal/Vulkan presenter unavailable; this mobile artifact does not include a software renderer"
+                );
+            }
         }
         self.complete_compositor_tiles(&tile_requests);
         if needs_anim_repaint {
@@ -4662,6 +4769,7 @@ impl App {
             self.recent_scroll_damage.clear();
         }
         crate::perf::record_paint(paint_started.elapsed());
+        #[cfg(feature = "cpu-render")]
         if !interest_requests.is_empty() {
             render_cpu::prepaint_text_interest_rect(
                 &interest_requests,
@@ -6975,18 +7083,27 @@ fn paint_nodes_as_flat<'a>(
     nodes: &'a [PaintNode],
     dummy_action: &'a EventAction,
 ) -> Vec<layout::FlatNodeInfo<'a>> {
-    nodes
+    let mut flat: Vec<layout::FlatNodeInfo<'a>> = nodes
         .iter()
         .filter(|node| !node.is_paint_only())
         .map(|node| layout::FlatNodeInfo {
+            component: None,
             stable_id: 0,
             kind: &node.kind,
             style: &node.style,
             on_click: dummy_action,
             sticky_counter_signal: node.sticky_counter_signal,
             parent: node.parent,
+            subtree_end: 0,
         })
-        .collect()
+        .collect();
+    // Paint-only filtering does not keep preorder ranges; scans stay
+    // bounded by the whole list here.
+    let len = flat.len();
+    for node in &mut flat {
+        node.subtree_end = len;
+    }
+    flat
 }
 
 #[cfg(test)]
@@ -8187,6 +8304,14 @@ impl ApplicationHandler for App {
             self.request_repaint();
         }
 
+        // Tray click and menu callbacks are queued by the status-item thread.
+        // Deliver them on this turn, before timers, so a handler can schedule
+        // work that the microtask checkpoint below will flush.
+        if crate::w3cos_extensions::flush_tray_events() > 0 {
+            self.rebuild_if_dirty();
+            self.request_repaint();
+        }
+
         // A due JS timer is eligible at every native task boundary. Limiting
         // this to ResumeTimeReached starves setTimeout(0) while redraw, touch,
         // or IME polling keeps the loop in Poll/WaitCancelled turns.
@@ -8441,6 +8566,38 @@ impl ApplicationHandler for App {
         #[cfg(all(feature = "cpu-render", not(feature = "gpu")))]
         crate::perf::set_backend("cpu");
 
+        #[cfg(all(
+            feature = "skia",
+            not(feature = "cpu-render"),
+            not(feature = "gpu"),
+            any(target_os = "ios", target_os = "android")
+        ))]
+        {
+            self.ensure_cpu_presenter(event_loop);
+            #[cfg(target_os = "ios")]
+            let backend = if self
+                .cpu
+                .as_ref()
+                .is_some_and(|cpu| cpu.skia_metal.is_some())
+            {
+                "skia-metal"
+            } else {
+                "skia-unavailable"
+            };
+            #[cfg(target_os = "android")]
+            let backend = if self
+                .cpu
+                .as_ref()
+                .is_some_and(|cpu| cpu.skia_vulkan.is_some())
+            {
+                "skia-vulkan"
+            } else {
+                "skia-unavailable"
+            };
+            crate::perf::set_backend(backend);
+            eprintln!("[W3C OS] renderer backend={backend}");
+        }
+
         #[cfg(feature = "devtools")]
         {
             if self.devtools_handle.is_none() {
@@ -8479,7 +8636,7 @@ impl ApplicationHandler for App {
         self.rendering_active = false;
         self.first_frame_presented = false;
 
-        #[cfg(all(feature = "cpu-render", target_os = "android"))]
+        #[cfg(all(any(feature = "cpu-render", feature = "skia"), target_os = "android"))]
         {
             // NativeActivity may replace its ANativeWindow after backgrounding.
             // Drop the Vulkan surface/device with the old window and rebuild
@@ -8524,6 +8681,11 @@ impl ApplicationHandler for App {
                 vulkan.purge_cached_resources();
             }
             #[cfg(feature = "skia")]
+            skia_safe::graphics::purge_all_caches();
+        }
+        #[cfg(all(feature = "skia", not(feature = "cpu-render"), target_os = "android"))]
+        if let Some(vulkan) = self.cpu.as_mut().and_then(|cpu| cpu.skia_vulkan.as_mut()) {
+            vulkan.purge_cached_resources();
             skia_safe::graphics::purge_all_caches();
         }
         eprintln!("[W3C OS] released recreatable resources after memory warning");
@@ -8573,7 +8735,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::Resized(_size) => {
-                #[cfg(all(feature = "skia", feature = "cpu-render", target_os = "android"))]
+                #[cfg(all(feature = "skia", target_os = "android"))]
                 if let Some(vulkan) = self.cpu.as_mut().and_then(|cpu| cpu.skia_vulkan.as_mut()) {
                     vulkan.invalidate_swapchain();
                 }
@@ -11074,7 +11236,7 @@ mod scroll_physics_tests {
         card_style.display = w3cos_std::style::Display::None;
         card_style.transition = transition;
         let root = Component::column(
-            Default::default(),
+            w3cos_std::Style::default(),
             vec![
                 Component::row(compact_style, vec![]),
                 Component::column(card_style, vec![]),
@@ -11144,7 +11306,7 @@ mod scroll_physics_tests {
         let mut sticky_style = w3cos_std::Style::default();
         sticky_style.position = Position::Sticky;
         let root = Component::column(
-            Default::default(),
+            w3cos_std::Style::default(),
             vec![Component::column(
                 sticky_style,
                 vec![
@@ -11319,11 +11481,11 @@ mod scroll_physics_tests {
 
     #[test]
     fn sticky_markers_accumulate_after_crossing_scrollport_top() {
-        let mut first = Component::column(Default::default(), vec![]);
+        let mut first = Component::column(w3cos_std::Style::default(), vec![]);
         first.sticky_counter_signal = Some(7);
-        let mut second = Component::column(Default::default(), vec![]);
+        let mut second = Component::column(w3cos_std::Style::default(), vec![]);
         second.sticky_counter_signal = Some(7);
-        let root = Component::column(Default::default(), vec![first, second]);
+        let root = Component::column(w3cos_std::Style::default(), vec![first, second]);
         let flat = layout::pre_flatten(&root);
         let layout_cache = vec![
             (

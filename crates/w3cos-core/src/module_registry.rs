@@ -17,26 +17,31 @@ use crate::Value;
 /// getter/setter callables without sharing either backend's private binding
 /// representation. A lexical binding starts uninitialized and therefore
 /// preserves the temporal dead zone across cyclic module graphs.
+///
+/// The state is `(value, initialized)` — the same representation an AOT frame
+/// uses for a captured context slot — so a function can capture a module
+/// binding as a direct context-slot load (V8 ScriptContext slot) instead of
+/// calling a getter closure per read.
 #[derive(Clone)]
 pub struct BindingCell {
-    state: Rc<RefCell<Option<Value>>>,
+    state: Rc<RefCell<(Value, bool)>>,
 }
 
 impl BindingCell {
     pub fn uninitialized() -> Self {
         Self {
-            state: Rc::new(RefCell::new(None)),
+            state: Rc::new(RefCell::new((Value::Undefined, false))),
         }
     }
 
     pub fn initialized(value: Value) -> Self {
         Self {
-            state: Rc::new(RefCell::new(Some(value))),
+            state: Rc::new(RefCell::new((value, true))),
         }
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.state.borrow().is_some()
+        self.state.borrow().1
     }
 
     pub fn read(&self) -> Value {
@@ -53,9 +58,10 @@ impl BindingCell {
     }
 
     pub fn try_read_named(&self, name: &str) -> Result<Value, Value> {
-        match self.state.borrow().clone() {
-            Some(value) => Ok(value),
-            None => Err(crate::intrinsics::reference_error(&format!(
+        let state = self.state.borrow();
+        match state.1 {
+            true => Ok(state.0.clone()),
+            false => Err(crate::intrinsics::reference_error(&format!(
                 "{name} is not initialized"
             ))),
         }
@@ -65,8 +71,13 @@ impl BindingCell {
     /// live binding. Declaration mutability remains enforced by the lowering
     /// metadata; this cell owns only instantiation and TDZ state.
     pub fn initialize_or_set(&self, value: Value) -> Value {
-        *self.state.borrow_mut() = Some(value.clone());
+        *self.state.borrow_mut() = (value.clone(), true);
         value
+    }
+
+    /// The shared `(value, initialized)` slot, for `AotCapture::Cell`.
+    pub fn shared_slot(&self) -> Rc<RefCell<(Value, bool)>> {
+        Rc::clone(&self.state)
     }
 }
 

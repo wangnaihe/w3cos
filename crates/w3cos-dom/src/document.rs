@@ -29,6 +29,75 @@ pub fn bump_structure_tick() {
     STRUCTURE_TICK.with(|tick| tick.set(tick.get().wrapping_add(1)));
 }
 
+thread_local! {
+    static CHILD_LOG: RefCell<ChildListLog> = RefCell::new(ChildListLog::default());
+    static DOCUMENT_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+/// One child-list edit for CollectionIndexCache-style replay (main).
+#[derive(Clone, Copy, Debug)]
+pub enum ChildListChange {
+    Insert {
+        doc: u64,
+        parent: u32,
+        child: u32,
+        before: u32,
+    },
+    Remove {
+        doc: u64,
+        parent: u32,
+        child: u32,
+    },
+    Reset {
+        doc: u64,
+        node: u32,
+    },
+}
+
+#[derive(Default)]
+struct ChildListLog {
+    start: u64,
+    entries: std::collections::VecDeque<(u64, ChildListChange)>,
+}
+
+const CHILD_LOG_CAP: usize = 256;
+
+fn log_child_change(change: ChildListChange) {
+    let tick = structure_tick();
+    CHILD_LOG.with(|log| {
+        let mut log = log.borrow_mut();
+        if log.entries.len() >= CHILD_LOG_CAP
+            && let Some((dropped, _)) = log.entries.pop_front()
+        {
+            log.start = dropped + 1;
+        }
+        log.entries.push_back((tick, change));
+    });
+    bump_structure_tick();
+}
+
+/// Replays child-list edits made since `tick`.
+pub fn replay_child_changes_since(
+    tick: u64,
+    limit: usize,
+    mut apply: impl FnMut(ChildListChange),
+) -> bool {
+    CHILD_LOG.with(|log| {
+        let log = log.borrow();
+        if tick < log.start {
+            return false;
+        }
+        let first = log.entries.partition_point(|(stamp, _)| *stamp < tick);
+        if log.entries.len() - first > limit {
+            return false;
+        }
+        for (_, change) in log.entries.range(first..) {
+            apply(*change);
+        }
+        true
+    })
+}
+
 #[derive(Clone, Default)]
 struct CounterSnapshot {
     scopes: Vec<HashMap<String, i32>>,
@@ -118,7 +187,10 @@ impl CounterSnapshot {
     }
 }
 
-fn resolve_css_variables(value: &str, custom_properties: &HashMap<String, String>) -> String {
+fn resolve_css_variables(
+    value: &str,
+    custom_properties: &std::collections::HashMap<String, String>,
+) -> String {
     let mut current = value.to_string();
     for _ in 0..10 {
         let Some(start) = current.find("var(") else {
@@ -413,6 +485,78 @@ fn bump_dirty_epoch(epoch: &mut u32, stamp: &mut Vec<u32>) {
 /// - Interned Atoms: O(1) tag/class comparison
 /// - HashMap indexes: O(1) getElementById, querySelector by class/tag
 /// - Node freelist: bounded memory with slot recycling
+
+/// Immutable, reference-counted computed style (Blink's scoped_refptr<const
+/// ComputedStyle>): the per-node cache and layout walk share one allocation.
+pub type SharedStyle = std::sync::Arc<w3cos_std::style::Style>;
+
+/// Set on the document element's component in quirks mode (BackCompat).
+pub const QUIRKS_MODE_MARKER: &str = "--w3cos-internal-quirks-mode";
+/// Set on the document element itself.
+pub const DOCUMENT_ELEMENT_MARKER: &str = "--w3cos-internal-document-element";
+/// Set on a block whose first line is styled by `::first-line`.
+pub const FIRST_LINE_STYLE_MARKER: &str = "--w3cos-internal-first-line-style";
+pub const FIRST_LETTER_STYLE_MARKER: &str = "--w3cos-internal-first-letter-style";
+/// Owner id for a split inline fragment (LayoutNG/main splice).
+pub const SPLIT_INLINE_FRAGMENT_OWNER: &str = "--w3cos-internal-split-inline-fragment-owner";
+
+/// Per-node subtree extent cache (see `Document::extent`).
+#[derive(Default)]
+struct ExtentCache {
+    /// `true` (or out of range) = must recompute.
+    dirty: Vec<bool>,
+    value: Vec<(f32, f32)>,
+    /// Descendants-only extent, valid while `dirty[idx]` is false and the
+    /// slot was written by `descendant_extent` (scrollWidth/Height of a
+    /// container with thousands of clean children answers in O(1)).
+    descendants: Vec<Option<Option<(f32, f32)>>>,
+}
+
+impl ExtentCache {
+    /// Mark dirty; false when it already was (the chain above is dirty too).
+    fn mark(&mut self, idx: usize) -> bool {
+        match self.dirty.get_mut(idx) {
+            Some(slot) if !*slot => {
+                *slot = true;
+                true
+            }
+            Some(_) => false,
+            // Never computed: nothing above can be clean because of it, but
+            // keep walking so a clean ancestor learns about this child.
+            None => true,
+        }
+    }
+
+    fn forget(&mut self, idx: usize) {
+        if let Some(slot) = self.dirty.get_mut(idx) {
+            *slot = true;
+        }
+    }
+
+    fn clean(&self, idx: usize) -> Option<(f32, f32)> {
+        (self.dirty.get(idx) == Some(&false)).then(|| self.value[idx])
+    }
+
+    fn store(&mut self, idx: usize, value: (f32, f32)) {
+        if self.dirty.len() <= idx {
+            self.dirty.resize(idx + 1, true);
+            self.value.resize(idx + 1, (0.0, 0.0));
+            self.descendants.resize(idx + 1, None);
+        }
+        self.dirty[idx] = false;
+        self.value[idx] = value;
+        self.descendants[idx] = None;
+    }
+
+    fn clean_descendants(&self, idx: usize) -> Option<Option<(f32, f32)>> {
+        if self.dirty.get(idx) == Some(&false) {
+            self.descendants.get(idx).copied().flatten()
+        } else {
+            None
+        }
+    }
+}
+
 pub struct Document {
     nodes: Vec<Option<DomNode>>,
     /// Bump arena for unique per-page strings (ids and text tails). Capacity
@@ -436,6 +580,8 @@ pub struct Document {
     scope_stamp: Vec<u32>,
     /// Bumps when the tree shape or baked text metrics change.
     structure_generation: u64,
+    /// Bumps when text paints without invalidating used boxes.
+    repaint_text_generation: u64,
     /// Bumps only when used geometry can change. A definite box can repaint
     /// new text without solving layout again.
     layout_generation: u64,
@@ -502,6 +648,13 @@ pub struct Document {
     html_document: bool,
     // Quirks mode changes percentage-height containing-block traversal.
     quirks_mode: bool,
+    /// Cached scrollable overflow extents (LayoutNG/main).
+    extent: std::cell::RefCell<ExtentCache>,
+    /// Identity in [`ChildListChange`] records (main).
+    serial: u64,
+    /// Interned equal computed styles (MPC sharing proxy for main tests).
+    shared_style_intern: RefCell<Vec<SharedStyle>>,
+    shared_style_intern_inserts: Cell<usize>,
 }
 
 #[path = "document/component_patch.rs"]
@@ -543,7 +696,7 @@ mod replaced_table_tests;
 mod form_control_tests;
 
 /// What happened to the child list of a node, for style invalidation.
-enum ChildListChange {
+enum ChildListDirtyKind {
     /// Insertion or move at an arbitrary position.
     Any,
     /// An element was appended after the last child.
@@ -556,7 +709,63 @@ enum ChildListChange {
     },
 }
 
+/// Whether the opt-in LayoutNG engine is requested (`W3COS_LAYOUT_NG`, or
+/// its verify mode). Mirrors `layout_ng::mode()`; the DOM crate cannot see
+/// the runtime crate.
+pub(crate) fn layout_ng_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        ["W3COS_LAYOUT_NG", "W3COS_LAYOUT_NG_VERIFY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| value != "0"))
+    })
+}
+
 impl Document {
+    /// Identity in [`ChildListChange`] records.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// Shared-style walk helper (main). Interns equal styles unless the node
+    /// has namespaced attributes (those opt out of MPC-style sharing).
+    pub fn computed_style_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        let style = self.computed_style_inherited_shared(id, inherited);
+        if !self.get_node(id).attribute_namespaces.is_empty() {
+            return style;
+        }
+        self.intern_shared_style(style)
+    }
+
+    fn intern_shared_style(&self, style: SharedStyle) -> SharedStyle {
+        let mut intern = self.shared_style_intern.borrow_mut();
+        if let Some(existing) = intern.iter().find(|s| s.as_ref() == style.as_ref()) {
+            return existing.clone();
+        }
+        intern.push(style.clone());
+        self.shared_style_intern_inserts
+            .set(self.shared_style_intern_inserts.get() + 1);
+        style
+    }
+
+    fn component_style_shared(
+        &self,
+        style: w3cos_std::style::Style,
+    ) -> w3cos_std::component::ComponentStyle {
+        w3cos_std::component::ComponentStyle::shared(
+            self.intern_shared_style(std::sync::Arc::new(style)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matched_properties_cache_entries(&self) -> usize {
+        self.shared_style_intern_inserts.get()
+    }
+
     /// Host readability preferences, separate from author-specified sizes.
     /// Zero leaves the corresponding minimum disabled.
     pub fn set_font_size_minimums(&mut self, hard: f32, logical: f32) {
@@ -618,6 +827,7 @@ impl Document {
             scope_epoch: 1,
             scope_stamp: Vec::new(),
             structure_generation: 0,
+            repaint_text_generation: 0,
             layout_generation: 0,
             geometry_epoch: 1,
             cascade_generation: 0,
@@ -661,6 +871,14 @@ impl Document {
             selection: Selection::new(),
             html_document: true,
             quirks_mode: false,
+            extent: std::cell::RefCell::new(ExtentCache::default()),
+            serial: DOCUMENT_SERIAL.with(|c| {
+                let n = c.get().wrapping_add(1);
+                c.set(n);
+                n
+            }),
+            shared_style_intern: RefCell::new(Vec::new()),
+            shared_style_intern_inserts: Cell::new(0),
         };
 
         let root_id = doc.alloc_node(DomNode {
@@ -690,6 +908,114 @@ impl Document {
     // -----------------------------------------------------------------------
     // W3C Document API
     // -----------------------------------------------------------------------
+
+    fn mark_extent_dirty(&mut self, id: NodeId) {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if !self.extent.get_mut().mark(node.0 as usize) {
+                break;
+            }
+            current = self
+                .nodes
+                .get(node.0 as usize)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|node| node.parent);
+        }
+    }
+
+    /// Max (right, bottom) layout edge over the descendants of `id`, or None
+    /// without descendants. Clean subtrees answer from the cache.
+    pub fn descendant_extent(&self, id: NodeId) -> Option<(f32, f32)> {
+        let mut cache = self.extent.borrow_mut();
+        let idx = id.0 as usize;
+        if let Some(hit) = cache.clean_descendants(idx) {
+            return hit;
+        }
+        let mut out: Option<(f32, f32)> = None;
+        let mut child = self.get_node(id).first_child;
+        while let Some(cid) = child {
+            if self.is_viewport_fixed(cid) {
+                // Still resolve (and cache) the subtree: the dirty-mark walk
+                // stops at an already-dirty node, so an unstored subtree
+                // would never propagate later rect writes to its ancestors.
+                let _ = self.subtree_extent(cid, &mut cache);
+                child = crate::node::sib(self.get_node(cid).next_sibling);
+                continue;
+            }
+            let (right, bottom) = self.subtree_extent(cid, &mut cache);
+            out = Some(match out {
+                Some((r, b)) => (r.max(right), b.max(bottom)),
+                None => (right, bottom),
+            });
+            child = crate::node::sib(self.get_node(cid).next_sibling);
+        }
+        // Children are clean now, so this node's own subtree entry can be
+        // stored too (a dirty mark below will reach it again).
+        let rect = self.get_layout_rect(id);
+        let (mut right, mut bottom) = (rect.x + rect.width, rect.y + rect.height);
+        if let Some((r, b)) = out {
+            right = right.max(r);
+            bottom = bottom.max(b);
+        }
+        cache.store(idx, (right, bottom));
+        cache.descendants[idx] = Some(out);
+        out
+    }
+
+    fn subtree_extent(&self, id: NodeId, cache: &mut ExtentCache) -> (f32, f32) {
+        let idx = id.0 as usize;
+        if let Some(hit) = cache.clean(idx) {
+            return hit;
+        }
+        let rect = self.get_layout_rect(id);
+        let mut right = rect.x + rect.width;
+        let mut bottom = rect.y + rect.height;
+        let mut child = self.get_node(id).first_child;
+        while let Some(cid) = child {
+            if self.is_viewport_fixed(cid) {
+                // Still resolve (and cache) the subtree: the dirty-mark walk
+                // stops at an already-dirty node, so an unstored subtree
+                // would never propagate later rect writes to its ancestors.
+                let _ = self.subtree_extent(cid, cache);
+                child = crate::node::sib(self.get_node(cid).next_sibling);
+                continue;
+            }
+            let (r, b) = self.subtree_extent(cid, cache);
+            right = right.max(r);
+            bottom = bottom.max(b);
+            child = crate::node::sib(self.get_node(cid).next_sibling);
+        }
+        cache.store(idx, (right, bottom));
+        (right, bottom)
+    }
+
+    /// css-overflow-3 scrollable overflow: a `position: fixed` box whose
+    /// containing block is the viewport (no transformed/filtered ancestor,
+    /// css-transforms-1 "fixed containing block") is not part of any
+    /// element's scrollable overflow. Blink: LayoutBox::AddLayoutOverflow
+    /// skips such children (they belong to the LayoutView's fixed layer).
+    fn is_viewport_fixed(&self, id: NodeId) -> bool {
+        let fixed = match self.cached_style(id) {
+            Some(style) => style.position == w3cos_std::style::Position::Fixed,
+            None => return false,
+        };
+        if !fixed {
+            return false;
+        }
+        let mut current = self.get_node(id).parent;
+        while let Some(ancestor) = current {
+            if let Some(style) = self.cached_style(ancestor)
+                && (!style.transform.is_identity()
+                    || style.filter.is_some()
+                    || style.will_change.transform
+                    || style.will_change.filter)
+            {
+                return false;
+            }
+            current = self.get_node(ancestor).parent;
+        }
+        true
+    }
 
     pub fn create_element(&mut self, tag: &str) -> Element {
         self.create_element_atom(Atom::intern(tag))
@@ -908,7 +1234,12 @@ impl Document {
         self.get_node_mut(child).parent = None;
         match removed {
             Some((boundary, tag)) => {
-                self.mark_child_list_dirty(parent, ChildListChange::Removed { boundary, tag })
+                self.mark_child_list_dirty(parent, ChildListDirtyKind::Removed { boundary, tag });
+                log_child_change(ChildListChange::Remove {
+                    doc: self.serial,
+                    parent: parent.as_u32(),
+                    child: child.as_u32(),
+                });
             }
             None => self.mark_dirty(parent),
         }
@@ -1017,13 +1348,26 @@ impl Document {
             self.get_node_mut(parent).first_child = Some(new_child);
         }
 
-        if let Some(old_parent) = old_parent
-            && old_parent != parent
-        {
-            self.mark_dirty(old_parent);
+        if let Some(old_parent) = old_parent {
+            // Moving an existing child: record unlink so cache replay drops the
+            // old index before the insert (same-parent moves included).
+            log_child_change(ChildListChange::Remove {
+                doc: self.serial,
+                parent: old_parent.as_u32(),
+                child: new_child.as_u32(),
+            });
+            if old_parent != parent {
+                self.mark_dirty(old_parent);
+            }
         }
         self.mark_dirty(parent);
         self.invalidate_style_subtree(new_child);
+        log_child_change(ChildListChange::Insert {
+            doc: self.serial,
+            parent: parent.as_u32(),
+            child: new_child.as_u32(),
+            before: ref_child.as_u32(),
+        });
         self.note_structure_change();
     }
 
@@ -1506,8 +1850,15 @@ impl Document {
     pub fn set_layout_rect(&mut self, id: NodeId, rect: DOMRect) {
         let idx = id.0 as usize;
         if idx < self.layout_rects.len() {
+            // Relayout rewrites every rect it visits; an unchanged rect keeps
+            // the cached overflow extent of its ancestors valid (Blink only
+            // recomputes overflow for boxes whose geometry changed).
+            let moved = self.layout_rects[idx] != rect;
             self.layout_rects[idx] = rect;
             self.geometry_epoch = self.geometry_epoch.wrapping_add(1);
+            if moved {
+                self.mark_extent_dirty(id);
+            }
         }
     }
 
@@ -1764,17 +2115,17 @@ impl Document {
     /// (or document root) and marks that scope dirty — not the whole tree.
     /// This enables incremental re-layout of only affected subtrees.
     pub fn mark_dirty(&mut self, id: NodeId) {
-        self.mark_child_list_dirty(id, ChildListChange::Any);
+        self.mark_child_list_dirty(id, ChildListDirtyKind::Any);
     }
 
     /// `mark_dirty` for a node appended after the last child of `id`. Earlier
     /// siblings keep their position from the start, so only rules that read
     /// following siblings (`:last-child`, `:only-child`, ...) can change.
     fn mark_dirty_after_tail_append(&mut self, id: NodeId) {
-        self.mark_child_list_dirty(id, ChildListChange::TailAppend);
+        self.mark_child_list_dirty(id, ChildListDirtyKind::TailAppend);
     }
 
-    fn mark_child_list_dirty(&mut self, id: NodeId, change: ChildListChange) {
+    fn mark_child_list_dirty(&mut self, id: NodeId, change: ChildListDirtyKind) {
         if stylesheet::has_sibling_dependencies()
             || stylesheet::has_structural_dependencies()
             || stylesheet::has_relational_dependencies()
@@ -1803,7 +2154,11 @@ impl Document {
     /// ancestors are restyled separately by `invalidate_relational_observers`.
     /// Returns false when the parent is not an element and the caller must
     /// restyle the whole parent subtree.
-    fn invalidate_child_list_observers(&mut self, parent: NodeId, change: ChildListChange) -> bool {
+    fn invalidate_child_list_observers(
+        &mut self,
+        parent: NodeId,
+        change: ChildListDirtyKind,
+    ) -> bool {
         if self
             .nodes
             .get(parent.0 as usize)
@@ -1827,11 +2182,11 @@ impl Document {
         }
         self.touch_style_revision(parent);
         let (removal, boundary) = match change {
-            ChildListChange::TailAppend => {
+            ChildListDirtyKind::TailAppend => {
                 self.invalidate_tail_append_observers(parent, &parent_context);
                 return true;
             }
-            ChildListChange::Removed { boundary, tag } => {
+            ChildListDirtyKind::Removed { boundary, tag } => {
                 // Text nodes are not counted by any positional rule, and
                 // `:empty` on the parent was handled above.
                 let Some(tag) = tag else { return true };
@@ -1844,7 +2199,7 @@ impl Document {
                 }
                 (true, boundary)
             }
-            ChildListChange::Any => (false, None),
+            ChildListDirtyKind::Any => (false, None),
         };
         // Children before the removed one lose position from the end, the
         // ones after it position from the start. Any other change (insert
@@ -2270,6 +2625,8 @@ impl Document {
     }
 
     fn record_layout_dirty(&mut self, id: NodeId) {
+        // A child-list edit changes the subtree extent without a rect write.
+        self.mark_extent_dirty(id);
         let scope = self.find_layout_scope(id);
         remember_dirty(
             &mut self.scope_stamp,
@@ -2297,7 +2654,7 @@ impl Document {
 
     /// The next paint must read new text, and the used boxes stay valid.
     pub fn note_repaint_without_layout(&mut self) {
-        self.structure_generation = self.structure_generation.wrapping_add(1);
+        self.repaint_text_generation = self.repaint_text_generation.wrapping_add(1);
     }
 
     /// Inherited or selector-matched styles may have changed below `id`.
@@ -2308,6 +2665,16 @@ impl Document {
 
     pub fn structure_generation(&self) -> u64 {
         self.structure_generation
+    }
+
+    pub fn repaint_text_generation(&self) -> u64 {
+        self.repaint_text_generation
+    }
+
+    /// Changes on every `take_precise_dirty`. A retained layout that saw the
+    /// previous value knows no other consumer drained mutations it missed.
+    pub fn precise_drain_epoch(&self) -> u32 {
+        self.precise_epoch
     }
 
     pub fn layout_generation(&self) -> u64 {
@@ -3566,7 +3933,7 @@ impl Document {
                 let Some(property) = crate::css_style::multicol_property_name(property) else {
                     continue;
                 };
-                let empty = HashMap::new();
+                let empty = std::collections::HashMap::<String, String>::new();
                 let value = resolve_css_variables(
                     value,
                     style.custom_properties.as_deref().unwrap_or(&empty),
@@ -5092,6 +5459,26 @@ impl Document {
         self.computed_style(id, &[], inherited)
     }
 
+    /// `computed_style_inherited` for walks that keep styles shared.
+    pub fn computed_style_inherited_shared(
+        &self,
+        id: NodeId,
+        inherited: Option<&SharedStyle>,
+    ) -> SharedStyle {
+        let inherited_ref = inherited.map(|style| style.as_ref());
+        std::sync::Arc::new(self.computed_style_inherited(id, inherited_ref))
+    }
+
+    /// `get_style_mut` for a write of one property. MPC epoch tracking from
+    /// main is approximated by always going through `get_style_mut`.
+    pub fn get_style_mut_for_property(
+        &mut self,
+        id: NodeId,
+        _property: &str,
+    ) -> &mut CSSStyleDeclaration {
+        self.get_style_mut(id)
+    }
+
     fn apply_font_size_minimums(&self, style: &mut w3cos_std::Style) {
         let specified = style.font_size;
         let absolute = style
@@ -5428,7 +5815,7 @@ impl Document {
         {
             // Keep an empty non-replaced inline box, like an empty span.
             // Promoting it to an atomic inline-block invents a line strut.
-            return Some(w3cos_std::Component::boxed(style, Vec::new()));
+            return Some(w3cos_std::Component::boxed_shared(self.component_style_shared(style), Vec::new()));
         }
         normalize_css_table_internal_used_style(&mut style);
         let (_, content) = selected_content?;
@@ -5464,7 +5851,10 @@ impl Document {
                 children.insert(0, marker);
             }
             style.display = w3cos_std::style::Display::Block;
-            return Some(w3cos_std::Component::boxed(style, children));
+            return Some(w3cos_std::Component::boxed_shared(
+                self.component_style_shared(style),
+                children,
+            ));
         }
         match content.as_slice() {
             [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
@@ -5485,7 +5875,10 @@ impl Document {
                     &style,
                     vec![w3cos_std::Component::text(text.clone(), inherited)],
                 );
-                Some(w3cos_std::Component::boxed(style, children))
+                Some(w3cos_std::Component::boxed_shared(
+                    self.component_style_shared(style),
+                    children,
+                ))
             }
             [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
                 if style.display == w3cos_std::style::Display::Inline
@@ -5501,9 +5894,9 @@ impl Document {
                     vec![w3cos_std::Component::text(text.clone(), inherited)],
                 ))
             }
-            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)] => {
-                Some(w3cos_std::Component::text(text.clone(), style))
-            }
+            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)] => Some(
+                w3cos_std::Component::text_shared(text.clone(), self.component_style_shared(style)),
+            ),
             [GeneratedContentItem::Image(source)] => {
                 Some(w3cos_std::Component::image(source.clone(), style))
             }
@@ -5580,7 +5973,10 @@ impl Document {
                             );
                     }
                     let children = fixup_css_table_children(&style, children);
-                    Some(w3cos_std::Component::row(style, children))
+                    Some(w3cos_std::Component::row_shared(
+                        self.component_style_shared(style),
+                        children,
+                    ))
                 } else {
                     let mut line_style = inherited;
                     line_style.display = w3cos_std::style::Display::Flex;
@@ -5609,7 +6005,10 @@ impl Document {
                         &style,
                         vec![w3cos_std::Component::row(line_style, children)],
                     );
-                    Some(w3cos_std::Component::boxed(style, children))
+                    Some(w3cos_std::Component::boxed_shared(
+                        self.component_style_shared(style),
+                        children,
+                    ))
                 }
             }
         }
@@ -5816,7 +6215,10 @@ impl Document {
                 } else {
                     style.background = style.color;
                 }
-                return Some(w3cos_std::Component::boxed(style, vec![]));
+                return Some(w3cos_std::Component::boxed_shared(
+                    self.component_style_shared(style),
+                    vec![],
+                ));
             }
             // Ordinal suffix spacing belongs to the out-of-flow marker.
             style.white_space = w3cos_std::style::WhiteSpace::Pre;
@@ -5836,7 +6238,10 @@ impl Document {
                     marker_type.as_deref().unwrap_or("disc").into(),
                 );
         }
-        Some(w3cos_std::Component::text(marker, style))
+        Some(w3cos_std::Component::text_shared(
+            marker,
+            self.component_style_shared(style),
+        ))
     }
 
     fn declared_counter_value(&self, id: NodeId, property: &str) -> Option<String> {
@@ -7291,7 +7696,7 @@ impl Document {
                 if !same_text_style || !component.children.is_empty() {
                     return false;
                 }
-                first_style.get_or_insert_with(|| component.style.clone());
+                first_style.get_or_insert_with(|| (*component.style).clone());
                 append_rendered_text(output, content, &component.style, ends, previous_source);
                 return true;
             }
@@ -7338,7 +7743,7 @@ impl Document {
                     {
                         return None;
                     }
-                    text_style.get_or_insert_with(|| component.style.clone());
+                    text_style.get_or_insert_with(|| (*component.style).clone());
                     append_rendered_text(
                         &mut content,
                         text,
@@ -7403,7 +7808,10 @@ impl Document {
         } else {
             w3cos_std::style::Display::Inline
         };
-        Some(w3cos_std::Component::text(content, style))
+        Some(w3cos_std::Component::text_shared(
+            content,
+            self.component_style_shared(style),
+        ))
     }
 
     fn coalesced_generated_text_run(
@@ -7466,7 +7874,7 @@ impl Document {
             {
                 return None;
             }
-            text_style.get_or_insert_with(|| component.style.clone());
+            text_style.get_or_insert_with(|| (*component.style).clone());
             w3cos_std::inline_text::append_source_fragment_ends(
                 &mut ends,
                 content.len(),
@@ -7479,7 +7887,10 @@ impl Document {
         let mut style = text_style?;
         w3cos_std::inline_text::set_fragment_ends(&mut style, &content, &ends);
         style.white_space = parent_style.white_space;
-        Some(w3cos_std::Component::text(content, style))
+        Some(w3cos_std::Component::text_shared(
+            content,
+            self.component_style_shared(style),
+        ))
     }
 
     fn passive_generated_inline_subtree(&self, id: NodeId) -> bool {
@@ -7895,10 +8306,13 @@ impl Document {
                 normalize_css_table_internal_used_style(&mut style);
                 w3cos_std::inline_text::set_source_run(&mut style, format!("text:{}", id.as_u32()));
                 let text = preserved_authored_text(text, style.white_space);
-                w3cos_std::Component::text(text.as_ref(), style)
+                w3cos_std::Component::text_shared(text.as_ref(), self.component_style_shared(style))
             }
             NodeType::Comment | NodeType::DocumentType => {
-                return w3cos_std::Component::column(style, vec![]);
+                return w3cos_std::Component::column_shared(
+                    self.component_style_shared(style),
+                    vec![],
+                );
             }
             NodeType::Element | NodeType::Document | NodeType::DocumentFragment => {
                 let loaded_object = tag == "object" && self.embedded_document_hosts.contains(&id);
@@ -7921,8 +8335,13 @@ impl Document {
                             .get_or_insert_with(Default::default)
                             .insert("--w3cos-internal-clearing-line-break".into(), "1".into());
                     }
-                    return self
-                        .attach_native_host(id, w3cos_std::Component::text("\u{2028}", style));
+                    return self.attach_native_host(
+                        id,
+                        w3cos_std::Component::text_shared(
+                            "\u{2028}",
+                            self.component_style_shared(style),
+                        ),
+                    );
                 }
                 if tag == "svg" {
                     let (attribute_width, attribute_height) = self.svg_root_size(id);
@@ -8078,8 +8497,13 @@ impl Document {
                         style.letter_spacing = generated_style.letter_spacing;
                         style.word_spacing = generated_style.word_spacing;
                         w3cos_std::inline_text::copy_used_decoration(&mut style, &generated_style);
-                        return self
-                            .attach_native_host(id, w3cos_std::Component::text(content, style));
+                        return self.attach_native_host(
+                            id,
+                            w3cos_std::Component::text_shared(
+                                content,
+                                self.component_style_shared(style),
+                            ),
+                        );
                     }
                 }
                 if matches!(
@@ -8162,7 +8586,10 @@ impl Document {
                         }
                         let component = match tag.as_str() {
                             "button" => w3cos_std::Component::button(text, style),
-                            _ => w3cos_std::Component::text(text, style),
+                            _ => w3cos_std::Component::text_shared(
+                                text,
+                                self.component_style_shared(style),
+                            ),
                         };
                         return self.attach_native_host(id, component);
                     }
@@ -8987,7 +9414,7 @@ impl Document {
                     text_style.user_select = style.user_select;
                     return self.attach_native_host(
                         id,
-                        w3cos_std::Component::text(content.clone(), text_style),
+                        w3cos_std::Component::text_shared(content.clone(), text_style),
                     );
                 }
                 if nowrap_inline_formatting_context
@@ -9094,7 +9521,13 @@ impl Document {
                             _ => None,
                         })
                         .collect::<String>();
-                    return self.attach_native_host(id, w3cos_std::Component::text(content, style));
+                    return self.attach_native_host(
+                        id,
+                        w3cos_std::Component::text_shared(
+                            content,
+                            self.component_style_shared(style),
+                        ),
+                    );
                 }
 
                 if style.display == w3cos_std::style::Display::Inline
@@ -9132,7 +9565,10 @@ impl Document {
                         );
                     children.insert(1, w3cos_std::Component::text("\u{2028}", break_style));
                     style.display = w3cos_std::style::Display::Contents;
-                    return w3cos_std::Component::boxed(style, children);
+                    return w3cos_std::Component::boxed_shared(
+                        self.component_style_shared(style),
+                        children,
+                    );
                 }
 
                 if style.display == w3cos_std::style::Display::Inline
@@ -9172,7 +9608,10 @@ impl Document {
                     }
                     return self.attach_native_host(
                         id,
-                        w3cos_std::Component::text(content.clone(), style),
+                        w3cos_std::Component::text_shared(
+                            content.clone(),
+                            self.component_style_shared(style),
+                        ),
                     );
                 }
 
@@ -9198,7 +9637,13 @@ impl Document {
                     // has no such descendant and can move its offset to the
                     // split in-flow fragments instead.
                     style.display = w3cos_std::style::Display::Inline;
-                    return self.attach_native_host(id, w3cos_std::Component::row(style, children));
+                    return self.attach_native_host(
+                        id,
+                        w3cos_std::Component::row_shared(
+                            self.component_style_shared(style),
+                            children,
+                        ),
+                    );
                 }
 
                 if style.display == w3cos_std::style::Display::InlineBlock
@@ -9295,7 +9740,10 @@ impl Document {
                     if children.is_empty() {
                         let component = match tag.as_str() {
                             "button" => w3cos_std::Component::button(text, style),
-                            _ => w3cos_std::Component::text(text, style),
+                            _ => w3cos_std::Component::text_shared(
+                                text,
+                                self.component_style_shared(style),
+                            ),
                         };
                         return self.attach_native_host(id, component);
                     }
@@ -10357,7 +10805,7 @@ impl Document {
                                 )
                             {
                                 let mut text = fragment_children.remove(0);
-                                text.style = fragment;
+                                text.style = fragment.into();
                                 text
                             } else {
                                 w3cos_std::Component::row(fragment, fragment_children)
@@ -10601,6 +11049,17 @@ impl Document {
                         }
                         return boxed_split_inline_group(&style, fragments);
                     }
+
+                    // CSSOM still exposes the empty leading and trailing
+                    // inline fragments around a sole in-flow block. Preserve
+                    // those physical roots even when the host has no visible
+                    // edge decoration; otherwise `getClientRects()` collapses
+                    // the split to one authored child box.
+                    let block = children.remove(0);
+                    return boxed_split_inline_group(
+                        &style,
+                        vec![side_fragment(true), block, side_fragment(false)],
+                    );
                 }
 
                 let is_row = matches!(
@@ -10662,25 +11121,45 @@ impl Document {
                                 "--w3cos-internal-replaced-element".to_string(),
                                 "1".to_string(),
                             );
-                        w3cos_std::Component::boxed(style, vec![])
+                        w3cos_std::Component::boxed_shared(
+                            self.component_style_shared(style),
+                            vec![],
+                        )
                     }
-                    "svg" | "g" | "defs" => w3cos_std::Component::boxed(style, children),
+                    "svg" | "g" | "defs" => w3cos_std::Component::boxed_shared(
+                        self.component_style_shared(style),
+                        children,
+                    ),
                     "rect" | "circle" | "ellipse" | "line" | "use" => {
-                        w3cos_std::Component::boxed(style, children)
+                        w3cos_std::Component::boxed_shared(
+                            self.component_style_shared(style),
+                            children,
+                        )
                     }
                     "polyline" | "polygon" | "path" => self
                         .svg_path_component(id, &tag, style.clone())
-                        .unwrap_or_else(|| w3cos_std::Component::boxed(style, children)),
+                        .unwrap_or_else(|| {
+                            w3cos_std::Component::boxed_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
+                        }),
                     "text" => {
                         let text = self.descendant_text_content(id);
-                        w3cos_std::Component::text(text, style)
+                        w3cos_std::Component::text_shared(text, self.component_style_shared(style))
                     }
                     "body" | "div" | "section" | "main" | "article" | "nav" | "header"
                     | "footer" | "aside" | "form" | "fieldset" | "ul" | "ol" | "dl" => {
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         }
                     }
                     "span" | "label" | "em" | "strong" | "code" | "small" | "li" | "dd" | "dt" => {
@@ -10688,14 +11167,23 @@ impl Document {
                             if children.is_empty() {
                                 return self.attach_native_host(
                                     id,
-                                    w3cos_std::Component::text(text, style),
+                                    w3cos_std::Component::text_shared(
+                                        text,
+                                        self.component_style_shared(style),
+                                    ),
                                 );
                             }
                         }
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         }
                     }
                     "p" => {
@@ -10703,14 +11191,23 @@ impl Document {
                             if children.is_empty() {
                                 return self.attach_native_host(
                                     id,
-                                    w3cos_std::Component::text(text, style),
+                                    w3cos_std::Component::text_shared(
+                                        text,
+                                        self.component_style_shared(style),
+                                    ),
                                 );
                             }
                         }
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         }
                     }
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -10718,9 +11215,15 @@ impl Document {
                             // UA heading defaults already participate in the
                             // cascade. Lower the computed style without
                             // overriding author normal weight or 16px size.
-                            w3cos_std::Component::text(text, style)
+                            w3cos_std::Component::text_shared(
+                                text,
+                                self.component_style_shared(style),
+                            )
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         }
                     }
                     "button" => {
@@ -10849,7 +11352,10 @@ impl Document {
                             .map(|(_, value)| value.as_str())
                             .unwrap_or("text");
                         if tag.as_str() == "input" && input_type.eq_ignore_ascii_case("file") {
-                            let mut component = w3cos_std::Component::boxed(style, children);
+                            let mut component = w3cos_std::Component::boxed_shared(
+                                self.component_style_shared(style),
+                                children,
+                            );
                             component.on_click = w3cos_std::EventAction::NativeHost {
                                 id: id.as_u32() as u64,
                                 click: true,
@@ -10913,9 +11419,15 @@ impl Document {
                     }
                     _ => {
                         if is_row {
-                            w3cos_std::Component::row(style, children)
+                            w3cos_std::Component::row_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         } else {
-                            w3cos_std::Component::column(style, children)
+                            w3cos_std::Component::column_shared(
+                                self.component_style_shared(style),
+                                children,
+                            )
                         }
                     }
                 };
@@ -12929,7 +13441,7 @@ mod inline_line_extra_ascent_tests {
             kind: w3cos_std::component::ComponentKind::Image {
                 src: "swatch.png".to_string(),
             },
-            style: image_style,
+            style: image_style.into(),
             ..passive_fragment()
         };
         // The image establishes the baseline from its own height, and the runtime
@@ -12962,7 +13474,7 @@ mod inline_line_extra_ascent_tests {
 fn cloned_text_fragment(
     source: &w3cos_std::Component,
     content: String,
-    style: w3cos_std::style::Style,
+    style: w3cos_std::component::ComponentStyle,
 ) -> w3cos_std::Component {
     let mut fragment = source.clone();
     fragment.kind = w3cos_std::ComponentKind::Text { content };
@@ -13158,7 +13670,7 @@ fn apply_first_letter_style_inner(
             fragments.push(cloned_text_fragment(
                 &source,
                 content[range.clone()].to_string(),
-                pseudo_style,
+                pseudo_style.into(),
             ));
             if range.end < content.len() {
                 fragments.push(cloned_text_fragment(
@@ -13251,7 +13763,7 @@ fn apply_first_line_style_inner(
                         cloned_text_fragment(
                             &source,
                             content[..break_at].to_string(),
-                            pseudo_style,
+                            pseudo_style.into(),
                         ),
                         cloned_text_fragment(&source, content[break_at..].to_string(), base_style),
                     ];
@@ -13263,7 +13775,8 @@ fn apply_first_line_style_inner(
             if !content.is_empty() {
                 let advance = first_line_text_advance(content, &components[index].style);
                 components[index].style =
-                    first_line_text_style(&components[index].style, declarations, fragment_height);
+                    first_line_text_style(&components[index].style, declarations, fragment_height)
+                        .into();
                 changed = true;
                 *used_width += advance;
                 if available_width.is_some_and(|width| *used_width >= width) {
@@ -13552,7 +14065,7 @@ fn equivalent_text_style(left: &w3cos_std::style::Style, right: &w3cos_std::styl
     // custom properties are compared apart from the style so the (large,
     // theme-variable) map is never cloned just to drop the fragment marker.
     const IGNORED: [&str; 1] = [w3cos_std::inline_text::FRAGMENT_ENDS];
-    let empty = w3cos_std::custom_properties::CustomProperties::default();
+    let empty = w3cos_std::style::CustomProperties::default();
     let properties_match = left
         .custom_properties
         .as_ref()
@@ -14968,7 +15481,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
     struct InlineUnit {
         content: String,
         component: w3cos_std::Component,
-        wrapper: Option<(w3cos_std::Component, w3cos_std::style::Style)>,
+        wrapper: Option<(w3cos_std::Component, w3cos_std::component::ComponentStyle)>,
         leading_ahem_wrapper: bool,
     }
 
@@ -15530,7 +16043,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             let mut break_style = anonymous_space
                 .as_ref()
                 .map(|space| space.style.clone())
-                .unwrap_or_else(w3cos_std::style::Style::default);
+                .unwrap_or_else(w3cos_std::component::ComponentStyle::default);
             break_style.display = Display::Inline;
             break_style.width = Dimension::Px(0.0);
             break_style.height = Dimension::Px(break_style.font_size * break_style.line_height);
@@ -15547,7 +16060,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
             break_style.border_left_width = None;
             break_style.background = w3cos_std::Color::TRANSPARENT;
             break_style.background_image = None;
-            normalized.push(w3cos_std::Component::text("\u{2028}", break_style));
+            normalized.push(w3cos_std::Component::text_shared("\u{2028}", break_style));
         } else if starts_new_line
             && fragment.line_index > 0
             && logical
@@ -15656,7 +16169,7 @@ fn reorder_explicit_bidi_children(component: &mut w3cos_std::Component) -> bool 
         {
             let mut wrapper = wrapper_source.clone();
             wrapper.style = fragment.component.style.clone();
-            wrapper.children = vec![w3cos_std::Component::text(
+            wrapper.children = vec![w3cos_std::Component::text_shared(
                 content.clone(),
                 inner_style.clone(),
             )];
@@ -15782,7 +16295,7 @@ fn plain_anonymous_inline_table_text(
                     return false;
                 }
             }
-            text_style.get_or_insert_with(|| component.style.clone());
+            text_style.get_or_insert_with(|| (*component.style).clone());
             w3cos_std::inline_text::append_fragment_ends(
                 ends,
                 content.len(),
@@ -16495,7 +17008,7 @@ fn hoist_floats_into_block_formatting_context(
                         .as_ref()
                         .is_none_or(|style| equivalent_text_style(style, &component.style))
                 {
-                    text_style.get_or_insert_with(|| component.style.clone());
+                    text_style.get_or_insert_with(|| (*component.style).clone());
                     content.push_str(text);
                     return true;
                 }
@@ -21603,7 +22116,7 @@ mod image_component_tests {
             runs: &mut Vec<(String, w3cos_std::style::Style)>,
         ) {
             if let ComponentKind::Text { content } = &component.kind {
-                runs.push((content.clone(), component.style.clone()));
+                runs.push((content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 collect(child, runs);
@@ -22006,7 +22519,7 @@ mod image_component_tests {
         let normal = w3cos_std::Component::text("SS", w3cos_std::style::Style::default());
         let mut floating = normal.style.clone();
         floating.float = Float::Left;
-        let floating = w3cos_std::Component::text("PA", floating);
+        let floating = w3cos_std::Component::text("PA", (*floating).clone());
         for children in [
             vec![floating.clone(), normal.clone()],
             vec![normal.clone(), floating.clone()],
@@ -22026,7 +22539,7 @@ mod image_component_tests {
             w3cos_std::Component::text("This test has: ", w3cos_std::style::Style::default());
         let mut bordered_style = plain.style.clone();
         bordered_style.border_top_width = Some(3.0);
-        let bordered = w3cos_std::Component::text("PASSED", bordered_style);
+        let bordered = w3cos_std::Component::text("PASSED", (*bordered_style).clone());
         assert!(
             document
                 .coalesced_generated_text_run(&[plain.clone(), bordered], &plain.style)
@@ -24240,7 +24753,7 @@ mod image_component_tests {
         painted.color = w3cos_std::Color::rgb(1, 2, 3);
         assert!(!equivalent_text_style(&base, &painted));
         let mut custom = base.clone();
-        let mut properties = w3cos_std::custom_properties::CustomProperties::default();
+        let mut properties = w3cos_std::style::CustomProperties::default();
         properties.insert("--tone".to_string(), "dark".to_string());
         custom.custom_properties = Some(properties);
         assert!(!equivalent_text_style(&base, &custom));
@@ -24253,9 +24766,7 @@ mod image_component_tests {
             .collect();
         let styled = |run: &str| {
             let mut style = w3cos_std::style::Style::default();
-            style.custom_properties = Some(w3cos_std::custom_properties::CustomProperties::from(
-                theme.clone(),
-            ));
+            style.custom_properties = Some(w3cos_std::style::CustomProperties::from(theme.clone()));
             w3cos_std::inline_text::set_source_run(&mut style, run);
             style
         };
@@ -26322,7 +26833,7 @@ mod image_component_tests {
             style.line_height = 3.0;
             style.padding.left = w3cos_std::style::Spacing::Px(16.0);
             style.padding.right = w3cos_std::style::Spacing::Px(16.0);
-            w3cos_std::Component::row(style, vec![plain(content)])
+            w3cos_std::Component::row((*style).clone(), vec![plain(content)])
         };
         let mut style = plain("").style;
         style.display = Display::Block;
@@ -26330,7 +26841,7 @@ mod image_component_tests {
         style.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
         style.flex_wrap = w3cos_std::style::FlexWrap::Wrap;
         let mut line = w3cos_std::Component::row(
-            style,
+            (*style).clone(),
             vec![
                 decorated("pppp pppX ppXp \u{202e} ppXp XXpp XppX "),
                 plain("pppX XXXp pXXp "),
@@ -26755,9 +27266,9 @@ mod image_component_tests {
         let mut line = w3cos_std::Component::row(
             parent,
             vec![
-                w3cos_std::Component::text("א", empty.style.clone()),
+                w3cos_std::Component::text("א", (*empty.style).clone()),
                 empty.clone(),
-                w3cos_std::Component::text("בג", empty.style.clone()),
+                w3cos_std::Component::text("בג", (*empty.style).clone()),
             ],
         );
         reorder_explicit_bidi_inline_rows(&mut line);
@@ -27310,7 +27821,7 @@ mod computed_style_cache_tests {
             runs: &mut Vec<(String, w3cos_std::style::Style)>,
         ) {
             if let w3cos_std::component::ComponentKind::Text { content } = &component.kind {
-                runs.push((content.clone(), component.style.clone()));
+                runs.push((content.clone(), (*component.style).clone()));
             }
             for child in &component.children {
                 collect(child, runs);

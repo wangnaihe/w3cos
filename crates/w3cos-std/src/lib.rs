@@ -2,6 +2,7 @@ pub mod background;
 pub mod color;
 pub mod component;
 pub mod custom_properties;
+pub mod fxhash;
 pub mod inline_text;
 pub mod keyboard_inset;
 pub mod safe_area;
@@ -10,7 +11,9 @@ pub mod svg;
 pub mod viewport;
 
 pub use color::Color;
-pub use component::{Component, ComponentKind, EventAction, SvgEventTarget, find_text_input};
+pub use component::{
+    Component, ComponentKind, ComponentStyle, EventAction, SvgEventTarget, find_text_input,
+};
 pub use style::Style;
 pub use svg::{SvgPathCommand, SvgPathData};
 

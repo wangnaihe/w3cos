@@ -2,6 +2,7 @@
 name = "w3cos-vm"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Interpreter for dynamically loaded W3IR modules"
 

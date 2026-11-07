@@ -665,12 +665,458 @@ pub fn animation_value(effect: Value, timeline: Value) -> Value {
 }
 
 pub fn animate_element(target: Value, keyframes: Value, options: Value, node: u32) -> Value {
+    let model_keyframes = keyframes_from_js(&keyframes);
+    let model_timing = timing_model_from(&options);
     let effect = keyframe_effect_value(target, keyframes, options);
-    let animation = animation_value(effect, document_timeline_value());
+    let animation = animation_value(effect.clone(), document_timeline_value());
     animation.set_property("__w3cos_animation_target", Value::Number(node as f64));
+    attach_effect_model(&animation, &effect, node, model_keyframes, model_timing);
     animation.call_method("play", Vec::new());
     ANIMATIONS.with(|animations| animations.borrow_mut().push(animation.clone()));
     animation
+}
+
+/// CSS property name for a keyframe member (`cssFloat` -> `float`,
+/// `backgroundColor` -> `background-color`; custom properties verbatim).
+fn keyframe_property_name(key: &str) -> String {
+    if key == "cssFloat" {
+        return "float".to_string();
+    }
+    if key.starts_with("--") {
+        return key.to_string();
+    }
+    let mut name = String::with_capacity(key.len() + 4);
+    for character in key.chars() {
+        if character.is_ascii_uppercase() {
+            name.push('-');
+            name.push(character.to_ascii_lowercase());
+        } else {
+            name.push(character);
+        }
+    }
+    name
+}
+
+/// Process a keyframes argument (web-animations-1 §5.3.3 "process a
+/// keyframes argument"): keyframe lists and property-indexed keyframes, then
+/// compute missing offsets (evenly spaced between known ones).
+pub(crate) fn keyframes_from_js(value: &Value) -> Vec<w3cos_dom::animation::Keyframe> {
+    use w3cos_dom::animation::Keyframe;
+    let mut frames: Vec<(Option<f64>, Vec<(String, String)>)> = Vec::new();
+    let member_keys = |object: &Value| -> Vec<String> {
+        w3cos_core::intrinsics::for_in_keys(object)
+            .iter()
+            .map(|key| key.to_js_string())
+            .filter(|key| !matches!(key.as_str(), "offset" | "easing" | "composite"))
+            .collect()
+    };
+    if value.is_array() {
+        for item in value.iter() {
+            if !item.is_object() {
+                continue;
+            }
+            let offset = item.get_property("offset");
+            let offset =
+                (offset.is_number() && offset.to_number().is_finite()).then(|| offset.to_number());
+            let declarations = member_keys(&item)
+                .into_iter()
+                .map(|key| {
+                    let value = item.get_property(&key).to_js_string();
+                    (keyframe_property_name(&key), value)
+                })
+                .collect();
+            frames.push((offset, declarations));
+        }
+    } else if value.is_object() {
+        // Property-indexed: each property's values are spaced evenly.
+        let mut merged: Vec<(f64, Vec<(String, String)>)> = Vec::new();
+        for key in member_keys(value) {
+            let member = value.get_property(&key);
+            let values: Vec<Value> = if member.is_array() {
+                member.iter().collect()
+            } else {
+                vec![member]
+            };
+            let total = values.len();
+            let property = keyframe_property_name(&key);
+            for (index, member_value) in values.into_iter().enumerate() {
+                let offset = if total <= 1 {
+                    1.0
+                } else {
+                    index as f64 / (total - 1) as f64
+                };
+                let declaration = (property.clone(), member_value.to_js_string());
+                if let Some(frame) = merged.iter_mut().find(|(at, _)| *at == offset) {
+                    frame.1.push(declaration);
+                } else {
+                    merged.push((offset, vec![declaration]));
+                }
+            }
+        }
+        merged.sort_by(|a, b| a.0.total_cmp(&b.0));
+        return merged
+            .into_iter()
+            .map(|(offset, declarations)| Keyframe {
+                offset,
+                declarations,
+            })
+            .collect();
+    }
+    let count = frames.len();
+    if count == 1 && frames[0].0.is_none() {
+        frames[0].0 = Some(1.0);
+    } else if count > 1 {
+        if frames[0].0.is_none() {
+            frames[0].0 = Some(0.0);
+        }
+        if frames[count - 1].0.is_none() {
+            frames[count - 1].0 = Some(1.0);
+        }
+        let mut previous = 0;
+        for index in 1..count {
+            if let Some(end) = frames[index].0 {
+                let start = frames[previous].0.unwrap_or(0.0);
+                let gap = index - previous;
+                for step in 1..gap {
+                    frames[previous + step].0 =
+                        Some(start + (end - start) * step as f64 / gap as f64);
+                }
+                previous = index;
+            }
+        }
+    }
+    frames
+        .into_iter()
+        .map(|(offset, declarations)| Keyframe {
+            offset: offset.unwrap_or(1.0),
+            declarations,
+        })
+        .collect()
+}
+
+/// `EffectTiming` from `animate()`/`KeyframeEffect` options (a number is
+/// the duration; `"auto"` duration is 0 for keyframe effects).
+pub(crate) fn timing_model_from(options: &Value) -> w3cos_dom::animation::Timing {
+    use w3cos_dom::animation::{FillMode, PlaybackDirection, Timing};
+    let mut timing = Timing::default();
+    if options.is_number() {
+        timing.duration = options.to_number().max(0.0);
+        return timing;
+    }
+    if !options.is_object() {
+        return timing;
+    }
+    let number = |name: &str, fallback: f64| {
+        let value = options.get_property(name);
+        if value.is_number() {
+            value.to_number()
+        } else {
+            fallback
+        }
+    };
+    timing.duration = number("duration", 0.0).max(0.0);
+    timing.delay = number("delay", 0.0);
+    timing.end_delay = number("endDelay", 0.0);
+    timing.iterations = number("iterations", 1.0).max(0.0);
+    timing.iteration_start = number("iterationStart", 0.0).max(0.0);
+    timing.fill = match options.get_property("fill").to_js_string().as_str() {
+        "none" => FillMode::None,
+        "forwards" => FillMode::Forwards,
+        "backwards" => FillMode::Backwards,
+        "both" => FillMode::Both,
+        _ => FillMode::Auto,
+    };
+    timing.direction = match options.get_property("direction").to_js_string().as_str() {
+        "reverse" => PlaybackDirection::Reverse,
+        "alternate" => PlaybackDirection::Alternate,
+        "alternate-reverse" => PlaybackDirection::AlternateReverse,
+        _ => PlaybackDirection::Normal,
+    };
+    let easing = options.get_property("easing");
+    if !easing.is_undefined() {
+        timing.easing = w3cos_dom::animation::parse_easing(&easing.to_js_string());
+    }
+    timing
+}
+
+struct EffectModel {
+    id: u64,
+    node: u32,
+    keyframes: Rc<Vec<w3cos_dom::animation::Keyframe>>,
+    timing: w3cos_dom::animation::Timing,
+    clock: w3cos_dom::animation::PlaybackClock,
+    /// Play-pending: the hold time is kept until the next animation frame
+    /// resolves the start time (web-animations-1 "pending play task").
+    pending_play: bool,
+}
+
+impl EffectModel {
+    fn current_time(&self) -> Option<f64> {
+        self.clock
+            .current_time(w3cos_dom::animation::timeline_now())
+    }
+
+    /// Push this effect into the element's effect stack and restyle it.
+    fn sync(&self) {
+        let installed =
+            (self.clock.hold_time.is_some() || self.clock.start_time.is_some()).then(|| {
+                w3cos_dom::animation::ElementEffect {
+                    id: self.id,
+                    keyframes: Rc::clone(&self.keyframes),
+                    timing: self.timing,
+                    clock: self.clock,
+                }
+            });
+        w3cos_dom::animation::set_element_effect(self.node, self.id, installed);
+        crate::dom::invalidate_animated_style(self.node);
+    }
+
+    fn set_current_time(&mut self, time: f64) {
+        let now = w3cos_dom::animation::timeline_now();
+        if self.clock.hold_time.is_some() || self.clock.start_time.is_none() {
+            self.clock.hold_time = Some(time);
+        } else {
+            let rate = if self.clock.playback_rate == 0.0 {
+                1.0
+            } else {
+                self.clock.playback_rate
+            };
+            self.clock.start_time = Some(now - time / rate);
+        }
+    }
+}
+
+thread_local! {
+    static NEXT_EFFECT_ID: Cell<u64> = const { Cell::new(1) };
+    static PENDING_PLAYS: RefCell<Vec<std::rc::Weak<RefCell<EffectModel>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Run pending play tasks at the frame's rendering update: the start time
+/// becomes the timeline time minus the held current time.
+pub fn resolve_pending_plays() {
+    let pending = PENDING_PLAYS.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    let now = w3cos_dom::animation::timeline_now();
+    for model in pending.into_iter().filter_map(|model| model.upgrade()) {
+        let mut model = model.borrow_mut();
+        if !model.pending_play {
+            continue;
+        }
+        model.pending_play = false;
+        let hold = model.clock.hold_time.take().unwrap_or(0.0);
+        let rate = if model.clock.playback_rate == 0.0 {
+            1.0
+        } else {
+            model.clock.playback_rate
+        };
+        model.clock.start_time = Some(now - hold / rate);
+        model.sync();
+    }
+}
+
+/// Back an `animate()` Animation with the playback model (start time / hold
+/// time, web-animations-1 §4.4) and register its KeyframeEffect on the target
+/// so sampled values reach style and layout.
+fn attach_effect_model(
+    animation: &Value,
+    effect: &Value,
+    node: u32,
+    keyframes: Vec<w3cos_dom::animation::Keyframe>,
+    timing: w3cos_dom::animation::Timing,
+) {
+    let id = NEXT_EFFECT_ID.with(|next| next.replace(next.get() + 1));
+    let model = Rc::new(RefCell::new(EffectModel {
+        id,
+        node,
+        keyframes: Rc::new(keyframes),
+        timing,
+        clock: w3cos_dom::animation::PlaybackClock {
+            start_time: None,
+            hold_time: None,
+            playback_rate: 1.0,
+        },
+        pending_play: false,
+    }));
+    let getter_model = Rc::clone(&model);
+    let setter_model = Rc::clone(&model);
+    w3cos_core::class::define_property(
+        animation,
+        "currentTime",
+        &Value::object(HashMap::from([
+            (
+                "get".into(),
+                realm_animation_function(move |_, _| {
+                    getter_model
+                        .borrow()
+                        .current_time()
+                        .map_or(Value::Null, Value::Number)
+                }),
+            ),
+            (
+                "set".into(),
+                realm_animation_function(move |_, args| {
+                    let time = args.first().cloned().unwrap_or(Value::Undefined);
+                    if time.is_null() || time.is_undefined() {
+                        return Value::Undefined;
+                    }
+                    let time = time.to_number();
+                    if !time.is_finite() {
+                        type_error("Failed to set the 'currentTime' property on 'Animation'");
+                    }
+                    let mut model = setter_model.borrow_mut();
+                    model.set_current_time(time);
+                    model.sync();
+                    Value::Undefined
+                }),
+            ),
+            ("configurable".into(), Value::Bool(true)),
+            ("enumerable".into(), Value::Bool(true)),
+        ])),
+    );
+    let start_model = Rc::clone(&model);
+    w3cos_core::class::define_property(
+        animation,
+        "startTime",
+        &Value::object(HashMap::from([
+            (
+                "get".into(),
+                realm_animation_function(move |_, _| {
+                    start_model
+                        .borrow()
+                        .clock
+                        .start_time
+                        .map_or(Value::Null, Value::Number)
+                }),
+            ),
+            ("configurable".into(), Value::Bool(true)),
+            ("enumerable".into(), Value::Bool(true)),
+        ])),
+    );
+    let wrap = |method: &'static str, update: Rc<dyn Fn(&mut EffectModel)>| {
+        let previous = animation.get_property(method);
+        let model = Rc::clone(&model);
+        animation.set_property(
+            method,
+            realm_animation_function(move |this, args| {
+                update(&mut model.borrow_mut());
+                if model.borrow().pending_play {
+                    PENDING_PLAYS.with(|pending| pending.borrow_mut().push(Rc::downgrade(&model)));
+                }
+                let result = previous.call(this, args);
+                model.borrow().sync();
+                result
+            }),
+        );
+    };
+    wrap(
+        "play",
+        Rc::new(|model| {
+            let end = model.timing.end_time();
+            let current = model.current_time();
+            let rate = model.clock.playback_rate;
+            let restart = match current {
+                None => Some(if rate < 0.0 { end } else { 0.0 }),
+                Some(time) if rate >= 0.0 && (time < 0.0 || time >= end) => Some(0.0),
+                Some(time) if rate < 0.0 && (time <= 0.0 || time > end) => Some(end),
+                Some(time) => Some(time),
+            };
+            model.clock.hold_time = Some(restart.unwrap_or(0.0));
+            model.clock.start_time = None;
+            model.pending_play = true;
+        }),
+    );
+    wrap(
+        "pause",
+        Rc::new(|model| {
+            let time = model.current_time().unwrap_or(0.0);
+            model.clock.hold_time = Some(time);
+            model.clock.start_time = None;
+            model.pending_play = false;
+        }),
+    );
+    wrap(
+        "cancel",
+        Rc::new(|model| {
+            model.clock.hold_time = None;
+            model.clock.start_time = None;
+            model.pending_play = false;
+        }),
+    );
+    wrap(
+        "finish",
+        Rc::new(|model| {
+            let end = if model.clock.playback_rate < 0.0 {
+                0.0
+            } else {
+                model.timing.end_time()
+            };
+            model.set_current_time(end);
+        }),
+    );
+    wrap(
+        "reverse",
+        Rc::new(|model| {
+            let current = model.current_time();
+            model.clock.playback_rate = -model.clock.playback_rate;
+            if let Some(time) = current {
+                model.clock.hold_time = None;
+                let now = w3cos_dom::animation::timeline_now();
+                model.clock.start_time = Some(now - time / model.clock.playback_rate);
+            }
+        }),
+    );
+    let rate_model = Rc::clone(&model);
+    let previous_rate = animation.get_property("updatePlaybackRate");
+    animation.set_property(
+        "updatePlaybackRate",
+        realm_animation_function(move |this, args| {
+            let rate = args.first().map(Value::to_number).unwrap_or(1.0);
+            {
+                let mut model = rate_model.borrow_mut();
+                let current = model.current_time();
+                model.clock.playback_rate = rate;
+                if let Some(time) = current
+                    && model.clock.hold_time.is_none()
+                    && rate != 0.0
+                {
+                    let now = w3cos_dom::animation::timeline_now();
+                    model.clock.start_time = Some(now - time / rate);
+                }
+                model.sync();
+            }
+            previous_rate.call(this, args)
+        }),
+    );
+    let frames_model = Rc::clone(&model);
+    let previous_set_keyframes = effect.get_property("setKeyframes");
+    effect.set_property(
+        "setKeyframes",
+        realm_animation_function(move |this, args| {
+            let frames = keyframes_from_js(&args.first().cloned().unwrap_or(Value::Undefined));
+            let result = previous_set_keyframes.call(this, args);
+            let mut model = frames_model.borrow_mut();
+            model.keyframes = Rc::new(frames);
+            model.sync();
+            result
+        }),
+    );
+    let timing_model = Rc::clone(&model);
+    let previous_update_timing = effect.get_property("updateTiming");
+    let timing_effect = effect.clone();
+    effect.set_property(
+        "updateTiming",
+        realm_animation_function(move |this, args| {
+            let result = previous_update_timing.call(this, args);
+            let timing = timing_effect.call_method("getTiming", Vec::new());
+            let mut model = timing_model.borrow_mut();
+            model.timing = timing_model_from(&timing);
+            model.sync();
+            result
+        }),
+    );
 }
 
 pub(crate) fn discrete_property_sample(
@@ -825,6 +1271,7 @@ pub fn animations_for(node: Option<u32>, subtree: bool) -> Value {
 }
 
 pub fn reset() {
+    w3cos_dom::animation::reset();
     ANIMATIONS.with(|animations| animations.borrow_mut().clear());
     ANIMATION_INSTANCES.with(|animations| {
         for animation in animations

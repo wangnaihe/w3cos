@@ -2,6 +2,7 @@
 name = "w3cos-ime"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "IME Hub and the bundled on-device pinyin engine."
 

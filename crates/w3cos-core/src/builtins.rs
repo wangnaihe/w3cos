@@ -351,6 +351,7 @@ pub fn boolean_value() -> Value {
 pub fn symbol_value() -> Value {
     thread_local! {
         static SYMBOL: RefCell<Option<Value>> = const { RefCell::new(None) };
+        static NEXT_SYMBOL: Cell<u64> = const { Cell::new(1) };
     }
     SYMBOL.with(|slot| {
         if let Some(value) = slot.borrow().clone() {
@@ -394,38 +395,74 @@ pub fn symbol_value() -> Value {
                 Value::function(|this, _| Value::from(this_symbol(&this, "[Symbol.toPrimitive]"))),
             ),
         ]));
-        let value = Value::object(HashMap::from([
-            (
-                "iterator".to_string(),
-                Value::from("__w3cos_symbol_iterator"),
-            ),
-            (
-                "asyncIterator".to_string(),
-                Value::from("__w3cos_symbol_async_iterator"),
-            ),
-            (
-                "unscopables".to_string(),
-                Value::from("__w3cos_symbol_unscopables"),
-            ),
-            (
-                "toPrimitive".to_string(),
-                Value::from("__w3cos_symbol_to_primitive"),
-            ),
-            (
-                "for".to_string(),
-                Value::function(|_, arguments| {
-                    Value::from(format!(
-                        "__w3cos_symbol_for:{}",
-                        arguments
+        // Unique Symbol() values need a per-thread sequence so each call is
+        // distinct from Symbol.for registry keys and from well-known symbols.
+        // Making the facade `Value::callable` is required after main's
+        // `intrinsics::call` `ensure_callable` graft — a plain object used to
+        // return Undefined on [[Call]] and now throws "object is not a function".
+        let value = Value::callable(
+            HashMap::from([
+                (
+                    "iterator".to_string(),
+                    Value::from("__w3cos_symbol_iterator"),
+                ),
+                (
+                    "asyncIterator".to_string(),
+                    Value::from("__w3cos_symbol_async_iterator"),
+                ),
+                (
+                    "unscopables".to_string(),
+                    Value::from("__w3cos_symbol_unscopables"),
+                ),
+                (
+                    "toPrimitive".to_string(),
+                    Value::from("__w3cos_symbol_to_primitive"),
+                ),
+                (
+                    "for".to_string(),
+                    Value::function(|_, arguments| {
+                        Value::from(format!(
+                            "__w3cos_symbol_for:{}",
+                            arguments
+                                .first()
+                                .cloned()
+                                .unwrap_or(Value::Undefined)
+                                .to_js_string()
+                        ))
+                    }),
+                ),
+                (
+                    "keyFor".to_string(),
+                    Value::function(|_, arguments| {
+                        let raw = arguments
                             .first()
                             .cloned()
                             .unwrap_or(Value::Undefined)
-                            .to_js_string()
-                    ))
-                }),
-            ),
-            ("prototype".to_string(), prototype),
-        ]));
+                            .to_js_string();
+                        match raw.strip_prefix("__w3cos_symbol_for:") {
+                            Some(key) => Value::from(key.to_string()),
+                            None => Value::Undefined,
+                        }
+                    }),
+                ),
+                ("prototype".to_string(), prototype.clone()),
+            ]),
+            |_, arguments| {
+                let desc = arguments.first().cloned().unwrap_or(Value::Undefined);
+                let desc = if desc.is_undefined() {
+                    String::new()
+                } else {
+                    desc.to_js_string()
+                };
+                let id = NEXT_SYMBOL.with(|c| {
+                    let n = c.get();
+                    c.set(n + 1);
+                    n
+                });
+                Value::from(format!("__w3cos_symbol_{id}:{desc}"))
+            },
+        );
+        prototype.set_property("constructor", value.clone());
         *slot.borrow_mut() = Some(value.clone());
         value
     })
@@ -1093,6 +1130,12 @@ fn build_string_value() -> Value {
                     "String.prototype.{name} called on null or undefined"
                 )));
             }
+            // ECMA-262 ToString(symbol) throws; do not coerce sentinel strings.
+            if this.type_of() == "symbol" {
+                crate::throw_value(crate::value::type_error(&format!(
+                    "Cannot convert a Symbol value to a string"
+                )));
+            }
             let receiver = if this.is_string() {
                 this
             } else if let Some(data) = string_wrapper_data(&this) {
@@ -1126,6 +1169,11 @@ fn build_string_value() -> Value {
                 "String.prototype[Symbol.iterator] called on null or undefined",
             ));
         }
+        if this.type_of() == "symbol" {
+            crate::throw_value(crate::value::type_error(
+                "Cannot convert a Symbol value to a string",
+            ));
+        }
         let text = if this.is_string() {
             this
         } else if let Some(data) = string_wrapper_data(&this) {
@@ -1139,6 +1187,9 @@ fn build_string_value() -> Value {
     define_builtin(&prototype, "__w3cos_symbol_iterator", iterator);
     let constructor = Value::callable(HashMap::new(), |_, arguments| match arguments.first() {
         None => Value::string(""),
+        Some(value) if value.type_of() == "symbol" => crate::throw_value(crate::value::type_error(
+            "Cannot convert a Symbol value to a string",
+        )),
         Some(value) => Value::from(value.to_js_string()),
     });
     for (key, value) in [
@@ -1943,6 +1994,10 @@ pub(crate) fn object_keys(value: &Value) -> Value {
             keys.into_iter()
                 .filter(|key| {
                     let key = key.to_js_string();
+                    // Symbol values are string sentinels; omit from Object.keys/entries.
+                    if key.starts_with("__w3cos_symbol_") {
+                        return false;
+                    }
                     object
                         .borrow()
                         .get_own_property_descriptor(&key)
@@ -1968,7 +2023,12 @@ pub(crate) fn object_keys(value: &Value) -> Value {
 
 fn object_own_property_names(value: &Value) -> Value {
     if let Some(object) = value.as_object() {
-        return object.borrow().own_keys();
+        let keys = object.borrow().own_keys();
+        return Value::array(
+            keys.iter()
+                .filter(|key| !key.to_js_string().starts_with("__w3cos_symbol_"))
+                .collect(),
+        );
     }
     if let Some(values) = value.as_array() {
         let mut keys = values
@@ -2690,6 +2750,42 @@ pub fn dispatch_resize_observers_bounded(
 #[cfg(test)]
 mod monaco_tests {
     use super::*;
+
+    #[test]
+    fn symbol_facade_is_callable_and_mints_unique_values() {
+        use crate::intrinsics::{call, call_completion, get_property};
+        let symbol = symbol_value();
+        assert!(
+            symbol.is_callable(),
+            "Symbol must be callable after ensure_callable"
+        );
+        let a = call(&symbol, Value::Undefined, vec![Value::string("s")]);
+        let b = call(&symbol, Value::Undefined, vec![Value::string("s")]);
+        assert_eq!(a.type_of(), "symbol");
+        assert_eq!(b.type_of(), "symbol");
+        assert!(!a.strict_eq(&b), "Symbol(desc) must be unique per call");
+        let for_fn = get_property(&symbol, &Value::string("for"));
+        let reg = call(&for_fn, symbol.clone(), vec![Value::string("s")]);
+        let reg2 = call(&for_fn, symbol.clone(), vec![Value::string("s")]);
+        assert!(reg.strict_eq(&reg2), "Symbol.for registry must be stable");
+        assert!(!reg.strict_eq(&a), "Symbol.for must differ from Symbol()");
+        let key_for = get_property(&symbol, &Value::string("keyFor"));
+        let key = call(&key_for, symbol.clone(), vec![reg.clone()]);
+        assert_eq!(key.to_js_string(), "s");
+        let miss = call(&key_for, symbol.clone(), vec![a.clone()]);
+        assert!(miss.is_undefined(), "keyFor(unique) => undefined");
+        // Array.includes path that CI regressed on: Symbol() must not throw
+        let includes = get_property(
+            &get_property(&array_value(), &Value::string("prototype")),
+            &Value::string("includes"),
+        );
+        let sample = Value::array(vec![Value::Number(42.0), a.clone()]);
+        let ok = call_completion(&includes, sample, vec![a.clone()]);
+        assert!(
+            ok.as_ref().ok().map(|v| v.to_bool()) == Some(true),
+            "includes(symbol): {ok:?}"
+        );
+    }
 
     #[test]
     fn reflect_and_symbol_facades_support_uncurried_captures() {

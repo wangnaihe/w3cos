@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "pr200",
+    "sha256": "49fd880e1822fa69424c691ea531d9738dab5892385b2ed83f3b06875514952d"
+  },
+  "candidate": {
+    "path": "fastpath-pr200-index",
+    "sha256": "092a3c3b3e9aabcaf54ced2fcbbabe4f2561c08e13d6a0eba807f48ce09163e4"
+  }
+}

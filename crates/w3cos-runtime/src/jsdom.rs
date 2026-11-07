@@ -303,13 +303,19 @@ impl ListenerStore {
     /// handler, capture)` without rebuilding the whole index. The last item
     /// moves into the hole; its index entry is rewritten in place, so every
     /// `(node, event type)` list keeps registration order.
-    fn remove_one(&mut self, node: u32, event_type: EventType, handler: &Value, capture: bool) {
+    fn remove_one(
+        &mut self,
+        node: u32,
+        event_type: EventType,
+        handler: &Value,
+        capture: bool,
+    ) -> bool {
         let Some(index) = self.index.as_mut() else {
-            return;
+            return false;
         };
         let key = (node, event_type);
         let Some(idxs) = index.get_mut(&key) else {
-            return;
+            return false;
         };
         let Some(pos) = idxs.iter().position(|&idx| {
             same_listener(
@@ -320,7 +326,7 @@ impl ListenerStore {
                 capture,
             )
         }) else {
-            return;
+            return false;
         };
         let removed = idxs.remove(pos);
         if idxs.is_empty() {
@@ -346,6 +352,7 @@ impl ListenerStore {
                 *slot = Some(OneListener::Many);
             }
         }
+        true
     }
 
     fn retain(&mut self, mut pred: impl FnMut(&JsListener) -> bool) {
@@ -9788,6 +9795,12 @@ pub(crate) fn invalidate_scroll_size_cache() {
 }
 
 fn forced_scroll_size(node: u32) -> (f64, f64) {
+    // scrollWidth/scrollHeight flush pending style and layout like every
+    // other geometry getter. Without this an appended child was invisible to
+    // scrollHeight (and to the scrollTop clamp) until something else flushed.
+    if dom::is_document_dirty() {
+        let _ = crate::incremental_layout::flush();
+    }
     let read = || {
         dom::with_document(|document| {
             let element = Element::new(NodeId::from_u32(node));
@@ -13652,8 +13665,8 @@ fn scan_css_animations() {
                 from,
                 to,
                 started_at: Instant::now(),
-                delay: Duration::from_millis(u64::from(animation.delay_ms)),
-                duration: Duration::from_millis(u64::from(animation.duration_ms)),
+                delay: Duration::from_millis(animation.delay_ms.max(0) as u64),
+                duration: Duration::from_millis(animation.duration_ms.max(0) as u64),
                 easing: animation.easing,
                 direction: animation.direction,
                 event_pending: true,
@@ -14638,6 +14651,13 @@ fn build_computed_style_value(node: u32, pseudo: Option<String>) -> Value {
 
 // ── JS event bridge ────────────────────────────────────────────────────────
 
+fn note_window_motion_listener(node: u32, type_name: &str, added: bool) {
+    if node != 0 {
+        return;
+    }
+    crate::orientation_web::adjust_motion_listener(type_name, if added { 1 } else { -1 });
+}
+
 fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Value) {
     if !handler.is_function() {
         return;
@@ -14662,6 +14682,7 @@ fn js_add_event_listener(node: u32, type_name: &str, handler: Value, options: Va
     });
     if added {
         ensure_native_registration(node, et);
+        note_window_motion_listener(node, type_name, true);
     }
 }
 
@@ -14744,10 +14765,13 @@ fn js_remove_event_listener(node: u32, type_name: &str, handler: Value, options:
     }
     let capture = listener_capture(&options);
     let et = event_type_for(type_name);
-    LISTENERS.with(|l| {
+    let removed = LISTENERS.with(|l| {
         let mut listeners = l.borrow_mut();
-        listeners.remove_one(node, et, &handler, capture);
+        listeners.remove_one(node, et, &handler, capture)
     });
+    if removed {
+        note_window_motion_listener(node, type_name, false);
+    }
 }
 
 fn key_code_for(key: &str, code: &str) -> u32 {
@@ -16046,6 +16070,20 @@ pub(crate) fn deliver_edit_context_command(input_type: &str) -> bool {
             Value::string(""),
         ],
     );
+    true
+}
+
+/// Code-OSS / cpu-render harness: synthesize a keydown+keyup on the focused
+/// target (and deliver EditContext commands when the key is not prevented).
+pub fn harness_key_press(key: &str, code: &str, shift: bool) -> bool {
+    let Some(target) = keyboard_event_target(None) else {
+        return false;
+    };
+    let prevented = dispatch_native_key(target, key, code, false, false, false, false, shift, true);
+    if !prevented && let Some(input_type) = edit_context_input_type_for_key(key, shift) {
+        deliver_edit_context_command(input_type);
+    }
+    dispatch_native_key(target, key, code, false, false, false, false, shift, false);
     true
 }
 
@@ -20336,7 +20374,7 @@ fn storage_value(persistent: bool) -> Value {
     value
 }
 
-fn crypto_key_class() -> Value {
+pub(crate) fn crypto_key_class() -> Value {
     CRYPTO_KEY_CLASS.with(|slot| {
         if let Some(class) = slot.borrow().clone() {
             return class;
@@ -23433,6 +23471,13 @@ pub fn drain_microtasks() -> usize {
         ran += crate::eventsource::poll_js_events();
         ran += crate::worker_web::poll_js_events();
         ran += crate::speech_web::poll_js_events();
+        ran += crate::audio_web::poll_live_outputs();
+        ran += crate::gamepad_web::poll();
+        ran += crate::serial_web::poll_serial_io();
+        ran += crate::device_access_web::poll_device_events();
+        ran += crate::sensors_web::poll_platform_samples();
+        ran += crate::geolocation_web::poll_platform_events();
+        ran += crate::bluetooth_web::poll_platform_events();
         ran += deliver_pending_events();
         ran += w3cos_core::promise::drain_microtasks();
         let batch: Vec<Value> = MICROTASKS.with(|m| std::mem::take(&mut *m.borrow_mut()));
@@ -34497,4 +34542,13 @@ try {
         );
         assert_eq!(hits.get(), 400);
     }
+}
+
+pub(crate) fn canvas_2d_rgba(node: u32) -> Option<(u32, u32, Vec<u8>)> {
+    CANVAS_CONTEXTS.with(|contexts| {
+        let contexts = contexts.borrow();
+        let context = contexts.get(&node)?;
+        let context = context.borrow();
+        Some((context.width, context.height, context.pixels().to_vec()))
+    })
 }

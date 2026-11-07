@@ -367,6 +367,23 @@ impl PropertyMap {
         self.get(key).is_some()
     }
 
+    pub(crate) fn contains_key_or_prefixed(
+        &self,
+        key: &str,
+        first_prefix: &str,
+        second_prefix: &str,
+    ) -> bool {
+        if self.contains_key(key) {
+            return true;
+        }
+        // Fall back to a scan when accessor prefixes may be present.
+        self.keys().any(|candidate| {
+            let candidate = candidate.as_str();
+            candidate.strip_prefix(first_prefix) == Some(key)
+                || candidate.strip_prefix(second_prefix) == Some(key)
+        })
+    }
+
     pub(crate) fn insert(&mut self, key: JsString, value: Value) -> Option<Value> {
         if let Some(slot) = self.get_mut(key.as_str()) {
             return Some(std::mem::replace(slot, value));

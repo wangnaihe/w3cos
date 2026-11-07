@@ -416,6 +416,20 @@ impl PartialEq for Immediate {
     }
 }
 
+pub(crate) fn accessor_key<'a>(
+    buf: &'a mut [u8; 96],
+    prefix: &str,
+    key: &str,
+) -> std::borrow::Cow<'a, str> {
+    let total = prefix.len() + key.len();
+    if total > buf.len() {
+        return std::borrow::Cow::Owned(format!("{prefix}{key}"));
+    }
+    buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+    buf[prefix.len()..total].copy_from_slice(key.as_bytes());
+    std::borrow::Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
+}
+
 impl Value {
     /// Unit-like constructor kept so AOT / host code can write `Value::Undefined`.
     #[allow(non_upper_case_globals)]
@@ -1954,6 +1968,13 @@ impl Clone for JsFunction {
 }
 
 impl JsFunction {
+    pub fn aot_factory_address(&self) -> Option<usize> {
+        match &self.data().body {
+            FunctionBody::Aot { factory, .. } => Some(*factory as usize),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn new(f: impl Fn(Value, Vec<Value>) -> Value + 'static) -> Self {
         Self::from_host(Rc::new(FunctionData::new(f)))

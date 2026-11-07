@@ -65,14 +65,31 @@ pub(crate) fn normalize_font_bytes_with_limit(
             ));
         }
     }
-    let decoded =
-        match bytes.get(..4) {
-            Some(b"wOFF") => wuff::decompress_woff1(bytes)
-                .map_err(|error| format!("WOFF decode failed: {error:?}")),
-            Some(b"wOF2") => wuff::decompress_woff2(bytes)
-                .map_err(|error| format!("WOFF2 decode failed: {error:?}")),
-            _ => Ok(bytes.to_vec()),
-        }?;
+    let decoded = match bytes.get(..4) {
+        Some(b"wOFF") => {
+            #[cfg(feature = "woff")]
+            {
+                wuff::decompress_woff1(bytes)
+                    .map_err(|error| format!("WOFF decode failed: {error:?}"))
+            }
+            #[cfg(not(feature = "woff"))]
+            {
+                Err("WOFF decoding requires the woff feature".to_string())
+            }
+        }
+        Some(b"wOF2") => {
+            #[cfg(feature = "woff")]
+            {
+                wuff::decompress_woff2(bytes)
+                    .map_err(|error| format!("WOFF2 decode failed: {error:?}"))
+            }
+            #[cfg(not(feature = "woff"))]
+            {
+                Err("WOFF2 decoding requires the woff feature".to_string())
+            }
+        }
+        _ => Ok(bytes.to_vec()),
+    }?;
     if decoded.len() > max_decoded_bytes {
         return Err(format!(
             "decoded font exceeds source limit ({} > {max_decoded_bytes} bytes)",
@@ -247,7 +264,7 @@ thread_local! {
 }
 
 fn face_hit_key(family: &str, weight: FontWeight, style: FontFaceStyle) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = w3cos_std::fxhash::FxHasher::default();
     family.hash(&mut hasher);
     weight.hash(&mut hasher);
     style.hash(&mut hasher);
@@ -469,10 +486,27 @@ pub(crate) fn parsed_fallback(character: char) -> Option<Arc<fontdue::Font>> {
 }
 
 /// Fontconfig-backed manager. Tests pin bundled faces before the first init.
+///
+/// `FontMgr::default()` builds a fresh platform manager on every call; on
+/// macOS `SkFontMgr_Mac` copies the full family-name list over XPC in its
+/// constructor (`CTFontManagerCopyAvailableFontFamilyNames`), which made
+/// per-glyph fallback lookups dominate CJK pages (30-55 s). Skia expects
+/// one long-lived manager (Blink keeps a single `FontCache`), so cache it
+/// per thread.
 #[cfg(feature = "skia")]
 pub(crate) fn pinned_font_mgr() -> skia_safe::FontMgr {
-    system_fonts::pin_test_fontconfig();
-    skia_safe::FontMgr::default()
+    thread_local! {
+        static MGR: skia_safe::FontMgr = {
+            system_fonts::pin_test_fontconfig();
+            skia_safe::FontMgr::default()
+        };
+    }
+    MGR.with(|m| m.clone())
+}
+
+#[cfg(feature = "embed-cjk-font")]
+pub(crate) fn embedded_cjk_subset_len() -> usize {
+    system_fonts::embedded_cjk_subset_len()
 }
 
 pub(crate) fn host_ui_font() -> &'static HostUiFont {
@@ -491,8 +525,17 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
                 families: &system_fonts::host_ui_families(),
                 ..fontdb::Query::default()
             })
-            .or_else(|| database.faces().next().map(|face| face.id))
-            .expect("host must provide at least one system font");
+            .or_else(|| database.faces().next().map(|face| face.id));
+        let Some(id) = id else {
+            #[cfg(all(not(test), feature = "embed-cjk-font"))]
+            if let Some(face) = system_fonts::bundled_cjk_face() {
+                eprintln!(
+                    "[W3C OS] no system font is installed; using the embedded CJK subset because embed-cjk-font is enabled"
+                );
+                return finish_host_font(face.family, face.data, face.collection_index.unwrap_or(0));
+            }
+            panic!("host must provide at least one system font");
+        };
         let family = database
             .face(id)
             .and_then(|face| face.families.first())
@@ -503,6 +546,54 @@ pub(crate) fn host_ui_font() -> &'static HostUiFont {
             .expect("selected system font must remain readable");
         finish_host_font(family, data, index)
     })
+}
+
+/// The physical font box used by a resolved text run, excluding CSS
+/// line-height leading. CSSOM text fragments expose this box while their line
+/// origins still advance by the used `line-height`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FontBoxMetrics {
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+impl FontBoxMetrics {
+    pub fn height(self) -> f32 {
+        self.ascent + self.descent
+    }
+}
+
+pub(crate) fn font_box_metrics_for_text(
+    style: &w3cos_std::style::Style,
+    text: &str,
+) -> Option<FontBoxMetrics> {
+    let runs = FontRegistry::global().resolve_style_runs(style, text);
+    let mut ascent = 0.0_f32;
+    let mut descent = 0.0_f32;
+    let mut found = false;
+    for run in runs {
+        let font = run.font.and_then(|font| font.parsed());
+        let font = font
+            .as_deref()
+            .unwrap_or_else(|| host_ui_font().font.as_ref());
+        let metrics = font.horizontal_line_metrics(style.font_size)?;
+        // CSS inline boxes use the face's rounded ascent/descent, while the
+        // CSS line box keeps its fractional used line-height.  This mirrors
+        // the physical font-box contract used by the shaping renderer and
+        // leaves the remaining fraction in lower leading.
+        ascent = ascent.max(metrics.ascent.max(0.0).round());
+        descent = descent.max((-metrics.descent).max(0.0).round());
+        found = true;
+    }
+    if !found {
+        let metrics = host_ui_font()
+            .font
+            .horizontal_line_metrics(style.font_size)?;
+        ascent = metrics.ascent.max(0.0).round();
+        descent = (-metrics.descent).max(0.0).round();
+    }
+    let metrics = FontBoxMetrics { ascent, descent };
+    (metrics.height().is_finite() && metrics.height() > 0.0).then_some(metrics)
 }
 
 fn finish_host_font(family: String, data: Arc<Vec<u8>>, index: u32) -> HostUiFont {
@@ -820,6 +911,14 @@ impl FontRegistry {
         style: FontFaceStyle,
         text: &str,
     ) -> Option<LoadedFont> {
+        let is_cascade_winner_for_all = |font: &LoadedFont| {
+            !stack.contains(',')
+                || text.chars().all(|character| {
+                    let glyph = crate::text_layout::font_glyph_character(character);
+                    self.resolve_render_stack(stack, weight, style, Some(glyph))
+                        .is_some_and(|resolved| resolved.cache_key() == font.cache_key())
+                })
+        };
         let key = face_hit_key(stack, weight, style);
         if let Some(cached) = FACE_HIT.with(|slot| {
             slot.borrow()
@@ -830,6 +929,7 @@ impl FontRegistry {
                 && text.chars().all(|character| {
                     cached.supports_character(crate::text_layout::font_glyph_character(character))
                 })
+                && is_cascade_winner_for_all(&cached)
             {
                 return Some(cached);
             }
@@ -843,6 +943,12 @@ impl FontRegistry {
         if text.chars().any(|character| {
             !font.supports_character(crate::text_layout::font_glyph_character(character))
         }) {
+            return None;
+        }
+        // Coverage alone is insufficient for a multi-family stack. A later
+        // fallback may cover the complete string while an earlier family wins
+        // individual characters (for example `Ahem, Second` and `ŢT`).
+        if !is_cascade_winner_for_all(&font) {
             return None;
         }
         FACE_HIT.with(|slot| *slot.borrow_mut() = Some((key, font.clone())));
@@ -882,7 +988,57 @@ impl FontRegistry {
         self.resolve_render_stack_with_eligibility(stack, weight, style, character, true)
     }
 
+    /// Per-character fallback memo, like Blink's FontFallbackList caching the
+    /// font chosen for a character: shaping a streamed paragraph resolved
+    /// the whole family stack (mutex, lowercase, system lookup) once per
+    /// character on every measure. Keyed by registry revision so a newly
+    /// loaded @font-face is seen.
     fn resolve_render_stack_with_eligibility(
+        &self,
+        stack: &str,
+        weight: FontWeight,
+        style: FontFaceStyle,
+        character: Option<char>,
+        require_glyph: bool,
+    ) -> Option<LoadedFont> {
+        type Key = (usize, u64, FontWeight, FontFaceStyle, Option<char>, bool);
+        thread_local! {
+            static MEMO: RefCell<(u64, w3cos_std::fxhash::FxHashMap<Key, Option<LoadedFont>>)> =
+                RefCell::new((u64::MAX, Default::default()));
+        }
+        let revision = self.revision();
+        let mut hasher = w3cos_std::fxhash::FxHasher::default();
+        stack.hash(&mut hasher);
+        let key: Key = (
+            self as *const Self as usize,
+            hasher.finish(),
+            weight,
+            style,
+            character,
+            require_glyph,
+        );
+        if let Some(hit) = MEMO.with(|memo| {
+            let memo = memo.borrow();
+            (memo.0 == revision)
+                .then(|| memo.1.get(&key).cloned())
+                .flatten()
+        }) {
+            return hit;
+        }
+        let resolved =
+            self.resolve_render_stack_uncached(stack, weight, style, character, require_glyph);
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.0 != revision || memo.1.len() > 65_536 {
+                memo.0 = revision;
+                memo.1.clear();
+            }
+            memo.1.insert(key, resolved.clone());
+        });
+        resolved
+    }
+
+    fn resolve_render_stack_uncached(
         &self,
         stack: &str,
         weight: FontWeight,
@@ -1003,8 +1159,56 @@ impl FontRegistry {
         runs
     }
 
+    /// Memoized per (font stack, weight, style, kerning, text), like Blink's
+    /// ShapeCache keyed by FontDescription + text: re-measuring an unchanged
+    /// text node walked the fallback list once per character.
     pub(crate) fn cascade_cache_key(&self, style: &w3cos_std::style::Style, text: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        thread_local! {
+            static MEMO: RefCell<(
+                u64,
+                usize,
+                w3cos_std::fxhash::FxHashMap<u64, w3cos_std::fxhash::FxHashMap<String, u64>>,
+            )> = RefCell::new((u64::MAX, 0, Default::default()));
+        }
+        #[cfg(feature = "dynamic-js")]
+        if std::ptr::eq(self, Self::global()) {
+            crate::dynamic_script::request_stylesheet_fonts_for_text(style, text);
+        }
+        let revision = self.revision();
+        let mut meta = w3cos_std::fxhash::FxHasher::default();
+        (self as *const Self as usize).hash(&mut meta);
+        style.font_family.hash(&mut meta);
+        style.font_weight.hash(&mut meta);
+        (style.font_style as u8).hash(&mut meta);
+        style.font_kerning.hash(&mut meta);
+        style.font_feature_kern.hash(&mut meta);
+        let meta = meta.finish();
+        if let Some(hit) = MEMO.with(|memo| {
+            let memo = memo.borrow();
+            (memo.0 == revision)
+                .then(|| memo.2.get(&meta).and_then(|texts| texts.get(text)).copied())
+                .flatten()
+        }) {
+            return hit;
+        }
+        let key = self.cascade_cache_key_uncached(style, text);
+        // A font load during resolution bumps the revision; storing under the
+        // old one makes the next lookup recompute.
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.0 != revision || memo.1 > 65_536 {
+                memo.0 = revision;
+                memo.1 = 0;
+                memo.2.clear();
+            }
+            memo.1 += 1;
+            memo.2.entry(meta).or_default().insert(text.to_owned(), key);
+        });
+        key
+    }
+
+    fn cascade_cache_key_uncached(&self, style: &w3cos_std::style::Style, text: &str) -> u64 {
+        let mut hasher = w3cos_std::fxhash::FxHasher::default();
         style.font_kerning.hash(&mut hasher);
         style.font_feature_kern.hash(&mut hasher);
         for run in self.resolve_style_runs(style, text) {
@@ -1715,9 +1919,25 @@ mod tests {
         assert!(resolved.unwrap().is_monospace);
     }
 
-    /// The CPU-only AOT build (no `dynamic-js`) must still decode WOFF: Code-OSS
-    /// ships its seti file icons as `seti.woff`. A bad payload fails in the
-    /// decoder rather than at a missing-feature stub.
+    /// Ordinary AOT (no `woff`) refuses compressed fonts at a feature stub so
+    /// the size probe does not link wuff/brotli. Product builds that need
+    /// Code-OSS `seti.woff` enable the `woff` feature without `dynamic-js`.
+    #[cfg(not(feature = "woff"))]
+    #[test]
+    fn woff_decoding_requires_woff_feature() {
+        let mut bogus = b"wOFF".to_vec();
+        bogus.resize(64, 0);
+        let error = normalize_font_bytes_with_limit(&bogus, 1 << 20).unwrap_err();
+        assert!(error.contains("woff feature"), "{error}");
+        let mut bogus2 = b"wOF2".to_vec();
+        bogus2.resize(64, 0);
+        let error = normalize_font_bytes_with_limit(&bogus2, 1 << 20).unwrap_err();
+        assert!(error.contains("woff feature"), "{error}");
+    }
+
+    /// With `woff` enabled (Code-OSS cpu-render or dynamic-js), a bad payload
+    /// fails in the decoder rather than at a missing-feature stub.
+    #[cfg(feature = "woff")]
     #[test]
     fn woff_decoding_does_not_depend_on_dynamic_js() {
         let mut bogus = b"wOFF".to_vec();
@@ -1730,7 +1950,7 @@ mod tests {
         assert!(error.contains("decode failed"), "{error}");
     }
 
-    #[cfg(feature = "dynamic-js")]
+    #[cfg(feature = "woff")]
     #[test]
     fn normalizes_woff_and_woff2_to_shared_sfnt_bytes() {
         use base64::Engine as _;
@@ -1848,7 +2068,10 @@ mod tests {
     /// family order - decides which face paints each character.
     #[test]
     fn ahem_does_not_claim_latin_extended_a() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -1895,7 +2118,10 @@ mod tests {
     /// must move to the next family rather than being painted by the first.
     #[test]
     fn an_uncovered_character_falls_through_to_the_next_family() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../wpt/fonts/Ahem.ttf");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/layout_ng/testdata/Ahem.ttf"
+        );
         let Ok(ahem_bytes) = std::fs::read(path) else {
             eprintln!("skipped: no pinned WPT checkout at {path}");
             return;
@@ -1920,6 +2146,12 @@ mod tests {
             font_family: Some("\"Ahem\", Second".into()),
             ..Default::default()
         };
+        let primed = registry.resolve_style_runs(&style, "\u{0162}");
+        assert_eq!(
+            primed[0].font.as_ref().map(|font| font.family.as_str()),
+            Some("Second"),
+            "the uncovered first character primes the later fallback face"
+        );
         let runs = registry.resolve_style_runs(&style, "\u{0162}T");
         let families = runs
             .iter()

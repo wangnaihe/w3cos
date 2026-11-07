@@ -31,6 +31,7 @@ use rule_set::RuleSet;
 pub(crate) use rule_set::{FollowingPosition, FollowingScan};
 pub(crate) use selector_filter::AncestorBloom;
 use selector_filter::LazyAncestorBloom;
+pub use selector_filter::StyleRecalcScope;
 
 /// Ancestor-chain entry used for descendant/child combinator matching.
 #[derive(Debug, Clone, Default)]
@@ -491,12 +492,26 @@ fn bump_generation() {
     STYLE_GENERATION.with(|generation| generation.set(generation.get().wrapping_add(1)));
 }
 
+/// `@keyframes` changed: computed styles depending on them are stale.
+pub(crate) fn note_animation_rules_changed() {
+    bump_generation();
+}
+
 pub fn generation() -> u64 {
     STYLE_GENERATION.with(Cell::get)
 }
 
 pub(crate) fn has_sibling_dependencies() -> bool {
     RULE_FLAGS.with(|cell| cell.get() & 2 != 0)
+}
+/// `+`/`~` combinators: an attribute edit can restyle following siblings.
+pub fn has_sibling_selectors() -> bool {
+    has_sibling_dependencies()
+}
+
+/// `:has()`-style selectors: a mutation can restyle any ancestor.
+pub fn has_relational_selectors() -> bool {
+    has_relational_dependencies()
 }
 
 pub(crate) fn has_relational_dependencies() -> bool {

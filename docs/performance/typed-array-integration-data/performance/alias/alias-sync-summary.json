@@ -1,0 +1,74 @@
+[
+  {
+    "mode": "array_push",
+    "n": 8192,
+    "aliases": 1,
+    "baseline_ns": 1248752.0,
+    "candidate_ns": 569956.5,
+    "median_paired_speedup": 2.1956721811628466,
+    "ratio_range": [
+      1.482168436341781,
+      2.58020021147359
+    ]
+  },
+  {
+    "mode": "construct",
+    "n": 8192,
+    "aliases": 1,
+    "baseline_ns": 424789.5,
+    "candidate_ns": 431514.5,
+    "median_paired_speedup": 1.019965104122579,
+    "ratio_range": [
+      0.9072954182601269,
+      1.2933700646032162
+    ]
+  },
+  {
+    "mode": "fill",
+    "n": 2048,
+    "aliases": 1,
+    "baseline_ns": 41532215.5,
+    "candidate_ns": 180731.5,
+    "median_paired_speedup": 224.5900021593847,
+    "ratio_range": [
+      186.54886839826082,
+      259.17255744065307
+    ]
+  },
+  {
+    "mode": "fill",
+    "n": 2048,
+    "aliases": 3,
+    "baseline_ns": 87524630.5,
+    "candidate_ns": 361549.5,
+    "median_paired_speedup": 246.88785489025207,
+    "ratio_range": [
+      199.75285817716488,
+      308.8942039594351
+    ]
+  },
+  {
+    "mode": "indexed",
+    "n": 2048,
+    "aliases": 1,
+    "baseline_ns": 42633107.0,
+    "candidate_ns": 177022.0,
+    "median_paired_speedup": 238.71285683974526,
+    "ratio_range": [
+      227.94134714148058,
+      257.32201281333585
+    ]
+  },
+  {
+    "mode": "indexed",
+    "n": 2048,
+    "aliases": 3,
+    "baseline_ns": 83366362.5,
+    "candidate_ns": 336486.0,
+    "median_paired_speedup": 233.6712346698484,
+    "ratio_range": [
+      85.41988755559285,
+      329.0348624249893
+    ]
+  }
+]

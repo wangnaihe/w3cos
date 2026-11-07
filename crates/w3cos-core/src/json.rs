@@ -106,10 +106,12 @@ pub fn stringify(args: Vec<Value>) -> Value {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let replacer = args.get(1).cloned().unwrap_or(Value::Undefined);
     let gap_value = args.get(2).cloned().unwrap_or(Value::Undefined);
+    // Only Number / String space applies. Symbol sentinels are strings in
+    // the host but Type(space) is Symbol — silently ignored (empty gap).
     let gap = if let Some(n) = gap_value.as_number() {
         " ".repeat((n.max(0.0) as usize).min(10))
-    } else if let Some(s) = gap_value.as_js_string() {
-        s.chars().take(10).collect()
+    } else if gap_value.type_of() == "string" {
+        gap_value.to_js_string().chars().take(10).collect()
     } else {
         String::new()
     };

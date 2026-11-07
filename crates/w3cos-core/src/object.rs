@@ -149,6 +149,23 @@ impl JsObject {
         object
     }
 
+    /// Construct a fresh proxy with its initial prototype already installed.
+    ///
+    /// This is only for native host wrappers before the object can escape to
+    /// JavaScript. It deliberately bypasses Proxy `setPrototypeOf` and the
+    /// observable shape-epoch invalidation used by later prototype mutation.
+    #[doc(hidden)]
+    pub fn with_proxy_and_initial_prototype(
+        properties: HashMap<String, Value>,
+        handler: ProxyHandler,
+        prototype: &Value,
+    ) -> Self {
+        debug_assert!(handler.set_prototype_of.is_none());
+        let mut object = Self::with_proxy(properties, handler);
+        object.set_prototype_direct(prototype);
+        object
+    }
+
     /// Create a callable object (a JS class / constructor): plain properties
     /// plus a call slot invoked by `Value::call` / `class::construct`.
     pub fn with_call_slot(properties: HashMap<String, Value>, call: Rc<FunctionData>) -> Self {
@@ -248,9 +265,16 @@ impl JsObject {
         if !self.has_getter_properties {
             return None;
         }
-        self.properties
-            .get(format!("__w3cos_getter_{key}").as_str())
-            .cloned()
+        let mut buf = [0u8; 96];
+        let getter_key = crate::value::accessor_key(&mut buf, "__w3cos_getter_", key);
+        self.properties.get(&getter_key).cloned()
+    }
+
+    /// Read an own setter without invoking it or traversing the prototype.
+    pub fn own_setter(&self, key: &str) -> Option<Value> {
+        let mut buf = [0u8; 96];
+        let setter_key = crate::value::accessor_key(&mut buf, "__w3cos_setter_", key);
+        self.properties.get(&setter_key).cloned()
     }
 
     /// Own data only, without invoking accessors, traps, or prototype lookup.
@@ -365,6 +389,26 @@ impl JsObject {
         writable.is_bool() && !writable.to_bool()
     }
 
+    /// True when `f` holds for any own string key, in insertion order,
+    /// without allocating the key list.
+    pub fn any_own_key(&self, mut f: impl FnMut(&str) -> bool) -> bool {
+        self.properties.any_key(|key| f(key.as_str()))
+    }
+
+    /// V8 boilerplate copy (object-literal AllocationSite): give an empty
+    /// ordinary object the exact own properties, in the same insertion
+    /// order, of a template object. Returns false (and changes nothing)
+    /// when `self` already has own properties or is a proxy.
+    pub fn copy_properties_from(&mut self, template: &JsObject) -> bool {
+        if !self.properties.is_empty() || self.proxy_handler.is_some() {
+            return false;
+        }
+        self.properties = template.properties.clone();
+        self.has_getter_properties |= template.has_getter_properties;
+        self.refresh_heap_accounting();
+        true
+    }
+
     pub fn may_have_getter_properties(&self) -> bool {
         self.has_getter_properties
             || self.prototype.as_ref().is_some_and(|prototype| {
@@ -400,13 +444,8 @@ impl JsObject {
     }
 
     pub fn has_own_property(&self, key: &str) -> bool {
-        self.properties.contains_key(key)
-            || self
-                .properties
-                .contains_key(format!("__w3cos_getter_{key}").as_str())
-            || self
-                .properties
-                .contains_key(format!("__w3cos_setter_{key}").as_str())
+        self.properties
+            .contains_key_or_prefixed(key, "__w3cos_getter_", "__w3cos_setter_")
     }
 
     /// `[[Delete]]` — the `delete` operator.
@@ -623,6 +662,10 @@ impl JsObject {
                 return trap(&target, proto);
             }
         }
+        self.set_prototype_direct(proto)
+    }
+
+    fn set_prototype_direct(&mut self, proto: &Value) -> bool {
         match proto {
             _ if proto.as_object().is_some() => {
                 self.prototype = Some(proto.as_object().expect("object"));
@@ -794,6 +837,25 @@ mod tests {
         assert!(obj.has_own_property("length"));
         assert!(!obj.has_own_property("inherited"));
         assert!(obj.has_direct("inherited"));
+    }
+
+    #[test]
+    fn own_property_check_matches_unicode_and_long_accessor_keys() {
+        let mut obj = JsObject::new();
+        obj.set_direct(
+            "__w3cos_getter_值",
+            Value::function(|_, _| Value::Number(1.0)),
+        );
+
+        let long = "x".repeat(128);
+        obj.set_direct(
+            &format!("__w3cos_setter_{long}"),
+            Value::function(|_, _| Value::Undefined),
+        );
+
+        assert!(obj.has_own_property("值"));
+        assert!(obj.has_own_property(&long));
+        assert!(!obj.has_own_property("missing"));
     }
 
     #[test]

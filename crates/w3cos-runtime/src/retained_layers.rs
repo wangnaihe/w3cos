@@ -246,6 +246,13 @@ fn content_fingerprint(artifact: &PaintArtifact, layers: &[CompositorLayer]) -> 
         hash_rect(item.visual_rect, &mut hasher);
         item.chunk_id.hash(&mut hasher);
     }
+    for (index, pieces) in artifact.text_fragments.iter().enumerate() {
+        for (rect, text) in pieces {
+            index.hash(&mut hasher);
+            hash_rect(*rect, &mut hasher);
+            text.hash(&mut hasher);
+        }
+    }
     for (index, node) in artifact.nodes.iter().enumerate() {
         index.hash(&mut hasher);
         node.parent.hash(&mut hasher);

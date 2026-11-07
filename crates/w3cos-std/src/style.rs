@@ -2,6 +2,7 @@ use crate::color::Color;
 use serde::{Deserialize, Serialize};
 
 pub use crate::custom_properties::CustomProperties;
+pub type CustomPropertyMap = crate::fxhash::FxHashMap<String, String>;
 pub use crate::safe_area::{SafeAreaEdge, SafeAreaInsets};
 
 /// Per-thread renderer adapter for the final font's zero-glyph advance.
@@ -104,6 +105,50 @@ pub struct CssClipRect {
     pub right: Option<Dimension>,
     pub bottom: Option<Dimension>,
     pub left: Option<Dimension>,
+}
+
+/// LayoutNG-only grid cascade. Kept off `Style` until a grid property is
+/// set, so recursive tree walks do not copy unused strings on the stack.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct GridNg {
+    /// `grid-template-rows`. Legacy track sizing does not read this.
+    #[serde(default)]
+    pub grid_template_rows: Option<String>,
+    /// `grid-row`. Legacy placement does not read this.
+    #[serde(default)]
+    pub grid_row: Option<String>,
+    /// Raw `grid-template` shorthand, after the cascade.
+    #[serde(default)]
+    pub grid_template: Option<String>,
+    /// Raw `grid` shorthand, after the cascade.
+    #[serde(default)]
+    pub grid_shorthand: Option<String>,
+    #[serde(default)]
+    pub grid_auto_flow: Option<String>,
+    #[serde(default)]
+    pub grid_auto_rows: Option<String>,
+    #[serde(default)]
+    pub grid_auto_columns: Option<String>,
+    #[serde(default)]
+    pub grid_template_areas: Option<String>,
+    /// Raw `grid-area`. Not copied into `grid_column`, which Taffy reads.
+    #[serde(default)]
+    pub grid_area: Option<String>,
+    /// Cascaded column template for LayoutNG. `None` with
+    /// `grid_columns_cascaded` is an explicit `none` or a shorthand that
+    /// reset the columns. Legacy keeps reading `grid_template_columns`.
+    #[serde(default)]
+    pub grid_columns_used: Option<String>,
+    #[serde(default)]
+    pub grid_columns_cascaded: bool,
+    /// Cascaded `grid-column` / `grid-row` for LayoutNG, including
+    /// `grid-area`. Absent until one of those properties is set.
+    #[serde(default)]
+    pub grid_column_used: Option<String>,
+    #[serde(default)]
+    pub grid_row_used: Option<String>,
+    #[serde(default)]
+    pub grid_placement_cascaded: bool,
 }
 
 /// CSS Modern Subset — Flexbox, Grid, Block, Inline, and positioning.
@@ -227,8 +272,9 @@ pub struct Style {
     pub border_bottom_left_radius: Option<f32>,
     pub border_width: f32,
     pub border_color: Color,
-    /// Computed keyword provenance, top/right/bottom/left. CSS currentColor
-    /// is inherited as a keyword, not as the parent's resolved RGBA value.
+    /// Computed keyword provenance, top/right/bottom/left. A currentColor
+    /// declaration on this element resolves against its foreground color;
+    /// explicit `inherit` copies the parent's computed edge color instead.
     /// None leaves native numeric styles without CSS provenance unchanged.
     #[serde(default)]
     pub border_current_color: Option<[bool; 4]>,
@@ -261,6 +307,10 @@ pub struct Style {
     // CSS Text (#31)
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
+    /// `white-space: break-spaces`: line breaking allows a break after every
+    /// space (Blink BreakSpaceType::kAfterEverySpace).
+    #[serde(default)]
+    pub break_spaces: bool,
     pub line_height: f32,
     /// Retained CSS keyword; old wire styles and native numeric builders default to false.
     #[serde(default)]
@@ -290,16 +340,19 @@ pub struct Style {
     #[serde(default)]
     pub font_feature_kern: Option<bool>,
     pub word_break: WordBreak,
+    /// CSS `line-break` (inherited).
+    #[serde(default)]
+    pub line_break: LineBreak,
+    /// `hanging-punctuation: last` (inherited).
+    #[serde(default)]
+    pub hanging_punctuation_last: bool,
     #[serde(default)]
     pub direction: TextDirection,
     #[serde(default)]
     pub unicode_bidi: UnicodeBidi,
 
     // CSS Custom Properties (#34)
-    pub custom_properties: Option<crate::custom_properties::CustomProperties>,
-    /// Identity of the authored text run a generated text piece came from
-    /// (`text:<node>` / `pseudo:...`). Kept out of `custom_properties` so
-    /// stamping it per text node never clones the shared variable map.
+    pub custom_properties: Option<CustomProperties>,
     #[serde(skip)]
     pub text_source_run: Option<std::sync::Arc<str>>,
 
@@ -346,14 +399,11 @@ pub struct Style {
     pub grid_template_columns: Option<String>,
     #[serde(default)]
     pub grid_column: Option<String>,
+    /// LayoutNG grid cascade. One heap box so the eleven strings are not
+    /// copied onto the stack of every recursive style walk. Legacy track
+    /// sizing still reads only `grid_template_columns` and `grid_column`.
     #[serde(default)]
-    pub grid_template_rows: Option<String>,
-    #[serde(default)]
-    pub grid_template_areas: Option<String>,
-    #[serde(default)]
-    pub grid_row: Option<String>,
-    #[serde(default)]
-    pub grid_area: Option<String>,
+    pub grid_ng: Option<Box<GridNg>>,
 
     // Interaction
     pub cursor: Cursor,
@@ -449,6 +499,7 @@ impl Default for Style {
             opacity: 1.0,
             text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
+            break_spaces: false,
             line_height: 1.2,
             line_height_is_normal: false,
             line_height_computed_px: None,
@@ -464,6 +515,8 @@ impl Default for Style {
             font_kerning: true,
             font_feature_kern: None,
             word_break: WordBreak::Normal,
+            line_break: LineBreak::Auto,
+            hanging_punctuation_last: false,
             direction: TextDirection::Ltr,
             unicode_bidi: UnicodeBidi::Normal,
             custom_properties: None,
@@ -486,10 +539,7 @@ impl Default for Style {
             justify_items: AlignItems::Stretch,
             grid_template_columns: None,
             grid_column: None,
-            grid_template_rows: None,
-            grid_template_areas: None,
-            grid_row: None,
-            grid_area: None,
+            grid_ng: None,
             cursor: Cursor::Default,
             pointer_events: PointerEvents::Auto,
             user_select: UserSelect::Auto,
@@ -641,6 +691,9 @@ impl Style {
             font_kerning,
             font_feature_kern,
             word_break,
+            line_break,
+            hanging_punctuation_last,
+            break_spaces,
             direction,
             unicode_bidi,
             custom_properties,
@@ -663,10 +716,7 @@ impl Style {
             justify_items,
             grid_template_columns,
             grid_column,
-            grid_template_rows,
-            grid_template_areas,
-            grid_row,
-            grid_area,
+            grid_ng,
             cursor,
             pointer_events,
             user_select,
@@ -768,6 +818,9 @@ impl Style {
             font_kerning: font_kerning_b,
             font_feature_kern: font_feature_kern_b,
             word_break: word_break_b,
+            line_break: line_break_b,
+            hanging_punctuation_last: hanging_punctuation_last_b,
+            break_spaces: break_spaces_b,
             direction: direction_b,
             unicode_bidi: unicode_bidi_b,
             custom_properties: custom_properties_b,
@@ -790,10 +843,7 @@ impl Style {
             justify_items: justify_items_b,
             grid_template_columns: grid_template_columns_b,
             grid_column: grid_column_b,
-            grid_template_rows: grid_template_rows_b,
-            grid_template_areas: grid_template_areas_b,
-            grid_row: grid_row_b,
-            grid_area: grid_area_b,
+            grid_ng: grid_ng_b,
             cursor: cursor_b,
             pointer_events: pointer_events_b,
             user_select: user_select_b,
@@ -893,6 +943,9 @@ impl Style {
             && font_kerning == font_kerning_b
             && font_feature_kern == font_feature_kern_b
             && word_break == word_break_b
+            && line_break == line_break_b
+            && hanging_punctuation_last == hanging_punctuation_last_b
+            && break_spaces == break_spaces_b
             && direction == direction_b
             && unicode_bidi == unicode_bidi_b
             && custom_properties == custom_properties_b
@@ -915,10 +968,7 @@ impl Style {
             && justify_items == justify_items_b
             && grid_template_columns == grid_template_columns_b
             && grid_column == grid_column_b
-            && grid_template_rows == grid_template_rows_b
-            && grid_template_areas == grid_template_areas_b
-            && grid_row == grid_row_b
-            && grid_area == grid_area_b
+            && grid_ng == grid_ng_b
             && cursor == cursor_b
             && pointer_events == pointer_events_b
             && user_select == user_select_b
@@ -942,6 +992,62 @@ const fn default_text_indent() -> Dimension {
 }
 
 impl Style {
+    /// The NG grid cascade, created on the first write.
+    pub fn grid_ng_mut(&mut self) -> &mut GridNg {
+        self.grid_ng
+            .get_or_insert_with(|| Box::new(GridNg::default()))
+    }
+
+    fn ng(&self) -> Option<&GridNg> {
+        self.grid_ng.as_deref()
+    }
+
+    pub fn grid_rows(&self) -> Option<&str> {
+        self.ng()
+            .and_then(|grid| grid.grid_template_rows.as_deref())
+    }
+
+    pub fn grid_flow(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_auto_flow.as_deref())
+    }
+
+    pub fn grid_auto_row_spec(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_auto_rows.as_deref())
+    }
+
+    pub fn grid_auto_column_spec(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_auto_columns.as_deref())
+    }
+
+    pub fn grid_areas(&self) -> Option<&str> {
+        self.ng()
+            .and_then(|grid| grid.grid_template_areas.as_deref())
+    }
+
+    pub fn grid_columns_cascaded(&self) -> bool {
+        self.ng().is_some_and(|grid| grid.grid_columns_cascaded)
+    }
+
+    pub fn grid_columns_used(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_columns_used.as_deref())
+    }
+
+    pub fn grid_placement_cascaded(&self) -> bool {
+        self.ng().is_some_and(|grid| grid.grid_placement_cascaded)
+    }
+
+    pub fn grid_row_used(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_row_used.as_deref())
+    }
+
+    pub fn grid_column_used(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_column_used.as_deref())
+    }
+
+    pub fn grid_row_spec(&self) -> Option<&str> {
+        self.ng().and_then(|grid| grid.grid_row.as_deref())
+    }
+
     /// Resolve `text-indent` against the containing block and viewport.
     pub fn resolved_text_indent(
         &self,
@@ -957,13 +1063,13 @@ impl Style {
             Dimension::Ch(value) => value * self.ch_advance(),
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
+            Dimension::Auto => 0.0,
             Dimension::Calc(calc) => calc.resolve(
                 containing_width,
                 self.font_size,
                 viewport_width,
                 viewport_height,
             ),
-            Dimension::Auto => 0.0,
         }
     }
 }
@@ -1106,22 +1212,6 @@ pub enum FlexWrap {
     WrapReverse,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
-pub enum Dimension {
-    #[default]
-    Auto,
-    Px(f32),
-    Percent(f32),
-    Rem(f32),
-    Em(f32),
-    Ch(f32),
-    Vw(f32),
-    Vh(f32),
-    /// A `calc()` expression reduced to a linear combination of units.
-    Calc(CalcId),
-}
-
-/// A `calc()` length reduced to `px + percent% + em*font + vw + vh`.
 ///
 /// Every term is linear, so `+`, `-`, `* <number>` and `/ <number>` fold the
 /// expression into five coefficients at parse time and resolution needs only
@@ -1253,6 +1343,19 @@ impl Dimension {
     pub fn calc(length: CalcLength) -> Self {
         Dimension::Calc(CalcId::new(length))
     }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum Dimension {
+    Calc(CalcId),
+    #[default]
+    Auto,
+    Px(f32),
+    Percent(f32),
+    Rem(f32),
+    Em(f32),
+    Ch(f32),
+    Vw(f32),
+    Vh(f32),
 }
 
 /// CSS length for padding/margin.
@@ -1785,6 +1888,17 @@ pub enum WordBreak {
     KeepAll,
 }
 
+/// CSS Text 3 `line-break`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LineBreak {
+    #[default]
+    Auto,
+    Loose,
+    Normal,
+    Strict,
+    Anywhere,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TextDirection {
     #[default]
@@ -1810,10 +1924,14 @@ pub struct Animation {
     pub name: String,
     pub duration_ms: u32,
     pub easing: Easing,
-    pub delay_ms: u32,
+    /// Signed: a negative animation-delay starts part-way through.
+    pub delay_ms: i32,
     pub iteration_count: AnimationIterationCount,
     pub direction: AnimationDirection,
     pub fill_mode: AnimationFillMode,
+    /// `animation-play-state: paused`.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

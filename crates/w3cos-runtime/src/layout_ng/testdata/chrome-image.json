@@ -1,0 +1,155 @@
+{
+ "browser": "Google Chrome 156.0.8078.73",
+ "cases": [
+  {
+   "name": "img1",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='width:30px;height:20px'>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "img2",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='width:30px;height:40px'>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     44
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     40
+    ]
+   }
+  },
+  {
+   "name": "img3",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='width:30px;height:40px;vertical-align:middle'>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     40
+    ],
+    "i": [
+     40,
+     0,
+     30,
+     40
+    ]
+   }
+  },
+  {
+   "name": "img4",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='display:inline-block;width:30px;height:20px;margin:5px 3px'>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     34
+    ],
+    "i": [
+     43,
+     5,
+     30,
+     20
+    ]
+   }
+  },
+  {
+   "name": "img5",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'><img id=i style='width:30px;height:10px'></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     20
+    ],
+    "i": [
+     0,
+     6,
+     30,
+     10
+    ]
+   }
+  },
+  {
+   "name": "img6",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='width:100px;height:20px;max-width:60px'>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     60,
+     20
+    ]
+   }
+  },
+  {
+   "name": "img7",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='width:20px;height:10px;min-height:30px;min-width:3em'>XX</div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     34
+    ],
+    "i": [
+     40,
+     0,
+     60,
+     30
+    ]
+   }
+  },
+  {
+   "name": "img8",
+   "html": "<div id=p style='font:20px/1 Ahem;width:300px'>XX<img id=i style='width:100px;height:20px;max-width:2em'>XX<img id=j style='width:10px;height:10px;vertical-align:top'></div>",
+   "rects": {
+    "p": [
+     0,
+     0,
+     300,
+     24
+    ],
+    "i": [
+     40,
+     0,
+     40,
+     20
+    ],
+    "j": [
+     120,
+     0,
+     10,
+     10
+    ]
+   }
+  }
+ ]
+}

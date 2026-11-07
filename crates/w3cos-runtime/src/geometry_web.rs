@@ -141,17 +141,15 @@ fn rect_value(values: [f64; 4], mutable: bool) -> Value {
             true
         })
         .build();
-    let value = Value::Object(Rc::new(RefCell::new(JsObject::with_proxy(
-        HashMap::new(),
-        handler,
-    ))));
     let class_name = if mutable {
         "DOMRect"
     } else {
         "DOMRectReadOnly"
     };
-    w3cos_core::class::set_prototype_of(&value, &class(class_name).get_property("prototype"));
-    value
+    let prototype = class(class_name).get_property("prototype");
+    Value::Object(Rc::new(RefCell::new(
+        JsObject::with_proxy_and_initial_prototype(HashMap::new(), handler, &prototype),
+    )))
 }
 
 fn rect_from_init(init: Value, mutable: bool) -> Value {
@@ -932,6 +930,21 @@ pub fn identity_matrix() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_rect_initial_prototype_does_not_invalidate_dom_shape() {
+        let dom_rect = class("DOMRect");
+        let before = w3cos_core::intrinsics::dom_shape_epoch();
+        let value = rect(8.0, 9.0, 20.0, 12.0);
+        assert_eq!(w3cos_core::intrinsics::dom_shape_epoch(), before);
+        assert!(w3cos_core::class::instance_of(&value, &dom_rect));
+        assert_eq!(value.get_property("x"), Value::Number(8.0));
+
+        let replacement = Value::object(HashMap::from([("marker".into(), Value::Number(17.0))]));
+        w3cos_core::class::set_prototype_of(&value, &replacement);
+        assert_ne!(w3cos_core::intrinsics::dom_shape_epoch(), before);
+        assert_eq!(value.get_property("marker"), Value::Number(17.0));
+    }
 
     #[test]
     fn rect_edges_point_transform_and_matrix_chain_match_geometry_api() {

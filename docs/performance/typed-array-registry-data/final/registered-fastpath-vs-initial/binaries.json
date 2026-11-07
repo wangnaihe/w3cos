@@ -1,0 +1,10 @@
+{
+  "baseline": {
+    "path": "lifecycle-candidate",
+    "sha256": "fa5c2b3ba93acbdc3b6d5277b77697ea6198cf2fa54f186e3effd8b12c652fe5"
+  },
+  "candidate": {
+    "path": "fastpath-candidate",
+    "sha256": "88d50c848e4495371f2b138a7f1a11bd504c85b11b9591ecdeff9506523400d2"
+  }
+}

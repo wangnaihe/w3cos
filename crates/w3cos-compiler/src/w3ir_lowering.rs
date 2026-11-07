@@ -463,6 +463,7 @@ fn finish_module(mut builder: Builder, specifier: &str, name: &str) -> Result<Mo
         is_generator: builder.is_generator,
         source_span: None,
         types: Default::default(),
+        own_name_length: None,
     }];
     functions.extend(builder.functions);
     let mut module = Module::new(specifier, FunctionId(0), functions);
@@ -5102,6 +5103,7 @@ impl Builder {
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -5183,6 +5185,7 @@ impl Builder {
             is_generator: false,
             source_span: None,
             types: Default::default(),
+            own_name_length: None,
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
@@ -5339,6 +5342,7 @@ impl Builder {
                 parameters: parameter_hints,
                 returns: return_hint,
             },
+            own_name_length: None,
         };
         self.functions.extend(child.functions);
         self.functions.push(function);
