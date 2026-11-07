@@ -2182,6 +2182,32 @@ fn multicol_with_abspos_child_stays_on_ng() {
     assert_eq!(rect(&ng, 1).2, 40.0);
 }
 
+/// Auto-height multicol with text-align-last stays on NG (Inc 6).
+#[test]
+fn multicol_auto_height_text_align_last_stays_on_ng() {
+    use w3cos_std::style::CustomProperties;
+    let mut child = block();
+    child.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-text-align-last".into(),
+        "end".into(),
+    )]));
+    let root = node(
+        Style {
+            column_count: Some(2),
+            column_gap: Some(0.0),
+            width: Dimension::Px(200.0),
+            height: Dimension::Auto,
+            ..block()
+        },
+        vec![node(child, vec![])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    assert!(super::columns::eligible(&flat, 0));
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    assert_eq!(rect(&ng, 0).2, 200.0);
+}
+
 /// The automatic minimum width of a flex item is clamped by its definite
 /// max-width, and a child's min-width keyword raises the item's
 /// min-content size (flexbox-min-width-auto-001,

@@ -32,8 +32,16 @@ pub(crate) fn replay<'a>(
             let (dx, dy) = principal.map_or((0.0, 0.0), |p| (rect.x - p.x, rect.y - p.y));
             let mut piece_style = style.clone();
             // A piece is exactly one line's run: never re-break it.
+            // Layout already applied text-align / text-align-last into the
+            // piece rect; paint must not align again (multicol continuous
+            // flow + text-align-last-015).
             if piece_style.white_space == w3cos_std::style::WhiteSpace::Normal {
                 piece_style.white_space = w3cos_std::style::WhiteSpace::NoWrap;
+            }
+            piece_style.text_align = w3cos_std::style::TextAlign::Start;
+            if let Some(properties) = piece_style.custom_properties.as_mut() {
+                properties.remove("--w3cos-internal-text-align-last");
+                properties.remove("--w3cos-internal-text-justify");
             }
             if matches!(
                 piece_style.display,

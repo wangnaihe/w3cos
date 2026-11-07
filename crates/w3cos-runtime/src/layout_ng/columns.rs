@@ -6,8 +6,8 @@
 //! for `height: auto` uses a simple equal split of the continuous flow
 //! height across the column count. Inc 3 admits auto/percent/ch sizes;
 //! Inc 4 admits floats and nested multicol in the continuous column
-//! flow. Inc 5 admits abspos in the continuous-flow BFC. Auto-height
-//! text-align-last stays on a later slice (column-aware last-line).
+//! flow. Inc 5 admits abspos in the continuous-flow BFC. Inc 6 admits
+//! auto-height text-align-last (NG text pieces skip paint-time re-align).
 
 use crate::layout::FlatNodeInfo;
 use w3cos_std::style::{ColumnFill, Dimension, Display, Style, WritingMode};
@@ -25,11 +25,10 @@ pub(super) fn establishes(style: &Style) -> bool {
     ) && (style.column_count.is_some() || style.column_width != Dimension::Auto)
 }
 
-/// Inc 5: horizontal-tb block multicol may have auto/percent/ch width or
-/// height, in-flow floats, nested multicol, and abspos children. Still
-/// bails auto-height text-align-last (needs column-aware last-line).
-/// Auto×auto under a flex/grid parent stays legacy (gap-002: `gap:inherit`
-/// of `normal` from grid-lanes pairs only on legacy today).
+/// Inc 6: horizontal-tb block multicol may have auto/percent/ch width or
+/// height, in-flow floats, nested multicol, abspos children, and
+/// auto-height text-align-last (layout-applied; paint pieces do not
+/// re-align). Auto×auto under a flex/grid parent stays legacy (gap-002).
 pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
     let style = flat[index].style;
     if !establishes(style) {
@@ -48,25 +47,9 @@ pub(super) fn eligible(flat: &[FlatNodeInfo], index: usize) -> bool {
             }
         }
     }
-    // Floats, nested multicol, and abspos use the continuous-flow BFC
-    // (each nest re-checks eligible()). Auto-height + text-align-last
-    // needs column-aware last-line alignment (text-align-last-015).
-    let auto_height = matches!(style.height, Dimension::Auto);
-    let end = flat[index].subtree_end;
-    for node in &flat[index + 1..end] {
-        if node.style.display == Display::None {
-            continue;
-        }
-        if auto_height
-            && node
-                .style
-                .custom_properties
-                .as_ref()
-                .is_some_and(|p| p.contains_key("--w3cos-internal-text-align-last"))
-        {
-            return false;
-        }
-    }
+    // Floats, nested multicol, abspos, and auto-height text-align-last use
+    // the continuous-flow BFC (each nest re-checks eligible()). Paint must
+    // not re-apply text-align-last on NG text pieces (block_text_paint).
     true
 }
 
