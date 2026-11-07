@@ -9004,12 +9004,14 @@ fn main() {{
             types: Default::default(),
             own_name_length: None,
         };
-        let module = Module::new("app:///new-target.w3ir", parent.id, vec![parent.clone(), nested]);
+        let module = Module::new(
+            "app:///new-target.w3ir",
+            parent.id,
+            vec![parent.clone(), nested],
+        );
         let nested_generated =
             generate_sync_function_from_module(&module, &parent, "outer_aot").unwrap();
-        assert!(nested_generated.contains(
-            "take_new_target(outer_aot__nested_1 as usize)"
-        ));
+        assert!(nested_generated.contains("take_new_target(outer_aot__nested_1 as usize)"));
 
         let sync = generate_sync_function_with_factories(
             &new_target_function(2, false, false),
@@ -9158,9 +9160,7 @@ fn main() {{
                         None,
                     )
                     .unwrap();
-                    assert!(generated.contains(&format!(
-                        "take_new_target({factory} as usize)"
-                    )));
+                    assert!(generated.contains(&format!("take_new_target({factory} as usize)")));
                     assert!(CURRENT_AOT_FACTORY.with(|current| current.borrow().is_empty()));
                 })
             })

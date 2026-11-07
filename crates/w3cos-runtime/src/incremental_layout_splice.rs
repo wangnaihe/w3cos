@@ -82,9 +82,9 @@ pub(super) fn tree_is_spliceable(root: &Component) -> bool {
     let mut stack = vec![root];
     while let Some(component) = stack.pop() {
         let style = &component.style;
-        if host_id(component).is_some_and(|id| {
-            matches!(crate::dom::tag_name(id).as_str(), "iframe" | "object")
-        }) {
+        if host_id(component)
+            .is_some_and(|id| matches!(crate::dom::tag_name(id).as_str(), "iframe" | "object"))
+        {
             return false;
         }
         // The sparse CSSOM fragment map is rebuilt from a complete flattened
