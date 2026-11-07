@@ -172,11 +172,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             return Some("flex:float-descendant");
         }
         // Percentage main sizes on the column item itself cycle through
-        // the automatic minimum. Leave those on legacy. A percentage on a
-        // descendant alone is fine: tables resolve cell percentages in
-        // their own algorithm, and a definite item height (including from
-        // min-height) is a percentage basis for nested blocks (main #412).
-        if !row && column_percent_size(flat, child) {
+        // the automatic minimum when the container height is indefinite.
+        // With a definite (length) container height the item's percentage
+        // has a basis — keep those on NG (flexbox-min-height-auto-001's
+        // `calc(10% + 50px)`, position-relative-percentage-top-004's
+        // `height: 50%`). Descendants alone are fine: tables resolve cell
+        // percentages in their own algorithm (main #412 / table-as-item).
+        if !row && column_percent_size(flat, child) && !matches!(style.height, Dimension::Px(_)) {
             return Some("flex:column-percent");
         }
     }

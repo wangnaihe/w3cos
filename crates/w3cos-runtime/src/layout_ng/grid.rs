@@ -4627,8 +4627,9 @@ fn layout_impl(
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_sub = columns_spec(style).is_some_and(is_subgrid_axis);
     let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
-    // Intrinsic sizing of a subgrid reuses parent tracks (main #418 path);
-    // do not bail here — contribute_subgrid_* handles the measure case.
+    if (measure || keyword.is_some()) && (column_sub || row_sub) {
+        return super::bail("grid:intrinsic-subgrid");
+    }
     let inherited = if column_sub || row_sub {
         Some(
             lookup_inherited(flat, index, space, column_sub, row_sub)
@@ -5007,7 +5008,12 @@ fn layout_impl(
         let child_style = flat[item.index].style;
         if columns_spec(child_style).is_some_and(is_subgrid_axis) {
             // A column subgrid's items contribute through the parent's
-            // tracks (standalone-axis intrinsic containers stay on NG).
+            // tracks; the standalone-axis pages that size them under an
+            // intrinsic container width use writing modes this engine does
+            // not store.
+            if measure {
+                return super::bail("grid:intrinsic-subgrid");
+            }
             contribute_subgrid_columns(
                 flat,
                 item.index,

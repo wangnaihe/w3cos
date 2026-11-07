@@ -3309,8 +3309,8 @@ pub(super) fn intrinsic_sizes_at(
         }
     };
     // Percentage descendants under flex/grid: size through the container's
-    // own min/max path (main removed this bail). Cyclic cases still bail
-    // deeper in flex/grid algorithms.
+    // own min/max path (needed for percentage-padding-002). Cyclic cases
+    // still bail deeper in flex/grid algorithms.
     if is_author_flex(info.style) {
         return super::flex::container_min_max_at(flat, index, space, block);
     }
