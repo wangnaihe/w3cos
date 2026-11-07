@@ -455,6 +455,18 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     {
         return Some("grid:areas");
     }
+    // Width keywords on a grid whose subgrid child has an implicit
+    // standalone axis size through parent tracks (main #418:
+    // dynamic-min-content-001, standalone-axis-size-006). Explicit
+    // fr/repeat on that axis (standalone-axis-size-010+) stays legacy.
+    if has_marker(style, WIDTH_KEYWORD)
+        && rendered_children(flat, index).any(|child| {
+            let child_style = flat[child].style;
+            subgrid_style(child_style) && !subgrid_standalone_axis_is_implicit(child_style)
+        })
+    {
+        return Some("grid:width-keyword");
+    }
     if is_baseline(style.justify_items) && !inline_baseline_container_ok(style) {
         return Some("grid:baseline");
     }
@@ -602,6 +614,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         // stay on legacy (item_width_keyword resolves the others).
         if has_marker(child_style, block::WIDTH_KEYWORD)
             && item_width_keyword(flat, child).is_none()
+            && !subgrid_style(child_style)
         {
             return Some("grid:item-width-keyword");
         }
@@ -1363,6 +1376,19 @@ fn axis_line(spec: Option<&str>, rows: bool) -> bool {
 fn subgrid_style(style: &Style) -> bool {
     columns_spec(style).is_some_and(is_subgrid_axis)
         || style.grid_rows().is_some_and(is_subgrid_axis)
+}
+
+/// Column-only / row-only subgrid whose other axis has no author track
+/// list. Explicit `repeat()` / `fr` tracks on that axis under a
+/// `width: min-content` parent still need the legacy engine (main #418).
+fn subgrid_standalone_axis_is_implicit(style: &Style) -> bool {
+    let col_sub = columns_spec(style).is_some_and(is_subgrid_axis);
+    let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
+    match (col_sub, row_sub) {
+        (true, false) => style.grid_rows().is_none(),
+        (false, true) => columns_spec(style).is_none(),
+        _ => false,
+    }
 }
 
 fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
@@ -4627,14 +4653,17 @@ fn layout_impl(
     let row_gap = style.row_gap.unwrap_or(style.gap).max(0.0);
     let column_sub = columns_spec(style).is_some_and(is_subgrid_axis);
     let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
-    if (measure || keyword.is_some()) && (column_sub || row_sub) {
-        return super::bail("grid:intrinsic-subgrid");
-    }
+    // Intrinsic sizing of a subgrid reuses parent tracks (main #418).
+    // Width-keyword parents of subgrids with explicit standalone tracks
+    // stay on legacy via container_reason. While the parent is still
+    // measuring, SUBGRID_PUBLISHED is empty — a single-axis subgrid can
+    // still size its standalone axis (standalone-axis-size-006/007).
     let inherited = if column_sub || row_sub {
-        Some(
-            lookup_inherited(flat, index, space, column_sub, row_sub)
-                .why("grid:subgrid-rt-lookup")?,
-        )
+        match lookup_inherited(flat, index, space, column_sub, row_sub) {
+            Some(tracks) => Some(tracks),
+            None if measure && !(column_sub && row_sub) => None,
+            None => return super::bail("grid:subgrid-rt-lookup"),
+        }
     } else {
         None
     };
@@ -4660,13 +4689,21 @@ fn layout_impl(
         }
     }
     let mut columns_template = if column_sub {
-        let inherited = inherited.as_ref().unwrap();
-        let names = merge_line_names(
-            &inherited.col_names,
-            &local_subgrid_names(style, false, inherited.columns.len()),
-            inherited.columns.len(),
-        );
-        fixed_template(&inherited.columns, names)
+        match inherited.as_ref() {
+            Some(inherited) => {
+                let names = merge_line_names(
+                    &inherited.col_names,
+                    &local_subgrid_names(style, false, inherited.columns.len()),
+                    inherited.columns.len(),
+                );
+                fixed_template(&inherited.columns, names)
+            }
+            None => {
+                // Measure without parent publish: size the standalone
+                // (non-subgridded) axis from local tracks / items.
+                parse_template("", true).why("grid:template")?
+            }
+        }
     } else {
         // No column template: no explicit columns. The one column that
         // row flow needs is added below as an implicit track.
@@ -4676,20 +4713,33 @@ fn layout_impl(
         }
     };
     let mut rows_template = if row_sub {
-        let inherited = inherited.as_ref().unwrap();
-        let local_of = |tracks| local_subgrid_names(style, true, tracks);
-        if let Some(rows) = &inherited.rows {
-            let names = merge_line_names(&inherited.row_names, &local_of(rows.len()), rows.len());
-            fixed_template(rows, names)
-        } else if inherited.row_span == 0 {
-            return super::bail("grid:subgrid-rt-rowspan0");
-        } else {
-            let names = merge_line_names(
-                &inherited.row_names,
-                &local_of(inherited.row_span),
-                inherited.row_span,
-            );
-            auto_named_template(inherited.row_span, names)
+        match inherited.as_ref() {
+            None => {
+                // Measure without parent publish. Honor `grid-row: span N`
+                // so column-flow items pack into the right track count
+                // (standalone-axis-size-007).
+                let span = resolve_axis(placement(style, true), &[], 0)
+                    .map(|axis| axis.span.max(1))
+                    .unwrap_or(1);
+                auto_named_template(span, vec![Vec::new(); span + 1])
+            }
+            Some(inherited) => {
+                let local_of = |tracks| local_subgrid_names(style, true, tracks);
+                if let Some(rows) = &inherited.rows {
+                    let names =
+                        merge_line_names(&inherited.row_names, &local_of(rows.len()), rows.len());
+                    fixed_template(rows, names)
+                } else if inherited.row_span == 0 {
+                    return super::bail("grid:subgrid-rt-rowspan0");
+                } else {
+                    let names = merge_line_names(
+                        &inherited.row_names,
+                        &local_of(inherited.row_span),
+                        inherited.row_span,
+                    );
+                    auto_named_template(inherited.row_span, names)
+                }
+            }
         }
     } else {
         match style.grid_rows() {
@@ -5008,12 +5058,8 @@ fn layout_impl(
         let child_style = flat[item.index].style;
         if columns_spec(child_style).is_some_and(is_subgrid_axis) {
             // A column subgrid's items contribute through the parent's
-            // tracks; the standalone-axis pages that size them under an
-            // intrinsic container width use writing modes this engine does
-            // not store.
-            if measure {
-                return super::bail("grid:intrinsic-subgrid");
-            }
+            // tracks (standalone-axis intrinsic containers stay on NG when
+            // container_reason allows; main #418).
             contribute_subgrid_columns(
                 flat,
                 item.index,
