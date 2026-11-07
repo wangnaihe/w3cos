@@ -1420,6 +1420,34 @@ pub(super) fn strut(style: &Style) -> (f32, f32) {
     (ascent, height - ascent)
 }
 
+/// `text-box-trim` on this IFC container: (trim-start, trim-end).
+/// Blink: node start/end trim (not fragmentainer); `text-box-edge: text`
+/// removes half-leading outside the em box of the first/last line.
+fn text_box_trim_ends(style: &Style) -> (bool, bool) {
+    let trim = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-text-box-trim"))
+        .map(String::as_str);
+    let edge = style
+        .custom_properties
+        .as_ref()
+        .and_then(|properties| properties.get("--w3cos-internal-text-box-edge"))
+        .map(String::as_str);
+    // Only an authored `text-box-edge: text` is implemented so far.
+    // Initial/`auto` is left alone: unclassed start-001 refs assume no
+    // trim until a variant sets the edge class.
+    if edge != Some("text") {
+        return (false, false);
+    }
+    match trim {
+        Some("trim-start") => (true, false),
+        Some("trim-end") => (false, true),
+        Some("trim-both") => (true, true),
+        _ => (false, false),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct InlineItem {
     index: usize,
@@ -3103,6 +3131,42 @@ fn layout_lines(
             available,
             last: forced || line_index + 1 == line_count,
         });
+    }
+
+    // text-box-trim (CSS Inline 3 / Blink node start/end): pull the first
+    // line's block-start to the text-over edge and the last line's
+    // block-end to the text-under edge. Per-column fragmentainer trim is
+    // a later slice (multicol-001).
+    let (trim_start, trim_end) = text_box_trim_ends(container);
+    // Float opportunities were computed for untrimmed line heights.
+    if (trim_start || trim_end) && !built.is_empty() && floats.is_none() {
+        let content_edges = |line: &Line| {
+            let mut content_ascent = 0.0f32;
+            let mut content_descent = 0.0f32;
+            let mut saw = false;
+            for &(k, ..) in &line.items {
+                let item = &items[k];
+                if item.forced || item.aligned.is_some() {
+                    continue;
+                }
+                saw = true;
+                content_ascent = content_ascent.max((item.content_ascent - item.shift).max(0.0));
+                let font_descent = (item.font_height - item.content_ascent).max(0.0);
+                content_descent = content_descent.max((font_descent + item.shift).max(0.0));
+            }
+            saw.then_some((content_ascent, content_descent))
+        };
+        if trim_start {
+            if let Some((ca, _)) = content_edges(&built[0]) {
+                built[0].ascent = ca.max(0.0).min(built[0].ascent);
+            }
+        }
+        if trim_end {
+            let last = built.len() - 1;
+            if let Some((_, cd)) = content_edges(&built[last]) {
+                built[last].descent = cd.max(0.0).min(built[last].descent);
+            }
+        }
     }
 
     // `-webkit-line-clamp`: keep the first N lines; the last kept line's final

@@ -123,6 +123,13 @@ pub const PERCENT_GAP_PROPERTY: &str = "--w3cos-internal-percent-gap";
 /// LayoutNG grid resolves it; other layouts keep the marker above only.
 pub const ROW_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-row-gap-percent";
 pub const COLUMN_GAP_PERCENT_PROPERTY: &str = "--w3cos-internal-column-gap-percent";
+/// `text-box-trim` (CSS Inline 3): `none` | `trim-start` | `trim-end` |
+/// `trim-both`. LayoutNG trims half-leading at the first/last formatted
+/// line; legacy ignores it.
+pub const TEXT_BOX_TRIM_PROPERTY: &str = "--w3cos-internal-text-box-trim";
+/// `text-box-edge` (CSS Inline 3). Only `text` / `auto` are consulted for
+/// trim amounts so far (em-box over/under edges).
+pub const TEXT_BOX_EDGE_PROPERTY: &str = "--w3cos-internal-text-box-edge";
 /// `flex-wrap` keyword this engine does not model (`balance`, …). The used
 /// value falls through to `nowrap`.
 pub const UNRECOGNIZED_FLEX_WRAP_PROPERTY: &str = "--w3cos-internal-unrecognized-flex-wrap";
@@ -2058,6 +2065,39 @@ impl CSSStyleDeclaration {
                         "--w3cos-internal-text-align-last".to_string(),
                         value.trim().to_ascii_lowercase(),
                     );
+            }
+            "text-box-trim" | "textBoxTrim" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                let keep = matches!(
+                    keyword.as_str(),
+                    "none" | "trim-start" | "trim-end" | "trim-both"
+                );
+                set_marker(
+                    &mut self.inner,
+                    TEXT_BOX_TRIM_PROPERTY,
+                    keep.then_some(keyword),
+                );
+            }
+            "text-box-edge" | "textBoxEdge" => {
+                let keyword = value.trim().to_ascii_lowercase();
+                // Store the first token (`text`, `auto`, `cap`, …). Two-value
+                // forms (`text alphabetic`) keep the over edge for now.
+                let over = keyword.split_whitespace().next().unwrap_or("").to_string();
+                let keep = matches!(
+                    over.as_str(),
+                    "auto"
+                        | "text"
+                        | "cap"
+                        | "ex"
+                        | "alphabetic"
+                        | "ideographic"
+                        | "ideographic-ink"
+                );
+                set_marker(
+                    &mut self.inner,
+                    TEXT_BOX_EDGE_PROPERTY,
+                    keep.then_some(over),
+                );
             }
             "text-justify" | "textJustify" => {
                 self.inner
@@ -8919,6 +8959,41 @@ fn inherit_gap_copies_normal_and_pixel_gaps() {
     assert_eq!(child.inner.row_gap, Some(12.0));
     assert_eq!(child.inner.column_gap, Some(4.0));
     assert_eq!(child.inner.gap, 12.0);
+}
+
+#[test]
+fn text_box_trim_and_edge_are_marked() {
+    let mut declaration = CSSStyleDeclaration::new();
+    declaration.set_property("text-box-trim", "trim-both");
+    declaration.set_property("text-box-edge", "text");
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(TEXT_BOX_TRIM_PROPERTY))
+            .map(String::as_str),
+        Some("trim-both")
+    );
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(TEXT_BOX_EDGE_PROPERTY))
+            .map(String::as_str),
+        Some("text")
+    );
+    declaration.set_property("text-box-trim", "none");
+    assert_eq!(
+        declaration
+            .inner
+            .custom_properties
+            .as_ref()
+            .and_then(|properties| properties.get(TEXT_BOX_TRIM_PROPERTY))
+            .map(String::as_str),
+        Some("none")
+    );
 }
 
 #[test]

@@ -2259,6 +2259,56 @@ fn multicol_auto_auto_under_flex_stays_on_ng_but_not_grid() {
     assert!(!super::columns::eligible(&flat, 1));
 }
 
+/// text-box-trim: trim-both removes upper+lower half-leading on a one-line IFC.
+#[test]
+fn text_box_trim_both_removes_half_leading_on_ifc() {
+    use w3cos_std::style::CustomProperties;
+    let font = |trim: bool| {
+        let mut style = Style {
+            display: Display::Block,
+            width: Dimension::Px(400.0),
+            font_family: Some("Ahem".into()),
+            font_size: 40.0,
+            line_height: 2.0,
+            line_height_is_normal: false,
+            ..block()
+        };
+        if trim {
+            style.custom_properties = Some(CustomProperties::from_iter([
+                ("--w3cos-internal-text-box-trim".into(), "trim-both".into()),
+                ("--w3cos-internal-text-box-edge".into(), "text".into()),
+            ]));
+        }
+        style
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        font_family: Some("Ahem".into()),
+        font_size: 40.0,
+        line_height: 2.0,
+        line_height_is_normal: false,
+        ..Style::default()
+    };
+    let height = |trim: bool| {
+        let root = node(
+            font(trim),
+            vec![Component::text("XXXX", text_style.clone())],
+        );
+        let flat = pre_flatten(&root);
+        assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+        let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+        rect(&ng, 0).3
+    };
+    let plain = height(false);
+    let trimmed = height(true);
+    // lh 80, em 40 → 20px half-leading each side; trim-both on one line → 40.
+    assert!((plain - 80.0).abs() < 1.0, "plain height {plain}");
+    assert!(
+        (trimmed - 40.0).abs() < 1.0,
+        "trimmed height {trimmed} (plain {plain})"
+    );
+}
+
 #[test]
 fn flex_auto_min_width_respects_max_width_and_child_keywords() {
     use w3cos_std::style::FlexDirection;

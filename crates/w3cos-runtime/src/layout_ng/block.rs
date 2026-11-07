@@ -173,6 +173,10 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // reads them; unsupported values gate as `text:align-last`.
             | "text-align-last"
             | "text-justify"
+            // `text-box-trim` / `text-box-edge`: IFC line boxes trim
+            // half-leading at the first/last formatted line (CSS Inline 3).
+            | "text-box-trim"
+            | "text-box-edge"
             // Grid reads these. The cascade leaves the legacy fields alone:
             // height stays the dimension it already stored, and justify-content
             // stays the enum flex already uses.
