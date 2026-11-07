@@ -2954,6 +2954,11 @@ fn layout_with(
     let mut children = Vec::with_capacity(items.len());
     let mut oof = Vec::new();
     let mut fallback_baseline = None;
+    // CSS Flexbox 8.5 / main #402: an `inline-flex` atomic inline's baseline
+    // is its first item's first baseline (single line, no reversal).
+    let mut inline_flex_baseline = LastBaseline::NoLines;
+    let first_item_baseline = style.display == Display::InlineFlex && !reverse && !reverse_cross;
+    let mut item_position = 0usize;
     for (((item, laid), ascent), last_ascent) in
         items.iter().zip(fragments).zip(&ascents).zip(&last_ascents)
     {
@@ -3018,6 +3023,13 @@ fn layout_with(
         } else {
             fallback_baseline.get_or_insert(item_baseline);
         }
+        if first_item_baseline && item_position == 0 {
+            // Prefer the real text baseline; do not synthesize from the
+            // border-box height (that mis-aligns multi-item horiz inline-flex).
+            if let LastBaseline::At(b) = laid.first_baseline {
+                inline_flex_baseline = LastBaseline::At(y + dy + b);
+            }
+        }
         let (paint_dy, fragment) = text_item_paint_box(flat, item.index, index, laid.fragment);
         children.push((x + dx, y + dy + paint_dy, fragment));
         let step = item.outer_main() + gap + between;
@@ -3026,16 +3038,21 @@ fn layout_with(
         } else {
             cursor += step;
         }
+        item_position += 1;
     }
 
     // A row's major baseline is the line's largest ascent; otherwise the
-    // fallback item's baseline (FlexLayoutAlgorithm FirstBaseline).
-    let container_baseline = match (row, max_ascent) {
-        (true, Some(ascent)) => LastBaseline::At(bt + pt + ascent),
-        (true, None) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
-        // A column's first baseline is its first item's (CSS Flexbox 8.5);
-        // an `inline-flex` aligns on it.
-        (false, _) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
+    // fallback item's baseline (FlexLayoutAlgorithm FirstBaseline). An
+    // inline-flex uses its first item's first baseline (main #402), else
+    // the margin-edge fallback (NoLines) — never synthesize from max_ascent.
+    let container_baseline = if first_item_baseline {
+        inline_flex_baseline
+    } else {
+        match (row, max_ascent) {
+            (true, Some(ascent)) => LastBaseline::At(bt + pt + ascent),
+            (true, None) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
+            (false, _) => fallback_baseline.unwrap_or(LastBaseline::NoLines),
+        }
     };
     let content_main = if row {
         inner_width

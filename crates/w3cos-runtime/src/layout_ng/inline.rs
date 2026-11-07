@@ -86,6 +86,33 @@ fn bidi_fragment(style: &Style) -> bool {
     has_marker(style, BIDI_VISUAL_ORDER_MARKER)
 }
 pub(super) const LINE_WIDTH_MARKER: &str = "--w3cos-internal-text-line-width";
+
+/// A sole line-width leaf: paint wraps and draws its whole text itself.
+fn paragraph_leaf(style: &Style, sole: bool, container: &Style) -> bool {
+    sole && line_width_leaf(style, container)
+}
+
+/// The DOM marks a block's sole text run `text-line-width` (paint wraps it
+/// inside the block's line width).  A run coalesced from dissolved inlines
+/// (#325: it carries CSSOM owner ranges) is not marked, although it is the
+/// same paragraph: infer the marker from the DOM's conditions so it takes
+/// the same path (and line model) as an equivalent unsplit run.
+/// (main 7f1c12d / shaping-000: ع<span>ع</span>ع folds to one Text with
+/// cssom-owner-ranges inside a definite-width RTL block.)
+fn line_width_leaf(style: &Style, container: &Style) -> bool {
+    has_marker(style, LINE_WIDTH_MARKER)
+        || (has_marker(style, w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+            && matches!(
+                container.white_space,
+                WhiteSpace::Normal | WhiteSpace::PreLine
+            )
+            && !matches!(style.position, Position::Absolute | Position::Fixed)
+            && (!matches!(container.width, Dimension::Auto)
+                || container.text_indent != Dimension::Px(0.0)
+                || container.text_align != TextAlign::Start
+                || has_marker(container, "--w3cos-internal-text-align-last")))
+}
+
 /// `vertical-align: top | text-top | bottom | text-bottom` (the cascade
 /// maps them to align-self start/end and keeps the keyword here).
 pub(super) const VALIGN_MARKER: &str = "--w3cos-internal-vertical-align-keyword";
@@ -770,9 +797,9 @@ fn inline_text_reason(
     }
     // The paragraph and preserved-newline paths place the leaf without a
     // baseline shift.
-    if valign_length(style).is_some()
-        && (has_marker(style, LINE_WIDTH_MARKER) || content.contains('\n'))
-    {
+    let line_width =
+        has_marker(style, LINE_WIDTH_MARKER) || (sole && line_width_leaf(style, container));
+    if valign_length(style).is_some() && (line_width || content.contains('\n')) {
         return Some("vertical-align-length");
     }
     // An embedding or isolate inside the paragraph needs bidi resolution
@@ -790,28 +817,25 @@ fn inline_text_reason(
     // leaf itself; word items get their levels from leaf_bidi_levels and
     // are reordered per line.  Preserved spaces that hang (pre-wrap) would
     // hang at the line's left end (L1): legacy.
-    let paragraph = sole && has_marker(style, LINE_WIDTH_MARKER);
+    let paragraph = paragraph_leaf(style, sole, container);
     if container.direction == TextDirection::Rtl
         && !paragraph
         && style.white_space == WhiteSpace::PreWrap
     {
         return Some("bidi:white-space");
     }
-    if !zero_edges(style)
-        && (has_marker(style, LINE_WIDTH_MARKER) || !inline_edges_supported(content, style))
-    {
+    if !zero_edges(style) && (line_width || !inline_edges_supported(content, style)) {
         return Some("text:edges");
     }
     // Preserved newlines (CSS Text 3 4.1.1) in a sole leaf: paint breaks
     // the lines; a trailing one only through the paragraph wrapper.
     let newline_ok = sole
         && match style.white_space {
-            WhiteSpace::PreLine => has_marker(style, LINE_WIDTH_MARKER),
+            WhiteSpace::PreLine => line_width,
             // (line-height: normal mixes the strut's computed line height
             // with the font's line spacing differently in legacy.)
             WhiteSpace::Pre | WhiteSpace::PreWrap => {
-                has_marker(style, LINE_WIDTH_MARKER)
-                    || (!content.ends_with('\n') && !style.line_height_is_normal)
+                line_width || (!content.ends_with('\n') && !style.line_height_is_normal)
             }
             _ => false,
         };
@@ -829,7 +853,7 @@ fn inline_text_reason(
     if !supported_script_in(content, fragment) {
         return Some("text:script");
     }
-    if has_marker(style, LINE_WIDTH_MARKER) {
+    if line_width {
         if !sole {
             return Some("text:line-width-shared");
         }
@@ -1142,10 +1166,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // box's own font; a box whose text does not inherit its font (a shadow
     // <slot>, display:contents in Chrome, carries a default style) does not
     // own the strut, so its style must not drive line metrics.
-    // A cascaded box (a resolved font-family, unlike that default style)
-    // whose only child is one inline text leaf (`<div><span>text</span>
-    // </div>`, the span folded into its text) is a one-item IFC: the box
-    // owns the strut and the leaf keeps its own font (CSS 2.1 10.8.1).
+    // Only a direct text child can carry a font the box does not own. An
+    // element child with its own font (an inline box, or a block lowered to
+    // inline) lays out through its own strut.
+    // (main 7f1c12d / flexbox-baseline-multi-item-horiz-001 ref: unmarked
+    // inline-block with a bigFont inline child must stay on NG.)
+    // A cascaded box whose only child is one inline text leaf (a folded
+    // span) owns the strut even when the leaf keeps its own font.
     let sole_text_leaf = || {
         let mut children = rendered_children(flat, index);
         style.font_family.is_some()
@@ -1157,7 +1184,10 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
             )
     };
     if !has_marker(style, IFC_MARKER)
-        && rendered_children(flat, index).any(|child| !same_font(flat[child].style, style))
+        && rendered_children(flat, index).any(|child| {
+            matches!(flat[child].kind, ComponentKind::Text { .. })
+                && !same_text_font(flat[child].style, style)
+        })
         && !sole_text_leaf()
     {
         return Some("ifc:unmarked");
@@ -1514,6 +1544,17 @@ fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &In
 /// ShapeResult::SnappedWidth.
 fn snap(advance: f32) -> f32 {
     crate::text_layout::inline_layout_advance(advance)
+}
+
+fn same_text_font(a: &Style, b: &Style) -> bool {
+    same_font(a, b)
+        || (a.line_height_is_normal
+            && b.line_height_is_normal
+            && (a.line_height - b.line_height).abs() < 0.01
+            && a.font_family == b.font_family
+            && a.font_size == b.font_size
+            && a.font_weight == b.font_weight
+            && a.font_style == b.font_style)
 }
 
 /// Same used font and line-height (text inheriting directly from a box).
@@ -2280,7 +2321,7 @@ fn layout_lines(
     if !has_boxes
         && let [child] = children[..]
         && !is_atomic_inline(flat, child)
-        && has_marker(flat[child].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[child].style, container)
     {
         let style = flat[child].style;
         let ComponentKind::Text { content } = flat[child].kind else {
