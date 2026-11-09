@@ -4932,14 +4932,18 @@ fn fit_sheet_text(node: &mut Component) {
             node.style.width = Dimension::Percent(100.0);
         }
     }
-    if narrow_sheet()
-        && matches!(node.kind, ComponentKind::Button { .. })
+    if matches!(node.kind, ComponentKind::Button { .. })
         && matches!(node.style.width, Dimension::Auto)
     {
-        node.style.flex_grow = 0.0;
-        node.style.width = Dimension::Percent(100.0);
+        // Desktop/tablet cards are 440px. A wide Latin label's min-content can
+        // exceed half of that; without min-width:0 FlexEnd keeps two
+        // unshrinkable buttons and overflows the viewport (sandbox-en@768).
         node.style.min_width = Dimension::Px(0.0);
-        node.style.max_width = Dimension::Percent(100.0);
+        if narrow_sheet() {
+            node.style.flex_grow = 0.0;
+            node.style.width = Dimension::Percent(100.0);
+            node.style.max_width = Dimension::Percent(100.0);
+        }
     }
     // A percentage width is the border box. Content-box padding would push
     // the control past the sheet's right edge.
