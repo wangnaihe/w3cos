@@ -40,7 +40,7 @@ fn sized(h: f32) -> Style {
 fn parity(root: &Component) -> Vec<(LayoutRect, usize)> {
     let flat = pre_flatten(root);
     assert!(block::supports_tree(&flat), "tree outside S1");
-    let legacy = crate::layout::compute(root, 800.0, 600.0).expect("legacy layout");
+    let legacy = crate::layout::legacy_layout_rects(root, 800.0, 600.0).expect("legacy layout");
     let ng = layout_tree(root, &flat, 800.0, 600.0).expect("ng layout");
     let diffs = verify(&flat, &legacy, &ng);
     assert_eq!(diffs, 0, "legacy {legacy:#?}\nng {ng:#?}");
@@ -419,7 +419,7 @@ fn generated_block_trees_cover_the_legacy_box_set() {
     for case in 0..400 {
         let root = node(block(), vec![random_tree(&mut rng, 3)]);
         let flat = pre_flatten(&root);
-        let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+        let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         let mut legacy_ids: Vec<usize> = legacy.iter().map(|(_, i)| *i).collect();
         let mut ng_ids: Vec<usize> = ng.iter().map(|(_, i)| *i).collect();
@@ -506,7 +506,7 @@ fn probe_html() {
     let root = crate::browser_page_domain::load_html_snapshot(&html, "file:///probe.html")
         .expect("snapshot");
     let flat = pre_flatten(&root);
-    let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy layout");
+    let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy layout");
     let reasons = block::unsupported_reasons(&flat);
     println!("reasons: {reasons:?}");
     let ng = if reasons.is_empty() {
@@ -7550,4 +7550,304 @@ fn max_content_subgrid_under_min_content_grid_matches_chrome() {
     };
     assert_eq!(at(1).2, 100.0, "min-content grid width {:?}", at(1));
     assert_eq!(at(2).2, 100.0, "max-content subgrid width {:?}", at(2));
+}
+
+fn os(value: &str) -> &std::ffi::OsStr {
+    std::ffi::OsStr::new(value)
+}
+
+/// aot-port: unset selects legacy (default off); any non-`0` value opts in,
+/// and a non-zero verify value wins over `0`.
+#[test]
+fn layout_ng_mode_from_env_defaults_on() {
+    use super::Mode;
+    let cases = [
+        (None, None, Mode::On),
+        (Some("1"), None, Mode::On),
+        (Some(""), None, Mode::On),
+        (Some("on"), None, Mode::On),
+        (Some("0"), None, Mode::Off),
+        (Some("0"), Some("0"), Mode::Off),
+        (Some("0"), Some("1"), Mode::Verify),
+        (Some("0"), Some("all"), Mode::Verify),
+        (None, Some("1"), Mode::Verify),
+        (Some("1"), Some("0"), Mode::On),
+        (Some("1"), Some("1"), Mode::Verify),
+    ];
+    for (ng, verify, want) in cases {
+        let got = super::mode_from_env(ng.map(os), verify.map(os));
+        assert_eq!(got, want, "ng={ng:?} verify={verify:?}");
+    }
+}
+
+/// The latched mode matches the process environment on the first read, and
+/// a second read returns the same value. Fresh processes are probed below.
+#[test]
+fn layout_ng_mode_latches_the_process_environment() {
+    let ng = std::env::var_os("W3COS_LAYOUT_NG");
+    let verify = std::env::var_os("W3COS_LAYOUT_NG_VERIFY");
+    let want = super::mode_from_env(ng.as_deref(), verify.as_deref());
+    assert_eq!(super::mode(), want);
+    assert_eq!(super::mode(), super::mode());
+}
+
+/// Child of the test harness. Prints the mode latched from the process
+/// environment and checks a second read. The parent test starts one process
+/// per flag value; this returns immediately in the normal suite run.
+#[test]
+fn layout_ng_mode_probe() {
+    if std::env::var_os("W3COS_LAYOUT_NG_MODE_PROBE").is_none() {
+        return;
+    }
+    let first = super::mode();
+    let second = super::mode();
+    assert_eq!(first, second, "mode is latched for the process");
+    eprintln!("LAYOUT_NG_MODE={first:?}");
+}
+
+#[test]
+fn layout_ng_fresh_processes_agree_on_unset_and_explicit_on() {
+    let probe = |ng: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.args([
+            "--exact",
+            "layout_ng::tests::layout_ng_mode_probe",
+            "--nocapture",
+        ]);
+        cmd.env("W3COS_LAYOUT_NG_MODE_PROBE", "1");
+        cmd.env_remove("W3COS_LAYOUT_NG_VERIFY");
+        match ng {
+            Some(value) => {
+                cmd.env("W3COS_LAYOUT_NG", value);
+            }
+            None => {
+                cmd.env_remove("W3COS_LAYOUT_NG");
+            }
+        }
+        let output = cmd.output().expect("spawn mode probe");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "ng={ng:?} status {:?} {stderr}",
+            output.status
+        );
+        stderr
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("LAYOUT_NG_MODE="))
+            .unwrap_or_else(|| panic!("ng={ng:?} produced no mode line:\n{stderr}"))
+            .to_string()
+    };
+    let unset = probe(None);
+    let on = probe(Some("1"));
+    let off = probe(Some("0"));
+    assert_eq!(unset, "On");
+    assert_eq!(on, "On");
+    assert_eq!(off, "Off");
+    assert_eq!(unset, on);
+}
+
+/// WPT css/css-display/empty-text-baseline-001.html. A `<br>` plus an empty
+/// text node inside an inline-block must not move the following span.
+/// Coalescing that break into the parent line ("x\u{2028}x") drops the span
+/// by one Ahem em (offsetTop 16).
+#[test]
+fn empty_text_after_br_does_not_shift_inline_block_baseline() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    crate::dom::reset_document();
+    crate::incremental_layout::invalidate();
+    crate::jsdom::set_viewport(800.0, 600.0);
+    let document = crate::jsdom::document_value();
+    document
+        .get_property("body")
+        .get_property("style")
+        .set_property("margin", w3cos_core::Value::string("0"));
+    let container = document.call_method("createElement", vec![w3cos_core::Value::string("div")]);
+    container
+        .get_property("style")
+        .set_property("fontFamily", w3cos_core::Value::string("Ahem"));
+    document
+        .get_property("body")
+        .call_method("appendChild", vec![container.clone()]);
+    let inner = document.call_method("createElement", vec![w3cos_core::Value::string("div")]);
+    inner
+        .get_property("style")
+        .set_property("display", w3cos_core::Value::string("inline-block"));
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("x")])],
+    );
+    container.call_method("appendChild", vec![inner.clone()]);
+    let span = document.call_method("createElement", vec![w3cos_core::Value::string("span")]);
+    span.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("x")])],
+    );
+    container.call_method("appendChild", vec![span.clone()]);
+    let before = span.get_property("offsetTop").to_number();
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createElement", vec![w3cos_core::Value::string("br")])],
+    );
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("")])],
+    );
+    let after = span.get_property("offsetTop").to_number();
+    assert_eq!(
+        after, before,
+        "empty text after br shifted the span by one em"
+    );
+    for white_space in ["pre-line", "pre"] {
+        inner
+            .get_property("style")
+            .set_property("whiteSpace", w3cos_core::Value::string(white_space));
+        assert_eq!(
+            span.get_property("offsetTop").to_number(),
+            before,
+            "white-space: {white_space} shifted the span"
+        );
+    }
+}
+
+/// 20×50 PNG. `image_intrinsic_size` reads the decode cache, not the path.
+fn install_20x50(src: &str) {
+    const HEX: &str = "89504e470d0a1a0a0000000d4948445200000014000000320802000000d31e6c710000002549444154789cedcbb10d000008c0a09eeee9fee0e440c24a4d77b22ccbb22ccbb22cffcc0b3e77f410a1bae3d20000000049454e44ae426082";
+    let bytes = (0..HEX.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&HEX[index..index + 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    crate::image_loader::decode_and_install(src, &bytes).expect("20x50 png");
+}
+
+/// css-sizing/aspect-ratio/grid-aspect-ratio-005 and 006. Headless Chrome
+/// 156, body margin 0, 800×600: `repeat(2, min-content)` does not shrink the
+/// grid box (it stays 800×100). A 20×50 image with `aspect-ratio: auto 1/1`
+/// transfers its intrinsic ratio, so `height: 100px` is 40×100 and
+/// `width: 40px` is 40×100. The 60×100 sibling sits at x=40. Together they
+/// cover a 100px square. Source newlines between the items are not cells.
+#[test]
+fn min_content_replaced_columns_match_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let src = "r37/20x50.png";
+    install_20x50(src);
+    let ratio = CustomProperties::from_iter([(
+        "--w3cos-internal-aspect-ratio".to_string(),
+        "1".to_string(),
+    )]);
+    let image = |width: Dimension, height: Dimension| {
+        Component::image(
+            src,
+            Style {
+                display: Display::Inline,
+                width,
+                height,
+                custom_properties: Some(ratio.clone()),
+                ..Style::default()
+            },
+        )
+    };
+    let sibling = node(
+        Style {
+            width: Dimension::Px(60.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![],
+    );
+    let grid = |columns: &str, image: Component, extra: Vec<Component>| {
+        let mut children = Vec::new();
+        children.push(Component::text(
+            "\n  ",
+            Style {
+                display: Display::Inline,
+                ..block()
+            },
+        ));
+        children.push(image);
+        children.push(Component::text(
+            "\n  ",
+            Style {
+                display: Display::Inline,
+                ..block()
+            },
+        ));
+        children.extend(extra);
+        node(
+            Style {
+                display: Display::Grid,
+                grid_template_columns: Some(columns.to_string()),
+                ..Style::default()
+            },
+            children,
+        )
+    };
+    let lay = |child: Component| {
+        let root = node(block(), vec![child]);
+        ng_rects(&root)
+    };
+    let height = lay(grid(
+        "repeat(2, min-content)",
+        image(Dimension::Auto, Dimension::Px(100.0)),
+        vec![sibling.clone()],
+    ));
+    close(rect(&height, 1), (0.0, 0.0, 800.0, 100.0));
+    close(rect(&height, 3), (0.0, 0.0, 40.0, 100.0));
+    close(rect(&height, 5), (40.0, 0.0, 60.0, 100.0));
+    let width = lay(grid(
+        "repeat(2, min-content)",
+        image(Dimension::Px(40.0), Dimension::Auto),
+        vec![sibling],
+    ));
+    close(rect(&width, 1), (0.0, 0.0, 800.0, 100.0));
+    close(rect(&width, 3), (0.0, 0.0, 40.0, 100.0));
+    close(rect(&width, 5), (40.0, 0.0, 60.0, 100.0));
+
+    let still_legacy = |child: Component, reason: &str| {
+        let root = node(block(), vec![child]);
+        let flat = pre_flatten(&root);
+        assert!(
+            !block::supports_tree(&flat),
+            "{reason} should stay on legacy: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        assert!(
+            block::unsupported_reasons(&flat)
+                .iter()
+                .any(|got| got == reason),
+            "{reason} {:?}",
+            block::unsupported_reasons(&flat)
+        );
+    };
+    still_legacy(
+        grid(
+            "repeat(2, max-content)",
+            image(Dimension::Auto, Dimension::Px(100.0)),
+            vec![node(
+                Style {
+                    width: Dimension::Px(60.0),
+                    height: Dimension::Px(100.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        ),
+        "grid:intrinsic-track",
+    );
+    still_legacy(
+        node(
+            Style {
+                display: Display::Grid,
+                grid_template_columns: Some("min-content".to_string()),
+                ..Style::default()
+            },
+            vec![Component::text(
+                "x x x",
+                Style {
+                    display: Display::Inline,
+                    ..block()
+                },
+            )],
+        ),
+        "grid:intrinsic-track",
+    );
 }

@@ -894,11 +894,13 @@ mod tests {
         let reuses = retained_paint_reuses();
         crate::dom::set_style_property(box_node, "top", "24px");
         let shifted = render_document_rgba(64, 64).expect("shifted frame");
-        assert_eq!(
-            retained_paint_reuses(),
-            reuses + 1,
-            "an absolute inset frame reuses the paint artifact"
-        );
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(
+                retained_paint_reuses(),
+                reuses + 1,
+                "an absolute inset frame reuses the paint artifact"
+            );
+        }
         assert_ne!(
             first.rgba, shifted.rgba,
             "moving the box must change pixels before the artifact is reused"

@@ -41,6 +41,66 @@ def number(value, label, minimum=0, integer=False):
     return value
 
 
+# Legacy engine (`W3COS_LAYOUT_NG=0`) checksums recorded on the full-gate
+# box. Do not replace these with NG-on numbers when the default engine
+# changes. Order is large-layout rects, startup layout rects, startup
+# paint pixels, scroll paint pixels.
+# The scroll value is the first list frame plus exactly three 24px scrolls.
+# It is not the sum of every `--samples` timing frame.
+LEGACY_LAYOUT_NG_OFF_CHECKSUMS = (
+    (("style_layout", "layout_checksum"), 18294915160932),
+    (("startup", "child", "layout_checksum"), 31627714668),
+    (("startup", "child", "checksum"), 150112521),
+    (("paint_scroll", "checksum"), 1786374846),
+)
+
+# Same four fields, measured on GitHub ubuntu-latest rather than the box.
+# aot-port residual after syncing main #431-#433 (PR #435 head 989f5753):
+# run 42543927882 job 128924728693, explicit W3COS_LAYOUT_NG=0 lane. Differs
+# from main's 7f1c12dc runner tuple because aot-port carries additional
+# layout/runtime surface; keep the box LEGACY_LAYOUT_NG_OFF_CHECKSUMS tuple
+# unchanged. They are not a substitute for the box tuple above.
+RUNNER_LEGACY_BASELINE_CHECKSUMS = (
+    (("style_layout", "layout_checksum"), 18321946508132),
+    (("startup", "child", "layout_checksum"), 31632136300),
+    (("startup", "child", "checksum"), 153009029),
+    (("paint_scroll", "checksum"), 1818919221),
+)
+
+
+def nested(report, path):
+    value = report
+    label = []
+    for key in path:
+        label.append(key)
+        require(isinstance(value, dict), f"{'.'.join(label)} is missing")
+        value = value.get(key)
+    return value, ".".join(label)
+
+
+def expect_checksum_tuple(report, pairs, constant_name):
+    """NG-off lane, 3 scroll frames, and one exact four-value checksum tuple."""
+    require(report.get("layout_ng") == "off", "legacy checksum lane requires layout_ng=off")
+    frames, frames_label = nested(report, ("paint_scroll", "checksum_frames"))
+    require(frames == 3, f"{frames_label} must be the historical 3-scroll protocol")
+    for path, expected in pairs:
+        value, label = nested(report, path)
+        require(type(value) is int, f"{label} must be an integer")
+        require(value == expected, f"{label} is {value}, {constant_name} is {expected}")
+
+
+def expect_legacy_checksums(report):
+    """The box font environment must still produce the historical tuple."""
+    expect_checksum_tuple(report, LEGACY_LAYOUT_NG_OFF_CHECKSUMS, "legacy constant")
+
+
+def expect_runner_legacy_baseline(report):
+    """ubuntu-latest must still produce the legacy tuple green main recorded."""
+    expect_checksum_tuple(
+        report, RUNNER_LEGACY_BASELINE_CHECKSUMS, "ubuntu-latest aot-port baseline"
+    )
+
+
 def validate_report(report):
     """Apply the CI gate with explicit types and finite, nonnegative evidence."""
     require(isinstance(report, dict), "report must be an object")
@@ -61,14 +121,27 @@ def validate_report(report):
     style = section("style_layout")
     nodes = field(style, "nodes", "style_layout", 5000, integer=True)
     full = positive(style, "median_us", "style_layout")
+    # Every mode, including LayoutNG on, edits a column flex through the
+    # subtree. A whole-tree rebuild is not that edit. `retained` is a
+    # cached full compute and is not one either.
+    layout_ng = report.get("layout_ng", "off")
+    require(layout_ng in ("off", "on", "verify"), f"layout_ng {layout_ng!r} is unknown")
     for name in ("width", "background", "text", "class", "insert", "remove"):
         label = f"incremental_{name}"
         edit = section(label)
         elapsed = positive(edit, "median_us", label)
+        # A cap against a runaway sample, not a claim that the modes match.
         require(elapsed < full * 4, f"{label} is not faster than four full passes")
-        if name != "background":
-            require(edit.get("kind") in ("style-subtree", "splice"), f"{label} did not use subtree layout")
+        if name == "background":
+            kind = edit.get("kind")
+            require(kind == "paint", f"{label} kind {kind!r} is not paint")
+        else:
             solved = field(edit, "solved_nodes", label, integer=True)
+            kind = edit.get("kind")
+            require(
+                kind in ("style-subtree", "splice"),
+                f"{label} did not use subtree layout",
+            )
             require(solved * 4 < nodes, f"{label} solved too much of the tree")
         if name in ("width", "class", "text"):
             dimension = "height" if name == "text" else "width"
@@ -87,6 +160,11 @@ def validate_report(report):
     field(paint, "rows", "paint_scroll", 200, integer=True)
     positive(paint, "first_us", "paint_scroll")
     field(paint, "checksum", "paint_scroll", 1, integer=True)
+    # Three scroll frames, on every lane. The pixel tuple checked by
+    # --expect-legacy-checksums is the box font environment; this runner
+    # check is the protocol, and it does not replace those constants.
+    frames = field(paint, "checksum_frames", "paint_scroll", 1, integer=True)
+    require(frames == 3, f"paint_scroll.checksum_frames is {frames}, want 3")
     positive(section("host_calls"), "median_ns_per_call", "host_calls")
     positive(section("startup"), "wall_us", "startup")
 
@@ -94,9 +172,34 @@ def validate_report(report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path)
+    parser.add_argument(
+        "--expect-layout-ng",
+        choices=("on", "off", "verify"),
+        help="require report.layout_ng to be this mode",
+    )
+    parser.add_argument(
+        "--expect-legacy-checksums",
+        action="store_true",
+        help="require the historical box W3COS_LAYOUT_NG=0 checksum tuple",
+    )
+    parser.add_argument(
+        "--expect-runner-legacy-baseline",
+        action="store_true",
+        help="require the ubuntu-latest legacy tuple recorded on green main",
+    )
     args = parser.parse_args(argv)
     try:
-        validate_report(load_report(args.report.read_text()))
+        report = load_report(args.report.read_text())
+        validate_report(report)
+        if args.expect_layout_ng is not None:
+            require(
+                report.get("layout_ng") == args.expect_layout_ng,
+                f"layout_ng is {report.get('layout_ng')!r}, want {args.expect_layout_ng}",
+            )
+        if args.expect_legacy_checksums:
+            expect_legacy_checksums(report)
+        if args.expect_runner_legacy_baseline:
+            expect_runner_legacy_baseline(report)
     except (OSError, ValueError) as error:
         print(f"runtime bench sanity failed: {error}", file=sys.stderr)
         return 1
