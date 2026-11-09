@@ -210,16 +210,16 @@ class RuntimeBenchTests(unittest.TestCase):
             ),
         )
 
-    def test_runner_baseline_matches_green_main_and_rejects_drift(self):
-        # ubuntu-latest main 7f1c12dc, run 42155314497 job 127687955856.
-        # Branch W3COS_LAYOUT_NG=0, run 42338677739 job 128301295869, matched.
+    def test_runner_baseline_matches_green_aot_port_and_rejects_drift(self):
+        # ubuntu-latest aot-port PR #435 head 989f5753, run 42543927882
+        # job 128924728693, W3COS_LAYOUT_NG=0 lane.
         self.assertEqual(
             gate.RUNNER_LEGACY_BASELINE_CHECKSUMS,
             (
-                (("style_layout", "layout_checksum"), 18291149073252),
-                (("startup", "child", "layout_checksum"), 31625672812),
-                (("startup", "child", "checksum"), 147785895),
-                (("paint_scroll", "checksum"), 1797980318),
+                (("style_layout", "layout_checksum"), 18321946508132),
+                (("startup", "child", "layout_checksum"), 31632136300),
+                (("startup", "child", "checksum"), 153009029),
+                (("paint_scroll", "checksum"), 1818919221),
             ),
         )
         self.assertNotEqual(
@@ -228,12 +228,12 @@ class RuntimeBenchTests(unittest.TestCase):
         )
         report = synthetic_report()
         report["layout_ng"] = "off"
-        report["style_layout"]["layout_checksum"] = 18291149073252
+        report["style_layout"]["layout_checksum"] = 18321946508132
         report["startup"] = {
             "wall_us": 10,
-            "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+            "child": {"layout_checksum": 31632136300, "checksum": 153009029},
         }
-        report["paint_scroll"]["checksum"] = 1797980318
+        report["paint_scroll"]["checksum"] = 1818919221
         report["paint_scroll"]["checksum_frames"] = 3
         gate.validate_report(report)
         gate.expect_runner_legacy_baseline(report)
@@ -248,10 +248,10 @@ class RuntimeBenchTests(unittest.TestCase):
         with self.assertRaises(gate.InvalidReport):
             gate.expect_runner_legacy_baseline(box)
         for path, replacement in (
-            (("style_layout", "layout_checksum"), 18291149073253),
-            (("startup", "child", "layout_checksum"), 31625672813),
-            (("startup", "child", "checksum"), 147785896),
-            (("paint_scroll", "checksum"), 1797980319),
+            (("style_layout", "layout_checksum"), 18321946508133),
+            (("startup", "child", "layout_checksum"), 31632136301),
+            (("startup", "child", "checksum"), 153009030),
+            (("paint_scroll", "checksum"), 1818919222),
         ):
             drifted = json.loads(json.dumps(report))
             cursor = drifted
@@ -277,16 +277,16 @@ class RuntimeBenchTests(unittest.TestCase):
             drifted["style_layout"]["layout_checksum"] = 1
             drifted["startup"] = {
                 "wall_us": 10,
-                "child": {"layout_checksum": 31625672812, "checksum": 147785895},
+                "child": {"layout_checksum": 31632136300, "checksum": 153009029},
             }
-            drifted["paint_scroll"]["checksum"] = 1797980318
+            drifted["paint_scroll"]["checksum"] = 1818919221
             drifted["paint_scroll"]["checksum_frames"] = 3
             path.write_text(json.dumps(drifted))
             missing = subprocess.run(
                 [sys.executable, str(SCRIPT), "--expect-runner-legacy-baseline", str(path)],
                 capture_output=True, text=True)
             self.assertEqual(missing.returncode, 1, missing.stderr)
-            self.assertIn("ubuntu-latest main baseline", missing.stderr)
+            self.assertIn("ubuntu-latest aot-port baseline", missing.stderr)
             self.assertNotIn("Traceback", missing.stderr)
 
 

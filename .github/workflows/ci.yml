@@ -127,9 +127,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build runtime bench
         run: cargo build --profile runtime-bench -p w3cos-runtime --bin w3cos-runtime-bench --no-default-features --features cpu-render
-      - name: Run runtime bench (LayoutNG opt-in; default is off on aot-port)
-        env:
-          W3COS_LAYOUT_NG: "1"
+      - name: Run runtime bench (LayoutNG default)
         run: target/runtime-bench/w3cos-runtime-bench --output runtime-bench.json --samples 3
       - name: Run runtime bench (legacy checksum lane)
         env:
@@ -138,10 +136,10 @@ jobs:
       - name: Check harness sanity
         run: |
           python3 -m unittest discover -s tests/scripts -p 'test_runtime_bench.py' -v
-          # LayoutNG lane (explicit =1): geometry and the no-rebuild subtree checks.
+          # Default lane: LayoutNG geometry and the no-rebuild subtree checks.
           python3 scripts/check-runtime-bench.py --expect-layout-ng on runtime-bench.json
-          # Legacy lane: same-runner checksums green main produced. The box
-          # tuple stays --expect-legacy-checksums and is not used here.
+          # Legacy lane: same-runner checksums this aot-port tree produced on
+          # ubuntu-latest. The box tuple stays --expect-legacy-checksums.
           python3 scripts/check-runtime-bench.py --expect-runner-legacy-baseline runtime-bench-legacy.json
       - name: Upload runtime bench report
         if: always()

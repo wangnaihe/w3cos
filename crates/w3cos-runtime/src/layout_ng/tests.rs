@@ -7559,10 +7559,10 @@ fn os(value: &str) -> &std::ffi::OsStr {
 /// aot-port: unset selects legacy (default off); any non-`0` value opts in,
 /// and a non-zero verify value wins over `0`.
 #[test]
-fn layout_ng_mode_from_env_default_is_aot_port_off() {
+fn layout_ng_mode_from_env_defaults_on() {
     use super::Mode;
     let cases = [
-        (None, None, Mode::Off),
+        (None, None, Mode::On),
         (Some("1"), None, Mode::On),
         (Some(""), None, Mode::On),
         (Some("on"), None, Mode::On),
@@ -7571,7 +7571,6 @@ fn layout_ng_mode_from_env_default_is_aot_port_off() {
         (Some("0"), Some("1"), Mode::Verify),
         (Some("0"), Some("all"), Mode::Verify),
         (None, Some("1"), Mode::Verify),
-        (None, Some("0"), Mode::Off),
         (Some("1"), Some("0"), Mode::On),
         (Some("1"), Some("1"), Mode::Verify),
     ];
@@ -7607,7 +7606,7 @@ fn layout_ng_mode_probe() {
 }
 
 #[test]
-fn layout_ng_fresh_processes_unset_is_off_on_aot_port() {
+fn layout_ng_fresh_processes_agree_on_unset_and_explicit_on() {
     let probe = |ng: Option<&str>| {
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
         cmd.args([
@@ -7641,10 +7640,10 @@ fn layout_ng_fresh_processes_unset_is_off_on_aot_port() {
     let unset = probe(None);
     let on = probe(Some("1"));
     let off = probe(Some("0"));
-    assert_eq!(unset, "Off", "aot-port keeps LayoutNG default off");
+    assert_eq!(unset, "On");
     assert_eq!(on, "On");
     assert_eq!(off, "Off");
-    assert_eq!(unset, off);
+    assert_eq!(unset, on);
 }
 
 /// WPT css/css-display/empty-text-baseline-001.html. A `<br>` plus an empty

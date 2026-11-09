@@ -729,10 +729,6 @@ fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Co
 /// `W3COS_LAYOUT_NG=0` does not, and `W3COS_LAYOUT_NG_VERIFY` other than `0`
 /// does even when NG is `0`. The DOM crate cannot see the runtime crate, so
 /// the two functions must stay in agreement.
-/// aot-port policy: must equal `layout_ng::LAYOUT_NG_DEFAULT_ON` in the
-/// runtime crate (false: NG is opt-in on aot-port).
-pub(crate) const LAYOUT_NG_DEFAULT_ON: bool = false;
-
 pub(crate) fn layout_ng_requested_from_env(
     ng: Option<&std::ffi::OsStr>,
     verify: Option<&std::ffi::OsStr>,
@@ -741,7 +737,7 @@ pub(crate) fn layout_ng_requested_from_env(
     if verify.is_some_and(enabled) {
         return true;
     }
-    ng.map_or(LAYOUT_NG_DEFAULT_ON, enabled)
+    ng.is_none_or(enabled)
 }
 
 /// Process-latched view of [`layout_ng_requested_from_env`].
@@ -756,7 +752,7 @@ pub(crate) fn layout_ng_requested() -> bool {
 
 #[cfg(test)]
 #[test]
-fn layout_ng_requested_defaults_off_on_aot_port_and_matches_the_runtime_rule() {
+fn layout_ng_requested_defaults_on_and_matches_the_runtime_rule() {
     let check = |ng: Option<&str>, verify: Option<&str>, want: bool| {
         let ng = ng.map(std::ffi::OsString::from);
         let verify = verify.map(std::ffi::OsString::from);
@@ -766,15 +762,13 @@ fn layout_ng_requested_defaults_off_on_aot_port_and_matches_the_runtime_rule() {
             "ng={ng:?} verify={verify:?}"
         );
     };
-    check(None, None, LAYOUT_NG_DEFAULT_ON);
-    assert!(!LAYOUT_NG_DEFAULT_ON, "aot-port keeps NG default off");
+    check(None, None, true);
     check(Some("1"), None, true);
     check(Some(""), None, true);
     check(Some("0"), None, false);
     check(Some("0"), Some("0"), false);
     check(Some("0"), Some("1"), true);
     check(None, Some("1"), true);
-    check(None, Some("0"), LAYOUT_NG_DEFAULT_ON);
     check(Some("1"), Some("0"), true);
 }
 

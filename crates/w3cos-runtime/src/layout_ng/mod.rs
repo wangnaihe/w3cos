@@ -10,9 +10,8 @@
 //! `(LayoutRect, flat index)` output, so paint, hit-testing and the CSSOM
 //! geometry getters are unchanged.
 //!
-//! Rollout: on aot-port LayoutNG is opt-in (`LAYOUT_NG_DEFAULT_ON = false`;
-//! main defaults it on). Unset `W3COS_LAYOUT_NG` uses the legacy engine. With
-//! `W3COS_LAYOUT_NG=1` this engine for trees it fully supports and falls back to the legacy Taffy +
+//! Rollout: LayoutNG is the default. An unset `W3COS_LAYOUT_NG` uses this
+//! engine for trees it fully supports and falls back to the legacy Taffy +
 //! projection engine otherwise. `W3COS_LAYOUT_NG=1` is the same mode.
 //! `W3COS_LAYOUT_NG=0` is the legacy escape hatch. `W3COS_LAYOUT_NG_VERIFY=1`
 //! (any value other than `0`) runs both on supported trees, keeps the legacy
@@ -53,12 +52,6 @@ pub(crate) enum Mode {
 /// with verify unset or `0` stays on the legacy engine. This is the single
 /// decision `mode` latches; `w3cos_dom::document::layout_ng_requested_from_env`
 /// must accept the same inputs.
-/// aot-port policy: LayoutNG stays opt-in here even though main (#431) made
-/// it the default. An unset `W3COS_LAYOUT_NG` therefore selects legacy; `=1`
-/// opts in. Flip this (and `w3cos_dom::document::LAYOUT_NG_DEFAULT_ON`) only
-/// by an explicit decision to make NG the default on aot-port.
-pub(crate) const LAYOUT_NG_DEFAULT_ON: bool = false;
-
 pub(crate) fn mode_from_env(
     ng: Option<&std::ffi::OsStr>,
     verify: Option<&std::ffi::OsStr>,
@@ -66,7 +59,7 @@ pub(crate) fn mode_from_env(
     let enabled = |value: &std::ffi::OsStr| value != "0";
     if verify.is_some_and(enabled) {
         Mode::Verify
-    } else if ng.map_or(LAYOUT_NG_DEFAULT_ON, enabled) {
+    } else if ng.is_none_or(enabled) {
         Mode::On
     } else {
         Mode::Off

@@ -55,15 +55,16 @@ LEGACY_LAYOUT_NG_OFF_CHECKSUMS = (
 )
 
 # Same four fields, measured on GitHub ubuntu-latest rather than the box.
-# Green main run 42155314497 job 127687955856 (7f1c12dc, flag unset, so the
-# legacy engine) recorded them. This branch's explicit W3COS_LAYOUT_NG=0
-# lane on run 42338677739 job 128301295869 (52c2a199) recorded the same
-# four. They are not a substitute for the box tuple above.
+# aot-port residual after syncing main #431-#433 (PR #435 head 989f5753):
+# run 42543927882 job 128924728693, explicit W3COS_LAYOUT_NG=0 lane. Differs
+# from main's 7f1c12dc runner tuple because aot-port carries additional
+# layout/runtime surface; keep the box LEGACY_LAYOUT_NG_OFF_CHECKSUMS tuple
+# unchanged. They are not a substitute for the box tuple above.
 RUNNER_LEGACY_BASELINE_CHECKSUMS = (
-    (("style_layout", "layout_checksum"), 18291149073252),
-    (("startup", "child", "layout_checksum"), 31625672812),
-    (("startup", "child", "checksum"), 147785895),
-    (("paint_scroll", "checksum"), 1797980318),
+    (("style_layout", "layout_checksum"), 18321946508132),
+    (("startup", "child", "layout_checksum"), 31632136300),
+    (("startup", "child", "checksum"), 153009029),
+    (("paint_scroll", "checksum"), 1818919221),
 )
 
 
@@ -96,7 +97,7 @@ def expect_legacy_checksums(report):
 def expect_runner_legacy_baseline(report):
     """ubuntu-latest must still produce the legacy tuple green main recorded."""
     expect_checksum_tuple(
-        report, RUNNER_LEGACY_BASELINE_CHECKSUMS, "ubuntu-latest main baseline"
+        report, RUNNER_LEGACY_BASELINE_CHECKSUMS, "ubuntu-latest aot-port baseline"
     )
 
 
