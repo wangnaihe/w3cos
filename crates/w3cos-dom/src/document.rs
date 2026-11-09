@@ -709,6 +709,21 @@ enum ChildListDirtyKind {
     },
 }
 
+/// An authored `display: flex` host whose children are all text runs (a
+/// styled `inline-block` span folds into one).
+fn is_flex_host_of_text_runs(style: &w3cos_std::Style, children: &[w3cos_std::Component]) -> bool {
+    style.display == w3cos_std::style::Display::Flex
+        && children.iter().all(|child| {
+            matches!(child.kind, w3cos_std::ComponentKind::Text { .. })
+                && matches!(
+                    child.style.display,
+                    w3cos_std::style::Display::Inline
+                        | w3cos_std::style::Display::InlineBlock
+                        | w3cos_std::style::Display::None
+                )
+        })
+}
+
 /// Whether LayoutNG should shape the DOM tree. Mirrors
 /// `layout_ng::mode_from_env`: unset and `W3COS_LAYOUT_NG=1` request NG,
 /// `W3COS_LAYOUT_NG=0` does not, and `W3COS_LAYOUT_NG_VERIFY` other than `0`
