@@ -1677,6 +1677,53 @@ fn item_text<'a>(flat: &'a [FlatNodeInfo], item: &InlineItem) -> &'a str {
     }
 }
 
+/// Cumulative character advances of `text`, plus the horizontal padding
+/// `max_content_width` adds. `None` when that width is not the snapped sum
+/// of per-character advances (a tab, Skia shaping, or a named family).
+fn additive_char_prefix(text: &str, style: &Style) -> Option<(Vec<f32>, f32)> {
+    // This branch measures preserved tabs from line position
+    // (`tab_item_advance`); their width is not a sum of char advances.
+    if text.contains('\t') {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    {
+        return None;
+    }
+    #[cfg(not(feature = "skia"))]
+    {
+        if style.font_family.is_some() {
+            return None;
+        }
+        let padding = style.padding_lengths();
+        let pad = padding.left + padding.right;
+        let font = crate::layout::layout_font();
+        let mut prefix = Vec::with_capacity(text.len() + 1);
+        prefix.push(0.0);
+        let mut sum = 0.0f32;
+        for ch in text.chars() {
+            sum += crate::text_layout::char_advance(ch, style.font_size, font);
+            for _ in 0..ch.len_utf8() {
+                prefix.push(sum);
+            }
+        }
+        Some((prefix, pad))
+    }
+}
+
+/// `hang_advance` from a prefix built by [`additive_char_prefix`].
+fn hang_from_prefix(piece: &str, raw: f32, prefix: &[f32], start: usize, pad: f32) -> f32 {
+    let trimmed = piece.trim_end_matches(' ').len();
+    if trimmed == 0 {
+        return 0.0;
+    }
+    if trimmed == piece.len() {
+        return raw;
+    }
+    let spaces = snap(prefix[start + piece.len()] - prefix[start + trimmed]) + pad;
+    (raw - spaces).max(0.0)
+}
+
 /// NGLineBreaker breaking inside a text item: split `item` at the latest
 /// UAX #14 opportunity (crate::line_break over the item's text) for which
 /// `fits(prefix)` holds, or, with `overflow`, at its first opportunity.
@@ -1702,13 +1749,34 @@ fn split_text_item(
     if candidates.is_empty() {
         return None;
     }
+    // Char advances add. A binary search that remeasures both sides of every
+    // probe repeats that sum for the whole remaining paragraph on each line.
+    // The prefix is the same sum `max_content_width` uses, so the snapped
+    // slice widths stay identical. Shaped faces (Skia, a named family) do
+    // not take this path.
+    let additive = additive_char_prefix(text, style);
     let piece = |o: usize| {
         let (head, tail) = text.split_at(o);
-        let adv = run_advances(&[head, tail], style);
+        let (head_width, tail_width) = if let Some((prefix, pad)) = additive.as_ref() {
+            (
+                snap(prefix[o] - prefix[0]) + pad,
+                snap(prefix[text.len()] - prefix[o]) + pad,
+            )
+        } else {
+            let adv = run_advances(&[head, tail], style);
+            (adv[0], adv[1])
+        };
+        let hang = |piece_text: &str, raw: f32, start: usize| {
+            if let Some((prefix, pad)) = additive.as_ref() {
+                hang_from_prefix(piece_text, raw, prefix, start, *pad)
+            } else {
+                hang_advance(piece_text, raw, style)
+            }
+        };
         let mut a = item.clone();
         a.range = Some((base, base + o));
-        a.raw = adv[0] + item.box_start;
-        a.raw_hang = hang_advance(head, adv[0], style) + item.box_start;
+        a.raw = head_width + item.box_start;
+        a.raw_hang = hang(head, head_width, 0) + item.box_start;
         a.hang_last = 0.0;
         a.ends_space = head.ends_with(' ');
         a.whitespace_only = head.trim_end_matches(' ').is_empty();
@@ -1716,8 +1784,8 @@ fn split_text_item(
         a.box_end = 0.0;
         let mut b = item.clone();
         b.range = Some((base + o, base + text.len()));
-        b.raw = adv[1] + item.box_end;
-        b.raw_hang = hang_advance(tail, adv[1], style) + item.box_end;
+        b.raw = tail_width + item.box_end;
+        b.raw_hang = hang(tail, tail_width, o) + item.box_end;
         b.starts_space = tail.starts_with(' ');
         b.whitespace_only = tail.trim_end_matches(' ').is_empty();
         b.internal_break = internal_opportunity(tail, style);
