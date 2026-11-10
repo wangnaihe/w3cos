@@ -2317,6 +2317,7 @@ fn layout_with(
         available_inline: inner_width,
         percentage_block: specified_height,
         cyclic_percent_auto: false,
+        line_clamp: None,
         ..*space
     };
     let stretch_styles = block::stretch_child_styles(flat, index, &item_space, false, false);
@@ -2356,6 +2357,7 @@ fn layout_with(
             basis_space = ConstraintSpace {
                 percentage_block: Some((line - cross_edges).max(0.0)),
                 cyclic_percent_auto: false,
+                line_clamp: None,
                 ..*space
             };
             &basis_space
@@ -2369,6 +2371,7 @@ fn layout_with(
             basis_space = ConstraintSpace {
                 percentage_block: Some(height),
                 cyclic_percent_auto: false,
+                line_clamp: None,
                 ..*space
             };
             &basis_space
@@ -2490,6 +2493,7 @@ fn layout_with(
                 let line = ConstraintSpace {
                     available_inline: available,
                     cyclic_percent_auto: false,
+                    line_clamp: None,
                     ..*space
                 };
                 block::replaced_size(flat[child].kind, child_style, &line)?.0
@@ -3123,6 +3127,7 @@ fn layout_with(
     let mut end_strut = MarginStrut::default();
     end_strut.append(metrics.margin[2]);
     Some(LayoutResult {
+        lines_used: 0,
         fragment: BoxFragment {
             index,
             width: border_width,
@@ -3733,6 +3738,7 @@ fn layout_wrapped(
     let mut end_strut = MarginStrut::default();
     end_strut.append(metrics.margin[2]);
     Some(LayoutResult {
+        lines_used: 0,
         fragment: BoxFragment {
             index,
             width: border_width,

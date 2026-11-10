@@ -2619,6 +2619,7 @@ pub(super) fn layout_with_block_size(
     let mut end_strut = MarginStrut::default();
     end_strut.append(metrics.margin[2]);
     Some(LayoutResult {
+        lines_used: 0,
         fragment,
         last_baseline,
         first_baseline: last_baseline,

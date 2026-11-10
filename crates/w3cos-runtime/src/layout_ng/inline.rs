@@ -68,7 +68,7 @@ const LINE_CLAMP_MARKER: &str = "--w3cos-internal-line-clamp";
 /// `-webkit-box`.
 const CONTINUE_MARKER: &str = "--w3cos-internal-continue";
 
-fn clamp_lines(style: &Style) -> Option<usize> {
+pub(super) fn clamp_lines(style: &Style) -> Option<usize> {
     // Standard `line-clamp: N` (`continue: collapse`) applies to any block
     // container. `-webkit-line-clamp` uses `continue: -webkit-legacy` and
     // only counts lines when webkit_box_styles copied `CLAMP_MARKER`.
@@ -78,10 +78,28 @@ fn clamp_lines(style: &Style) -> Option<usize> {
         return match marker_value(style, LINE_CLAMP_MARKER) {
             Some("auto") => auto_clamp_lines(style),
             Some(raw) => raw.parse().ok(),
-            None => None,
+            // `continue: collapse` without max-lines is the same as
+            // `line-clamp: auto` (CSS Overflow 4; continue-001).
+            None => auto_clamp_lines(style),
         };
     }
     marker_value(style, CLAMP_MARKER)?.parse().ok()
+}
+
+/// Whether this box's own clamp inserts a block-ellipsis (`line-clamp`
+/// and `-webkit-line-clamp` set `block-ellipsis: auto`; `continue:
+/// collapse` alone does not).
+pub(super) fn clamp_has_ellipsis(style: &Style) -> bool {
+    marker_value(style, LINE_CLAMP_MARKER).is_some() || marker_value(style, CLAMP_MARKER).is_some()
+}
+
+/// Line budget and ellipsis flag for this IFC: the box's own `line-clamp`
+/// wins, otherwise a same-BFC ancestor budget on the constraint space.
+fn clamp_budget(style: &Style, space: &super::ConstraintSpace) -> Option<(usize, bool)> {
+    if let Some(n) = clamp_lines(style) {
+        return Some((n, clamp_has_ellipsis(style)));
+    }
+    space.line_clamp.map(|c| (c.remaining, c.ellipsis))
 }
 
 /// How many line boxes fit in the content-box block size cap used by
@@ -2339,6 +2357,9 @@ pub(super) struct InlineResult {
     /// The widest line's content width (hanging spaces excluded): the
     /// min-content / max-content size at available 0 / indefinite.
     pub max_line_width: f32,
+    /// Line boxes produced after clamping; an ancestor line-clamp budget
+    /// subtracts this from its remaining count.
+    pub lines_used: usize,
 }
 
 /// Height of a paragraph leaf's text at `width` and whether it is a single
@@ -2717,6 +2738,7 @@ fn layout_lines(
             LastBaseline::Unknown
         };
         return Some(InlineResult {
+            lines_used: 0,
             height,
             max_line_width: available,
             last_baseline: baseline,
@@ -2767,15 +2789,21 @@ fn layout_lines(
         let ascent = strut_ascent.max(baseline);
         let single = ascent + strut_descent.max(line - baseline);
         let line_count = content.split('\n').count();
-        if let Some(n) = clamp_lines(container).filter(|&n| n < line_count) {
+        let (clamp_n, use_ellipsis) = match clamp_budget(container, space) {
+            Some((n, e)) => (Some(n), e),
+            None => (None, false),
+        };
+        if let Some(n) = clamp_n.filter(|&n| n < line_count) {
             // `-webkit-line-clamp`: one piece per kept line, the last one
             // followed by the block ellipsis. `line-clamp: auto` with a
-            // zero content-box cap keeps no lines.
+            // zero content-box cap keeps no lines. `continue: collapse`
+            // without block-ellipsis keeps the line and hides the rest.
             if floats.is_some() || style.white_space != WhiteSpace::Pre {
                 return super::bail("clamp-text");
             }
             if n == 0 {
                 return Some(InlineResult {
+                    lines_used: 0,
                     height: 0.0,
                     max_line_width: 0.0,
                     last_baseline: LastBaseline::NoLines,
@@ -2797,7 +2825,7 @@ fn layout_lines(
                 // line that cannot fit its text plus the ellipsis keeps
                 // only the ellipsis (block-ellipsis-013).
                 let mut range_end = start + text.len();
-                if last {
+                if last && use_ellipsis {
                     if width + ellipsis > available + EPSILON {
                         if ellipsis > available + EPSILON {
                             return super::bail("clamp-ellipsis");
@@ -2815,7 +2843,7 @@ fn layout_lines(
                     BoxFragment {
                         index: child,
                         text_range: Some((start, range_end)),
-                        ellipsis: last,
+                        ellipsis: last && use_ellipsis,
                         vertical: false,
                         width,
                         height: inline_font_height(style),
@@ -2825,6 +2853,7 @@ fn layout_lines(
                 start += text.len() + 1;
             }
             return Some(InlineResult {
+                lines_used: n,
                 height: single * n as f32,
                 max_line_width: widest,
                 last_baseline: LastBaseline::At(ascent + single * (n - 1) as f32),
@@ -2840,6 +2869,7 @@ fn layout_lines(
             return super::bail("float-paint-paragraph");
         }
         return Some(InlineResult {
+            lines_used: line_count,
             height: single * lines,
             max_line_width: width,
             last_baseline: LastBaseline::Unknown,
@@ -3579,7 +3609,11 @@ fn layout_lines(
     let mut ellipsis_item = None;
     let mut ellipsis_width = 0.0f32;
     let mut ellipsis_range = None;
-    if let Some(n) = clamp_lines(container).filter(|&n| n < built.len()) {
+    let (clamp_n, use_ellipsis) = match clamp_budget(container, space) {
+        Some((n, e)) => (Some(n), e),
+        None => (None, false),
+    };
+    if let Some(n) = clamp_n.filter(|&n| n < built.len()) {
         if floats.is_some() || has_boxes || reorder || preserve || !can_wrap {
             return super::bail("clamp-ifc");
         }
@@ -3589,6 +3623,12 @@ fn layout_lines(
                 .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
                 .collect();
             built.clear();
+        } else if !use_ellipsis {
+            dropped = built[n..]
+                .iter()
+                .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+                .collect();
+            built.truncate(n);
         } else {
             dropped = built[n..]
                 .iter()
@@ -3632,6 +3672,7 @@ fn layout_lines(
     // Every placed piece as (leaf position, line, offset, width, baseline):
     // a box split across lines spans the pieces of its leaves per line.
     let mut placed_all: Vec<(usize, usize, f32, f32, f32)> = Vec::new();
+    let lines_used = built.len();
     for (line_index, line) in built.into_iter().enumerate() {
         if floats.is_some() {
             top = line.top;
@@ -3849,6 +3890,7 @@ fn layout_lines(
         }
     }
     Some(InlineResult {
+        lines_used,
         height: top,
         children: out,
         last_baseline: last_line_baseline.map_or(LastBaseline::NoLines, LastBaseline::At),
@@ -3952,6 +3994,7 @@ pub(super) fn inline_min_max(
                 available_inline: available,
                 percent_unresolved: true,
                 cyclic_percent_auto: false,
+                line_clamp: None,
                 ..*space
             },
         )

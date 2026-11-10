@@ -8578,6 +8578,162 @@ fn line_clamp_auto_uses_definite_block_size() {
     assert_eq!(got, ["A", "B", "C", "D…"]);
 }
 
+/// Same-BFC block children share the ancestor `line-clamp` budget
+/// (line-clamp-005/007/008). Independent BFCs are not clamped from
+/// outside. `continue: collapse` without `block-ellipsis` hides overflow
+/// and does not insert U+2026 (continue-001).
+#[test]
+fn line_clamp_counts_same_bfc_block_children() {
+    use w3cos_std::style::{CustomProperties, Overflow, WhiteSpace};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 16.0,
+        line_height: 32.0,
+        line_height_is_normal: false,
+        line_height_computed_px: Some(32.0),
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::Pre,
+        ..font.clone()
+    };
+    let child_font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 24.0,
+        line_height: 48.0,
+        line_height_is_normal: false,
+        line_height_computed_px: Some(48.0),
+        white_space: WhiteSpace::Pre,
+        ..block()
+    };
+    let child_text = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::Pre,
+        ..child_font.clone()
+    };
+    let pre_block = Style {
+        white_space: WhiteSpace::Pre,
+        ..font.clone()
+    };
+    let clamp_style = |lines: &str| Style {
+        white_space: WhiteSpace::Pre,
+        custom_properties: Some(CustomProperties::from_iter([
+            ("--w3cos-internal-line-clamp".to_string(), lines.to_string()),
+            (
+                "--w3cos-internal-continue".to_string(),
+                "collapse".to_string(),
+            ),
+        ])),
+        ..font.clone()
+    };
+    let leaf = |style: Style, text_style: Style, content: &str| {
+        node(style, vec![Component::text(content, text_style)])
+    };
+    let layout = |style: Style, kids: Vec<Component>| {
+        let root = node(block(), vec![node(style, kids)]);
+        let flat = pre_flatten(&root);
+        layout_tree_with_text(&root, &flat, 800.0, 600.0)
+    };
+
+    // Two ancestor lines plus a same-BFC child: clamp 3 keeps the child's
+    // first line with a block-ellipsis (line-clamp-005).
+    let some = layout(
+        clamp_style("3"),
+        vec![
+            leaf(pre_block.clone(), text_style.clone(), "A\nB"),
+            leaf(child_font.clone(), child_text.clone(), "C\nD"),
+        ],
+    )
+    .expect("same-BFC 3");
+    let got: Vec<&str> = some.1.iter().map(|t| t.text.as_str()).collect();
+    let (_, _, _, h) = rect(&some.0, 1);
+    assert!(
+        (h - (32.0 + 32.0 + 48.0)).abs() < 1.0,
+        "same-BFC height {h}, texts {got:?}"
+    );
+    assert!(
+        got.iter().any(|t| t.contains('C') && t.contains('…')),
+        "child last line is ellipsized: {got:?}"
+    );
+    assert!(
+        got.iter().all(|t| !t.contains('D') || t.contains('…')),
+        "child second line is hidden: {got:?}"
+    );
+
+    // An independent BFC child's lines do not count (line-clamp-007).
+    let mut bfc_child = child_font.clone();
+    bfc_child.overflow = Overflow::Auto;
+    bfc_child.display = Display::FlowRoot;
+    let indep = layout(
+        clamp_style("3"),
+        vec![
+            leaf(pre_block.clone(), text_style.clone(), "A\nB"),
+            leaf(bfc_child, child_text.clone(), "C\nD"),
+            leaf(pre_block.clone(), text_style.clone(), "E\nF"),
+        ],
+    )
+    .expect("independent BFC");
+    let got: Vec<&str> = indep.1.iter().map(|t| t.text.as_str()).collect();
+    let (_, _, _, h) = rect(&indep.0, 1);
+    assert!(
+        (h - (32.0 * 2.0 + 48.0 * 2.0 + 32.0)).abs() < 1.0,
+        "independent BFC height {h}, texts {got:?}"
+    );
+    assert!(
+        got.iter().any(|t| t.contains('E') && t.contains('…')),
+        "third counted line is ellipsized: {got:?}"
+    );
+    assert!(
+        got.iter().all(|t| !t.contains('F') || t.contains('…')),
+        "line after the clamp is hidden: {got:?}"
+    );
+
+    // In-flow boxes after the clamp point are hidden (line-clamp-008).
+    let hidden = layout(
+        clamp_style("4"),
+        vec![
+            leaf(pre_block.clone(), text_style.clone(), "A\nB\nC\nD\nE"),
+            leaf(pre_block.clone(), text_style.clone(), "HIDE"),
+        ],
+    )
+    .expect("hide later boxes");
+    let got: Vec<&str> = hidden.1.iter().map(|t| t.text.as_str()).collect();
+    let (_, _, _, h) = rect(&hidden.0, 1);
+    assert!(
+        (h - 32.0 * 4.0).abs() < 1.0,
+        "hidden later box height {h}, texts {got:?}"
+    );
+    assert!(
+        got.iter().any(|t| t.contains('D') && t.contains('…')),
+        "last kept line is ellipsized: {got:?}"
+    );
+    assert!(
+        got.iter().all(|t| !t.contains("HIDE")),
+        "later in-flow box is hidden: {got:?}"
+    );
+
+    // continue: collapse + max-height 3lh, no block-ellipsis (continue-001).
+    let collapse = Style {
+        white_space: WhiteSpace::Pre,
+        max_height: Dimension::Lh(3.0),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-continue".to_string(),
+            "collapse".to_string(),
+        )])),
+        ..font.clone()
+    };
+    let just = layout(
+        collapse,
+        vec![leaf(pre_block.clone(), text_style.clone(), "A\nB\nC\nD\nE")],
+    )
+    .expect("continue collapse");
+    let got: Vec<&str> = just.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B", "C"]);
+    assert!(got.iter().all(|t| !t.contains('…')), "no ellipsis: {got:?}");
+}
+
 /// A column flex item's flexed size is not a percentage basis for its
 /// children while the container's height is indefinite
 /// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.

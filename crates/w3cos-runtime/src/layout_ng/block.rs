@@ -4264,6 +4264,7 @@ pub(super) fn layout_root(
         fixed_block_indefinite: false,
         percent_unresolved: false,
         cyclic_percent_auto: false,
+        line_clamp: None,
     };
     let result = layout_block(flat, 0, &space, true).why("root-layout")?;
     if result.float_overlap {
@@ -4802,7 +4803,22 @@ pub(super) fn layout_block_in(
         fixed_block_indefinite: false,
         percent_unresolved: false,
         cyclic_percent_auto: space.cyclic_percent_auto,
+        line_clamp: None,
     };
+
+    // This box's own line-clamp starts a budget for same-BFC descendants;
+    // otherwise inherit the ancestor BFC budget (CSS Overflow 4).
+    let mut clamp = if let Some(n) = inline::clamp_lines(style) {
+        Some(super::LineClampState {
+            remaining: n,
+            ellipsis: inline::clamp_has_ellipsis(style),
+        })
+    } else {
+        space.line_clamp
+    };
+    let mut child_space = child_space;
+    child_space.line_clamp = clamp;
+    let mut lines_used = 0usize;
 
     // CSS Sizing 4 stretch-fit sizing: a child's `stretch` sizes resolve
     // against this box's content box. Block margins that would collapse
@@ -4908,6 +4924,10 @@ pub(super) fn layout_block_in(
         last_baseline = result.last_baseline.offset(content_top);
         first_baseline = result.first_baseline.offset(content_top);
         at_top = result.children.is_empty();
+        lines_used = result.lines_used;
+        if let Some(c) = clamp.as_mut() {
+            c.remaining = c.remaining.saturating_sub(result.lines_used);
+        }
         children.extend(
             result
                 .children
@@ -4962,6 +4982,13 @@ pub(super) fn layout_block_in(
                 static_rtl: child_space.rtl,
                 ..OofCandidate::default()
             });
+            child = next;
+            continue;
+        }
+        // `continue: collapse` hides later in-flow boxes once the line
+        // budget is spent (line-clamp-008). Out-of-flow static positions
+        // were already recorded.
+        if clamp.as_ref().is_some_and(|c| c.remaining == 0) {
             child = next;
             continue;
         }
@@ -5310,6 +5337,13 @@ pub(super) fn layout_block_in(
         let (estimate, estimate_cleared) = place(own_top).why("place-estimate")?;
         let snapshot = exclusions.snapshot();
         let mut nested = child_space;
+        // Independent BFCs do not count their internal lines and are not
+        // clamped from the outside (line-clamp-007).
+        nested.line_clamp = if is_bfc_root(child_info.style) {
+            None
+        } else {
+            clamp
+        };
         nested.bfc_x = bfc_x + x;
         nested.bfc_y = content_bfc_y + estimate;
         // Margins collapsing through us: the child (and we) end up past
@@ -5514,6 +5548,13 @@ pub(super) fn layout_block_in(
             result = fitted;
         }
         float_overlap |= result.float_overlap;
+        if nested.line_clamp.is_some() {
+            let used = result.lines_used;
+            lines_used += used;
+            if let Some(c) = clamp.as_mut() {
+                c.remaining = c.remaining.saturating_sub(used);
+            }
+        }
         // Paint-wrapped block text and BFC roots must avoid floats too
         // (IFC line boxes use their line opportunities); fall back.
         let child_style = child_info.style;
@@ -5845,6 +5886,7 @@ pub(super) fn layout_block_in(
         last_baseline = LastBaseline::At(height + metrics.margin[2]);
     }
     Some(LayoutResult {
+        lines_used,
         last_baseline,
         first_baseline,
         fragment: BoxFragment {

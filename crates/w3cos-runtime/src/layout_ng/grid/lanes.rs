@@ -845,6 +845,7 @@ pub(super) fn layout(
     let mut end_strut = MarginStrut::default();
     end_strut.append(metrics.margin[2]);
     Some(LayoutResult {
+        lines_used: 0,
         fragment: BoxFragment {
             index,
             width: border_width,

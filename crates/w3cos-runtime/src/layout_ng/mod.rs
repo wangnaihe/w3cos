@@ -155,6 +155,18 @@ pub(crate) struct ConstraintSpace {
     /// Inherited by descendants, but reset by flex layout, whose
     /// flex-basis measurement resolves such percentages later.
     pub cyclic_percent_auto: bool,
+    /// Remaining line budget for `line-clamp` / `continue: collapse` in
+    /// this BFC, propagated to same-BFC block children (CSS Overflow 4).
+    /// Independent formatting-context children do not inherit it.
+    pub line_clamp: Option<LineClampState>,
+}
+
+/// How many line boxes may still be kept in the current line-clamp BFC,
+/// and whether the last kept line gets a block-ellipsis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineClampState {
+    pub remaining: usize,
+    pub ellipsis: bool,
 }
 
 /// NGMarginStrut: the positive and negative extremes of adjoining margins.
@@ -250,6 +262,8 @@ pub(crate) struct LayoutResult {
     /// Line boxes or a BFC root would have to avoid a float
     /// (NGLayoutOpportunity per line; not implemented yet).
     pub float_overlap: bool,
+    /// Line boxes this box contributes to an ancestor line-clamp budget.
+    pub lines_used: usize,
 }
 
 #[cfg(any(test, feature = "layout-ng-trace"))]

@@ -1017,6 +1017,17 @@ impl CSSStyleDeclaration {
                     set_line_clamp_longhands(&mut self.inner, marker, continue_mode);
                 }
             }
+            "continue" => {
+                // CSS Overflow 4 `continue` longhand. `collapse` hides
+                // content after a definite block-size cap; invalid values
+                // keep the previous declaration. `auto` (initial) clears.
+                let keyword = value.trim().to_ascii_lowercase();
+                if keyword == "collapse" {
+                    set_marker(&mut self.inner, CONTINUE_PROPERTY, Some("collapse".into()));
+                } else if keyword == "auto" || css_wide_keyword(&keyword) {
+                    set_marker(&mut self.inner, CONTINUE_PROPERTY, None);
+                }
+            }
             "line-clamp" | "lineClamp" => {
                 // CSS Overflow 4: `line-clamp: <integer> | auto` is a
                 // shorthand for `max-lines`, `block-ellipsis: auto`, and

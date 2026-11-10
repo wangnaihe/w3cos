@@ -6670,6 +6670,7 @@ fn layout_impl(
         });
     }
     Some(GridOut::Laid(LayoutResult {
+        lines_used: 0,
         fragment: BoxFragment {
             index,
             width: border_width,

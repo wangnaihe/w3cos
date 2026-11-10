@@ -493,6 +493,7 @@ pub(super) fn layout(
         fixed_block_indefinite: false,
         percent_unresolved: false,
         cyclic_percent_auto: false,
+        line_clamp: None,
     };
     let inner_style = &styles[0];
     let inline_sized = if inner_style.width == Dimension::Auto {
@@ -520,6 +521,7 @@ pub(super) fn layout(
     let mut end_strut = MarginStrut::default();
     end_strut.append(margin_bottom);
     Some(LayoutResult {
+        lines_used: 0,
         fragment,
         last_baseline: LastBaseline::NoLines,
         first_baseline: LastBaseline::NoLines,
