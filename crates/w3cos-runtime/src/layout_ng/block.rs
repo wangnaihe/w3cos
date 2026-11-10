@@ -4050,7 +4050,7 @@ fn is_blockified_inline_grid(flat: &[FlatNodeInfo], index: usize) -> bool {
 
 /// Top-level `inline-grid` that shares a line with its siblings. A flex or
 /// grid item is blockified and is not one of these.
-fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
+pub(super) fn is_inline_grid_line(flat: &[FlatNodeInfo], index: usize) -> bool {
     is_inline_grid(flat[index].style)
         && !is_blockified_inline_grid(flat, index)
         && (super::grid::definite_inline_grid(flat[index].style)

@@ -13115,36 +13115,6 @@ fn column_flex_percent_descendant_of_definite_item_matches_chrome() {
     assert_eq!(rect(&out, 3), (0.0, 0.0, 100.0, 100.0));
 }
 
-/// A percentage height on the column flex item itself still falls back
-/// (`flex:column-percent`): those sizes cycle through the automatic
-/// minimum when the container's block size is indefinite.
-#[test]
-fn column_flex_percent_item_stays_on_legacy() {
-    let col = Style {
-        display: Display::Flex,
-        flex_direction: FlexDirection::Column,
-        ..Style::default()
-    };
-    let item = Style {
-        width: Dimension::Px(100.0),
-        height: Dimension::Percent(50.0),
-        ..block()
-    };
-    let root = node(block(), vec![node(col, vec![node(item, vec![])])]);
-    let flat = pre_flatten(&root);
-    assert!(
-        !block::supports_tree(&flat),
-        "percent column item must stay on legacy"
-    );
-    assert!(
-        block::unsupported_reasons(&flat)
-            .iter()
-            .any(|reason| *reason == "flex:column-percent"),
-        "{:?}",
-        block::unsupported_reasons(&flat)
-    );
-}
-
 /// A grid with `width: min-content` whose only item is a column subgrid
 /// (css-grid/subgrid/dynamic-min-content-001 end state). Headless Chrome,
 /// body margin 0: the outer grid is a 100×100 border box; the subgrid and

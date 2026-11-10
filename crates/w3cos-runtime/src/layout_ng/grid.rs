@@ -484,7 +484,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // (intrinsic-ratio transfer) and definite px boxes
     // (`min_content_replaced_columns`) — main #432.
     if intrinsic_tracks_without_subgrid(flat, index)
-        && !inline_grid_line_lays_out(flat, index)
+        && !super::block::is_inline_grid_line(flat, index)
         && !min_content_replaced_columns(flat, index)
     {
         return Some("grid:intrinsic-track");
@@ -1159,6 +1159,14 @@ fn zero_padding_and_border(style: &Style) -> bool {
         && block::border_widths(style)
             .iter()
             .all(|value| value.abs() <= EPS)
+}
+
+fn zero_box_edges(style: &Style) -> bool {
+    spacing_is_zero(style.margin.top)
+        && spacing_is_zero(style.margin.right)
+        && spacing_is_zero(style.margin.bottom)
+        && spacing_is_zero(style.margin.left)
+        && zero_padding_and_border(style)
 }
 
 /// Top-level `inline-grid` whose column and row templates are definite px
