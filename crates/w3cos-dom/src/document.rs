@@ -6372,17 +6372,14 @@ impl Document {
                 ))
             }
             [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
-                if generated_single_text_can_be_a_styled_leaf(&style) =>
+                if !generated_single_text_requires_principal_box(&style, pseudo_element) =>
             {
-                // A single generated string can carry the principal style
-                // as a text leaf, which is the cw58y input that layout
-                // (NG and legacy) already handles: width on a non-replaced
-                // in-flow inline does not apply (CSS 2.1 10.3.1), and an
-                // inline-block that holds only this text — including an
-                // empty `content:''` strut — is an atomic text leaf
-                // (CSS 2.1 10.8.1). Painted or decorated principals
-                // (borders, UA link style on `::scroll-marker`) still
-                // fall through to the wrapper.
+                // cw58y default: a single generated string is a text leaf
+                // that carries the principal style, including
+                // `display:contents` and empty `display:block` clearfix.
+                // A principal wrapper is used only when a box is required
+                // (painted decorations, UA `::scroll-marker` link style,
+                // or a scroll-marker used size).
                 Some(w3cos_std::Component::text(text.clone(), style))
             }
             [GeneratedContentItem::Image(source)] => {
@@ -15076,31 +15073,50 @@ fn principal_box_can_collapse_generated_text(style: &w3cos_std::style::Style) ->
         && principal_box_can_merge_generated_inline_text(style)
 }
 
-fn generated_single_text_can_be_a_styled_leaf(style: &w3cos_std::style::Style) -> bool {
-    use w3cos_std::style::{Dimension, Display, Float, Position};
-    // Width and height do not apply to a non-replaced in-flow inline, so
-    // they alone must not keep a principal box that legacy will honor as
-    // a 5em advance (floats-114 `.a`). A floated generated string is a
-    // blockified text leaf in the same way (cw58y / floats-114 `.b`).
-    // Painted or decorated principals, and flex/grid items with a used
-    // size plus decoration, still stay wrapped.
-    if matches!(style.position, Position::Absolute | Position::Fixed) {
-        return false;
-    }
-    let in_flow_inline = matches!(style.display, Display::Inline | Display::InlineBlock)
-        && style.float == Float::None;
-    let blockified_float = style.float != Float::None && style.display == Display::Block;
-    if !in_flow_inline && !blockified_float {
-        return false;
-    }
-    let mut unsize = style.clone();
-    unsize.width = Dimension::Auto;
-    unsize.height = Dimension::Auto;
-    unsize.min_width = Dimension::Auto;
-    unsize.min_height = Dimension::Auto;
-    unsize.max_width = Dimension::Auto;
-    unsize.max_height = Dimension::Auto;
-    principal_box_can_merge_generated_inline_text(&unsize)
+fn generated_single_text_requires_principal_box(
+    style: &w3cos_std::style::Style,
+    pseudo_element: &str,
+) -> bool {
+    use w3cos_std::style::{Dimension, OutlineStyle, TextDecoration, Transform2D};
+    // Invert of the previous allow-list: default to the cw58y text leaf
+    // for every display (contents, empty block clearfix, in-flow width,
+    // floated block, …). Keep a principal box only when one is required
+    // for paint or for a UA `::scroll-marker` flex item used size.
+    let paints = style.padding != w3cos_std::style::Edges::ZERO
+        || style.border_width > 0.0
+        || [
+            style.border_top_width,
+            style.border_right_width,
+            style.border_bottom_width,
+            style.border_left_width,
+        ]
+        .into_iter()
+        .any(|width| width.unwrap_or(0.0) > 0.0)
+        || style.background.a != 0
+        || style
+            .background_image
+            .as_deref()
+            .is_some_and(|image| !image.eq_ignore_ascii_case("none"))
+        || style.has_box_shadow()
+        || style.backdrop_blur.is_some()
+        || style.filter.is_some()
+        || style.opacity != 1.0
+        || style.transform != Transform2D::default()
+        || (style.outline_style != OutlineStyle::None && style.outline_width > 0.0);
+    let decorated = style.text_decoration != TextDecoration::None || !style.text_shadows.is_empty();
+    let used_size = style.width != Dimension::Auto
+        || style.height != Dimension::Auto
+        || style.min_width != Dimension::Auto
+        || style.min_height != Dimension::Auto
+        || style.max_width != Dimension::Auto
+        || style.max_height != Dimension::Auto;
+    let scroll_marker_item = {
+        let name = pseudo_element.trim_matches(':').to_ascii_lowercase();
+        name == "scroll-marker"
+            || name.ends_with("::scroll-marker")
+            || name.ends_with("scroll-marker")
+    };
+    paints || decorated || (scroll_marker_item && used_size)
 }
 
 fn principal_box_can_merge_generated_inline_text(style: &w3cos_std::style::Style) -> bool {

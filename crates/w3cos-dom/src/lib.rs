@@ -3162,6 +3162,122 @@ mod tests {
     }
 
     #[test]
+    fn generated_display_contents_text_is_a_leaf_that_joins_in_the_flex_item() {
+        // display-contents-before-after-003: ::before "A" and ::after "S"
+        // with display:contents must lower as text leaves (cw58y) so they
+        // hoist into one flex item "AS".
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "#host",
+            &[("display", "inline-flex"), ("flex-direction", "column")],
+        );
+        crate::stylesheet::register_rule(
+            "#host::before",
+            &[("display", "contents"), ("content", "'A'")],
+        );
+        crate::stylesheet::register_rule(
+            "#host::after",
+            &[("display", "contents"), ("content", "'S'")],
+        );
+
+        let mut doc = Document::new();
+        let before = doc.create_text_node("P");
+        let flex = doc.create_element("div");
+        flex.set_attribute(&mut doc, "id", "host");
+        let after = doc.create_text_node("S");
+        doc.body().append_child(&mut doc, before);
+        doc.body().append_child(&mut doc, flex);
+        doc.body().append_child(&mut doc, after);
+
+        let tree = doc.to_component_tree();
+        fn find_flex(node: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if node.style.display == w3cos_std::style::Display::InlineFlex {
+                return Some(node);
+            }
+            node.children.iter().find_map(find_flex)
+        }
+        let flex = find_flex(&tree).expect("inline-flex host");
+        let joined = descendant_generated_text(flex);
+        assert_eq!(
+            joined, "AS",
+            "contents-generated A and S must join in the flex, text={joined:?}"
+        );
+        // Not two separately wrapped letters (each in its own inner IFC).
+        let ifc_wrappers = flex
+            .children
+            .iter()
+            .filter(|child| has_ifc(&child.style))
+            .count();
+        assert_eq!(
+            ifc_wrappers,
+            0,
+            "display:contents text must not sit in inner IFC wrappers, children={}",
+            flex.children.len()
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn empty_block_generated_clearfix_is_a_leaf_without_an_inner_ifc() {
+        // flexbox_item-float-ref / text-wrap-balance-before-after-001:
+        // `content:''` `display:block` (optional `clear:both`) is an empty
+        // block leaf, not a principal with an invented inner IFC.
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "div::after",
+            &[("content", "''"), ("display", "block"), ("clear", "both")],
+        );
+
+        let mut doc = Document::new();
+        let container = doc.create_element("div");
+        let item = doc.create_element("p");
+        item.set_attribute(&mut doc, "style", "float:left;width:2em;height:2em");
+        container.append_child(&mut doc, item);
+        doc.body().append_child(&mut doc, container);
+
+        let tree = doc.to_component_tree();
+        fn find_clearfix(node: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            let empty_text = matches!(
+                &node.kind,
+                w3cos_std::ComponentKind::Text { content } if content.is_empty()
+            );
+            if node.style.display == w3cos_std::style::Display::Block
+                && (empty_text
+                    || (node.children.is_empty()
+                        && !matches!(node.kind, w3cos_std::ComponentKind::Text { .. })))
+            {
+                // Prefer the generated clearfix over an empty authored block.
+                if empty_text || node.style.clear != w3cos_std::style::Clear::None {
+                    return Some(node);
+                }
+            }
+            node.children.iter().find_map(find_clearfix)
+        }
+        let generated = find_clearfix(&tree).expect("empty block clearfix");
+        assert!(
+            matches!(
+                generated.kind,
+                w3cos_std::ComponentKind::Text { ref content } if content.is_empty()
+            ),
+            "empty display:block is a text leaf, kind={:?}",
+            generated.kind
+        );
+        assert!(
+            !has_ifc(&generated.style),
+            "clearfix leaf must not be an IFC"
+        );
+        assert!(
+            generated.children.is_empty()
+                || generated
+                    .children
+                    .iter()
+                    .all(|child| !has_ifc(&child.style)),
+            "clearfix must not invent an inner IFC"
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
     fn br_lowers_as_a_forced_break_inside_one_anonymous_text_run() {
         crate::stylesheet::clear_rules();
         let mut doc = Document::new();
