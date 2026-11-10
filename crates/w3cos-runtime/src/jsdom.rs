@@ -33628,9 +33628,9 @@ try {
             initial.get_property("1").get_property("width").to_number(),
             400.0
         );
-        // The engine does not yet expose computed custom properties, but the
-        // internal numeric owner must not leak through that existing surface.
-        assert_eq!(computed_owner(), "");
+        // aot-port exposes computed custom properties: the author's own value
+        // is reported, but the internal numeric owner must never leak.
+        assert_eq!(computed_owner(), "user-token");
         assert_eq!(inline_owner(), "user-token");
 
         block.set_property("className", Value::string("hot"));
@@ -33650,7 +33650,7 @@ try {
         let bounds = host.call_method("getBoundingClientRect", vec![]);
         assert_eq!(bounds.get_property("width").to_number(), 420.0);
         assert_eq!(bounds.get_property("height").to_number(), 12.0);
-        assert_eq!(computed_owner(), "");
+        assert_eq!(computed_owner(), "user-token");
         assert_eq!(inline_owner(), "user-token");
     }
 
