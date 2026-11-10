@@ -216,21 +216,22 @@ fn pack_keyword(keyword: &str, rtl: bool) -> Pack {
 /// on legacy only to hold accidental passes (the paired subgrid and
 /// grid-lanes tests, whose plain-grid references legacy renders the same
 /// wrong way); the gate covers those pages.
-fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
+fn baseline_container_height_ok(flat: &[FlatNodeInfo], container: usize) -> bool {
     // A definite height, or an auto height over implicit tracks only: the
-    // auto-height forms with authored templates stay on legacy until the
-    // paired subgrid and grid-lanes baseline tests run on NG as well. Their
-    // references are plain templated grids that legacy renders wrongly, in
-    // the same way as the (legacy) test, so lifting the restriction turns
-    // those accidental passes into failures (subgrid-baseline-003/004,
+    // auto-height forms with authored templates stay on legacy (row axis)
+    // or skip column-baseline participation (justify axis) so paired
+    // subgrid and grid-lanes baseline tests keep matching their
+    // plain-grid references (subgrid-baseline-003/004,
     // grid-lanes-baseline-alignment-affects-intrinsic-size-002,
     // row-grid-lanes-item-baseline-003, column-grid-lanes-container-
-    // baseline-001b). Grids that nest boxes (an item with element children,
+    // baseline-001b, and column-grid-lanes-item-baseline-synthesized-001
+    // whose ref is an auto-height templated grid with `justify-items:
+    // baseline`). Grids that nest boxes (an item with element children,
     // or a grid inside a grid) are the exception: those are what the
     // nested-grid alignment tests measure, and their references are not the
     // flat text-item grids the paired tests above share.
     let style = flat[container].style;
-    (matches!(style.height, Dimension::Px(_))
+    matches!(style.height, Dimension::Px(_))
         || (columns_spec(style).is_none() && style.grid_rows().is_none())
         || rendered_children(flat, container).any(|c| {
             rendered_children(flat, c)
@@ -241,7 +242,11 @@ fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
         // content height, so its row baselines do not feed a size cycle.
         || (block::is_inline_grid(style)
             && parse_template(style.grid_rows().unwrap_or(""), true)
-                .is_some_and(|rows| fixed_px_sum(&rows).is_some())))
+                .is_some_and(|rows| fixed_px_sum(&rows).is_some()))
+}
+
+fn block_baseline_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
+    baseline_container_height_ok(flat, container)
         && baseline_shape_supported(flat, container, child)
 }
 
@@ -284,13 +289,137 @@ fn synthesized_block_baseline(last: bool, border_height: f32) -> f32 {
     if last { 0.0 } else { border_height }
 }
 
-/// Inline-axis (`justify-*: baseline`) alignment in a horizontal grid whose
-/// items are horizontal too: the synthesized inline-axis baseline is the
-/// item's start margin edge, so an item alone in its column baseline group
-/// sits at the start of its area. Shared groups bail where they are built.
+/// Inline-axis (`justify-*: baseline`) alignment is modeled only in a
+/// horizontal-tb grid. Vertical containers stay on the transposed path,
+/// which still drops baseline styles.
 fn inline_baseline_container_ok(style: &Style) -> bool {
     use w3cos_std::style::WritingMode;
     style.writing_mode == WritingMode::HorizontalTb
+}
+
+/// A typographic first/last baseline is only valid in the grid's inline
+/// axis when the item's writing mode is vertical (parallel to that axis).
+/// Horizontal-tb items synthesize from the under (first) or over (last)
+/// border edge in an assumed axis-compatible writing mode: vertical-lr
+/// in an ltr grid, vertical-rl in an rtl grid (CSS Align 3 §9.1 / §9.3,
+/// csswg #4675 / #1038; grid items use border edges, Blink
+/// `GridLayoutAlgorithm`, BSD-style Chromium license). Opposite
+/// block-flow directions form separate sharing groups.
+fn typographic_inline_baseline(child: &Style) -> bool {
+    !child.writing_mode.is_horizontal()
+}
+
+/// `true` when the item's under edge for synthesized (or assumed)
+/// first-baseline alignment is the physical right border edge.
+fn col_baseline_under_right(container: &Style, child: &Style) -> bool {
+    use w3cos_std::style::WritingMode;
+    match child.writing_mode {
+        WritingMode::VerticalRl | WritingMode::SidewaysRl => true,
+        WritingMode::VerticalLr | WritingMode::SidewaysLr => false,
+        WritingMode::HorizontalTb => container.direction == TextDirection::Rtl,
+    }
+}
+
+/// Alphabetic descent of the item's resolved face, not a constant 0.2em.
+/// Ahem happens to be 0.2em; other faces (Noto Serif, Tinos, …) differ.
+/// Used as the typographic first baseline in a horizontal alignment
+/// context with sideways-rotated Latin (CSS Writing Modes: horizontal
+/// typographic mode, dominant baseline alphabetic; em-bottom faces
+/// physical left). Vertical typographic mode's central baseline is not
+/// selected here (`text-orientation` is not stored, and this cluster
+/// sets `sideways`).
+fn typographic_font_descent(style: &Style) -> f32 {
+    #[cfg(feature = "skia")]
+    if let Some(metrics) = crate::render_skia::resolved_font_geometry(style) {
+        return metrics.descent.max(0.0);
+    }
+    (crate::layout::inline_font_height(style) - crate::layout::inline_font_content_ascent(style))
+        .max(0.0)
+}
+
+/// Typographic first baseline from the border-box left:
+/// border-left + padding-left + the face's alphabetic descent.
+fn typographic_col_first_from_border_left(style: &Style, space: &ConstraintSpace) -> f32 {
+    let border = block::border_widths(style);
+    let pad_left = spacing_px(style, style.padding.left, 0.0, space);
+    border[3] + pad_left + typographic_font_descent(style)
+}
+
+/// Synthesized first/last baseline from the border-box left. First uses
+/// the under edge, last the over edge, of the assumed writing mode.
+fn synthesized_col_baseline(last: bool, border_width: f32, under_right: bool) -> f32 {
+    let edge_right = if last { !under_right } else { under_right };
+    if edge_right { border_width } else { 0.0 }
+}
+
+/// Margin-box ascent and descent of a column-baseline participant, and
+/// the group's under-right key. Used both as the Blink-style baseline
+/// shim into column min/max and to place the item in its group.
+fn col_baseline_ascent_descent(
+    container: &Style,
+    child: &Style,
+    space: &ConstraintSpace,
+    margin_box: i64,
+    last: bool,
+) -> (i64, i64, bool) {
+    let ml = units(spacing_px(child, child.margin.left, 0.0, space));
+    let mr = units(spacing_px(child, child.margin.right, 0.0, space));
+    let border_box = (margin_box - ml - mr).max(0);
+    let under_right = col_baseline_under_right(container, child);
+    let offset = if typographic_inline_baseline(child) {
+        typographic_col_first_from_border_left(child, space)
+    } else {
+        synthesized_col_baseline(last, from_units(border_box), under_right)
+    };
+    let ascent = ml + units(offset);
+    (ascent, margin_box - ascent, under_right)
+}
+
+fn percent_width(style: &Style) -> bool {
+    matches!(style.width, Dimension::Percent(_) | Dimension::Calc { .. })
+        && !has_marker(style, WIDTH_KEYWORD)
+}
+
+/// Shape gate for `justify-*: baseline` column groups. Lanes and subgrid
+/// stay excluded. Auto-height + authored templates are filtered in
+/// `item_col_baseline` (same `baseline_container_height_ok` as the row
+/// axis) so the lanes synthesized-001 ref stays start-aligned.
+fn inline_baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usize) -> bool {
+    let style = flat[container].style;
+    let child_style = flat[child].style;
+    let subgrid = |spec: Option<&str>| {
+        spec.is_some_and(|text| text.contains("subgrid") || text.contains("masonry"))
+    };
+    inline_baseline_container_ok(style)
+        && !has_marker(style, "--w3cos-internal-grid-lanes")
+        && !subgrid(columns_spec(style))
+        && !subgrid(style.grid_rows())
+        && !subgrid(columns_spec(child_style))
+        && !subgrid(child_style.grid_rows())
+        && !matches!(child_style.margin.left, Spacing::Auto)
+        && !matches!(child_style.margin.right, Spacing::Auto)
+        && !percent_width(child_style)
+}
+
+/// Column-axis baseline alignment of a grid item: `Some(false)` for
+/// `first baseline`, `Some(true)` for `last baseline`.
+fn inline_baseline(container: &Style, child: &Style) -> Option<bool> {
+    let keyword = marker(child, "--w3cos-internal-justify-self")
+        .filter(|keyword| *keyword != "auto")
+        .or_else(|| marker(container, "--w3cos-internal-justify-items"));
+    match keyword {
+        Some(keyword) if keyword.contains("baseline") => Some(keyword.contains("last")),
+        Some(_) => None,
+        None => is_baseline(used_item_align(container.justify_items, child.justify_self))
+            .then_some(false),
+    }
+}
+
+fn item_col_baseline(flat: &[FlatNodeInfo], container: usize, child: usize) -> Option<bool> {
+    inline_baseline(flat[container].style, flat[child].style).filter(|_| {
+        inline_baseline_shape_supported(flat, container, child)
+            && baseline_container_height_ok(flat, container)
+    })
 }
 
 /// The static-position alignment of an abspos grid child whose authored
@@ -4124,6 +4253,8 @@ struct Item {
     block_pack: Pack,
     /// Block-axis baseline alignment: `Some(last)`.
     baseline: Option<bool>,
+    /// Inline-axis (`justify-*: baseline`) alignment: `Some(last)`.
+    col_baseline: Option<bool>,
     /// A non-replaced ratio item whose block axis is stretched: its auto
     /// inline size follows the stretched block size once the rows are known
     /// (a stretch in the block axis wins over `normal` in the inline axis).
@@ -5196,6 +5327,8 @@ fn layout_impl(
     let mut col_max = vec![0_i64; column_specs.len()];
     let mut col_has_item = vec![false; column_specs.len()];
     let mut contribs = Vec::new();
+    // (col, last, under_right, ascent, descent) for the baseline shim.
+    let mut col_shims: Vec<(usize, bool, bool, i64, i64)> = Vec::new();
     // Column sizing resolves an item's percentage block size against its
     // area when every row it spans is a fixed length (Blink sizes the
     // columns with the definite row sizes in hand).
@@ -5329,6 +5462,34 @@ fn layout_impl(
             col_min_content[item.col] = col_min_content[item.col].max(min_c);
             col_max[item.col] = col_max[item.col].max(max_c);
         }
+        // Blink baseline shim: a shared `justify-*: baseline` group's
+        // extent (max ascent + max descent) is a min/max contribution
+        // to the column, so auto tracks grow to fit the aligned items.
+        if item.col_span == 1
+            && let Some(last) = item_col_baseline(flat, index, item.index)
+        {
+            let (ascent, descent, under_right) =
+                col_baseline_ascent_descent(style, child_style, space, max_c, last);
+            col_shims.push((item.col, last, under_right, ascent, descent));
+        }
+    }
+    let mut col_groups_shim: Vec<(usize, bool, bool, i64, i64)> = Vec::new();
+    for &(col, last, under_right, ascent, descent) in &col_shims {
+        if let Some(group) = col_groups_shim
+            .iter_mut()
+            .find(|(c, k, u, _, _)| *c == col && *k == last && *u == under_right)
+        {
+            group.3 = group.3.max(ascent);
+            group.4 = group.4.max(descent);
+        } else {
+            col_groups_shim.push((col, last, under_right, ascent, descent));
+        }
+    }
+    for &(col, _, _, ascent, descent) in &col_groups_shim {
+        let extent = ascent + descent;
+        col_min[col] = col_min[col].max(extent);
+        col_min_content[col] = col_min_content[col].max(extent);
+        col_max[col] = col_max[col].max(extent);
     }
     // Subgrid columns wrote only `col_min`; they are min-content too.
     for (min_content, minimum) in col_min_content.iter_mut().zip(&col_min) {
@@ -5480,16 +5641,18 @@ fn layout_impl(
         // under/over border edge (CSS Align 3 §9.1, csswg #4675).
         let baseline = block_baseline(style, child_style)
             .filter(|_| block_baseline_supported(flat, index, item.index));
-        // `justify-self: baseline` shares typographic column baselines
-        // only with items whose writing mode is parallel to the row axis
-        // (vertical items in a horizontal-tb grid). Horizontal-tb items
-        // fall back to start (`Pack::Start`). Shared typographic column
-        // groups bail after every item is placed, below.
+        let col_baseline = item_col_baseline(flat, index, item.index);
         if baseline.is_some() {
             if item.row_span != 1 {
                 return super::bail("grid:baseline-span");
             }
             align = Pack::Start;
+        }
+        if col_baseline.is_some() {
+            if item.col_span != 1 {
+                return super::bail("grid:baseline-span");
+            }
+            justify = Pack::Start;
         }
         // An item with a preferred aspect ratio also behaves as `start` for
         // `normal` (Blink ComputeNormalBehavior); its auto axis follows the
@@ -5652,34 +5815,9 @@ fn layout_impl(
             inline_pack: justify,
             block_pack: align,
             baseline,
+            col_baseline,
             ratio_stretch,
         });
-    }
-
-    // Shared typographic `justify-*: baseline` groups are not modeled
-    // yet. CSS Align 3 §9.3 (Blink `GridLayoutAlgorithm` baseline
-    // sharing): only items whose writing mode is parallel to the row axis
-    // participate — vertical writing modes in a horizontal-tb grid. Two
-    // or more such items in the same column stay on legacy. A singleton
-    // group, and horizontal-tb items (orthogonal to that axis), fall back
-    // to the start margin edge (`Pack::Start`).
-    {
-        use w3cos_std::style::WritingMode;
-        let mut typographic_cols: Vec<usize> = built
-            .iter()
-            .filter(|item| {
-                let child_style = flat[item.index].style;
-                is_baseline(used_item_align(
-                    style.justify_items,
-                    child_style.justify_self,
-                )) && child_style.writing_mode != WritingMode::HorizontalTb
-            })
-            .map(|item| item.col)
-            .collect();
-        typographic_cols.sort_unstable();
-        if typographic_cols.windows(2).any(|pair| pair[0] == pair[1]) {
-            return super::bail("grid:baseline");
-        }
     }
 
     let _subgrid_publish = publish_subgrid(
@@ -6071,6 +6209,36 @@ fn layout_impl(
     let (row_lead, row_between) = pack_gap(row_pack(style), row_free, active_rows, row_gap_u);
     let row_y = positions(&rows, &row_collapsed, row_between, row_lead);
 
+    // Column baseline-sharing groups, keyed by column, first/last, and
+    // under-edge direction (vertical-lr vs vertical-rl). The group's
+    // extent already fed column sizing; the shift lines each item up.
+    let mut col_baseline_extents: Vec<(usize, i64, i64, bool)> = Vec::new();
+    for (built_index, item) in built.iter().enumerate() {
+        let Some(last) = item.col_baseline else {
+            continue;
+        };
+        let child_style = flat[item.index].style;
+        let margin_box =
+            units(fragments[built_index].fragment.width) + item.margin_u[3] + item.margin_u[1];
+        let (ascent, descent, under_right) =
+            col_baseline_ascent_descent(style, child_style, space, margin_box, last);
+        col_baseline_extents.push((built_index, ascent, descent, under_right));
+    }
+    let mut col_groups: Vec<(usize, bool, bool, i64, i64)> = Vec::new();
+    for &(item_index, ascent, descent, under_right) in &col_baseline_extents {
+        let item = &built[item_index];
+        let last = item.col_baseline == Some(true);
+        if let Some(group) = col_groups
+            .iter_mut()
+            .find(|(c, k, u, _, _)| *c == item.col && *k == last && *u == under_right)
+        {
+            group.3 = group.3.max(ascent);
+            group.4 = group.4.max(descent);
+        } else {
+            col_groups.push((item.col, last, under_right, ascent, descent));
+        }
+    }
+
     let origin_x = units(bl + pl);
     let origin_y = units(bt + pt);
     let rtl = style.direction == TextDirection::Rtl;
@@ -6130,6 +6298,34 @@ fn layout_impl(
             item.block_pack,
         );
         let mut x = from_units(origin_x + column_x[item.col] + ml + inline_offset);
+        let col_baseline_shift = match item.col_baseline {
+            None => 0,
+            Some(last) => {
+                let (ascent, _) = col_baseline_extents
+                    .iter()
+                    .find(|(i, _, _, _)| *i == index)
+                    .map(|(_, a, d, _)| (*a, *d))
+                    .unwrap_or((0, 0));
+                let group = col_groups
+                    .iter()
+                    .find(|(c, k, u, _, _)| {
+                        *c == item.col
+                            && *k == last
+                            && col_baseline_extents
+                                .iter()
+                                .find(|(i, _, _, _)| *i == index)
+                                .is_some_and(|(_, _, _, ur)| ur == u)
+                    })
+                    .map(|(_, _, _, a, d)| (*a, *d))
+                    .unwrap_or((0, 0));
+                if last {
+                    area - group.1 - ascent
+                } else {
+                    group.0 - ascent
+                }
+            }
+        };
+        x += from_units(col_baseline_shift);
         let baseline_shift = match item.baseline {
             None => 0,
             Some(last) => {

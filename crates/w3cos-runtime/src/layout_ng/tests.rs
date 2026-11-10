@@ -12535,6 +12535,293 @@ fn orthogonal_grid_item_synthesizes_under_border_edge_with_text() {
     assert_eq!(rect(&out, 4), (50.0, 0.0, 50.0, 30.0));
 }
 
+/// Two vertical-lr Ahem items in one column share a typographic
+/// `justify-items: baseline` group. Font-size 20 and 10 have descents
+/// 4 and 2, so the smaller box shifts 2px right and the auto column
+/// is the larger item's width.
+#[test]
+fn typographic_column_baseline_groups_with_text() {
+    use w3cos_std::style::{AlignItems, CustomProperties, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = |size: f32| Style {
+        font_family: Some("Ahem".into()),
+        font_size: size,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        writing_mode: WritingMode::VerticalLr,
+        ..block()
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        height: Dimension::Px(80.0),
+        justify_items: AlignItems::Baseline,
+        align_items: AlignItems::FlexStart,
+        grid_template_columns: Some("auto".to_string()),
+        gap: 0.0,
+        ..block()
+    };
+    grid.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-width-keyword".to_string(),
+        "max-content".to_string(),
+    )]));
+    grid.grid_ng_mut().grid_template_rows = Some("40px 40px".to_string());
+    let item = |size: f32| {
+        let style = font(size);
+        node(style.clone(), vec![Component::text("X", style)])
+    };
+    let root = node(block(), vec![node(grid, vec![item(20.0), item(10.0)])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 20.0, 80.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 20.0, 20.0));
+    assert_eq!(rect(&out, 4), (2.0, 40.0, 10.0, 10.0));
+}
+
+/// A typographic vertical-lr item and an orthogonal horizontal-tb item
+/// share one column group (assumed vertical-lr in an ltr grid). Extra
+/// padding-left on the typographic item and padding-right on the
+/// synthesized item distinguish typographic (bl+pl+descent) from a
+/// synthesized under-left (0) or under-right (width) baseline.
+#[test]
+fn mixed_column_baseline_synthesizes_under_left_with_text() {
+    use w3cos_std::style::{AlignItems, CustomProperties, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let ahem = |size: f32, mode: WritingMode, pad_l: f32, pad_r: f32| {
+        let font = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            ..block()
+        };
+        let wrap = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(pad_r),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Px(pad_l),
+            },
+            ..block()
+        };
+        node(
+            wrap,
+            vec![node(font.clone(), vec![Component::text("X", font)])],
+        )
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        height: Dimension::Px(80.0),
+        justify_items: AlignItems::Baseline,
+        align_items: AlignItems::FlexStart,
+        grid_template_columns: Some("auto".to_string()),
+        gap: 0.0,
+        ..block()
+    };
+    grid.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-width-keyword".to_string(),
+        "max-content".to_string(),
+    )]));
+    grid.grid_ng_mut().grid_template_rows = Some("40px 40px".to_string());
+    let root = node(
+        block(),
+        vec![node(
+            grid,
+            vec![
+                ahem(20.0, WritingMode::HorizontalTb, 0.0, 15.0),
+                ahem(20.0, WritingMode::VerticalLr, 8.0, 0.0),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    // VLR typo ascent = 8+4 = 12; HTB synthesized under-left ascent = 0,
+    // margin-box 35; group extent 12+35 = 47. HTB shifts 12px right.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 47.0, 80.0));
+    assert_eq!(rect(&out, 2), (12.0, 0.0, 35.0, 20.0));
+    assert_eq!(rect(&out, 5), (0.0, 40.0, 28.0, 20.0));
+}
+
+/// Vertical-rl typographic items do not share a group with horizontal-tb
+/// items (opposite block-flow / assumed vertical-lr). The column is the
+/// max of the two group extents, and the HTB item stays at start.
+#[test]
+fn vertical_rl_column_baseline_does_not_share_with_horizontal_items() {
+    use w3cos_std::style::{AlignItems, CustomProperties, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let ahem = |size: f32, mode: WritingMode, pad_r: f32| {
+        let font = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            ..block()
+        };
+        let wrap = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(pad_r),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Px(0.0),
+            },
+            ..block()
+        };
+        node(
+            wrap,
+            vec![node(font.clone(), vec![Component::text("X", font)])],
+        )
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        height: Dimension::Px(120.0),
+        justify_items: AlignItems::Baseline,
+        align_items: AlignItems::FlexStart,
+        grid_template_columns: Some("auto".to_string()),
+        gap: 0.0,
+        ..block()
+    };
+    grid.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-width-keyword".to_string(),
+        "max-content".to_string(),
+    )]));
+    grid.grid_ng_mut().grid_template_rows = Some("40px 40px 40px".to_string());
+    let root = node(
+        block(),
+        vec![node(
+            grid,
+            vec![
+                ahem(20.0, WritingMode::HorizontalTb, 10.0),
+                ahem(20.0, WritingMode::VerticalRl, 0.0),
+                ahem(10.0, WritingMode::VerticalRl, 0.0),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    // HTB group extent 30; VRL typographic group extent 20. Column 30.
+    // VRL 10px item shifts 2px right inside its own group; HTB stays at 0.
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 30.0, 120.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 30.0, 20.0));
+    assert_eq!(rect(&out, 5), (0.0, 40.0, 20.0, 20.0));
+    assert_eq!(rect(&out, 8), (2.0, 80.0, 10.0, 10.0));
+}
+
+/// The typographic x-baseline uses the item's resolved face metrics
+/// (alphabetic descent), not an Ahem 0.2em constant. Noto Serif's
+/// descent at 40px is well above 8px, so a hardcoded 0.2em would
+/// place the synthesized HTB item at the wrong x.
+#[cfg(feature = "skia")]
+#[test]
+fn typographic_column_baseline_uses_resolved_face_metrics() {
+    use w3cos_std::style::{AlignItems, CustomProperties, WritingMode};
+    const OWNER: u64 = 0x10c0_105e_71f0;
+    const FAMILY: &str = "W3COS Test NotoSerif";
+    let bytes = include_bytes!("../../assets/test-fonts/NotoSerif-Regular.ttf");
+    crate::font_face::FontRegistry::global()
+        .register_for_owner(
+            OWNER,
+            crate::font_face::FontFace {
+                family: FAMILY.into(),
+                src: crate::font_face::FontSource::Bytes(bytes.to_vec()),
+                ..Default::default()
+            },
+        )
+        .expect("register NotoSerif");
+    let font_style = || Style {
+        font_family: Some(FAMILY.into()),
+        font_size: 40.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let metrics =
+        crate::render_skia::resolved_font_geometry(&font_style()).expect("NotoSerif metrics");
+    // Must not be the Ahem 0.2em split; otherwise this test cannot
+    // distinguish real face metrics from a hardcoded constant.
+    assert!(
+        (metrics.descent - 8.0).abs() > 1.0,
+        "NotoSerif descent at 40px should differ from Ahem 0.2em (8px), got {}",
+        metrics.descent
+    );
+    let item = |mode: WritingMode, pad_l: f32, content_w: f32| {
+        let font = Style {
+            writing_mode: mode,
+            ..font_style()
+        };
+        let wrap = Style {
+            font_family: Some(FAMILY.into()),
+            font_size: 40.0,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            width: Dimension::Px(content_w),
+            height: Dimension::Px(40.0),
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Px(pad_l),
+            },
+            ..block()
+        };
+        node(
+            wrap,
+            vec![node(font.clone(), vec![Component::text("X", font)])],
+        )
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        height: Dimension::Px(100.0),
+        justify_items: AlignItems::Baseline,
+        align_items: AlignItems::FlexStart,
+        grid_template_columns: Some("auto".to_string()),
+        gap: 0.0,
+        ..block()
+    };
+    grid.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-width-keyword".to_string(),
+        "max-content".to_string(),
+    )]));
+    grid.grid_ng_mut().grid_template_rows = Some("50px 50px".to_string());
+    let root = node(
+        block(),
+        vec![node(
+            grid,
+            vec![
+                item(WritingMode::HorizontalTb, 0.0, 50.0),
+                item(WritingMode::VerticalLr, 10.0, 40.0),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    crate::font_face::FontRegistry::global().clear_owner(OWNER);
+    // Content-box width: HTB 50, VLR 40+10 padding = 50 border box.
+    // VLR typographic ascent = 10 + face descent; HTB synthesizes under-left (0).
+    let to_px = |v: f32| (v * 64.0).trunc() as i64 as f32 / 64.0;
+    let typo = to_px(10.0 + metrics.descent);
+    let extent = typo + 50.0;
+    let shift = typo;
+    assert_eq!(rect(&out, 1), (0.0, 0.0, extent, 100.0));
+    assert_eq!(rect(&out, 2), (shift, 0.0, 50.0, 40.0));
+    assert_eq!(rect(&out, 5), (0.0, 50.0, 50.0, 40.0));
+}
+
 /// An absolutely positioned `display: inline` box in a block container
 /// whose children are all block-level: its static position is where a
 /// zero-width inline would sit on a line at the current block offset,
