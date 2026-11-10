@@ -1055,7 +1055,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                     is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
                 }) =>
         {
-// Source newlines between the image and the definite box of a
+            // Source newlines between the image and the definite box of a
             // min-content replaced grid are not items (CSS Grid §4.1).
             // They must not send that slice back to legacy.
             if content.chars().all(char::is_whitespace)
@@ -3337,7 +3337,10 @@ pub(super) fn intrinsic_sizes_at(
         return super::grid::min_max(flat, index, space);
     }
     if let ComponentKind::Text { content } = info.kind {
-        return Some(inline::text_min_max(content, info.style));
+        return Some(inline::text_min_max(
+            content,
+            &inline::block_text_measure_style(info.style),
+        ));
     }
     if let ComponentKind::Image { src } = info.kind {
         let (width, _) = replaced_content_size(src, info.style, space).why("image-intrinsic")?;

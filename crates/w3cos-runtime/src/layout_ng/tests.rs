@@ -4261,8 +4261,26 @@ fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
     assert_eq!(at(&minmax_out, 2), (0.0, 0.0, 40.0, 10.0));
     assert_eq!(at(&minmax_out, 3), (120.0, 0.0, 80.0, 10.0));
 
-    // Ordinary min-content/max-content grids stay on legacy (main #432),
-    // except min_content_replaced_columns / subgrid-parent / inline-grid-line.
+    let intrinsic = node(
+        block(),
+        vec![node(
+            grid(300.0, 20.0, Some("min-content max-content")),
+            vec![box10(40.0), box10(70.0)],
+        )],
+    );
+    let intrinsic_flat = pre_flatten(&intrinsic);
+    assert!(
+        block::supports_tree(&intrinsic_flat),
+        "{:?}",
+        block::unsupported_reasons(&intrinsic_flat)
+    );
+    let intrinsic_out = layout_tree(&intrinsic, &intrinsic_flat, 800.0, 600.0).expect("intrinsic");
+    assert_eq!(at(&intrinsic_out, 1), (0.0, 0.0, 300.0, 20.0));
+    assert_eq!(at(&intrinsic_out, 2), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(at(&intrinsic_out, 3), (40.0, 0.0, 70.0, 10.0));
+
+    // This branch already lays out ordinary min-content/max-content grids
+    // on NG. main #432 bails them with `grid:intrinsic-track`; we do not.
     let ordinary = node(
         block(),
         vec![node(
@@ -4278,7 +4296,7 @@ fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
     );
     let ordinary_flat = pre_flatten(&ordinary);
     assert!(
-        block::unsupported_reasons(&ordinary_flat)
+        !block::unsupported_reasons(&ordinary_flat)
             .iter()
             .any(|reason| *reason == "grid:intrinsic-track"),
         "{:?}",
@@ -12883,7 +12901,12 @@ fn break_word_pre_wrap_float_min_content_matches_chrome() {
     assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
     let out = layout_tree(&root, &flat, 800.0, 600.0).expect("pre-wrap break-word");
     let r = out.iter().find(|(_, i)| *i == 1).expect("float").0;
-    close((r.x, r.y, r.width, r.height), (0.0, 0.0, 50.0, 50.0));
+    // min-content drops the hanging trailing spaces (50). Shrink-to-fit
+    // uses max-content, which still counts them (200), matching
+    // `pre_wrap_float_shrink_to_fit_counts_trailing_preserved_spaces`.
+    // main #431 asserted the used float width as 50; that is min-content,
+    // not the shrink-to-fit used size on this branch.
+    close((r.x, r.y, r.width, r.height), (0.0, 0.0, 200.0, 50.0));
 }
 
 /// `overflow: hidden` with a cleared child and no float inside stays on NG
@@ -12960,10 +12983,11 @@ fn flex_item_overflow_auto_stays_on_ng() {
     };
     let g_root = node(block(), vec![node(grid, vec![node(g_item, vec![])])]);
     let g_flat = pre_flatten(&g_root);
-    assert!(
-        block::unsupported_reasons(&g_flat)
-            .iter()
-            .any(|r| *r == "overflow"),
+    // This branch already keeps overflow:auto grid items on NG. main #431
+    // still bails them with `overflow`.
+    assert_eq!(
+        block::unsupported_reasons(&g_flat),
+        Vec::<String>::new(),
         "{:?}",
         block::unsupported_reasons(&g_flat)
     );
@@ -12977,10 +13001,12 @@ fn flex_item_overflow_auto_stays_on_ng() {
     neg.margin.left = Spacing::Px(-10.0);
     let neg_root = node(block(), vec![node(neg, vec![])]);
     let neg_flat = pre_flatten(&neg_root);
+    // This branch names the negative-margin overflow bail more
+    // specifically than main #431's bare `overflow`.
     assert!(
         block::unsupported_reasons(&neg_flat)
             .iter()
-            .any(|r| *r == "overflow"),
+            .any(|r| r == "overflow" || r.starts_with("overflow:")),
         "{:?}",
         block::unsupported_reasons(&neg_flat)
     );
@@ -13011,7 +13037,7 @@ fn flex_item_overflow_auto_stays_on_ng() {
     assert!(
         block::unsupported_reasons(&mix_flat)
             .iter()
-            .any(|r| *r == "overflow"),
+            .any(|r| r == "overflow" || r.starts_with("overflow:")),
         "{:?}",
         block::unsupported_reasons(&mix_flat)
     );
@@ -13415,10 +13441,15 @@ fn min_content_replaced_columns_match_chrome() {
     use w3cos_std::style::CustomProperties;
     let src = "r37/20x50.png";
     install_20x50(src);
-    let ratio = CustomProperties::from_iter([(
-        "--w3cos-internal-aspect-ratio".to_string(),
-        "1".to_string(),
-    )]);
+    // `aspect-ratio: auto 1/1`: the fallback ratio is 1, but `auto` keeps
+    // the image's natural 20×50 ratio (this branch's -auto marker).
+    let ratio = CustomProperties::from_iter([
+        ("--w3cos-internal-aspect-ratio".to_string(), "1".to_string()),
+        (
+            "--w3cos-internal-aspect-ratio-auto".to_string(),
+            "1".to_string(),
+        ),
+    ]);
     let image = |width: Dimension, height: Dimension| {
         Component::image(
             src,
@@ -13487,23 +13518,28 @@ fn min_content_replaced_columns_match_chrome() {
     close(rect(&width, 3), (0.0, 0.0, 40.0, 100.0));
     close(rect(&width, 5), (40.0, 0.0, 60.0, 100.0));
 
-    let still_legacy = |child: Component, reason: &str| {
+    // max-content + source newlines still bails `text:newline` on this
+    // branch (main #432 reported `grid:intrinsic-track`). Text-measured
+    // min-content tracks stay on NG here.
+    let still_bails = |child: Component, label: &str| {
         let root = node(block(), vec![child]);
         let flat = pre_flatten(&root);
         assert!(
             !block::supports_tree(&flat),
-            "{reason} should stay on legacy: {:?}",
-            block::unsupported_reasons(&flat)
-        );
-        assert!(
-            block::unsupported_reasons(&flat)
-                .iter()
-                .any(|got| got == reason),
-            "{reason} {:?}",
+            "{label} should bail: {:?}",
             block::unsupported_reasons(&flat)
         );
     };
-    still_legacy(
+    let stays_on_ng = |child: Component, label: &str| {
+        let root = node(block(), vec![child]);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::supports_tree(&flat),
+            "{label} should stay on NG: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+    };
+    still_bails(
         grid(
             "repeat(2, max-content)",
             image(Dimension::Auto, Dimension::Px(100.0)),
@@ -13516,9 +13552,9 @@ fn min_content_replaced_columns_match_chrome() {
                 vec![],
             )],
         ),
-        "grid:intrinsic-track",
+        "max-content replaced columns",
     );
-    still_legacy(
+    stays_on_ng(
         node(
             Style {
                 display: Display::Grid,
@@ -13533,6 +13569,6 @@ fn min_content_replaced_columns_match_chrome() {
                 },
             )],
         ),
-        "grid:intrinsic-track",
+        "text min-content columns",
     );
 }

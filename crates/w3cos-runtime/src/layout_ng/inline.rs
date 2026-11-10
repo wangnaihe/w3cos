@@ -35,8 +35,8 @@ use crate::layout::{
 };
 use w3cos_std::ComponentKind;
 use w3cos_std::style::{
-    Dimension, Display, Float, LineBreak, Position, Style, TextAlign, TextDirection, WhiteSpace,
-    WordBreak,
+    Dimension, Display, Edges, Float, LineBreak, Position, Style, TextAlign, TextDirection,
+    WhiteSpace, WordBreak,
 };
 
 const EPSILON: f32 = 1.0 / 128.0;
@@ -2143,9 +2143,27 @@ fn has_forced_break(content: &str, style: &Style) -> bool {
             ))
 }
 
+/// The style a block text leaf's lines are measured with. The legacy text
+/// measurers inset a text component by its own padding; on NG the leaf's
+/// padding is a block box edge that block layout already applied (main #399).
+pub(super) fn block_text_measure_style(style: &Style) -> std::borrow::Cow<'_, Style> {
+    let padding = style.padding_lengths();
+    if [padding.top, padding.right, padding.bottom, padding.left]
+        .into_iter()
+        .all(|v| v == 0.0)
+    {
+        return std::borrow::Cow::Borrowed(style);
+    }
+    std::borrow::Cow::Owned(Style {
+        padding: Edges::ZERO,
+        ..style.clone()
+    })
+}
+
 /// Content height of a block-level text leaf of content width `width`.
 /// Content height and last baseline of a block-level text leaf.
 pub(super) fn block_text_layout(content: &str, width: f32, style: &Style) -> (f32, LastBaseline) {
+    let style = &*block_text_measure_style(style);
     let (height, single, ascent) = paragraph_height(content, width, style, style, false);
     (
         height,

@@ -480,15 +480,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // on ordinary grids. A parent of a subgrid is the exception: the
     // subgrid items size those tracks. A top-level inline-grid with a
     // definite border box is the other: those tracks are the line box.
-    // A third: `min-content` columns whose items are one replaced image
-    // (intrinsic-ratio transfer) and definite px boxes
-    // (`min_content_replaced_columns`) — main #432.
-    if intrinsic_tracks_without_subgrid(flat, index)
-        && !super::block::is_inline_grid_line(flat, index)
-        && !min_content_replaced_columns(flat, index)
-    {
-        return Some("grid:intrinsic-track");
-    }
+    // This branch already lays out ordinary min-content/max-content tracks
+    // on NG (lanes, spanners, ratio-scroll items). main #432 keeps those
+    // on `grid:intrinsic-track` except `min_content_replaced_columns`;
+    // we keep the helper for whitespace-skip / ratio transfer, but do
+    // not re-bail the broader surface.
     let real_lanes =
         has_marker(style, "--w3cos-internal-grid-lanes") && lanes::eligible(flat, index);
     if has_marker(style, "--w3cos-internal-grid-lanes")
