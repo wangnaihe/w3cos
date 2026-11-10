@@ -9,8 +9,14 @@
 //! A row aligns baseline items per line by their first baseline, or the
 //! synthesized border-box under edge (FlexLayoutAlgorithm::BaselineAscent),
 //! measured from the cross end under `wrap-reverse` (the minor group).
-//! Column baseline groups and items whose subtree NG reports no baseline
-//! for stay on legacy (`flex:baseline-column`, `flex:baseline-nested`).
+//! A column in a horizontal-tb container aligns baseline items on the
+//! cross (inline) axis with the same typographic / synthesized groups as
+//! grid `justify-*: baseline` (CSS Align 3 §9.1 / §9.3; Blink
+//! `FlexLayoutAlgorithm::BaselineAscent`). Vertical-rl / sideways-rl
+//! items form the minor group and pack from the cross end. Vertical
+//! containers stay on legacy (`flex:baseline-column`). Items whose
+//! subtree NG reports no baseline for in a row stay on legacy
+//! (`flex:baseline-nested`).
 //! `wrap-reverse` swaps the cross-start (Flexbox §5.2) and packs lines
 //! from that edge. Column wrap breaks lines against a definite block size,
 //! a `max-height`, or an `aspect-ratio` transferred from a definite width.
@@ -270,8 +276,14 @@ fn clamp_scroll_baseline(style: &Style, baseline: LastBaseline, height: f32) -> 
 
 fn baseline_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
+    // Column baseline groups are implemented for a horizontal-tb
+    // container (cross axis = inline). A vertical container stays on
+    // legacy. Row items still need an exported first baseline.
     if !row_axis(style.flex_direction) {
-        return Some("flex:baseline-column");
+        if style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb {
+            return Some("flex:baseline-column");
+        }
+        return None;
     }
     for child in rendered_children(flat, index) {
         if baseline_participant(style.align_items, flat[child].style.align_self)
@@ -293,6 +305,48 @@ fn baseline_ascent(item: &Item, laid: &LayoutResult) -> Option<f32> {
         LastBaseline::Unknown => return None,
     };
     Some(item.margin_cross_start + baseline)
+}
+
+/// Cross-axis `BaselineAscent` for a column item in a horizontal-tb
+/// container. Returns `(ascent, minor)`. The typographic first baseline
+/// is measured from the border-box left (face descent); a horizontal-tb
+/// item synthesizes from the under edge of the assumed vertical writing
+/// mode. Wrap-reverse xor last-baseline flips the offset inside the box
+/// (Blink `BaselineAscent`). Opposite block-flow (vertical-rl) is the
+/// minor group and uses the cross-end margin.
+fn column_baseline_ascent(
+    container: &Style,
+    child: &Style,
+    space: &ConstraintSpace,
+    item: &Item,
+    border_cross: f32,
+    last: bool,
+    wrap_reverse: bool,
+) -> (f32, bool) {
+    let under_right = super::grid::col_baseline_under_right(container, child);
+    let mut offset = if super::grid::typographic_inline_baseline(child) {
+        super::grid::typographic_col_first_from_border_left(child, space)
+    } else {
+        super::grid::synthesized_col_baseline(last, border_cross, under_right)
+    };
+    if wrap_reverse != last {
+        offset = border_cross - offset;
+    }
+    let minor = under_right != (wrap_reverse != last);
+    let ascent = if minor {
+        item.margin_cross_end + offset
+    } else {
+        item.margin_cross_start + offset
+    };
+    (ascent, minor)
+}
+
+fn flex_cross_border(row: bool, laid: &LayoutResult) -> f32 {
+    if row {
+        laid.fragment.height
+    } else {
+        laid.fragment.width
+    }
 }
 
 fn subtree_has_float(flat: &[FlatNodeInfo], index: usize) -> bool {
@@ -2719,7 +2773,8 @@ fn layout_with(
             auto_cross_start,
             auto_cross_end,
             align: item_align_with_last(style, child_style, auto_cross_start || auto_cross_end),
-            last_baseline: row
+            last_baseline: (row
+                || style.writing_mode == w3cos_std::style::WritingMode::HorizontalTb)
                 && !auto_cross_start
                 && !auto_cross_end
                 && last_baseline_item(style, child_style),
@@ -2813,15 +2868,16 @@ fn layout_with(
     // Baseline participants (FlexLayoutAlgorithm::BuildFlexLines): the
     // line's baseline size is the largest ascent plus the largest descent,
     // unless the single line has a definite cross size.
+    let wrap_reverse = style.flex_wrap == FlexWrap::WrapReverse;
     let mut ascents = vec![None; items.len()];
+    let mut minors = vec![false; items.len()];
     let mut max_ascent = None::<f32>;
     let mut max_descent = 0.0_f32;
-    for (slot, item) in ascents.iter_mut().zip(&items) {
+    let mut max_minor_ascent = None::<f32>;
+    let mut max_minor_descent = 0.0_f32;
+    for (index, (slot, item)) in ascents.iter_mut().zip(&items).enumerate() {
         if item.align != AlignItems::Baseline {
             continue;
-        }
-        if !row {
-            return super::bail("flex:baseline-column");
         }
         let laid = layout_item_basis(
             flat,
@@ -2829,18 +2885,42 @@ fn layout_with(
             space,
             inner_width,
             specified_height,
-            true,
+            row,
             Some(item.content),
             item.cross,
             !(item.cross_auto && item.align != AlignItems::Stretch),
         )?;
-        let ascent = baseline_ascent(item, &laid).why("flex:baseline-unknown")?;
-        let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
+        let border_cross = flex_cross_border(row, &laid);
+        let margin_box = border_cross + item.margin_cross_start + item.margin_cross_end;
+        let (ascent, minor) = if row {
+            (
+                baseline_ascent(item, &laid).why("flex:baseline-unknown")?,
+                false,
+            )
+        } else {
+            column_baseline_ascent(
+                style,
+                flat[item.index].style,
+                space,
+                item,
+                border_cross,
+                false,
+                wrap_reverse,
+            )
+        };
         *slot = Some(ascent);
-        max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
-        max_descent = max_descent.max(margin_box - ascent);
+        if minor {
+            minors[index] = true;
+            max_minor_ascent = Some(max_minor_ascent.map_or(ascent, |max| max.max(ascent)));
+            max_minor_descent = max_minor_descent.max(margin_box - ascent);
+        } else {
+            max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
+            max_descent = max_descent.max(margin_box - ascent);
+        }
     }
-    let baseline_extent = max_ascent.map_or(0.0, |ascent| ascent + max_descent);
+    let baseline_extent = max_ascent
+        .map_or(0.0, |ascent| ascent + max_descent)
+        .max(max_minor_ascent.map_or(0.0, |ascent| ascent + max_minor_descent));
     // The last-baseline group: its largest ascent plus largest descent
     // also sizes the line, and the group sits flush with the cross end.
     let mut last_ascents = vec![None::<f32>; items.len()];
@@ -2856,18 +2936,37 @@ fn layout_with(
             space,
             inner_width,
             specified_height,
-            true,
+            row,
             Some(item.content),
             item.cross,
             !(item.cross_auto && item.align != AlignItems::Stretch),
         )?;
-        let baseline = match laid.last_baseline {
-            LastBaseline::At(baseline) => baseline,
-            LastBaseline::NoLines => laid.fragment.height,
-            LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+        let border_cross = flex_cross_border(row, &laid);
+        let (ascent, margin_box) = if row {
+            let baseline = match laid.last_baseline {
+                LastBaseline::At(baseline) => baseline,
+                LastBaseline::NoLines => laid.fragment.height,
+                LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+            };
+            (
+                item.margin_cross_start + baseline,
+                border_cross + item.margin_cross_start + item.margin_cross_end,
+            )
+        } else {
+            let (ascent, _) = column_baseline_ascent(
+                style,
+                flat[item.index].style,
+                space,
+                item,
+                border_cross,
+                true,
+                wrap_reverse,
+            );
+            (
+                ascent,
+                border_cross + item.margin_cross_start + item.margin_cross_end,
+            )
         };
-        let ascent = item.margin_cross_start + baseline;
-        let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
         *slot = Some(ascent);
         max_last_ascent = Some(max_last_ascent.map_or(ascent, |max| max.max(ascent)));
         max_last_descent = max_last_descent.max(margin_box - ascent);
@@ -2963,8 +3062,12 @@ fn layout_with(
     let mut inline_flex_baseline = LastBaseline::NoLines;
     let first_item_baseline = style.display == Display::InlineFlex && !reverse && !reverse_cross;
     let mut item_position = 0usize;
-    for (((item, laid), ascent), last_ascent) in
-        items.iter().zip(fragments).zip(&ascents).zip(&last_ascents)
+    for ((((item, laid), ascent), last_ascent), minor) in items
+        .iter()
+        .zip(fragments)
+        .zip(&ascents)
+        .zip(&last_ascents)
+        .zip(&minors)
     {
         let border_main = item.content + item.main_edges;
         let main = if reverse {
@@ -2984,14 +3087,23 @@ fn layout_with(
             (_, Some(last)) => line_inner - max_last_descent - last,
             (AlignItems::FlexEnd, _) => extra,
             (AlignItems::Center, _) => extra / 2.0,
+            (AlignItems::Baseline, _) if *minor => {
+                extra - (max_minor_ascent.unwrap_or(0.0) - ascent.unwrap_or(item.margin_cross_end))
+            }
             (AlignItems::Baseline, _) => {
                 max_ascent.unwrap_or(0.0) - ascent.unwrap_or(item.margin_cross_start)
             }
             (AlignItems::Stretch | AlignItems::FlexStart, _) => 0.0,
         };
-        let cross = if reverse_cross {
+        // Blink places baseline items with `line + offset + CrossStart`
+        // after flipping the group (`is_flipped` = wrap-reverse). The
+        // `reverse_cross` mirror is only for non-baseline alignment.
+        let baseline_item = item.align == AlignItems::Baseline || last_ascent.is_some();
+        let cross = if reverse_cross && !(!row && baseline_item) {
             let border_cross = item.cross.unwrap_or(0.0) + item.cross_edges;
             line_origin + line_inner - from_start - margin_cross_start - border_cross
+        } else if reverse_cross && !row && baseline_item {
+            line_origin + from_start + margin_cross_start
         } else {
             margin_cross_start + from_start
         };
@@ -3299,10 +3411,11 @@ fn layout_wrapped(
 ) -> Option<LayoutResult> {
     let direction = style.flex_direction;
     let row = row_axis(direction);
-    // Column baseline groups stay on legacy. `container_reason` already
-    // rejects them; this keeps a later caller from painting those items
-    // at the cross start.
-    if !row && items.iter().any(|item| item.align == AlignItems::Baseline) {
+    // Vertical-container column baseline groups stay on legacy.
+    if !row
+        && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb
+        && items.iter().any(|item| item.align == AlignItems::Baseline)
+    {
         return super::bail("flex:baseline-column");
     }
     let reverse = reverse_axis(direction);
@@ -3352,7 +3465,9 @@ fn layout_wrapped(
     // with is_flipped): BaselineAscent measures from the cross end, which is
     // where `margin_cross_start` already sits here.
     let mut ascents = vec![None::<f32>; items.len()];
+    let mut minors = vec![false; items.len()];
     let mut line_ascent = vec![None::<f32>; lines.len()];
+    let mut line_minor_ascent = vec![None::<f32>; lines.len()];
     let mut last_ascents = vec![None::<f32>; items.len()];
     let mut line_last_descent = vec![0.0_f32; lines.len()];
     let mut line_cross: Vec<f32> = Vec::with_capacity(lines.len());
@@ -3360,6 +3475,8 @@ fn layout_wrapped(
         let mut size = 0.0_f32;
         let mut max_ascent = None::<f32>;
         let mut max_descent = 0.0_f32;
+        let mut max_minor_ascent = None::<f32>;
+        let mut max_minor_descent = 0.0_f32;
         let mut max_last_ascent = None::<f32>;
         let mut max_last_descent = 0.0_f32;
         for (offset, item) in items[start..end].iter().enumerate() {
@@ -3371,19 +3488,37 @@ fn layout_wrapped(
                     space,
                     inner_width,
                     specified_height,
-                    true,
+                    row,
                     Some(item.content),
                     item.cross,
                     !(item.cross_auto && item.align != AlignItems::Stretch),
                 )?;
-                let baseline = match laid.last_baseline {
-                    LastBaseline::At(baseline) => baseline,
-                    LastBaseline::NoLines => laid.fragment.height,
-                    LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+                let border_cross = flex_cross_border(row, &laid);
+                let (ascent, margin_box) = if row {
+                    let baseline = match laid.last_baseline {
+                        LastBaseline::At(baseline) => baseline,
+                        LastBaseline::NoLines => laid.fragment.height,
+                        LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+                    };
+                    (
+                        item.margin_cross_start + baseline,
+                        border_cross + item.margin_cross_start + item.margin_cross_end,
+                    )
+                } else {
+                    let (ascent, _) = column_baseline_ascent(
+                        style,
+                        flat[item.index].style,
+                        space,
+                        item,
+                        border_cross,
+                        true,
+                        wrap_reverse,
+                    );
+                    (
+                        ascent,
+                        border_cross + item.margin_cross_start + item.margin_cross_end,
+                    )
                 };
-                let ascent = item.margin_cross_start + baseline;
-                let margin_box =
-                    laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
                 last_ascents[start + offset] = Some(ascent);
                 max_last_ascent = Some(max_last_ascent.map_or(ascent, |max| max.max(ascent)));
                 max_last_descent = max_last_descent.max(margin_box - ascent);
@@ -3398,34 +3533,57 @@ fn layout_wrapped(
                 space,
                 inner_width,
                 specified_height,
-                true,
+                row,
                 Some(item.content),
                 item.cross,
                 !(item.cross_auto && item.align != AlignItems::Stretch),
             )?;
-            let baseline = match laid.first_baseline {
-                LastBaseline::At(baseline) => baseline,
-                LastBaseline::NoLines => laid.fragment.height,
-                LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
-            };
-            let from_cross_start = if wrap_reverse {
-                laid.fragment.height - baseline
+            let border_cross = flex_cross_border(row, &laid);
+            let margin_box = border_cross + item.margin_cross_start + item.margin_cross_end;
+            let (ascent, minor) = if row {
+                let baseline = match laid.first_baseline {
+                    LastBaseline::At(baseline) => baseline,
+                    LastBaseline::NoLines => laid.fragment.height,
+                    LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
+                };
+                let from_cross_start = if wrap_reverse {
+                    border_cross - baseline
+                } else {
+                    baseline
+                };
+                (item.margin_cross_start + from_cross_start, false)
             } else {
-                baseline
+                column_baseline_ascent(
+                    style,
+                    flat[item.index].style,
+                    space,
+                    item,
+                    border_cross,
+                    false,
+                    wrap_reverse,
+                )
             };
-            let ascent = item.margin_cross_start + from_cross_start;
-            let margin_box = laid.fragment.height + item.margin_cross_start + item.margin_cross_end;
             ascents[start + offset] = Some(ascent);
-            max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
-            max_descent = max_descent.max(margin_box - ascent);
+            if minor {
+                minors[start + offset] = true;
+                max_minor_ascent = Some(max_minor_ascent.map_or(ascent, |max| max.max(ascent)));
+                max_minor_descent = max_minor_descent.max(margin_box - ascent);
+            } else {
+                max_ascent = Some(max_ascent.map_or(ascent, |max| max.max(ascent)));
+                max_descent = max_descent.max(margin_box - ascent);
+            }
         }
         if let Some(ascent) = max_ascent {
             size = size.max(ascent + max_descent);
+        }
+        if let Some(ascent) = max_minor_ascent {
+            size = size.max(ascent + max_minor_descent);
         }
         if let Some(ascent) = max_last_ascent {
             size = size.max(ascent + max_last_descent);
         }
         line_ascent[line_index] = max_ascent;
+        line_minor_ascent[line_index] = max_minor_ascent;
         line_last_descent[line_index] = max_last_descent;
         line_cross.push(size);
     }
@@ -3589,6 +3747,12 @@ fn layout_wrapped(
                 (_, Some(last)) => line_size - line_last_descent[line_index] - last,
                 (AlignItems::FlexEnd, _) => extra,
                 (AlignItems::Center, _) => extra / 2.0,
+                (AlignItems::Baseline, _) if minors[start + offset] => {
+                    match (line_minor_ascent[line_index], ascent) {
+                        (Some(max), Some(ascent)) => extra - (max - ascent),
+                        _ => extra,
+                    }
+                }
                 (AlignItems::Baseline, _) => match (line_ascent[line_index], ascent) {
                     (Some(max), Some(ascent)) => max - ascent,
                     _ => 0.0,
@@ -3597,9 +3761,11 @@ fn layout_wrapped(
             };
             let border_cross = item.cross_edges + item.cross.unwrap_or(0.0);
             // Cross-start is the top of the line, unless `wrap-reverse` put
-            // it at the bottom. The offset is the border box from the line's
-            // physical top.
-            let cross = if reverse_cross {
+            // it at the bottom. Column baseline items keep Blink's
+            // unmirrored offset; the mirror is only for other alignments.
+            let baseline_item =
+                item.align == AlignItems::Baseline || last_ascents[start + offset].is_some();
+            let cross = if reverse_cross && !(!row && baseline_item) {
                 line_size - from_cross_start - margin_cross_start - border_cross
             } else {
                 from_cross_start + margin_cross_start
@@ -4858,8 +5024,18 @@ mod tests {
 
     #[test]
     fn column_and_nested_grid_or_column_wrap_baseline_stay_on_legacy() {
+        // A horizontal-tb column baseline group is implemented; a vertical
+        // container still stays on legacy.
         let mut column = flex_style(FlexDirection::Column, 100.0, Some(80.0));
         column.align_items = AlignItems::Baseline;
+        expect(
+            &Component::boxed(
+                column.clone(),
+                vec![leaf(block_box(Some(40.0), Some(10.0)))],
+            ),
+            &[(0, [0.0, 0.0, 100.0, 80.0]), (1, [0.0, 0.0, 40.0, 10.0])],
+        );
+        column.writing_mode = w3cos_std::style::WritingMode::VerticalLr;
         stays_legacy(&Component::boxed(
             column,
             vec![leaf(block_box(Some(40.0), Some(10.0)))],

@@ -305,13 +305,13 @@ fn inline_baseline_container_ok(style: &Style) -> bool {
 /// csswg #4675 / #1038; grid items use border edges, Blink
 /// `GridLayoutAlgorithm`, BSD-style Chromium license). Opposite
 /// block-flow directions form separate sharing groups.
-fn typographic_inline_baseline(child: &Style) -> bool {
+pub(super) fn typographic_inline_baseline(child: &Style) -> bool {
     !child.writing_mode.is_horizontal()
 }
 
 /// `true` when the item's under edge for synthesized (or assumed)
 /// first-baseline alignment is the physical right border edge.
-fn col_baseline_under_right(container: &Style, child: &Style) -> bool {
+pub(super) fn col_baseline_under_right(container: &Style, child: &Style) -> bool {
     use w3cos_std::style::WritingMode;
     match child.writing_mode {
         WritingMode::VerticalRl | WritingMode::SidewaysRl => true,
@@ -339,7 +339,10 @@ fn typographic_font_descent(style: &Style) -> f32 {
 
 /// Typographic first baseline from the border-box left:
 /// border-left + padding-left + the face's alphabetic descent.
-fn typographic_col_first_from_border_left(style: &Style, space: &ConstraintSpace) -> f32 {
+pub(super) fn typographic_col_first_from_border_left(
+    style: &Style,
+    space: &ConstraintSpace,
+) -> f32 {
     let border = block::border_widths(style);
     let pad_left = spacing_px(style, style.padding.left, 0.0, space);
     border[3] + pad_left + typographic_font_descent(style)
@@ -347,7 +350,7 @@ fn typographic_col_first_from_border_left(style: &Style, space: &ConstraintSpace
 
 /// Synthesized first/last baseline from the border-box left. First uses
 /// the under edge, last the over edge, of the assumed writing mode.
-fn synthesized_col_baseline(last: bool, border_width: f32, under_right: bool) -> f32 {
+pub(super) fn synthesized_col_baseline(last: bool, border_width: f32, under_right: bool) -> f32 {
     let edge_right = if last { !under_right } else { under_right };
     if edge_right { border_width } else { 0.0 }
 }

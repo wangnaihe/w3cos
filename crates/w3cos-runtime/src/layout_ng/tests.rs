@@ -5275,6 +5275,123 @@ fn flex_row_baseline_alignment_matches_chrome() {
     assert_eq!(rect(&out, 9), (80.0, 100.0, 40.0, 30.0));
 }
 
+/// Column `align-items: baseline` in a horizontal-tb container (CSS Align
+/// 3 §9.1 / Blink `BaselineAscent`): horizontal-tb items synthesize from
+/// the under-left edge and pack at the cross start; wrap-reverse packs
+/// that group at the cross end. Vertical-lr typographic items share a
+/// group from the left (border + descent); vertical-rl is the minor
+/// group and packs from the cross end.
+#[test]
+fn flex_column_baseline_groups_match_chrome() {
+    use w3cos_std::style::{AlignItems, FlexDirection, FlexWrap, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let column = |wrap: FlexWrap| Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        flex_wrap: wrap,
+        align_items: AlignItems::Baseline,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    let box_item = |h: f32| Style {
+        width: Dimension::Px(40.0),
+        height: Dimension::Px(h),
+        margin: margins(0.0, 0.0, 0.0, 11.0),
+        ..block()
+    };
+    let start = node(
+        block(),
+        vec![node(
+            column(FlexWrap::NoWrap),
+            vec![node(box_item(20.0), vec![]), node(box_item(40.0), vec![])],
+        )],
+    );
+    let flat = pre_flatten(&start);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&start, &flat, 800.0, 600.0).expect("column start");
+    let (x0, _, w0, _) = rect(&out, 2);
+    let (x1, _, w1, _) = rect(&out, 3);
+    assert_eq!((x0, w0), (11.0, 40.0), "HTB items start at the left margin");
+    assert_eq!(
+        (x1, w1),
+        (11.0, 40.0),
+        "HTB items share the synthesized edge"
+    );
+
+    let rev = node(
+        block(),
+        vec![node(
+            column(FlexWrap::WrapReverse),
+            vec![node(box_item(20.0), vec![]), node(box_item(40.0), vec![])],
+        )],
+    );
+    let flat = pre_flatten(&rev);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&rev, &flat, 800.0, 600.0).expect("column wrap-reverse");
+    let (xr, _, wr, _) = rect(&out, 2);
+    // wrap-reverse swaps cross sides, so the 11px left margin hangs on
+    // the right: 200 - 40 - 11 = 149.
+    assert_eq!(
+        (xr, wr),
+        (149.0, 40.0),
+        "wrap-reverse packs the group at the cross end"
+    );
+
+    let text_item = |size: f32, mode: WritingMode| {
+        let style = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            ..block()
+        };
+        node(style.clone(), vec![Component::text("X", style)])
+    };
+    let typo = node(
+        block(),
+        vec![node(
+            column(FlexWrap::NoWrap),
+            vec![
+                text_item(20.0, WritingMode::VerticalLr),
+                text_item(10.0, WritingMode::VerticalLr),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&typo);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&typo, &flat, 800.0, 600.0).expect("column typographic");
+    let (xl, _, wl, _) = rect(&out, 2);
+    let (xs, _, ws, _) = rect(&out, 4);
+    assert_eq!((xl, wl), (0.0, 20.0), "20px VLR typographic at x=0");
+    assert_eq!(
+        (xs, ws),
+        (2.0, 10.0),
+        "10px VLR shifts by the descent delta (4-2)"
+    );
+
+    let mixed = node(
+        block(),
+        vec![node(
+            column(FlexWrap::NoWrap),
+            vec![
+                text_item(20.0, WritingMode::VerticalLr),
+                text_item(20.0, WritingMode::VerticalRl),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&mixed);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&mixed, &flat, 800.0, 600.0).expect("column mixed");
+    let (vlr, _, _, _) = rect(&out, 2);
+    let (vrl, _, vw, _) = rect(&out, 4);
+    assert!((vlr - 0.0).abs() < 1.0, "VLR stays at the start, got {vlr}");
+    assert!(
+        (vrl - (200.0 - vw)).abs() < 1.0,
+        "VRL minor group packs from the end, got {vrl} width {vw}"
+    );
+}
+
 /// `align-items: last baseline` in a row flex line (CSS Align 9.3): the
 /// items' last baselines coincide and the group sits flush with the cross
 /// end; a line without a definite height is the largest ascent plus the
