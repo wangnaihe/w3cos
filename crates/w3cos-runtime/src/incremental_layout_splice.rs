@@ -1933,6 +1933,51 @@ mod tests {
         );
     }
 
+    /// A long flex-item paragraph is broken inside one text item. A later
+    /// width or font edit, and a shorter replacement, still match a full
+    /// layout: the break widths are not reused from the previous string.
+    #[test]
+    fn long_paragraph_edits_match_full_layout() {
+        let (column, items) = flex_column();
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(
+            text,
+            &"alpha beta gamma delta epsilon zeta eta theta ".repeat(36),
+        );
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("long paragraph", "splice", Some(30));
+        assert_matches_full("long paragraph");
+        let wide = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .height
+        });
+        crate::dom::set_style_property(column, "width", "180px");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("narrow column");
+        let narrow = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .height
+        });
+        assert!(
+            narrow > wide + 1.0,
+            "narrowing the column did not rewrap: wide {wide} narrow {narrow}"
+        );
+        crate::dom::set_style_property(items[0], "font-size", "22px");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("font size");
+        crate::dom::set_text_content(text, "short again");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("text replaced");
+    }
+
     /// The runtime bench's sections are `width:100%` columns, not a fixed
     /// 420px. The same edits have to match a full LayoutNG pass there too,
     /// including a background change that must not move the next item.
