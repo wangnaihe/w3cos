@@ -4318,6 +4318,9 @@ impl Document {
             w3cos_std::style::Dimension::Rem(value) => {
                 w3cos_std::style::Dimension::Px(value * 16.0)
             }
+            w3cos_std::style::Dimension::Lh(value) => {
+                w3cos_std::style::Dimension::Px(value * parent.used_line_height_px())
+            }
             other => other,
         };
         if let Some(parent) = inherited {
@@ -4647,6 +4650,9 @@ impl Document {
             }
             w3cos_std::style::Dimension::Rem(value) => {
                 w3cos_std::style::Dimension::Px(value * 16.0)
+            }
+            w3cos_std::style::Dimension::Lh(value) => {
+                w3cos_std::style::Dimension::Px(value * parent.used_line_height_px())
             }
             other => other,
         };
@@ -10895,6 +10901,9 @@ impl Document {
                             w3cos_std::style::Dimension::Vh(value) => {
                                 w3cos_std::style::Spacing::Vh(value)
                             }
+                            w3cos_std::style::Dimension::Lh(value) => {
+                                w3cos_std::style::Spacing::Px(value * style.used_line_height_px())
+                            }
                             w3cos_std::style::Dimension::Auto
                             | w3cos_std::style::Dimension::Calc { .. } => {
                                 w3cos_std::style::Spacing::Px(0.0)
@@ -15730,6 +15739,7 @@ fn normalize_single_inline_text_indent(component: &mut w3cos_std::Component) {
         Dimension::Ch(value) => Spacing::Ch(value),
         Dimension::Vw(value) => Spacing::Vw(value),
         Dimension::Vh(value) => Spacing::Vh(value),
+        Dimension::Lh(value) => Spacing::Px(value * component.style.used_line_height_px()),
         Dimension::Auto | Dimension::Calc { .. } => return,
     };
     let margin = match component.style.direction {

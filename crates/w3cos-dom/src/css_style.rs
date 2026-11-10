@@ -1018,14 +1018,15 @@ impl CSSStyleDeclaration {
                 }
             }
             "line-clamp" | "lineClamp" => {
-                // CSS Overflow 4: `line-clamp: <integer>` is a shorthand for
-                // `max-lines`, `block-ellipsis: auto`, and `continue: collapse`
-                // (clamps any block container). `auto` and `block-ellipsis`
-                // values are left unset in this slice (legacy already ignores
-                // them). Invalid values keep the previous declaration.
+                // CSS Overflow 4: `line-clamp: <integer> | auto` is a
+                // shorthand for `max-lines`, `block-ellipsis: auto`, and
+                // `continue: collapse` (clamps any block container).
+                // `auto` clamps to a definite `max-height` / `height`.
+                // Invalid values keep the previous declaration.
                 let keyword = value.trim().to_ascii_lowercase();
                 let marker = match keyword.parse::<u32>() {
                     Ok(lines) if lines > 0 => Some(Some(lines.to_string())),
+                    _ if keyword == "auto" => Some(Some("auto".to_string())),
                     _ if keyword == "none" || css_wide_keyword(&keyword) => Some(None),
                     _ => None,
                 };
@@ -3473,6 +3474,7 @@ pub fn dimension_to_css(dim: &w3cos_std::style::Dimension) -> String {
         w3cos_std::style::Dimension::Ch(v) => format!("{v}ch"),
         w3cos_std::style::Dimension::Vw(v) => format!("{v}vw"),
         w3cos_std::style::Dimension::Vh(v) => format!("{v}vh"),
+        w3cos_std::style::Dimension::Lh(v) => format!("{v}lh"),
         w3cos_std::style::Dimension::Auto => "auto".to_string(),
         w3cos_std::style::Dimension::Calc { percent, px } => {
             let (sign, px) = if *px < 0.0 { ('-', -px) } else { ('+', *px) };
@@ -3853,6 +3855,8 @@ fn inline_size_keyword(value: &str) -> Option<String> {
         Dimension::Rem(n) => format!("{n}rem"),
         Dimension::Vw(n) => format!("{n}vw"),
         Dimension::Vh(n) => format!("{n}vh"),
+        Dimension::Lh(n) => format!("{n}lh"),
+        Dimension::Ch(n) => format!("{n}ch"),
         _ => return None,
     };
     if argument.starts_with('-') {
@@ -4270,7 +4274,8 @@ pub fn parse_column_width(value: &str) -> Option<Dimension> {
                 | Dimension::Em(n)
                 | Dimension::Ch(n)
                 | Dimension::Vw(n)
-                | Dimension::Vh(n) => n,
+                | Dimension::Vh(n)
+                | Dimension::Lh(n) => n,
                 _ => return None,
             };
             (number.is_finite() && number >= 0.0).then_some(width)
@@ -4413,6 +4418,13 @@ fn parse_dimension_checked(value: &str) -> Option<Dimension> {
         && let Ok(n) = n.trim().parse()
     {
         return Some(Dimension::Rem(n));
+    }
+    // `rlh` is the root used line-height; not stored in this slice.
+    if let Some(n) = v.strip_suffix("lh")
+        && !v.to_ascii_lowercase().ends_with("rlh")
+        && let Ok(n) = n.trim().parse()
+    {
+        return Some(Dimension::Lh(n));
     }
     if let Some(n) = v.strip_suffix("ch")
         && let Ok(n) = n.trim().parse()
@@ -4715,7 +4727,8 @@ fn dimension_is_non_negative_or_auto(value: &Dimension) -> bool {
         | Dimension::Em(value)
         | Dimension::Ch(value)
         | Dimension::Vw(value)
-        | Dimension::Vh(value) => value >= 0.0,
+        | Dimension::Vh(value)
+        | Dimension::Lh(value) => value >= 0.0,
     }
 }
 
@@ -9184,19 +9197,27 @@ fn webkit_box_orient_and_line_clamp_keep_markers() {
     declaration.set_property("line-clamp", "none");
     assert_eq!(marker(&declaration, LINE_CLAMP_PROPERTY), None);
     assert_eq!(marker(&declaration, CONTINUE_PROPERTY), None);
-    // Invalid `line-clamp` values keep the previous declaration; `auto` is
-    // not stored in this slice.
+    // `line-clamp: auto` stores max-lines auto and continue: collapse.
     declaration.set_property("line-clamp", "3");
     declaration.set_property("line-clamp", "auto");
-    declaration.set_property("line-clamp", "0");
     assert_eq!(
         marker(&declaration, LINE_CLAMP_PROPERTY).as_deref(),
-        Some("3")
+        Some("auto")
     );
     assert_eq!(
         marker(&declaration, CONTINUE_PROPERTY).as_deref(),
         Some("collapse")
     );
+    // Invalid values keep the previous declaration.
+    declaration.set_property("line-clamp", "0");
+    assert_eq!(
+        marker(&declaration, LINE_CLAMP_PROPERTY).as_deref(),
+        Some("auto")
+    );
+    // `none` clears auto as well.
+    declaration.set_property("line-clamp", "none");
+    assert_eq!(marker(&declaration, LINE_CLAMP_PROPERTY), None);
+    assert_eq!(marker(&declaration, CONTINUE_PROPERTY), None);
 }
 
 #[test]

@@ -1227,6 +1227,7 @@ impl Style {
             Dimension::Ch(value) => value * self.ch_advance(),
             Dimension::Vw(value) => viewport_width * value / 100.0,
             Dimension::Vh(value) => viewport_height * value / 100.0,
+            Dimension::Lh(value) => value * self.used_line_height_px(),
             Dimension::Auto | Dimension::Calc { .. } => 0.0,
         }
     }
@@ -1391,6 +1392,8 @@ pub enum Dimension {
     Ch(f32),
     Vw(f32),
     Vh(f32),
+    /// Used line-height of the element (`lh`, CSS Values 4).
+    Lh(f32),
     /// `calc()` of a percentage and a px length: `percent`% of the basis
     /// plus `px`. Only LayoutNG resolves it; legacy layout treats it as
     /// `auto`, as it did when the declaration was dropped.
@@ -1584,6 +1587,29 @@ impl Style {
                 .unwrap_or(self.border_radius),
             self.border_bottom_left_radius.unwrap_or(self.border_radius),
         ]
+    }
+
+    /// Used line-height in px (`lh`). `line-height: normal` is the
+    /// computed ratio times `font-size`; a specified length uses that px.
+    pub fn used_line_height_px(&self) -> f32 {
+        if self.line_height_is_normal {
+            return self.font_size * self.line_height;
+        }
+        if let Some(length) = self.line_height_computed_px {
+            return (length * 64.0).round() / 64.0;
+        }
+        let font_size = (self.font_size * 64.0).round() / 64.0;
+        let units = font_size * self.line_height * 64.0;
+        if !units.is_finite() {
+            return self.font_size * self.line_height;
+        }
+        let nearest = units.round();
+        let units = if (units - nearest).abs() <= f32::EPSILON * units.abs() {
+            nearest
+        } else {
+            units
+        };
+        units.trunc() / 64.0
     }
 
     pub fn padding_lengths(&self) -> EdgeLengths {
@@ -2482,6 +2508,9 @@ impl Dimension {
             Dimension::Ch(v) => Some(*v * local_font_size * 0.5),
             Dimension::Vw(v) => Some(*v * viewport_w / 100.0),
             Dimension::Vh(v) => Some(*v * viewport_h / 100.0),
+            // Used `lh` is resolved in LayoutNG (`resolve_dim`) where the
+            // element's used line-height is known.
+            Dimension::Lh(_) => None,
             Dimension::Calc { .. } => None,
         }
     }

@@ -72,10 +72,68 @@ fn clamp_lines(style: &Style) -> Option<usize> {
     // Standard `line-clamp: N` (`continue: collapse`) applies to any block
     // container. `-webkit-line-clamp` uses `continue: -webkit-legacy` and
     // only counts lines when webkit_box_styles copied `CLAMP_MARKER`.
+    // `line-clamp: auto` keeps as many lines as fit in a definite
+    // `max-height` / `height` (CSS Overflow 4).
     if marker_value(style, CONTINUE_MARKER) == Some("collapse") {
-        return marker_value(style, LINE_CLAMP_MARKER)?.parse().ok();
+        return match marker_value(style, LINE_CLAMP_MARKER) {
+            Some("auto") => auto_clamp_lines(style),
+            Some(raw) => raw.parse().ok(),
+            None => None,
+        };
     }
     marker_value(style, CLAMP_MARKER)?.parse().ok()
+}
+
+/// How many line boxes fit in the content-box block size cap used by
+/// `line-clamp: auto`. `None` means the size is indefinite (no clamp).
+fn auto_clamp_lines(style: &Style) -> Option<usize> {
+    let cap = definite_clamp_block(style)?;
+    let line = style.used_line_height_px();
+    if line <= EPSILON {
+        return Some(0);
+    }
+    Some((cap / line + EPSILON).floor().max(0.0) as usize)
+}
+
+/// Definite content-box block size from `height` and/or `max-height`.
+/// `min-height` is not a clamp cap (line-clamp-auto-012).
+fn definite_clamp_block(style: &Style) -> Option<f32> {
+    let resolve = |d: Dimension| -> Option<f32> {
+        match d {
+            Dimension::Px(v) => Some(v),
+            Dimension::Em(v) => Some(v * style.font_size),
+            Dimension::Rem(v) => Some(v * crate::layout::ROOT_FONT_SIZE),
+            Dimension::Lh(v) => Some(v * style.used_line_height_px()),
+            Dimension::Ch(v) => Some(v * style.ch_advance()),
+            _ => None,
+        }
+    };
+    let height = resolve(style.height);
+    let max_height = resolve(style.max_height);
+    let min_height = resolve(style.min_height);
+    // `min-height` alone is not a clamp cap (auto-012). When both
+    // min and max are definite, the used constraint is max(min, max)
+    // (CSS 2.1 10.7; auto-014).
+    let used = match (height, max_height, min_height) {
+        (None, None, _) => return None,
+        (Some(h), Some(m), Some(n)) => h.min(m).max(n),
+        (Some(h), Some(m), None) => h.min(m),
+        (Some(h), None, Some(n)) => h.max(n),
+        (Some(h), None, None) => h,
+        (None, Some(m), Some(n)) => m.max(n),
+        (None, Some(m), None) => m,
+        (None, None, _) => unreachable!(),
+    };
+    let padding = style.padding_lengths();
+    let bt = style.border_top_width.unwrap_or(0.0);
+    let bb = style.border_bottom_width.unwrap_or(0.0);
+    let edges = padding.top + padding.bottom + bt + bb;
+    let content = if style.box_sizing == w3cos_std::style::BoxSizing::BorderBox {
+        (used - edges).max(0.0)
+    } else {
+        used
+    };
+    Some(content)
 }
 
 /// The substring of a text leaf this item paints (the item's range, or
@@ -2711,9 +2769,19 @@ fn layout_lines(
         let line_count = content.split('\n').count();
         if let Some(n) = clamp_lines(container).filter(|&n| n < line_count) {
             // `-webkit-line-clamp`: one piece per kept line, the last one
-            // followed by the block ellipsis.
+            // followed by the block ellipsis. `line-clamp: auto` with a
+            // zero content-box cap keeps no lines.
             if floats.is_some() || style.white_space != WhiteSpace::Pre {
                 return super::bail("clamp-text");
+            }
+            if n == 0 {
+                return Some(InlineResult {
+                    height: 0.0,
+                    max_line_width: 0.0,
+                    last_baseline: LastBaseline::NoLines,
+                    first_baseline: LastBaseline::NoLines,
+                    children: Vec::new(),
+                });
             }
             let ellipsis = text_intrinsic_size("\u{2026}", style).0;
             let top = ascent - inline_font_content_ascent(style);
@@ -3515,33 +3583,41 @@ fn layout_lines(
         if floats.is_some() || has_boxes || reorder || preserve || !can_wrap {
             return super::bail("clamp-ifc");
         }
-        dropped = built[n..]
-            .iter()
-            .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
-            .collect();
-        built.truncate(n);
-        let last = &mut built[n - 1];
-        let k = last
-            .items
-            .iter()
-            .rev()
-            .map(|&(k, ..)| k)
-            .find(|&k| !items[k].forced)
-            .why("clamp-ifc")?;
-        let item = &items[k];
-        let ComponentKind::Text { content } = &flat[item.index].kind else {
-            return super::bail("clamp-ifc");
-        };
-        if !clamp_ellipsis_piece_ok(item, content, flat[item.index].style) {
-            return super::bail("clamp-ifc");
-        }
-        ellipsis_width = text_intrinsic_size("…", flat[item.index].style).0;
-        match trim_line_for_block_ellipsis(&items, flat, last, &mut dropped, ellipsis_width) {
-            Some((k, range)) => {
-                ellipsis_item = Some(k);
-                ellipsis_range = range;
+        if n == 0 {
+            dropped = built
+                .iter()
+                .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+                .collect();
+            built.clear();
+        } else {
+            dropped = built[n..]
+                .iter()
+                .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
+                .collect();
+            built.truncate(n);
+            let last = &mut built[n - 1];
+            let k = last
+                .items
+                .iter()
+                .rev()
+                .map(|&(k, ..)| k)
+                .find(|&k| !items[k].forced)
+                .why("clamp-ifc")?;
+            let item = &items[k];
+            let ComponentKind::Text { content } = &flat[item.index].kind else {
+                return super::bail("clamp-ifc");
+            };
+            if !clamp_ellipsis_piece_ok(item, content, flat[item.index].style) {
+                return super::bail("clamp-ifc");
             }
-            None => return super::bail("clamp-ellipsis"),
+            ellipsis_width = text_intrinsic_size("…", flat[item.index].style).0;
+            match trim_line_for_block_ellipsis(&items, flat, last, &mut dropped, ellipsis_width) {
+                Some((k, range)) => {
+                    ellipsis_item = Some(k);
+                    ellipsis_range = range;
+                }
+                None => return super::bail("clamp-ellipsis"),
+            }
         }
     }
     let mut top = 0.0f32;

@@ -1734,6 +1734,7 @@ fn canvas_axis_px(dim: Dimension, style: &Style) -> Option<f32> {
         Dimension::Px(value) => Some(value),
         Dimension::Em(value) => Some(value * style.font_size),
         Dimension::Rem(value) => Some(value * crate::layout::ROOT_FONT_SIZE),
+        Dimension::Lh(value) => Some(value * style.used_line_height_px()),
         _ => None,
     }
 }
@@ -2891,6 +2892,7 @@ fn resolve_dim(
         Dimension::Ch(v) => Some(v * style.ch_advance()),
         Dimension::Vw(v) => Some(v * space.viewport_w / 100.0),
         Dimension::Vh(v) => Some(v * space.viewport_h / 100.0),
+        Dimension::Lh(v) => Some(v * style.used_line_height_px()),
         Dimension::Calc { percent, px } => {
             basis.map(|b| layout_unit(b * percent / 100.0 + px).max(0.0))
         }

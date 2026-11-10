@@ -484,6 +484,7 @@ fn css2_clip_rect(style: &Style, rect: LayoutRect) -> Option<LayoutRect> {
         Some(w3cos_std::style::Dimension::Ch(value)) => value * style.font_size * 0.5,
         Some(w3cos_std::style::Dimension::Vw(value)) => value * rect.width / 100.0,
         Some(w3cos_std::style::Dimension::Vh(value)) => value * rect.height / 100.0,
+        Some(w3cos_std::style::Dimension::Lh(value)) => value * style.used_line_height_px(),
         Some(w3cos_std::style::Dimension::Percent(value)) => value * auto / 100.0,
         Some(w3cos_std::style::Dimension::Auto | w3cos_std::style::Dimension::Calc { .. })
         | None => auto,

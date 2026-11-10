@@ -1947,6 +1947,7 @@ pub(crate) fn component_max_content_width(component: &Component) -> f32 {
         WDim::Em(value) => Some(value * component.style.font_size),
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Ch(value) => Some(value * css_ch_advance(&component.style)),
+        WDim::Lh(value) => Some(value * component.style.used_line_height_px()),
         WDim::Auto | WDim::Percent(_) | WDim::Vw(_) | WDim::Vh(_) | WDim::Calc { .. } => None,
     };
     let constraint_border_box = |dimension| {
@@ -3858,6 +3859,7 @@ fn dim_to_px(dim: WDim) -> Option<f32> {
         | WDim::Ch(_)
         | WDim::Vw(_)
         | WDim::Vh(_)
+        | WDim::Lh(_)
         | WDim::Calc { .. } => None,
     }
 }
@@ -4451,6 +4453,7 @@ fn text_measure_key(width: f32, style: &w3cos_std::style::Style, font: u64) -> T
             WDim::Ch(value) => (5, value.to_bits()),
             WDim::Vw(value) => (6, value.to_bits()),
             WDim::Vh(value) => (7, value.to_bits()),
+            WDim::Lh(value) => (8, value.to_bits()),
             WDim::Calc { .. } => (0, 0),
         },
         padding_top: padding.top.to_bits(),
@@ -21567,6 +21570,7 @@ fn build_taffy_tree(
         WDim::Rem(value) => Some(value * ROOT_FONT_SIZE),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
         WDim::Percent(value) => definite_height_basis.map(|basis| basis * value / 100.0),
+        WDim::Lh(value) => Some(value * comp.style.used_line_height_px()),
         WDim::Auto | WDim::Ch(_) | WDim::Vw(_) | WDim::Calc { .. } => None,
     };
     // Anonymous block boxes do not establish a percentage containing block.
@@ -21913,6 +21917,7 @@ fn build_taffy_tree(
         WDim::Ch(value) => Some(value * css_ch_advance(&comp.style)),
         WDim::Vw(value) => Some(value * viewport_w / 100.0),
         WDim::Vh(value) => Some(value * viewport_h / 100.0),
+        WDim::Lh(value) => Some(value * comp.style.used_line_height_px()),
         WDim::Auto | WDim::Percent(_) | WDim::Calc { .. } => None,
     };
     let absorbs_ua_inline_padding =
@@ -25562,9 +25567,13 @@ fn collect_layouts_fast(
                         || relative_containing_block_height_definite)
             }
             WDim::Percent(_) => relative_containing_block_height_definite,
-            WDim::Px(_) | WDim::Rem(_) | WDim::Em(_) | WDim::Ch(_) | WDim::Vw(_) | WDim::Vh(_) => {
-                true
-            }
+            WDim::Px(_)
+            | WDim::Rem(_)
+            | WDim::Em(_)
+            | WDim::Ch(_)
+            | WDim::Vw(_)
+            | WDim::Vh(_)
+            | WDim::Lh(_) => true,
         });
 
     for &child in tree.children(node).unwrap().iter() {
@@ -26850,6 +26859,7 @@ fn to_taffy_dim(
         WDim::Ch(v) => Dimension::length(v * font_style.ch_advance()),
         WDim::Vw(v) => Dimension::length(v * viewport_w / 100.0),
         WDim::Vh(v) => Dimension::length(v * viewport_h / 100.0),
+        WDim::Lh(v) => Dimension::length(v * font_style.used_line_height_px()),
     }
 }
 
@@ -26868,6 +26878,7 @@ fn to_taffy_auto(
         WDim::Ch(v) => LengthPercentageAuto::length(v * font_style.ch_advance()),
         WDim::Vw(v) => LengthPercentageAuto::length(v * viewport_w / 100.0),
         WDim::Vh(v) => LengthPercentageAuto::length(v * viewport_h / 100.0),
+        WDim::Lh(v) => LengthPercentageAuto::length(v * font_style.used_line_height_px()),
     }
 }
 

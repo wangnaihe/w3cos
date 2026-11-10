@@ -8429,6 +8429,155 @@ fn line_clamp_collapse_trims_last_wrap_for_ellipsis() {
     );
 }
 
+/// `line-clamp: auto` keeps as many lines as fit in a definite
+/// `max-height` / `height` (CSS Overflow 4). `lh` is the used line-height.
+/// `min-height` is not a clamp cap (line-clamp-auto-012).
+#[test]
+fn line_clamp_auto_uses_definite_block_size() {
+    use w3cos_std::style::{BoxSizing, CustomProperties, Edges, WhiteSpace};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 16.0,
+        line_height: 32.0,
+        line_height_is_normal: false,
+        line_height_computed_px: Some(32.0),
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::Pre,
+        ..font.clone()
+    };
+    let auto_clamp = |style: Style| Style {
+        white_space: WhiteSpace::Pre,
+        custom_properties: Some(CustomProperties::from_iter([
+            (
+                "--w3cos-internal-line-clamp".to_string(),
+                "auto".to_string(),
+            ),
+            (
+                "--w3cos-internal-continue".to_string(),
+                "collapse".to_string(),
+            ),
+        ])),
+        ..style
+    };
+    let layout = |style: Style, content: &str| {
+        let root = node(
+            block(),
+            vec![node(
+                style,
+                vec![Component::text(content, text_style.clone())],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        layout_tree_with_text(&root, &flat, 800.0, 600.0)
+    };
+    let six = "A\nB\nC\nD\nE\nF";
+
+    // max-height: 4lh keeps 4 of 6 lines with a block-ellipsis (auto-001).
+    let some = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            max_height: Dimension::Lh(4.0),
+            ..font.clone()
+        }),
+        six,
+    )
+    .expect("auto 4lh");
+    let got: Vec<&str> = some.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B", "C", "D…"]);
+    let (_, _, _, h4) = rect(&some.0, 1);
+
+    // max-height: 5lh with 5 lines does not clamp (auto-006).
+    let five = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            max_height: Dimension::Lh(5.0),
+            ..font.clone()
+        }),
+        "A\nB\nC\nD\nE",
+    )
+    .expect("auto 5lh no clamp");
+    let texts: Vec<&str> = five.1.iter().map(|t| t.text.as_str()).collect();
+    assert!(
+        texts.iter().all(|t| !t.contains('…')),
+        "exact fit has no ellipsis: {texts:?}"
+    );
+    let (_, _, _, h5) = rect(&five.0, 1);
+    assert!(
+        h5 > h4,
+        "five unclamped lines are taller than four ({h5} vs {h4})"
+    );
+
+    // min-height alone does not clamp (auto-012).
+    let min_only = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            min_height: Dimension::Lh(3.0),
+            ..font.clone()
+        }),
+        six,
+    )
+    .expect("min-height is not a cap");
+    let texts: Vec<&str> = min_only.1.iter().map(|t| t.text.as_str()).collect();
+    assert!(
+        texts.iter().all(|t| !t.contains('…')),
+        "min-height must not clamp: {texts:?}"
+    );
+
+    // height: 4.5lh clamps to 4 lines but keeps the used 4.5lh height (auto-005).
+    let tall = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            height: Dimension::Lh(4.5),
+            ..font.clone()
+        }),
+        six,
+    )
+    .expect("height 4.5lh");
+    let got: Vec<&str> = tall.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B", "C", "D…"]);
+    let (_, _, _, used) = rect(&tall.0, 1);
+    assert!(
+        (used - 4.5 * 32.0).abs() < 0.5,
+        "specified height is kept after clamp: {used}"
+    );
+
+    // border-box max-height 138px with 1px border + 4px padding is 128px
+    // of content, 4 lines (auto-003).
+    let boxed = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            max_height: Dimension::Px(138.0),
+            box_sizing: BoxSizing::BorderBox,
+            padding: Edges::all(4.0),
+            border_top_width: Some(1.0),
+            border_bottom_width: Some(1.0),
+            ..font.clone()
+        }),
+        six,
+    )
+    .expect("border-box 138px");
+    let got: Vec<&str> = boxed.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B", "C", "D…"]);
+
+    // min-height 4lh and max-height 3lh: used cap is 4lh (auto-014).
+    let min_wins = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            min_height: Dimension::Lh(4.0),
+            max_height: Dimension::Lh(3.0),
+            ..font.clone()
+        }),
+        six,
+    )
+    .expect("min-height wins over max-height");
+    let got: Vec<&str> = min_wins.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B", "C", "D…"]);
+}
+
 /// A column flex item's flexed size is not a percentage basis for its
 /// children while the container's height is indefinite
 /// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.
