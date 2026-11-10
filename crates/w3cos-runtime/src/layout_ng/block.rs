@@ -219,6 +219,8 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // box they have no effect.
             | "webkit-box-orient"
             | "webkit-line-clamp"
+            | "line-clamp"
+            | "continue"
             | "clamp-lines"
             // Read with the run-in display marker (run_in_block_styles).
             | "run-in-block"

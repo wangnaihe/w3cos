@@ -204,9 +204,15 @@ pub const WEBKIT_BOX_ORIENT_PROPERTY: &str = "--w3cos-internal-webkit-box-orient
 /// leaves it unset). The paint tree resolves it
 /// against the laid-out box (the pixel part stays in `Style::transform`).
 pub const TRANSLATE_PERCENT_PROPERTY: &str = "--w3cos-internal-translate-percent";
-/// `-webkit-line-clamp`: a positive line count. Legacy ignores it.
-/// (The standard `line-clamp` is not stored: NG does not model it.)
+/// `-webkit-line-clamp` / `line-clamp`: the shared `max-lines` count.
+/// Legacy ignores these markers.
 pub const WEBKIT_LINE_CLAMP_PROPERTY: &str = "--w3cos-internal-webkit-line-clamp";
+/// Standard `line-clamp` / `-webkit-line-clamp` `max-lines` (same count as
+/// `WEBKIT_LINE_CLAMP_PROPERTY`). Not inherited.
+pub const LINE_CLAMP_PROPERTY: &str = "--w3cos-internal-line-clamp";
+/// CSS Overflow 4 `continue`: `collapse` (standard `line-clamp`) or
+/// `webkit-legacy` (`-webkit-line-clamp`). Absent is `auto` (no clamp).
+pub const CONTINUE_PROPERTY: &str = "--w3cos-internal-continue";
 
 fn update_percent_gap(style: &mut Style, row: Option<bool>, column: Option<bool>) {
     let current = style
@@ -416,6 +422,15 @@ pub fn inherit_gap(style: &mut Style, parent: &Style, longhand: &str) {
         }
         _ => {}
     }
+}
+
+/// Shared longhands of `line-clamp` and `-webkit-line-clamp` (CSS Overflow 4).
+/// `lines` is the `max-lines` count; `continue_mode` is `collapse` or
+/// `webkit-legacy`. `None` clears all three (the `none` / initial shorthand).
+fn set_line_clamp_longhands(style: &mut Style, lines: Option<String>, continue_mode: Option<&str>) {
+    set_marker(style, LINE_CLAMP_PROPERTY, lines.clone());
+    set_marker(style, WEBKIT_LINE_CLAMP_PROPERTY, lines);
+    set_marker(style, CONTINUE_PROPERTY, continue_mode.map(str::to_string));
 }
 
 fn set_marker(style: &mut Style, key: &str, value: Option<String>) {
@@ -988,6 +1003,9 @@ impl CSSStyleDeclaration {
                 }
             }
             "-webkit-line-clamp" | "webkit-line-clamp" | "webkitLineClamp" => {
+                // CSS Overflow 4: `-webkit-line-clamp` is a shorthand for
+                // `max-lines`, `block-ellipsis`, and `continue: -webkit-legacy`
+                // (clamps only on a vertical `-webkit-box`).
                 let keyword = value.trim().to_ascii_lowercase();
                 let marker = match keyword.parse::<u32>() {
                     Ok(lines) if lines > 0 => Some(Some(lines.to_string())),
@@ -995,7 +1013,25 @@ impl CSSStyleDeclaration {
                     _ => None,
                 };
                 if let Some(marker) = marker {
-                    set_marker(&mut self.inner, WEBKIT_LINE_CLAMP_PROPERTY, marker);
+                    let continue_mode = marker.as_ref().map(|_| "webkit-legacy");
+                    set_line_clamp_longhands(&mut self.inner, marker, continue_mode);
+                }
+            }
+            "line-clamp" | "lineClamp" => {
+                // CSS Overflow 4: `line-clamp: <integer>` is a shorthand for
+                // `max-lines`, `block-ellipsis: auto`, and `continue: collapse`
+                // (clamps any block container). `auto` and `block-ellipsis`
+                // values are left unset in this slice (legacy already ignores
+                // them). Invalid values keep the previous declaration.
+                let keyword = value.trim().to_ascii_lowercase();
+                let marker = match keyword.parse::<u32>() {
+                    Ok(lines) if lines > 0 => Some(Some(lines.to_string())),
+                    _ if keyword == "none" || css_wide_keyword(&keyword) => Some(None),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    let continue_mode = marker.as_ref().map(|_| "collapse");
+                    set_line_clamp_longhands(&mut self.inner, marker, continue_mode);
                 }
             }
             "flex-grow" | "flexGrow" => {
@@ -9117,9 +9153,50 @@ fn webkit_box_orient_and_line_clamp_keep_markers() {
     declaration.set_property("-webkit-line-clamp", "2");
     declaration.set_property("-webkit-line-clamp", "initial");
     assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
-    // The standard `line-clamp` is not modeled and leaves no marker.
+    assert_eq!(marker(&declaration, LINE_CLAMP_PROPERTY), None);
+    assert_eq!(marker(&declaration, CONTINUE_PROPERTY), None);
+    // Standard `line-clamp: N` sets max-lines and `continue: collapse`.
     declaration.set_property("line-clamp", "2");
-    assert_eq!(marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY), None);
+    assert_eq!(
+        marker(&declaration, LINE_CLAMP_PROPERTY).as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        marker(&declaration, WEBKIT_LINE_CLAMP_PROPERTY).as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        marker(&declaration, CONTINUE_PROPERTY).as_deref(),
+        Some("collapse")
+    );
+    // A later `-webkit-line-clamp` wins the same longhands (line-clamp-034):
+    // `continue` becomes `-webkit-legacy`, so a box without `-webkit-box`
+    // does not clamp.
+    declaration.set_property("-webkit-line-clamp", "4");
+    assert_eq!(
+        marker(&declaration, LINE_CLAMP_PROPERTY).as_deref(),
+        Some("4")
+    );
+    assert_eq!(
+        marker(&declaration, CONTINUE_PROPERTY).as_deref(),
+        Some("webkit-legacy")
+    );
+    declaration.set_property("line-clamp", "none");
+    assert_eq!(marker(&declaration, LINE_CLAMP_PROPERTY), None);
+    assert_eq!(marker(&declaration, CONTINUE_PROPERTY), None);
+    // Invalid `line-clamp` values keep the previous declaration; `auto` is
+    // not stored in this slice.
+    declaration.set_property("line-clamp", "3");
+    declaration.set_property("line-clamp", "auto");
+    declaration.set_property("line-clamp", "0");
+    assert_eq!(
+        marker(&declaration, LINE_CLAMP_PROPERTY).as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        marker(&declaration, CONTINUE_PROPERTY).as_deref(),
+        Some("collapse")
+    );
 }
 
 #[test]

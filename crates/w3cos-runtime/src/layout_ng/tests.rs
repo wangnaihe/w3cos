@@ -8281,6 +8281,87 @@ fn webkit_box_vertical_clamps_lines() {
     }
 }
 
+/// CSS Overflow 4 `line-clamp: N` (`continue: collapse`) clamps a block
+/// container that is not a `-webkit-box`. A sole `pre` leaf with
+/// `line-height: normal` keeps the first N forced-break lines; a last
+/// kept line that cannot fit its text plus the block ellipsis (`white-space:
+/// pre` has no wrap opportunities) keeps only U+2026. A later
+/// `-webkit-line-clamp` wins `continue: -webkit-legacy`, so a box without
+/// `-webkit-box` does not clamp (line-clamp-034).
+#[test]
+fn line_clamp_collapse_clamps_a_block_pre_leaf() {
+    use w3cos_std::style::{CustomProperties, WhiteSpace};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 20.0,
+        line_height_is_normal: true,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::Pre,
+        ..font.clone()
+    };
+    let clamped = |lines: &str, continue_mode: &str, width: f32| Style {
+        width: Dimension::Px(width),
+        white_space: WhiteSpace::Pre,
+        custom_properties: Some(CustomProperties::from_iter([
+            ("--w3cos-internal-line-clamp".to_string(), lines.to_string()),
+            (
+                "--w3cos-internal-webkit-line-clamp".to_string(),
+                lines.to_string(),
+            ),
+            (
+                "--w3cos-internal-continue".to_string(),
+                continue_mode.to_string(),
+            ),
+        ])),
+        ..font.clone()
+    };
+    // 0 root, 1 box, 2 text.
+    let layout = |style: Style, content: &str| {
+        let root = node(
+            block(),
+            vec![node(
+                style,
+                vec![Component::text(content, text_style.clone())],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        layout_tree_with_text(&root, &flat, 800.0, 600.0)
+    };
+
+    let some = layout(clamped("2", "collapse", 240.0), "A\nB\nC\nD").expect("clamp 2");
+    let got: Vec<&str> = some.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B…"]);
+    let (_, _, _, h2) = rect(&some.0, 1);
+
+    let full = layout(clamped("5", "collapse", 240.0), "A\nB\nC\nD").expect("clamp 5 is a no-op");
+    // When N is not less than the line count, the sole pre leaf is one
+    // unclamped paragraph fragment (`text_range` is none; paint draws it).
+    let (_, _, _, h4) = rect(&full.0, 1);
+    assert!(h4 > h2, "four lines are taller than two ({h4} vs {h2})");
+    assert!((h4 / h2 - 2.0).abs() < 0.1, "2 vs 4 line boxes: {h2} {h4}");
+
+    // Nowrap last line does not fit "XXXXXXXX" + ellipsis in 100px (5em).
+    let wide =
+        layout(clamped("2", "collapse", 100.0), "AAAA\nXXXXXXXX\nYY").expect("nowrap ellipsis");
+    let got: Vec<&str> = wide.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["AAAA", "…"]);
+
+    // `-webkit-legacy` without CLAMP_MARKER (no vertical `-webkit-box`)
+    // does not clamp, matching line-clamp-034.
+    let legacy =
+        layout(clamped("2", "webkit-legacy", 240.0), "A\nB\nC\nD").expect("legacy no clamp");
+    let (_, _, _, h_legacy) = rect(&legacy.0, 1);
+    assert!(
+        (h_legacy - h4).abs() < 0.5,
+        "webkit-legacy without a box is unclamped ({h_legacy} vs {h4})"
+    );
+}
+
 /// A column flex item's flexed size is not a percentage basis for its
 /// children while the container's height is indefinite
 /// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.

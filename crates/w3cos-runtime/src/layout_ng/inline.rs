@@ -60,8 +60,21 @@ const FORCED_BREAK: &str = "\u{2028}";
 /// Line count of a `-webkit-line-clamp` box (`block::webkit_box_styles`
 /// sets it on the block-flow `-webkit-box` it lays out).
 pub(super) const CLAMP_MARKER: &str = "--w3cos-internal-clamp-lines";
+/// CSS Overflow 4 `max-lines` from the `line-clamp` / `-webkit-line-clamp`
+/// shorthands.
+const LINE_CLAMP_MARKER: &str = "--w3cos-internal-line-clamp";
+/// CSS Overflow 4 `continue`. `collapse` clamps any block container;
+/// `webkit-legacy` clamps only through `CLAMP_MARKER` on a vertical
+/// `-webkit-box`.
+const CONTINUE_MARKER: &str = "--w3cos-internal-continue";
 
 fn clamp_lines(style: &Style) -> Option<usize> {
+    // Standard `line-clamp: N` (`continue: collapse`) applies to any block
+    // container. `-webkit-line-clamp` uses `continue: -webkit-legacy` and
+    // only counts lines when webkit_box_styles copied `CLAMP_MARKER`.
+    if marker_value(style, CONTINUE_MARKER) == Some("collapse") {
+        return marker_value(style, LINE_CLAMP_MARKER)?.parse().ok();
+    }
     marker_value(style, CLAMP_MARKER)?.parse().ok()
 }
 
@@ -834,9 +847,12 @@ fn inline_text_reason(
             WhiteSpace::PreLine => line_width,
             // (line-height: normal mixes the strut's computed line height
             // with the font's line spacing differently in legacy.)
-            WhiteSpace::Pre | WhiteSpace::PreWrap => {
-                line_width || (!content.ends_with('\n') && !style.line_height_is_normal)
-            }
+            // Trailing newlines still stay on legacy (the paragraph
+            // wrapper / letter-spacing-end-of-line path). `line-height:
+            // normal` is allowed: the sole-leaf path uses the same strut
+            // + face metrics as a specified unit line-height of 1em on
+            // Ahem, which is Blink's used line box for these pre leaves.
+            WhiteSpace::Pre | WhiteSpace::PreWrap => line_width || !content.ends_with('\n'),
             _ => false,
         };
     // (`first_line`: the item's line offset is known when items are built;
@@ -2520,10 +2536,21 @@ fn layout_lines(
             for (k, text) in content.split('\n').take(n).enumerate() {
                 let last = k + 1 == n;
                 let mut width = text_intrinsic_size(text, style).0;
+                // CSS Overflow 4 block-ellipsis: place U+2026 after the last
+                // soft wrap opportunity on the last kept line that still
+                // fits. `white-space: pre` has no wrap opportunities, so a
+                // line that cannot fit its text plus the ellipsis keeps
+                // only the ellipsis (block-ellipsis-013).
+                let mut range_end = start + text.len();
                 if last {
-                    width += ellipsis;
-                    if width > available + EPSILON {
-                        return super::bail("clamp-ellipsis");
+                    if width + ellipsis > available + EPSILON {
+                        if ellipsis > available + EPSILON {
+                            return super::bail("clamp-ellipsis");
+                        }
+                        width = ellipsis;
+                        range_end = start;
+                    } else {
+                        width += ellipsis;
                     }
                 }
                 widest = widest.max(width);
@@ -2532,7 +2559,7 @@ fn layout_lines(
                     top + k as f32 * single,
                     BoxFragment {
                         index: child,
-                        text_range: Some((start, start + text.len())),
+                        text_range: Some((start, range_end)),
                         ellipsis: last,
                         vertical: false,
                         width,
