@@ -411,3 +411,80 @@ fn child_scroll_marker_host_is_the_originating_element() {
     );
     crate::stylesheet::clear_rules();
 }
+
+#[test]
+fn link_styled_scroll_markers_are_non_atomic_inlines() {
+    // scroll-marker-011: letters in a block group must be non-atomic
+    // inlines (like <a>P</a>), not IFC rows, so they share one line.
+    crate::stylesheet::clear_rules();
+    crate::stylesheet::register_rule(
+        "section",
+        &[("scroll-marker-group", "before"), ("overflow", "hidden")],
+    );
+    crate::stylesheet::register_rule(
+        "section::scroll-marker-group",
+        &[("display", "block"), ("height", "2em")],
+    );
+    crate::stylesheet::register_rule(
+        "section>div::scroll-marker",
+        &[("content", "attr(data-letter)")],
+    );
+
+    let mut document = Document::new();
+    let scroller = document.create_element("section");
+    for letter in ["P", "A", "S", "S"] {
+        let item = document.create_element("div");
+        item.set_attribute(&mut document, "data-letter", letter);
+        scroller.append_child(&mut document, item);
+    }
+    document.body().append_child(&mut document, scroller);
+
+    let tree = document.to_component_tree();
+    let group = find_marker_group(&tree).expect("group");
+    assert_eq!(group.children.len(), 4);
+    let mut letters = String::new();
+    for marker in &group.children {
+        assert_eq!(marker.style.display, Display::Inline);
+        assert_eq!(marker.style.text_decoration, TextDecoration::Underline);
+        assert_eq!(marker.style.color, w3cos_std::Color::rgb(0, 0, 238));
+        assert!(
+            !matches!(marker.kind, ComponentKind::Text { .. }),
+            "UA link decoration keeps a principal box"
+        );
+        assert!(
+            !marker
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                }),
+            "the letter is not its own IFC"
+        );
+        assert!(
+            marker.children.iter().all(|child| !child
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                })),
+            "no inner IFC between the principal and the letter"
+        );
+        let text = descendant_text(marker);
+        assert_eq!(text.len(), 1, "got {text:?}");
+        letters.push_str(&text);
+        fn assert_no_copied_decoration(component: &w3cos_std::Component) {
+            if matches!(component.kind, ComponentKind::Text { .. }) {
+                assert_eq!(component.style.text_decoration, TextDecoration::None);
+            }
+            for child in &component.children {
+                assert_no_copied_decoration(child);
+            }
+        }
+        assert_no_copied_decoration(marker);
+    }
+    assert_eq!(letters, "PASS");
+
+    crate::stylesheet::clear_rules();
+}

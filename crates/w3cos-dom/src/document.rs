@@ -6372,15 +6372,17 @@ impl Document {
                 ))
             }
             [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
-                if principal_box_can_merge_generated_inline_text(&style) =>
+                if generated_single_text_can_be_a_styled_leaf(&style) =>
             {
-                // A transparent, auto-sized inline principal box is
-                // indistinguishable from its text run. Width, height,
-                // background, padding, or decoration belong on the
-                // principal box (CSS Display / Generated Content), so
-                // those cases fall through to the wrapper below. That
-                // matters when the used display is later blockified
-                // (flex/grid item, float, abspos).
+                // A single generated string can carry the principal style
+                // as a text leaf, which is the cw58y input that layout
+                // (NG and legacy) already handles: width on a non-replaced
+                // in-flow inline does not apply (CSS 2.1 10.3.1), and an
+                // inline-block that holds only this text — including an
+                // empty `content:''` strut — is an atomic text leaf
+                // (CSS 2.1 10.8.1). Painted or decorated principals
+                // (borders, UA link style on `::scroll-marker`) still
+                // fall through to the wrapper.
                 Some(w3cos_std::Component::text(text.clone(), style))
             }
             [GeneratedContentItem::Image(source)] => {
@@ -6448,41 +6450,42 @@ impl Document {
                         | w3cos_std::style::Display::TableRow
                 ) {
                     if style.display == w3cos_std::style::Display::Inline {
-                        // The principal box is the pseudo, not the
-                        // anonymous IFC for its `content` items. Tagging
-                        // the principal itself as the IFC lets a parent
-                        // block adopt it as its line box and hoist the
-                        // text, dropping the pseudo's border/background.
-                        let mut line_style = inherited;
-                        line_style.display = w3cos_std::style::Display::Flex;
-                        line_style.flex_direction = w3cos_std::style::FlexDirection::Row;
-                        line_style.flex_wrap = if matches!(
-                            style.white_space,
-                            w3cos_std::style::WhiteSpace::NoWrap
-                                | w3cos_std::style::WhiteSpace::Pre
-                        ) {
-                            w3cos_std::style::FlexWrap::NoWrap
-                        } else {
-                            w3cos_std::style::FlexWrap::Wrap
-                        };
-                        line_style.align_items = w3cos_std::style::AlignItems::Baseline;
-                        line_style
-                            .custom_properties
-                            .get_or_insert_with(Default::default)
-                            .insert(
-                                "--w3cos-internal-inline-formatting-context".to_string(),
-                                "1".to_string(),
-                            );
-                        let children = fixup_css_table_children(
-                            &style,
-                            vec![w3cos_std::Component::row(line_style, children)],
-                        );
+                        // CSS 2.1 9.2.2 / 9.4.2: a non-replaced inline box
+                        // does not establish an IFC. Its `content` items
+                        // participate in the enclosing IFC, like an
+                        // authored <span> or <a>. An inner IFC row would
+                        // make the principal atomic, so "PA"+"SS" would
+                        // not join and adjacent link-styled letters would
+                        // not share a line the way the <a> ref does.
+                        // Do not tag the principal as an IFC either: a
+                        // parent block would adopt it as its line box and
+                        // hoist the text, dropping the pseudo's border.
+                        // Still expose word-break items under the principal's
+                        // own `white-space`, so 'two words' can wrap in the
+                        // enclosing line.
+                        let children = fixup_css_table_children(&style, children);
+                        let children = split_wrapping_ascii_text_runs(children, &style);
+                        let children = group_unbroken_ascii_inline_words(children, &style);
                         return Some(w3cos_std::Component::row(style, children));
                     }
-                    style.flex_direction = w3cos_std::style::FlexDirection::Row;
-                    style.align_items = w3cos_std::style::AlignItems::Baseline;
-                    let children = fixup_css_table_children(&style, children);
-                    Some(w3cos_std::Component::row(style, children))
+                    // Inline-block (and other atomic inlines) establish
+                    // their own formatting context. Do not stamp
+                    // flex-row / align-items:baseline onto the principal:
+                    // that changes the used baseline of an empty
+                    // inline-block strut (`vertical-align`, grid-lanes
+                    // intrinsic size). An empty `content:''` box keeps
+                    // used width/height and no dummy text child.
+                    let children = if children.iter().all(|child| {
+                        matches!(
+                            &child.kind,
+                            w3cos_std::ComponentKind::Text { content } if content.is_empty()
+                        ) && child.children.is_empty()
+                    }) {
+                        Vec::new()
+                    } else {
+                        fixup_css_table_children(&style, children)
+                    };
+                    Some(w3cos_std::Component::boxed(style, children))
                 } else {
                     let mut line_style = inherited;
                     line_style.display = w3cos_std::style::Display::Flex;
@@ -15073,6 +15076,33 @@ fn principal_box_can_collapse_generated_text(style: &w3cos_std::style::Style) ->
         && principal_box_can_merge_generated_inline_text(style)
 }
 
+fn generated_single_text_can_be_a_styled_leaf(style: &w3cos_std::style::Style) -> bool {
+    use w3cos_std::style::{Dimension, Display, Float, Position};
+    // Width and height do not apply to a non-replaced in-flow inline, so
+    // they alone must not keep a principal box that legacy will honor as
+    // a 5em advance (floats-114 `.a`). A floated generated string is a
+    // blockified text leaf in the same way (cw58y / floats-114 `.b`).
+    // Painted or decorated principals, and flex/grid items with a used
+    // size plus decoration, still stay wrapped.
+    if matches!(style.position, Position::Absolute | Position::Fixed) {
+        return false;
+    }
+    let in_flow_inline = matches!(style.display, Display::Inline | Display::InlineBlock)
+        && style.float == Float::None;
+    let blockified_float = style.float != Float::None && style.display == Display::Block;
+    if !in_flow_inline && !blockified_float {
+        return false;
+    }
+    let mut unsize = style.clone();
+    unsize.width = Dimension::Auto;
+    unsize.height = Dimension::Auto;
+    unsize.min_width = Dimension::Auto;
+    unsize.min_height = Dimension::Auto;
+    unsize.max_width = Dimension::Auto;
+    unsize.max_height = Dimension::Auto;
+    principal_box_can_merge_generated_inline_text(&unsize)
+}
+
 fn principal_box_can_merge_generated_inline_text(style: &w3cos_std::style::Style) -> bool {
     use w3cos_std::style::{Dimension, Transform2D};
 
@@ -15329,6 +15359,65 @@ fn split_css_tokens(value: &str) -> Vec<String> {
         .map(|token| token.trim_matches(|character: char| matches!(character, ',' | '/')))
         .filter(|token| !token.is_empty())
         .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn split_wrapping_ascii_text_runs(
+    children: Vec<w3cos_std::Component>,
+    parent: &w3cos_std::style::Style,
+) -> Vec<w3cos_std::Component> {
+    use w3cos_std::{Component, component::ComponentKind, style::*};
+    if !matches!(parent.white_space, WhiteSpace::Normal | WhiteSpace::PreLine) {
+        return children;
+    }
+    children
+        .into_iter()
+        .flat_map(|child| {
+            let ComponentKind::Text { content } = &child.kind else {
+                return vec![child];
+            };
+            if child.style.display != Display::Inline
+                || child.style.position != Position::Static
+                || !matches!(
+                    child.style.white_space,
+                    WhiteSpace::Normal | WhiteSpace::PreLine
+                )
+                || content.split(' ').filter(|word| !word.is_empty()).count() < 2
+            {
+                return vec![child];
+            }
+            let words: Vec<&str> = content.split(' ').filter(|word| !word.is_empty()).collect();
+            let mut pieces = Vec::with_capacity(words.len() * 2 + 1);
+            if content.starts_with(' ') {
+                let mut space = child.clone();
+                space.kind = ComponentKind::Text {
+                    content: " ".to_string(),
+                };
+                pieces.push(space);
+            }
+            for (index, word) in words.iter().enumerate() {
+                let mut fragment = child.clone();
+                fragment.kind = ComponentKind::Text {
+                    content: (*word).to_string(),
+                };
+                pieces.push(fragment);
+                if index + 1 < words.len() {
+                    let mut space = child.clone();
+                    space.kind = ComponentKind::Text {
+                        content: " ".to_string(),
+                    };
+                    pieces.push(space);
+                }
+            }
+            if content.ends_with(' ') && !content.chars().all(|ch| ch == ' ') {
+                let mut space = child.clone();
+                space.kind = ComponentKind::Text {
+                    content: " ".to_string(),
+                };
+                pieces.push(space);
+            }
+            pieces
+        })
         .collect()
 }
 
@@ -15878,6 +15967,32 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
                 properties.contains_key("--w3cos-internal-inline-formatting-context")
             })
     {
+        // A non-atomic `display:inline` principal is not itself an IFC,
+        // but its text still wraps in the enclosing line. After bidi
+        // coalescing joins a multi-word run, re-expose the spaces.
+        if component.style.display == Display::Inline
+            && component.style.position == Position::Static
+            && component.style.float == w3cos_std::style::Float::None
+            && matches!(
+                component.style.white_space,
+                WhiteSpace::Normal | WhiteSpace::PreLine
+            )
+            && component.children.iter().any(|child| {
+                // Words beside a replaced item need break opportunities
+                // in the enclosing IFC. Do not treat `inline-flex` (bidi
+                // isolate/override boxes, e.g. <bdo>) or other atomic
+                // inlines as a reason to split adjacent authored text;
+                // that turned "A " into two nodes beside a nested bdo.
+                // Pure-text inlines already fragment via the parent IFC.
+                matches!(
+                    child.kind,
+                    ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
+                )
+            })
+        {
+            let children = std::mem::take(&mut component.children);
+            component.children = split_wrapping_ascii_text_runs(children, &component.style);
+        }
         return;
     }
 
@@ -15916,8 +16031,11 @@ fn split_padded_inline_text_fragments(component: &mut w3cos_std::Component) {
             && matches!(child.style.align_self, w3cos_std::style::AlignSelf::Auto
                 | w3cos_std::style::AlignSelf::Baseline)
             && matches!(child.style.white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
-            && if bordered { principal_box_can_merge_generated_inline_text(&principal) }
-                else { painted_inline_text_box_can_merge(&child.style) }
+            && if bordered {
+                principal_box_can_merge_generated_inline_text(&principal)
+            } else {
+                painted_inline_text_box_can_merge(&child.style)
+            }
             && child.style.border_radius == 0.0
             && [child.style.border_top_left_radius, child.style.border_top_right_radius,
                 child.style.border_bottom_left_radius, child.style.border_bottom_right_radius]
@@ -19945,7 +20063,9 @@ mod generated_counter_format_tests {
 mod image_component_tests {
     use super::*;
     use w3cos_std::component::ComponentKind;
-    use w3cos_std::style::{AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing};
+    use w3cos_std::style::{
+        AlignSelf, Dimension, Display, FlexWrap, Float, Position, Spacing, WhiteSpace,
+    };
 
     #[test]
     fn adjacent_decorated_inline_spaces_collapse_to_one_visual_space() {
@@ -24030,7 +24150,7 @@ mod image_component_tests {
             document.body().append_child(&mut document, host);
             let tree = document.to_component_tree();
             fn find_line(node: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
-                if matches!(node.kind, ComponentKind::Row)
+                if matches!(node.kind, ComponentKind::Row | ComponentKind::Box)
                     && node
                         .children
                         .iter()
@@ -24041,17 +24161,46 @@ mod image_component_tests {
                 node.children.iter().find_map(find_line)
             }
             let line = find_line(&tree).expect("generated inline content row");
-            assert_eq!(
-                line.style.flex_wrap, expected_wrap,
-                "{display}: {white_space}"
-            );
-            assert!(
-                line.style
-                    .custom_properties
-                    .as_ref()
-                    .is_some_and(|properties| properties
-                        .contains_key("--w3cos-internal-inline-formatting-context"))
-            );
+            if display == "inline" {
+                // A non-replaced inline is not itself an IFC; wrap lives on
+                // the enclosing line. White-space is still honored by the
+                // principal's used style (word splitting is tested above).
+                assert_eq!(
+                    line.style.display,
+                    Display::Inline,
+                    "{display}: {white_space}"
+                );
+                assert!(
+                    !line
+                        .style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|properties| {
+                            properties.contains_key("--w3cos-internal-inline-formatting-context")
+                        }),
+                    "display:inline principal must not become an IFC ({white_space})"
+                );
+                assert_eq!(
+                    line.style.white_space,
+                    match white_space {
+                        "pre" => WhiteSpace::Pre,
+                        _ => WhiteSpace::Normal,
+                    },
+                    "{display}: {white_space}"
+                );
+            } else {
+                assert_eq!(
+                    line.style.flex_wrap, expected_wrap,
+                    "{display}: {white_space}"
+                );
+                assert!(
+                    line.style
+                        .custom_properties
+                        .as_ref()
+                        .is_some_and(|properties| properties
+                            .contains_key("--w3cos-internal-inline-formatting-context"))
+                );
+            }
         }
         crate::stylesheet::clear_rules();
     }

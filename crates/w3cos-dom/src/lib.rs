@@ -2689,7 +2689,70 @@ mod tests {
                     return true;
                 }
             }
+            // Flatten may split a generated run into word fragments; the
+            // used border then lives on those fragments, not the covering
+            // ancestor (which may be the origin box).
+            if let Some(fragment) = first_decorated_generated_fragment(node, needle) {
+                path.push(fragment);
+            }
             true
+        }
+        fn first_decorated_generated_fragment<'a>(
+            node: &'a w3cos_std::Component,
+            needle: &str,
+        ) -> Option<&'a w3cos_std::Component> {
+            fn is_decorated(node: &w3cos_std::Component) -> bool {
+                node.style.border_width > 0.0
+                    || [
+                        node.style.border_top_width,
+                        node.style.border_right_width,
+                        node.style.border_bottom_width,
+                        node.style.border_left_width,
+                    ]
+                    .into_iter()
+                    .any(|width| width.unwrap_or(0.0) > 0.0)
+                    || node.style.background.a != 0
+                    || node.style.padding != w3cos_std::style::Edges::ZERO
+                    || node.style.width != w3cos_std::style::Dimension::Auto
+                    || node.style.height != w3cos_std::style::Dimension::Auto
+                    || node.style.text_decoration != w3cos_std::style::TextDecoration::None
+                    || node.style.float != w3cos_std::style::Float::None
+            }
+            fn collect_leaves<'a>(
+                node: &'a w3cos_std::Component,
+                leaves: &mut Vec<&'a w3cos_std::Component>,
+            ) {
+                if matches!(node.kind, w3cos_std::ComponentKind::Text { .. })
+                    && node.children.is_empty()
+                {
+                    leaves.push(node);
+                }
+                for child in &node.children {
+                    collect_leaves(child, leaves);
+                }
+            }
+            let mut leaves = Vec::new();
+            collect_leaves(node, &mut leaves);
+            let joined = leaves
+                .iter()
+                .map(|leaf| match &leaf.kind {
+                    w3cos_std::ComponentKind::Text { content } => content.as_str(),
+                    _ => "",
+                })
+                .collect::<String>();
+            if !joined.contains(needle) {
+                return None;
+            }
+            leaves.into_iter().find(|leaf| {
+                is_decorated(leaf)
+                    && match &leaf.kind {
+                        w3cos_std::ComponentKind::Text { content } => {
+                            needle.contains(content.as_str())
+                                && !content.chars().all(char::is_whitespace)
+                        }
+                        _ => false,
+                    }
+            })
         }
         let mut path = Vec::new();
         assert!(
@@ -2701,8 +2764,20 @@ mod tests {
             .copied()
             .find(|node| {
                 node.style.border_width > 0.0
+                    || [
+                        node.style.border_top_width,
+                        node.style.border_right_width,
+                        node.style.border_bottom_width,
+                        node.style.border_left_width,
+                    ]
+                    .into_iter()
+                    .any(|width| width.unwrap_or(0.0) > 0.0)
                     || node.style.background.a != 0
                     || node.style.padding != w3cos_std::style::Edges::ZERO
+                    || node.style.width != w3cos_std::style::Dimension::Auto
+                    || node.style.height != w3cos_std::style::Dimension::Auto
+                    || node.style.text_decoration != w3cos_std::style::TextDecoration::None
+                    || node.style.float != w3cos_std::style::Float::None
             })
             .or_else(|| path.last().copied())
             .expect("generated text path")
@@ -2842,7 +2917,22 @@ mod tests {
             "the generated principal must be a distinct box from the origin"
         );
         assert_eq!(principal.style.border_width, 15.0);
-        assert_eq!(generated.style.border_width, 3.0);
+        let used_border = |style: &w3cos_std::style::Style| {
+            [
+                style.border_width,
+                style.border_top_width.unwrap_or(0.0),
+                style.border_right_width.unwrap_or(0.0),
+                style.border_bottom_width.unwrap_or(0.0),
+                style.border_left_width.unwrap_or(0.0),
+            ]
+            .into_iter()
+            .fold(0.0_f32, f32::max)
+        };
+        assert_eq!(
+            used_border(&generated.style),
+            3.0,
+            "used generated border is medium, not the origin's 15px"
+        );
         assert_eq!(
             generated.style.border_color,
             w3cos_std::Color::rgb(255, 165, 0)
@@ -2872,13 +2962,202 @@ mod tests {
             !std::ptr::eq(generated, principal),
             "border:inherit belongs on the generated principal, not the origin"
         );
-        assert_eq!(generated.style.border_width, 2.0);
-        assert_eq!(generated.style.border_width, principal.style.border_width);
+        let used_border = |style: &w3cos_std::style::Style| {
+            [
+                style.border_width,
+                style.border_top_width.unwrap_or(0.0),
+                style.border_right_width.unwrap_or(0.0),
+                style.border_bottom_width.unwrap_or(0.0),
+                style.border_left_width.unwrap_or(0.0),
+            ]
+            .into_iter()
+            .fold(0.0_f32, f32::max)
+        };
+        assert_eq!(
+            used_border(&generated.style),
+            2.0,
+            "border:inherit used width matches the origin"
+        );
+        assert_eq!(used_border(&generated.style), used_border(&principal.style));
         assert_eq!(
             generated.style.border_color,
             w3cos_std::Color::rgb(0, 128, 0)
         );
         assert_eq!(generated.style.border_color, principal.style.border_color);
+        crate::stylesheet::clear_rules();
+    }
+
+    fn has_ifc(style: &w3cos_std::style::Style) -> bool {
+        style.custom_properties.as_ref().is_some_and(|properties| {
+            properties.contains_key("--w3cos-internal-inline-formatting-context")
+        })
+    }
+
+    #[test]
+    fn generated_inline_with_width_stays_in_the_enclosing_ifc() {
+        // floats-114 .a: specified width does not apply to a non-replaced
+        // in-flow inline, and must not wrap "PA" in an inner IFC that would
+        // make it atomic beside authored "SS". Layout ignores the used
+        // width; the principal stays in the paragraph IFC.
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "p::before",
+            &[("content", "'PA'"), ("float", "none"), ("width", "5em")],
+        );
+
+        let mut doc = Document::new();
+        let item = doc.create_element("p");
+        let text = doc.create_text_node("SS");
+        item.append_child(&mut doc, text);
+        doc.body().append_child(&mut doc, item);
+
+        let tree = doc.to_component_tree();
+        fn find_shared_line(node: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            let text = descendant_generated_text(node);
+            let has_both = text.contains("PASS") || (text.contains("PA") && text.contains("SS"));
+            if !has_both {
+                return node.children.iter().find_map(find_shared_line);
+            }
+            if let Some(deeper) = node.children.iter().find_map(find_shared_line) {
+                return Some(deeper);
+            }
+            Some(node)
+        }
+        let line = find_shared_line(&tree).expect("PA and SS share a line");
+        assert!(
+            has_ifc(&line.style)
+                || descendant_generated_text(line).contains("SS")
+                || descendant_generated_text(line).contains("PASS"),
+            "PA must share a line with SS, display={:?} ifc={} text={:?}",
+            line.style.display,
+            has_ifc(&line.style),
+            descendant_generated_text(line)
+        );
+        let generated = generated_principal_box(&tree, "PA");
+        assert!(
+            matches!(generated.kind, w3cos_std::ComponentKind::Text { .. }),
+            "width on an in-flow inline is a text leaf, kind={:?}",
+            generated.kind
+        );
+        assert!(
+            !has_ifc(&generated.style),
+            "an in-flow inline text leaf is not an IFC"
+        );
+        assert!(
+            generated
+                .children
+                .iter()
+                .all(|child| !has_ifc(&child.style)),
+            "content items must not be wrapped in an inner IFC"
+        );
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn floated_generated_principal_is_blockified_and_keeps_its_box() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("p::before", &[("content", "'PA'"), ("float", "left")]);
+        crate::stylesheet::register_rule(
+            "p::after",
+            &[("content", "'PA'"), ("float", "left"), ("height", "5em")],
+        );
+
+        let mut doc = Document::new();
+        let item = doc.create_element("p");
+        let text = doc.create_text_node("SS");
+        item.append_child(&mut doc, text);
+        doc.body().append_child(&mut doc, item);
+
+        let tree = doc.to_component_tree();
+        let before = generated_principal_box(&tree, "PA");
+        // There may be two "PA" principals; pick by float+height for after.
+        fn walk<'a>(c: &'a w3cos_std::Component, out: &mut Vec<&'a w3cos_std::Component>) {
+            if descendant_generated_text(c).contains("PA")
+                && c.style.float != w3cos_std::style::Float::None
+            {
+                out.push(c);
+            }
+            for child in &c.children {
+                walk(child, out);
+            }
+        }
+        let mut floated = Vec::new();
+        walk(&tree, &mut floated);
+        // Innermost floated principals first; keep unique boxes with float.
+        assert!(
+            floated
+                .iter()
+                .any(|c| c.style.display == w3cos_std::style::Display::Block
+                    && c.style.float == w3cos_std::style::Float::Left
+                    && c.style.height == w3cos_std::style::Dimension::Auto),
+            "floated :before is blockified, got {:?}",
+            floated
+                .iter()
+                .map(|c| (c.style.display, c.style.float, c.style.height))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            floated
+                .iter()
+                .any(|c| c.style.display == w3cos_std::style::Display::Block
+                    && c.style.float == w3cos_std::style::Float::Left
+                    && c.style.height == w3cos_std::style::Dimension::Em(5.0)),
+            "floated :after keeps height 5em"
+        );
+        let _ = before;
+        crate::stylesheet::clear_rules();
+    }
+
+    #[test]
+    fn empty_inline_block_generated_box_keeps_used_size_and_valign() {
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule(
+            "div::before",
+            &[
+                ("content", "''"),
+                ("display", "inline-block"),
+                ("width", "10px"),
+                ("height", "60px"),
+                ("vertical-align", "bottom"),
+            ],
+        );
+
+        let mut doc = Document::new();
+        let item = doc.create_element("div");
+        doc.body().append_child(&mut doc, item);
+
+        let tree = doc.to_component_tree();
+        fn find_ib(c: &w3cos_std::Component) -> Option<&w3cos_std::Component> {
+            if c.style.display == w3cos_std::style::Display::InlineBlock
+                && c.style.width == w3cos_std::style::Dimension::Px(10.0)
+                && c.style.height == w3cos_std::style::Dimension::Px(60.0)
+            {
+                return Some(c);
+            }
+            c.children.iter().find_map(find_ib)
+        }
+        let generated = find_ib(&tree).expect("empty inline-block strut");
+        // cw58y / CSS 2.1 10.8.1: an inline-block that holds only this
+        // (possibly empty) text is a sized atomic text leaf, not a
+        // flex-stamped principal that changes the used baseline.
+        assert!(
+            matches!(
+                generated.kind,
+                w3cos_std::ComponentKind::Text { ref content } if content.is_empty()
+            ),
+            "empty IB is a text leaf, kind={:?}",
+            generated.kind
+        );
+        assert!(!has_ifc(&generated.style));
+        assert_eq!(
+            generated
+                .style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get("--w3cos-internal-vertical-align-keyword"))
+                .map(String::as_str),
+            Some("bottom")
+        );
         crate::stylesheet::clear_rules();
     }
 
