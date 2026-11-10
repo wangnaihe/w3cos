@@ -4228,6 +4228,29 @@ pub(super) fn is_author_grid(style: &Style) -> bool {
     style.display == Display::Grid || is_grid_lanes(style) || is_inline_grid(style)
 }
 
+/// Attach a block-ellipsis to the last kept line of already-placed
+/// in-flow children, used when a later sibling does not fit a height cap
+/// (line-clamp-auto-033).
+fn ellipsize_last_kept_line(children: &mut [(f32, f32, BoxFragment)]) {
+    fn mark(fragment: &mut BoxFragment) -> bool {
+        for child in fragment.children.iter_mut().rev() {
+            if mark(&mut child.2) {
+                return true;
+            }
+        }
+        if fragment.text_range.is_some() {
+            fragment.ellipsis = true;
+            return true;
+        }
+        false
+    }
+    for (_, _, fragment) in children.iter_mut().rev() {
+        if mark(fragment) {
+            return;
+        }
+    }
+}
+
 fn is_bfc_root(style: &Style) -> bool {
     // A flex or grid container establishes an independent formatting
     // context (CSS Flexbox §3, CSS Grid §1). Multicol containers do too
@@ -4808,14 +4831,35 @@ pub(super) fn layout_block_in(
 
     // This box's own line-clamp starts a budget for same-BFC descendants;
     // otherwise inherit the ancestor BFC budget (CSS Overflow 4).
+    // Integer clamp is a line count; auto / continue:collapse uses the
+    // remaining content-box block size so descendant edges consume it.
     let mut clamp = if let Some(n) = inline::clamp_lines(style) {
-        Some(super::LineClampState {
-            remaining: n,
-            ellipsis: inline::clamp_has_ellipsis(style),
-        })
+        if inline::clamp_is_auto(style) {
+            Some(super::LineClampState {
+                remaining: None,
+                remaining_block: inline::definite_clamp_block(style),
+                ellipsis: inline::clamp_has_ellipsis(style),
+            })
+        } else {
+            Some(super::LineClampState {
+                remaining: Some(n),
+                remaining_block: None,
+                ellipsis: inline::clamp_has_ellipsis(style),
+            })
+        }
     } else {
         space.line_clamp
     };
+    // Inherited height cap is a remaining margin-box budget; this box's
+    // margins, padding, and border consume it before its content.
+    if inline::clamp_lines(style).is_none() {
+        if let Some(c) = clamp.as_mut() {
+            if let Some(cap) = c.remaining_block.as_mut() {
+                let [mt, _, mb, _] = metrics.margin;
+                *cap = (*cap - mt - mb - bt - bb - pt - pb).max(0.0);
+            }
+        }
+    }
     let mut child_space = child_space;
     child_space.line_clamp = clamp;
     let mut lines_used = 0usize;
@@ -4926,7 +4970,12 @@ pub(super) fn layout_block_in(
         at_top = result.children.is_empty();
         lines_used = result.lines_used;
         if let Some(c) = clamp.as_mut() {
-            c.remaining = c.remaining.saturating_sub(result.lines_used);
+            if let Some(remaining) = c.remaining.as_mut() {
+                *remaining = remaining.saturating_sub(result.lines_used);
+            }
+            if let Some(cap) = c.remaining_block.as_mut() {
+                *cap = (*cap - result.height).max(0.0);
+            }
         }
         children.extend(
             result
@@ -4988,7 +5037,9 @@ pub(super) fn layout_block_in(
         // `continue: collapse` hides later in-flow boxes once the line
         // budget is spent (line-clamp-008). Out-of-flow static positions
         // were already recorded.
-        if clamp.as_ref().is_some_and(|c| c.remaining == 0) {
+        if clamp.as_ref().is_some_and(|c| {
+            c.remaining == Some(0) || c.remaining_block.is_some_and(|h| h <= 1.0 / 128.0)
+        }) {
             child = next;
             continue;
         }
@@ -5548,11 +5599,38 @@ pub(super) fn layout_block_in(
             result = fitted;
         }
         float_overlap |= result.float_overlap;
+        // Height-based auto clamp: hide a later sibling (including an
+        // independent BFC) that does not fit the remaining cap, and put
+        // the block-ellipsis on the last kept line (line-clamp-auto-033).
+        // Integer line-clamp still shows a BFC and does not count its
+        // internal lines (line-clamp-007).
+        if let Some(cap) = clamp.as_ref().and_then(|c| c.remaining_block) {
+            if result.fragment.height > cap + 1.0 / 128.0 {
+                if clamp.as_ref().is_some_and(|c| c.ellipsis) {
+                    ellipsize_last_kept_line(&mut children);
+                }
+                if let Some(c) = clamp.as_mut() {
+                    c.remaining_block = Some(0.0);
+                    if c.remaining.is_some() {
+                        c.remaining = Some(0);
+                    }
+                }
+                child = next;
+                continue;
+            }
+        }
         if nested.line_clamp.is_some() {
             let used = result.lines_used;
             lines_used += used;
             if let Some(c) = clamp.as_mut() {
-                c.remaining = c.remaining.saturating_sub(used);
+                if let Some(remaining) = c.remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(used);
+                }
+            }
+        }
+        if let Some(c) = clamp.as_mut() {
+            if let Some(cap) = c.remaining_block.as_mut() {
+                *cap = (*cap - result.fragment.height).max(0.0);
             }
         }
         // Paint-wrapped block text and BFC roots must avoid floats too

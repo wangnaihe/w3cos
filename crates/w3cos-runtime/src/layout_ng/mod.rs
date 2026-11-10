@@ -161,11 +161,15 @@ pub(crate) struct ConstraintSpace {
     pub line_clamp: Option<LineClampState>,
 }
 
-/// How many line boxes may still be kept in the current line-clamp BFC,
-/// and whether the last kept line gets a block-ellipsis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Remaining clamp budget in the current line-clamp BFC, and whether the
+/// last kept line gets a block-ellipsis. Integer `line-clamp` uses a
+/// line-box count; `line-clamp: auto` / `continue: collapse` uses a
+/// remaining content-box block size so descendant padding, border, and
+/// margin consume the cap (CSS Overflow 4).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct LineClampState {
-    pub remaining: usize,
+    pub remaining: Option<usize>,
+    pub remaining_block: Option<f32>,
     pub ellipsis: bool,
 }
 

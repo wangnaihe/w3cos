@@ -95,11 +95,35 @@ pub(super) fn clamp_has_ellipsis(style: &Style) -> bool {
 
 /// Line budget and ellipsis flag for this IFC: the box's own `line-clamp`
 /// wins, otherwise a same-BFC ancestor budget on the constraint space.
+/// An inherited height cap becomes `floor(remaining_block / used lh)`.
 fn clamp_budget(style: &Style, space: &super::ConstraintSpace) -> Option<(usize, bool)> {
     if let Some(n) = clamp_lines(style) {
         return Some((n, clamp_has_ellipsis(style)));
     }
-    space.line_clamp.map(|c| (c.remaining, c.ellipsis))
+    let c = space.line_clamp?;
+    let from_lines = c.remaining;
+    let from_height = c.remaining_block.map(|cap| {
+        let line = style.used_line_height_px();
+        if line <= EPSILON {
+            0
+        } else {
+            (cap / line + EPSILON).floor().max(0.0) as usize
+        }
+    });
+    match (from_lines, from_height) {
+        (Some(n), Some(h)) => Some((n.min(h), c.ellipsis)),
+        (Some(n), None) => Some((n, c.ellipsis)),
+        (None, Some(h)) => Some((h, c.ellipsis)),
+        (None, None) => None,
+    }
+}
+
+/// `line-clamp: auto` or `continue: collapse` without an integer
+/// `max-lines`, when a definite height/`max-height` cap exists.
+pub(super) fn clamp_is_auto(style: &Style) -> bool {
+    marker_value(style, CONTINUE_MARKER) == Some("collapse")
+        && matches!(marker_value(style, LINE_CLAMP_MARKER), Some("auto") | None)
+        && auto_clamp_lines(style).is_some()
 }
 
 /// How many line boxes fit in the content-box block size cap used by
@@ -115,7 +139,7 @@ fn auto_clamp_lines(style: &Style) -> Option<usize> {
 
 /// Definite content-box block size from `height` and/or `max-height`.
 /// `min-height` is not a clamp cap (line-clamp-auto-012).
-fn definite_clamp_block(style: &Style) -> Option<f32> {
+pub(super) fn definite_clamp_block(style: &Style) -> Option<f32> {
     let resolve = |d: Dimension| -> Option<f32> {
         match d {
             Dimension::Px(v) => Some(v),
@@ -2793,7 +2817,15 @@ fn layout_lines(
             Some((n, e)) => (Some(n), e),
             None => (None, false),
         };
-        if let Some(n) = clamp_n.filter(|&n| n < line_count) {
+        // Inherited height-based auto clamp emits per-line pieces even
+        // when every line fits, so a later sibling that does not fit can
+        // still attach the block-ellipsis to the last kept line (auto-033).
+        let force_lines = space
+            .line_clamp
+            .is_some_and(|c| c.remaining_block.is_some());
+        if let Some(n) = clamp_n.filter(|&n| n < line_count || force_lines) {
+            let n = n.min(line_count);
+            let use_ellipsis = use_ellipsis && n < line_count;
             // `-webkit-line-clamp`: one piece per kept line, the last one
             // followed by the block ellipsis. `line-clamp: auto` with a
             // zero content-box cap keeps no lines. `continue: collapse`

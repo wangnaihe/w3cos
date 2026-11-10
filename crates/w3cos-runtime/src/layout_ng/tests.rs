@@ -8734,6 +8734,120 @@ fn line_clamp_counts_same_bfc_block_children() {
     assert!(got.iter().all(|t| !t.contains('…')), "no ellipsis: {got:?}");
 }
 
+/// `line-clamp: auto` clamps by remaining content-box height, so a
+/// descendant's padding and border consume the cap (auto-018) and an
+/// independent BFC that does not fit is hidden (auto-033).
+#[test]
+fn line_clamp_auto_uses_remaining_block_height() {
+    use w3cos_std::style::{CustomProperties, Display, Edges, Overflow, WhiteSpace};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 16.0,
+        line_height: 32.0,
+        line_height_is_normal: false,
+        line_height_computed_px: Some(32.0),
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::Pre,
+        ..font.clone()
+    };
+    let pre_block = Style {
+        white_space: WhiteSpace::Pre,
+        ..font.clone()
+    };
+    let auto_clamp = |style: Style| Style {
+        custom_properties: Some(CustomProperties::from_iter([
+            (
+                "--w3cos-internal-line-clamp".to_string(),
+                "auto".to_string(),
+            ),
+            (
+                "--w3cos-internal-continue".to_string(),
+                "collapse".to_string(),
+            ),
+        ])),
+        ..style
+    };
+    let leaf = |box_style: Style, text_style: Style, content: &str| {
+        node(box_style, vec![Component::text(content, text_style)])
+    };
+    let layout = |style: Style, kids: Vec<Component>| {
+        let root = node(block(), vec![node(style, kids)]);
+        let flat = pre_flatten(&root);
+        layout_tree_with_text(&root, &flat, 800.0, 600.0)
+    };
+    let six = "A\nB\nC\nD\nE\nF";
+
+    // Direct content, no descendant edges: 5lh keeps 5 of 6 lines
+    // (auto-001 shape).
+    let direct = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            max_height: Dimension::Lh(5.0),
+            white_space: WhiteSpace::Pre,
+            ..font.clone()
+        }),
+        vec![Component::text(six, text_style.clone())],
+    )
+    .expect("auto 5lh direct");
+    let got: Vec<&str> = direct.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["A", "B", "C", "D", "E…"]);
+
+    // Child padding 2px + border 2px (8px total) under max-height 5lh:
+    // 5 lines would overflow, so keep 4 + ellipsis (auto-018).
+    let mut padded = pre_block.clone();
+    padded.padding = Edges::all(2.0);
+    padded.border_top_width = Some(2.0);
+    padded.border_bottom_width = Some(2.0);
+    padded.border_left_width = Some(2.0);
+    padded.border_right_width = Some(2.0);
+    let edged = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            max_height: Dimension::Lh(5.0),
+            ..font.clone()
+        }),
+        vec![leaf(padded, text_style.clone(), six)],
+    )
+    .expect("auto 5lh child edges");
+    let got: Vec<&str> = edged.1.iter().map(|t| t.text.as_str()).collect();
+    let (_, _, _, h) = rect(&edged.0, 1);
+    assert_eq!(got, ["A", "B", "C", "D…"], "edged texts {got:?}");
+    assert!(
+        (h - (32.0 * 4.0 + 8.0)).abs() < 1.0,
+        "edged height {h}, expected 136"
+    );
+
+    // Four lines then a 3-line independent BFC under max-height 6lh:
+    // clamp before the BFC and ellipsize the fourth line (auto-033).
+    let mut bfc = pre_block.clone();
+    bfc.overflow = Overflow::Auto;
+    bfc.display = Display::FlowRoot;
+    let before_bfc = layout(
+        auto_clamp(Style {
+            width: Dimension::Px(240.0),
+            max_height: Dimension::Lh(6.0),
+            ..font.clone()
+        }),
+        vec![
+            leaf(pre_block.clone(), text_style.clone(), "A\nB\nC\nD"),
+            leaf(bfc, text_style.clone(), "E\nF\nG"),
+            leaf(pre_block, text_style, "H"),
+        ],
+    )
+    .expect("auto 6lh hide BFC");
+    let got: Vec<&str> = before_bfc.1.iter().map(|t| t.text.as_str()).collect();
+    let (_, _, _, h) = rect(&before_bfc.0, 1);
+    assert_eq!(got, ["A", "B", "C", "D…"], "hide-BFC texts {got:?}");
+    assert!(
+        (h - 32.0 * 4.0).abs() < 1.0,
+        "hide-BFC height {h}, expected 128"
+    );
+}
+
 /// A column flex item's flexed size is not a percentage basis for its
 /// children while the container's height is indefinite
 /// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.
