@@ -1331,6 +1331,77 @@ fn inline_blocks_are_atomic_items() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+#[test]
+fn orthogonal_inline_block_synthesizes_under_margin_edge_with_text() {
+    // CSS Align 3 §9.1 / CSS Inline 3 / csswg #4675: a vertical-lr
+    // inline-block in a horizontal-tb IFC has no typographic baseline in
+    // the line's block axis, so the alphabetic baseline is synthesized
+    // from the under margin edge. A 20px Ahem "X" has its typographic
+    // first baseline at 16px; a 20px "É" in a vertical-lr IB with
+    // 10px padding-bottom has a 30px margin box whose under edge is the
+    // synthesized baseline. The text sits 14px down so the two edges
+    // coincide; the padding sits above that edge (a typographic em-bottom
+    // would have put the 10px below the "X").
+    use w3cos_std::style::WritingMode;
+    let _ahem = AhemGuard::new();
+    let mut container = Style {
+        display: Display::Block,
+        width: Dimension::Px(200.0),
+        ..Style::default()
+    };
+    font(&mut container, 20.0, LineHeight::Number(1.0));
+    container
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(inline::IFC_MARKER.into(), "1".into());
+    let mut text_style = Style {
+        display: Display::Inline,
+        ..Style::default()
+    };
+    font(&mut text_style, 20.0, LineHeight::Number(1.0));
+    let mut ib = Style {
+        display: Display::InlineBlock,
+        writing_mode: WritingMode::VerticalLr,
+        padding: Edges {
+            top: Spacing::Px(0.0),
+            right: Spacing::Px(0.0),
+            bottom: Spacing::Px(10.0),
+            left: Spacing::Px(0.0),
+        },
+        ..Style::default()
+    };
+    font(&mut ib, 20.0, LineHeight::Number(1.0));
+    let mut ib_text = Style {
+        display: Display::Inline,
+        writing_mode: WritingMode::VerticalLr,
+        ..Style::default()
+    };
+    font(&mut ib_text, 20.0, LineHeight::Number(1.0));
+    let root = Component::boxed(
+        Style {
+            display: Display::Block,
+            ..Style::default()
+        },
+        vec![Component::boxed(
+            container,
+            vec![
+                Component::text("X", text_style),
+                Component::boxed(ib, vec![Component::text("É", ib_text)]),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let r = |index: usize| {
+        let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
+        [r.x, r.y, r.width, r.height]
+    };
+    // #1 IFC, #2 "X", #3 IB, #4 "É"
+    assert_eq!(r(2), [0.0, 14.0, 20.0, 20.0], "X");
+    assert_eq!(r(3), [20.0, 0.0, 20.0, 30.0], "IB");
+}
+
 /// CSS2 10.3.9 shrink-to-fit inline-blocks (NGBlockNode::ComputeMinMaxSizes):
 /// max-content that fits, min-content vs. available, block children's
 /// margin boxes, nested atomics, max-width below min-content.  Rects from

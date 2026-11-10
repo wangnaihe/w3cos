@@ -2637,6 +2637,15 @@ fn layout_lines(
                 side(style.margin.left),
             ];
             let height = margin[0] + result.fragment.height + margin[2];
+            // CSS Align 3 §9.1 / CSS Inline 3 / csswg #4675 (Blink
+            // LayoutNG atomic inlines, BSD-style Chromium license): a
+            // box whose writing mode is orthogonal to the IFC has no
+            // typographic baseline in the line's block axis. Inline-level
+            // boxes synthesize the alphabetic baseline from the under
+            // margin edge; in a horizontal-tb line that is the physical
+            // bottom of the margin box.
+            let orthogonal = container.writing_mode == w3cos_std::style::WritingMode::HorizontalTb
+                && style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb;
             let ascent = match result.last_baseline {
                 // (A button keeps its content baseline, as in block.rs.)
                 _ if super::block::baseline_is_margin_edge(style)
@@ -2644,6 +2653,7 @@ fn layout_lines(
                 {
                     height
                 }
+                _ if orthogonal => height,
                 LastBaseline::At(b) => margin[0] + b,
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),

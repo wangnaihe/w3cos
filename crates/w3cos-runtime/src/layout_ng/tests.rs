@@ -12484,6 +12484,57 @@ fn grid_item_baseline_groups_match_chrome() {
     assert_eq!(rect(&out, 8), (53.0, 39.0, 50.0, 10.0));
 }
 
+#[test]
+fn orthogonal_grid_item_synthesizes_under_border_edge_with_text() {
+    // CSS Align 3 §9.1 / csswg #4675: typographic first baselines and
+    // synthesized under-border-edge baselines share one group. A 20px Ahem
+    // "X" has its typographic first baseline at 16px (same metric as
+    // `grid_item_baseline_groups_match_chrome`); a 30px vertical-lr box
+    // synthesizes at the under border edge (physical bottom in this
+    // horizontal-tb alignment context). The text item sits 14px down so
+    // the two edges coincide.
+    use w3cos_std::style::WritingMode;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(40.0),
+        align_items: w3cos_std::style::AlignItems::Baseline,
+        grid_template_columns: Some("50px 50px".to_string()),
+        gap: 0.0,
+        ..block()
+    };
+    grid.grid_ng_mut().grid_template_rows = Some("auto".to_string());
+    let orthogonal = Style {
+        height: Dimension::Px(30.0),
+        writing_mode: WritingMode::VerticalLr,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            grid,
+            vec![
+                node(font.clone(), vec![Component::text("X", font)]),
+                node(orthogonal, vec![]),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 40.0));
+    assert_eq!(rect(&out, 2), (0.0, 14.0, 50.0, 20.0));
+    assert_eq!(rect(&out, 4), (50.0, 0.0, 50.0, 30.0));
+}
+
 /// An absolutely positioned `display: inline` box in a block container
 /// whose children are all block-level: its static position is where a
 /// zero-width inline would sit on a line at the current block offset,

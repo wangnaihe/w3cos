@@ -252,8 +252,12 @@ fn baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
     let subgrid = |spec: Option<&str>| {
         spec.is_some_and(|text| text.contains("subgrid") || text.contains("masonry"))
     };
+    // The container must be a horizontal-tb grid without subgrid or lanes.
+    // An orthogonal child is allowed and joins the `align-*: baseline`
+    // group with a synthesized under/over border edge (CSS Align 3 §9.1,
+    // csswg #4675 / #1038, Blink GridLayoutAlgorithm). Auto block margins
+    // and a percent height still keep the container on legacy.
     style.writing_mode == WritingMode::HorizontalTb
-        && child_style.writing_mode == WritingMode::HorizontalTb
         && !has_marker(style, "--w3cos-internal-grid-lanes")
         && !subgrid(columns_spec(style))
         && !subgrid(style.grid_rows())
@@ -262,6 +266,22 @@ fn baseline_shape_supported(flat: &[FlatNodeInfo], container: usize, child: usiz
         && !matches!(child_style.margin.top, Spacing::Auto)
         && !matches!(child_style.margin.bottom, Spacing::Auto)
         && !percent_height(child_style)
+}
+
+/// A typographic first/last baseline is only valid in the grid's block
+/// axis when the item's writing mode is horizontal-tb (parallel to that
+/// axis). An orthogonal item synthesizes from the under (first) or over
+/// (last) border edge, assuming horizontal-tb in the alignment context
+/// (CSS Align 3 §9.1; grid items use border edges, Blink
+/// GridLayoutAlgorithm, BSD-style Chromium license).
+fn typographic_block_baseline(container: &Style, child: &Style) -> bool {
+    use w3cos_std::style::WritingMode;
+    container.writing_mode == WritingMode::HorizontalTb
+        && child.writing_mode == WritingMode::HorizontalTb
+}
+
+fn synthesized_block_baseline(last: bool, border_height: f32) -> f32 {
+    if last { 0.0 } else { border_height }
 }
 
 /// Inline-axis (`justify-*: baseline`) alignment in a horizontal grid whose
@@ -587,11 +607,16 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if placement(child_style, true).is_some_and(|value| parse_axis_syntax(value).is_none()) {
             return Some("grid:row");
         }
+        // A vertical-writing-mode container still bails: the transposed
+        // path does not model baseline groups yet. In a horizontal-tb
+        // grid, an orthogonal item may use `justify-*: baseline`; a
+        // singleton column group falls back to start, and a shared
+        // typographic group bails where the items are built (CSS Align 3
+        // §9.3).
         if is_baseline(used_item_align(
             style.justify_items,
             child_style.justify_self,
-        )) && !(inline_baseline_container_ok(style)
-            && child_style.writing_mode == w3cos_std::style::WritingMode::HorizontalTb)
+        )) && !inline_baseline_container_ok(style)
         {
             return Some("grid:baseline");
         }
@@ -5450,11 +5475,16 @@ fn layout_impl(
         // An authored `first baseline` / `last baseline` keyword outside
         // the supported shapes keeps its earlier treatment (laid out as
         // stretch); only the plain `baseline` forms fall back there.
+        // Orthogonal items join the group too: they have no typographic
+        // baseline in the column axis, so one is synthesized from the
+        // under/over border edge (CSS Align 3 §9.1, csswg #4675).
         let baseline = block_baseline(style, child_style)
             .filter(|_| block_baseline_supported(flat, index, item.index));
-        // `justify-self: baseline` shares column baselines only with
-        // orthogonal items (css-align-3 9.3); the parallel items this path
-        // lays out fall back to start alignment, which `Pack::Start` is.
+        // `justify-self: baseline` shares typographic column baselines
+        // only with items whose writing mode is parallel to the row axis
+        // (vertical items in a horizontal-tb grid). Horizontal-tb items
+        // fall back to start (`Pack::Start`). Shared typographic column
+        // groups bail after every item is placed, below.
         if baseline.is_some() {
             if item.row_span != 1 {
                 return super::bail("grid:baseline-span");
@@ -5626,6 +5656,32 @@ fn layout_impl(
         });
     }
 
+    // Shared typographic `justify-*: baseline` groups are not modeled
+    // yet. CSS Align 3 §9.3 (Blink `GridLayoutAlgorithm` baseline
+    // sharing): only items whose writing mode is parallel to the row axis
+    // participate — vertical writing modes in a horizontal-tb grid. Two
+    // or more such items in the same column stay on legacy. A singleton
+    // group, and horizontal-tb items (orthogonal to that axis), fall back
+    // to the start margin edge (`Pack::Start`).
+    {
+        use w3cos_std::style::WritingMode;
+        let mut typographic_cols: Vec<usize> = built
+            .iter()
+            .filter(|item| {
+                let child_style = flat[item.index].style;
+                is_baseline(used_item_align(
+                    style.justify_items,
+                    child_style.justify_self,
+                )) && child_style.writing_mode != WritingMode::HorizontalTb
+            })
+            .map(|item| item.col)
+            .collect();
+        typographic_cols.sort_unstable();
+        if typographic_cols.windows(2).any(|pair| pair[0] == pair[1]) {
+            return super::bail("grid:baseline");
+        }
+    }
+
     let _subgrid_publish = publish_subgrid(
         flat,
         index,
@@ -5696,14 +5752,21 @@ fn layout_impl(
         } else if let Some(last) = item.baseline {
             // Baseline-sharing group member: the track contribution is the
             // group's extent, added after every item is measured.
-            let baseline = match if last {
-                laid.last_baseline
+            let typographic = typographic_block_baseline(style, flat[item.index].style);
+            let baseline = if typographic {
+                match if last {
+                    laid.last_baseline
+                } else {
+                    laid.first_baseline
+                } {
+                    LastBaseline::At(value) => value,
+                    LastBaseline::NoLines => laid.fragment.height,
+                    LastBaseline::Unknown => return super::bail("grid:baseline-unknown"),
+                }
             } else {
-                laid.first_baseline
-            } {
-                LastBaseline::At(value) => value,
-                LastBaseline::NoLines => laid.fragment.height,
-                LastBaseline::Unknown => return super::bail("grid:baseline-unknown"),
+                // Ignore a typographic baseline from the item's own
+                // (orthogonal) axis; synthesize from the border box.
+                synthesized_block_baseline(last, laid.fragment.height)
             };
             let margin_box = units(laid.fragment.height) + item.margin_u[0] + item.margin_u[2];
             let ascent = item.margin_u[0] + units(baseline);
@@ -8207,6 +8270,35 @@ mod tests {
                 vec![leaf(block_box(None, Some(30.0))), leaf(margined)],
             ),
             &[(1, [0.0, 0.0, 50.0, 30.0]), (2, [50.0, 20.0, 50.0, 10.0])],
+        );
+    }
+
+    #[test]
+    fn orthogonal_items_synthesize_under_border_edge() {
+        // CSS Align 3 §9.1 / csswg #4675 / Blink: an orthogonal item
+        // participates with a baseline synthesized from the under border
+        // edge (assumed horizontal-tb in this alignment context = physical
+        // bottom). The 10px vertical-lr box sits on the same under edge as
+        // the 10px horizontal box, 20px down in the 30px row.
+        use w3cos_std::style::WritingMode;
+        let mut style = grid_style(150.0, Some(30.0), Some("50px 50px 50px"));
+        style.align_items = AlignItems::Baseline;
+        let mut orthogonal = block_box(Some(50.0), Some(10.0));
+        orthogonal.writing_mode = WritingMode::VerticalLr;
+        expect(
+            &Component::boxed(
+                style,
+                vec![
+                    leaf(block_box(None, Some(30.0))),
+                    leaf(block_box(None, Some(10.0))),
+                    leaf(orthogonal),
+                ],
+            ),
+            &[
+                (1, [0.0, 0.0, 50.0, 30.0]),
+                (2, [50.0, 20.0, 50.0, 10.0]),
+                (3, [100.0, 20.0, 50.0, 10.0]),
+            ],
         );
     }
 
