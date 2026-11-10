@@ -476,6 +476,19 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if let Some(reason) = subgrid_or_template(flat, index, true) {
         return Some(reason);
     }
+    // `min-content` / `max-content` still disagree with the legacy engine
+    // on ordinary grids. A parent of a subgrid is the exception: the
+    // subgrid items size those tracks. A top-level inline-grid with a
+    // definite border box is the other: those tracks are the line box.
+    // A third: `min-content` columns whose items are one replaced image
+    // (intrinsic-ratio transfer) and definite px boxes
+    // (`min_content_replaced_columns`) — main #432.
+    if intrinsic_tracks_without_subgrid(flat, index)
+        && !inline_grid_line_lays_out(flat, index)
+        && !min_content_replaced_columns(flat, index)
+    {
+        return Some("grid:intrinsic-track");
+    }
     let real_lanes =
         has_marker(style, "--w3cos-internal-grid-lanes") && lanes::eligible(flat, index);
     if has_marker(style, "--w3cos-internal-grid-lanes")
@@ -1402,6 +1415,152 @@ fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
     }
 }
 
+fn is_whitespace_text(flat: &[FlatNodeInfo], index: usize) -> bool {
+    match flat[index].kind {
+        w3cos_std::ComponentKind::Text { content } => content.chars().all(char::is_whitespace),
+        _ => false,
+    }
+}
+
+fn one_axis_px(style: &Style) -> bool {
+    let px =
+        |dim: Dimension| matches!(dim, Dimension::Px(value) if value.is_finite() && value >= 0.0);
+    let auto = |dim: Dimension| matches!(dim, Dimension::Auto);
+    ((px(style.width) && auto(style.height)) || (auto(style.width) && px(style.height)))
+        && auto(style.min_width)
+        && auto(style.max_width)
+        && auto(style.min_height)
+        && auto(style.max_height)
+}
+
+/// `grid-template-columns` is only `min-content` (including `repeat()`),
+/// and every in-flow item is either a replaced image with one definite
+/// axis or a definite px box. Headless Chrome sizes the image from its
+/// intrinsic ratio (`aspect-ratio: auto`), which `image_intrinsic_size`
+/// already does: a 20×50 image with `height: 100px` is 40×100, and the
+/// 60×100 sibling makes a 100px square (css-sizing
+/// grid-aspect-ratio-005/006). The grid box itself stretches to the
+/// containing block. `max-content`, `fit-content`, text-measured tracks,
+/// width keywords, and grid-lanes stay on `grid:intrinsic-track` so a
+/// lanes test and its ordinary-grid reference do not split engines.
+pub(super) fn min_content_replaced_columns(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    if has_marker(style, "--w3cos-internal-grid-lanes")
+        || has_marker(style, "--w3cos-internal-width-keyword")
+        || has_marker(style, "--w3cos-internal-size-containment")
+        || has_marker(style, "--w3cos-internal-percent-gap")
+        || style.float != Float::None
+        || style.position != Position::Static
+        || style.gap != 0.0
+        || style.column_gap.is_some()
+        || style.row_gap.is_some()
+        || style.justify_content != JustifyContent::FlexStart
+        || style.align_items != AlignItems::Stretch
+        || style.justify_items != AlignItems::Stretch
+        || style.align_content != AlignContent::Stretch
+        || !matches!(style.width, Dimension::Auto)
+        || !matches!(style.height, Dimension::Auto)
+        || !zero_box_edges(style)
+    {
+        return false;
+    }
+    let Some(columns) = columns_spec(style).and_then(|spec| parse_template(spec, false)) else {
+        return false;
+    };
+    if columns.auto_fit.is_some()
+        || !columns.auto_tracks.is_empty()
+        || columns.tracks.is_empty()
+        || columns
+            .tracks
+            .iter()
+            .any(|track| !matches!(track, Spec::One(Breadth::MinContent)))
+    {
+        return false;
+    }
+    if let Some(rows) = style.grid_rows() {
+        let Some(rows) = parse_template(rows, true) else {
+            return false;
+        };
+        if rows.auto_fit.is_some()
+            || rows
+                .tracks
+                .iter()
+                .chain(rows.auto_tracks.iter())
+                .any(spec_is_intrinsic_keyword)
+        {
+            return false;
+        }
+    }
+    let mut saw_image = false;
+    let mut saw_box = false;
+    for child in rendered_children(flat, index) {
+        if is_whitespace_text(flat, child) {
+            continue;
+        }
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style)
+            || child_style.float != Float::None
+            || child_style.position != Position::Static
+            || has_marker(child_style, "--w3cos-internal-width-keyword")
+            || !zero_box_edges(child_style)
+        {
+            return false;
+        }
+        if matches!(flat[child].kind, w3cos_std::ComponentKind::Image { .. }) {
+            let ratio = child_style
+                .custom_properties
+                .as_ref()
+                .and_then(|props| props.get("--w3cos-internal-aspect-ratio"))
+                .and_then(|raw| raw.parse::<f32>().ok());
+            if !one_axis_px(child_style)
+                || !matches!(
+                    child_style.display,
+                    Display::Inline | Display::InlineBlock | Display::Block | Display::FlowRoot
+                )
+                || !ratio.is_some_and(|ratio| ratio.is_finite() && ratio > 0.0)
+            {
+                return false;
+            }
+            saw_image = true;
+            continue;
+        }
+        if matches!(child_style.width, Dimension::Px(value) if value.is_finite() && value >= 0.0)
+            && matches!(child_style.height, Dimension::Px(value) if value.is_finite() && value >= 0.0)
+            && matches!(child_style.display, Display::Block | Display::FlowRoot)
+            && !block::is_author_flex(child_style)
+            && !block::is_author_grid(child_style)
+        {
+            saw_box = true;
+            continue;
+        }
+        return false;
+    }
+    saw_image && saw_box
+}
+
+/// Ordinary grids keep intrinsic keywords on the legacy engine. A grid
+/// that has a subgrid item lays them out, because those items are the
+/// track's contents.
+fn intrinsic_tracks_without_subgrid(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    let intrinsic = |spec: Option<&str>, rows: bool| {
+        spec.and_then(|spec| parse_template(spec, rows))
+            .is_some_and(|template| {
+                template
+                    .tracks
+                    .iter()
+                    .chain(template.auto_tracks.iter())
+                    .any(spec_is_intrinsic_keyword)
+            })
+    };
+    if !intrinsic(columns_spec(style), false) && !intrinsic(style.grid_rows(), true) {
+        return false;
+    }
+    !rendered_children(flat, index).any(|child| {
+        let child_style = flat[child].style;
+        !oof::is_out_of_flow(child_style) && subgrid_style(child_style)
+    })
+}
 struct InheritedTracks {
     columns: Vec<i64>,
     /// `None` while the parent is still measuring this span.
@@ -4926,6 +5085,7 @@ fn layout_impl(
 
     let mut pending = Vec::new();
     let mut oof_children = Vec::new();
+    let replaced_min_columns = min_content_replaced_columns(flat, index);
     for (ordinal, child) in rendered_children(flat, index).enumerate() {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
@@ -4933,13 +5093,12 @@ fn layout_impl(
             continue;
         }
         // Whitespace-only text does not generate a grid item when
-        // white-space collapses (CSS Grid §4.1). Only the inline-grid
-        // line path skips it; an ordinary grid keeps its current items.
-        if (inline_fixed || inline_intrinsic)
-            && matches!(
-                flat[child].kind,
-                w3cos_std::ComponentKind::Text { content } if content.chars().all(|ch| ch.is_whitespace())
-            )
+        // white-space collapses (CSS Grid §4.1). The inline-grid line
+        // path skips it. An ordinary grid keeps those items, except the
+        // min-content replaced-column slice: source newlines between the
+        // image and the definite box must not occupy a cell.
+        if is_whitespace_text(flat, child)
+            && (inline_fixed || inline_intrinsic || replaced_min_columns)
         {
             continue;
         }

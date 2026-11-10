@@ -198,7 +198,8 @@ fn update_percent_gap_values(style: &mut Style, row: Option<&str>, column: Optio
 /// LayoutNG reads this for a block-flow `-webkit-box`.
 pub const WEBKIT_BOX_ORIENT_PROPERTY: &str = "--w3cos-internal-webkit-box-orient";
 /// `transform: translate*(<percentage>)` as `"x,y"` percentages of the
-/// border box. Set only under `W3COS_LAYOUT_NG`; the paint tree resolves it
+/// border box. Set when LayoutNG is on (the default; `W3COS_LAYOUT_NG=0`
+/// leaves it unset). The paint tree resolves it
 /// against the laid-out box (the pixel part stays in `Style::transform`).
 pub const TRANSLATE_PERCENT_PROPERTY: &str = "--w3cos-internal-translate-percent";
 /// `-webkit-line-clamp`: a positive line count. Legacy ignores it.

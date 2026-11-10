@@ -40,7 +40,7 @@ fn sized(h: f32) -> Style {
 fn parity(root: &Component) -> Vec<(LayoutRect, usize)> {
     let flat = pre_flatten(root);
     assert!(block::supports_tree(&flat), "tree outside S1");
-    let legacy = crate::layout::compute(root, 800.0, 600.0).expect("legacy layout");
+    let legacy = crate::layout::legacy_layout_rects(root, 800.0, 600.0).expect("legacy layout");
     let ng = layout_tree(root, &flat, 800.0, 600.0).expect("ng layout");
     let diffs = verify(&flat, &legacy, &ng);
     assert_eq!(diffs, 0, "legacy {legacy:#?}\nng {ng:#?}");
@@ -436,7 +436,7 @@ fn generated_block_trees_cover_the_legacy_box_set() {
     for case in 0..400 {
         let root = node(block(), vec![random_tree(&mut rng, 3)]);
         let flat = pre_flatten(&root);
-        let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+        let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         let mut legacy_ids: Vec<usize> = legacy.iter().map(|(_, i)| *i).collect();
         let mut ng_ids: Vec<usize> = ng.iter().map(|(_, i)| *i).collect();
@@ -523,7 +523,7 @@ fn probe_html() {
     let root = crate::browser_page_domain::load_html_snapshot(&html, "file:///probe.html")
         .expect("snapshot");
     let flat = pre_flatten(&root);
-    let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy layout");
+    let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy layout");
     let reasons = block::unsupported_reasons(&flat);
     println!("reasons: {reasons:?}");
     let ng = if reasons.is_empty() {
@@ -4261,24 +4261,8 @@ fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
     assert_eq!(at(&minmax_out, 2), (0.0, 0.0, 40.0, 10.0));
     assert_eq!(at(&minmax_out, 3), (120.0, 0.0, 80.0, 10.0));
 
-    let intrinsic = node(
-        block(),
-        vec![node(
-            grid(300.0, 20.0, Some("min-content max-content")),
-            vec![box10(40.0), box10(70.0)],
-        )],
-    );
-    let intrinsic_flat = pre_flatten(&intrinsic);
-    assert!(
-        block::supports_tree(&intrinsic_flat),
-        "{:?}",
-        block::unsupported_reasons(&intrinsic_flat)
-    );
-    let intrinsic_out = layout_tree(&intrinsic, &intrinsic_flat, 800.0, 600.0).expect("intrinsic");
-    assert_eq!(at(&intrinsic_out, 1), (0.0, 0.0, 300.0, 20.0));
-    assert_eq!(at(&intrinsic_out, 2), (0.0, 0.0, 40.0, 10.0));
-    assert_eq!(at(&intrinsic_out, 3), (40.0, 0.0, 70.0, 10.0));
-
+    // Ordinary min-content/max-content grids stay on legacy (main #432),
+    // except min_content_replaced_columns / subgrid-parent / inline-grid-line.
     let ordinary = node(
         block(),
         vec![node(
@@ -4294,7 +4278,7 @@ fn top_level_inline_grid_non_fixed_tracks_share_a_baseline() {
     );
     let ordinary_flat = pre_flatten(&ordinary);
     assert!(
-        !block::unsupported_reasons(&ordinary_flat)
+        block::unsupported_reasons(&ordinary_flat)
             .iter()
             .any(|reason| *reason == "grid:intrinsic-track"),
         "{:?}",
@@ -12715,4 +12699,870 @@ fn tab_after_content_matches_chrome() {
             "{name}: {actual:?} vs {want}"
         );
     }
+}
+
+/// A block text leaf (`<p>text</p>` lowered to one Text box) with its own
+/// border and padding stays on NG: block layout insets the content box the
+/// lines wrap in. Headless Chrome 155, body margin 0, Ahem 20px/1:
+/// - `border: 5px; width: 200px` "XXXXX XXXXX XX": (0,0,210,50);
+/// - `padding: 3px 7px 4px 9px; width: 100px` "XX XX XX XX": (0,50,116,47).
+#[test]
+fn block_text_leaf_with_border_and_padding() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let bordered = Style {
+        border_width: 5.0,
+        width: Dimension::Px(200.0),
+        ..font.clone()
+    };
+    let padded = Style {
+        padding: margins(3.0, 7.0, 4.0, 9.0),
+        width: Dimension::Px(100.0),
+        ..font
+    };
+    // 0 root, 1 bordered text, 2 padded text.
+    let root = node(
+        block(),
+        vec![
+            Component::text("XXXXX XXXXX XX", bordered),
+            Component::text("XX XX XX XX", padded),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 210.0, 50.0));
+    close(rect(&out, 2), (0.0, 50.0, 116.0, 47.0));
+}
+
+#[test]
+fn inline_flex_column_gap_shrink_to_fit() {
+    // Chrome: <div>XX<section style="display:inline-flex;
+    // flex-direction:column;gap:20px"><div>XXX</div><div>X</div></section>
+    // in 10px/1 Ahem -> section (20,0,30,40), items (20,0,30,10) and
+    // (20,30,30,10), line box height 40.
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let section = Style {
+        display: Display::InlineFlex,
+        flex_direction: FlexDirection::Column,
+        gap: 20.0,
+        ..font.clone()
+    };
+    // 0 root, 1 text, 2 section, 3 / 4 items.
+    let root = node(
+        font.clone(),
+        vec![
+            Component::text(
+                "XX",
+                Style {
+                    display: Display::Inline,
+                    ..font.clone()
+                },
+            ),
+            node(
+                section,
+                vec![
+                    Component::text("XXX", font.clone()),
+                    Component::text("X", font),
+                ],
+            ),
+        ],
+    );
+    let out = ng_rects(&root);
+    close(rect(&out, 2), (20.0, 0.0, 30.0, 40.0));
+    close(rect(&out, 3), (20.0, 0.0, 30.0, 10.0));
+    close(rect(&out, 4), (20.0, 30.0, 30.0, 10.0));
+    assert_eq!(rect(&out, 0).3, 40.0);
+}
+
+#[test]
+fn line_break_anywhere_breaks_every_character() {
+    // Chrome: <div style="width:40px;line-break:anywhere"> in 10px/1 Ahem:
+    // "XXXXXXXXXX" -> (0,0,40,30); "XX XXX.XX" -> (0,30,40,30).
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 10.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        width: Dimension::Px(40.0),
+        line_break: w3cos_std::style::LineBreak::Anywhere,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![
+            Component::text("XXXXXXXXXX", font.clone()),
+            Component::text("XX XXX.XX", font),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 40.0, 30.0));
+    close(rect(&out, 2), (0.0, 30.0, 40.0, 30.0));
+}
+
+/// `word-break: keep-all` on Latin-1 matches `normal` (CSS Text 3 §5.3
+/// only glues CJK pairs). Headless Chrome, Ahem 20px/1, `width: min-content`,
+/// body margin 0: "XXXX" is a 80×20 box (overflow-wrap-min-content-size-006).
+#[test]
+fn keep_all_latin1_min_content_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        word_break: w3cos_std::style::WordBreak::KeepAll,
+        ..block()
+    };
+    let mut box_style = font.clone();
+    box_style.custom_properties = Some(CustomProperties::from_iter([(
+        "--w3cos-internal-width-keyword".to_string(),
+        "min-content".to_string(),
+    )]));
+    let text = Component::text(
+        "XXXX",
+        Style {
+            display: Display::Inline,
+            ..font
+        },
+    );
+    let root = node(block(), vec![node(box_style, vec![text])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = ng_rects(&root);
+    close(rect(&out, 1), (0.0, 0.0, 80.0, 20.0));
+}
+
+/// `overflow-wrap: break-word` under `white-space: pre` / `pre-wrap` does
+/// not change min-content (CSS Text 3; white-space-intrinsic-size-003/016).
+/// Headless Chrome, Ahem 50px/1, floated `pre-wrap` "X   ": 50×50 (trailing
+/// spaces dropped for min-content).
+#[test]
+fn break_word_pre_wrap_float_min_content_matches_chrome() {
+    use w3cos_std::style::{Float, WhiteSpace, WordBreak};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 50.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let floated = Style {
+        float: Float::Left,
+        white_space: WhiteSpace::PreWrap,
+        word_break: WordBreak::BreakWord,
+        ..font.clone()
+    };
+    let text = Component::text(
+        "X   ",
+        Style {
+            display: Display::Inline,
+            white_space: WhiteSpace::PreWrap,
+            word_break: WordBreak::BreakWord,
+            ..font
+        },
+    );
+    let root = node(block(), vec![node(floated, vec![text])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("pre-wrap break-word");
+    let r = out.iter().find(|(_, i)| *i == 1).expect("float").0;
+    close((r.x, r.y, r.width, r.height), (0.0, 0.0, 50.0, 50.0));
+}
+
+/// `overflow: hidden` with a cleared child and no float inside stays on NG
+/// (flexbox_item-clear-ref). Clear alone does not need the legacy
+/// adjoining-float path.
+#[test]
+fn overflow_clear_alone_stays_on_ng() {
+    use w3cos_std::style::{Clear, Overflow};
+    let scroller = Style {
+        overflow: Overflow::Hidden,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    let cleared = Style {
+        clear: Clear::Both,
+        height: Dimension::Px(40.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(scroller, vec![node(cleared, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("clear alone");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 200.0, 40.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 200.0, 40.0));
+}
+
+/// A grid item with `overflow: auto` stays on NG. Headless Chrome, body
+/// margin 0: a 100×50 item fills its 100×50 area (no automatic-minimum
+/// bail). Negative-margin overflow and float+inflow overflow still fall
+/// back.
+#[test]
+/// A flex item with `overflow: auto` stays on NG; a grid item with the
+/// same still falls back. Negative-margin overflow and float+inflow
+/// overflow still fall back. Headless Chrome, body margin 0: column flex
+/// 100×50 with an overflow:auto item that has an 80px child shrinks the
+/// item to 50 (automatic minimum is zero).
+#[test]
+fn flex_item_overflow_auto_stays_on_ng() {
+    use w3cos_std::style::{Float, Overflow, Spacing};
+    let flex = Style {
+        display: Display::Flex,
+        flex_direction: w3cos_std::style::FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    let item = Style {
+        overflow: Overflow::Auto,
+        ..block()
+    };
+    let child = Style {
+        height: Dimension::Px(80.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(flex, vec![node(item, vec![node(child, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("flex item overflow");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 50.0));
+
+    let grid = Style {
+        display: Display::Grid,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        ..Style::default()
+    };
+    let g_item = Style {
+        overflow: Overflow::Auto,
+        ..block()
+    };
+    let g_root = node(block(), vec![node(grid, vec![node(g_item, vec![])])]);
+    let g_flat = pre_flatten(&g_root);
+    assert!(
+        block::unsupported_reasons(&g_flat)
+            .iter()
+            .any(|r| *r == "overflow"),
+        "{:?}",
+        block::unsupported_reasons(&g_flat)
+    );
+
+    let mut neg = Style {
+        overflow: Overflow::Hidden,
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        ..block()
+    };
+    neg.margin.left = Spacing::Px(-10.0);
+    let neg_root = node(block(), vec![node(neg, vec![])]);
+    let neg_flat = pre_flatten(&neg_root);
+    assert!(
+        block::unsupported_reasons(&neg_flat)
+            .iter()
+            .any(|r| *r == "overflow"),
+        "{:?}",
+        block::unsupported_reasons(&neg_flat)
+    );
+
+    let mixed = Style {
+        overflow: Overflow::Hidden,
+        width: Dimension::Px(200.0),
+        ..block()
+    };
+    let floated = Style {
+        float: Float::Left,
+        width: Dimension::Px(40.0),
+        height: Dimension::Px(20.0),
+        ..block()
+    };
+    let inflow = Style {
+        height: Dimension::Px(20.0),
+        ..block()
+    };
+    let mix_root = node(
+        block(),
+        vec![node(
+            mixed,
+            vec![node(floated, vec![]), node(inflow, vec![])],
+        )],
+    );
+    let mix_flat = pre_flatten(&mix_root);
+    assert!(
+        block::unsupported_reasons(&mix_flat)
+            .iter()
+            .any(|r| *r == "overflow"),
+        "{:?}",
+        block::unsupported_reasons(&mix_flat)
+    );
+}
+
+/// A column subgrid whose parent is a top-level `inline-grid` with
+/// `gap: 25px` (css-grid/subgrid/independent-tracks-from-parent-grid).
+/// Headless Chrome, body margin 0: the parent and subgrid are 100×100 at
+/// the origin and the four 100×25 items stack at y = 0, 25, 50, 75. The
+/// single subgridded column has no gutter, and the subgrid's own rows do
+/// not take the parent's row gap.
+#[test]
+fn subgrid_in_inline_grid_parent_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let parent = Style {
+        display: Display::Flex,
+        gap: 25.0,
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-unrecognized-display".to_string(),
+            "inline-grid".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let subgrid = Style {
+        display: Display::Grid,
+        grid_template_columns: Some("subgrid".to_string()),
+        ..Style::default()
+    };
+    let item = || {
+        node(
+            Style {
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(25.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let root = node(
+        block(),
+        vec![node(
+            parent,
+            vec![node(subgrid, vec![item(), item(), item(), item()])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("subgrid");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    assert_eq!(at(1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(at(2), (0.0, 0.0, 100.0, 100.0));
+    for (k, index) in (3..7).enumerate() {
+        assert_eq!(at(index), (0.0, 25.0 * k as f32, 100.0, 25.0));
+    }
+}
+
+/// A column flex item with a definite used height (min-height wins over a
+/// smaller height) may host a percentage-height descendant. Headless
+/// Chrome, body margin 0: the item and the percent child are both 100×100.
+/// The item itself has no percentage block size, so the container stays on
+/// NG (`flex:column-percent` only fires for the item).
+#[test]
+fn column_flex_percent_descendant_of_definite_item_matches_chrome() {
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        width: Dimension::Px(100.0),
+        ..Style::default()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(50.0),
+        min_height: Dimension::Px(100.0),
+        ..block()
+    };
+    let pct = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(col, vec![node(item, vec![node(pct, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("column percent descendant");
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 3), (0.0, 0.0, 100.0, 100.0));
+}
+
+/// A percentage height on the column flex item itself still falls back
+/// (`flex:column-percent`): those sizes cycle through the automatic
+/// minimum when the container's block size is indefinite.
+#[test]
+fn column_flex_percent_item_stays_on_legacy() {
+    let col = Style {
+        display: Display::Flex,
+        flex_direction: FlexDirection::Column,
+        ..Style::default()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Percent(50.0),
+        ..block()
+    };
+    let root = node(block(), vec![node(col, vec![node(item, vec![])])]);
+    let flat = pre_flatten(&root);
+    assert!(
+        !block::supports_tree(&flat),
+        "percent column item must stay on legacy"
+    );
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| *reason == "flex:column-percent"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+}
+
+/// A grid with `width: min-content` whose only item is a column subgrid
+/// (css-grid/subgrid/dynamic-min-content-001 end state). Headless Chrome,
+/// body margin 0: the outer grid is a 100×100 border box; the subgrid and
+/// its 100px-wide item share that inline size. Previously NG bailed with
+/// `grid:width-keyword` whenever a width-keyword grid had a subgrid child.
+#[test]
+fn min_content_grid_with_column_subgrid_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let parent = Style {
+        display: Display::Grid,
+        height: Dimension::Px(100.0),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-width-keyword".to_string(),
+            "min-content".to_string(),
+        )])),
+        ..Style::default()
+    };
+    let subgrid = Style {
+        display: Display::Grid,
+        grid_template_columns: Some("subgrid".to_string()),
+        ..Style::default()
+    };
+    let item = Style {
+        width: Dimension::Px(100.0),
+        height: Dimension::Px(100.0),
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(parent, vec![node(subgrid, vec![node(item, vec![])])])],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    assert!(
+        !block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| *reason == "grid:width-keyword"),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng layout");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    assert_eq!(at(1), (0.0, 0.0, 100.0, 100.0), "min-content grid");
+    assert_eq!(at(2), (0.0, 0.0, 100.0, 100.0), "column subgrid");
+    assert_eq!(at(3), (0.0, 0.0, 100.0, 100.0), "item");
+}
+
+/// Outer `width: min-content` grid hosting a row-subgrid with
+/// `width: max-content; max-width: 100px` (standalone-axis-size-006 shape).
+/// Headless Chrome / WPT: the outer grid's used width is 100px. The
+/// subgrid is a grid item, so `intrinsic_keyword_applies` is false — NG
+/// keeps its width keyword via the subgrid exceptions on
+/// `grid:width-keyword` / `grid:item-width-keyword`.
+#[test]
+fn max_content_subgrid_under_min_content_grid_matches_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let kw = |word: &str| {
+        CustomProperties::from_iter([(
+            "--w3cos-internal-width-keyword".to_string(),
+            word.to_string(),
+        )])
+    };
+    let parent = Style {
+        display: Display::Grid,
+        custom_properties: Some(kw("min-content")),
+        ..Style::default()
+    };
+    let mut subgrid = Style {
+        display: Display::Grid,
+        max_width: Dimension::Px(100.0),
+        custom_properties: Some(kw("max-content")),
+        ..Style::default()
+    };
+    subgrid.grid_ng_mut().grid_template_rows = Some("subgrid".to_string());
+    let item = || {
+        node(
+            Style {
+                display: Display::InlineBlock,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(50.0),
+                font_size: 0.0,
+                ..Style::default()
+            },
+            vec![],
+        )
+    };
+    let wrap = Style {
+        display: Display::Block,
+        font_size: 0.0,
+        line_height: 0.0,
+        line_height_is_normal: false,
+        ..Style::default()
+    };
+    let root = node(
+        block(),
+        vec![node(
+            parent,
+            vec![node(subgrid, vec![node(wrap, vec![item(), item()])])],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert!(
+        block::supports_tree(&flat),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = layout_tree(&root, &flat, 800.0, 600.0).expect("ng layout");
+    let at = |index| {
+        let r = out.iter().find(|(_, i)| *i == index).expect("rect").0;
+        (r.x, r.y, r.width, r.height)
+    };
+    assert_eq!(at(1).2, 100.0, "min-content grid width {:?}", at(1));
+    assert_eq!(at(2).2, 100.0, "max-content subgrid width {:?}", at(2));
+}
+
+fn os(value: &str) -> &std::ffi::OsStr {
+    std::ffi::OsStr::new(value)
+}
+
+/// Unset selects NG, the same as `W3COS_LAYOUT_NG=1`. Only `0` is legacy,
+/// and a non-zero verify value wins over `0`.
+#[test]
+fn layout_ng_mode_from_env_defaults_on() {
+    use super::Mode;
+    let cases = [
+        (None, None, Mode::On),
+        (Some("1"), None, Mode::On),
+        (Some(""), None, Mode::On),
+        (Some("on"), None, Mode::On),
+        (Some("0"), None, Mode::Off),
+        (Some("0"), Some("0"), Mode::Off),
+        (Some("0"), Some("1"), Mode::Verify),
+        (Some("0"), Some("all"), Mode::Verify),
+        (None, Some("1"), Mode::Verify),
+        (Some("1"), Some("0"), Mode::On),
+        (Some("1"), Some("1"), Mode::Verify),
+    ];
+    for (ng, verify, want) in cases {
+        let got = super::mode_from_env(ng.map(os), verify.map(os));
+        assert_eq!(got, want, "ng={ng:?} verify={verify:?}");
+    }
+}
+
+/// The latched mode matches the process environment on the first read, and
+/// a second read returns the same value. Fresh processes are probed below.
+#[test]
+fn layout_ng_mode_latches_the_process_environment() {
+    let ng = std::env::var_os("W3COS_LAYOUT_NG");
+    let verify = std::env::var_os("W3COS_LAYOUT_NG_VERIFY");
+    let want = super::mode_from_env(ng.as_deref(), verify.as_deref());
+    assert_eq!(super::mode(), want);
+    assert_eq!(super::mode(), super::mode());
+}
+
+/// Child of the test harness. Prints the mode latched from the process
+/// environment and checks a second read. The parent test starts one process
+/// per flag value; this returns immediately in the normal suite run.
+#[test]
+fn layout_ng_mode_probe() {
+    if std::env::var_os("W3COS_LAYOUT_NG_MODE_PROBE").is_none() {
+        return;
+    }
+    let first = super::mode();
+    let second = super::mode();
+    assert_eq!(first, second, "mode is latched for the process");
+    eprintln!("LAYOUT_NG_MODE={first:?}");
+}
+
+#[test]
+fn layout_ng_fresh_processes_agree_on_unset_and_explicit_on() {
+    let probe = |ng: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.args([
+            "--exact",
+            "layout_ng::tests::layout_ng_mode_probe",
+            "--nocapture",
+        ]);
+        cmd.env("W3COS_LAYOUT_NG_MODE_PROBE", "1");
+        cmd.env_remove("W3COS_LAYOUT_NG_VERIFY");
+        match ng {
+            Some(value) => {
+                cmd.env("W3COS_LAYOUT_NG", value);
+            }
+            None => {
+                cmd.env_remove("W3COS_LAYOUT_NG");
+            }
+        }
+        let output = cmd.output().expect("spawn mode probe");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "ng={ng:?} status {:?} {stderr}",
+            output.status
+        );
+        stderr
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("LAYOUT_NG_MODE="))
+            .unwrap_or_else(|| panic!("ng={ng:?} produced no mode line:\n{stderr}"))
+            .to_string()
+    };
+    let unset = probe(None);
+    let on = probe(Some("1"));
+    let off = probe(Some("0"));
+    assert_eq!(unset, "On");
+    assert_eq!(on, "On");
+    assert_eq!(off, "Off");
+    assert_eq!(unset, on);
+}
+
+/// WPT css/css-display/empty-text-baseline-001.html. A `<br>` plus an empty
+/// text node inside an inline-block must not move the following span.
+/// Coalescing that break into the parent line ("x\u{2028}x") drops the span
+/// by one Ahem em (offsetTop 16).
+#[test]
+fn empty_text_after_br_does_not_shift_inline_block_baseline() {
+    let _ahem = super::inline_tests::AhemGuard::new();
+    crate::dom::reset_document();
+    crate::incremental_layout::invalidate();
+    crate::jsdom::set_viewport(800.0, 600.0);
+    let document = crate::jsdom::document_value();
+    document
+        .get_property("body")
+        .get_property("style")
+        .set_property("margin", w3cos_core::Value::string("0"));
+    let container = document.call_method("createElement", vec![w3cos_core::Value::string("div")]);
+    container
+        .get_property("style")
+        .set_property("fontFamily", w3cos_core::Value::string("Ahem"));
+    document
+        .get_property("body")
+        .call_method("appendChild", vec![container.clone()]);
+    let inner = document.call_method("createElement", vec![w3cos_core::Value::string("div")]);
+    inner
+        .get_property("style")
+        .set_property("display", w3cos_core::Value::string("inline-block"));
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("x")])],
+    );
+    container.call_method("appendChild", vec![inner.clone()]);
+    let span = document.call_method("createElement", vec![w3cos_core::Value::string("span")]);
+    span.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("x")])],
+    );
+    container.call_method("appendChild", vec![span.clone()]);
+    let before = span.get_property("offsetTop").to_number();
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createElement", vec![w3cos_core::Value::string("br")])],
+    );
+    inner.call_method(
+        "appendChild",
+        vec![document.call_method("createTextNode", vec![w3cos_core::Value::string("")])],
+    );
+    let after = span.get_property("offsetTop").to_number();
+    assert_eq!(
+        after, before,
+        "empty text after br shifted the span by one em"
+    );
+    for white_space in ["pre-line", "pre"] {
+        inner
+            .get_property("style")
+            .set_property("whiteSpace", w3cos_core::Value::string(white_space));
+        assert_eq!(
+            span.get_property("offsetTop").to_number(),
+            before,
+            "white-space: {white_space} shifted the span"
+        );
+    }
+}
+
+/// 20×50 PNG. `image_intrinsic_size` reads the decode cache, not the path.
+fn install_20x50(src: &str) {
+    const HEX: &str = "89504e470d0a1a0a0000000d4948445200000014000000320802000000d31e6c710000002549444154789cedcbb10d000008c0a09eeee9fee0e440c24a4d77b22ccbb22ccbb22cffcc0b3e77f410a1bae3d20000000049454e44ae426082";
+    let bytes = (0..HEX.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&HEX[index..index + 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    crate::image_loader::decode_and_install(src, &bytes).expect("20x50 png");
+}
+
+/// css-sizing/aspect-ratio/grid-aspect-ratio-005 and 006. Headless Chrome
+/// 156, body margin 0, 800×600: `repeat(2, min-content)` does not shrink the
+/// grid box (it stays 800×100). A 20×50 image with `aspect-ratio: auto 1/1`
+/// transfers its intrinsic ratio, so `height: 100px` is 40×100 and
+/// `width: 40px` is 40×100. The 60×100 sibling sits at x=40. Together they
+/// cover a 100px square. Source newlines between the items are not cells.
+#[test]
+fn min_content_replaced_columns_match_chrome() {
+    use w3cos_std::style::CustomProperties;
+    let src = "r37/20x50.png";
+    install_20x50(src);
+    let ratio = CustomProperties::from_iter([(
+        "--w3cos-internal-aspect-ratio".to_string(),
+        "1".to_string(),
+    )]);
+    let image = |width: Dimension, height: Dimension| {
+        Component::image(
+            src,
+            Style {
+                display: Display::Inline,
+                width,
+                height,
+                custom_properties: Some(ratio.clone()),
+                ..Style::default()
+            },
+        )
+    };
+    let sibling = node(
+        Style {
+            width: Dimension::Px(60.0),
+            height: Dimension::Px(100.0),
+            ..block()
+        },
+        vec![],
+    );
+    let grid = |columns: &str, image: Component, extra: Vec<Component>| {
+        let mut children = Vec::new();
+        children.push(Component::text(
+            "\n  ",
+            Style {
+                display: Display::Inline,
+                ..block()
+            },
+        ));
+        children.push(image);
+        children.push(Component::text(
+            "\n  ",
+            Style {
+                display: Display::Inline,
+                ..block()
+            },
+        ));
+        children.extend(extra);
+        node(
+            Style {
+                display: Display::Grid,
+                grid_template_columns: Some(columns.to_string()),
+                ..Style::default()
+            },
+            children,
+        )
+    };
+    let lay = |child: Component| {
+        let root = node(block(), vec![child]);
+        ng_rects(&root)
+    };
+    let height = lay(grid(
+        "repeat(2, min-content)",
+        image(Dimension::Auto, Dimension::Px(100.0)),
+        vec![sibling.clone()],
+    ));
+    close(rect(&height, 1), (0.0, 0.0, 800.0, 100.0));
+    close(rect(&height, 3), (0.0, 0.0, 40.0, 100.0));
+    close(rect(&height, 5), (40.0, 0.0, 60.0, 100.0));
+    let width = lay(grid(
+        "repeat(2, min-content)",
+        image(Dimension::Px(40.0), Dimension::Auto),
+        vec![sibling],
+    ));
+    close(rect(&width, 1), (0.0, 0.0, 800.0, 100.0));
+    close(rect(&width, 3), (0.0, 0.0, 40.0, 100.0));
+    close(rect(&width, 5), (40.0, 0.0, 60.0, 100.0));
+
+    let still_legacy = |child: Component, reason: &str| {
+        let root = node(block(), vec![child]);
+        let flat = pre_flatten(&root);
+        assert!(
+            !block::supports_tree(&flat),
+            "{reason} should stay on legacy: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+        assert!(
+            block::unsupported_reasons(&flat)
+                .iter()
+                .any(|got| got == reason),
+            "{reason} {:?}",
+            block::unsupported_reasons(&flat)
+        );
+    };
+    still_legacy(
+        grid(
+            "repeat(2, max-content)",
+            image(Dimension::Auto, Dimension::Px(100.0)),
+            vec![node(
+                Style {
+                    width: Dimension::Px(60.0),
+                    height: Dimension::Px(100.0),
+                    ..block()
+                },
+                vec![],
+            )],
+        ),
+        "grid:intrinsic-track",
+    );
+    still_legacy(
+        node(
+            Style {
+                display: Display::Grid,
+                grid_template_columns: Some("min-content".to_string()),
+                ..Style::default()
+            },
+            vec![Component::text(
+                "x x x",
+                Style {
+                    display: Display::Inline,
+                    ..block()
+                },
+            )],
+        ),
+        "grid:intrinsic-track",
+    );
 }

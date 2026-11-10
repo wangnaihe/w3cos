@@ -1055,6 +1055,17 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                     is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
                 }) =>
         {
+// Source newlines between the image and the definite box of a
+            // min-content replaced grid are not items (CSS Grid §4.1).
+            // They must not send that slice back to legacy.
+            if content.chars().all(char::is_whitespace)
+                && info.parent.is_some_and(|parent| {
+                    is_author_grid(flat[parent].style)
+                        && super::grid::min_content_replaced_columns(flat, parent)
+                })
+            {
+                return None;
+            }
             // A text grid or flex item is an anonymous block (CSS Grid §6,
             // CSS Flexbox §4: each contiguous text run is wrapped in an
             // anonymous block container). Its display stays inline in the
