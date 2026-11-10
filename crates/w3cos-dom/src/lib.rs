@@ -2073,7 +2073,20 @@ mod tests {
             w3cos_std::style::Display::Inline,
             "the authored pseudo display belongs to its principal box"
         );
-        let items = &generated.children;
+        // `content` items live in the principal's anonymous IFC, not as
+        // siblings that replace the pseudo box.
+        let items = if generated.children.len() == 1
+            && generated.children[0]
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-inline-formatting-context")
+                }) {
+            generated.children[0].children.as_slice()
+        } else {
+            generated.children.as_slice()
+        };
         assert!(matches!(
             &items[0].kind,
             w3cos_std::ComponentKind::Text { content } if content == "A"
@@ -2640,6 +2653,61 @@ mod tests {
         crate::stylesheet::clear_rules();
     }
 
+    fn descendant_generated_text(component: &w3cos_std::Component) -> String {
+        let mut output = String::new();
+        fn walk(component: &w3cos_std::Component, output: &mut String) {
+            if let w3cos_std::ComponentKind::Text { content } = &component.kind {
+                output.push_str(content);
+            }
+            for child in &component.children {
+                walk(child, output);
+            }
+        }
+        walk(component, &mut output);
+        output
+    }
+
+    /// Nearest box of a generated text run that carries the principal
+    /// decorations (border, background, or padding). Concatenates
+    /// descendant text so a split word run still matches. A transparent
+    /// anonymous IFC between the owner and the run is skipped.
+    fn generated_principal_box<'a>(
+        root: &'a w3cos_std::Component,
+        needle: &str,
+    ) -> &'a w3cos_std::Component {
+        fn find_path<'a>(
+            node: &'a w3cos_std::Component,
+            needle: &str,
+            path: &mut Vec<&'a w3cos_std::Component>,
+        ) -> bool {
+            if !descendant_generated_text(node).contains(needle) {
+                return false;
+            }
+            path.push(node);
+            for child in &node.children {
+                if find_path(child, needle, path) {
+                    return true;
+                }
+            }
+            true
+        }
+        let mut path = Vec::new();
+        assert!(
+            find_path(root, needle, &mut path),
+            "missing generated text {needle:?}"
+        );
+        path.iter()
+            .rev()
+            .copied()
+            .find(|node| {
+                node.style.border_width > 0.0
+                    || node.style.background.a != 0
+                    || node.style.padding != w3cos_std::style::Edges::ZERO
+            })
+            .or_else(|| path.last().copied())
+            .expect("generated text path")
+    }
+
     #[test]
     fn collapsed_generated_inline_text_keeps_its_pseudo_paint_and_whitespace_style() {
         crate::stylesheet::clear_rules();
@@ -2659,11 +2727,17 @@ mod tests {
         doc.body().append_child(&mut doc, item);
 
         let tree = doc.to_component_tree();
-        let principal = &tree.children[0];
-        assert!(matches!(
-            &principal.kind,
-            w3cos_std::ComponentKind::Text { .. }
-        ));
+        // Background belongs on the generated principal box (CSS Generated
+        // Content / Display). The host span is not flattened into a text
+        // leaf when that box is kept; the paint and whitespace still live
+        // on the pseudo's principal box, which wraps the text run.
+        let principal = generated_principal_box(&tree, "Test");
+        assert!(
+            descendant_generated_text(principal).contains("Test")
+                && descendant_generated_text(principal).contains("passes"),
+            "generated text was lost: {:?}",
+            descendant_generated_text(principal)
+        );
         assert_eq!(
             principal.style.white_space,
             w3cos_std::style::WhiteSpace::NoWrap
@@ -2760,7 +2834,13 @@ mod tests {
 
         let tree = doc.to_component_tree();
         let principal = &tree.children[0];
-        let generated = &principal.children[0];
+        // A kept generated principal box may sit inside an anonymous IFC
+        // line; read the box that owns the generated text, not children[0].
+        let generated = generated_principal_box(&tree, "PASS PASS");
+        assert!(
+            !std::ptr::eq(generated, principal),
+            "the generated principal must be a distinct box from the origin"
+        );
         assert_eq!(principal.style.border_width, 15.0);
         assert_eq!(generated.style.border_width, 3.0);
         assert_eq!(
@@ -2787,8 +2867,17 @@ mod tests {
 
         let tree = doc.to_component_tree();
         let principal = &tree.children[0];
-        let generated = &principal.children[0];
+        let generated = generated_principal_box(&tree, "Before");
+        assert!(
+            !std::ptr::eq(generated, principal),
+            "border:inherit belongs on the generated principal, not the origin"
+        );
+        assert_eq!(generated.style.border_width, 2.0);
         assert_eq!(generated.style.border_width, principal.style.border_width);
+        assert_eq!(
+            generated.style.border_color,
+            w3cos_std::Color::rgb(0, 128, 0)
+        );
         assert_eq!(generated.style.border_color, principal.style.border_color);
         crate::stylesheet::clear_rules();
     }

@@ -2,8 +2,9 @@ use w3cos_std::color::Color;
 use w3cos_std::safe_area::SafeAreaEdge;
 use w3cos_std::style::{
     AlignItems, BoxSizing, Clear, ColumnFill, Contain, CssClipRect, Dimension, Display, Edges,
-    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, PhysicalSide, Position, Spacing,
-    Style, TextDirection, UnicodeBidi, WillChange, WritingMode, parse_css_integer_clamped,
+    FlexDirection, FlexWrap, Float, JustifyContent, Overflow, PhysicalSide, Position,
+    ScrollMarkerGroup, Spacing, Style, TextDirection, UnicodeBidi, WillChange, WritingMode,
+    parse_css_integer_clamped,
 };
 
 /// The one switch for resolving logical properties to physical ones by the
@@ -30,6 +31,7 @@ pub const NG_LOGICAL_PROPERTIES: bool = true;
 pub const NG_BLOCK_AXIS_LOGICAL_PROPERTIES: bool = false;
 
 pub(crate) const LIST_IMAGE_PROPERTY: &str = "--w3cos-internal-list-style-image";
+pub(crate) const BREAK_BEFORE_PROPERTY: &str = "--w3cos-internal-break-before";
 pub const RESIZE_PROPERTY: &str = "--w3cos-internal-css-resize";
 /// Computed `tab-size` (CSS Text 3 4.2, inherited): `<number>` spaces as a
 /// bare number, a `<length>` resolved at the declaring element as `Npx`.
@@ -1099,6 +1101,16 @@ impl CSSStyleDeclaration {
             "column-fill" | "columnFill" => {
                 if let Some(fill) = parse_column_fill(value) {
                     self.inner.column_fill = fill;
+                }
+            }
+            "break-before" | "breakBefore" | "page-break-before" | "pageBreakBefore" => {
+                if let Some(keyword) = parse_break_before(value) {
+                    set_marker(&mut self.inner, BREAK_BEFORE_PROPERTY, Some(keyword));
+                }
+            }
+            "scroll-marker-group" | "scrollMarkerGroup" => {
+                if let Some(group) = parse_scroll_marker_group(value) {
+                    self.inner.scroll_marker_group = group;
                 }
             }
             "columns" => {
@@ -2681,6 +2693,19 @@ impl CSSStyleDeclaration {
                 ColumnFill::BalanceAll => "balance-all",
             }
             .into(),
+            "break-before" | "breakBefore" | "page-break-before" | "pageBreakBefore" => self
+                .inner
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| properties.get(BREAK_BEFORE_PROPERTY))
+                .cloned()
+                .unwrap_or_else(|| "auto".to_string()),
+            "scroll-marker-group" | "scrollMarkerGroup" => match self.inner.scroll_marker_group {
+                ScrollMarkerGroup::None => "none",
+                ScrollMarkerGroup::Before => "before",
+                ScrollMarkerGroup::After => "after",
+            }
+            .into(),
             "columns" => format!(
                 "{} {}",
                 self.get_property("column-width"),
@@ -4226,11 +4251,40 @@ pub fn parse_column_count(value: &str) -> Option<Option<u32>> {
     (count > 0).then_some(Some(count as u32))
 }
 
+pub fn parse_break_before(value: &str) -> Option<String> {
+    let keyword = value.trim().to_ascii_lowercase();
+    matches!(
+        keyword.as_str(),
+        "auto"
+            | "avoid"
+            | "avoid-page"
+            | "avoid-column"
+            | "always"
+            | "all"
+            | "page"
+            | "left"
+            | "right"
+            | "recto"
+            | "verso"
+            | "column"
+    )
+    .then_some(keyword)
+}
+
 pub fn parse_column_fill(value: &str) -> Option<ColumnFill> {
     match value.trim().to_ascii_lowercase().as_str() {
         "auto" => Some(ColumnFill::Auto),
         "balance" | "initial" | "unset" => Some(ColumnFill::Balance),
         "balance-all" => Some(ColumnFill::BalanceAll),
+        _ => None,
+    }
+}
+
+pub fn parse_scroll_marker_group(value: &str) -> Option<ScrollMarkerGroup> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" | "initial" | "unset" => Some(ScrollMarkerGroup::None),
+        "before" => Some(ScrollMarkerGroup::Before),
+        "after" => Some(ScrollMarkerGroup::After),
         _ => None,
     }
 }
@@ -4282,6 +4336,7 @@ pub fn valid_multicol_declaration(name: &str, value: &str) -> bool {
         "column-count" => parse_column_count(value).is_some(),
         "column-fill" => parse_column_fill(value).is_some(),
         "columns" => parse_columns(value).is_some(),
+        "scroll-marker-group" => parse_scroll_marker_group(value).is_some(),
         _ => true,
     }
 }

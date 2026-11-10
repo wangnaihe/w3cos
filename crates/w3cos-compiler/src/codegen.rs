@@ -1101,6 +1101,14 @@ fn gen_style(s: &StyleDecl, depth: usize, signal_names: &[&str]) -> String {
         };
         fields.push(format!("scroll_initial_target: {variant}"));
     }
+    if let Some(ref group) = s.scroll_marker_group {
+        let variant = match group.as_str() {
+            "before" => "ScrollMarkerGroup::Before",
+            "after" => "ScrollMarkerGroup::After",
+            _ => "ScrollMarkerGroup::None",
+        };
+        fields.push(format!("scroll_marker_group: {variant}"));
+    }
     if let Some(margin) = gen_margin_edges(s) {
         fields.push(margin);
     }

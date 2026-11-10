@@ -147,6 +147,10 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             | "split-inline-owner"
             | "quirks-mode"
             | "rendered-legend"
+            | "break-before"
+            | "fieldset-content-box"
+            // Hit-test owner of a ::scroll-marker (elementFromPoint).
+            | "scroll-marker-origin"
             | "document-element"
             | "size-containment"
             | "contain-intrinsic-size"
@@ -221,6 +225,11 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             // Paint resolves it against the laid-out border box
             // (paint_artifact::resolve_translate_percent).
             | "translate-percent"
+            // CSS Overflow 5 adjunct boxes generated beside a scroller
+            // (`::scroll-marker-group`) and their `::column::scroll-marker`
+            // children. Identification only; layout is ordinary flex.
+            | "scroll-marker-group"
+            | "column-scroll-marker"
         )
         || name.starts_with("decoration-owner")
         // Logical sizes the cascade does not resolve. Legacy layout ignores
@@ -982,8 +991,22 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
     match info.kind {
         ComponentKind::Root | ComponentKind::Box | ComponentKind::Column | ComponentKind::Row => {
             if inline::is_inline_box(flat, index) {
-                // Validated with its IFC container (container_reason).
-                (!inline::in_inline_container(flat, index)).then_some("display:inline")
+                // CSS Display §2.7 / Flexbox §4: an in-flow flex item is
+                // blockified, so this box is not an IFC participant. Width
+                // and height apply; `flex::layout_item` already lays it out
+                // through `layout_block_sized`. Computed `display` stays
+                // `inline` (Chrome 156 `::scroll-marker` in a flex group).
+                if is_in_flow_flex_item(flat, index) {
+                    let mut used = info.style.clone();
+                    used.display = Display::Block;
+                    // The DOM lowers a `display:inline` principal box to a
+                    // row tagged as an IFC. After blockification that marker
+                    // is the item's inner IFC, not a reason to leave NG.
+                    unsupported_style(&used, &[inline::VALIGN_MARKER, inline::IFC_MARKER])
+                } else {
+                    // Validated with its IFC container (container_reason).
+                    (!inline::in_inline_container(flat, index)).then_some("display:inline")
+                }
             } else if is_author_flex(info.style) {
                 // `run-in`, `-webkit-box`, and `-webkit-inline-box` compute
                 // to `display: flex` for legacy. When this stage can lay
@@ -4164,6 +4187,15 @@ fn is_vertical_webkit_box(style: &Style) -> bool {
 fn is_legacy_webkit_box(style: &Style) -> bool {
     unrecognized_display(style)
         .is_some_and(|value| matches!(value, "-webkit-box" | "-webkit-inline-box"))
+}
+
+/// An in-flow child of a flex container (CSS Flexbox §4). Out-of-flow
+/// boxes are not flex items; `float` does not apply to items.
+pub(super) fn is_in_flow_flex_item(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let info = &flat[index];
+    info.parent
+        .is_some_and(|parent| is_author_flex(flat[parent].style))
+        && !oof::is_out_of_flow(info.style)
 }
 
 pub(super) fn is_author_flex(style: &Style) -> bool {

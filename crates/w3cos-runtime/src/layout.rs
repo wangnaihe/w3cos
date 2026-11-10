@@ -4887,7 +4887,11 @@ impl LayoutEngine {
                         // The legacy Taffy tree no longer matches this output.
                         self.tree_valid = false;
                         let (scrollable_nodes, clip_only_nodes, scroll_ancestor) =
-                            scroll_containers_from_layout(&layout_cache, flat);
+                            scroll_containers_from_layout(
+                                &layout_cache,
+                                flat,
+                                Some((viewport_w, viewport_h)),
+                            );
                         Ok(LayoutResults {
                             layout_cache,
                             scrollable_nodes,
@@ -5309,6 +5313,12 @@ impl LayoutEngine {
         }
         refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
         extend_scroll_extents_from_descendants(&results, flat, &scroll_ancestor, &mut scrollable);
+        extend_scroll_extents_from_overflow_columns(
+            &results,
+            flat,
+            Some((viewport_w, viewport_h)),
+            &mut scrollable,
+        );
 
         results.extend(fixed_results);
 
@@ -6045,6 +6055,12 @@ pub fn compute_with_scroll_details(
     }
     refresh_scroll_container_rects(&results, &mut scrollable, &mut clip_only);
     extend_scroll_extents_from_descendants(&results, &flat, &scroll_ancestor, &mut scrollable);
+    extend_scroll_extents_from_overflow_columns(
+        &results,
+        &flat,
+        Some((viewport_w, viewport_h)),
+        &mut scrollable,
+    );
     phase.mark("proj_rest");
 
     results.extend(fixed_results);
@@ -20618,6 +20634,7 @@ fn refresh_scroll_container_rects(
 pub(crate) fn scroll_containers_from_layout(
     layouts: &[(LayoutRect, usize)],
     flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
 ) -> (
     Vec<(usize, LayoutRect, ScrollExtent)>,
     Vec<(usize, LayoutRect)>,
@@ -20741,6 +20758,7 @@ pub(crate) fn scroll_containers_from_layout(
         &scroll_ancestor,
         &mut scrollable,
     );
+    extend_scroll_extents_from_overflow_columns(&shifted_layouts, flat, viewport, &mut scrollable);
     let mut clip_only = Vec::new();
     scrollable.retain(|(index, rect, extent)| {
         if extent.max_x > 0.0 || extent.max_y > 0.0 || hidden_clip[*index] {
@@ -20751,6 +20769,59 @@ pub(crate) fn scroll_containers_from_layout(
         }
     });
     (scrollable, clip_only, scroll_ancestor)
+}
+
+/// Overflow columns are paint-projected (CSS Multicol) and therefore absent
+/// from the descendant border-box extent. They still form the scrollable
+/// overflow rectangle in the inline axis: max scroll is
+/// `column-width+gap` times the fragmentainer count, minus the content box.
+fn extend_scroll_extents_from_overflow_columns(
+    layouts: &[(LayoutRect, usize)],
+    flat: &[FlatNodeInfo<'_>],
+    viewport: Option<(f32, f32)>,
+    scrollable: &mut [(usize, LayoutRect, ScrollExtent)],
+) {
+    if scrollable.is_empty() {
+        return;
+    }
+    let mut rects = vec![None; flat.len()];
+    for &(rect, index) in layouts {
+        if index < rects.len() {
+            rects[index] = Some(rect);
+        }
+    }
+    let nodes: Vec<(&w3cos_std::style::Style, Option<usize>)> =
+        flat.iter().map(|node| (node.style, node.parent)).collect();
+    let plans = resolve_column_fragment_plans(&nodes, &rects, viewport);
+    for (index, _, extent) in scrollable.iter_mut() {
+        let Some(plan) = plans.get(*index).and_then(|plan| plan.as_ref()) else {
+            continue;
+        };
+        if plan.bands.is_empty() {
+            continue;
+        }
+        let Some(principal) = rects.get(*index).copied().flatten() else {
+            continue;
+        };
+        let style = flat[*index].style;
+        let padding = style.padding_lengths();
+        let left = style.border_left_width.unwrap_or(style.border_width) + padding.left;
+        let right = style.border_right_width.unwrap_or(style.border_width) + padding.right;
+        let port = (principal.width - left - right).max(0.0);
+        let (vw, vh) = viewport.unwrap_or((principal.width, principal.height));
+        let Some(column_width) = used_column_width(style, port, vw, vh) else {
+            continue;
+        };
+        let gap = style.column_gap.unwrap_or(style.font_size).max(0.0);
+        let stride = column_width + gap;
+        if port <= 0.0 || stride <= 0.0 {
+            continue;
+        }
+        let extra = (stride * plan.bands.len() as f32 - port).max(0.0);
+        if extra > 0.0 {
+            extent.max_x = extent.max_x.max(extra);
+        }
+    }
 }
 
 fn extend_scroll_extents_from_descendants(

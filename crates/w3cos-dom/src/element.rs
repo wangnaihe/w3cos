@@ -505,6 +505,10 @@ impl Element {
             width = width.max(right - root.x);
             height = height.max(bottom - root.y);
         }
+        let extra = doc.column_overflow_scroll_advance(self.id);
+        if extra > 0.0 {
+            width = width.max(root.width + extra);
+        }
         (width.max(0.0), height.max(0.0))
     }
 

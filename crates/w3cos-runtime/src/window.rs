@@ -3253,6 +3253,24 @@ impl App {
                 .collect(),
         );
 
+        if measurement_pass < 2
+            && self.dom_mode
+            && crate::incremental_layout::sync_column_scroll_marker_counts(
+                &flat,
+                &self.layout_cache,
+                (w, layout_h),
+            )
+        {
+            drop(retained_flat);
+            drop(walked_flat);
+            self.paint_artifact.nodes = old_paint_nodes;
+            self.root = crate::dom::to_component_tree();
+            self.needs_layout = true;
+            self.needs_tree_rebuild = true;
+            self.ensure_layout_pass(measurement_pass + 1);
+            return;
+        }
+
         let (virtual_heights_changed, virtual_anchor_corrections) = measure_virtual_list_rows(
             &flat,
             &self.layout_cache,

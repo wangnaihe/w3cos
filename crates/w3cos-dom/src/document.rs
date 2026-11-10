@@ -19,6 +19,78 @@ thread_local! {
     static STRUCTURE_TICK: Cell<u64> = const { Cell::new(1) };
     static CHILD_LOG: RefCell<ChildListLog> = RefCell::new(ChildListLog::default());
     static DOCUMENT_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// Layout-time ::column counts, used to generate ::column::scroll-marker
+    /// boxes on the next component-tree build (Blink regenerates column
+    /// pseudos after multicol layout).
+    static COLUMN_PSEUDO_COUNTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
+
+/// Number of ::column boxes recorded for `id` after the last layout pass.
+pub fn column_pseudo_count(id: NodeId) -> usize {
+    COLUMN_PSEUDO_COUNTS.with(|counts| counts.borrow().get(&id.as_u32()).copied().unwrap_or(0))
+}
+
+/// Record the number of ::column boxes for `id`. Returns true when the
+/// stored value changed, so the caller can rebuild the component tree.
+pub fn set_column_pseudo_count(id: NodeId, count: usize) -> bool {
+    COLUMN_PSEUDO_COUNTS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        let key = id.as_u32();
+        let previous = counts.get(&key).copied().unwrap_or(0);
+        if previous == count {
+            return false;
+        }
+        if count == 0 {
+            counts.remove(&key);
+        } else {
+            counts.insert(key, count);
+        }
+        true
+    })
+}
+
+pub fn clear_column_pseudo_counts() {
+    COLUMN_PSEUDO_COUNTS.with(|counts| counts.borrow_mut().clear());
+}
+
+/// CSS Overflow 3: a box that establishes an overflow clip and uses
+/// `hidden | scroll | auto` on either axis is a scroll container.
+/// `overflow: clip` is not.
+fn establishes_scroll_container(style: &w3cos_std::style::Style) -> bool {
+    use w3cos_std::style::Overflow;
+    if !style.display.establishes_overflow_clip() {
+        return false;
+    }
+    let axis = |overflow| {
+        matches!(
+            overflow,
+            Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+        )
+    };
+    axis(style.resolved_overflow_x()) || axis(style.resolved_overflow_y())
+}
+
+/// Hit testing a `::scroll-marker` returns its originating element
+/// (`elementFromPoint`). This is a hit-test-only carrier, not a
+/// `NativeHost`: the marker must not publish its rect as the element's.
+pub const SCROLL_MARKER_ORIGIN: &str = "--w3cos-internal-scroll-marker-origin";
+
+fn attach_scroll_marker_host(marker: &mut w3cos_std::Component, id: NodeId) {
+    marker
+        .style
+        .custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(SCROLL_MARKER_ORIGIN.into(), id.as_u32().to_string());
+}
+
+fn with_counter_target_occurrence<T>(occurrence: usize, f: impl FnOnce() -> T) -> T {
+    COUNTER_TARGET_OCCURRENCE.with(|cell| {
+        let previous = cell.get();
+        cell.set(occurrence);
+        let value = f();
+        cell.set(previous);
+        value
+    })
 }
 
 /// One child-list edit, recorded so a cached child-id vector can be patched
@@ -122,6 +194,9 @@ struct CounterMemo {
 
 thread_local! {
     static COUNTER_MEMO: RefCell<Option<CounterMemo>> = const { RefCell::new(None) };
+    /// Which `::column::scroll-marker` (0-based) a counter() snapshot should
+    /// capture. Each generated column marker increments in document order.
+    static COUNTER_TARGET_OCCURRENCE: Cell<usize> = const { Cell::new(0) };
 }
 
 struct CounterMemoScope {
@@ -913,6 +988,10 @@ mod text_presentation;
 #[cfg(test)]
 #[path = "document/generated_content_inheritance_tests.rs"]
 mod generated_content_inheritance_tests;
+
+#[cfg(test)]
+#[path = "document/scroll_marker_tests.rs"]
+mod scroll_marker_tests;
 
 mod inline_boundary;
 
@@ -2109,13 +2188,41 @@ impl Document {
     pub fn set_scroll(&mut self, id: NodeId, left: Option<f32>, top: Option<f32>) {
         let idx = id.0 as usize;
         if idx < self.scroll_offsets.len() {
+            let before = self.scroll_offsets[idx];
             if let Some(l) = left {
                 self.scroll_offsets[idx].0 = l;
             }
             if let Some(t) = top {
                 self.scroll_offsets[idx].1 = t;
             }
+            if self.scroll_offsets[idx] != before {
+                self.record_layout_dirty(id);
+                if self.computed_style_for(id).scroll_marker_group
+                    != w3cos_std::style::ScrollMarkerGroup::None
+                {
+                    // :target-current is a layout-time fact of the component tree.
+                    self.mark_dirty(id);
+                }
+            }
         }
+    }
+
+    /// Extra scrollable overflow from NG overflow columns (paint-projected,
+    /// so it is not in the descendant layout-rect extent).
+    pub(crate) fn column_overflow_scroll_advance(&self, id: NodeId) -> f32 {
+        let style = self.computed_style_for(id);
+        if style.column_count.is_none() && style.column_width == w3cos_std::style::Dimension::Auto {
+            return 0.0;
+        }
+        let count = column_pseudo_count(id);
+        if count == 0 {
+            return 0.0;
+        }
+        let (port, stride) = self.column_scroll_port_and_stride(id, &style);
+        if port <= 0.0 || stride <= 0.0 {
+            return 0.0;
+        }
+        (stride * count as f32 - port).max(0.0)
     }
 
     /// Free a node slot for reuse. Does NOT unlink from tree — call remove_child first.
@@ -5775,6 +5882,236 @@ impl Document {
         merged.to_style()
     }
 
+    /// CSS Overflow 5 §3.1.8: active `::column::scroll-marker` for the
+    /// scroller's eventual scroll position (redistribute unreachable
+    /// targets in the first/last `min(1/8 * scrollport, range/2)`).
+    fn active_column_scroll_marker_index(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+        count: usize,
+    ) -> usize {
+        Self::select_active_column_scroll_marker(
+            self.get_scroll(id).0,
+            self.column_scroll_port_and_stride(id, origin_style),
+            count,
+        )
+    }
+
+    pub(crate) fn select_active_column_scroll_marker(
+        scroll: f32,
+        port_and_stride: (f32, f32),
+        count: usize,
+    ) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let (port, stride) = port_and_stride;
+        if count == 1 || port <= 0.0 || stride <= 0.0 {
+            return 0;
+        }
+        let scroll_size = stride * count as f32;
+        let range = (scroll_size - port).max(0.0);
+        let position = scroll.max(0.0).min(range);
+        let mut positions: Vec<f32> = (0..count).map(|i| i as f32 * stride).collect();
+        if range > 0.0 {
+            let distribute = (port / 8.0).min(range / 2.0).max(0.0);
+            if distribute > 0.0 {
+                let before: Vec<usize> = positions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p < distribute)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(min_pos) = before.iter().map(|&i| positions[i]).reduce(f32::min) {
+                    let denom = distribute - min_pos;
+                    if denom > 0.0 {
+                        for i in before {
+                            positions[i] = (positions[i] - min_pos) / denom * distribute;
+                        }
+                    }
+                }
+                let after_start = range - distribute;
+                let after: Vec<usize> = positions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| **p > after_start)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(max_pos) = after.iter().map(|&i| positions[i]).reduce(f32::max) {
+                    let denom = max_pos - after_start;
+                    if denom > 0.0 {
+                        for i in after {
+                            positions[i] =
+                                (positions[i] - after_start) / denom * distribute + after_start;
+                        }
+                    }
+                }
+            }
+        }
+        let mut selected = 0;
+        for (i, p) in positions.iter().enumerate() {
+            if *p <= position + 0.5 {
+                selected = i;
+            }
+        }
+        selected
+    }
+
+    fn column_scroll_port_and_stride(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+    ) -> (f32, f32) {
+        let rect = self.get_layout_rect(id);
+        let border = |side: Option<f32>| side.unwrap_or(origin_style.border_width);
+        let pad_px = |s: w3cos_std::style::Spacing| match s {
+            w3cos_std::style::Spacing::Px(v) => v,
+            _ => 0.0,
+        };
+        let port = (rect.width
+            - border(origin_style.border_left_width)
+            - border(origin_style.border_right_width)
+            - pad_px(origin_style.padding.left)
+            - pad_px(origin_style.padding.right))
+        .max(0.0);
+        let gap = origin_style.column_gap.unwrap_or(0.0).max(0.0);
+        let authored = origin_style.column_count.unwrap_or(1).max(1) as f32;
+        let column_width = if authored <= 0.0 {
+            port
+        } else {
+            ((port - gap * (authored - 1.0)) / authored).max(0.0)
+        };
+        (port, column_width + gap)
+    }
+
+    /// CSS Overflow 5 `::scroll-marker-group` adjunct box, generated as a
+    /// sibling of a scroll container whose `scroll-marker-group` is not
+    /// `none`. Column markers are created after layout reports a column
+    /// count; child `::scroll-marker` boxes are created immediately.
+    fn scroll_marker_group_component(
+        &self,
+        id: NodeId,
+        origin_style: &w3cos_std::style::Style,
+    ) -> Option<w3cos_std::Component> {
+        if origin_style.scroll_marker_group == w3cos_std::style::ScrollMarkerGroup::None {
+            return None;
+        }
+        // CSS Overflow 5: the group is an adjunct of a *scroll container*.
+        if !establishes_scroll_container(origin_style) {
+            return None;
+        }
+        let declarations =
+            stylesheet::matching_pseudo_declarations_for_node(self, id, "::scroll-marker-group");
+        let mut merged = CSSStyleDeclaration::new();
+        // Initial used display of the generated adjunct is block (015's
+        // "initial display type" packs floats; author `display` still wins).
+        merged.set_property("display", "block");
+        for (property, value, _) in &declarations {
+            merged.set_property(property, value);
+        }
+        // CSS Overflow 5 recommended UA: `contain: size !important`, so
+        // marker generation cannot change the group's used size (or layout
+        // outside it). Applied after author declarations because this merge
+        // is not a full cascade. Author `display:none` still suppresses the box.
+        merged.set_property("contain", "size");
+        let mut style = merged.to_style();
+        if !generated_display_creates_box(style.display) {
+            return None;
+        }
+        let declares = |property: &str| {
+            declarations
+                .iter()
+                .rev()
+                .find(|(name, _, _)| css_property_eq(name, property))
+                .is_some_and(|(_, value, _)| {
+                    !matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "inherit" | "unset"
+                    )
+                })
+        };
+        inherit_text_style(&mut style, origin_style, "::scroll-marker-group", declares);
+        if !declares("flex-direction")
+            && !declares("flex-flow")
+            && matches!(
+                style.display,
+                w3cos_std::style::Display::Flex | w3cos_std::style::Display::InlineFlex
+            )
+        {
+            // CSS initial is row; Style::default() is column.
+            style.flex_direction = w3cos_std::style::FlexDirection::Row;
+        }
+        style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-scroll-marker-group".into(), "1".into());
+
+        let mut children = Vec::new();
+        if self
+            .generated_pseudo_component(id, "::column::scroll-marker", origin_style)
+            .is_some()
+        {
+            let current_decls = stylesheet::matching_pseudo_declarations_for_node(
+                self,
+                id,
+                "::column::scroll-marker:target-current",
+            );
+            let count = column_pseudo_count(id);
+            let current = self.active_column_scroll_marker_index(id, origin_style, count);
+            for index in 0..count {
+                // Resolve `content: counter(...)` after this marker's
+                // increment, not once for a shared template.
+                let mut marker = with_counter_target_occurrence(index, || {
+                    self.generated_pseudo_component(id, "::column::scroll-marker", origin_style)
+                })
+                .expect("column scroll marker still generates");
+                if index == current && !current_decls.is_empty() {
+                    let mut declaration = CSSStyleDeclaration::from_style((*marker.style).clone());
+                    for (property, value, _) in &current_decls {
+                        if !css_property_eq(property, "content") {
+                            declaration.set_property(property, value);
+                        }
+                    }
+                    *marker.style = declaration.to_style();
+                }
+                marker
+                    .style
+                    .custom_properties
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        "--w3cos-internal-column-scroll-marker".into(),
+                        index.to_string(),
+                    );
+                attach_scroll_marker_host(&mut marker, id);
+                children.push(marker);
+            }
+        }
+        for child_id in self.children_ids(id) {
+            let child = self.get_node(child_id);
+            if child.node_type != NodeType::Element {
+                continue;
+            }
+            let child_style = self.computed_style_for(child_id);
+            if let Some(mut marker) =
+                self.generated_pseudo_component(child_id, "::scroll-marker", &child_style)
+            {
+                attach_scroll_marker_host(&mut marker, child_id);
+                children.push(marker);
+            }
+        }
+
+        let component = if matches!(
+            style.flex_direction,
+            w3cos_std::style::FlexDirection::Row | w3cos_std::style::FlexDirection::RowReverse
+        ) {
+            w3cos_std::Component::row_shared(style.into(), children)
+        } else {
+            w3cos_std::Component::column_shared(style.into(), children)
+        };
+        Some(component)
+    }
+
     fn generated_pseudo_component(
         &self,
         id: NodeId,
@@ -5840,7 +6177,14 @@ impl Document {
         }
 
         let mut merged = CSSStyleDeclaration::new();
-        merged.set_property("display", "inline");
+        // CSS Overflow 5 / Chrome computed style: `::scroll-marker`
+        // defaults to `display:inline` (same initial as `::before`).
+        // Width/height then apply only when the *used* display is
+        // blockified — flex/grid item, float, abspos, or an authored
+        // block-level display — not because the UA sheet uses
+        // `inline-block`.
+        let default_display = "inline";
+        merged.set_property("display", default_display);
         for (property, value, _) in &declarations {
             if !css_property_eq(property, "content") {
                 merged.set_property(property, value);
@@ -5874,6 +6218,19 @@ impl Document {
                 })
         };
         inherit_text_style(&mut style, origin_style, pseudo_element, declares);
+        if matches!(
+            pseudo_element,
+            "::scroll-marker" | "::column::scroll-marker"
+        ) {
+            // CSS Overflow 5 / CSSWG: default styling matches a link
+            // (`:visited` never applies). Author color / text-decoration win.
+            if !declares("color") {
+                style.color = w3cos_std::Color::rgb(0, 0, 238);
+            }
+            if !declares("text-decoration") {
+                style.text_decoration = w3cos_std::style::TextDecoration::Underline;
+            }
+        }
         if style.float != w3cos_std::style::Float::None {
             use w3cos_std::style::Display;
             // Generated principal boxes obey the same computed-display
@@ -6014,7 +6371,16 @@ impl Document {
                     vec![w3cos_std::Component::text(text.clone(), inherited)],
                 ))
             }
-            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)] => {
+            [GeneratedContentItem::Text(text) | GeneratedContentItem::Quote(text)]
+                if principal_box_can_merge_generated_inline_text(&style) =>
+            {
+                // A transparent, auto-sized inline principal box is
+                // indistinguishable from its text run. Width, height,
+                // background, padding, or decoration belong on the
+                // principal box (CSS Display / Generated Content), so
+                // those cases fall through to the wrapper below. That
+                // matters when the used display is later blockified
+                // (flex/grid item, float, abspos).
                 Some(w3cos_std::Component::text(text.clone(), style))
             }
             [GeneratedContentItem::Image(source)] => {
@@ -6028,7 +6394,13 @@ impl Document {
                 // items into one transparent row inside it.
                 let mut inherited = w3cos_std::style::Style::default();
                 inherit_text_style(&mut inherited, &style, "", |_| false);
-                w3cos_std::inline_text::copy_used_decoration(&mut inherited, &style);
+                // Paint collects ancestor decorations. Copying the
+                // owner's text-decoration onto the inner run would
+                // underline the same text twice once the principal box
+                // is kept (single-text markers with UA link style).
+                if style.text_decoration == w3cos_std::style::TextDecoration::None {
+                    w3cos_std::inline_text::copy_used_decoration(&mut inherited, &style);
+                }
                 inherited.visibility = style.visibility;
 
                 let children = content
@@ -6075,10 +6447,16 @@ impl Document {
                         | w3cos_std::style::Display::InlineTable
                         | w3cos_std::style::Display::TableRow
                 ) {
-                    style.flex_direction = w3cos_std::style::FlexDirection::Row;
-                    style.align_items = w3cos_std::style::AlignItems::Baseline;
                     if style.display == w3cos_std::style::Display::Inline {
-                        style.flex_wrap = if matches!(
+                        // The principal box is the pseudo, not the
+                        // anonymous IFC for its `content` items. Tagging
+                        // the principal itself as the IFC lets a parent
+                        // block adopt it as its line box and hoist the
+                        // text, dropping the pseudo's border/background.
+                        let mut line_style = inherited;
+                        line_style.display = w3cos_std::style::Display::Flex;
+                        line_style.flex_direction = w3cos_std::style::FlexDirection::Row;
+                        line_style.flex_wrap = if matches!(
                             style.white_space,
                             w3cos_std::style::WhiteSpace::NoWrap
                                 | w3cos_std::style::WhiteSpace::Pre
@@ -6087,14 +6465,22 @@ impl Document {
                         } else {
                             w3cos_std::style::FlexWrap::Wrap
                         };
-                        style
+                        line_style.align_items = w3cos_std::style::AlignItems::Baseline;
+                        line_style
                             .custom_properties
                             .get_or_insert_with(Default::default)
                             .insert(
                                 "--w3cos-internal-inline-formatting-context".to_string(),
                                 "1".to_string(),
                             );
+                        let children = fixup_css_table_children(
+                            &style,
+                            vec![w3cos_std::Component::row(line_style, children)],
+                        );
+                        return Some(w3cos_std::Component::row(style, children));
                     }
+                    style.flex_direction = w3cos_std::style::FlexDirection::Row;
+                    style.align_items = w3cos_std::style::AlignItems::Baseline;
                     let children = fixup_css_table_children(&style, children);
                     Some(w3cos_std::Component::row(style, children))
                 } else {
@@ -6708,6 +7094,48 @@ impl Document {
         None
     }
 
+    /// `::column::scroll-marker` boxes originate on the scroll container
+    /// and participate in its counter scope (CSS Overflow 5 / CSS Lists).
+    /// Each generated marker applies its increment in column order.
+    fn visit_column_scroll_marker_counters(
+        &self,
+        id: NodeId,
+        target: NodeId,
+        target_pseudo: &str,
+        scopes: &mut Vec<HashMap<String, i32>>,
+    ) -> Option<CounterSnapshot> {
+        let count = column_pseudo_count(id);
+        if count == 0 || !self.pseudo_generates_box(id, "::column::scroll-marker") {
+            return None;
+        }
+        let target_occurrence = COUNTER_TARGET_OCCURRENCE.with(|cell| cell.get());
+        for index in 0..count {
+            scopes.push(HashMap::new());
+            for (property, default_value, operation) in [
+                ("counter-reset", 0, "reset"),
+                ("counter-set", 0, "set"),
+                ("counter-increment", 1, "increment"),
+            ] {
+                Self::apply_counter_declaration(
+                    scopes,
+                    self.pseudo_counter_value(id, "::column::scroll-marker", property),
+                    default_value,
+                    operation,
+                );
+            }
+            if id == target
+                && target_pseudo == "::column::scroll-marker"
+                && index == target_occurrence
+            {
+                return Some(CounterSnapshot {
+                    scopes: scopes.clone(),
+                });
+            }
+            scopes.pop();
+        }
+        None
+    }
+
     fn visit_counter_tree(
         &self,
         id: NodeId,
@@ -6753,6 +7181,15 @@ impl Document {
                     }
                 }
             });
+        }
+        if self.computed_style_for(id).scroll_marker_group
+            == w3cos_std::style::ScrollMarkerGroup::Before
+        {
+            if let Some(snapshot) =
+                self.visit_column_scroll_marker_counters(id, target, target_pseudo, scopes)
+            {
+                return Some(snapshot);
+            }
         }
         let sibling_scope_base = scopes.len();
         if let Some(snapshot) =
@@ -6804,6 +7241,15 @@ impl Document {
             self.visit_pseudo_counters(id, "::after", target, target_pseudo, scopes, false)
         {
             return Some(snapshot);
+        }
+        if self.computed_style_for(id).scroll_marker_group
+            == w3cos_std::style::ScrollMarkerGroup::After
+        {
+            if let Some(snapshot) =
+                self.visit_column_scroll_marker_counters(id, target, target_pseudo, scopes)
+            {
+                return Some(snapshot);
+            }
         }
         let element_scope = scopes[incoming_scope_count].clone();
         scopes.truncate(incoming_scope_count);
@@ -7840,7 +8286,19 @@ impl Document {
                     content: "\u{200b}".into(),
                 };
             }
-            components.push(component);
+            if let Some(group) = self.scroll_marker_group_component(child_id, &component.style) {
+                if component.style.scroll_marker_group
+                    == w3cos_std::style::ScrollMarkerGroup::Before
+                {
+                    components.push(group);
+                    components.push(component);
+                } else {
+                    components.push(component);
+                    components.push(group);
+                }
+            } else {
+                components.push(component);
+            }
         }
         components
     }
@@ -8340,6 +8798,86 @@ impl Document {
                 self.get_node(child).node_type == NodeType::Text
                     || self.passive_vertical_align_text_subtree(child)
             })
+    }
+
+    /// HTML §15.3.13: the fieldset's anonymous content box holds every
+    /// child except the rendered legend. Overflow and multicol on the
+    /// fieldset apply to that box, not to the legend.
+    fn wrap_fieldset_anonymous_content(
+        style: &mut w3cos_std::style::Style,
+        children: &mut Vec<w3cos_std::Component>,
+    ) {
+        let has_columns = style.column_count.is_some()
+            || !matches!(style.column_width, w3cos_std::style::Dimension::Auto);
+        let clips = matches!(
+            style.resolved_overflow_x(),
+            w3cos_std::style::Overflow::Hidden
+                | w3cos_std::style::Overflow::Scroll
+                | w3cos_std::style::Overflow::Auto
+        ) || matches!(
+            style.resolved_overflow_y(),
+            w3cos_std::style::Overflow::Hidden
+                | w3cos_std::style::Overflow::Scroll
+                | w3cos_std::style::Overflow::Auto
+        );
+        if !has_columns && !clips {
+            return;
+        }
+        let Some(legend_index) = children.iter().position(|child| {
+            child
+                .style
+                .custom_properties
+                .as_ref()
+                .is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-rendered-legend")
+                })
+        }) else {
+            return;
+        };
+        let mut content_children = Vec::new();
+        let mut kept = Vec::with_capacity(2);
+        for (index, child) in std::mem::take(children).into_iter().enumerate() {
+            if index == legend_index {
+                kept.push(child);
+            } else {
+                content_children.push(child);
+            }
+        }
+        if content_children.is_empty() {
+            *children = kept;
+            return;
+        }
+        let mut content_style = w3cos_std::style::Style::default();
+        content_style.display = w3cos_std::style::Display::Block;
+        content_style.column_count = style.column_count;
+        content_style.column_width = style.column_width;
+        content_style.column_fill = style.column_fill;
+        content_style.column_gap = style.column_gap;
+        content_style.overflow = style.overflow;
+        content_style.overflow_x = style.overflow_x;
+        content_style.overflow_y = style.overflow_y;
+        content_style.overflow_clip_x = style.overflow_clip_x;
+        content_style.overflow_clip_y = style.overflow_clip_y;
+        content_style.height = style.height;
+        content_style
+            .custom_properties
+            .get_or_insert_with(Default::default)
+            .insert("--w3cos-internal-fieldset-content-box".into(), "1".into());
+        style.column_count = None;
+        style.column_width = w3cos_std::style::Dimension::Auto;
+        style.column_fill = w3cos_std::style::ColumnFill::Balance;
+        style.column_gap = None;
+        style.overflow = w3cos_std::style::Overflow::Visible;
+        style.overflow_x = None;
+        style.overflow_y = None;
+        style.overflow_clip_x = false;
+        style.overflow_clip_y = false;
+        style.height = w3cos_std::style::Dimension::Auto;
+        kept.push(w3cos_std::Component::column(
+            content_style,
+            content_children,
+        ));
+        *children = kept;
     }
 
     fn node_to_component(
@@ -12030,6 +12568,9 @@ impl Document {
                         w3cos_std::Component::canvas_shared(width, height, style)
                     }
                     _ => {
+                        if tag == "fieldset" {
+                            Self::wrap_fieldset_anonymous_content(&mut style, &mut children);
+                        }
                         if is_row {
                             w3cos_std::Component::row_shared(style, children)
                         } else {

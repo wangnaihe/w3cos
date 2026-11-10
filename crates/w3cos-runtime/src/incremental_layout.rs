@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use w3cos_dom::node::NodeId;
 use w3cos_std::component::EventAction;
-use w3cos_std::style::{Dimension, Display, Float, Overflow, Position, TextDirection};
+use w3cos_std::style::{
+    Dimension, Display, Float, Overflow, Position, ScrollMarkerGroup, TextDirection,
+};
 use w3cos_std::{Component, ComponentKind};
 
 use crate::layout::{LayoutEngine, pre_flatten};
@@ -259,8 +261,26 @@ fn rebuild(
     viewport_h: f32,
     drain_epoch: u32,
 ) -> bool {
-    let component = crate::dom::to_component_tree();
-    let flat = pre_flatten(&component);
+    let mut component = crate::dom::to_component_tree();
+    let mut flat = pre_flatten(&component);
+    let mut engine = LayoutEngine::new();
+    configure_engine(&mut engine, &component);
+    let Ok(mut results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
+        return false;
+    };
+    if sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h)) {
+        // Column count is a layout-time fact. Rebuild markers before
+        // publishing geometry so scrollWidth / scrollLeft clamp see
+        // overflow columns (CSS Overflow 5 / CSS Multicol).
+        component = crate::dom::to_component_tree();
+        flat = pre_flatten(&component);
+        engine = LayoutEngine::new();
+        configure_engine(&mut engine, &component);
+        let Ok(second) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
+            return false;
+        };
+        results = second;
+    }
     let node_ids = flat
         .iter()
         .map(|info| match info.on_click {
@@ -268,11 +288,6 @@ fn rebuild(
             _ => u32::MAX,
         })
         .collect::<Vec<_>>();
-    let mut engine = LayoutEngine::new();
-    configure_engine(&mut engine, &component);
-    let Ok(results) = engine.compute(&component, &flat, viewport_w, viewport_h) else {
-        return false;
-    };
     let snaps = write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let width_memos = memos_for_tree(&component, layout_gen, viewport_w, viewport_h, snaps);
     let splice_ok = splice::tree_is_spliceable(&component);
@@ -465,7 +480,9 @@ fn recompute(cache: &mut Cache, viewport_w: f32, viewport_h: f32) -> bool {
         return false;
     };
     write_rects(&flat, &results.layout_cache, &results.text_fragments);
-    true
+    // A changed column count needs a tree rebuild so overflow-column
+    // scroll geometry and ::column::scroll-marker siblings stay in sync.
+    !sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h))
 }
 
 fn write_rects(
@@ -1266,6 +1283,43 @@ pub fn with_paint_layout<R>(
     })
 }
 
+/// After a multicol layout, record how many ::column boxes each
+/// `scroll-marker-group` container produced so the next tree build can
+/// emit that many `::column::scroll-marker` children (CSS Overflow 5).
+pub(crate) fn sync_column_scroll_marker_counts(
+    flat: &[crate::layout::FlatNodeInfo<'_>],
+    layout_cache: &[(crate::layout::LayoutRect, usize)],
+    viewport: (f32, f32),
+) -> bool {
+    let mut changed = false;
+    let mut rects = vec![None; flat.len()];
+    for &(rect, index) in layout_cache {
+        if index < rects.len() {
+            rects[index] = Some(rect);
+        }
+    }
+    let nodes: Vec<(&w3cos_std::style::Style, Option<usize>)> =
+        flat.iter().map(|node| (node.style, node.parent)).collect();
+    let plans = crate::layout::resolve_column_fragment_plans(&nodes, &rects, Some(viewport));
+    for (index, node) in flat.iter().enumerate() {
+        if node.style.scroll_marker_group == ScrollMarkerGroup::None {
+            continue;
+        }
+        let EventAction::NativeHost { id, .. } = node.on_click else {
+            continue;
+        };
+        let count = plans
+            .get(index)
+            .and_then(|plan| plan.as_ref())
+            .map(|plan| plan.bands.len())
+            .unwrap_or(0);
+        if crate::dom::set_column_pseudo_count(*id as u32, count) {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn rebuild_paint_cache(
     slot: &mut Option<PaintCache>,
     structure: u64,
@@ -1273,16 +1327,27 @@ fn rebuild_paint_cache(
     viewport_w: f32,
     viewport_h: f32,
 ) -> anyhow::Result<()> {
-    let component = crate::dom::to_component_tree();
-    let flat = pre_flatten(&component);
-    let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
+    let mut component = crate::dom::to_component_tree();
+    let mut flat = pre_flatten(&component);
     let mut engine = LayoutEngine::new();
     // Floats, tables, and inline-block need the post-Taffy projections. A
     // block/absolute tree already matches `compute_with_scroll_details`
     // without that walk, which is most of a retained frame.
     engine.set_skip_projections(can_skip_projections(&component));
     engine.set_measure_text(true);
-    let results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
+    let mut results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
+    if sync_column_scroll_marker_counts(&flat, &results.layout_cache, (viewport_w, viewport_h)) {
+        // Column count is a layout-time fact. Rebuild the adjunct
+        // ::scroll-marker-group with the right number of markers and
+        // lay the tree out once more (CSS Overflow 5 / Blink).
+        component = crate::dom::to_component_tree();
+        flat = pre_flatten(&component);
+        engine = LayoutEngine::new();
+        engine.set_skip_projections(can_skip_projections(&component));
+        engine.set_measure_text(true);
+        results = engine.compute(&component, &flat, viewport_w, viewport_h)?;
+    }
+    let node_ids = flat.iter().map(flat_host_id).collect::<Vec<_>>();
     write_rects(&flat, &results.layout_cache, &results.text_fragments);
     let children = child_lists(&flat);
     let shift_ok = absolute_shift_ok(&flat);

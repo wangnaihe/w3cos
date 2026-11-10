@@ -1122,15 +1122,25 @@ fn inline_box_reason(
     {
         return Some("inline-box:edges");
     }
-    // The box's strut (NGInlineBoxState text metrics) is taken from text it
-    // holds directly in its own font, which always gets a fragment.
+    // The box's strut (NGInlineBoxState text metrics, CSS 2.1 10.8.1) is
+    // its own font. Direct non-space text in that font always gets a
+    // fragment and is the usual source. An empty or space-only box still
+    // has a strut from its font; those spaces may collapse (CSS 2.1 16.6.1)
+    // and then paint nothing. A direct text child in a different font is
+    // still outside this stage.
     let strut_text = rendered_children(flat, index).any(|child| {
         matches!(flat[child].kind, ComponentKind::Text { content }
             if !content.trim_matches(' ').is_empty() && content != FORCED_BREAK)
             && same_font(flat[child].style, style)
     });
     if !strut_text {
-        return Some("inline-box:strut");
+        let other_font_text = rendered_children(flat, index).any(|child| {
+            matches!(flat[child].kind, ComponentKind::Text { .. })
+                && !same_font(flat[child].style, style)
+        });
+        if other_font_text {
+            return Some("inline-box:strut");
+        }
     }
     // An edge next to a collapsible space needs the space handling at
     // inline box boundaries.
@@ -3448,6 +3458,12 @@ fn layout_lines(
         let mut starts: std::collections::HashMap<usize, (usize, usize, f32, f32)> =
             std::collections::HashMap::new();
         for (k, boxes) in opens.iter().enumerate() {
+            // A leaf that never contributed a piece (a collapsed space,
+            // CSS 2.1 16.6.1) does not place the inline boxes that would
+            // open on it; those boxes have no fragment.
+            if placed[k].is_none() {
+                continue;
+            }
             for (pos, &b) in boxes.iter().enumerate() {
                 let (line, x, _, baseline) = placed[k].why("inline-box-placement")?;
                 let start =
@@ -3456,6 +3472,9 @@ fn layout_lines(
             }
         }
         for (k, boxes) in closes.iter().enumerate() {
+            if placed_last[k].is_none() {
+                continue;
+            }
             for (pos, &b) in boxes.iter().enumerate() {
                 let (line, x, width, _) = placed_last[k].why("inline-box-placement")?;
                 let (first, start_line, start, baseline) =

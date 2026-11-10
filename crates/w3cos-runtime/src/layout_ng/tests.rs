@@ -9180,7 +9180,7 @@ fn scroll_containers_match_chrome() {
     let extents = |root: &Component| {
         let flat = pre_flatten(root);
         let rects = ng_rects(root);
-        let (scrollable, clip_only, ancestor) = scroll_containers_from_layout(&rects, &flat);
+        let (scrollable, clip_only, ancestor) = scroll_containers_from_layout(&rects, &flat, None);
         (
             scrollable
                 .iter()
@@ -9410,7 +9410,7 @@ fn sticky_keeps_static_position_like_chrome() {
     close(rect(&out, 3), (0.0, 20.0, 100.0, 20.0));
     close(rect(&out, 4), (0.0, 40.0, 100.0, 100.0));
     let flat = pre_flatten(&root);
-    let (_, _, ancestor) = scroll_containers_from_layout(&out, &flat);
+    let (_, _, ancestor) = scroll_containers_from_layout(&out, &flat, None);
     assert_eq!(ancestor[3], Some(1));
 
     // sticky-flow: margin and a child inside a sticky box in normal flow.
@@ -12944,6 +12944,142 @@ fn overflow_clear_alone_stays_on_ng() {
 /// 100×50 with an overflow:auto item that has an 80px child shrinks the
 /// item to 50 (automatic minimum is zero).
 #[test]
+fn inline_in_size_contained_block_ignores_width_height() {
+    // CSS 2.1 10.3.1 / 10.6.1: width and height do not apply to a
+    // non-replaced inline. Size containment on the parent does not clip
+    // ink, but it also must not stretch the inline's background to the
+    // containing-block width.
+    use w3cos_std::style::CustomProperties;
+    let marker = || {
+        node(
+            Style {
+                display: Display::Inline,
+                width: Dimension::Px(50.0),
+                height: Dimension::Px(50.0),
+                background: w3cos_std::Color {
+                    r: 0,
+                    g: 0,
+                    b: 255,
+                    a: 255,
+                },
+                font_size: 16.0,
+                ..Style::default()
+            },
+            vec![Component::text(
+                " ",
+                Style {
+                    display: Display::Inline,
+                    font_size: 16.0,
+                    ..Style::default()
+                },
+            )],
+        )
+    };
+    let contained = Style {
+        display: Display::Block,
+        width: Dimension::Px(784.0),
+        custom_properties: Some(CustomProperties::from_iter([(
+            "--w3cos-internal-size-containment".to_string(),
+            "1".to_string(),
+        )])),
+        ..block()
+    };
+    let root = node(contained, vec![marker(), marker()]);
+    let out = ng_rects(&root);
+    for (r, i) in &out {
+        println!("rect {i}: x={} y={} w={} h={}", r.x, r.y, r.width, r.height);
+    }
+    // The size-contained block itself is 784×0 (contain-intrinsic 0).
+    // Inline boxes must not become 784-wide or ~50-tall used boxes.
+    let wide = out.iter().any(|(r, _)| {
+        r.width > 200.0
+            && r.height > 20.0
+            && (*r).width < 784.5
+            && r.height < 60.0
+            && r.width > 700.0
+    });
+    assert!(!wide, "inline background/box smeared: {out:?}");
+}
+
+#[test]
+fn inline_flex_item_is_blockified_and_honors_width_height() {
+    // CSS Display §2.7 / Flexbox §4: a `display:inline` flex item is
+    // blockified, so width and height apply. Computed display stays
+    // inline (Chrome 156 `::scroll-marker` in a flex group).
+    use w3cos_std::style::{AlignItems, CustomProperties, FlexDirection};
+    let item = |label: &str| {
+        // Match `generated_pseudo_component` for a kept `display:inline`
+        // principal: the item keeps width/height, and content lives in
+        // an inner anonymous IFC row.
+        let item_style = Style {
+            display: Display::Inline,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(100.0),
+            flex_shrink: 0.0,
+            ..Style::default()
+        };
+        let line_style = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Baseline,
+            custom_properties: Some(CustomProperties::from_iter([(
+                "--w3cos-internal-inline-formatting-context".to_string(),
+                "1".to_string(),
+            )])),
+            ..Style::default()
+        };
+        Component::row(
+            item_style,
+            vec![Component::row(
+                line_style,
+                vec![Component::text(
+                    label,
+                    Style {
+                        display: Display::Inline,
+                        ..Style::default()
+                    },
+                )],
+            )],
+        )
+    };
+    let root = node(
+        Style {
+            display: Display::Block,
+            width: Dimension::Px(300.0),
+            ..block()
+        },
+        vec![node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                width: Dimension::Px(300.0),
+                height: Dimension::Px(100.0),
+                ..Style::default()
+            },
+            vec![item("1"), item("2"), item("3")],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(
+        block::unsupported_reasons(&flat),
+        Vec::<String>::new(),
+        "{:?}",
+        block::unsupported_reasons(&flat)
+    );
+    let out = ng_rects(&root);
+    let sizes: Vec<_> = out.iter().map(|(r, _)| (r.width, r.height)).collect();
+    // root, flex container, three 100×100 items (text leaves may also appear)
+    assert!(
+        sizes
+            .iter()
+            .filter(|&&(w, h)| (w - 100.0).abs() < 0.5 && (h - 100.0).abs() < 0.5)
+            .count()
+            >= 3,
+        "expected three 100×100 flex items, got {sizes:?}"
+    );
+}
+
+#[test]
 fn flex_item_overflow_auto_stays_on_ng() {
     use w3cos_std::style::{Float, Overflow, Spacing};
     let flex = Style {
@@ -13571,4 +13707,308 @@ fn min_content_replaced_columns_match_chrome() {
         ),
         "text min-content columns",
     );
+}
+
+/// Repro: a ::scroll-marker-group sibling must not wrap "First column"
+/// (column-scroll-marker-001).
+#[test]
+fn scroll_marker_group_sibling_keeps_column_text_on_one_line() {
+    fn dump(label: &str, root: &Component) {
+        let flat = pre_flatten(root);
+        println!(
+            "{label} reasons={:?} nodes={}",
+            block::unsupported_reasons(&flat),
+            flat.len()
+        );
+        let Some(ng) = layout_tree(root, &flat, 800.0, 600.0) else {
+            println!("{label} NG layout failed");
+            return;
+        };
+        for (i, node) in flat.iter().enumerate() {
+            let text = match &node.kind {
+                ComponentKind::Text { content } => content.as_str(),
+                _ => continue,
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let r = ng.iter().find(|(_, j)| *j == i).map(|(r, _)| *r);
+            println!("  #{i} parent={:?} {text:?} rect={r:?}", node.parent);
+        }
+    }
+
+    fn build(with_group: bool) -> Component {
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::document::clear_column_pseudo_counts();
+        let mut container_decls: Vec<(&str, &str)> = vec![
+            ("overflow", "hidden"),
+            ("columns", "3"),
+            ("column-fill", "auto"),
+            ("gap", "0"),
+            ("orphans", "1"),
+            ("widows", "1"),
+            ("height", "100px"),
+            ("border", "15px solid"),
+            ("line-height", "20px"),
+            ("background", "yellow"),
+        ];
+        if with_group {
+            container_decls.push(("scroll-marker-group", "before"));
+            w3cos_dom::stylesheet::register_rule(
+                "div::scroll-marker-group",
+                &[
+                    ("display", "flex"),
+                    ("justify-content", "space-between"),
+                    ("height", "50px"),
+                    ("background", "cyan"),
+                ],
+            );
+            w3cos_dom::stylesheet::register_rule(
+                "div::column::scroll-marker",
+                &[
+                    ("display", "flex"),
+                    ("justify-content", "center"),
+                    ("align-items", "center"),
+                    ("width", "50px"),
+                    ("height", "50px"),
+                    ("background", "hotpink"),
+                    ("content", "'*'"),
+                ],
+            );
+        }
+        w3cos_dom::stylesheet::register_rule("#container", &container_decls);
+
+        let mut document = w3cos_dom::Document::new();
+        let wrapper = document.create_element("div");
+        wrapper
+            .style_mut(&mut document)
+            .set_property("width", "450px");
+        let container = document.create_element("div");
+        container.set_attribute(&mut document, "id", "container");
+        for label in [
+            "First column",
+            "Second column",
+            "Third column",
+            "Fourth column",
+            "Fifth column",
+        ] {
+            let text = document.create_text_node(label);
+            container.append_child(&mut document, text);
+            let br = document.create_element("br");
+            container.append_child(&mut document, br);
+            if label != "Fifth column" {
+                for _ in 0..4 {
+                    let br = document.create_element("br");
+                    container.append_child(&mut document, br);
+                }
+            }
+        }
+        wrapper.append_child(&mut document, container);
+        document.body().append_child(&mut document, wrapper);
+        if with_group {
+            let _ = w3cos_dom::document::set_column_pseudo_count(container.id, 5);
+        }
+        let tree = document.to_component_tree();
+        w3cos_dom::stylesheet::clear_rules();
+        w3cos_dom::document::clear_column_pseudo_counts();
+        tree
+    }
+
+    fn first_line_ys(root: &Component) -> Vec<(String, f32, f32, f32)> {
+        let flat = pre_flatten(root);
+        let reasons = block::unsupported_reasons(&flat);
+        assert!(
+            reasons.is_empty(),
+            "group/multicol tree should stay on NG, got {reasons:?}"
+        );
+        let ng = layout_tree(root, &flat, 800.0, 600.0).expect("NG layout");
+        let mut out = Vec::new();
+        for (i, node) in flat.iter().enumerate() {
+            let ComponentKind::Text { content } = &node.kind else {
+                continue;
+            };
+            if !matches!(content.as_str(), "First" | " " | "column" | "Second") {
+                continue;
+            }
+            let r = ng
+                .iter()
+                .find(|(_, j)| *j == i)
+                .map(|(r, _)| *r)
+                .expect("text rect");
+            out.push((content.clone(), r.x, r.y, r.width));
+            if content == "Second" {
+                break;
+            }
+        }
+        out
+    }
+
+    dump("WITHOUT", &build(false));
+    dump("WITH", &build(true));
+    let without = first_line_ys(&build(false));
+    let with = first_line_ys(&build(true));
+    let y0 = without[0].2;
+    assert!(
+        without
+            .iter()
+            .take(3)
+            .all(|(_, _, y, _)| (y - y0).abs() < 1.0),
+        "without group, First column should be one line: {without:?}"
+    );
+    let y1 = with[0].2;
+    assert!(
+        with.iter().take(3).all(|(_, _, y, _)| (y - y1).abs() < 1.0),
+        "with group sibling, First column should stay on one line: {with:?}"
+    );
+}
+
+/// CSS Multicol overflow columns contribute to scrollable overflow. A
+/// geometry flush (the `scrollLeft` setter path) must publish that size
+/// before the offset is clamped, and LayoutNG scroll extents must agree
+/// so paint does not clamp the stored offset back to zero.
+#[test]
+fn overflow_column_scroll_geometry_is_published_at_flush() {
+    w3cos_dom::stylesheet::clear_rules();
+    w3cos_dom::document::clear_column_pseudo_counts();
+    crate::dom::reset_document();
+    crate::jsdom::reset_bridge();
+    crate::incremental_layout::invalidate();
+    crate::jsdom::set_viewport(800.0, 600.0);
+    crate::dom::with_document_mut(|document| {
+        document
+            .body()
+            .style_mut(document)
+            .set_property("margin", "0");
+    });
+    w3cos_dom::stylesheet::register_rule(
+        "#container",
+        &[
+            ("overflow", "hidden"),
+            ("columns", "3"),
+            ("column-fill", "auto"),
+            ("gap", "0"),
+            ("orphans", "1"),
+            ("widows", "1"),
+            ("height", "100px"),
+            ("border", "15px solid"),
+            ("line-height", "20px"),
+            ("scroll-marker-group", "before"),
+            ("background", "yellow"),
+        ],
+    );
+    w3cos_dom::stylesheet::register_rule(
+        "div::scroll-marker-group",
+        &[
+            ("display", "flex"),
+            ("justify-content", "space-between"),
+            ("height", "50px"),
+            ("background", "cyan"),
+        ],
+    );
+    w3cos_dom::stylesheet::register_rule(
+        "div::column::scroll-marker",
+        &[
+            ("display", "flex"),
+            ("justify-content", "center"),
+            ("align-items", "center"),
+            ("width", "50px"),
+            ("height", "50px"),
+            ("background", "hotpink"),
+            ("content", "'*'"),
+        ],
+    );
+
+    let container_id = crate::dom::with_document_mut(|document| {
+        let wrapper = document.create_element("div");
+        wrapper.style_mut(document).set_property("width", "450px");
+        let container = document.create_element("div");
+        container.set_attribute(document, "id", "container");
+        for label in [
+            "First column",
+            "Second column",
+            "Third column",
+            "Fourth column",
+            "Fifth column",
+        ] {
+            let text = document.create_text_node(label);
+            container.append_child(document, text);
+            let br = document.create_element("br");
+            container.append_child(document, br);
+            if label != "Fifth column" {
+                for _ in 0..4 {
+                    let br = document.create_element("br");
+                    container.append_child(document, br);
+                }
+            }
+        }
+        wrapper.append_child(document, container);
+        document.body().append_child(document, wrapper);
+        container.id
+    });
+
+    assert!(
+        crate::incremental_layout::flush(),
+        "first geometry flush should lay out the multicol"
+    );
+
+    let (scroll_width, client_width, count) = crate::dom::with_document(|document| {
+        let element = w3cos_dom::element::Element::new(container_id);
+        (
+            element.scroll_width(document),
+            element.client_width(document),
+            w3cos_dom::document::column_pseudo_count(container_id),
+        )
+    });
+    let rect = crate::dom::with_document(|document| document.get_layout_rect(container_id));
+
+    assert_eq!(
+        count, 5,
+        "flush must record the overflow-column count before scrollLeft clamp (rect={rect:?})"
+    );
+    let max_left = (scroll_width - client_width).max(0.0);
+    assert!(
+        (max_left - 280.0).abs() < 1.0,
+        "scrollWidth-clientWidth should be the overflow-column advance (280), got scrollWidth={scroll_width} clientWidth={client_width} rect={rect:?} max={max_left}"
+    );
+
+    let document = crate::jsdom::document_value();
+    let container = document.call_method(
+        "getElementById",
+        vec![w3cos_core::Value::string("container")],
+    );
+    container.set_property("scrollLeft", w3cos_core::Value::Number(400.0));
+    let left = container.get_property("scrollLeft").to_number();
+    assert!(
+        (left - 280.0).abs() < 1.0,
+        "scrollLeft=400 should clamp to overflow-column max 280, got {left} (scrollWidth={scroll_width} clientWidth={client_width})"
+    );
+
+    // Layout scroll extents must include the same overflow so headless
+    // paint does not clamp the stored offset back to zero.
+    let root = crate::dom::to_component_tree();
+    let flat = pre_flatten(&root);
+    let results = crate::layout::LayoutEngine::new()
+        .compute(&root, &flat, 800.0, 600.0)
+        .expect("layout after flush");
+    let host = flat.iter().position(|node| {
+        matches!(
+            node.on_click,
+            w3cos_std::component::EventAction::NativeHost { id, .. }
+                if *id == u64::from(container_id.as_u32())
+        )
+    });
+    let extent = results
+        .scrollable_nodes
+        .iter()
+        .find(|(index, _, _)| Some(*index) == host)
+        .map(|(_, _, extent)| extent.max_x);
+    assert!(
+        extent.is_some_and(|max_x| (max_x - 280.0).abs() < 1.0),
+        "overflow-column scroll extent should be 280, got {extent:?} host={host:?}"
+    );
+
+    w3cos_dom::stylesheet::clear_rules();
+    w3cos_dom::document::clear_column_pseudo_counts();
+    crate::dom::reset_document();
+    crate::incremental_layout::invalidate();
 }

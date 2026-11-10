@@ -362,6 +362,9 @@ pub struct Style {
     /// CSS Scroll Snap Level 2 `scroll-initial-target`.
     #[serde(default)]
     pub scroll_initial_target: ScrollInitialTarget,
+    /// CSS Overflow 5 `scroll-marker-group`.
+    #[serde(default)]
+    pub scroll_marker_group: ScrollMarkerGroup,
     /// CSS `overflow-anchor`; `false` excludes this subtree from UA scroll anchoring.
     #[serde(default = "default_overflow_anchor")]
     pub overflow_anchor: bool,
@@ -608,6 +611,7 @@ impl Default for Style {
             overflow_clip_margin: (0, 0.0),
             overscroll_behavior: OverscrollBehavior::Auto,
             scroll_initial_target: ScrollInitialTarget::None,
+            scroll_marker_group: ScrollMarkerGroup::None,
             overflow_anchor: true,
             background: Color::TRANSPARENT,
             background_image: None,
@@ -789,6 +793,7 @@ impl Style {
             overflow_clip_margin,
             overscroll_behavior,
             scroll_initial_target,
+            scroll_marker_group,
             overflow_anchor,
             background,
             background_image,
@@ -920,6 +925,7 @@ impl Style {
             overflow_clip_margin: overflow_clip_margin_b,
             overscroll_behavior: overscroll_behavior_b,
             scroll_initial_target: scroll_initial_target_b,
+            scroll_marker_group: scroll_marker_group_b,
             overflow_anchor: overflow_anchor_b,
             background: background_b,
             background_image: background_image_b,
@@ -1049,6 +1055,7 @@ impl Style {
             && overflow_clip_margin == overflow_clip_margin_b
             && overscroll_behavior == overscroll_behavior_b
             && scroll_initial_target == scroll_initial_target_b
+            && scroll_marker_group == scroll_marker_group_b
             && overflow_anchor == overflow_anchor_b
             && background == background_b
             && background_image == background_image_b
@@ -1323,6 +1330,16 @@ pub enum ScrollInitialTarget {
     #[default]
     None,
     Nearest,
+}
+
+/// CSS Overflow 5 `scroll-marker-group`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScrollMarkerGroup {
+    #[default]
+    None,
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]

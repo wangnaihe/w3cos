@@ -8838,7 +8838,14 @@ fn elements_at_point(x: f32, y: f32) -> Vec<u32> {
             }
             let node = match entry.on_click {
                 w3cos_std::EventAction::NativeHost { id, .. } => u32::try_from(*id).ok()?,
-                _ => return None,
+                // CSS Overflow 5: a ::scroll-marker hit is its originating element.
+                _ => entry
+                    .style
+                    .custom_properties
+                    .as_ref()?
+                    .get(w3cos_dom::document::SCROLL_MARKER_ORIGIN)?
+                    .parse()
+                    .ok()?,
             };
             (dom::node_type(node) == 1).then_some((index, node))
         })
