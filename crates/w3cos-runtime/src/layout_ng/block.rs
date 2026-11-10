@@ -92,6 +92,10 @@ fn is_value_carrier_marker(key: &str) -> bool {
             | "background-inherit"
             | "text-source-run"
             | "text-fragment-ends"
+            // CSSOM getClientRects ownership metadata (#325): the CSSOM
+            // writeback reads it from the laid-out text; box layout never does.
+            | "cssom-owner-ranges"
+            | "cssom-box-owners"
             | "quirks-mode"
             | "document-element"
             | "size-containment"
@@ -149,7 +153,7 @@ fn unsupported_box_style(style: &Style, allowed: &[&str], atomic: bool) -> Optio
     // An author `display:flex` (no marker) is a flex container (S5).
     let lowered_ifc = matches!(style.display, Display::Flex | Display::InlineFlex)
         && marker(style, inline::IFC_MARKER).is_some();
-    let author_flex = style.display == Display::Flex && !lowered_ifc;
+    let author_flex = matches!(style.display, Display::Flex | Display::InlineFlex) && !lowered_ifc;
     // `display:grid` is a grid container when `grid::container_reason` accepts
     // the template. `inline-grid` keeps `display: flex` for legacy and is a
     // grid here (`is_author_grid`).
@@ -616,6 +620,7 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 &[inline::VALIGN_MARKER, inline::VALIGN_LENGTH_MARKER],
                 true,
             )
+            .or_else(|| inline::text_edges_reason(info.style))
             .or_else(|| inline::block_text_reason(content, info.style)),
             _ if inline::is_inline_container(flat, index) => unsupported_box_style(
                 info.style,
@@ -707,6 +712,17 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                     is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
                 }) =>
         {
+            // Source newlines between the image and the definite box of a
+            // min-content replaced grid are not items (CSS Grid §4.1).
+            // They must not send that slice back to legacy.
+            if content.chars().all(char::is_whitespace)
+                && info.parent.is_some_and(|parent| {
+                    is_author_grid(flat[parent].style)
+                        && super::grid::min_content_replaced_columns(flat, parent)
+                })
+            {
+                return None;
+            }
             // A text grid item is an anonymous block. Its display stays
             // inline in the cascade; the grid lays it out as block text.
             unsupported_box_style(
@@ -719,6 +735,16 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
                 ],
                 info.style.display == Display::Inline,
             )
+            .or_else(|| {
+                // A block-level leaf lays its own edges out; a flex or grid
+                // text item (or inline text there) stays on legacy.
+                let item = info.style.display == Display::Inline
+                    || info.parent.is_some_and(|parent| {
+                        is_author_grid(flat[parent].style) || is_author_flex(flat[parent].style)
+                    });
+                item.then(|| inline::text_edges_reason(info.style))
+                    .flatten()
+            })
             .or_else(|| inline::block_text_reason(content, info.style))
         }
         ComponentKind::Text { content } => {
@@ -729,7 +755,8 @@ fn node_box_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             // here would send only this page back to the legacy engine.
             if !inline::in_inline_container(flat, index) {
                 if anonymous_block_text(flat, index) {
-                    inline::block_text_reason(content, info.style)
+                    inline::text_edges_reason(info.style)
+                        .or_else(|| inline::block_text_reason(content, info.style))
                 } else {
                     Some("ifc:mixed")
                 }
@@ -1162,19 +1189,26 @@ fn non_visible_overflow(style: &Style) -> bool {
         || style.resolved_overflow_y() != Overflow::Visible
 }
 
-/// Overflow shapes that still disagree with the legacy engine: a flex or
-/// grid item (automatic minimum), a negative margin, or a float/clear inside
-/// the box. Scrollports (`hidden`, `scroll`, `auto`) are laid out here as BFC
-/// roots without scrollbar space; the scroll containers themselves are
-/// derived from the result by `layout::scroll_containers_from_layout`.
+/// Overflow shapes that still disagree with the legacy engine: a negative
+/// margin, a grid item (automatic minimum / subgrid sizing still partial),
+/// or a float that shares the scrollport with in-flow content / clearance.
+/// Flex items with non-visible overflow stay on NG: §4.5 zeroes their
+/// main-axis automatic minimum. Clear alone inside an overflow BFC is
+/// fine (flexbox_item-clear-ref). Scrollports are laid out here as BFC
+/// roots without scrollbar space; `layout::scroll_containers_from_layout`
+/// derives the scroll containers from the result.
 fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> {
     let style = flat[index].style;
     if !non_visible_overflow(style) || !style.display.establishes_overflow_clip() {
         return None;
     }
-    if flat[index].parent.is_some_and(|parent| {
-        is_author_flex(flat[parent].style) || is_author_grid(flat[parent].style)
-    }) {
+    // Grid items with overflow still need the legacy automatic-minimum
+    // path (grid-item-minimum-size-*, aspect-ratio + overflow). Flex items
+    // are handled in `flex::resolve_main_limits`.
+    if flat[index]
+        .parent
+        .is_some_and(|parent| is_author_grid(flat[parent].style))
+    {
         return Some("overflow");
     }
     let negative = |spacing: Spacing| match spacing {
@@ -1195,8 +1229,10 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         return Some("overflow");
     }
     // A float alone inside the box matches legacy (the BFC contains it).
-    // A float together with in-flow content, or a `clear`, still takes the
-    // legacy adjoining-float path.
+    // A float together with in-flow content, or a clear next to a float,
+    // still takes the legacy adjoining-float path. Clear alone is fine:
+    // an overflow BFC has no floats of its own to clear past
+    // (flexbox_item-clear-ref).
     let mut saw_float = false;
     let mut saw_inflow = false;
     let mut saw_clear = false;
@@ -1213,7 +1249,7 @@ fn overflow_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
             saw_inflow = true;
         }
     }
-    if saw_clear || (saw_float && saw_inflow) {
+    if (saw_float && saw_inflow) || (saw_float && saw_clear) {
         return Some("overflow");
     }
     None
@@ -1715,7 +1751,10 @@ pub(super) fn intrinsic_sizes(
         return super::flex::intrinsic_sizes(flat, index, space);
     }
     if let ComponentKind::Text { content } = info.kind {
-        return Some(inline::text_min_max(content, info.style));
+        return Some(inline::text_min_max(
+            content,
+            &inline::block_text_measure_style(info.style),
+        ));
     }
     if let ComponentKind::Image { src } = info.kind {
         let (width, _) = replaced_content_size(src, info.style, space).why("image-intrinsic")?;
@@ -1923,7 +1962,7 @@ fn unrecognized_display(style: &Style) -> Option<&str> {
     marker(style, "--w3cos-internal-unrecognized-display")
 }
 
-fn is_inline_grid(style: &Style) -> bool {
+pub(super) fn is_inline_grid(style: &Style) -> bool {
     unrecognized_display(style).is_some_and(|value| value == "inline-grid")
 }
 
@@ -2035,7 +2074,9 @@ fn is_legacy_webkit_box(style: &Style) -> bool {
 }
 
 pub(super) fn is_author_flex(style: &Style) -> bool {
-    style.display == Display::Flex
+    // An `inline-flex` box is an atomic inline (inline::is_atomic_inline)
+    // whose contents are a flex formatting context.
+    matches!(style.display, Display::Flex | Display::InlineFlex)
         && marker(style, inline::IFC_MARKER).is_none()
         && !is_float_group(style)
         && !is_grid_lanes(style)
@@ -2181,6 +2222,20 @@ fn layout_block_in(
     // NGFlexLayoutAlgorithm. Lowered IFC rows and synthetic float groups
     // stay on the paths below.
     if is_author_flex(style) {
+        // CSS2 10.3.9: an auto-width `inline-flex` atomic inline is
+        // shrink-to-fit (NGBlockNode::ComputeMinMaxSizes for the inline
+        // formatting context's atomic box).
+        let sized = match sized {
+            None if style.display == Display::InlineFlex
+                && style.width == Dimension::Auto
+                && inline::is_atomic_inline(flat, index) =>
+            {
+                let metrics = resolve_inline(style, space);
+                let width = shrink_to_fit(flat, index, space, &metrics).why("shrink-to-fit")?;
+                Some((width, None))
+            }
+            other => other,
+        };
         return super::flex::layout(flat, index, space, sized);
     }
     if is_author_grid(style) {

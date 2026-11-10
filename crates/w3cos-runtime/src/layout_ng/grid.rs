@@ -277,13 +277,26 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     if has_marker(style, "--w3cos-internal-size-containment") {
         return Some("grid:contain");
     }
-    // A subgrid item's tracks come from this grid's own sizing, which the
-    // keyword resolves against; that cycle stays on the legacy engine.
-    if has_marker(style, "--w3cos-internal-width-keyword")
-        && (!block::intrinsic_keyword_applies(flat, index)
-            || rendered_children(flat, index).any(|child| subgrid_style(flat[child].style)))
-    {
-        return Some("grid:width-keyword");
+    // Intrinsic width keywords on an in-flow grid are resolved from the
+    // grid's own track min/max contributions in `layout`. Subgrid children
+    // feed those tracks (see `intrinsic_tracks_without_subgrid`) when their
+    // standalone axis is implicit (dynamic-min-content-001/002,
+    // standalone-axis-size-006). Explicit fr/repeat tracks on that axis
+    // (standalone-axis-size-010+) still disagree with legacy, so keep the
+    // keyword bail there. A subgrid item may also carry a width keyword;
+    // its parent is a grid so `intrinsic_keyword_applies` is false — keep
+    // it when the box itself is a subgrid.
+    if has_marker(style, "--w3cos-internal-width-keyword") {
+        let self_ok = block::intrinsic_keyword_applies(flat, index) || subgrid_style(style);
+        if !self_ok {
+            return Some("grid:width-keyword");
+        }
+        if rendered_children(flat, index).any(|child| {
+            let child_style = flat[child].style;
+            subgrid_style(child_style) && !subgrid_standalone_axis_is_implicit(child_style)
+        }) {
+            return Some("grid:width-keyword");
+        }
     }
     if style.grid_areas().is_some() {
         return Some("grid:areas");
@@ -298,7 +311,13 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // on ordinary grids. A parent of a subgrid is the exception: the
     // subgrid items size those tracks. A top-level inline-grid with a
     // definite border box is the other: those tracks are the line box.
-    if intrinsic_tracks_without_subgrid(flat, index) && !inline_grid_line_lays_out(flat, index) {
+    // A third: `min-content` columns whose items are one replaced image
+    // (intrinsic-ratio transfer) and definite px boxes
+    // (`min_content_replaced_columns`).
+    if intrinsic_tracks_without_subgrid(flat, index)
+        && !inline_grid_line_lays_out(flat, index)
+        && !min_content_replaced_columns(flat, index)
+    {
         return Some("grid:intrinsic-track");
     }
     let real_lanes =
@@ -384,7 +403,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if child_style.position == Position::Relative && inset_set(child_style) {
             return Some("grid:inset");
         }
-        if has_marker(child_style, "--w3cos-internal-width-keyword") {
+        // A subgrid item may carry `width: min/max/fit-content`; those
+        // sizes contribute through the parent's track sizing
+        // (standalone-axis-size-006). Non-subgrid items still disagree.
+        if has_marker(child_style, "--w3cos-internal-width-keyword") && !subgrid_style(child_style)
+        {
             return Some("grid:item-width-keyword");
         }
     }
@@ -486,7 +509,9 @@ fn subgrid_static_reason(flat: &[FlatNodeInfo], index: usize, rows: bool) -> Opt
     // its ordinary-grid reference is not.
     let parent_lanes = has_marker(parent_style, "--w3cos-internal-grid-lanes");
     if has_marker(style, "--w3cos-internal-grid-lanes")
-        || (parent_style.display != Display::Grid && !parent_lanes)
+        || (parent_style.display != Display::Grid
+            && !parent_lanes
+            && !block::is_inline_grid(parent_style))
         || (parent_lanes && !lanes_like_grid(flat, parent))
     {
         return Some("grid:subgrid");
@@ -1012,6 +1037,19 @@ fn subgrid_style(style: &Style) -> bool {
         || style.grid_rows().is_some_and(is_subgrid_axis)
 }
 
+/// Column-only / row-only subgrid whose other axis has no author track
+/// list. Explicit `repeat()` / `fr` tracks on that axis under a
+/// `width: min-content` parent still need the legacy engine.
+fn subgrid_standalone_axis_is_implicit(style: &Style) -> bool {
+    let col_sub = columns_spec(style).is_some_and(is_subgrid_axis);
+    let row_sub = style.grid_rows().is_some_and(is_subgrid_axis);
+    match (col_sub, row_sub) {
+        (true, false) => style.grid_rows().is_none(),
+        (false, true) => columns_spec(style).is_none(),
+        _ => false,
+    }
+}
+
 fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
     match *spec {
         Spec::One(Breadth::MinContent | Breadth::MaxContent) => true,
@@ -1021,6 +1059,129 @@ fn spec_is_intrinsic_keyword(spec: &Spec) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_whitespace_text(flat: &[FlatNodeInfo], index: usize) -> bool {
+    match flat[index].kind {
+        w3cos_std::ComponentKind::Text { content } => content.chars().all(char::is_whitespace),
+        _ => false,
+    }
+}
+
+fn one_axis_px(style: &Style) -> bool {
+    let px =
+        |dim: Dimension| matches!(dim, Dimension::Px(value) if value.is_finite() && value >= 0.0);
+    let auto = |dim: Dimension| matches!(dim, Dimension::Auto);
+    ((px(style.width) && auto(style.height)) || (auto(style.width) && px(style.height)))
+        && auto(style.min_width)
+        && auto(style.max_width)
+        && auto(style.min_height)
+        && auto(style.max_height)
+}
+
+/// `grid-template-columns` is only `min-content` (including `repeat()`),
+/// and every in-flow item is either a replaced image with one definite
+/// axis or a definite px box. Headless Chrome sizes the image from its
+/// intrinsic ratio (`aspect-ratio: auto`), which `image_intrinsic_size`
+/// already does: a 20×50 image with `height: 100px` is 40×100, and the
+/// 60×100 sibling makes a 100px square (css-sizing
+/// grid-aspect-ratio-005/006). The grid box itself stretches to the
+/// containing block. `max-content`, `fit-content`, text-measured tracks,
+/// width keywords, and grid-lanes stay on `grid:intrinsic-track` so a
+/// lanes test and its ordinary-grid reference do not split engines.
+pub(super) fn min_content_replaced_columns(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    if has_marker(style, "--w3cos-internal-grid-lanes")
+        || has_marker(style, "--w3cos-internal-width-keyword")
+        || has_marker(style, "--w3cos-internal-size-containment")
+        || has_marker(style, "--w3cos-internal-percent-gap")
+        || style.float != Float::None
+        || style.position != Position::Static
+        || style.gap != 0.0
+        || style.column_gap.is_some()
+        || style.row_gap.is_some()
+        || style.justify_content != JustifyContent::FlexStart
+        || style.align_items != AlignItems::Stretch
+        || style.justify_items != AlignItems::Stretch
+        || style.align_content != AlignContent::Stretch
+        || !matches!(style.width, Dimension::Auto)
+        || !matches!(style.height, Dimension::Auto)
+        || !zero_box_edges(style)
+    {
+        return false;
+    }
+    let Some(columns) = columns_spec(style).and_then(|spec| parse_template(spec, false)) else {
+        return false;
+    };
+    if columns.auto_fit.is_some()
+        || !columns.auto_tracks.is_empty()
+        || columns.tracks.is_empty()
+        || columns
+            .tracks
+            .iter()
+            .any(|track| !matches!(track, Spec::One(Breadth::MinContent)))
+    {
+        return false;
+    }
+    if let Some(rows) = style.grid_rows() {
+        let Some(rows) = parse_template(rows, true) else {
+            return false;
+        };
+        if rows.auto_fit.is_some()
+            || rows
+                .tracks
+                .iter()
+                .chain(rows.auto_tracks.iter())
+                .any(spec_is_intrinsic_keyword)
+        {
+            return false;
+        }
+    }
+    let mut saw_image = false;
+    let mut saw_box = false;
+    for child in rendered_children(flat, index) {
+        if is_whitespace_text(flat, child) {
+            continue;
+        }
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style)
+            || child_style.float != Float::None
+            || child_style.position != Position::Static
+            || has_marker(child_style, "--w3cos-internal-width-keyword")
+            || !zero_box_edges(child_style)
+        {
+            return false;
+        }
+        if matches!(flat[child].kind, w3cos_std::ComponentKind::Image { .. }) {
+            let ratio = child_style
+                .custom_properties
+                .as_ref()
+                .and_then(|props| props.get("--w3cos-internal-aspect-ratio"))
+                .and_then(|raw| raw.parse::<f32>().ok());
+            if !one_axis_px(child_style)
+                || !matches!(
+                    child_style.display,
+                    Display::Inline | Display::InlineBlock | Display::Block | Display::FlowRoot
+                )
+                || !ratio.is_some_and(|ratio| ratio.is_finite() && ratio > 0.0)
+            {
+                return false;
+            }
+            saw_image = true;
+            continue;
+        }
+        if matches!(child_style.width, Dimension::Px(value) if value.is_finite() && value >= 0.0)
+            && matches!(child_style.height, Dimension::Px(value) if value.is_finite() && value >= 0.0)
+            && matches!(child_style.display, Display::Block | Display::FlowRoot)
+            && !block::is_author_flex(child_style)
+            && !block::is_author_grid(child_style)
+        {
+            saw_box = true;
+            continue;
+        }
+        return false;
+    }
+    saw_image && saw_box
 }
 
 /// Ordinary grids keep intrinsic keywords on the legacy engine. A grid
@@ -3190,6 +3351,7 @@ pub(super) fn layout(
 
     let mut pending = Vec::new();
     let mut oof_children = Vec::new();
+    let replaced_min_columns = min_content_replaced_columns(flat, index);
     for (ordinal, child) in rendered_children(flat, index).enumerate() {
         let child_style = flat[child].style;
         if oof::is_out_of_flow(child_style) {
@@ -3197,13 +3359,12 @@ pub(super) fn layout(
             continue;
         }
         // Whitespace-only text does not generate a grid item when
-        // white-space collapses (CSS Grid §4.1). Only the inline-grid
-        // line path skips it; an ordinary grid keeps its current items.
-        if (inline_fixed || inline_intrinsic)
-            && matches!(
-                flat[child].kind,
-                w3cos_std::ComponentKind::Text { content } if content.chars().all(|ch| ch.is_whitespace())
-            )
+        // white-space collapses (CSS Grid §4.1). The inline-grid line
+        // path skips it. An ordinary grid keeps those items, except the
+        // min-content replaced-column slice: source newlines between the
+        // image and the definite box must not occupy a cell.
+        if is_whitespace_text(flat, child)
+            && (inline_fixed || inline_intrinsic || replaced_min_columns)
         {
             continue;
         }
@@ -3231,6 +3392,12 @@ pub(super) fn layout(
             row_span,
             source,
         });
+    }
+    // With no column template every column is implicit (CSS Grid 7.6,
+    // GridTrackSizingAlgorithm): once placement adds columns, the first
+    // one is `grid-auto-columns` too, not the lone-column `1fr` stand-in.
+    if columns_spec(style).is_none() && !flow.column && column_specs.len() > 1 {
+        column_specs[0] = implicit_column.clone();
     }
     if column_specs.len() > MAX_TRACKS || row_specs.len() > MAX_TRACKS {
         return super::bail("grid:tracks");
@@ -5342,6 +5509,36 @@ mod tests {
             &[
                 (0, [0.0, 0.0, 200.0, text_height]),
                 (1, [0.0, 0.0, 200.0, text_height]),
+            ],
+        );
+    }
+
+    #[test]
+    fn untemplated_implicit_columns_stretch_like_chrome() {
+        // Chrome: display:grid; width:200px; gap:10px; items 40x10, 20x30,
+        // 30x15 at grid-column 1 / 2 / 3 -> x = 0, 80, 140 (three implicit
+        // auto columns share the free space).
+        let mut grid = grid_style(200.0, None, None);
+        grid.gap = 10.0;
+        let item = |column: &str, width: f32, height: f32| {
+            let mut style = block_box(Some(width), Some(height));
+            style.grid_column = Some(column.to_string());
+            style
+        };
+        expect(
+            &Component::boxed(
+                grid,
+                vec![
+                    leaf(item("1", 40.0, 10.0)),
+                    leaf(item("2", 20.0, 30.0)),
+                    leaf(item("3", 30.0, 15.0)),
+                ],
+            ),
+            &[
+                (0, [0.0, 0.0, 200.0, 30.0]),
+                (1, [0.0, 0.0, 40.0, 10.0]),
+                (2, [80.0, 0.0, 20.0, 30.0]),
+                (3, [140.0, 0.0, 30.0, 15.0]),
             ],
         );
     }

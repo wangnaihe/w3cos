@@ -507,10 +507,15 @@ fn merge_orphan_punctuation_lines(lines: &mut Vec<String>) {
     }
 }
 
+fn collapses_wrap_space(white_space: WhiteSpace) -> bool {
+    matches!(white_space, WhiteSpace::Normal | WhiteSpace::PreLine)
+}
+
 fn wrap_greedy<F>(
     text: &str,
     max_width: f32,
     first_line_width: f32,
+    collapse_overflow_space: bool,
     mut char_width: F,
 ) -> Vec<String>
 where
@@ -560,6 +565,20 @@ where
             max_width
         };
         if !current.is_empty() && current_w + cw > available_width {
+            // `white-space: normal` / `pre-line`: the space that ends the
+            // line is the wrap opportunity. It is not the first glyph of
+            // the next line (an Ahem space is one em and would force
+            // another break).
+            if collapse_overflow_space && ch == ' ' {
+                // Only a space that does not fit is the wrap opportunity.
+                // A space that fits — a leading space, a trailing space
+                // inside the line, or a run whose whole text is one space —
+                // stays in the measured line. Dropping every space that
+                // starts an empty buffer turned " BB" into "BB" (one em
+                // short) and " " into an empty line.
+                flush(&mut lines, &mut current, &mut current_w);
+                continue;
+            }
             if may_not_start_line(ch) {
                 // Keep closing punctuation with the preceding character
                 // without letting the completed line exceed its paint box.
@@ -1549,7 +1568,13 @@ pub fn wrap_text_with_char_width(
             |run| run.chars().map(&mut char_width).sum(),
         );
     }
-    wrap_greedy(&text, max_width, max_width, char_width)
+    wrap_greedy(
+        &text,
+        max_width,
+        max_width,
+        collapses_wrap_space(white_space),
+        char_width,
+    )
 }
 
 pub fn wrap_text_with_char_width_and_first_line(
@@ -1582,7 +1607,13 @@ pub fn wrap_text_with_char_width_and_first_line(
             |run| run.chars().map(&mut char_width).sum(),
         );
     }
-    wrap_greedy(&text, max_width, first_line_width.max(1.0), char_width)
+    wrap_greedy(
+        &text,
+        max_width,
+        first_line_width.max(1.0),
+        collapses_wrap_space(white_space),
+        char_width,
+    )
 }
 
 pub fn wrap_text_with_run_width(
@@ -2408,7 +2439,7 @@ mod tests {
     #[test]
     fn cjk_closing_punctuation_stays_inside_wrap_width() {
         let max_width = 4.0;
-        let lines = wrap_greedy("甲乙丙丁。戊", max_width, max_width, |_| 1.0);
+        let lines = wrap_greedy("甲乙丙丁。戊", max_width, max_width, false, |_| 1.0);
         assert_eq!(lines, vec!["甲乙丙", "丁。戊"]);
         assert!(
             lines
@@ -2429,6 +2460,32 @@ mod tests {
     }
 
     #[test]
+    fn char_width_wrap_drops_the_space_that_ends_an_exact_line() {
+        let lines = wrap_text_with_char_width("XX XX XX XX", 100.0, WhiteSpace::Normal, |_| 20.0);
+        assert_eq!(lines, vec!["XX XX".to_string(), "XX XX".to_string()]);
+    }
+
+    #[test]
+    fn char_width_wrap_keeps_a_space_that_fits() {
+        // A fitting space is part of the measured run. The previous
+        // empty-buffer skip deleted it and every following inline box
+        // that started with a space lost one em.
+        assert_eq!(
+            wrap_text_with_char_width(" BB", 80.0, WhiteSpace::Normal, |_| 20.0),
+            vec![" BB".to_string()]
+        );
+        assert_eq!(
+            wrap_text_with_char_width(" ", 80.0, WhiteSpace::Normal, |_| 20.0),
+            vec![" ".to_string()]
+        );
+        // The word before an overflowing space is kept whole; only that
+        // space is consumed.
+        assert_eq!(
+            wrap_text_with_char_width("XX XX ", 100.0, WhiteSpace::Normal, |_| 20.0),
+            vec!["XX XX".to_string()]
+        );
+    }
+
     fn overflowing_collapsible_space_is_consumed_by_the_soft_wrap() {
         let lines = wrap_text_with_run_width("1 2 3 4", 6.0, WhiteSpace::Normal, |text| {
             text.chars()

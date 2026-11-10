@@ -686,10 +686,22 @@ fn publish_client_rects(
             ))
         };
         let physical_advance = |text: &str, style: &w3cos_std::Style| measure(text, style);
-        let lines = crate::text_layout::wrap_text_with_run_width(
+        // With LayoutNG the writeback re-wraps with the same UAX #14 mode as
+        // layout and paint (line-break strictness, word-break, lang), so the
+        // published fragments follow the painted lines.
+        // keep-all leaves fall back to the legacy layout and keep its mode.
+        let break_mode = if crate::layout_ng::mode() == crate::layout_ng::Mode::Off
+            || info.style.word_break == w3cos_std::style::WordBreak::KeepAll
+        {
+            crate::line_break::BreakMode::default()
+        } else {
+            crate::line_break::BreakMode::of(info.style)
+        };
+        let lines = crate::text_layout::wrap_text_with_run_width_in(
             content,
             line_box.width.max(1.0),
             info.style.white_space,
+            break_mode,
             |text| measure(text, info.style),
         );
         let line_styles = crate::text_layout::authored_line_styles(content, info.style, &lines);
@@ -1675,8 +1687,13 @@ mod paint_layout_tests {
     }
 
     fn fresh_rect(id: u32) -> crate::layout::LayoutRect {
+        // Same entry as the retained paint path (`LayoutEngine::compute`),
+        // so the oracle follows the process mode instead of the always-legacy
+        // Taffy helper.
         let component = crate::dom::to_component_tree();
-        let results = crate::layout::compute_with_scroll_details(&component, 1024.0, 768.0)
+        let flat = crate::layout::pre_flatten(&component);
+        let results = crate::layout::LayoutEngine::new()
+            .compute(&component, &flat, 1024.0, 768.0)
             .expect("full layout");
         host_rect(&component, &results, id)
     }
@@ -1726,17 +1743,21 @@ mod paint_layout_tests {
         crate::dom::set_style_property(box_node, "top", "40px");
         let second = paint_rect(box_node);
         let (rebuilds_after, patches_after) = paint_layout_stats();
-        assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
-        assert_eq!(
-            patches_after - patches,
-            1,
-            "absolute top must patch, not rebuild"
-        );
-        assert_eq!(
-            paint_shift_count() - shifts,
-            1,
-            "a px absolute top skips another Taffy solve"
-        );
+        // The Taffy patch counters describe the legacy retained tree.
+        // LayoutNG replaces that tree, so the default engine rebuilds.
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(rebuilds_after - rebuilds, 1, "first frame builds the tree");
+            assert_eq!(
+                patches_after - patches,
+                1,
+                "absolute top must patch, not rebuild"
+            );
+            assert_eq!(
+                paint_shift_count() - shifts,
+                1,
+                "a px absolute top skips another Taffy solve"
+            );
+        }
         assert!(
             second.y > first.y + 30.0,
             "top 40px must move the box, {first:?} -> {second:?}"
@@ -1774,7 +1795,9 @@ mod paint_layout_tests {
         crate::dom::set_style_property(parent, "top", "50px");
         let after = paint_rect(child);
         let fresh = fresh_rect(child);
-        assert_eq!(paint_shift_count() - shifts, 1);
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(paint_shift_count() - shifts, 1);
+        }
         assert!(
             after.y > before.y + 40.0,
             "child must move with the absolute parent, {before:?} -> {after:?}"
@@ -2136,7 +2159,9 @@ mod paint_layout_tests {
         let after = paint_rect(node);
         let fresh = fresh_rect(node);
         let (rebuilds_after, _) = paint_layout_stats();
-        assert_eq!(rebuilds_after, rebuilds, "width stays on the retained tree");
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::Off {
+            assert_eq!(rebuilds_after, rebuilds, "width stays on the retained tree");
+        }
         assert!(
             after.width > before.width + 40.0,
             "width edit must move the used box {before:?} -> {after:?}"

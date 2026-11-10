@@ -16,7 +16,7 @@
 
 use w3cos_dom::node::{NodeId, NodeType};
 use w3cos_std::style::{
-    AlignItems, AlignSelf, Dimension, Display, Edges, FlexDirection, FlexWrap, Float,
+    AlignContent, AlignItems, AlignSelf, Dimension, Display, Edges, FlexDirection, FlexWrap, Float,
     JustifyContent, Overflow, Position, Spacing, Style,
 };
 use w3cos_std::{Component, ComponentKind};
@@ -27,6 +27,13 @@ use crate::layout::{LayoutEngine, pre_flatten};
 thread_local! {
     /// (subtree splices, tail splices) since thread start.
     static SPLICES: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    /// Column append/remove splices that kept untouched items instead of
+    /// laying them out again.
+    static COLUMN_TAIL_REUSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn column_tail_reuses() -> u32 {
+    COLUMN_TAIL_REUSES.with(|count| count.get())
 }
 
 /// `W3COS_SPLICE_DEBUG=1` prints why a flush fell back to a full rebuild.
@@ -188,6 +195,21 @@ fn component_path(root: &Component, chain: &[u32]) -> Option<Vec<usize>> {
         }
     }
     Some(path)
+}
+
+/// LayoutNG column flex on this path. A width edit changes whether the
+/// item's sole text is a `text-line-width` paragraph, which only a fresh
+/// lower records. The caller re-lowers that item instead of rebuilding
+/// the document. `Mode::Off` never takes the branch.
+fn path_has_column_flex(root: &Component, path: &[usize]) -> bool {
+    if crate::layout_ng::mode() != crate::layout_ng::Mode::On {
+        return false;
+    }
+    (0..=path.len()).any(|end| {
+        let style = &at_path(root, &path[..end]).style;
+        matches!(style.display, Display::Flex | Display::InlineFlex)
+            && style.flex_direction == FlexDirection::Column
+    })
 }
 
 fn at_path<'a>(root: &'a Component, path: &[usize]) -> &'a Component {
@@ -600,7 +622,14 @@ fn try_container(
 
 fn wrapper_for(parent: &Component, width: f32, children: Vec<Component>) -> Component {
     let mut style = parent.style.clone();
-    style.display = Display::Block;
+    // Flex and grid items do not share a block's used width or margin
+    // collapse. LayoutNG's line breaks follow that used width, so a block
+    // wrapper can come back shorter than the same item in the real column
+    // and the followers keep the old y. The legacy engine's block and flex
+    // heights agree on these splices, and that path stays a block wrapper.
+    if crate::layout_ng::mode() == crate::layout_ng::Mode::Off || !is_flex_or_grid(&parent.style) {
+        style.display = Display::Block;
+    }
     style.position = Position::Static;
     style.float = Float::None;
     style.width = Dimension::Px(width);
@@ -642,6 +671,15 @@ fn solve(
     crate::layout::LayoutRect,
 )> {
     let flat = pre_flatten(wrapper);
+    // `LayoutEngine::compute` publishes legacy rects when LayoutNG bails.
+    // A subtree that bails would then store a legacy line count beside a
+    // full NG layout, and followers keep the short y. Under Mode::On, refuse
+    // that result so the flush rebuilds with the same engine as `full_rects`.
+    if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+        let (layout_cache, _) =
+            crate::layout_ng::layout_tree_with_text(wrapper, &flat, viewport_w, viewport_h)?;
+        return host_rects(&flat, &layout_cache);
+    }
     let mut engine = LayoutEngine::new();
     // Projections repair floats, tables, inline-block and RTL boxes. A
     // subtree with none of them gets nothing from them even when the rest
@@ -651,9 +689,19 @@ fn solve(
     let results = engine
         .compute(wrapper, &flat, viewport_w, viewport_h)
         .ok()?;
-    let mut rects = Vec::with_capacity(results.layout_cache.len());
+    host_rects(&flat, &results.layout_cache)
+}
+
+fn host_rects(
+    flat: &[crate::layout::FlatNodeInfo],
+    layout_cache: &[(crate::layout::LayoutRect, usize)],
+) -> Option<(
+    Vec<(u32, crate::layout::LayoutRect)>,
+    crate::layout::LayoutRect,
+)> {
+    let mut rects = Vec::with_capacity(layout_cache.len());
     let mut own = None;
-    for (rect, index) in &results.layout_cache {
+    for (rect, index) in layout_cache {
         if *index == 0 {
             own = Some(*rect);
         }
@@ -790,6 +838,136 @@ fn spliced_skip_projections(cache: &Cache, removed: &[Component], inserted: &[Co
     }
 }
 
+fn component_same(left: &Component, right: &Component) -> bool {
+    host_id(left) == host_id(right)
+        && left.style == right.style
+        && left.kind == right.kind
+        && left.children.len() == right.children.len()
+        && left
+            .children
+            .iter()
+            .zip(&right.children)
+            .all(|(left, right)| component_same(left, right))
+}
+
+/// Append or remove of the last column-flex item. Earlier items are identical,
+/// so their used boxes stay. Anything else, including a middle insert or a
+/// text edit, returns `None` and the caller lays out the whole column.
+fn column_tail_edit(old: &Component, fresh: &Component) -> Option<bool> {
+    if crate::layout_ng::mode() != crate::layout_ng::Mode::On || !column_flex_stacks(old) {
+        return None;
+    }
+    let align = old.style.align_items;
+    let content = old.style.align_content;
+    if !matches!(align, AlignItems::Stretch | AlignItems::FlexStart)
+        || !matches!(content, AlignContent::Stretch | AlignContent::FlexStart)
+        || !matches!(old.style.height, Dimension::Auto)
+        || !matches!(old.style.min_height, Dimension::Auto)
+        || !matches!(old.style.max_height, Dimension::Auto)
+    {
+        return None;
+    }
+    let old_len = old.children.len();
+    let new_len = fresh.children.len();
+    let (prefix, appended) = if new_len == old_len + 1 {
+        (old_len, true)
+    } else if old_len == new_len + 1 && new_len > 0 {
+        (new_len, false)
+    } else {
+        return None;
+    };
+    if !old.children[..prefix]
+        .iter()
+        .zip(&fresh.children[..prefix])
+        .all(|(left, right)| component_same(left, right))
+    {
+        return None;
+    }
+    if fresh
+        .children
+        .iter()
+        .any(|child| child.style.flex_grow != 0.0)
+    {
+        return None;
+    }
+    if appended {
+        let child = &fresh.children[prefix];
+        if !matches!(
+            child.style.align_self,
+            AlignSelf::Auto | AlignSelf::Stretch | AlignSelf::FlexStart
+        ) {
+            return None;
+        }
+    }
+    Some(appended)
+}
+
+/// Lay out only the appended item, or drop the removed item's margin box.
+/// `None` means the caller must solve the column.
+fn reuse_column_tail(
+    cache: &Cache,
+    path: &[usize],
+    fresh: &Component,
+    viewport_w: f32,
+    viewport_h: f32,
+) -> Option<(Vec<(u32, crate::layout::LayoutRect)>, f32, f32, f32)> {
+    let old = at_path(&cache.component, path);
+    let appended = column_tail_edit(old, fresh)?;
+    let Some(column_id) = host_id(old) else {
+        return None;
+    };
+    let column_rect =
+        crate::dom::with_document(|document| document.get_layout_rect(NodeId::from_u32(column_id)));
+    if appended {
+        let child = fresh.children.last()?.clone();
+        let last = old.children.last()?;
+        let last_id = host_id(last)?;
+        let last_bottom = px_spacing(last.style.margin.bottom)?;
+        let content_width = content_box_width(&old.style, column_rect.width);
+        if !content_width.is_finite() || content_width <= 0.0 {
+            return None;
+        }
+        let skip_child = can_skip_projections(&child);
+        let wrapper = wrapper_for(old, content_width, vec![child]);
+        let (rects, own) = solve(&wrapper, skip_child, true, viewport_w, viewport_h)?;
+        let child_id = host_id(wrapper.children.first()?)?;
+        let child_rect = rect_of(&rects, child_id)?;
+        let rects: Vec<_> = rects
+            .into_iter()
+            .filter(|(id, _)| *id != column_id)
+            .collect();
+        let last_rect = crate::dom::with_document(|document| {
+            document.get_layout_rect(NodeId::from_u32(last_id))
+        });
+        let pad = old.style.padding_lengths();
+        let origin_x = column_rect.x + border_side(&old.style, 3) + pad.left;
+        let local_x = child_rect.x - own.x;
+        let local_y = child_rect.y - own.y;
+        let target_x = origin_x + local_x;
+        let target_y = last_rect.y + last_rect.height + last_bottom + local_y;
+        let dh = own.height;
+        if !dh.is_finite() || dh <= 0.0 || !(child_rect.height > 0.0) {
+            return None;
+        }
+        COLUMN_TAIL_REUSES.with(|count| count.set(count.get() + 1));
+        Some((rects, target_x - child_rect.x, target_y - child_rect.y, dh))
+    } else {
+        let removed = old.children.last()?;
+        let removed_id = host_id(removed)?;
+        let removed_rect = crate::dom::with_document(|document| {
+            document.get_layout_rect(NodeId::from_u32(removed_id))
+        });
+        let top = px_spacing(removed.style.margin.top)?;
+        let bottom = px_spacing(removed.style.margin.bottom)?;
+        let dh = -(removed_rect.height + top + bottom);
+        if !dh.is_finite() || column_rect.height + dh <= 0.0 {
+            return None;
+        }
+        COLUMN_TAIL_REUSES.with(|count| count.set(count.get() + 1));
+        Some((Vec::new(), 0.0, 0.0, dh))
+    }
+}
+
 pub(super) fn try_splice(
     cache: &mut Cache,
     dirty: &[NodeId],
@@ -830,45 +1008,58 @@ pub(super) fn try_splice(
         PlanKind,
     ) = match plan.kind {
         PlanKind::Subtree(fresh) => {
-            let old = at_path(&cache.component, &plan.path);
-            let margins = old.style.margin_lengths();
-            let width = node_rect.width + margins.left + margins.right;
-            if !(node_rect.height > 0.0) || !width.is_finite() || width <= 0.0 {
-                return bail("solve 555");
+            if let Some((rects, dx, dy, dh)) =
+                reuse_column_tail(cache, &plan.path, &fresh, viewport_w, viewport_h)
+            {
+                let skip = if cache.skip_projections {
+                    can_skip_projections(&fresh)
+                } else {
+                    false
+                };
+                let measure = text_metric_for_fresh(cache, &plan.path, &fresh);
+                (rects, dx, dy, dh, skip, measure, PlanKind::Subtree(fresh))
+            } else {
+                let old = at_path(&cache.component, &plan.path);
+                let margins = old.style.margin_lengths();
+                let width = node_rect.width + margins.left + margins.right;
+                if !(node_rect.height > 0.0) || !width.is_finite() || width <= 0.0 {
+                    return bail("solve 555");
+                }
+                // Engine flags are whole-tree properties: a full rebuild would
+                // derive them from the spliced tree, so the subtree uses those.
+                let old_subtree =
+                    std::mem::replace(at_path_mut(&mut cache.component, &plan.path), fresh);
+                let skip = spliced_skip_projections(
+                    cache,
+                    std::slice::from_ref(&old_subtree),
+                    std::slice::from_ref(at_path(&cache.component, &plan.path)),
+                );
+                let measure = text_metric_after_edit(cache, &plan.path);
+                let fresh =
+                    std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
+                let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
+                let mut wrapper = wrapper_for(parent, width, vec![fresh]);
+                let Some((rects, _)) = solve(&wrapper, skip, measure, viewport_w, viewport_h)
+                else {
+                    return bail("solve 568");
+                };
+                let Some(new_rect) = rect_of(&rects, plan.node) else {
+                    return bail("solve 571");
+                };
+                if !(new_rect.height > 0.0) || (new_rect.width - node_rect.width).abs() > 0.01 {
+                    return bail("solve 574");
+                }
+                let fresh = wrapper.children.pop().expect("wrapper child");
+                (
+                    rects,
+                    node_rect.x - new_rect.x,
+                    node_rect.y - new_rect.y,
+                    new_rect.height - node_rect.height,
+                    skip,
+                    measure,
+                    PlanKind::Subtree(fresh),
+                )
             }
-            // Engine flags are whole-tree properties: a full rebuild would
-            // derive them from the spliced tree, so the subtree uses those.
-            let old_subtree =
-                std::mem::replace(at_path_mut(&mut cache.component, &plan.path), fresh);
-            let skip = spliced_skip_projections(
-                cache,
-                std::slice::from_ref(&old_subtree),
-                std::slice::from_ref(at_path(&cache.component, &plan.path)),
-            );
-            let measure = text_metric_after_edit(cache, &plan.path);
-            let fresh =
-                std::mem::replace(at_path_mut(&mut cache.component, &plan.path), old_subtree);
-            let parent = at_path(&cache.component, &plan.path[..plan.path.len() - 1]);
-            let mut wrapper = wrapper_for(parent, width, vec![fresh]);
-            let Some((rects, _)) = solve(&wrapper, skip, measure, viewport_w, viewport_h) else {
-                return bail("solve 568");
-            };
-            let Some(new_rect) = rect_of(&rects, plan.node) else {
-                return bail("solve 571");
-            };
-            if !(new_rect.height > 0.0) || (new_rect.width - node_rect.width).abs() > 0.01 {
-                return bail("solve 574");
-            }
-            let fresh = wrapper.children.pop().expect("wrapper child");
-            (
-                rects,
-                node_rect.x - new_rect.x,
-                node_rect.y - new_rect.y,
-                new_rect.height - node_rect.height,
-                skip,
-                measure,
-                PlanKind::Subtree(fresh),
-            )
         }
         PlanKind::Tail { keep, tail } => {
             let target = at_path_mut(&mut cache.component, &plan.path);
@@ -950,6 +1141,19 @@ pub(super) fn try_splice(
     if matches!(commit, PlanKind::Tail { .. }) {
         grown.push(plan.node);
     }
+    if matches!(commit, PlanKind::Subtree(_))
+        && dh != 0.0
+        && !rects.iter().any(|(id, _)| *id == plan.node)
+    {
+        // A reused column tail does not re-solve the column box. Its
+        // auto height still grows or shrinks by the item's margin box.
+        // Tail plans already record `plan.node` above; adding it again
+        // would apply `dh` twice.
+        let column = at_path(&cache.component, &plan.path);
+        if !matches!(column.style.height, Dimension::Px(_)) {
+            grown.push(plan.node);
+        }
+    }
     if dh != 0.0 {
         for level in 0..levels {
             let depth = plan.path.len() - 1 - level;
@@ -1020,6 +1224,21 @@ pub(super) fn try_splice(
 /// classified. A definite-height or out-of-flow ancestor makes that predicate
 /// ignore the subtree, so a tail inside a scroller must not turn measurement
 /// on by itself.
+fn text_metric_for_fresh(cache: &Cache, path: &[usize], fresh: &Component) -> bool {
+    if cache.measure_text {
+        return true;
+    }
+    for depth in 0..path.len() {
+        let style = &at_path(&cache.component, &path[..depth]).style;
+        if matches!(style.position, Position::Absolute | Position::Fixed)
+            || matches!(style.height, Dimension::Px(_))
+        {
+            return false;
+        }
+    }
+    needs_text_metric(fresh)
+}
+
 fn text_metric_after_edit(cache: &Cache, path: &[usize]) -> bool {
     if cache.measure_text {
         return true;
@@ -1144,6 +1363,11 @@ pub(super) fn try_style_subtree(
     if path.is_empty() || host_id(at_path(&cache.component, &path)) != Some(id) {
         return bail("style host");
     }
+    // A column-flex item whose width just became definite (or auto again)
+    // is re-lowered below. The cached text still has the previous
+    // `text-line-width` mark, and the paragraph line count would not match
+    // a full lower of the same border box.
+    let column_flex = path_has_column_flex(&cache.component, &path);
     let parent = at_path(&cache.component, &path[..path.len() - 1]);
     let node_alone = stacking_parent(parent)
         && cross_axis_start_stable(&parent.style, new)
@@ -1188,7 +1412,18 @@ pub(super) fn try_style_subtree(
     if !wrapper_width.is_finite() || wrapper_width <= 0.0 {
         return bail("style width");
     }
-    let fresh = target.clone();
+    let fresh = if column_flex {
+        let lowered = crate::dom::with_document(|document| {
+            document.to_component_subtree(NodeId::from_u32(host))
+        });
+        if host_id(&lowered) != Some(host) {
+            return bail("style relower");
+        }
+        lowered
+    } else {
+        target.clone()
+    };
+    let relowered = column_flex.then(|| fresh.clone());
     let solved_nodes = crate::layout::count_nodes(&fresh) as u32;
     let wrapper = wrapper_for(parent_of_target, wrapper_width, vec![fresh]);
     let Some((rects, _)) = solve(
@@ -1237,6 +1472,12 @@ pub(super) fn try_style_subtree(
             document.set_layout_rect(id, rect);
         }
     });
+    if let Some(relowered) = relowered {
+        // The text run's line-width mark lives on the children. The element's
+        // own style stays the computed style already assigned, so a later
+        // background edit is still paint-only.
+        at_path_mut(&mut cache.component, &solve_path).children = relowered.children;
+    }
     cache.engine.invalidate();
     cache.width_memos.clear();
     super::note_flush("style-subtree", solved_nodes, shifted_nodes);
@@ -1297,6 +1538,20 @@ fn verify(viewport_w: f32, viewport_h: f32, node: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Column flex uses the same subtree kind in every mode. Geometry stays
+    /// exact; a full-document rebuild is not the supported path.
+    fn expect_column_flex_edit(label: &str, fast_kind: &str, fast_node_limit: Option<u32>) {
+        let stats = crate::incremental_layout::last_flush_stats();
+        assert_eq!(stats.kind, fast_kind, "{label} {}", stats.kind);
+        if let Some(limit) = fast_node_limit {
+            assert!(
+                stats.solved_nodes < limit,
+                "{label} solved {} nodes",
+                stats.solved_nodes
+            );
+        }
+    }
 
     fn style(node: u32, decls: &[(&str, &str)]) {
         for (name, value) in decls {
@@ -1576,17 +1831,7 @@ mod tests {
         let (column, items) = flex_column();
         crate::dom::set_style_property(items[1], "width", "36px");
         assert!(crate::incremental_layout::flush());
-        let stats = crate::incremental_layout::last_flush_stats();
-        assert_eq!(
-            stats.kind, "style-subtree",
-            "width edit solved {}",
-            stats.kind
-        );
-        assert!(
-            stats.solved_nodes < 30,
-            "width edit solved {} nodes",
-            stats.solved_nodes
-        );
+        expect_column_flex_edit("width edit", "style-subtree", Some(30));
         assert_matches_full("flex width");
 
         let text = crate::dom::with_document(|document| {
@@ -1601,11 +1846,7 @@ mod tests {
             "one two three four five six seven eight nine ten eleven twelve thirteen fourteen",
         );
         assert!(crate::incremental_layout::flush());
-        assert_eq!(
-            crate::incremental_layout::last_flush_stats().kind,
-            "splice",
-            "text edit"
-        );
+        expect_column_flex_edit("text edit", "splice", None);
         assert_matches_full("flex text");
 
         let extra = crate::dom::create_element("div");
@@ -1613,21 +1854,218 @@ mod tests {
         crate::dom::append_child(extra, crate::dom::create_text_node("appended row"));
         crate::dom::append_child(column, extra);
         assert!(crate::incremental_layout::flush());
-        assert_eq!(
-            crate::incremental_layout::last_flush_stats().kind,
-            "splice",
-            "append"
-        );
+        expect_column_flex_edit("append", "splice", None);
         assert_matches_full("flex append");
 
         crate::dom::remove_child(column, extra);
         assert!(crate::incremental_layout::flush());
-        assert_eq!(
-            crate::incremental_layout::last_flush_stats().kind,
-            "splice",
-            "remove"
-        );
+        expect_column_flex_edit("remove", "splice", None);
         assert_matches_full("flex remove");
+    }
+
+    /// Appending or removing the last column item must not re-solve an
+    /// untouched text cell. A text edit and a middle insert still match a
+    /// full layout, and they do not take that reuse.
+    #[test]
+    fn column_tail_reuses_an_untouched_text_cell() {
+        let (column, items) = flex_column();
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(text, &"alpha beta gamma delta epsilon ".repeat(40));
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("long text");
+        let before = column_tail_reuses();
+        let extra = crate::dom::create_element("div");
+        style(extra, &[("margin", "4px"), ("padding", "4px")]);
+        crate::dom::append_child(extra, crate::dom::create_text_node("tail item"));
+        crate::dom::append_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("append after long text");
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(
+                column_tail_reuses() > before,
+                "append should reuse untouched column items"
+            );
+        } else {
+            assert_eq!(column_tail_reuses(), before);
+        }
+        let middle = crate::dom::create_element("div");
+        style(middle, &[("margin", "4px"), ("padding", "4px")]);
+        crate::dom::append_child(middle, crate::dom::create_text_node("middle"));
+        let reused = column_tail_reuses();
+        crate::dom::insert_before(column, middle, items[2]);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("middle insert");
+        assert_eq!(
+            column_tail_reuses(),
+            reused,
+            "a middle insert lays the column out again"
+        );
+        crate::dom::set_text_content(text, "short again");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("text edit invalidates the cell");
+        assert_eq!(column_tail_reuses(), reused);
+        let before_remove = column_tail_reuses();
+        crate::dom::remove_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("remove tail");
+        if crate::layout_ng::mode() == crate::layout_ng::Mode::On {
+            assert!(column_tail_reuses() > before_remove);
+        } else {
+            assert_eq!(column_tail_reuses(), before_remove);
+        }
+        let grown = crate::dom::create_element("div");
+        style(grown, &[("flex-grow", "1"), ("margin", "4px")]);
+        crate::dom::append_child(grown, crate::dom::create_text_node("grows"));
+        let before_grow = column_tail_reuses();
+        crate::dom::append_child(column, grown);
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("flex-grow append");
+        assert_eq!(
+            column_tail_reuses(),
+            before_grow,
+            "a flex-grow item lays the column out again"
+        );
+    }
+
+    /// A long flex-item paragraph is broken inside one text item. A later
+    /// width or font edit, and a shorter replacement, still match a full
+    /// layout: the break widths are not reused from the previous string.
+    #[test]
+    fn long_paragraph_edits_match_full_layout() {
+        let (column, items) = flex_column();
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(
+            text,
+            &"alpha beta gamma delta epsilon zeta eta theta ".repeat(36),
+        );
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("long paragraph", "splice", Some(30));
+        assert_matches_full("long paragraph");
+        let wide = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .height
+        });
+        crate::dom::set_style_property(column, "width", "180px");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("narrow column");
+        let narrow = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[0]))
+                .height
+        });
+        assert!(
+            narrow > wide + 1.0,
+            "narrowing the column did not rewrap: wide {wide} narrow {narrow}"
+        );
+        crate::dom::set_style_property(items[0], "font-size", "22px");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("font size");
+        crate::dom::set_text_content(text, "short again");
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("text replaced");
+    }
+
+    /// The runtime bench's sections are `width:100%` columns, not a fixed
+    /// 420px. The same edits have to match a full LayoutNG pass there too,
+    /// including a background change that must not move the next item.
+    #[test]
+    fn percent_column_edits_match_full_layout() {
+        crate::dom::reset_document();
+        crate::incremental_layout::invalidate();
+        crate::jsdom::set_viewport(1024.0, 768.0);
+        crate::stylesheet::clear_rules();
+        crate::stylesheet::register_rule("div", &[("font-size", "14px")]);
+        let column = crate::dom::create_element("div");
+        style(
+            column,
+            &[
+                ("display", "flex"),
+                ("flex-direction", "column"),
+                ("width", "100%"),
+            ],
+        );
+        crate::dom::append_child(crate::dom::body_id(), column);
+        let mut items = Vec::new();
+        for index in 0..4 {
+            let item = crate::dom::create_element("div");
+            style(item, &[("margin", "2px"), ("padding", "4px")]);
+            crate::dom::append_child(
+                item,
+                crate::dom::create_text_node(&format!(
+                    "Item {index} alpha beta gamma delta epsilon zeta"
+                )),
+            );
+            crate::dom::append_child(column, item);
+            items.push(item);
+        }
+        assert!(crate::incremental_layout::flush());
+        assert_matches_full("percent initial");
+
+        crate::dom::set_style_property(items[0], "width", "160px");
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent width", "style-subtree", Some(30));
+        assert_matches_full("percent width");
+
+        let text = crate::dom::with_document(|document| {
+            document
+                .get_node(w3cos_dom::node::NodeId::from_u32(items[1]))
+                .first_child
+                .expect("text")
+                .as_u32()
+        });
+        crate::dom::set_text_content(
+            text,
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda",
+        );
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent text", "splice", None);
+        assert_matches_full("percent text");
+
+        let sibling_before = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[1]))
+                .y
+        });
+        crate::dom::set_style_property(items[0], "background", "#204060");
+        assert!(crate::incremental_layout::flush());
+        let stats = crate::incremental_layout::last_flush_stats();
+        assert_eq!(stats.kind, "paint", "percent background {}", stats.kind);
+        let sibling_after = crate::dom::with_document(|document| {
+            document
+                .get_layout_rect(w3cos_dom::node::NodeId::from_u32(items[1]))
+                .y
+        });
+        assert_eq!(
+            sibling_before, sibling_after,
+            "background moved the next item"
+        );
+        assert_matches_full("percent background");
+
+        let extra = crate::dom::create_element("div");
+        style(extra, &[("margin", "2px"), ("padding", "4px")]);
+        crate::dom::append_child(extra, crate::dom::create_text_node("Inserted row"));
+        crate::dom::append_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent append", "splice", None);
+        assert_matches_full("percent append");
+        crate::dom::remove_child(column, extra);
+        assert!(crate::incremental_layout::flush());
+        expect_column_flex_edit("percent remove", "splice", None);
+        assert_matches_full("percent remove");
+        crate::stylesheet::clear_rules();
     }
 
     #[test]
@@ -1688,8 +2126,7 @@ mod tests {
         let (_column, items) = flex_column();
         crate::dom::class_list_add(items[0], "wide");
         assert!(crate::incremental_layout::flush());
-        let stats = crate::incremental_layout::last_flush_stats();
-        assert_eq!(stats.kind, "style-subtree", "class toggle {}", stats.kind);
+        expect_column_flex_edit("class toggle", "style-subtree", None);
         assert_matches_full("class on");
         crate::dom::class_list_remove(items[0], "wide");
         assert!(crate::incremental_layout::flush());

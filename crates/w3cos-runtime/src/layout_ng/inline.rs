@@ -195,8 +195,27 @@ fn tab_advance(text: &str, style: &Style) -> Option<f32> {
 }
 
 /// A sole line-width leaf: paint wraps and draws its whole text itself.
-fn paragraph_leaf(style: &Style, sole: bool) -> bool {
-    sole && has_marker(style, LINE_WIDTH_MARKER)
+fn paragraph_leaf(style: &Style, sole: bool, container: &Style) -> bool {
+    sole && line_width_leaf(style, container)
+}
+
+/// The DOM marks a block's sole text run `text-line-width` (paint wraps it
+/// inside the block's line width).  A run coalesced from dissolved inlines
+/// (#325: it carries CSSOM owner ranges) is not marked, although it is the
+/// same paragraph: infer the marker from the DOM's conditions so it takes
+/// the same path (and line model) as an equivalent unsplit run.
+fn line_width_leaf(style: &Style, container: &Style) -> bool {
+    has_marker(style, LINE_WIDTH_MARKER)
+        || (has_marker(style, w3cos_std::inline_text::CSSOM_OWNER_RANGES)
+            && matches!(
+                container.white_space,
+                WhiteSpace::Normal | WhiteSpace::PreLine
+            )
+            && !matches!(style.position, Position::Absolute | Position::Fixed)
+            && (!matches!(container.width, Dimension::Auto)
+                || container.text_indent != Dimension::Px(0.0)
+                || container.text_align != TextAlign::Start
+                || has_marker(container, "--w3cos-internal-text-align-last")))
 }
 
 fn has_marker(style: &Style, key: &str) -> bool {
@@ -405,18 +424,27 @@ fn text_style_reason(content: &str, style: &Style) -> Option<&'static str> {
     if style.hanging_punctuation_last && !content.chars().all(|c| c.is_ascii()) {
         return Some("text:hanging-punctuation");
     }
-    if !matches!(style.line_break, LineBreak::Auto | LineBreak::Normal) {
+    // `line-break: anywhere` is the shared breaker's BreakCharacter mode
+    // (ComputedStyle::GetLineBreakType); strict / loose stay on legacy.
+    if !matches!(
+        style.line_break,
+        LineBreak::Auto | LineBreak::Normal | LineBreak::Anywhere
+    ) {
         return Some("text:line-break");
     }
     if style.break_spaces {
         return Some("text:break-spaces");
     }
     // break-all is a LineBreakType of the UAX #14 iterator the NG breaker
-    // uses (crate::line_break::BreakMode); overflow-wrap emergency breaks and
-    // keep-all on a paragraph leaf are not modelled.
-    if !matches!(style.word_break, WordBreak::Normal | WordBreak::BreakAll)
-        || break_all_jamo(content, style)
-    {
+    // uses (crate::line_break::BreakMode). `keep-all` only glues CJK letter
+    // pairs (CSS Text 3 §5.3); on Latin-1 it matches `normal`. `break-word`
+    // / overflow-wrap emergency breaks are unused under `pre` / `pre-wrap`
+    // (white-space-intrinsic-size-003 / 016).
+    let word_break_ok = matches!(style.word_break, WordBreak::Normal | WordBreak::BreakAll)
+        || (style.word_break == WordBreak::KeepAll && latin1(content))
+        || (style.word_break == WordBreak::BreakWord
+            && matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap));
+    if !word_break_ok || break_all_jamo(content, style) {
         return Some("text:word-break");
     }
     if style.text_align == TextAlign::Justify {
@@ -615,11 +643,10 @@ fn fallback_grows_line(content: &str, style: &Style) -> bool {
     false
 }
 
-/// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
-/// block-axis margins are handled by block layout.
-pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
+/// Padding or borders on a text box whose edges NG does not lay out.
+pub(super) fn text_edges_reason(style: &Style) -> Option<&'static str> {
     let padding = style.padding_lengths();
-    if [padding.top, padding.right, padding.bottom, padding.left]
+    ([padding.top, padding.right, padding.bottom, padding.left]
         .into_iter()
         .any(|v| v != 0.0)
         || style.border_width != 0.0
@@ -631,10 +658,18 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
         ]
         .into_iter()
         .flatten()
-        .any(|v| v != 0.0)
-    {
-        return Some("text:edges");
-    }
+        .any(|v| v != 0.0))
+    .then_some("text:edges")
+}
+
+/// A block-level text leaf (`<p>text</p>` lowered to one Text box).  Its
+/// block-axis margins are handled by block layout.
+///
+/// Padding and borders of a block-level leaf are its own box edges: block
+/// layout (NGBlockLayoutAlgorithm border/padding) insets the content box
+/// its lines are laid out in. Text that is an anonymous block, flex or grid
+/// item, or inline-level still checks `text_edges_reason`.
+pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static str> {
     if content.is_empty()
         || content.contains(['\n', '\r'])
         || (content.contains('\t') && !tab_only(content, style))
@@ -652,6 +687,18 @@ pub(super) fn block_text_reason(content: &str, style: &Style) -> Option<&'static
     // A block text leaf is its own paragraph.
     if !super::block::block_unicode_bidi_ok(style) {
         return Some("unicode-bidi");
+    }
+    // overflow-wrap: break-word / anywhere on a block text leaf: its lines
+    // are measured (wrapped_text_height) and painted by the same breaker
+    // with emergency breaks, so NG only places the box.
+    if style.word_break == WordBreak::BreakWord {
+        return text_style_reason(
+            content,
+            &Style {
+                word_break: WordBreak::Normal,
+                ..style.clone()
+            },
+        );
     }
     text_style_reason(content, style)
 }
@@ -720,6 +767,9 @@ fn inline_text_reason(
     first: bool,
     container: &Style,
 ) -> Option<&'static str> {
+    // Only a sole leaf is a paragraph; a shared line keeps its own marker.
+    let line_width =
+        has_marker(style, LINE_WIDTH_MARKER) || (sole && line_width_leaf(style, container));
     if style.display != Display::Inline {
         return Some("text:display");
     }
@@ -739,9 +789,7 @@ fn inline_text_reason(
     }
     // The paragraph and preserved-newline paths place the leaf without a
     // baseline shift.
-    if valign_length(style).is_some()
-        && (has_marker(style, LINE_WIDTH_MARKER) || content.contains('\n'))
-    {
+    if valign_length(style).is_some() && (line_width || content.contains('\n')) {
         return Some("vertical-align-length");
     }
     // An embedding or isolate inside the paragraph needs bidi resolution
@@ -759,28 +807,25 @@ fn inline_text_reason(
     // leaf itself; word items get their levels from leaf_bidi_levels and
     // are reordered per line.  Preserved spaces that hang (pre-wrap) would
     // hang at the line's left end (L1): legacy.
-    let paragraph = sole && has_marker(style, LINE_WIDTH_MARKER);
+    let paragraph = sole && line_width;
     if container.direction == TextDirection::Rtl
         && !paragraph
         && style.white_space == WhiteSpace::PreWrap
     {
         return Some("bidi:white-space");
     }
-    if !zero_edges(style)
-        && (has_marker(style, LINE_WIDTH_MARKER) || !inline_edges_supported(content, style))
-    {
+    if !zero_edges(style) && (line_width || !inline_edges_supported(content, style)) {
         return Some("text:edges");
     }
     // Preserved newlines (CSS Text 3 4.1.1) in a sole leaf: paint breaks
     // the lines; a trailing one only through the paragraph wrapper.
     let newline_ok = sole
         && match style.white_space {
-            WhiteSpace::PreLine => has_marker(style, LINE_WIDTH_MARKER),
+            WhiteSpace::PreLine => line_width,
             // (line-height: normal mixes the strut's computed line height
             // with the font's line spacing differently in legacy.)
             WhiteSpace::Pre | WhiteSpace::PreWrap => {
-                has_marker(style, LINE_WIDTH_MARKER)
-                    || (!content.ends_with('\n') && !style.line_height_is_normal)
+                line_width || (!content.ends_with('\n') && !style.line_height_is_normal)
             }
             _ => false,
         };
@@ -792,7 +837,7 @@ fn inline_text_reason(
         || content.contains('\r')
         || (content.contains('\t')
             && !(first && tab_only(content, style))
-            && !(tabs_in_pre_text(content, style) && !paragraph_leaf(style, sole)))
+            && !(tabs_in_pre_text(content, style) && !paragraph_leaf(style, sole, container)))
         || (content.contains('\n') && !newline_ok)
     {
         return Some("text:content");
@@ -808,7 +853,7 @@ fn inline_text_reason(
     if fallback_grows_line(content, style) {
         return Some("text:fallback-metrics");
     }
-    if has_marker(style, LINE_WIDTH_MARKER) {
+    if line_width {
         if !sole {
             return Some("text:line-width-shared");
         }
@@ -822,8 +867,10 @@ fn inline_text_reason(
             return Some("vertical-align-keyword");
         }
         // overflow-wrap adds emergency breaks inside an item (break-all is
-        // an iterator break type, below).
-        if style.word_break == w3cos_std::style::WordBreak::BreakWord
+        // an iterator break type, below). `pre` / `pre-wrap` do not take
+        // those opportunities, so break-word is fine there.
+        if (style.word_break == WordBreak::BreakWord
+            && !matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap))
             || break_all_jamo(content, style)
         {
             return Some("text:word-break");
@@ -878,7 +925,8 @@ pub(super) fn is_atomic_inline(flat: &[FlatNodeInfo], index: usize) -> bool {
     let inline_block = matches!(
         flat[index].style.display,
         Display::InlineBlock | Display::InlineTable
-    );
+    ) || (flat[index].style.display == Display::InlineFlex
+        && super::block::is_author_flex(flat[index].style));
     if matches!(
         flat[index].kind,
         ComponentKind::Image { .. } | ComponentKind::Canvas { .. }
@@ -1092,8 +1140,14 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // box's own font; a box whose text does not inherit its font (a shadow
     // <slot>, display:contents in Chrome, carries a default style) does not
     // own the strut, so its style must not drive line metrics.
+    // Only a direct text child can carry a font the box does not own. An
+    // element child with its own font (an inline box, or a block lowered to
+    // inline) lays out through its own strut.
     if !has_marker(style, IFC_MARKER)
-        && rendered_children(flat, index).any(|child| !same_font(flat[child].style, style))
+        && rendered_children(flat, index).any(|child| {
+            matches!(flat[child].kind, ComponentKind::Text { .. })
+                && !same_text_font(flat[child].style, style)
+        })
     {
         return Some("ifc:unmarked");
     }
@@ -1125,7 +1179,7 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
     // pixel; keep this document on legacy too.
     if let [InlineEntry::Leaf(c)] = entries[..]
         && !is_atomic_inline(flat, c)
-        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[c].style, style)
         && flat[c].style.font_family != style.font_family
         && style.font_size > 0.0
         && flat[c].style.font_size >= style.font_size * 4.0
@@ -1241,7 +1295,7 @@ fn rtl_paragraph_reason(
     }
     if let [InlineEntry::Leaf(c)] = entries[..]
         && !is_atomic_inline(flat, c)
-        && has_marker(flat[c].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[c].style, container)
     {
         return None;
     }
@@ -1385,9 +1439,11 @@ fn internal_opportunity(content: &str, style: &Style) -> bool {
     let core = content.trim_matches(' ');
     if core.bytes().all(|b| b.is_ascii_alphanumeric())
         && style.word_break != w3cos_std::style::WordBreak::BreakAll
+        && style.line_break != LineBreak::Anywhere
     {
         // FillAscii: no opportunity between ASCII letters and digits
-        // (break-all adds one between any two, ShouldBreakAfterBreakAll).
+        // (break-all adds one between any two, ShouldBreakAfterBreakAll;
+        // line-break: anywhere is BreakCharacter, every grapheme).
         return false;
     }
     core.chars().any(is_soft_wrap_char)
@@ -1419,6 +1475,20 @@ fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &In
 /// ShapeResult::SnappedWidth.
 fn snap(advance: f32) -> f32 {
     crate::text_layout::inline_layout_advance(advance)
+}
+
+/// `same_font`, except that two `line-height: normal` styles whose
+/// font-derived ratios differ in the third decimal still share a strut (the
+/// primary font's metrics, rounded once per style).
+fn same_text_font(a: &Style, b: &Style) -> bool {
+    same_font(a, b)
+        || (a.line_height_is_normal
+            && b.line_height_is_normal
+            && (a.line_height - b.line_height).abs() < 0.01
+            && a.font_family == b.font_family
+            && a.font_size == b.font_size
+            && a.font_weight == b.font_weight
+            && a.font_style == b.font_style)
 }
 
 /// Same used font and line-height (text inheriting directly from a box).
@@ -1498,6 +1568,51 @@ fn item_text<'a>(flat: &'a [FlatNodeInfo], item: &InlineItem) -> &'a str {
     }
 }
 
+/// Cumulative character advances of `text`, plus the horizontal padding
+/// `max_content_width` adds. `None` when that width is not the snapped sum
+/// of per-character advances (a tab, Skia shaping, or a named family).
+fn additive_char_prefix(text: &str, style: &Style) -> Option<(Vec<f32>, f32)> {
+    if tab_advance(text, style).is_some() {
+        return None;
+    }
+    #[cfg(feature = "skia")]
+    {
+        return None;
+    }
+    #[cfg(not(feature = "skia"))]
+    {
+        if style.font_family.is_some() {
+            return None;
+        }
+        let padding = style.padding_lengths();
+        let pad = padding.left + padding.right;
+        let font = crate::layout::layout_font();
+        let mut prefix = Vec::with_capacity(text.len() + 1);
+        prefix.push(0.0);
+        let mut sum = 0.0f32;
+        for ch in text.chars() {
+            sum += crate::text_layout::char_advance(ch, style.font_size, font);
+            for _ in 0..ch.len_utf8() {
+                prefix.push(sum);
+            }
+        }
+        Some((prefix, pad))
+    }
+}
+
+/// `hang_advance` from a prefix built by [`additive_char_prefix`].
+fn hang_from_prefix(piece: &str, raw: f32, prefix: &[f32], start: usize, pad: f32) -> f32 {
+    let trimmed = piece.trim_end_matches(' ').len();
+    if trimmed == 0 {
+        return 0.0;
+    }
+    if trimmed == piece.len() {
+        return raw;
+    }
+    let spaces = snap(prefix[start + piece.len()] - prefix[start + trimmed]) + pad;
+    (raw - spaces).max(0.0)
+}
+
 /// NGLineBreaker breaking inside a text item: split `item` at the latest
 /// UAX #14 opportunity (crate::line_break over the item's text) for which
 /// `fits(prefix)` holds, or, with `overflow`, at its first opportunity.
@@ -1523,21 +1638,42 @@ fn split_text_item(
     if candidates.is_empty() {
         return None;
     }
+    // Char advances add. A binary search that remeasures both sides of every
+    // probe repeats that sum for the whole remaining paragraph on each line.
+    // The prefix is the same sum `max_content_width` uses, so the snapped
+    // slice widths stay identical. Shaped faces (Skia, a named family) do
+    // not take this path.
+    let additive = additive_char_prefix(text, style);
     let piece = |o: usize| {
         let (head, tail) = text.split_at(o);
-        let adv = run_advances(&[head, tail], style);
+        let (head_width, tail_width) = if let Some((prefix, pad)) = additive.as_ref() {
+            (
+                snap(prefix[o] - prefix[0]) + pad,
+                snap(prefix[text.len()] - prefix[o]) + pad,
+            )
+        } else {
+            let adv = run_advances(&[head, tail], style);
+            (adv[0], adv[1])
+        };
+        let hang = |piece_text: &str, raw: f32, start: usize| {
+            if let Some((prefix, pad)) = additive.as_ref() {
+                hang_from_prefix(piece_text, raw, prefix, start, *pad)
+            } else {
+                hang_advance(piece_text, raw, style)
+            }
+        };
         let mut a = item.clone();
         a.range = Some((base, base + o));
-        a.raw = adv[0] + item.box_start;
-        a.raw_hang = hang_advance(head, adv[0], style) + item.box_start;
+        a.raw = head_width + item.box_start;
+        a.raw_hang = hang(head, head_width, 0) + item.box_start;
         a.ends_space = head.ends_with(' ');
         a.whitespace_only = head.trim_end_matches(' ').is_empty();
         a.internal_break = internal_opportunity(head, style);
         a.box_end = 0.0;
         let mut b = item.clone();
         b.range = Some((base + o, base + text.len()));
-        b.raw = adv[1] + item.box_end;
-        b.raw_hang = hang_advance(tail, adv[1], style) + item.box_end;
+        b.raw = tail_width + item.box_end;
+        b.raw_hang = hang(tail, tail_width, o) + item.box_end;
         b.starts_space = tail.starts_with(' ');
         b.whitespace_only = tail.trim_end_matches(' ').is_empty();
         b.internal_break = internal_opportunity(tail, style);
@@ -1704,19 +1840,22 @@ fn max_content_width(content: &str, style: &Style) -> f32 {
     #[cfg(not(feature = "skia"))]
     {
         let padding = style.padding_lengths();
-        let inner = if style.font_family.is_none() {
-            crate::text_layout::measure_text_width_font(
-                content,
-                style.font_size,
-                crate::layout::layout_font(),
-            )
+        // A named family, including a test's registered Ahem, is measured
+        // with that face. The host face here is often the embedded CJK
+        // subset (`Noto Sans SC`, 573/1000 em), which is not Ahem's em cell.
+        let registered = crate::layout::registered_style_font(style);
+        let host;
+        let font = if let Some(face) = registered.as_ref() {
+            face.as_ref()
         } else {
-            let (width, _) = crate::text_layout::text_intrinsic_size_font(
-                content,
-                style,
-                f32::MAX / 4.0,
-                crate::layout::layout_font(),
-            );
+            host = crate::layout::layout_font();
+            host
+        };
+        let inner = if style.font_family.is_none() {
+            crate::text_layout::measure_text_width_font(content, style.font_size, font)
+        } else {
+            let (width, _) =
+                crate::text_layout::text_intrinsic_size_font(content, style, f32::MAX / 4.0, font);
             width - padding.left - padding.right
         };
         crate::text_layout::inline_layout_advance(inner.max(0.0)) + padding.left + padding.right
@@ -1734,9 +1873,27 @@ fn has_forced_break(content: &str, style: &Style) -> bool {
             ))
 }
 
+/// The style a block text leaf's lines are measured with. The legacy text
+/// measurers inset a text component by its own padding; on NG the leaf's
+/// padding is a block box edge that block layout already applied.
+pub(super) fn block_text_measure_style(style: &Style) -> std::borrow::Cow<'_, Style> {
+    let padding = style.padding_lengths();
+    if [padding.top, padding.right, padding.bottom, padding.left]
+        .into_iter()
+        .all(|v| v == 0.0)
+    {
+        return std::borrow::Cow::Borrowed(style);
+    }
+    std::borrow::Cow::Owned(Style {
+        padding: w3cos_std::style::Edges::ZERO,
+        ..style.clone()
+    })
+}
+
 /// Content height of a block-level text leaf of content width `width`.
 /// Content height and last baseline of a block-level text leaf.
 pub(super) fn block_text_layout(content: &str, width: f32, style: &Style) -> (f32, LastBaseline) {
+    let style = &*block_text_measure_style(style);
     let (height, single, ascent) = paragraph_height(content, width, style, style, false);
     (
         height,
@@ -1883,7 +2040,7 @@ pub(super) fn layout_inline_beside(
     if !has_boxes
         && let [child] = children[..]
         && !is_atomic_inline(flat, child)
-        && has_marker(flat[child].style, LINE_WIDTH_MARKER)
+        && line_width_leaf(flat[child].style, container)
     {
         let style = flat[child].style;
         let ComponentKind::Text { content } = flat[child].kind else {
@@ -2077,6 +2234,13 @@ pub(super) fn layout_inline_beside(
             let k = start;
             let child = children[k];
             let style = flat[child].style;
+            // An `inline-flex` box in a right-to-left line keeps legacy
+            // (flex:rtl; its main axis follows the inherited direction).
+            if style.display == Display::InlineFlex
+                && (space.rtl || container.direction == TextDirection::Rtl)
+            {
+                return super::bail("flex:rtl");
+            }
             let result =
                 super::block::layout_block(flat, child, space, true).why("atomic-layout")?;
             if !result.oof.is_empty() {
@@ -2830,7 +2994,7 @@ pub(super) fn inline_min_max(
     if let [InlineEntry::Leaf(child)] = entries[..]
         && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
-        && (has_marker(flat[child].style, LINE_WIDTH_MARKER) || content.contains('\n'))
+        && (line_width_leaf(flat[child].style, flat[index].style) || content.contains('\n'))
     {
         return Some(text_min_max(content, flat[child].style));
     }

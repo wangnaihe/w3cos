@@ -177,8 +177,11 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("flex:column-align-self");
         }
-        // Percentage main sizes and percentage block descendants cycle
-        // through the automatic minimum. Leave those columns on legacy.
+        // Percentage main sizes on the column item itself cycle through
+        // the automatic minimum. Leave those on legacy. A percentage on a
+        // descendant alone is fine: tables resolve cell percentages in
+        // their own algorithm, and a definite item height (including from
+        // min-height) is a percentage basis for nested blocks.
         if !row && column_percent_size(flat, child) {
             return Some("flex:column-percent");
         }
@@ -300,22 +303,12 @@ fn subtree_has_float(flat: &[FlatNodeInfo], index: usize) -> bool {
     false
 }
 
-/// A percentage block size on this column item or a descendant. The
-/// flex base, the used height, and min/max height all count.
+/// A percentage block size on this column flex item. The flex base, the
+/// used height, and min/max height all count. Descendants are not scanned:
+/// a table item keeps cell percentages inside table layout, and a
+/// definite item height is a percentage basis for nested blocks.
 fn column_percent_size(flat: &[FlatNodeInfo], index: usize) -> bool {
-    let end = flat[index].subtree_end.max(index + 1);
-    let mut child = index;
-    while child < end {
-        if flat[child].style.display == w3cos_std::style::Display::None {
-            child = flat[child].subtree_end.max(child + 1);
-            continue;
-        }
-        if percent_block_size(flat[child].style) {
-            return true;
-        }
-        child += 1;
-    }
-    false
+    percent_block_size(flat[index].style)
 }
 
 fn percent_block_size(style: &Style) -> bool {
@@ -734,19 +727,31 @@ fn resolve_main_limits(
     } else {
         (style.min_height, style.max_height, style.height)
     };
+    // CSS Flexbox §4.5: a scroll container's main-axis automatic minimum
+    // is zero (overflow non-visible on that axis disables content-based
+    // min-width/min-height:auto).
+    let main_scrolls = if row {
+        style.resolved_overflow_x() != w3cos_std::style::Overflow::Visible
+    } else {
+        style.resolved_overflow_y() != w3cos_std::style::Overflow::Visible
+    };
     let min = if matches!(min_dim, Dimension::Auto) {
-        let content_min = if row {
-            let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
-            content.min.unwrap_or(content.max)
-        } else if block::size_contained(style) {
-            block::contain_intrinsic_size(style).1
+        if main_scrolls {
+            0.0
         } else {
-            block_content_min(flat, index, space).why("flex:block-min")?
-        }
-        .max(0.0);
-        match definite(specified, inner, style, space).why("flex:percent")? {
-            Some(size) => content_min.min(to_content(style, edges, size)),
-            None => content_min,
+            let content_min = if row {
+                let content = content_minmax(flat, index, space).why("flex:intrinsic")?;
+                content.min.unwrap_or(content.max)
+            } else if block::size_contained(style) {
+                block::contain_intrinsic_size(style).1
+            } else {
+                block_content_min(flat, index, space).why("flex:block-min")?
+            }
+            .max(0.0);
+            match definite(specified, inner, style, space).why("flex:percent")? {
+                Some(size) => content_min.min(to_content(style, edges, size)),
+                None => content_min,
+            }
         }
     } else {
         match definite(min_dim, inner, style, space).why("flex:percent")? {
@@ -1441,7 +1446,12 @@ pub(super) fn layout(
     let mut cursor = lead;
     let mut children = Vec::with_capacity(items.len());
     let mut oof = Vec::new();
-    for (item, laid) in items.iter().zip(fragments) {
+    // CSS Flexbox 8.5: an `inline-flex` atomic inline's baseline is its
+    // first item's first baseline (NGFlexLayoutAlgorithm, single line,
+    // no reversal; other cases keep the margin-edge fallback).
+    let mut inline_flex_baseline = LastBaseline::NoLines;
+    let first_item_baseline = style.display == Display::InlineFlex && !reverse && !reverse_cross;
+    for (position, (item, laid)) in items.iter().zip(fragments).enumerate() {
         let border_main = item.content + item.main_edges;
         let main = if reverse {
             cursor - item.margin_main_start - border_main
@@ -1482,6 +1492,11 @@ pub(super) fn layout(
                 .iter()
                 .map(|candidate| candidate.translated(x + dx, y + dy)),
         );
+        if first_item_baseline && position == 0 {
+            if let LastBaseline::At(b) = laid.first_baseline {
+                inline_flex_baseline = LastBaseline::At(y + dy + b);
+            }
+        }
         children.push((x + dx, y + dy, laid.fragment));
         let step = item.outer_main() + gap + between;
         if reverse {
@@ -1559,8 +1574,8 @@ pub(super) fn layout(
             ellipsis: false,
             children,
         },
-        last_baseline: LastBaseline::NoLines,
-        first_baseline: LastBaseline::NoLines,
+        last_baseline: inline_flex_baseline,
+        first_baseline: inline_flex_baseline,
         start_strut,
         end_strut,
         self_collapsing: false,

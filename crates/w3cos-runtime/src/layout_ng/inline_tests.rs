@@ -67,6 +67,29 @@ enum LineHeight {
     Px(f32),
 }
 
+#[test]
+fn registered_ahem_xx_is_two_em() {
+    let _ahem = AhemGuard::new();
+    let mut block = Style {
+        display: Display::Block,
+        ..Style::default()
+    };
+    font(&mut block, 20.0, LineHeight::Number(1.0));
+    let mut item = Style {
+        display: Display::Inline,
+        ..Style::default()
+    };
+    font(&mut item, 20.0, LineHeight::Number(1.0));
+    let root = Component::boxed(block, vec![Component::text("XX", item)]);
+    let flat = pre_flatten(&root);
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let text = ng.iter().find(|(_, index)| *index == 1).expect("text").0;
+    assert_eq!(
+        text.width, 40.0,
+        "registered Ahem XX at 20px is two em cells, not the host CJK advance"
+    );
+}
+
 fn font(style: &mut Style, size: f32, line_height: LineHeight) {
     style.font_family = Some("Ahem".into());
     style.font_size = size;
@@ -271,7 +294,7 @@ fn generated_inline_trees_are_supported() {
         );
         let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
         if dump.is_some() {
-            let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+            let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
             lines.push_str(&format!(
                 "{{\"case\":{case},\"fonts\":[\"Ahem\"],\"html\":{:?},\"legacy\":{{{}}},\"ng\":{{{}}}}}\n",
                 case_html(&flat),
@@ -352,7 +375,7 @@ fn ext_trees_are_supported(level: u8, seed: u64, dump_env: &str, min_handled: us
         };
         handled += 1;
         if dump.is_some() {
-            let legacy = crate::layout::compute(&root, 800.0, 600.0).expect("legacy");
+            let legacy = crate::layout::legacy_layout_rects(&root, 800.0, 600.0).expect("legacy");
             lines.push_str(&format!(
                 "{{\"case\":{case},\"fonts\":[\"Ahem\"],\"html\":{:?},\"legacy\":{{{}}},\"ng\":{{{}}}}}\n",
                 case_html(&flat),
@@ -2692,4 +2715,38 @@ fn empty_collapsible_text_is_skipped() {
         let r = ng.iter().find(|(_, i)| *i == index).expect("rect").0;
         assert_eq!([r.x, r.y, r.width, r.height], want, "#{index}");
     }
+}
+
+/// line-break: anywhere (BreakCharacter) breaks inside an ASCII word that
+/// is its own text item.  Chrome: <div style="width:100px;
+/// line-break:anywhere">X<span>XXXXXXXXXX</span></div> in 25px/1 Ahem is
+/// 100x75 (XXXX / XXXX / XXX).
+#[test]
+fn line_break_anywhere_breaks_inside_an_ascii_item() {
+    let _ahem = AhemGuard::new();
+    let mut style = Style {
+        display: Display::Block,
+        width: Dimension::Px(100.0),
+        line_break: w3cos_std::style::LineBreak::Anywhere,
+        ..Style::default()
+    };
+    font(&mut style, 25.0, LineHeight::Number(1.0));
+    let mut item = Style {
+        display: Display::Inline,
+        line_break: w3cos_std::style::LineBreak::Anywhere,
+        ..Style::default()
+    };
+    font(&mut item, 25.0, LineHeight::Number(1.0));
+    let root = Component::boxed(
+        style,
+        vec![
+            Component::text("X", item.clone()),
+            Component::text("XXXXXXXXXX", item),
+        ],
+    );
+    let flat = pre_flatten(&root);
+    assert_eq!(block::unsupported_reasons(&flat), Vec::<String>::new());
+    let ng = layout_tree(&root, &flat, 800.0, 600.0).expect("ng");
+    let r = ng.iter().find(|(_, i)| *i == 0).expect("rect").0;
+    assert_eq!((r.width, r.height), (100.0, 75.0));
 }
