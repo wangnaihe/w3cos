@@ -393,12 +393,19 @@ impl Element {
             node.clear_attribute_namespace(index);
         }
         let old_classes = std::mem::replace(&mut node.class_list, next);
+        let current_classes = doc.get_node(self.id).class_list.clone();
+        // Preserve entries shared by the old and new values. Class-name
+        // updates commonly replace one state token while retaining structural
+        // tokens, so removing and re-adding every entry needlessly churns the
+        // selector index.
         for class in old_classes.iter() {
-            doc.remove_from_class_index(self.id, class);
+            if !current_classes.contains(class) {
+                doc.remove_from_class_index(self.id, class);
+            }
         }
-        for position in 0..doc.get_node(self.id).class_list.len() {
-            if let Some(class) = doc.get_node(self.id).class_list.get(position).copied() {
-                doc.add_to_class_index(self.id, &class);
+        for class in current_classes.iter() {
+            if !old_classes.contains(class) {
+                doc.add_to_class_index(self.id, class);
             }
         }
         let node = doc.get_node_mut(self.id);
