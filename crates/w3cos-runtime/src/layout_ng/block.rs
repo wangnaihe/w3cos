@@ -4809,6 +4809,7 @@ pub(super) fn layout_block_in(
     // PreviousInflowPosition::self_collapsing_child_had_clearance.
     let mut last_cleared_self_collapsing = false;
     let mut children = Vec::new();
+    let mut column_monoliths = Vec::new();
     // Offset of the content box from the border box.
     let content_top = bt + pt;
     let mut last_baseline = LastBaseline::NoLines;
@@ -5626,6 +5627,9 @@ pub(super) fn layout_block_in(
         let (dx, dy) = oof::relative_offset(child_info.style, &child_space);
         let (fx, fy) = (x + dx, bt + pt + y + dy);
         oof_candidates.extend(result.oof.iter().map(|c| c.translated(fx, fy)));
+        if column_width.is_some() && result.fragment.height > 0.0 {
+            column_monoliths.push((y, y + result.fragment.height));
+        }
         children.push((fx, fy, result.fragment));
         child = next;
     }
@@ -5679,7 +5683,7 @@ pub(super) fn layout_block_in(
         (None, None) => {
             let h = if let Some(col_w) = column_width {
                 let n = super::columns::count(style, metrics.content_width, col_w);
-                super::columns::content_block_size(style, None, auto_content, n)
+                super::columns::auto_content_block_size(style, auto_content, n, &column_monoliths)
             } else {
                 auto_content
             };

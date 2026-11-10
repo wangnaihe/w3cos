@@ -105,6 +105,33 @@ pub(super) fn content_block_size(
     }
 }
 
+/// Raise a balanced column height so it does not cut a monolithic in-flow
+/// child's border box (CSS Fragmentation: unforced breaks fall between
+/// boxes). `approx` is the equal-height first approximation.
+pub(super) fn snap_balanced_height(approx: f32, monoliths: &[(f32, f32)]) -> f32 {
+    let height = approx.max(0.0);
+    monoliths
+        .iter()
+        .copied()
+        .find(|(start, end)| *start < height - 0.01 && *end > height + 0.01)
+        .map_or(height, |(_, end)| end)
+}
+
+/// Auto-height used block size. `column-fill: auto` keeps the flow height;
+/// `balance` starts from an equal split and snaps to monoliths.
+pub(super) fn auto_content_block_size(
+    style: &Style,
+    flow_height: f32,
+    column_count: usize,
+    monoliths: &[(f32, f32)],
+) -> f32 {
+    let height = content_block_size(style, None, flow_height, column_count);
+    match style.column_fill {
+        ColumnFill::Auto => height,
+        ColumnFill::Balance | ColumnFill::BalanceAll => snap_balanced_height(height, monoliths),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +152,20 @@ mod tests {
             ..style
         };
         assert_eq!(content_block_size(&auto, None, 300.0, 3), 300.0);
+    }
+
+    #[test]
+    fn balance_snaps_off_a_monolithic_child() {
+        let style = Style {
+            column_count: Some(2),
+            column_fill: ColumnFill::Balance,
+            column_gap: Some(16.0),
+            ..Style::default()
+        };
+        // Three 22px boxes in a 66px flow: 66/2 = 33 would cut the second
+        // box. The used height is 44 (two boxes in the first column).
+        let monoliths = [(0.0, 22.0), (22.0, 44.0), (44.0, 66.0)];
+        assert_eq!(auto_content_block_size(&style, 66.0, 2, &monoliths), 44.0);
+        assert_eq!(content_block_size(&style, None, 66.0, 2), 33.0);
     }
 }
