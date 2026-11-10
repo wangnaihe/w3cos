@@ -3444,6 +3444,22 @@ mod tests {
     }
 
     #[test]
+    fn foreign_element_type_and_attribute_names_are_case_sensitive() {
+        setup();
+        register_rule("lineargradient[viewbox]", &[("wrong-case", "yes")]);
+        register_rule("linearGradient[viewBox]", &[("exact-case", "yes")]);
+        let element = SelectorContext::new("linearGradient", None, &[])
+            .with_attributes(&[("viewBox", "0 0 10 10")])
+            .with_html_element(false);
+        let declarations = matching_declarations_for_context(&element, &[]);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            (declarations[0].0.as_str(), declarations[0].1.as_str()),
+            ("exact-case", "yes")
+        );
+    }
+
+    #[test]
     fn node_matcher_stays_equivalent_to_owned_context_reference() {
         setup();
         let mut document = Document::new();
@@ -3670,22 +3686,6 @@ mod tests {
             node_selector_context_constructions(),
             0,
             "node selector matching must not materialize owned SelectorContext values",
-        );
-    }
-
-    #[test]
-    fn foreign_element_type_and_attribute_names_are_case_sensitive() {
-        setup();
-        register_rule("lineargradient[viewbox]", &[("wrong-case", "yes")]);
-        register_rule("linearGradient[viewBox]", &[("exact-case", "yes")]);
-        let element = SelectorContext::new("linearGradient", None, &[])
-            .with_attributes(&[("viewBox", "0 0 10 10")])
-            .with_html_element(false);
-        let declarations = matching_declarations_for_context(&element, &[]);
-        assert_eq!(declarations.len(), 1);
-        assert_eq!(
-            (declarations[0].0.as_str(), declarations[0].1.as_str()),
-            ("exact-case", "yes")
         );
     }
 
