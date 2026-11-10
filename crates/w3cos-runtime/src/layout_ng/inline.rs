@@ -1711,6 +1711,13 @@ pub(super) fn strut(style: &Style) -> (f32, f32) {
     (ascent, height - ascent)
 }
 
+/// Typographic first-baseline metrics of the root inline box in a
+/// transposed vertical IFC (`sideways`: under faces block-start).
+fn sideways_strut(style: &Style) -> (f32, f32) {
+    let (ascent, descent) = strut(style);
+    (descent, ascent)
+}
+
 /// `text-box-trim` on this IFC container: (trim-start, trim-end).
 /// Blink: node start/end trim (not fragmentainer); `text-box-edge: text`
 /// removes half-leading outside the em box of the first/last line.
@@ -2998,7 +3005,21 @@ fn layout_lines(
                     height
                 }
                 _ if orthogonal => height,
-                LastBaseline::At(b) => margin[0] + b,
+                LastBaseline::At(b) => {
+                    // A transposed vertical IFC maps block-start to the
+                    // typographic under (`sideways`). Use padding-top +
+                    // descent, not the HTB alphabetic-from-over.
+                    let b = if super::orthogonal::is_transposed(style) {
+                        super::orthogonal::sideways_typographic_ascent(
+                            style,
+                            result.fragment.height,
+                            b,
+                        )
+                    } else {
+                        b
+                    };
+                    margin[0] + b
+                }
                 LastBaseline::NoLines => height,
                 LastBaseline::Unknown => return super::bail("atomic-baseline"),
             };
@@ -3426,8 +3447,16 @@ fn layout_lines(
     // Line boxes (NGLineBoxFragmentBuilder): run slices start on LayoutUnit
     // offsets; pieces inside a slice keep their raw shaping offsets and the
     // slice's last piece absorbs the snap remainder.
+    // A transposed typographic IFC of only inline-blocks uses the sideways
+    // strut (under faces block-start). Text-only orthogonal roots keep the
+    // HTB strut so their typographic text metrics stay consistent.
+    let atomic_only = items
+        .iter()
+        .all(|item| item.atomic.is_some() || item.whitespace_only || item.forced);
     let (strut_ascent, strut_descent) = if quirks {
         (f32::NEG_INFINITY, f32::NEG_INFINITY)
+    } else if super::orthogonal::is_transposed(container) && atomic_only {
+        sideways_strut(container)
     } else {
         strut(container)
     };

@@ -289,12 +289,13 @@ fn synthesized_block_baseline(last: bool, border_height: f32) -> f32 {
     if last { 0.0 } else { border_height }
 }
 
-/// Inline-axis (`justify-*: baseline`) alignment is modeled only in a
-/// horizontal-tb grid. Vertical containers stay on the transposed path,
-/// which still drops baseline styles.
+/// Inline-axis (`justify-*: baseline`) alignment is modeled in a
+/// horizontal-tb grid, and in a transposed vertical grid whose physical
+/// frame is the same (the [`VERTICAL_MARKER`] path has already swapped
+/// tracks, flow, alignment, and auto placements).
 fn inline_baseline_container_ok(style: &Style) -> bool {
     use w3cos_std::style::WritingMode;
-    style.writing_mode == WritingMode::HorizontalTb
+    style.writing_mode == WritingMode::HorizontalTb || has_marker(style, VERTICAL_MARKER)
 }
 
 /// A typographic first/last baseline is only valid in the grid's inline
@@ -422,6 +423,12 @@ fn item_col_baseline(flat: &[FlatNodeInfo], container: usize, child: usize) -> O
     inline_baseline(flat[container].style, flat[child].style).filter(|_| {
         inline_baseline_shape_supported(flat, container, child)
             && baseline_container_height_ok(flat, container)
+            // After transpose, `justify-*: baseline` is the original
+            // column-axis (physical-horizontal typographic) group.
+            // Horizontal-tb items are orthogonal to that axis and stay
+            // start-aligned (CSS Align 3 §9.3; self-baseline-vertical-00{2,3}).
+            && !(has_marker(flat[container].style, VERTICAL_MARKER)
+                && !typographic_inline_baseline(flat[child].style))
     })
 }
 
@@ -739,12 +746,15 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         if placement(child_style, true).is_some_and(|value| parse_axis_syntax(value).is_none()) {
             return Some("grid:row");
         }
-        // A vertical-writing-mode container still bails: the transposed
-        // path does not model baseline groups yet. In a horizontal-tb
-        // grid, an orthogonal item may use `justify-*: baseline`; a
-        // singleton column group falls back to start, and a shared
-        // typographic group bails where the items are built (CSS Align 3
-        // §9.3).
+        // A transposed vertical grid models typographic column groups
+        // (`justify-*: baseline` after the axis swap). Block-axis
+        // (`align-*: baseline`) groups are not modeled there yet, but
+        // must not reject the container: items that share only a
+        // column stay start-aligned on that axis (self-baseline-vertical
+        // 001/002/007). In a horizontal-tb grid, an orthogonal item may
+        // use `justify-*: baseline`; a singleton column group falls back
+        // to start, and a shared typographic group bails where the items
+        // are built (CSS Align 3 §9.3).
         if is_baseline(used_item_align(
             style.justify_items,
             child_style.justify_self,
@@ -752,7 +762,8 @@ pub(super) fn container_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'
         {
             return Some("grid:baseline");
         }
-        if block_baseline(style, child_style).is_some()
+        if !has_marker(style, VERTICAL_MARKER)
+            && block_baseline(style, child_style).is_some()
             && !block_baseline_supported(flat, index, child)
             && is_baseline(used_item_align(style.align_items, child_style.align_self))
         {
@@ -6816,6 +6827,7 @@ fn vertical_container_markers_ok(style: &Style, inline_root: bool) -> bool {
             key == ALIGN_ITEMS_STRETCH
                 || key == JUSTIFY_ITEMS_STRETCH
                 || key == "--w3cos-internal-align-items"
+                || key == "--w3cos-internal-justify-items"
                 || key == "--w3cos-internal-align-self"
                 || key == "--w3cos-internal-justify-self"
         })
@@ -6874,7 +6886,7 @@ fn horizontal_text_item(flat: &[FlatNodeInfo], child: usize) -> bool {
         && flat[child].style.display == Display::Block
         && (child + 1..flat[child].subtree_end).all(|node| {
             matches!(flat[node].kind, w3cos_std::ComponentKind::Text { content }
-                if content.chars().all(|c| c.is_ascii() || c == '\u{2028}'))
+                if content.chars().all(super::orthogonal::sideways_char))
         })
 }
 
@@ -6887,14 +6899,68 @@ fn swap_flow(flow: Option<&str>) -> Option<String> {
     ))
 }
 
-/// Grid containers in `vertical-lr` / `vertical-rl` whose items are empty
-/// boxes, with their axes transposed: the column axis is vertical and the
-/// row axis horizontal. The tracks, placements, gaps and alignments of the
-/// two axes are exchanged so the physical layout runs unchanged; the row
-/// axis then runs right to left for `vertical-rl` (the patched direction is
-/// rtl) and the column axis bottom to top under `direction: rtl`
-/// ([`VERTICAL_MARKER`]). Only definite physical sizes and plain leaf items
-/// of the same writing mode and direction qualify.
+/// 1-based `start / end` grid lines covering `span` tracks from `start`.
+fn line_range(start: usize, span: usize) -> String {
+    format!("{} / {}", start + 1, start + 1 + span.max(1))
+}
+
+/// Auto-placed cells of an in-flow item in the authored (pre-transpose)
+/// writing mode, so the patched style can write the swapped coordinates
+/// when implicit tracks would otherwise be rebuilt in the new flow.
+fn authored_auto_places(
+    flat: &[FlatNodeInfo],
+    container: usize,
+) -> Option<Vec<(usize, usize, usize, usize, usize)>> {
+    let style = flat[container].style;
+    let (col_names, explicit_cols) = match columns_spec(style) {
+        Some(spec) => {
+            let template = parse_template(spec, false)?;
+            let count = template.names.len().saturating_sub(1);
+            (template.names, count)
+        }
+        None => (vec![Vec::new()], 0),
+    };
+    let (row_names, explicit_rows) = match style.grid_rows() {
+        Some(spec) => {
+            let template = parse_template(spec, true)?;
+            let count = template.names.len().saturating_sub(1);
+            (template.names, count)
+        }
+        None => (vec![Vec::new()], 0),
+    };
+    let flow = parse_flow(style.grid_flow())?;
+    let mut pending = Vec::new();
+    for (ordinal, child) in rendered_children(flat, container).enumerate() {
+        let child_style = flat[child].style;
+        if oof::is_out_of_flow(child_style) {
+            continue;
+        }
+        let column = resolve_axis(placement(child_style, false), &col_names, explicit_cols)?;
+        let row = resolve_axis(placement(child_style, true), &row_names, explicit_rows)?;
+        pending.push((Some(column), Some(row), child_style.order, child, ordinal));
+    }
+    sort_placement_order(&mut pending);
+    Some(
+        place_items(&pending, explicit_cols, explicit_rows, flow)?
+            .into_iter()
+            .map(|(index, col, row, col_span, row_span, _ordinal)| {
+                (index, col, row, col_span, row_span)
+            })
+            .collect(),
+    )
+}
+
+/// Grid containers in `vertical-lr` / `vertical-rl` with their axes
+/// transposed: the column axis is vertical and the row axis horizontal.
+/// The tracks, placements, gaps and alignments of the two axes are
+/// exchanged so the physical layout runs unchanged; the row axis then
+/// runs right to left for `vertical-rl` (the patched direction is rtl)
+/// and the column axis bottom to top under `direction: rtl`
+/// ([`VERTICAL_MARKER`]). Definite physical sizes with plain leaf items
+/// of the same writing mode qualify, as do auto-sized first-baseline
+/// containers whose typographic (same or opposite vertical writing mode)
+/// or horizontal-tb text items the existing typographic column groups
+/// can place after the swap.
 pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)> {
     use w3cos_std::style::WritingMode;
     let mut patched = Vec::new();
@@ -6913,9 +6979,19 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             && block::is_inline_grid(style)
             && !block::is_inline_lanes(style)
             && inline_grid_tracks_for(flat, index, false, true);
+        let last_baseline = marker(style, "--w3cos-internal-align-items")
+            .is_some_and(|keyword| keyword.contains("last"))
+            || marker(style, "--w3cos-internal-justify-items")
+                .is_some_and(|keyword| keyword.contains("last"));
+        // First-baseline typographic groups are laid out after the
+        // transpose. Last-baseline still stays on the previous path.
+        let baseline_container = !last_baseline
+            && (is_baseline(style.align_items)
+                || is_baseline(style.justify_items)
+                || container_wants_block_baseline(style));
         let sized = |dim: Dimension| match dim {
             Dimension::Px(_) => true,
-            Dimension::Auto => inline_root,
+            Dimension::Auto => inline_root || baseline_container,
             _ => false,
         };
         if !(style.display == Display::Grid || inline_root)
@@ -6927,9 +7003,7 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
             || !matches!(style.max_height, Dimension::Auto)
             || super::flex::percent_spacing(&style.margin)
             || super::flex::percent_spacing(&style.padding)
-            || is_baseline(style.align_items)
-            || is_baseline(style.justify_items)
-            || container_wants_block_baseline(style)
+            || last_baseline
             || !vertical_container_markers_ok(style, inline_root)
             || style.grid_areas().is_some()
             || parse_flow(style.grid_flow()).is_none()
@@ -6956,6 +7030,11 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 && child_style.direction == TextDirection::Ltr
                 && flat[child].subtree_end > child + 1
                 && horizontal_text_item(flat, child);
+            // Same or opposite vertical writing mode: typographic
+            // column groups after the swap (self-baseline-vertical-007).
+            let typographic_vertical_text = static_text_ok
+                && child_style.position == Position::Static
+                && super::orthogonal::grid_item_text_flow(flat, child).is_some();
             if !matches!(
                 flat[child].kind,
                 w3cos_std::ComponentKind::Box
@@ -6971,10 +7050,12 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                         || static_horizontal_text)))
                 || !(child_style.writing_mode == style.writing_mode
                     || child_style.position == Position::Absolute
-                    || static_horizontal_text)
+                    || static_horizontal_text
+                    || typographic_vertical_text)
                 || !(child_style.direction == style.direction
                     || child_style.position == Position::Absolute
-                    || static_horizontal_text)
+                    || static_horizontal_text
+                    || typographic_vertical_text)
                 || !(child_style.position == Position::Static
                     || (child_style.position == Position::Absolute
                         && !rtl
@@ -6983,10 +7064,10 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 || (child_style.position == Position::Absolute
                     && abspos_alignment_unmodelled(style, child_style))
                 || (child_style.position == Position::Static
-                    && (child_style.align_self == AlignSelf::Baseline
-                        || child_style.justify_self == AlignSelf::Baseline
-                        || marker(child_style, "--w3cos-internal-align-self")
-                            .is_some_and(|keyword| keyword.contains("baseline"))))
+                    && (marker(child_style, "--w3cos-internal-align-self")
+                        .is_some_and(|keyword| keyword.contains("last"))
+                        || marker(child_style, "--w3cos-internal-justify-self")
+                            .is_some_and(|keyword| keyword.contains("last"))))
                 || super::flex::percent_spacing(&child_style.margin)
                 || super::flex::percent_spacing(&child_style.padding)
                 || child_style.custom_properties.as_ref().is_some_and(|props| {
@@ -7000,6 +7081,7 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                             && key != "--w3cos-internal-align-self"
                             && key != "--w3cos-internal-justify-self"
                             && key != "--w3cos-internal-align-items"
+                            && key != "--w3cos-internal-justify-items"
                     })
                 })
             {
@@ -7011,6 +7093,23 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
         if !simple || items.is_empty() {
             continue;
         }
+        // Auto-flow rebuilds implicit tracks in the swapped flow, which
+        // would keep a no-template `grid-auto-flow: column` grid as 1×N
+        // instead of transposing it to N×1. Resolve authored cells and
+        // write the swapped coordinates below.
+        let needs_resolved_places = items.iter().any(|child| {
+            placement(flat[*child].style, false).is_none()
+                && placement(flat[*child].style, true).is_none()
+        }) && (columns_spec(style).is_none()
+            || style.grid_rows().is_none());
+        let resolved_places = if needs_resolved_places {
+            let Some(places) = authored_auto_places(flat, index) else {
+                continue;
+            };
+            places
+        } else {
+            Vec::new()
+        };
         let Some(flow) = swap_flow(style.grid_flow()) else {
             continue;
         };
@@ -7069,6 +7168,14 @@ pub(super) fn vertical_grid_styles(flat: &[FlatNodeInfo]) -> Vec<(usize, Style)>
                 ng.grid_placement_cascaded = true;
                 ng.grid_column_used = row;
                 ng.grid_row_used = column;
+                if let Some((_, col, row, col_span, row_span)) = resolved_places
+                    .iter()
+                    .find(|(item_index, _, _, _, _)| *item_index == child)
+                {
+                    // (orig col, orig row) → (trans col = orig row, trans row = orig col)
+                    ng.grid_column_used = Some(line_range(*row, *row_span));
+                    ng.grid_row_used = Some(line_range(*col, *col_span));
+                }
             }
             item.align_self = child_style.justify_self;
             item.justify_self = child_style.align_self;

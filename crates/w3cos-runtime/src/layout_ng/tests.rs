@@ -12193,6 +12193,83 @@ fn orthogonal_roots_accept_cascade_only_markers() {
     assert!(texts.iter().all(|t| t.vertical) && !texts.is_empty());
 }
 
+/// A floated vertical-lr IFC of typographic inline-blocks is an
+/// orthogonal root: items stack in the inline (vertical) axis and share
+/// a typographic first baseline in the block axis (physical-horizontal).
+/// Font-size 20 and 10 have descents 4 and 2; extra padding-left on the
+/// larger item is typographic (padding-left + descent), not a synthesized
+/// under-edge. This is the reference shape of
+/// `grid-self-baseline-vertical-lr-001`.
+#[test]
+fn vertical_ifc_typographic_inline_blocks_share_first_baseline() {
+    use w3cos_std::style::{Float, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let item = |size: f32, pad_l: f32| {
+        let font = Style {
+            display: Display::Inline,
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: WritingMode::VerticalLr,
+            ..block()
+        };
+        let wrap = Style {
+            display: Display::InlineBlock,
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: WritingMode::VerticalLr,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Px(pad_l),
+            },
+            ..block()
+        };
+        node(wrap, vec![Component::text("É", font)])
+    };
+    let ifc = Style {
+        display: Display::Block,
+        float: Float::Left,
+        writing_mode: WritingMode::VerticalLr,
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 1.0,
+        line_height_is_normal: false,
+        ..block()
+    };
+    let root = node(
+        block(),
+        vec![node(ifc, vec![item(20.0, 8.0), item(10.0, 0.0)])],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    // Same typographic column geometry as the vertical-lr grid unit test:
+    // 20px item ascent 8+4=12, 10px item ascent 2, shift 10px; shrink-to-fit
+    // 28×30, stacked downward.
+    assert_eq!(
+        rect(&out, 1),
+        (0.0, 0.0, 28.0, 30.0),
+        "floated typographic IFC shrink-to-fit, got {:?}",
+        rect(&out, 1)
+    );
+    assert_eq!(
+        rect(&out, 2),
+        (0.0, 0.0, 28.0, 20.0),
+        "larger typographic inline-block stays at start, got {:?}",
+        rect(&out, 2)
+    );
+    assert_eq!(
+        rect(&out, 4),
+        (10.0, 20.0, 10.0, 10.0),
+        "smaller typographic inline-block shifts to the shared baseline, got {:?}",
+        rect(&out, 4)
+    );
+}
+
 /// An absolutely positioned item with text, in a vertical fixed-track
 /// inline-grid, is an orthogonal root of the grid's frame: shrink-to-fit
 /// along the vertical inline axis, one text line per `<br>`. Measured with
@@ -13504,6 +13581,160 @@ fn typographic_column_baseline_uses_resolved_face_metrics() {
     assert_eq!(rect(&out, 1), (0.0, 0.0, extent, 100.0));
     assert_eq!(rect(&out, 2), (shift, 0.0, 50.0, 40.0));
     assert_eq!(rect(&out, 5), (0.0, 50.0, 50.0, 40.0));
+}
+
+/// A vertical-lr auto-sized grid with `align-items: baseline` and
+/// `grid-auto-flow: column` transposes to typographic column groups.
+/// Font-size 20 and 10 have descents 4 and 2; extra padding-left on the
+/// larger item is typographic (border-left + padding-left + descent),
+/// not a synthesized under-edge. Items stack in the inline (vertical)
+/// axis and share the horizontal typographic baseline.
+#[test]
+fn vertical_container_typographic_row_baseline_groups() {
+    use w3cos_std::style::{AlignItems, Float, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let item = |size: f32, pad_l: f32| {
+        let font = Style {
+            display: Display::Inline,
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: WritingMode::VerticalLr,
+            ..block()
+        };
+        let wrap = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: WritingMode::VerticalLr,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Px(pad_l),
+            },
+            ..block()
+        };
+        node(wrap, vec![Component::text("É", font)])
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        float: Float::Left,
+        writing_mode: WritingMode::VerticalLr,
+        align_items: AlignItems::Baseline,
+        justify_items: AlignItems::Baseline,
+        gap: 0.0,
+        ..block()
+    };
+    grid.grid_ng_mut().grid_auto_flow = Some("column".to_string());
+    let root = node(
+        block(),
+        vec![node(grid, vec![item(20.0, 8.0), item(10.0, 0.0)])],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    // VLR typographic first baseline from the left: padding-left + descent.
+    // 20px item: 8+4=12; 10px item: 2. The 10px box shifts 10px right.
+    // Margin-box widths 28 and 10; group extent 12+(28-12)=28.
+    // Auto-flow column in vertical-lr stacks the items downward.
+    assert_eq!(
+        rect(&out, 1),
+        (0.0, 0.0, 28.0, 30.0),
+        "shrink-to-fit typographic column, got {:?}",
+        rect(&out, 1)
+    );
+    assert_eq!(
+        rect(&out, 2),
+        (0.0, 0.0, 28.0, 20.0),
+        "larger typographic item stays at start, got {:?}",
+        rect(&out, 2)
+    );
+    assert_eq!(
+        rect(&out, 5),
+        (10.0, 20.0, 10.0, 10.0),
+        "smaller typographic item shifts to the shared baseline, got {:?}",
+        rect(&out, 5)
+    );
+}
+
+/// Horizontal-tb items of a vertical-lr baseline grid are orthogonal to
+/// the typographic column axis after the transpose and stay start-aligned,
+/// even when a sibling typographic item has extra padding-left.
+#[test]
+fn vertical_container_orthogonal_items_stay_start_aligned() {
+    use w3cos_std::style::{AlignItems, Float, WritingMode};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let item = |size: f32, mode: WritingMode, pad_l: f32| {
+        let font = Style {
+            display: Display::Inline,
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            ..block()
+        };
+        let wrap = Style {
+            font_family: Some("Ahem".into()),
+            font_size: size,
+            line_height: 1.0,
+            line_height_is_normal: false,
+            writing_mode: mode,
+            padding: Edges {
+                top: Spacing::Px(0.0),
+                right: Spacing::Px(0.0),
+                bottom: Spacing::Px(0.0),
+                left: Spacing::Px(pad_l),
+            },
+            ..block()
+        };
+        node(wrap, vec![Component::text("É", font)])
+    };
+    let mut grid = Style {
+        display: Display::Grid,
+        float: Float::Left,
+        writing_mode: WritingMode::VerticalLr,
+        align_items: AlignItems::Baseline,
+        justify_items: AlignItems::Baseline,
+        gap: 0.0,
+        ..block()
+    };
+    grid.grid_ng_mut().grid_auto_flow = Some("column".to_string());
+    let root = node(
+        block(),
+        vec![node(
+            grid,
+            vec![
+                item(20.0, WritingMode::VerticalLr, 8.0),
+                item(20.0, WritingMode::HorizontalTb, 0.0),
+            ],
+        )],
+    );
+    let flat = pre_flatten(&root);
+    let out = layout_tree(&root, &flat, 300.0, 300.0).expect("ng");
+    // Typographic VLR item: width 28, at x=0. Orthogonal HTB "É" is a
+    // 20px square at start (x=0), not synthesized into the column group.
+    // Shrink-to-fit width is the typographic item (28).
+    assert_eq!(
+        rect(&out, 1),
+        (0.0, 0.0, 28.0, 40.0),
+        "grid shrinks to the typographic item, got {:?}",
+        rect(&out, 1)
+    );
+    assert_eq!(
+        rect(&out, 2),
+        (0.0, 0.0, 28.0, 20.0),
+        "typographic item at start, got {:?}",
+        rect(&out, 2)
+    );
+    assert_eq!(
+        rect(&out, 5),
+        (0.0, 20.0, 20.0, 20.0),
+        "orthogonal item stays start-aligned, got {:?}",
+        rect(&out, 5)
+    );
 }
 
 /// An absolutely positioned `display: inline` box in a block container

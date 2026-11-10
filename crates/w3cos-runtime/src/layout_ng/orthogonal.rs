@@ -50,7 +50,7 @@ fn flow_of(style: &Style) -> Option<Flow> {
 /// `text-orientation: mixed`: Latin scripts and general punctuation. Upright
 /// scripts, bidi controls and scripts with their own vertical rules are not
 /// modeled.
-fn sideways_char(c: char) -> bool {
+pub(super) fn sideways_char(c: char) -> bool {
     c <= '\u{24F}' || ('\u{2010}'..='\u{2027}').contains(&c) || c == '\u{2028}'
 }
 
@@ -72,6 +72,7 @@ pub(super) const INERT_MARKERS: &[&str] = &[
     // run only tells the inline builder where a text node came from.
     "--w3cos-internal-list-style-image",
     "--w3cos-internal-text-source-run",
+    TRANSPOSE_MARKER,
 ];
 
 fn has_internal_marker(style: &Style, allowed: &[&str]) -> bool {
@@ -104,11 +105,33 @@ fn plain_style(style: &Style, flow: Flow) -> bool {
         && style.position == Position::Static
 }
 
+/// Like [`plain_style`], but a floated box may be the orthogonal root
+/// itself (the typographic vertical-lr/rl IFC of a shrink-to-fit float).
+/// Descendants still go through [`plain_style`] (they must not float).
+fn plain_root_style(style: &Style, flow: Flow) -> bool {
+    matches!(style.float, Float::None | Float::Left | Float::Right)
+        && flow_of(style) == Some(flow)
+        && style.clear == Clear::None
+        && style.unicode_bidi == UnicodeBidi::Normal
+        && !block::non_visible_overflow(style)
+        && matches!(style.text_align, TextAlign::Start)
+        && style.text_decoration == TextDecoration::None
+        && style.column_count.is_none()
+        && style.column_width == Dimension::Auto
+        && style.direction == TextDirection::Ltr
+        && style.position == Position::Static
+}
+
 /// Set on the style copy of an absolutely positioned item of a transposed
 /// vertical grid that holds text (`grid::vertical_grid_styles`): the item is
 /// an orthogonal root of the grid's physical (horizontal) frame, sized by the
 /// out-of-flow resolver.
 pub(super) const GRID_ITEM_MARKER: &str = "--w3cos-internal-vertical-grid-item";
+
+/// Set on every style copy of an orthogonal root's transposed
+/// (horizontal-tb) tree. The IFC reads it to convert typographic
+/// alphabetic-from-over into sideways typographic-from-block-start.
+pub(super) const TRANSPOSE_MARKER: &str = "--w3cos-internal-orthogonal-transpose";
 
 /// Markers an out-of-flow vertical grid item carries for its alignment.
 const GRID_ITEM_MARKERS: &[&str] = &[
@@ -195,7 +218,7 @@ fn descendants_plain(flat: &[FlatNodeInfo], index: usize, flow: Flow) -> bool {
             _ => false,
         };
         let display_ok = match s.display {
-            Display::Block | Display::FlowRoot | Display::Inline => true,
+            Display::Block | Display::FlowRoot | Display::Inline | Display::InlineBlock => true,
             Display::Flex => s
                 .custom_properties
                 .as_ref()
@@ -230,12 +253,21 @@ pub(super) fn root_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
     }
     let parent = info.parent?;
     let parent_style = flat[parent].style;
+    let floated = matches!(style.float, Float::Left | Float::Right);
+    // A floated orthogonal root is lowered under a synthetic float group
+    // that carries only cascade markers; the typographic IFC is the float.
+    let parent_allowed = if floated && block::is_float_group(parent_style) {
+        block::FLOAT_GROUP_MARKERS.as_slice()
+    } else {
+        [].as_slice()
+    };
     if parent_style.writing_mode != WritingMode::HorizontalTb
         || parent_style.direction != TextDirection::Ltr
-        || !matches!(parent_style.display, Display::Block | Display::FlowRoot)
+        || !(matches!(parent_style.display, Display::Block | Display::FlowRoot)
+            || (floated && block::is_float_group(parent_style)))
         || block::is_author_flex(parent_style)
         || block::is_author_grid(parent_style)
-        || block::is_float_group(parent_style)
+        || (block::is_float_group(parent_style) && !floated)
         || inline::is_inline_container(flat, parent)
         || !matches!(
             flat[parent].kind,
@@ -246,7 +278,7 @@ pub(super) fn root_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
     }
     // A parent whose block size comes from a ratio or containment gives its
     // children percentages the transposed layout cannot see.
-    if has_internal_marker(parent_style, &[]) {
+    if has_internal_marker(parent_style, parent_allowed) {
         return None;
     }
     if !matches!(style.display, Display::Block | Display::FlowRoot)
@@ -254,7 +286,7 @@ pub(super) fn root_flow(flat: &[FlatNodeInfo], index: usize) -> Option<Flow> {
             info.kind,
             ComponentKind::Box | ComponentKind::Column | ComponentKind::Row
         )
-        || !plain_style(style, flow)
+        || !plain_root_style(style, flow)
         || block::is_author_flex(style)
         || block::is_author_grid(style)
         || has_internal_marker(style, &[inline::IFC_MARKER])
@@ -339,7 +371,33 @@ pub(super) fn transpose_style(style: &Style, flow: Flow) -> Style {
     out.border_left_width = Some(border[3]);
     out.border_styles = map_sides(style.border_styles, flow);
     out.computed_border_widths = map_sides(style.computed_border_widths, flow);
+    out.custom_properties
+        .get_or_insert_with(Default::default)
+        .insert(TRANSPOSE_MARKER.to_string(), String::new());
     out
+}
+
+pub(super) fn is_transposed(style: &Style) -> bool {
+    style
+        .custom_properties
+        .as_ref()
+        .is_some_and(|props| props.contains_key(TRANSPOSE_MARKER))
+}
+
+/// Convert an HTB alphabetic baseline (from the over / top border edge)
+/// to the typographic first baseline from the transposed top, which is
+/// the original block-start and typographic under (`text-orientation:
+/// sideways`, CSS Writing Modes §5.1): padding-top + descent.
+pub(super) fn sideways_typographic_ascent(
+    style: &Style,
+    border_height: f32,
+    from_over: f32,
+) -> f32 {
+    let px = |s: Spacing| match s {
+        Spacing::Px(value) => value,
+        _ => 0.0,
+    };
+    (px(style.padding.top) + border_height - px(style.padding.bottom) - from_over).max(0.0)
 }
 
 /// A dimension of the physical axis whose percentages refer to `basis`
@@ -375,7 +433,11 @@ pub(super) fn layout(
         .custom_properties
         .as_ref()
         .is_some_and(|props| props.contains_key(GRID_ITEM_MARKER));
-    if sized.is_some() && !item {
+    let floated = matches!(style.float, Float::Left | Float::Right);
+    // A shrink-to-fit float passes its used physical content width; that
+    // is this root's block size (transposed height). Other measured
+    // sizes (flex/grid items) stay on the previous path.
+    if sized.is_some() && !item && !floated {
         return super::bail("orthogonal:sized");
     }
     if space.percent_unresolved || (space.rtl && !item) {
@@ -440,14 +502,16 @@ pub(super) fn layout(
         if is_ifc_strut(style) {
             inner.min_width = Dimension::Auto;
         }
-        if let Some((width, height)) = sized {
-            // Content sizes: the physical width is the block size, the
-            // physical height (when definite) the inline size.
-            inner.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
-            inner.height = Dimension::Px(width);
-            if let Some(height) = height {
-                inner.width = Dimension::Px(height);
-            }
+    }
+    if (item || floated)
+        && let Some((width, height)) = sized
+    {
+        // Content sizes: the physical width is the block size, the
+        // physical height (when definite) the inline size.
+        inner.box_sizing = w3cos_std::style::BoxSizing::ContentBox;
+        inner.height = Dimension::Px(width);
+        if let Some(height) = height {
+            inner.width = Dimension::Px(height);
         }
     }
 

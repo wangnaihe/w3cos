@@ -161,6 +161,7 @@ pub(super) fn is_value_carrier_marker(key: &str) -> bool {
             | "vertical-flex"
             | "vertical-grid"
             | "vertical-grid-item"
+            | "orthogonal-transpose"
             | "overflow-alignment"
             // The authored `align-self` / `align-items` keyword: read only
             // for the static position of an abspos flex child.
