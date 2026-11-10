@@ -78,6 +78,140 @@ fn clamp_lines(style: &Style) -> Option<usize> {
     marker_value(style, CLAMP_MARKER)?.parse().ok()
 }
 
+/// The substring of a text leaf this item paints (the item's range, or
+/// the whole leaf when it has none).
+fn clamp_item_text<'a>(item: &InlineItem, content: &'a str) -> &'a str {
+    item.range
+        .and_then(|(a, b)| content.get(a..b))
+        .unwrap_or(content)
+}
+
+/// Whether a last-kept-line text item can carry a block-ellipsis: paint
+/// draws the piece verbatim, with only single U+0020 spaces between words.
+/// The check looks at the item's range, not the whole leaf, so a
+/// `white-space: normal` paragraph whose source still has newlines can
+/// clamp. Collapsed whitespace (`\n` / `\t` / `\r`) is treated as space.
+fn clamp_ellipsis_piece_ok(item: &InlineItem, content: &str, style: &Style) -> bool {
+    if item.atomic.is_some() || !zero_edges(style) {
+        return false;
+    }
+    let slice = clamp_item_text(item, content);
+    let preserve = matches!(style.white_space, WhiteSpace::Pre | WhiteSpace::PreWrap);
+    if preserve {
+        return !slice.contains(|c: char| c.is_whitespace() && c != ' ')
+            && !slice.contains("  ")
+            && !(item.range.is_none() && (item.starts_space || item.ends_space));
+    }
+    true
+}
+
+/// Longest prefix of `slice` ending at a soft wrap opportunity that is at
+/// most `max_width` wide (CSS Overflow 4 block-ellipsis).
+fn last_wrap_prefix_fit(slice: &str, style: &Style, max_width: f32) -> Option<(usize, f32)> {
+    let full = text_intrinsic_size(slice, style).0;
+    if full <= max_width + EPSILON {
+        return Some((slice.len(), full));
+    }
+    let mut best = None;
+    let mut i = 0;
+    while i < slice.len() {
+        let rest = &slice[i..];
+        let Some(rel) = rest.find(|c: char| c.is_whitespace()) else {
+            break;
+        };
+        let at = i + rel;
+        let prefix = &slice[..at];
+        let width = text_intrinsic_size(prefix, style).0;
+        if width <= max_width + EPSILON {
+            best = Some((at, width));
+        }
+        let ch = rest[rel..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        i = at + ch;
+    }
+    best
+}
+
+/// If the last kept line cannot fit its text plus the ellipsis, drop
+/// trailing items and shrink the last remaining item back to the last
+/// wrap opportunity that still leaves room (or keep only the ellipsis).
+fn trim_line_for_block_ellipsis(
+    items: &[InlineItem],
+    flat: &[FlatNodeInfo],
+    line: &mut Line,
+    dropped: &mut Vec<usize>,
+    ellipsis_width: f32,
+) -> Option<(usize, Option<(usize, usize)>)> {
+    let available = line.available;
+    loop {
+        let k = line
+            .items
+            .iter()
+            .rev()
+            .map(|&(k, ..)| k)
+            .find(|&k| !items[k].forced)?;
+        let item = &items[k];
+        let ComponentKind::Text { content } = &flat[item.index].kind else {
+            return None;
+        };
+        if !clamp_ellipsis_piece_ok(item, content, flat[item.index].style) {
+            return None;
+        }
+        if line.width + ellipsis_width <= available + EPSILON {
+            return Some((k, None));
+        }
+        let slice = clamp_item_text(item, content);
+        let start = item.range.map(|(a, _)| a).unwrap_or(0);
+        let (x, item_width) = line
+            .items
+            .iter()
+            .rev()
+            .find(|&&(ik, ..)| ik == k)
+            .map(|&(_, x, w)| (x, w))
+            .unwrap_or((0.0, 0.0));
+        let text_w = text_intrinsic_size(slice, flat[item.index].style).0;
+        let extras = (item_width - text_w).max(0.0);
+        let max_text = available - x - extras - ellipsis_width;
+        if let Some((kept_end, kept_w)) =
+            last_wrap_prefix_fit(slice, flat[item.index].style, max_text)
+        {
+            let new_w = kept_w + extras;
+            if let Some(slot) = line.items.iter_mut().rev().find(|slot| slot.0 == k) {
+                slot.2 = new_w;
+            }
+            line.width = x + new_w;
+            let range = (kept_end < slice.len()).then_some((start, start + kept_end));
+            return Some((k, range));
+        }
+        let content_items = line
+            .items
+            .iter()
+            .filter(|&&(ik, ..)| !items[ik].forced && !items[ik].whitespace_only)
+            .count();
+        if content_items <= 1 {
+            if ellipsis_width > available + EPSILON {
+                return None;
+            }
+            if let Some(slot) = line.items.iter_mut().rev().find(|slot| slot.0 == k) {
+                slot.2 = extras;
+            }
+            line.width = x + extras;
+            return Some((k, Some((start, start))));
+        }
+        while let Some(&(ik, ..)) = line.items.last() {
+            dropped.push(ik);
+            line.items.pop();
+            if ik == k {
+                break;
+            }
+        }
+        line.width = line.items.last().map(|&(_, x, w)| x + w).unwrap_or(0.0);
+    }
+}
+
 fn marker_value<'a>(style: &'a Style, key: &str) -> Option<&'a str> {
     style
         .custom_properties
@@ -299,6 +433,33 @@ fn zero_edges(style: &Style) -> bool {
 fn is_soft_wrap_char(c: char) -> bool {
     matches!(c, ' ' | '-' | '\u{2010}' | '\u{00AD}' | '\u{200B}')
         || crate::text_layout::is_cjk_line_break_character(c)
+}
+
+/// CSS Text 3 4.1.2: in `normal` / `nowrap`, a newline, tab, or form feed
+/// is a collapsible space (same byte length as U+0020, so ranges stay valid
+/// when the character is rewritten as a space for line breaking).
+fn is_collapsible_space(c: char) -> bool {
+    matches!(c, ' ' | '\n' | '\t' | '\u{0c}')
+}
+
+fn collapses_whitespace(style: &Style) -> bool {
+    matches!(style.white_space, WhiteSpace::Normal | WhiteSpace::NoWrap)
+}
+
+/// Line-breaking text of an item: collapsed whitespace modes rewrite
+/// source newlines / tabs / form feeds as U+0020 so UAX #14 does not
+/// treat them as mandatory breaks (CSS Text 3 4.1.2).
+fn as_collapsed_spaces<'a>(text: &'a str, style: &Style) -> std::borrow::Cow<'a, str> {
+    if collapses_whitespace(style) && text.bytes().any(|b| matches!(b, b'\n' | b'\t' | 0x0c)) {
+        std::borrow::Cow::Owned(text.replace(['\n', '\t', '\u{0c}'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn ifc_break_opportunities(text: &str, style: &Style) -> Vec<usize> {
+    let text = as_collapsed_spaces(text, style);
+    crate::line_break::break_opportunities(&text, break_mode(style))
 }
 
 /// `word-break: auto-phrase` suppresses hyphenation, so a soft hyphen is
@@ -853,7 +1014,11 @@ fn inline_text_reason(
             // + face metrics as a specified unit line-height of 1em on
             // Ahem, which is Blink's used line box for these pre leaves.
             WhiteSpace::Pre | WhiteSpace::PreWrap => line_width || !content.ends_with('\n'),
-            _ => false,
+            // Collapsed (not preserved) newlines are wrap spaces, CSS Text 3
+            // 4.1.2. Only take this on a line-clamp container: a general
+            // paragraph with source newlines still uses the legacy path
+            // until IFC collapse is proven gate-safe.
+            WhiteSpace::Normal | WhiteSpace::NoWrap => clamp_lines(container).is_some(),
         };
     // (`first_line`: the item's line offset is known when items are built;
     // see `tab_item_advance`.)
@@ -1550,7 +1715,7 @@ pub(super) fn internal_opportunity(content: &str, style: &Style) -> bool {
     // set: only crate::line_break's own count there.
     let keep_all = style.word_break == WordBreak::KeepAll || suppresses_hyphenation(style);
     (!keep_all && core.chars().any(is_soft_wrap_char))
-        || crate::line_break::break_opportunities(core, break_mode(style))
+        || ifc_break_opportunities(core, style)
             .iter()
             .any(|&o| o < core.len())
 }
@@ -1559,8 +1724,7 @@ pub(super) fn internal_opportunity(content: &str, style: &Style) -> bool {
 /// crate::line_break opportunity past its leading non-space text.
 fn has_split_opportunity(flat: &[FlatNodeInfo], item: &InlineItem) -> bool {
     let text = item_text(flat, item);
-    let mode = break_mode(flat[item.index].style);
-    crate::line_break::break_opportunities(text, mode)
+    ifc_break_opportunities(text, flat[item.index].style)
         .into_iter()
         .any(|o| o > 0 && o < text.len() && !text[..o].trim_end_matches(' ').is_empty())
 }
@@ -1577,7 +1741,7 @@ fn text_boundary_opportunity(flat: &[FlatNodeInfo], prev: &InlineItem, next: &In
         return false;
     }
     let joined = format!("{a}{b}");
-    crate::line_break::break_opportunities(&joined, break_mode(flat[prev.index].style))
+    ifc_break_opportunities(&joined, flat[prev.index].style)
         .binary_search(&a.len())
         .is_ok()
 }
@@ -1679,7 +1843,11 @@ fn run_advances(texts: &[&str], style: &Style) -> Vec<f32> {
 
 /// Raw advance of `content` without its trailing spaces.
 fn hang_advance(content: &str, raw: f32, style: &Style) -> f32 {
-    let trimmed = content.trim_end_matches(' ');
+    let trimmed = if collapses_whitespace(style) {
+        content.trim_end_matches(is_collapsible_space)
+    } else {
+        content.trim_end_matches(' ')
+    };
     if trimmed.is_empty() {
         return 0.0;
     }
@@ -1767,8 +1935,7 @@ fn split_text_item(
     }
     let text = item_text(flat, item);
     let base = item.range.map_or(0, |r| r.0);
-    let mode = break_mode(style);
-    let candidates: Vec<usize> = crate::line_break::break_opportunities(text, mode)
+    let candidates: Vec<usize> = ifc_break_opportunities(text, style)
         .into_iter()
         .filter(|&o| o > 0 && o < text.len() && !text[..o].trim_end_matches(' ').is_empty())
         .collect();
@@ -1804,16 +1971,32 @@ fn split_text_item(
         a.raw = head_width + item.box_start;
         a.raw_hang = hang(head, head_width, 0) + item.box_start;
         a.hang_last = 0.0;
-        a.ends_space = head.ends_with(' ');
-        a.whitespace_only = head.trim_end_matches(' ').is_empty();
+        a.ends_space = if collapses_whitespace(style) {
+            head.ends_with(is_collapsible_space)
+        } else {
+            head.ends_with(' ')
+        };
+        a.whitespace_only = if collapses_whitespace(style) {
+            head.trim_end_matches(is_collapsible_space).is_empty()
+        } else {
+            head.trim_end_matches(' ').is_empty()
+        };
         a.internal_break = internal_opportunity(head, style);
         a.box_end = 0.0;
         let mut b = item.clone();
         b.range = Some((base + o, base + text.len()));
         b.raw = tail_width + item.box_end;
         b.raw_hang = hang(tail, tail_width, o) + item.box_end;
-        b.starts_space = tail.starts_with(' ');
-        b.whitespace_only = tail.trim_end_matches(' ').is_empty();
+        b.starts_space = if collapses_whitespace(style) {
+            tail.starts_with(is_collapsible_space)
+        } else {
+            tail.starts_with(' ')
+        };
+        b.whitespace_only = if collapses_whitespace(style) {
+            tail.trim_end_matches(is_collapsible_space).is_empty()
+        } else {
+            tail.trim_end_matches(' ').is_empty()
+        };
         b.internal_break = internal_opportunity(tail, style);
         b.box_start = 0.0;
         (a, b)
@@ -2452,6 +2635,10 @@ fn layout_lines(
         && let [child] = children[..]
         && !is_atomic_inline(flat, child)
         && line_width_leaf(flat[child].style, container)
+        // A clamped paragraph cannot use the paint-wraps-itself path:
+        // CSS Overflow 4 block-ellipsis has to be placed on the last
+        // kept IFC line (block-ellipsis-001).
+        && clamp_lines(container).is_none()
     {
         let style = flat[child].style;
         let ComponentKind::Text { content } = flat[child].kind else {
@@ -2459,9 +2646,6 @@ fn layout_lines(
         };
         let (height, single, ascent, y, rect_height) =
             paragraph_box(content, available, style, container, quirks);
-        if !single && clamp_lines(container).is_some() {
-            return super::bail("clamp-paragraph");
-        }
         if floats.is_some_and(|f| {
             f.exclusions
                 .overlaps(f.x, f.y, f.x + available, f.y + height)
@@ -2503,6 +2687,9 @@ fn layout_lines(
         && !is_atomic_inline(flat, child)
         && let ComponentKind::Text { content } = flat[child].kind
         && content.contains('\n')
+        // Collapsed newlines in `normal` / `nowrap` are wrap spaces; they
+        // take the IFC wrap path below, not the preserved-newline split.
+        && !collapses_whitespace(flat[child].style)
     {
         let style = flat[child].style;
         let width = text_intrinsic_size(content, style).0;
@@ -2796,9 +2983,21 @@ fn layout_lines(
                 },
                 hang_last: 0.0,
                 run,
-                starts_space: content.starts_with(' '),
-                ends_space: content.ends_with(' '),
-                whitespace_only: content.trim_end_matches(' ').is_empty(),
+                starts_space: if collapses_whitespace(style) {
+                    content.starts_with(is_collapsible_space)
+                } else {
+                    content.starts_with(' ')
+                },
+                ends_space: if collapses_whitespace(style) {
+                    content.ends_with(is_collapsible_space)
+                } else {
+                    content.ends_with(' ')
+                },
+                whitespace_only: if collapses_whitespace(style) {
+                    content.trim_end_matches(is_collapsible_space).is_empty()
+                } else {
+                    content.trim_end_matches(' ').is_empty()
+                },
                 forced: content == FORCED_BREAK,
                 edges,
                 box_start,
@@ -3311,6 +3510,7 @@ fn layout_lines(
     let mut dropped: Vec<usize> = Vec::new();
     let mut ellipsis_item = None;
     let mut ellipsis_width = 0.0f32;
+    let mut ellipsis_range = None;
     if let Some(n) = clamp_lines(container).filter(|&n| n < built.len()) {
         if floats.is_some() || has_boxes || reorder || preserve || !can_wrap {
             return super::bail("clamp-ifc");
@@ -3320,7 +3520,7 @@ fn layout_lines(
             .flat_map(|l| l.items.iter().map(|&(k, ..)| k))
             .collect();
         built.truncate(n);
-        let last = &built[n - 1];
+        let last = &mut built[n - 1];
         let k = last
             .items
             .iter()
@@ -3329,23 +3529,20 @@ fn layout_lines(
             .find(|&k| !items[k].forced)
             .why("clamp-ifc")?;
         let item = &items[k];
-        let ComponentKind::Text { content } = flat[item.index].kind else {
+        let ComponentKind::Text { content } = &flat[item.index].kind else {
             return super::bail("clamp-ifc");
         };
-        // Paint draws a piece verbatim: single spaces between words only.
-        if item.atomic.is_some()
-            || !zero_edges(flat[item.index].style)
-            || content.contains(|c: char| c.is_whitespace() && c != ' ')
-            || content.contains("  ")
-            || (item.range.is_none() && (item.starts_space || item.ends_space))
-        {
+        if !clamp_ellipsis_piece_ok(item, content, flat[item.index].style) {
             return super::bail("clamp-ifc");
         }
-        ellipsis_width = text_intrinsic_size("\u{2026}", flat[item.index].style).0;
-        if last.width + ellipsis_width > last.available + EPSILON {
-            return super::bail("clamp-ellipsis");
+        ellipsis_width = text_intrinsic_size("…", flat[item.index].style).0;
+        match trim_line_for_block_ellipsis(&items, flat, last, &mut dropped, ellipsis_width) {
+            Some((k, range)) => {
+                ellipsis_item = Some(k);
+                ellipsis_range = range;
+            }
+            None => return super::bail("clamp-ellipsis"),
         }
-        ellipsis_item = Some(k);
     }
     let mut top = 0.0f32;
     let mut first_line_baseline = None;
@@ -3449,9 +3646,13 @@ fn layout_lines(
                 baseline - content_ascent - e.top,
                 BoxFragment {
                     index: item.index,
-                    text_range: match (item.range, clamped, flat[item.index].kind) {
-                        (None, true, ComponentKind::Text { content }) => Some((0, content.len())),
-                        (range, ..) => range,
+                    text_range: match (ellipsis_range, item.range, clamped, &flat[item.index].kind)
+                    {
+                        (Some(range), _, true, _) => Some(range),
+                        (None, None, true, ComponentKind::Text { content }) => {
+                            Some((0, content.len()))
+                        }
+                        (_, range, ..) => range,
                     },
                     ellipsis: clamped,
                     vertical: false,
@@ -3588,26 +3789,35 @@ fn layout_lines(
 /// otherwise, the whole text for nowrap / pre.
 pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
     let width = |t: &str| snap(text_intrinsic_size(t, style).0);
-    let max = content
-        .split(['\n', '\u{2028}', '\u{2029}'])
-        .map(width)
-        .fold(0.0f32, f32::max);
+    let collapsed = as_collapsed_spaces(content, style);
+    let measure = collapsed.as_ref();
+    let max = if collapses_whitespace(style) {
+        width(measure)
+    } else {
+        content
+            .split(['\n', '\u{2028}', '\u{2029}'])
+            .map(width)
+            .fold(0.0f32, f32::max)
+    };
+    // Preserved newlines force a max-content break; collapsed ones do not.
     let forced = has_forced_break(content, style)
-        || (content.contains('\n') && !matches!(style.white_space, WhiteSpace::Pre));
+        || (content.contains('\n')
+            && !collapses_whitespace(style)
+            && !matches!(style.white_space, WhiteSpace::Pre));
     let min = if matches!(style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre) {
         Some(max)
     } else if !forced
-        && latin1(content)
-        && !content.chars().any(|c| {
+        && latin1(measure)
+        && !measure.chars().any(|c| {
             c != ' ' && is_soft_wrap_char(c) && !(c == '\u{ad}' && suppresses_hyphenation(style))
         })
     {
         // Pre-wrap: trailing preserved spaces hang and do not affect
         // min-content (CSS Text 3; white-space-intrinsic-size-003).
         let body = if style.white_space == WhiteSpace::PreWrap {
-            content.trim_end_matches(' ')
+            measure.trim_end_matches(' ')
         } else {
-            content
+            measure
         };
         Some(body.split(' ').map(width).fold(0.0f32, f32::max))
     } else if !forced {
@@ -3615,12 +3825,11 @@ pub(super) fn text_min_max(content: &str, style: &Style) -> MinMax {
         // run's BreakMode is taken; trailing hanging spaces (pre-wrap)
         // do not contribute to min-content.
         let body = if style.white_space == WhiteSpace::PreWrap {
-            content.trim_end_matches(' ')
+            measure.trim_end_matches(' ')
         } else {
-            content
+            measure
         };
-        let mode = break_mode(style);
-        let mut cuts = crate::line_break::break_opportunities(body, mode);
+        let mut cuts = ifc_break_opportunities(body, style);
         cuts.retain(|&o| o > 0 && o < body.len());
         cuts.push(body.len());
         let mut start = 0;

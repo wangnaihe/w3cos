@@ -8362,6 +8362,73 @@ fn line_clamp_collapse_clamps_a_block_pre_leaf() {
     );
 }
 
+/// `line-clamp` on a wrapping (non-`pre`) block: CSS Overflow 4 places
+/// the block-ellipsis after the last soft wrap opportunity that still
+/// leaves room for U+2026 (block-ellipsis-001). Source newlines in a
+/// `white-space: normal` leaf are collapsed and must not block clamping.
+#[test]
+fn line_clamp_collapse_trims_last_wrap_for_ellipsis() {
+    use w3cos_std::style::{CustomProperties, WhiteSpace};
+    let _ahem = super::inline_tests::AhemGuard::new();
+    let font = Style {
+        font_family: Some("Ahem".into()),
+        font_size: 20.0,
+        line_height: 20.0,
+        line_height_is_normal: true,
+        ..block()
+    };
+    let text_style = Style {
+        display: Display::Inline,
+        white_space: WhiteSpace::Normal,
+        ..font.clone()
+    };
+    let clamped = |lines: &str, width: f32| Style {
+        width: Dimension::Px(width),
+        white_space: WhiteSpace::Normal,
+        custom_properties: Some(CustomProperties::from_iter([
+            ("--w3cos-internal-line-clamp".to_string(), lines.to_string()),
+            (
+                "--w3cos-internal-continue".to_string(),
+                "collapse".to_string(),
+            ),
+        ])),
+        ..font.clone()
+    };
+    let layout = |style: Style, content: &str| {
+        let root = node(
+            block(),
+            vec![node(
+                style,
+                vec![Component::text(content, text_style.clone())],
+            )],
+        );
+        let flat = pre_flatten(&root);
+        layout_tree_with_text(&root, &flat, 800.0, 600.0)
+    };
+
+    // 5em (100px) fits one "AAAA " line; clamp 2 of four words keeps
+    // "AAAA" and "BBBB…".
+    let some = layout(clamped("2", 100.0), "AAAA BBBB CCCC DDDD").expect("clamp wrap");
+    let got: Vec<&str> = some.1.iter().map(|t| t.text.as_str()).collect();
+    assert_eq!(got, ["AAAA ", "BBBB…"]);
+    let (_, _, _, h2) = rect(&some.0, 1);
+
+    // Source newlines collapse and still clamp (block-ellipsis-001).
+    let nl = layout(clamped("2", 100.0), "AAAA\nBBBB\nCCCC\nDDDD").expect("clamp wrap newline");
+    let got: Vec<String> = nl.1.iter().map(|t| t.text.replace('\n', " ")).collect();
+    assert_eq!(got, ["AAAA ", "BBBB…"]);
+
+    // Clamp 4 is a no-op (four wrapped lines, no ellipsis).
+    let full = layout(clamped("4", 100.0), "AAAA BBBB CCCC DDDD").expect("clamp 4 no-op");
+    let (_, _, _, h4) = rect(&full.0, 1);
+    assert!(h4 > h2, "four lines are taller than two ({h4} vs {h2})");
+    let texts: Vec<&str> = full.1.iter().map(|t| t.text.as_str()).collect();
+    assert!(
+        texts.iter().all(|t| !t.contains('…')),
+        "unclamped lines have no ellipsis: {texts:?}"
+    );
+}
+
 /// A column flex item's flexed size is not a percentage basis for its
 /// children while the container's height is indefinite
 /// (css-flexbox/percentage-heights-016): `height: 100%` there is auto.
