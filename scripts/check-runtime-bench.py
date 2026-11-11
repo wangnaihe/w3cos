@@ -55,15 +55,19 @@ LEGACY_LAYOUT_NG_OFF_CHECKSUMS = (
 )
 
 # Same four fields, measured on GitHub ubuntu-latest rather than the box.
-# Green main run 42155314497 job 127687955856 (7f1c12dc, flag unset, so the
-# legacy engine) recorded them. This branch's explicit W3COS_LAYOUT_NG=0
-# lane on run 42338677739 job 128301295869 (52c2a199) recorded the same
-# four. They are not a substitute for the box tuple above.
+# The previous tuple (18291149073252 / 31625672812 / 147785895 / 1797980318)
+# was recorded on run 42155314497 job 127687955856 (7f1c12dc) and still
+# matched #433 (723de3cc, run 42465083937) and #434's PR (run 42466650727)
+# on 2026-11-08. After the ubuntu-latest image fonts moved, main 3b46fd78
+# run 42737048870 job 129568708507 recorded these four on 2026-11-10. The
+# same delta appeared on both the NG-on and NG-off lanes, so this is the
+# runner font environment, not a layout-engine change. They are not a
+# substitute for the box tuple above.
 RUNNER_LEGACY_BASELINE_CHECKSUMS = (
-    (("style_layout", "layout_checksum"), 18291149073252),
-    (("startup", "child", "layout_checksum"), 31625672812),
-    (("startup", "child", "checksum"), 147785895),
-    (("paint_scroll", "checksum"), 1797980318),
+    (("style_layout", "layout_checksum"), 18321946508132),
+    (("startup", "child", "layout_checksum"), 31632136300),
+    (("startup", "child", "checksum"), 153009029),
+    (("paint_scroll", "checksum"), 1818266327),
 )
 
 
