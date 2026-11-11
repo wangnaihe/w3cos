@@ -1650,13 +1650,31 @@ fn aot_function_meta(factory: AotFactory) -> Option<(&'static str, u32, bool)> {
         .and_then(|map| map.get(&(factory as usize)).copied())
 }
 
+/// Object-safe call surface for host closures.
+///
+/// A `Box<dyn Fn(..)>` vtable carries `call`, `call_mut` and `call_once` slots,
+/// and rustc emits a `FnOnce` by-value shim for every closure type to fill the
+/// last one. Thousands of host functions are erased through this path, so the
+/// shims, their vtable slots and the relocations for those slots add up to a
+/// large share of the binary. This trait exposes a single `invoke` slot.
+trait HostFn {
+    fn invoke(&self, this: Value, args: Vec<Value>) -> Value;
+}
+
+impl<F: Fn(Value, Vec<Value>) -> Value> HostFn for F {
+    #[inline]
+    fn invoke(&self, this: Value, args: Vec<Value>) -> Value {
+        self(this, args)
+    }
+}
+
 /// Callable body stored inside [`FunctionData`].
 ///
 /// Host / DOM / capture-adapter closures keep [`FunctionBody::Dyn`]. AOT
 /// `CreateClosure` uses [`FunctionBody::Aot`] so the page slab holds a fn
 /// pointer + captures without an extra `Box<dyn Fn>` allocation per closure.
 enum FunctionBody {
-    Dyn(Box<dyn Fn(Value, Vec<Value>) -> Value>),
+    Dyn(Box<dyn HostFn>),
     Aot {
         factory: AotFactory,
         captures: Box<AotCaptureMap>,
@@ -1733,7 +1751,7 @@ impl FunctionData {
     /// Rust closure type. Host / DOM / adapter sites still go through this path;
     /// AOT `CreateClosure` uses [`Self::from_aot`] instead.
     #[inline(never)]
-    fn from_erased(inner: Box<dyn Fn(Value, Vec<Value>) -> Value>) -> Self {
+    fn from_erased(inner: Box<dyn HostFn>) -> Self {
         Self::finish(FunctionBody::Dyn(inner))
     }
 
@@ -1813,7 +1831,7 @@ impl FunctionData {
 
     pub fn call(&self, this: Value, args: Vec<Value>) -> Value {
         match &self.body {
-            FunctionBody::Dyn(inner) => inner(this, args),
+            FunctionBody::Dyn(inner) => inner.invoke(this, args),
             FunctionBody::Aot { factory, captures } => factory(this, &args, captures),
             FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
@@ -1823,7 +1841,7 @@ impl FunctionData {
     /// collect a `Vec`; AOT factories receive the slice directly.
     pub fn call_slice(&self, this: Value, args: &[Value]) -> Value {
         match &self.body {
-            FunctionBody::Dyn(inner) => inner(this, args.to_vec()),
+            FunctionBody::Dyn(inner) => inner.invoke(this, args.to_vec()),
             FunctionBody::Aot { factory, captures } => factory(this, args, captures),
             FunctionBody::Bump { cell, addend } => bump_number(cell, *addend),
         }
@@ -2190,6 +2208,11 @@ fn dom_shape_method_key(key: &str) -> bool {
             | "createTextNode"
             | "push"
             | "__proto__"
+            // The detach fast path caches a negative scan of DOM prototype
+            // chains. Authored lifecycle state on any shared/custom
+            // prototype must invalidate that proof before the next removal.
+            | "__w3cos_custom_element_upgraded"
+            | "disconnectedCallback"
     )
 }
 

@@ -1247,6 +1247,31 @@ mod tests {
     }
 
     #[test]
+    fn class_name_replacement_does_not_churn_retained_index_entries() {
+        let mut doc = Document::new();
+        let first = doc.create_element("div");
+        let second = doc.create_element("div");
+        doc.body().append_child(&mut doc, first);
+        doc.body().append_child(&mut doc, second);
+        first.set_class_name(&mut doc, "bench active");
+        second.set_class_name(&mut doc, "bench active");
+        let ids = |doc: &Document, class: &str| {
+            doc.get_elements_by_class_name(class)
+                .iter()
+                .map(|element| element.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&doc, "bench"), vec![first.id, second.id]);
+
+        // Only the state token changes: the retained "bench" entry must stay
+        // where it is instead of being removed and re-appended.
+        first.set_class_name(&mut doc, "bench inactive");
+        assert_eq!(ids(&doc, "bench"), vec![first.id, second.id]);
+        assert_eq!(ids(&doc, "active"), vec![second.id]);
+        assert_eq!(ids(&doc, "inactive"), vec![first.id]);
+    }
+
+    #[test]
     fn test_element_class_list_add() {
         let mut doc = Document::new();
         let el = doc.create_element("div");
