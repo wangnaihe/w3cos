@@ -6025,6 +6025,25 @@ impl Document {
         if !generated_display_creates_box(style.display) {
             return None;
         }
+        // Size containment: auto block size is the contain-intrinsic-size,
+        // or 0. Pin it on the style so later auto-height projections cannot
+        // re-expand the group from in-flow markers (style-remove). Floated
+        // markers still overflow and paint (015).
+        if matches!(style.height, w3cos_std::style::Dimension::Auto) {
+            let height = style
+                .custom_properties
+                .as_ref()
+                .and_then(|properties| {
+                    properties.get(crate::css_style::CONTAIN_INTRINSIC_SIZE_PROPERTY)
+                })
+                .and_then(|value| {
+                    let mut axes = value.split_ascii_whitespace();
+                    let _width = axes.next()?;
+                    axes.next()?.parse().ok()
+                })
+                .unwrap_or(0.0);
+            style.height = w3cos_std::style::Dimension::Px(height);
+        }
         let declares = |property: &str| {
             declarations
                 .iter()

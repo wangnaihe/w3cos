@@ -2468,7 +2468,13 @@ fn render_node_with_applied_decorations(
                 .unwrap_or(centered.y),
             // The measured non-empty fragment already includes its painted
             // height; the font-size fallback would add an extra border row.
-            height: if plain_background
+            height: if centered.height <= 0.0
+                && style.custom_properties.as_ref().is_some_and(|properties| {
+                    properties.contains_key("--w3cos-internal-scroll-marker-origin")
+                        || properties.contains_key("--w3cos-internal-size-containment")
+                }) {
+                0.0
+            } else if plain_background
                 || top_aligned_inline
                 || normal_side_only_border
                 || (split_inline_edge && !empty_split_inline_edge)
