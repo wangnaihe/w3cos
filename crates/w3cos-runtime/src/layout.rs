@@ -30698,6 +30698,7 @@ mod tests {
         w3cos_dom::stylesheet::clear_rules();
     }
 
+    #[cfg(feature = "cpu-render")]
     #[test]
     fn break_spaces_006_headless_paint_covers_the_second_line() {
         // Same tree as overflow-wrap-break-word-006, painted through the
@@ -30877,6 +30878,7 @@ mod tests {
         w3cos_dom::stylesheet::clear_rules();
     }
 
+    #[cfg(feature = "cpu-render")]
     #[test]
     fn unstyled_scroll_marker_group_headless_paint_has_no_full_width_bar() {
         // style-remove after the class is gone: contain:size must clip the
