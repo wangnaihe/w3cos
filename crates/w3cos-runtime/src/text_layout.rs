@@ -67,13 +67,13 @@ pub(crate) fn authored_line_styles(
         let local_owner_ranges = owner_ranges
             .iter()
             .filter_map(|(owner, owner_start, owner_end)| {
+                // Owners that end before (or start after) this line clip to
+                // an empty range. `bool::then_some` evaluates its tuple
+                // eagerly, so the line-relative offsets must only be computed
+                // once the clipped range is known to be non-empty.
                 let local_start = (*owner_start).max(start);
                 let local_end = (*owner_end).min(end);
-                (local_start < local_end).then_some((
-                    *owner,
-                    local_start - start,
-                    local_end - start,
-                ))
+                (local_start < local_end).then(|| (*owner, local_start - start, local_end - start))
             })
             .collect::<Vec<_>>();
         w3cos_std::inline_text::set_cssom_owner_ranges(&mut line_style, line, &local_owner_ranges);
@@ -2152,6 +2152,27 @@ mod tests {
                 Some(vec![3, 7])
             );
         }
+    }
+
+    #[test]
+    fn owner_ranges_ending_before_a_later_line_are_clipped_not_underflowed() {
+        // A coalesced run whose first owner ends before the second line
+        // starts: clipping that owner to the second line yields an empty
+        // range, which must be dropped rather than turned into
+        // `owner_end - line_start` (an unsigned underflow).
+        let text = "aaa bbb";
+        let mut style = Style::default();
+        w3cos_std::inline_text::set_cssom_owner_ranges(&mut style, text, &[(1, 0, 3), (2, 4, 7)]);
+        let lines = vec!["aaa".into(), "bbb".into()];
+        let styles = authored_line_styles(text, &style, &lines).unwrap();
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges(&lines[0], &styles[0]),
+            vec![(1, 0, 3)]
+        );
+        assert_eq!(
+            w3cos_std::inline_text::cssom_owner_ranges(&lines[1], &styles[1]),
+            vec![(2, 0, 3)]
+        );
     }
 
     #[test]
