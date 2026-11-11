@@ -24773,6 +24773,47 @@ mod tests {
     }
 
     #[test]
+    fn spans_coalesced_across_forced_breaks_each_publish_one_client_rect_per_line() {
+        // `<br>`-separated spans coalesce into one text run whose later lines
+        // start after earlier owners end. Each span must keep exactly one
+        // client rect: earlier owners clip away on later lines (no unsigned
+        // underflow) and no owner range is published twice.
+        setup();
+        set_viewport(1280.0, 800.0);
+        let document = document_value();
+        let sheet = document.call_method("createElement", vec![Value::string("style")]);
+        sheet.set_property("textContent", Value::string(".zz { color: red; }"));
+        document
+            .get_property("head")
+            .call_method("appendChild", vec![sheet]);
+        let host = document.call_method("createElement", vec![Value::string("div")]);
+        let mut spans = vec![];
+        for text in ["first", "second", "third"] {
+            host.call_method(
+                "appendChild",
+                vec![document.call_method("createElement", vec![Value::string("br")])],
+            );
+            let span = document.call_method("createElement", vec![Value::string("span")]);
+            span.set_property("textContent", Value::string(text));
+            host.call_method("appendChild", vec![span.clone()]);
+            spans.push(span);
+        }
+        document
+            .get_property("body")
+            .call_method("appendChild", vec![host]);
+        let mut previous_top = f64::NEG_INFINITY;
+        for span in &spans {
+            let rects = span.call_method("getClientRects", vec![]);
+            assert_eq!(rects.get_property("length").to_number(), 1.0);
+            let rect = rects.call_method("item", vec![Value::Number(0.0)]);
+            assert!(rect.get_property("width").to_number() > 0.0);
+            let top = rect.get_property("top").to_number();
+            assert!(top > previous_top, "each span sits on its own line");
+            previous_top = top;
+        }
+    }
+
+    #[test]
     fn inline_span_holding_only_text_has_a_measured_box() {
         setup();
         set_viewport(1280.0, 800.0);

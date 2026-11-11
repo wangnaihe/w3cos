@@ -7935,6 +7935,12 @@ impl Document {
         } else {
             content
         };
+        // A text child's component box already lists its inline parent in
+        // `cssom_box_owners`, and the coalescing loop also records that
+        // parent as the logical owner of the same bytes. Publishing both
+        // would give the element two identical client rects per line.
+        let mut seen_owner_ranges = HashSet::new();
+        owner_ranges.retain(|range| seen_owner_ranges.insert(*range));
         let mut style = text_style?;
         w3cos_std::inline_text::set_fragment_ends(&mut style, &content, &ends);
         w3cos_std::inline_text::set_cssom_owner_ranges(&mut style, &content, &owner_ranges);
