@@ -8150,6 +8150,131 @@ fn column_flex_unhandled_baseline_stays_on_legacy() {
     );
 }
 
+/// Flexbox §8.4. Three 40×20 items in a 100×100 wrapped row: two on the
+/// first line, one on the second. Leftover cross space is 60px. The
+/// positions are the same distribution `justify-content` uses on the main
+/// axis, and they match the legacy engine.
+#[test]
+fn wrapped_row_align_content_matches_legacy() {
+    use w3cos_std::style::{AlignContent, AlignItems, FlexWrap};
+    let item = || {
+        node(
+            Style {
+                width: Dimension::Px(40.0),
+                height: Dimension::Px(20.0),
+                flex_grow: 0.0,
+                flex_shrink: 0.0,
+                flex_basis: Dimension::Px(40.0),
+                ..block()
+            },
+            vec![],
+        )
+    };
+    let case = |align: AlignContent, gap: f32| {
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                align_content: align,
+                align_items: AlignItems::FlexStart,
+                width: Dimension::Px(100.0),
+                height: Dimension::Px(100.0),
+                gap,
+                ..Style::default()
+            },
+            vec![item(), item(), item()],
+        )
+    };
+    let center = parity(&case(AlignContent::Center, 0.0));
+    assert_eq!(rect(&center, 1), (0.0, 30.0, 40.0, 20.0));
+    assert_eq!(rect(&center, 2), (40.0, 30.0, 40.0, 20.0));
+    assert_eq!(rect(&center, 3), (0.0, 50.0, 40.0, 20.0));
+    let end = parity(&case(AlignContent::FlexEnd, 0.0));
+    assert_eq!(rect(&end, 1).1, 60.0);
+    assert_eq!(rect(&end, 3).1, 80.0);
+    // flexbox_align-content-flexend-ref.html: the last line's end edge is
+    // the container's end edge. 20px lines, 60px free, flex-end lead 60.
+    assert_eq!(rect(&end, 3).1 + rect(&end, 3).3, 100.0);
+
+    // Column wrap: cross axis is horizontal. Two 30×40 items in a 120×50
+    // box wrap into two columns. flex-end packs them at x=60 and x=90.
+    let column = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            flex_wrap: FlexWrap::Wrap,
+            align_content: AlignContent::FlexEnd,
+            align_items: AlignItems::FlexStart,
+            width: Dimension::Px(120.0),
+            height: Dimension::Px(50.0),
+            ..Style::default()
+        },
+        vec![
+            node(
+                Style {
+                    width: Dimension::Px(30.0),
+                    height: Dimension::Px(40.0),
+                    flex_grow: 0.0,
+                    flex_shrink: 0.0,
+                    flex_basis: Dimension::Px(40.0),
+                    ..block()
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    width: Dimension::Px(30.0),
+                    height: Dimension::Px(40.0),
+                    flex_grow: 0.0,
+                    flex_shrink: 0.0,
+                    flex_basis: Dimension::Px(40.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    );
+    let out = parity(&column);
+    assert_eq!(rect(&out, 1), (60.0, 0.0, 30.0, 40.0));
+    assert_eq!(rect(&out, 2), (90.0, 0.0, 30.0, 40.0));
+
+    for align in [
+        AlignContent::SpaceBetween,
+        AlignContent::SpaceAround,
+        AlignContent::SpaceEvenly,
+    ] {
+        let root = case(align, 0.0);
+        let flat = pre_flatten(&root);
+        assert!(
+            block::unsupported_reasons(&flat)
+                .iter()
+                .any(|reason| reason == "flex:align-content"),
+            "{align:?} stays on legacy: {:?}",
+            block::unsupported_reasons(&flat)
+        );
+    }
+
+    let nowrap = node(
+        Style {
+            display: Display::Flex,
+            align_content: AlignContent::Center,
+            width: Dimension::Px(100.0),
+            height: Dimension::Px(100.0),
+            ..Style::default()
+        },
+        vec![item()],
+    );
+    let flat = pre_flatten(&nowrap);
+    assert!(
+        block::unsupported_reasons(&flat)
+            .iter()
+            .any(|reason| reason == "flex:align-content"),
+        "nowrap align-content stays on legacy: {:?}",
+        block::unsupported_reasons(&flat)
+    );
+}
+
 fn wide_space() -> ConstraintSpace {
     ConstraintSpace {
         available_inline: 200.0,
