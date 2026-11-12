@@ -15477,3 +15477,290 @@ fn overflow_column_scroll_geometry_is_published_at_flush() {
     crate::dom::reset_document();
     crate::incremental_layout::invalidate();
 }
+
+fn column_flex(direction: FlexDirection, width: f32, children: Vec<Component>) -> Component {
+    node(
+        Style {
+            display: Display::Flex,
+            flex_direction: direction,
+            align_items: w3cos_std::style::AlignItems::Baseline,
+            width: Dimension::Px(width),
+            ..Style::default()
+        },
+        children,
+    )
+}
+
+fn fixed_box(width: f32, height: f32) -> Component {
+    node(
+        Style {
+            width: Dimension::Px(width),
+            height: Dimension::Px(height),
+            ..block()
+        },
+        vec![],
+    )
+}
+
+fn text_block(text: &str, size: f32) -> Component {
+    let style = Style {
+        display: Display::Block,
+        font_size: size,
+        line_height: 1.0,
+        ..Style::default()
+    };
+    node(
+        style.clone(),
+        vec![Component::text(
+            text,
+            Style {
+                display: Display::Inline,
+                font_size: size,
+                line_height: 1.0,
+                ..style
+            },
+        )],
+    )
+}
+
+fn at_baseline(value: LastBaseline) -> f32 {
+    match value {
+        LastBaseline::At(offset) => offset,
+        other => panic!("expected a baseline, got {other:?}"),
+    }
+}
+
+/// Flexbox §8.3 and `align-baseline-ref.html`: a horizontal column's
+/// `align-items: baseline` is `flex-start`. An empty item has no line box,
+/// so Flexbox §8.5 synthesizes the container baseline from that item's
+/// border-box under edge. `column-reverse` takes the main-start item,
+/// which is the first child, packed at the bottom.
+#[test]
+fn column_flex_baseline_is_flex_start_and_exports_border_edges() {
+    let children = vec![fixed_box(40.0, 10.0), fixed_box(30.0, 20.0)];
+    let root = column_flex(FlexDirection::Column, 100.0, children.clone());
+    let out = parity(&root);
+    assert_eq!(rect(&out, 0), (0.0, 0.0, 100.0, 30.0));
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 10.0, 30.0, 20.0));
+    let flat = pre_flatten(&root);
+    let result = block::layout_block(&flat, 0, &wide_space(), true).expect("column");
+    assert_eq!(at_baseline(result.first_baseline), 10.0);
+    assert_eq!(at_baseline(result.last_baseline), 30.0);
+
+    // `flexbox-align-self-vert-002-ref.xhtml` places `.baseline` with
+    // `float: left`. A 4px cross-start margin shifts the border box.
+    let mut inset = Style {
+        width: Dimension::Px(40.0),
+        height: Dimension::Px(10.0),
+        ..block()
+    };
+    inset.margin.left = px(4.0);
+    let margined = column_flex(FlexDirection::Column, 100.0, vec![node(inset, vec![])]);
+    let out = parity(&margined);
+    assert_eq!(rect(&out, 1), (4.0, 0.0, 40.0, 10.0));
+
+    let reversed = column_flex(FlexDirection::ColumnReverse, 100.0, children);
+    let out = parity(&reversed);
+    assert_eq!(rect(&out, 0), (0.0, 0.0, 100.0, 30.0));
+    assert_eq!(rect(&out, 1), (0.0, 20.0, 40.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 0.0, 30.0, 20.0));
+    let flat = pre_flatten(&reversed);
+    let result = block::layout_block(&flat, 0, &wide_space(), true).expect("column-reverse");
+    assert_eq!(at_baseline(result.first_baseline), 30.0);
+    assert_eq!(at_baseline(result.last_baseline), 20.0);
+}
+
+/// The container baseline is the item's real text baseline, not the
+/// border-box under edge (Flexbox §8.5).
+#[test]
+fn column_flex_baseline_exports_the_item_text_baseline() {
+    let first = text_block("A", 30.0);
+    let second = text_block("B", 16.0);
+    let first_flat = pre_flatten(&first);
+    let second_flat = pre_flatten(&second);
+    let first_base = at_baseline(
+        block::layout_block(&first_flat, 0, &wide_space(), true)
+            .expect("first item")
+            .first_baseline,
+    );
+    let second_base = at_baseline(
+        block::layout_block(&second_flat, 0, &wide_space(), true)
+            .expect("second item")
+            .last_baseline,
+    );
+    let first_height = {
+        let laid = block::layout_block(&first_flat, 0, &wide_space(), true).expect("height");
+        laid.fragment.height
+    };
+    assert!(
+        first_base < first_height,
+        "a text baseline sits above the border-box under edge ({first_base} vs {first_height})"
+    );
+
+    let root = column_flex(FlexDirection::Column, 200.0, vec![first, second]);
+    let out = parity(&root);
+    assert_eq!(rect(&out, 1).0, 0.0);
+    assert_eq!(rect(&out, 3).0, 0.0);
+    let flat = pre_flatten(&root);
+    let result = block::layout_block(&flat, 0, &wide_space(), true).expect("column");
+    assert_eq!(at_baseline(result.first_baseline), first_base);
+    assert_eq!(
+        at_baseline(result.last_baseline),
+        rect(&out, 3).1 + second_base
+    );
+}
+
+/// `align-self: baseline` is flex-start (`float: left` in
+/// `flexbox-align-self-vert-002-ref.xhtml`). A stretched sibling still
+/// fills the column. `flexbox-align-self-baseline-compatability.html`
+/// is the same single line when the column's height is auto, even with
+/// `flex-wrap: wrap`: two 100×50 items stack into a 100×100 box.
+#[test]
+fn column_flex_align_self_baseline_matches_flex_start() {
+    let baseline = node(
+        Style {
+            display: Display::Block,
+            align_self: w3cos_std::style::AlignSelf::Baseline,
+            width: Dimension::Px(50.0),
+            height: Dimension::Px(10.0),
+            ..Style::default()
+        },
+        vec![],
+    );
+    let stretched = node(
+        Style {
+            display: Display::Block,
+            height: Dimension::Px(20.0),
+            ..Style::default()
+        },
+        vec![],
+    );
+    let root = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            align_items: w3cos_std::style::AlignItems::Stretch,
+            width: Dimension::Px(200.0),
+            ..Style::default()
+        },
+        vec![baseline, stretched],
+    );
+    let out = parity(&root);
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 50.0, 10.0));
+    assert_eq!(rect(&out, 2), (0.0, 10.0, 200.0, 20.0));
+
+    let wrapped = node(
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            flex_wrap: w3cos_std::style::FlexWrap::Wrap,
+            width: Dimension::Px(100.0),
+            ..Style::default()
+        },
+        vec![
+            node(
+                Style {
+                    align_self: w3cos_std::style::AlignSelf::Baseline,
+                    width: Dimension::Px(100.0),
+                    height: Dimension::Px(50.0),
+                    ..block()
+                },
+                vec![],
+            ),
+            node(
+                Style {
+                    align_self: w3cos_std::style::AlignSelf::Baseline,
+                    width: Dimension::Px(100.0),
+                    height: Dimension::Px(50.0),
+                    ..block()
+                },
+                vec![],
+            ),
+        ],
+    );
+    let out = parity(&wrapped);
+    assert_eq!(rect(&out, 0), (0.0, 0.0, 100.0, 100.0));
+    assert_eq!(rect(&out, 1), (0.0, 0.0, 100.0, 50.0));
+    assert_eq!(rect(&out, 2), (0.0, 50.0, 100.0, 50.0));
+}
+
+#[test]
+fn column_flex_unhandled_baseline_stays_on_legacy() {
+    let still = |root: Component, reason: &str| {
+        let flat = pre_flatten(&root);
+        assert!(
+            block::unsupported_reasons(&flat)
+                .iter()
+                .any(|got| got == reason),
+            "{reason} {:?}",
+            block::unsupported_reasons(&flat)
+        );
+    };
+    still(
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                flex_wrap: w3cos_std::style::FlexWrap::Wrap,
+                align_items: w3cos_std::style::AlignItems::Baseline,
+                width: Dimension::Px(200.0),
+                height: Dimension::Px(80.0),
+                ..Style::default()
+            },
+            vec![fixed_box(40.0, 10.0), fixed_box(40.0, 10.0)],
+        ),
+        "flex:baseline",
+    );
+    still(
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                flex_wrap: w3cos_std::style::FlexWrap::WrapReverse,
+                align_items: w3cos_std::style::AlignItems::Baseline,
+                width: Dimension::Px(200.0),
+                ..Style::default()
+            },
+            vec![fixed_box(40.0, 10.0)],
+        ),
+        "flex:baseline",
+    );
+    still(
+        node(
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                align_items: w3cos_std::style::AlignItems::Baseline,
+                direction: w3cos_std::style::TextDirection::Rtl,
+                width: Dimension::Px(200.0),
+                ..Style::default()
+            },
+            vec![fixed_box(40.0, 10.0)],
+        ),
+        "flex:baseline",
+    );
+    // Center and align-self flex-end on a single-line column already
+    // lay out on NG in this branch, so the #447 legacy oracles for
+    // `flex:column-align` / `flex:column-align-self` are not imported.
+}
+
+fn wide_space() -> ConstraintSpace {
+    ConstraintSpace {
+        available_inline: 200.0,
+        percentage_block: None,
+        viewport_w: 800.0,
+        viewport_h: 600.0,
+        rtl: false,
+        bfc_x: 0.0,
+        bfc_y: 0.0,
+        margin_base: 0.0,
+        margin_strut: MarginStrut::default(),
+        forced_bfc: false,
+        adjoining_from: 0,
+        percent_unresolved: false,
+        fixed_block_indefinite: false,
+        cyclic_percent_auto: false,
+        line_clamp: None,
+    }
+}

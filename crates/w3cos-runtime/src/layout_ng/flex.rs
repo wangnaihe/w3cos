@@ -5,16 +5,18 @@
 //! Copyright The Chromium Authors, BSD-style license) and CSS Flexible Box
 //! Layout Level 1 §4.5 (automatic minimum size) and §9 (main size, flexible
 //! lengths, alignment, line breaking). An indefinite percentage basis
-//! stays on the legacy engine.
+//! stays on the legacy engine. A text run is an anonymous flex item:
+//! block text with its min-content as the automatic minimum (not under
+//! an unrecognized display such as `-webkit-box`).
 //! A row aligns baseline items per line by their first baseline, or the
 //! synthesized border-box under edge (FlexLayoutAlgorithm::BaselineAscent),
 //! measured from the cross end under `wrap-reverse` (the minor group).
-//! A column in a horizontal-tb container aligns baseline items on the
-//! cross (inline) axis with the same typographic / synthesized groups as
-//! grid `justify-*: baseline` (CSS Align 3 §9.1 / §9.3; Blink
-//! `FlexLayoutAlgorithm::BaselineAscent`). Vertical-rl / sideways-rl
-//! items form the minor group and pack from the cross end. Vertical
-//! containers stay on legacy (`flex:baseline-column`). Items whose
+//! Authored `last baseline` items form a second group flush with the
+//! cross end. A horizontal column or column-reverse treats `baseline` as
+//! `flex-start` on the cross axis (the item's inline axis is that cross
+//! axis) and exports each item's first and last baseline. A definite-height
+//! wrap, `wrap-reverse`, `direction: rtl`, and vertical containers stay
+//! on legacy (`flex:baseline` / `flex:baseline-column`). Items whose
 //! subtree NG reports no baseline for in a row stay on legacy
 //! (`flex:baseline-nested`).
 //! `wrap-reverse` swaps the cross-start (Flexbox §5.2) and packs lines
@@ -226,6 +228,46 @@ fn item_align_with_last(container: &Style, child: &Style, auto_margin: bool) -> 
     item_align(container, child)
 }
 
+/// Horizontal `column` / `column-reverse` baseline alignment.
+///
+/// Flexbox §8.3: when the item's inline axis is the cross axis, `baseline`
+/// is identical to `flex-start`. This engine does not store writing-mode,
+/// so every item is horizontal and a column's cross axis is that inline
+/// axis. A definite-height wrap has several lines. `wrap-reverse` swaps
+/// the cross-start, and `direction: rtl` moves it; those stay on legacy.
+fn column_cross_baseline(flat: &[FlatNodeInfo], index: usize) -> bool {
+    let style = flat[index].style;
+    if row_axis(style.flex_direction) || style.direction == TextDirection::Rtl {
+        return false;
+    }
+    if style.flex_wrap == FlexWrap::WrapReverse {
+        return false;
+    }
+    if style.flex_wrap != FlexWrap::NoWrap && !matches!(style.height, Dimension::Auto) {
+        return false;
+    }
+    style.align_items == AlignItems::Baseline
+        || rendered_children(flat, index)
+            .any(|child| flat[child].style.align_self == AlignSelf::Baseline)
+}
+
+/// The item's first or last baseline, measured from `origin` (the item's
+/// border-box top in the flex container). A box with no line box uses its
+/// border-box under edge (Flexbox §8.5).
+fn exported_item_baseline(laid: &LayoutResult, origin: f32, first: bool) -> LastBaseline {
+    let baseline = if first {
+        laid.first_baseline
+    } else {
+        laid.last_baseline
+    };
+    match baseline {
+        LastBaseline::At(value) => LastBaseline::At(origin + value),
+        LastBaseline::NoLines | LastBaseline::Unknown => {
+            LastBaseline::At(origin + laid.fragment.height)
+        }
+    }
+}
+
 fn baseline_participant(container: AlignItems, item: AlignSelf) -> bool {
     match item {
         AlignSelf::Baseline => true,
@@ -283,6 +325,16 @@ fn baseline_reason(flat: &[FlatNodeInfo], index: usize) -> Option<&'static str> 
         if style.writing_mode != w3cos_std::style::WritingMode::HorizontalTb {
             return Some("flex:baseline-column");
         }
+        // #447: definite-height wrap, wrap-reverse, and rtl stay on legacy.
+        if style.direction == TextDirection::Rtl {
+            return Some("flex:baseline");
+        }
+        if style.flex_wrap == FlexWrap::WrapReverse {
+            return Some("flex:baseline");
+        }
+        if style.flex_wrap != FlexWrap::NoWrap && !matches!(style.height, Dimension::Auto) {
+            return Some("flex:baseline");
+        }
         return None;
     }
     for child in rendered_children(flat, index) {
@@ -305,40 +357,6 @@ fn baseline_ascent(item: &Item, laid: &LayoutResult) -> Option<f32> {
         LastBaseline::Unknown => return None,
     };
     Some(item.margin_cross_start + baseline)
-}
-
-/// Cross-axis `BaselineAscent` for a column item in a horizontal-tb
-/// container. Returns `(ascent, minor)`. The typographic first baseline
-/// is measured from the border-box left (face descent); a horizontal-tb
-/// item synthesizes from the under edge of the assumed vertical writing
-/// mode. Wrap-reverse xor last-baseline flips the offset inside the box
-/// (Blink `BaselineAscent`). Opposite block-flow (vertical-rl) is the
-/// minor group and uses the cross-end margin.
-fn column_baseline_ascent(
-    container: &Style,
-    child: &Style,
-    space: &ConstraintSpace,
-    item: &Item,
-    border_cross: f32,
-    last: bool,
-    wrap_reverse: bool,
-) -> (f32, bool) {
-    let under_right = super::grid::col_baseline_under_right(container, child);
-    let mut offset = if super::grid::typographic_inline_baseline(child) {
-        super::grid::typographic_col_first_from_border_left(child, space)
-    } else {
-        super::grid::synthesized_col_baseline(last, border_cross, under_right)
-    };
-    if wrap_reverse != last {
-        offset = border_cross - offset;
-    }
-    let minor = under_right != (wrap_reverse != last);
-    let ascent = if minor {
-        item.margin_cross_end + offset
-    } else {
-        item.margin_cross_start + offset
-    };
-    (ascent, minor)
 }
 
 fn flex_cross_border(row: bool, laid: &LayoutResult) -> f32 {
@@ -2892,22 +2910,15 @@ fn layout_with(
         )?;
         let border_cross = flex_cross_border(row, &laid);
         let margin_box = border_cross + item.margin_cross_start + item.margin_cross_end;
-        let (ascent, minor) = if row {
-            (
-                baseline_ascent(item, &laid).why("flex:baseline-unknown")?,
-                false,
-            )
-        } else {
-            column_baseline_ascent(
-                style,
-                flat[item.index].style,
-                space,
-                item,
-                border_cross,
-                false,
-                wrap_reverse,
-            )
-        };
+        if !row {
+            // Column `baseline` is flex-start (#447); it does not join a
+            // typographic ascent group.
+            continue;
+        }
+        let (ascent, minor) = (
+            baseline_ascent(item, &laid).why("flex:baseline-unknown")?,
+            false,
+        );
         *slot = Some(ascent);
         if minor {
             minors[index] = true;
@@ -2942,37 +2953,25 @@ fn layout_with(
             !(item.cross_auto && item.align != AlignItems::Stretch),
         )?;
         let border_cross = flex_cross_border(row, &laid);
-        let (ascent, margin_box) = if row {
-            let baseline = match laid.last_baseline {
-                LastBaseline::At(baseline) => baseline,
-                LastBaseline::NoLines => laid.fragment.height,
-                LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
-            };
-            (
-                item.margin_cross_start + baseline,
-                border_cross + item.margin_cross_start + item.margin_cross_end,
-            )
-        } else {
-            let (ascent, _) = column_baseline_ascent(
-                style,
-                flat[item.index].style,
-                space,
-                item,
-                border_cross,
-                true,
-                wrap_reverse,
-            );
-            (
-                ascent,
-                border_cross + item.margin_cross_start + item.margin_cross_end,
-            )
+        if !row {
+            continue;
+        }
+        let baseline = match laid.last_baseline {
+            LastBaseline::At(baseline) => baseline,
+            LastBaseline::NoLines => laid.fragment.height,
+            LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
         };
+        let (ascent, margin_box) = (
+            item.margin_cross_start + baseline,
+            border_cross + item.margin_cross_start + item.margin_cross_end,
+        );
         *slot = Some(ascent);
         max_last_ascent = Some(max_last_ascent.map_or(ascent, |max| max.max(ascent)));
         max_last_descent = max_last_descent.max(margin_box - ascent);
     }
     let last_extent = max_last_ascent.map_or(0.0, |ascent| ascent + max_last_descent);
     let line_inner = definite_line.unwrap_or(max_margin_box.max(baseline_extent).max(last_extent));
+    let column_baseline = column_cross_baseline(flat, index);
 
     for item in &mut items {
         if item.align == AlignItems::Stretch && item.cross_auto {
@@ -3060,7 +3059,10 @@ fn layout_with(
     // CSS Flexbox 8.5 / main #402: an `inline-flex` atomic inline's baseline
     // is its first item's first baseline (single line, no reversal).
     let mut inline_flex_baseline = LastBaseline::NoLines;
-    let first_item_baseline = style.display == Display::InlineFlex && !reverse && !reverse_cross;
+    let mut column_first = LastBaseline::NoLines;
+    let mut column_last = LastBaseline::NoLines;
+    let first_item_baseline =
+        !column_baseline && style.display == Display::InlineFlex && !reverse && !reverse_cross;
     let mut item_position = 0usize;
     for ((((item, laid), ascent), last_ascent), minor) in items
         .iter()
@@ -3084,15 +3086,16 @@ fn layout_with(
         let extra = line_inner - margin_box;
         let (margin_cross_start, _) = item.cross_margins(extra);
         let from_start = match (item.align, last_ascent) {
-            (_, Some(last)) => line_inner - max_last_descent - last,
+            (_, Some(last)) if row => line_inner - max_last_descent - last,
             (AlignItems::FlexEnd, _) => extra,
             (AlignItems::Center, _) => extra / 2.0,
-            (AlignItems::Baseline, _) if *minor => {
+            (AlignItems::Baseline, _) if row && *minor => {
                 extra - (max_minor_ascent.unwrap_or(0.0) - ascent.unwrap_or(item.margin_cross_end))
             }
-            (AlignItems::Baseline, _) => {
+            (AlignItems::Baseline, _) if row => {
                 max_ascent.unwrap_or(0.0) - ascent.unwrap_or(item.margin_cross_start)
             }
+            (AlignItems::Baseline, _) => 0.0,
             (AlignItems::Stretch | AlignItems::FlexStart, _) => 0.0,
         };
         // Blink places baseline items with `line + offset + CrossStart`
@@ -3145,6 +3148,13 @@ fn layout_with(
             if let LastBaseline::At(b) = laid.first_baseline {
                 inline_flex_baseline = LastBaseline::At(y + dy + b);
             }
+        }
+        if column_baseline {
+            let origin = y + dy;
+            if item_position == 0 {
+                column_first = exported_item_baseline(&laid, origin, true);
+            }
+            column_last = exported_item_baseline(&laid, origin, false);
         }
         let (paint_dy, fragment) = text_item_paint_box(flat, item.index, index, laid.fragment);
         children.push((x + dx, y + dy + paint_dy, fragment));
@@ -3249,8 +3259,16 @@ fn layout_with(
             vertical: false,
             children,
         },
-        last_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
-        first_baseline: clamp_scroll_baseline(style, container_baseline, border_height),
+        last_baseline: if column_baseline {
+            column_last
+        } else {
+            clamp_scroll_baseline(style, container_baseline, border_height)
+        },
+        first_baseline: if column_baseline {
+            column_first
+        } else {
+            clamp_scroll_baseline(style, container_baseline, border_height)
+        },
         start_strut,
         end_strut,
         self_collapsing: false,
@@ -3494,31 +3512,20 @@ fn layout_wrapped(
                     !(item.cross_auto && item.align != AlignItems::Stretch),
                 )?;
                 let border_cross = flex_cross_border(row, &laid);
-                let (ascent, margin_box) = if row {
-                    let baseline = match laid.last_baseline {
-                        LastBaseline::At(baseline) => baseline,
-                        LastBaseline::NoLines => laid.fragment.height,
-                        LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
-                    };
-                    (
-                        item.margin_cross_start + baseline,
-                        border_cross + item.margin_cross_start + item.margin_cross_end,
-                    )
-                } else {
-                    let (ascent, _) = column_baseline_ascent(
-                        style,
-                        flat[item.index].style,
-                        space,
-                        item,
-                        border_cross,
-                        true,
-                        wrap_reverse,
-                    );
-                    (
-                        ascent,
-                        border_cross + item.margin_cross_start + item.margin_cross_end,
-                    )
+                if !row {
+                    // Column `baseline` is flex-start; typographic last-baseline
+                    // groups stay on rows.
+                    continue;
+                }
+                let baseline = match laid.last_baseline {
+                    LastBaseline::At(baseline) => baseline,
+                    LastBaseline::NoLines => laid.fragment.height,
+                    LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
                 };
+                let (ascent, margin_box) = (
+                    item.margin_cross_start + baseline,
+                    border_cross + item.margin_cross_start + item.margin_cross_end,
+                );
                 last_ascents[start + offset] = Some(ascent);
                 max_last_ascent = Some(max_last_ascent.map_or(ascent, |max| max.max(ascent)));
                 max_last_descent = max_last_descent.max(margin_box - ascent);
@@ -3540,29 +3547,20 @@ fn layout_wrapped(
             )?;
             let border_cross = flex_cross_border(row, &laid);
             let margin_box = border_cross + item.margin_cross_start + item.margin_cross_end;
-            let (ascent, minor) = if row {
-                let baseline = match laid.first_baseline {
-                    LastBaseline::At(baseline) => baseline,
-                    LastBaseline::NoLines => laid.fragment.height,
-                    LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
-                };
-                let from_cross_start = if wrap_reverse {
-                    border_cross - baseline
-                } else {
-                    baseline
-                };
-                (item.margin_cross_start + from_cross_start, false)
-            } else {
-                column_baseline_ascent(
-                    style,
-                    flat[item.index].style,
-                    space,
-                    item,
-                    border_cross,
-                    false,
-                    wrap_reverse,
-                )
+            if !row {
+                continue;
+            }
+            let baseline = match laid.first_baseline {
+                LastBaseline::At(baseline) => baseline,
+                LastBaseline::NoLines => laid.fragment.height,
+                LastBaseline::Unknown => return super::bail("flex:baseline-unknown"),
             };
+            let from_cross_start = if wrap_reverse {
+                border_cross - baseline
+            } else {
+                baseline
+            };
+            let (ascent, minor) = (item.margin_cross_start + from_cross_start, false);
             ascents[start + offset] = Some(ascent);
             if minor {
                 minors[start + offset] = true;
@@ -5023,9 +5021,11 @@ mod tests {
     }
 
     #[test]
-    fn column_and_nested_grid_or_column_wrap_baseline_stay_on_legacy() {
-        // A horizontal-tb column baseline group is implemented; a vertical
-        // container still stays on legacy.
+    fn column_baseline_lays_out_and_row_baselines_stay_on_legacy() {
+        // A horizontal column's baseline cross-alignment is flex-start.
+        // The empty item has no line box, so the container baseline is
+        // that item's border-box under edge. A vertical container stays
+        // on legacy.
         let mut column = flex_style(FlexDirection::Column, 100.0, Some(80.0));
         column.align_items = AlignItems::Baseline;
         expect(
